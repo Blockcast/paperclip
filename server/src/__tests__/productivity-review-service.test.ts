@@ -13,6 +13,7 @@ import {
   issueApprovals,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
   plugins,
   pluginState,
@@ -34,6 +35,7 @@ import {
 } from "../services/productivity-review.js";
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
+import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST } from "../services/pull-request-work-products.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -194,9 +196,18 @@ describeEmbeddedPostgres("productivity review service", () => {
     withRunComments?: boolean;
     contextSource?: string;
     status?: string;
+    startedAt?: Date | null;
+    nextAction?: string | null;
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
     logBytes?: number | null;
+    // BLO-26165: defaults to a value distinct from the DB's own default of
+    // `"not_applicable"` so existing fixtures — which model a run that
+    // genuinely executed and simply produced no comment — are not silently
+    // excluded from the no-comment-streak walk by the new
+    // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filter. Pass `"not_applicable"`
+    // explicitly to model a never-invoked run (BLO-23096).
+    issueCommentStatus?: string;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -209,15 +220,16 @@ describeEmbeddedPostgres("productivity review service", () => {
         status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
-        startedAt: createdAt,
-        finishedAt: new Date(createdAt.getTime() + 30_000),
+        startedAt: input.startedAt === undefined ? createdAt : input.startedAt,
+        finishedAt: (input.status ?? "succeeded") === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
         contextSnapshot: input.contextSource
           ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
           : { issueId: input.issueId, taskId: input.issueId },
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
-        nextAction: "Continue processing the next batch.",
+        issueCommentStatus: input.issueCommentStatus ?? "retry_exhausted",
+        nextAction: input.nextAction === undefined ? "Continue processing the next batch." : input.nextAction,
         createdAt,
         updatedAt: createdAt,
       });
@@ -378,6 +390,362 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
   });
 
+  // BLO-19566 AC4. The productivity reviewer's verdict criteria ask for "a
+  // non-stale PR/MR link in the source issue's evidence", but collectEvidence
+  // never queried one, so an assignee pushing commits to an open PR produced an
+  // evidence pack indistinguishable from an idle issue. BLO-19541 misfired on
+  // exactly this: it reported "0/6h runs, none recorded" while PR #806 had
+  // commits from that same morning.
+  describe("pull-request evidence (BLO-19566)", () => {
+    async function seedIssueWithPullRequest(opts: {
+      prUpdatedAt: Date;
+      status?: string;
+      metadata?: Record<string, unknown> | null;
+      url?: string | null;
+      createdByRunId?: string | null;
+    }) {
+      const seeded = await seedAssignedIssue();
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Widen the authz grant",
+        url: opts.url === undefined ? "https://github.com/Blockcast/paperclip/pull/806" : opts.url,
+        status: opts.status ?? "ready_for_review",
+        metadata: opts.metadata === undefined
+          ? { source: "github_pull_request_webhook", sourceEventOrder: 10 }
+          : opts.metadata,
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdByRunId: opts.createdByRunId ?? null,
+        createdAt: opts.prUpdatedAt,
+        updatedAt: opts.prUpdatedAt,
+      });
+      return seeded;
+    }
+
+    it("surfaces a recently-pushed PR instead of reporting zero progress signal", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      // Pushed 2h ago -- inside the 6h window the AC names.
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const reviews = await listProductivityReviews(seeded.companyId);
+      expect(reviews).toHaveLength(1);
+      const description = reviews[0]?.description ?? "";
+      // The regression this guards: the line used to be absent entirely.
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+      expect(description).toContain("non-stale");
+      expect(description).not.toContain("Linked pull request: none recorded");
+      // And the manager is told the PR satisfies the second verdict criterion,
+      // so a live PR is not read as "no concrete progress signal".
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("counts a fresh draft PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "draft",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("`draft`");
+      expect(description).toContain("progress-eligible");
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("does not count a freshly closed unmerged PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "closed",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("`closed`");
+      expect(description).toContain("non-stale");
+      expect(description).toContain("not progress-eligible");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("lets an older fresh progress PR satisfy the signal when a newer closed PR exists", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#807",
+        title: "Closed unmerged follow-up",
+        url: "https://github.com/Blockcast/paperclip/pull/807",
+        status: "closed",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 20 },
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+      expect(description).toContain("`ready_for_review`");
+      expect(description).toContain("The second signal is already present");
+      expect(description).not.toContain("https://github.com/Blockcast/paperclip/pull/807");
+    });
+
+    it("counts a freshly merged PR as concrete progress", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        status: "merged",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 30 },
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("`merged`");
+      expect(description).toContain("The second signal is already present");
+    });
+
+    it("reads a delayed first delivery as stale by GitHub event time, not DB receipt time", async () => {
+      // A first webhook delivery can land long after the PR event (retry,
+      // backfill, outage drain). The row then inserts with `updatedAt = now`,
+      // so aging off `updatedAt` advertises an already-dead PR as fresh
+      // progress for another 24h. Age must come from the GitHub event time.
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const threeDaysAgoMs = now.getTime() - 3 * 24 * 60 * 60 * 1000;
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Widen the authz grant",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: {
+          source: "github_pull_request_webhook",
+          sourceEventOrder: 10,
+          sourceEventTimestamp: new Date(threeDaysAgoMs).toISOString(),
+          sourceEventTimestampMs: threeDaysAgoMs,
+        },
+        sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+        createdByRunId: null,
+        // Receipt time is "now" -- the delayed delivery.
+        createdAt: now,
+        updatedAt: now,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      const prLine = description.split("\n").find((line) => line.includes("Linked pull request:")) ?? "";
+      expect(prLine).not.toBe("");
+      // Aged from the GitHub event time (3d), not the "now" receipt time.
+      // Asserted on the PR line specifically: the manager's verdict criteria
+      // quote the phrase "non-stale" too, so a whole-description match would
+      // pass regardless of what this line says.
+      expect(prLine).toContain("2026-04-27T12:00:00.000Z");
+      expect(prLine).toContain(", stale,");
+      expect(prLine).not.toContain("non-stale");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores actor-authored GitHub PR rows without webhook provenance", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const runs = await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Actor-authored PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: { source: "manual" },
+        createdByRunId: runs[0]?.id ?? null,
+        createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores rows that spoof webhook metadata without server provenance", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#806",
+        title: "Spoofed webhook PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/806",
+        status: "ready_for_review",
+        metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 },
+        sourceTrust: null,
+        createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        updatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("ignores webhook PR rows that do not carry an inspectable URL", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        url: null,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("marks a PR that has not moved in over 24h as stale", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedIssueWithPullRequest({
+        prUpdatedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request:");
+      expect(description).toContain("stale");
+      // A stale PR must NOT be advertised as satisfying the verdict criterion.
+      expect(description).not.toContain("The second signal is already present");
+    });
+
+    it("still reports none recorded when the issue genuinely has no PR", async () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+      expect(description).toContain("Linked pull request: none recorded");
+    });
+  });
+
   // BLO-21769: a run that crashlooped, hit an upstream 503 storm, was killed
   // by provider capacity limits, or exhausted its retry budget never got a
   // model turn. It must not be counted as "the agent ran and stayed silent" —
@@ -470,6 +838,112 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` never
+  // had an adapter container created for it (BLO-23096: `preferred_workspace_
+  // unrealizable` / `adapter_failed` setup failures — the same shape as this
+  // fixture's runs, but with `livenessState: null` because classification
+  // never ran, which is exactly the case `isNeverExecutedRun`'s
+  // `livenessState !== "failed"` check cannot catch). There was nothing
+  // capable of writing a comment, so it must not count toward
+  // `no_comment_streak`.
+  it("excludes never-invoked runs (issueCommentStatus: not_applicable) from the no-comment streak, even when the never-executed liveness heuristic misses them (BLO-26165)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Mirrors the BLO-23096 fixture: 25 consecutive terminal runs whose
+    // adapter never started. `livenessState: null` means `isNeverExecutedRun`
+    // alone would NOT exclude these (it requires `livenessState === "failed"`)
+    // — only the new `issueCommentStatus` predicate does. Anchored 2h before
+    // `now` (outside the 1h/6h high_churn windows) so that once no_comment_streak
+    // and runtime_failure_streak are both correctly suppressed, the fixture
+    // doesn't accidentally trip `high_churn` instead — this test is only about
+    // proving no review fires at all.
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 25,
+      now: insertNow,
+      status: "failed",
+      livenessState: null,
+      usageJson: null,
+      logBytes: null,
+      issueCommentStatus: "not_applicable",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(0);
+  });
+
+  it("still fires no_comment_streak on a streak of executed, comment-required-but-missed runs (BLO-26165 control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      issueCommentStatus: "retry_exhausted",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 0",
+    );
+  });
+
+  it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Most recent 5 runs never invoked (adapter never started, not_applicable).
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now,
+      status: "failed",
+      livenessState: null,
+      usageJson: null,
+      logBytes: null,
+      issueCommentStatus: "not_applicable",
+    });
+    // Older 10 runs genuinely executed and stayed silent.
+    const olderNow = new Date(now.getTime() - 6 * 60_000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: olderNow,
+      issueCommentStatus: "retry_exhausted",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 5",
+    );
   });
 
   // BLO-22097: a post-model failure whose result event never arrives leaves
@@ -763,6 +1237,243 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(cappedRefresh.updated).toBe(0);
     expect(cappedRefresh.existing).toBe(1);
     expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+  });
+
+  describe("BLO-22105: refresh regenerates the description on a trigger flip", () => {
+    it("regenerates the Manager Decision block when a no_comment_streak review flips to runtime_failure_streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("Request decomposition");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.id).toBe(review!.id);
+      expect(refreshedReview?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(refreshedReview?.description).toContain("do not decompose, block, or cancel");
+      expect(refreshedReview?.description).not.toContain("Request decomposition");
+    });
+
+    it("regenerates the Manager Decision block when a runtime_failure_streak review flips to no_comment_streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(review?.description).toContain("do not decompose, block, or cancel");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.id).toBe(review!.id);
+      expect(refreshedReview?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(refreshedReview?.description).toContain("Request decomposition");
+      expect(refreshedReview?.description).not.toContain("do not decompose, block, or cancel");
+    });
+
+    it("does not rewrite the description when the refresh observes the same trigger", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      const originalDescription = review!.description;
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+      });
+
+      const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+      expect(refresh.updated).toBe(1);
+
+      const [refreshedReview] = await listProductivityReviews(seeded.companyId);
+      expect(refreshedReview?.description).toBe(originalDescription);
+    });
+
+    it("still regenerates a stale description after the refresh-comment cap is reached, without posting another comment", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+
+      // Exhaust the DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS cap (3)
+      // with unchanged-trigger refreshes, exactly like the existing
+      // "caps refresh comments" coverage above.
+      let cursor = now;
+      for (let i = 0; i < DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS; i += 1) {
+        cursor = new Date(cursor.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now: cursor,
+        });
+        await service.reconcileProductivityReviews({ now: cursor, companyId: seeded.companyId });
+      }
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+
+      // The cap is now hit. A further refresh that only repeats the same
+      // trigger should stay throttled...
+      const stillNoOpAt = new Date(cursor.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      const noOpRefresh = await service.reconcileProductivityReviews({
+        now: stillNoOpAt,
+        companyId: seeded.companyId,
+      });
+      expect(noOpRefresh.updated).toBe(0);
+      expect(noOpRefresh.existing).toBe(1);
+
+      // ...but a trigger flip must still correct the Manager Decision block —
+      // the comment cap bounds comment churn, not correctness of the guidance.
+      const flipAt = new Date(stillNoOpAt.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: flipAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+      const flipRefresh = await service.reconcileProductivityReviews({ now: flipAt, companyId: seeded.companyId });
+      expect(flipRefresh.updated).toBe(1);
+
+      const [afterFlip] = await listProductivityReviews(seeded.companyId);
+      expect(afterFlip?.description).toContain("Primary trigger: `runtime_failure_streak`");
+      expect(afterFlip?.description).toContain("do not decompose, block, or cancel");
+      // No new comment: the cap still bounds comment churn.
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+    });
+
+    it("preserves a description edited concurrently with a trigger-flip refresh instead of clobbering it", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+
+      const refreshAt = new Date(now.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: refreshAt,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      });
+
+      const concurrentlyEditedDescription = `${review!.description}\n\nManager note: escalating directly, do not overwrite.`;
+
+      // Simulate a human editing the review issue's description directly
+      // (e.g. via the issues API) in the window between this refresh's outer
+      // read of `existing` and the transaction's guarded UPDATE. The
+      // advisory lock only serializes this refresh path against itself; it
+      // says nothing about a plain issue edit landing concurrently.
+      const originalTransaction = db.transaction.bind(db);
+      const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(
+        (async (...args: Parameters<typeof db.transaction>) => {
+          await db
+            .update(issues)
+            .set({ description: concurrentlyEditedDescription })
+            .where(eq(issues.id, review!.id));
+          return originalTransaction(...args);
+        }) as typeof db.transaction,
+      );
+
+      try {
+        const refresh = await service.reconcileProductivityReviews({ now: refreshAt, companyId: seeded.companyId });
+        // The refresh comment still gets appended — only the description
+        // overwrite lost the race.
+        expect(refresh.updated).toBe(1);
+      } finally {
+        transactionSpy.mockRestore();
+      }
+
+      const [afterRefresh] = await listProductivityReviews(seeded.companyId);
+      expect(afterRefresh?.description).toBe(concurrentlyEditedDescription);
+      expect(afterRefresh?.description).not.toContain("Primary trigger: `runtime_failure_streak`");
+    });
   });
 
   it("allows only one productivity review per source issue in 24 hours", async () => {
@@ -1921,12 +2632,350 @@ describeEmbeddedPostgres("productivity review service", () => {
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
+      thresholds: { longActiveMs: 60_000 },
     });
 
     expect(result.created).toBe(1);
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-19604 live reproduction (BLO-19570 against BLO-18285): the issue entered
+  // in_progress 7h ago (past the 6h threshold), but the assignee has been actively
+  // dispatching and completing runs the whole time — only the run enqueued right
+  // alongside the original checkout is still stuck `queued`, never dispatched. Prior
+  // to the fix, elapsed time was computed purely from the issue's own `startedAt`, so
+  // the queued run's age was irrelevant but the raw checkout age alone still tripped
+  // `long_active_duration` even though real work was landing minutes before this
+  // evaluation. The episode anchor must track the most recent *dispatched* run instead.
+  it("does not raise long_active_duration when only a queued, never-dispatched run is stale but recent runs were actually dispatched", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const sevenHoursAgo = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: sevenHoursAgo,
+    });
+
+    // The run enqueued alongside the original checkout: still `queued`, never claimed,
+    // `startedAt` null. Its age (7h) must not leak into the elapsed-time figure.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: sevenHoursAgo,
+      status: "queued",
+      startedAt: null,
+      nextAction: null,
+    });
+
+    // Real, dispatched work landing well inside the 6h window.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now: fourHoursAgo,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22016 live reproduction (BLO-18846 / run `9e49405e`): the issue was checked out
+  // ~12h ago and its current execution holder (`executionRunId`) is still `queued` — it
+  // never reached `startedAt` at all, so no work has executed in this episode. Before the
+  // fix, `activeStartedAt` fell back to the checkout timestamp whenever there was no
+  // in-episode dispatch, so this reported ~12h of "active" time despite zero tokens ever
+  // executing. That is a dispatch-lag problem (surfaced via `queuedUndispatchedRunCount`
+  // in evidence, tracked separately under BLO-21116 et al.), not a long-active-episode
+  // problem. Uses `pinExecutionRun` (not `insertRuns`) so `sourceIssue.executionRunId`
+  // is populated, matching the real checkout invariant — a checked-out issue always has
+  // an execution holder, whether or not that holder has started.
+  it("does not raise long_active_duration when the current execution holder is still queued and has never started (BLO-22016 / BLO-18846)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: twelveHoursAgo,
+    });
+
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "queued",
+      lockedAt: twelveHoursAgo,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Contrast case: no run row exists at all since checkout — nothing was even attempted,
+  // as distinct from "a run was queued but never started" above. This is the existing,
+  // deliberately-tested "unattended episode" scenario (see the monitor-gating tests
+  // below, e.g. "reports the whole episode as unattended when no monitor was ever
+  // armed") and must keep firing on raw wall-clock time; the BLO-22016 fix must not
+  // desensitize this case just because it also involves zero dispatched runs.
+  it("still raises long_active_duration when a checked-out issue has no run at all, unlike a queued-never-started run", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: twelveHoursAgo,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // Control: once the previously-queued run actually starts executing and stays live past
+  // the threshold, the trigger must still fire — the fix must not desensitize the detector
+  // for genuine stalls, only for queue residency that was never real work.
+  it("still creates a long_active_duration review once the run actually starts and runs past the threshold", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const dispatchedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: checkoutAt,
+    });
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: dispatchedAt,
+      status: "running",
+      startedAt: dispatchedAt,
+      nextAction: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // Ally review on PR #1036: `mostRecentDispatchAt` must be a true `max(startedAt)`, not
+  // "the `startedAt` of whichever sampled run happens to have the greatest `createdAt`".
+  // Here an older-created run is dispatched *more* recently than a newer-created run that
+  // was dispatched almost immediately — creation order and dispatch order diverge. Scanning
+  // `createdAt`-ordered runs for the first non-null `startedAt` would hit the newer-created,
+  // earlier-dispatched run first and anchor the episode to a stale timestamp, crossing the
+  // 6h threshold and firing a false `long_active_duration`.
+  it("anchors elapsed time to the true max(startedAt) when creation order and dispatch order diverge", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 8 * 60 * 60 * 1000),
+    });
+
+    // Created earlier, but dispatched last — the true most recent dispatch.
+    const olderCreatedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const olderRunId = randomUUID();
+    // Created later than the run above, but dispatched shortly after creation — the run a
+    // createdAt-ordered `.find()` would hit first.
+    const newerCreatedAt = new Date(now.getTime() - 6 * 60 * 60 * 1000 - 50 * 60_000);
+    const newerRunId = randomUUID();
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: olderRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(now.getTime() - 30 * 60_000),
+        finishedAt: new Date(now.getTime() - 20 * 60_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: olderCreatedAt,
+        updatedAt: olderCreatedAt,
+      },
+      {
+        id: newerRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000 - 5 * 60_000),
+        finishedAt: new Date(now.getTime() - 6 * 60 * 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: newerCreatedAt,
+        updatedAt: newerCreatedAt,
+      },
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-19604 AC2: `run.nextAction` is only populated by that run's own liveness
+  // classification, which can miss a `Next` line the assignee posted in a plain issue
+  // comment. Reporting "none recorded" in that case reads as "no next step exists" when
+  // one plainly does — the report must recover it from the assignee's own comments.
+  it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      nextAction: null,
+    });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: runs[0]?.id,
+      body: "Made progress on the import job.\n\nNext: verify the retry backoff against the new queue depth metric.",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).not.toContain("Current next action: none recorded");
+    expect(review?.description).toContain(
+      "Current next action: verify the retry backoff against the new queue depth metric.",
+    );
+  });
+
+  // Ally review on PR #1036: the `commentNextAction` fallback (added above) must find a
+  // `Next:` line even when the comment has no `createdByRunId` at all — a genuinely plain
+  // issue comment, not one merely detached from the run it was posted alongside. The
+  // `latestComments` query used for report rendering inner-joins `heartbeatRuns` on that
+  // column and would silently exclude this comment, which is exactly the case the fallback
+  // exists to recover.
+  it("recovers a Next line from an assignee comment with no createdByRunId link", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      nextAction: null,
+    });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: null,
+      body: "Made progress on the import job.\n\nNext: verify the retry backoff against the new queue depth metric.",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    // A comment with no `createdByRunId` cannot break the no-comment streak (it is not a
+    // "run-created issue comment"), so this fires `no_comment_streak` rather than
+    // `high_churn` — that trigger choice is unrelated to what this test is verifying.
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).not.toContain("Current next action: none recorded");
+    expect(review?.description).toContain(
+      "Current next action: verify the retry backoff against the new queue depth metric.",
+    );
+  });
+
+  it("recovers a Next line even after newer non-matching assignee comments", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      nextAction: null,
+    });
+    const matchingCommentAt = new Date(now.getTime() - 20 * 60_000);
+    await db.insert(issueComments).values([
+      {
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: null,
+        body: "Made progress on the import job.\n\nNext: verify the retry backoff against the new queue depth metric.",
+        createdAt: matchingCommentAt,
+        updatedAt: matchingCommentAt,
+      },
+      ...Array.from({ length: 6 }, (_, index) => {
+        const createdAt = new Date(now.getTime() - (6 - index) * 60_000);
+        return {
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          authorAgentId: seeded.coderId,
+          createdByRunId: null,
+          body: `Status update ${index + 1}: still validating the import job.`,
+          createdAt,
+          updatedAt: createdAt,
+        };
+      }),
+    ]);
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).not.toContain("Current next action: none recorded");
+    expect(review?.description).toContain(
+      "Current next action: verify the retry backoff against the new queue depth metric.",
+    );
   });
 
   // BLO-21003: the monitor came due seconds ago, but `monitorNextCheckAt` lapsing
@@ -2061,6 +3110,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 6 * 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2111,6 +3161,128 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-25877: `currentPendingMonitorForReviewSuppression` issues its own, fresher
+  // `getCurrentIssue` read than the one evidence assembly saw. A monitor that fires
+  // in that gap clears `monitorNextCheckAt` to null — `buildIssueMonitorTriggeredPatch`
+  // clears it atomically with setting `monitorLastTriggeredAt` — so the suppression
+  // check used to see "nothing pending" on its very first guard, even though the fire
+  // itself is the strongest possible evidence the issue is attended (it enqueues a
+  // successor run by construction). This is the exact BLO-25527 replay: fails on
+  // pre-fix code because `deliberatePendingMonitor` returned null purely because
+  // `monitorNextCheckAt` was null, never looking at how recently it got that way.
+  it("suppresses long-active reviews for a monitor that fired within grace and cleared monitorNextCheckAt", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorLastTriggeredAt = new Date(now.getTime() - 2_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - (41 * 60 * 60 * 1000)), // 1d 17h episode
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.details).toMatchObject({
+      suppressedBy: "monitor_scheduled",
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt: monitorLastTriggeredAt.toISOString(),
+    });
+  });
+
+  // BLO-25877 AC: the just-fired suppression above must stay bounded, mirroring
+  // BLO-22331 AC2 — a monitor that fired long ago and was never re-armed since is
+  // exactly the unattended-stall signal this trigger exists to catch, not something
+  // an old firing should shield forever.
+  it("still fires long-active review for a monitor that fired long ago and was never re-armed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 41 * 60 * 60 * 1000),
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt: new Date(now.getTime() - 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-25877 defect 2: `longActive` used to compare raw `elapsedMs` against the
+  // threshold, ignoring the monitor-gated split computed for the report text. A
+  // monitor that lapsed early in a long episode and was never serviced again must
+  // still subtract the measured (non-upper-bound) gated span, leaving the genuine
+  // unattended remainder to trip the threshold.
+  it("subtracts only the measured monitor-gated span from the long-active predicate", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("5m monitor-gated, 19h 55m unattended");
+    expect(review?.description).toContain("monitor lapsed at");
+    expect(review?.description).toContain("never re-armed");
+  });
+
+  // BLO-25877 defect 2 regression guard: the still-armed branch reports
+  // `unattendedMs: 0` as a deliberate, documented upper bound (no arm-time column
+  // exists), not a measured value. Wiring it into the predicate wholesale would make
+  // `long_active_duration` structurally unfireable for any issue with a monitor armed
+  // however briefly — asserting only `created: 0` here would not catch that
+  // regression, since a wrongly-zeroed predicate also produces `created: 0`, just via
+  // "never triggered" instead of "triggered, then suppressed". Assert
+  // `monitorScheduledSuppressed: 1` to distinguish the two.
+  it("keeps the still-armed branch on the pending-monitor gate instead of feeding unattendedMs:0 into the predicate", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 15 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() + 60_000),
+      monitorScheduledBy: "assignee",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("does not renew backlog grace forever behind a non-draining predecessor", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
@@ -2142,6 +3314,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2206,6 +3379,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2469,7 +3643,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     }).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      // BLO-25877: 10m unattended residue must clear `longActiveMs` for
+      // `collectEvidence` to reach the monitor-suppression hooks under test here.
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(result.created).toBe(0);
@@ -2510,7 +3686,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     }).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(result.created).toBe(0);
@@ -2555,7 +3731,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     }).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(result.failed).toBe(0);
@@ -2605,6 +3781,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2653,6 +3830,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2699,6 +3877,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         monitorLapseServiceGraceMs: 60_000,
         monitorSchedulerIntervalMs: 60_000,
         monitorDispatchBatchSize: 50,
+        longActiveMs: 60_000,
       },
     });
 
@@ -2979,7 +4158,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const replayed = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(replayed.created).toBe(1);
     expect(replayed.failed).toBe(0);
@@ -2993,7 +4172,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const second = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(second.created).toBe(0);
     expect(second.existing).toBe(1);
@@ -3047,7 +4226,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const first = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(first.created).toBe(1);
     expect(wakeups).toHaveLength(1);
@@ -3057,7 +4236,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const second = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(second.created).toBe(1);
     expect(wakeups).toHaveLength(2);
@@ -3098,14 +4277,14 @@ describeEmbeddedPostgres("productivity review service", () => {
     const first = service.reconcileProductivityReviews({
       now: scanStartedAt,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     await firstWakeStarted.promise;
 
     const second = await service.reconcileProductivityReviews({
       now: scanStartedAt,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
 
     expect(second.created).toBe(0);
@@ -3173,7 +4352,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const replayed = await service.reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
-      thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
     });
     expect(replayed.created).toBe(1);
     expect(wakeups).toHaveLength(0);
@@ -3216,7 +4395,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         service.reconcileProductivityReviews({
           now,
           companyId: seeded.companyId,
-          thresholds: { monitorLapseServiceGraceMs: 60_000 },
+          thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
         }),
         1_000,
         "productivity review wake enqueue row-lock replay",
@@ -3495,12 +4674,18 @@ describeEmbeddedPostgres("productivity review service", () => {
   // unsupervised and must still fire exactly as it does today. Without this
   // case, a fix that simply disabled the trigger (e.g. always suppressing)
   // would pass the positive test above too.
+  // BLO-25877: past the service grace window is necessary but not sufficient once
+  // `longActive` subtracts the measured monitor-gated span — the monitor here lapses
+  // near the *start* of the episode (not 10 minutes before `now`, as this test used
+  // to set up) so the genuinely-unattended remainder still clears the default 6h
+  // threshold on its own, the same way an 8h-old, never-re-armed lapse would.
   it("still creates a long-active review when the monitor lapsed well past the service grace window", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
-      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
-      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      startedAt,
+      monitorNextCheckAt: new Date(startedAt.getTime() + 5 * 60 * 1000),
       monitorScheduledBy: "assignee",
     });
 
@@ -3515,37 +4700,42 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
-  // BLO-21003 AC3: even outside the suppression window (monitor already
-  // triggered, `monitorNextCheckAt` cleared), a sub-minute nonzero unattended
-  // residue must not floor to `0m` — that reads as "measured and zero" rather
-  // than "sub-minute and real". Replays the BLO-19772 shape (14h10m elapsed,
-  // wake serviced ~29s after the monitor came due) but reports the residue
-  // directly as seconds instead of flooring it away.
+  // BLO-21003 AC3 / BLO-25877: even outside the suppression window (monitor already
+  // lapsed, well past grace), a sub-minute nonzero unattended residue must not floor
+  // to `0m` — that reads as "measured and zero" rather than "sub-minute and real".
+  // Replays the BLO-19772 shape (14h10m elapsed, wake serviced ~45s after the monitor
+  // came due) but reports the residue directly as seconds instead of flooring it
+  // away. Uses a non-null, never-triggered `monitorNextCheckAt` (not
+  // `monitorLastTriggeredAt`) so this exercises the "lapsed, unserviced" gating branch
+  // rather than BLO-25877's just-fired suppression branch, and shrinks both grace and
+  // the long-active threshold so a 45s residue is both past grace and past threshold
+  // without inflating the episode.
   it("reports a sub-minute unattended residue in seconds instead of flooring it to 0m", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const startedAt = new Date(now.getTime() - (14 * 60 + 10) * 60 * 1000);
-    const monitorLastTriggeredAt = new Date(now.getTime() - 45_000);
+    const monitorNextCheckAt = new Date(now.getTime() - 45_000);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt,
-      monitorNextCheckAt: null,
+      monitorNextCheckAt,
       monitorScheduledBy: "assignee",
-      monitorLastTriggeredAt,
     });
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
       now,
       companyId: seeded.companyId,
+      thresholds: { monitorLapseServiceGraceMs: 10_000, longActiveMs: 30_000 },
     });
 
     expect(result.created).toBe(1);
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain(
-      `- Elapsed accounting: 14h 9m monitor-gated, 45s unattended (monitor lapsed at ${monitorLastTriggeredAt.toISOString()}, never re-armed)`,
+      `- Elapsed accounting: 14h 9m monitor-gated, 45s unattended (monitor lapsed at ${monitorNextCheckAt.toISOString()}, never re-armed)`,
     );
     expect(review?.description).not.toContain("0m unattended");
   });
+
 
   it("reports the whole episode as unattended when no monitor was ever armed", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -3573,6 +4763,12 @@ describeEmbeddedPostgres("productivity review service", () => {
   // first 1h23m of the 15h53m episode was monitor-gated. The review therefore
   // still fires (correctly: 14h30m genuinely unattended), and the evidence block
   // must make that split legible to the adjudicating manager.
+  //
+  // BLO-25877: a null `monitorNextCheckAt` with `monitorLastTriggeredAt` set means
+  // the monitor's last transition was a fire, not an abandoned schedule — the text
+  // now says so ("fired on schedule ... and enqueued a successor run") rather than
+  // "lapsed, never re-armed", which BLO-25877 reserves for a monitor that is
+  // actually stuck. No successor run is named here because none was seeded.
   it("splits monitor-gated from unattended elapsed time when the monitor lapsed (BLO-19067 replay)", async () => {
     const startedAt = new Date("2026-07-30T21:13:34.758Z");
     const monitorLastTriggeredAt = new Date("2026-07-30T22:36:42.405Z");
@@ -3595,7 +4791,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Current active elapsed time: 15h 53m");
     expect(review?.description).toContain(
-      `- Elapsed accounting: 1h 23m monitor-gated, 14h 30m unattended (monitor lapsed at ${monitorLastTriggeredAt.toISOString()}, never re-armed)`,
+      `- Elapsed accounting: 1h 23m monitor-gated, 14h 30m unattended (monitor fired on schedule at ${monitorLastTriggeredAt.toISOString()} and enqueued a successor run; nothing has re-armed it since)`,
     );
   });
 

@@ -200,6 +200,73 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
 }
 
 /**
+ * RPC failure codes that mean "the worker never got a fair chance to answer
+ * initialize" rather than "the plugin is broken":
+ *
+ *   TIMEOUT            — the 60s initialize budget was blown, which at pod
+ *                        start is boot contention (BLO-20410).
+ *   WORKER_UNAVAILABLE — the process died before initialize resolved, so the
+ *                        in-flight call was rejected by handleProcessExit().
+ *
+ * Anything else — including an `initialize` handler that throws — is the
+ * plugin reporting a real fault and must fail closed on the first attempt.
+ */
+const TRANSIENT_STARTUP_RPC_CODES: readonly number[] = [
+  PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+  PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+];
+
+function startupFailureCode(err: unknown): number | null {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "number" ? code : null;
+}
+
+const HOST_STARTUP_RPC_FAILURE = Symbol("paperclip.hostStartupRpcFailure");
+
+type HostStartupRpcFailure = JsonRpcCallError & {
+  readonly [HOST_STARTUP_RPC_FAILURE]?: true;
+};
+
+function markHostStartupRpcFailure(error: JsonRpcCallError): JsonRpcCallError {
+  Object.defineProperty(error, HOST_STARTUP_RPC_FAILURE, { value: true });
+  return error;
+}
+
+function isHostStartupRpcFailure(err: unknown): err is HostStartupRpcFailure {
+  return (
+    err instanceof JsonRpcCallError &&
+    (err as HostStartupRpcFailure)[HOST_STARTUP_RPC_FAILURE] === true
+  );
+}
+
+/**
+ * Thrown by `startWorker()` when a worker cannot be brought up.
+ *
+ * `transient` is the activation-retry contract (BLO-20410, narrowed in
+ * BLO-22095). It is carried as a typed field rather than inferred from the
+ * message because the wrapper prefix `Worker initialize failed for "<id>"` is
+ * applied to *every* initialize failure — a substring match on it cannot tell a
+ * blown budget apart from a plugin that threw, so the classifier retried real
+ * plugin faults three times while its own doc comment claimed it did not.
+ */
+export class WorkerStartupError extends Error {
+  override readonly name = "WorkerStartupError";
+  /** True only for host-owned contention-shaped startup failures. */
+  readonly transient: boolean;
+  /** The underlying JSON-RPC error code, when the cause carried one. */
+  readonly causeCode: number | null;
+
+  constructor(
+    message: string,
+    options: { transient: boolean; causeCode?: number | null },
+  ) {
+    super(message);
+    this.transient = options.transient;
+    this.causeCode = options.causeCode ?? null;
+  }
+}
+
+/**
  * Host env vars that steer the `@anthropic-ai/sdk` client. The platform points
  * these at ccrotate-serve so all Anthropic traffic flows through the pooled
  * OAuth proxy instead of api.anthropic.com.
@@ -284,6 +351,8 @@ interface PendingRequest {
   method: string;
   /** Resolve the promise with the response. */
   resolve: (response: JsonRpcResponse) => void;
+  /** Reject the promise with a host-owned failure. */
+  reject: (error: Error) => void;
   /** Timeout timer handle. */
   timer: ReturnType<typeof setTimeout>;
   /** Timestamp when the request was sent. */
@@ -641,6 +710,16 @@ export function createPluginWorkerHandle(
       return companyId ? { companyId } : null;
     }
 
+    // The scheduler dispatches a scheduled job once per company configured
+    // for the plugin (BLO-20957) and stamps that company onto `job.companyId`
+    // for the dispatch. Honor it the same way the other per-method scopes
+    // above are honored, so the job's own company-scoped host calls made
+    // during this invocation succeed instead of being denied.
+    if (method === "runJob" && isRecord(params.job)) {
+      const companyId = readNonEmptyString(params.job.companyId);
+      return companyId ? { companyId } : null;
+    }
+
     return null;
   }
 
@@ -651,10 +730,12 @@ export function createPluginWorkerHandle(
     const derived = deriveInvocationScope(method, params);
     if (derived) return derived;
 
-    // Plugin job declarations predate company-scoped plugin config and remain
-    // instance-level. A worker with exactly one configured company can safely
-    // run those legacy jobs in that sole scope; ambiguous workers stay
-    // instance-scoped and the normal host guards reject company access.
+    // Fallback for runJob callers that don't stamp an explicit per-dispatch
+    // company scope (e.g. a manual "run now" trigger — BLO-20957 only
+    // updated the scheduled-tick dispatch path). A worker with exactly one
+    // configured company can safely run those legacy jobs in that sole
+    // scope; ambiguous workers stay instance-scoped and the normal host
+    // guards reject company access rather than guessing a tenant.
     if (method === "runJob" && options.bootstrapCompanyId) {
       return { companyId: options.bootstrapCompanyId };
     }
@@ -939,12 +1020,18 @@ export function createPluginWorkerHandle(
     childProcess = null;
     startedAt = null;
 
-    // Reject all pending requests
+    // Reject all pending requests. Tag this host-owned process-exit failure so
+    // initialize can be retried without trusting worker-returned error codes.
     rejectAllPending(
-      new Error(formatWorkerFailureMessage(
-        `Worker process exited (code=${code}, signal=${signal})`,
-        stderrExcerpt,
-      )),
+      markHostStartupRpcFailure(
+        new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
+          message: formatWorkerFailureMessage(
+            `Worker process exited (code=${code}, signal=${signal})`,
+            stderrExcerpt,
+          ),
+        }),
+      ),
     );
 
     // Emit synthetic close for any orphaned stream channels so SSE clients
@@ -1002,15 +1089,8 @@ export function createPluginWorkerHandle(
   }
 
   function rejectAllPending(error: Error): void {
-    for (const [id, pending] of pendingRequests) {
-      clearTimeout(pending.timer);
-      pending.resolve(
-        createErrorResponse(
-          pending.id,
-          PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE,
-          error.message,
-        ) as JsonRpcResponse,
-      );
+    for (const pending of Array.from(pendingRequests.values())) {
+      pending.reject(error);
     }
     pendingRequests.clear();
     for (const invocation of activeInvocations.values()) {
@@ -1104,12 +1184,24 @@ export function createPluginWorkerHandle(
       }
       supportedMethods = result.supportedMethods ?? [];
     } catch (err) {
-      // Initialize failed — kill the process and propagate
+      // Initialize failed — kill the process and propagate. The classification
+      // rides along as a typed field: every failure here gets the same message
+      // prefix, so the retry loop cannot recover it from the string.
       const msg = err instanceof Error ? err.message : String(err);
-      log.error({ err: msg }, "worker initialize failed");
+      const causeCode = startupFailureCode(err);
+      const transient =
+        isHostStartupRpcFailure(err) &&
+        TRANSIENT_STARTUP_RPC_CODES.includes(err.code);
+      log.error({ err: msg, causeCode }, "worker initialize failed");
       await killProcess();
       setStatus("crashed");
-      throw new Error(`Worker initialize failed for "${pluginId}": ${msg}`);
+      throw new WorkerStartupError(
+        `Worker initialize failed for "${pluginId}": ${msg}`,
+        {
+          transient,
+          causeCode,
+        },
+      );
     }
 
     // Reset crash counter on successful start
@@ -1234,8 +1326,16 @@ export function createPluginWorkerHandle(
   }
 
   async function killProcess(): Promise<void> {
-    if (!childProcess) return;
+    // Order matters (BLO-22095). A worker that crashed before `initialize`
+    // resolved has already run handleProcessExit(), which nulled childProcess
+    // AND scheduled a restart on a 750–1250ms backoff. That is strictly inside
+    // the activation retry loop's 2000ms sleep, so returning early here left
+    // the timer armed and the worker restarted itself — one unbudgeted start
+    // racing the retry the loop was about to make. Mark the stop intentional
+    // and cancel the pending restart before the childProcess guard.
     intentionalStop = true;
+    cancelPendingRestart();
+    if (!childProcess) return;
     try {
       childProcess.kill("SIGKILL");
     } catch {
@@ -1297,12 +1397,15 @@ export function createPluginWorkerHandle(
       };
 
       const timer = setTimeout(() => {
+        const timeoutError = new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+          message: `RPC call "${method}" timed out after ${timeout}ms`,
+        });
         settle(
           reject,
-          new JsonRpcCallError({
-            code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
-            message: `RPC call "${method}" timed out after ${timeout}ms`,
-          }),
+          method === "initialize"
+            ? markHostStartupRpcFailure(timeoutError)
+            : timeoutError,
         );
       }, timeout);
 
@@ -1318,6 +1421,7 @@ export function createPluginWorkerHandle(
             settle(reject, new Error(`Unexpected response format for "${method}"`));
           }
         },
+        reject: (error: Error) => settle(reject, error),
         timer,
         sentAt: Date.now(),
         invocationId: invocation?.id,

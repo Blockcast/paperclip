@@ -17,6 +17,15 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: read
+    env:
+      # BLO-25515: a GITHUB_TOKEN-authored push/PR gets its own workflow runs
+      # quarantined behind action_required (or, per BLO-24150's later
+      # occurrence, never queued at all) once the merge queue is the only
+      # merge path — see the commitperclip App token generated below. Blockcast
+      # provisions this key; if a fork doesn't, the steps that need it degrade
+      # to github.token instead of failing the job.
+      COMMITPERCLIP_ENABLED: ${{ secrets.COMMITPERCLIP_KEY != '' }}
 
     steps:
       - name: Checkout repository
@@ -60,6 +69,17 @@ jobs:
           path: ${{ steps.pnpm-cache.outputs.path }}
           key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
 
+      - name: Generate commitperclip token
+        id: bot-token
+        if: env.COMMITPERCLIP_ENABLED == 'true'
+        run: |
+          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          echo "::add-mask::$TOKEN"
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          COMMITPERCLIP_APP_ID: ${{ vars.COMMITPERCLIP_APP_ID }}
+
       - name: Fail on unexpected file changes
         run: |
           changed="$(git status --porcelain)"
@@ -76,7 +96,11 @@ jobs:
       - name: Create or update pull request
         id: upsert-pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          # BLO-25515: push and PR creation must use the App token (falls back
+          # to github.token only when COMMITPERCLIP_KEY isn't provisioned) so
+          # the PR's checks are not attributed to GITHUB_TOKEN — that
+          # attribution is what quarantines this bot's own workflow runs.
+          GH_TOKEN: ${{ steps.bot-token.outputs.value || github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           if git diff --quiet -- pnpm-lock.yaml; then
@@ -92,7 +116,11 @@ jobs:
           git checkout -B "$BRANCH"
           git add pnpm-lock.yaml
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml"
-          git push --force origin "$BRANCH"
+          # Push through an explicit x-access-token URL rather than the
+          # `origin` remote actions/checkout wired up: that remote's stored
+          # credential is always github.token, which would silently undo the
+          # point of GH_TOKEN above.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
 
           # Only reuse an open PR from this repository owner, not a fork with the same branch name.
           pr_url="$(
@@ -114,10 +142,52 @@ jobs:
       - name: Merge lockfile PR
         if: steps.upsert-pr.outputs.pr_url != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.value || github.token }}
         run: |
           # The merge queue owns the eventual merge and rejects --delete-branch
           # because it is asynchronous. Keep the refresh branch: the next run
           # deliberately force-updates it before reusing its PR.
           gh pr merge --squash "${{ steps.upsert-pr.outputs.pr_url }}" \
             || gh pr merge --auto --squash "${{ steps.upsert-pr.outputs.pr_url }}"
+
+      # BLO-24150: the direct squash above sometimes falls through to --auto,
+      # which then waits on this PR's own required checks. If those checks'
+      # *workflow runs* are sitting in `action_required` (observed 2026-07-21
+      # and 2026-08-10, ~2.5h before a human happened to notice and click
+      # "Approve and run"), --auto silently waits forever with no signal
+      # anywhere that a human is needed — during which every frozen install
+      # on master (PRs and merge-queue entries alike) keeps failing. Make
+      # that stall loud instead of silent.
+      - name: Alert if the merge stalled on an unapproved workflow run
+        if: steps.upsert-pr.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr_url="${{ steps.upsert-pr.outputs.pr_url }}"
+          state="$(gh pr view "$pr_url" --json state --jq .state)"
+          if [ "$state" = "MERGED" ]; then
+            echo "Lockfile PR merged cleanly, nothing to alert on."
+            exit 0
+          fi
+
+          head_sha="$(gh pr view "$pr_url" --json headRefOid --jq .headRefOid)"
+          runs_json="$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$head_sha&per_page=50")"
+          action_required_count="$(printf '%s' "$runs_json" | jq '[.workflow_runs[] | select(.status == "action_required")] | length')"
+          total_run_count="$(printf '%s' "$runs_json" | jq '.workflow_runs | length')"
+
+          # BLO-25515: the App-token push should keep this PR out of
+          # action_required. Keep both checks anyway: a GITHUB_TOKEN fallback
+          # (COMMITPERCLIP_KEY absent) hits the original action_required
+          # shape, while BLO-24150's later occurrences (#1237, #1240) show a
+          # PR that reaches BLOCKED/mergeable-pending state with *zero*
+          # recorded workflow runs at all — a stall the action_required-only
+          # check would miss entirely.
+          if [ "${action_required_count:-0}" -gt 0 ]; then
+            gh pr comment "$pr_url" --body "🚨 **Self-heal stalled on a human approval gate (BLO-24150).** \`$action_required_count\` workflow run(s) on this commit are sitting in \`action_required\` — CI cannot start until someone clicks *Approve and run* on this PR's checks (Actions tab → this PR → pending runs). Until then \`--auto\` merge will wait indefinitely while every \`pnpm install --frozen-lockfile\` job on \`master\`, every PR, and every merge-queue entry keeps failing with \`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH\`-style install errors. See https://paperclip.blockcast.net/BLO/issues/BLO-24150 for the known mechanism and prior occurrences (2026-07-21, 2026-08-10)."
+            echo "Posted stall alert: $action_required_count run(s) awaiting approval."
+          elif [ "${total_run_count:-0}" -eq 0 ]; then
+            gh pr comment "$pr_url" --body "🚨 **Self-heal stalled with zero workflow runs recorded (BLO-24150/BLO-25515).** This commit has no workflow runs at all yet its required checks (e.g. \`verify\`) haven't reported, so \`--auto\` merge will wait indefinitely. This is the same class of stall as \`action_required\`, just without a run object to click approve on — check the Actions tab for this PR and, if nothing is queued, re-run \`Refresh Lockfile\` via workflow_dispatch or push an empty commit to re-trigger. Until resolved, every \`pnpm install --frozen-lockfile\` job on \`master\`, every PR, and every merge-queue entry keeps failing. See https://paperclip.blockcast.net/BLO/issues/BLO-24150."
+            echo "Posted stall alert: zero workflow runs recorded for $head_sha."
+          else
+            echo "PR not yet merged but no stall signature found (state=$state, action_required=$action_required_count, total_runs=$total_run_count) — likely still mid-flight, not stalled."
+          fi

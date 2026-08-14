@@ -456,6 +456,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(contender.status).toBe("queued");
     expect(contender.error).toBeNull();
     expect(contender.errorCode).toBeNull();
+    // BLO-21116 (Ally review, onprem-k8s#2013): deferring a running contender
+    // back to queued must reset its queued-age clock to the defer instant, not
+    // leave the age gauge reading this row's original (pre-run) createdAt.
+    expect(contender.queuedAt).not.toBeNull();
+    expect(contender.queuedAt!.getTime()).toBeGreaterThanOrEqual(contender.createdAt.getTime());
     expect(contender.contextSnapshot).toMatchObject({
       paperclipK8sIsolationRetryAttempt: 1,
     });
