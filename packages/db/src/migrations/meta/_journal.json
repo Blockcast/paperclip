@@ -1471,6 +1471,13 @@
       "when": 1786682095165,
       "tag": "0217_heartbeat_runs_queued_age_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 218,
+      "version": "7",
+      "when": 1786682096165,
+      "tag": "0218_plugin_install_dir",
+      "breakpoints": true
     }
   ]
 }

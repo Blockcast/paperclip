@@ -50,6 +50,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import { resolveDefaultInstallDir } from "../bootstrap/isolated-sdk-plugins.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -614,6 +615,12 @@ export interface DiscoveredPlugin {
   source: PluginSource;
   /** The parsed and validated manifest if available, null if discovery-only. */
   manifest: PaperclipPluginManifestV1 | null;
+  /**
+   * npm install prefix this package was (or would be) installed into.
+   * Equal to the shared `localPluginDir` unless the package is isolated
+   * (see BLO-20961 / `resolveDefaultInstallDir`).
+   */
+  installDir: string;
 }
 
 /**
@@ -1601,7 +1608,12 @@ export function pluginLoader(
       throw new Error("Either packageName or localPath must be provided");
     }
 
-    const targetInstallDir = installDir ?? localPluginDir;
+    // Third-party packages that declare their own real `@paperclipai/plugin-sdk`
+    // dependency default into an isolated install dir instead of the shared
+    // store, so the workspace-SDK-fork vendoring in index.ts can never tear
+    // their install (BLO-20961). Callers can still force a specific
+    // `installDir` (e.g. upgradePlugin reusing a plugin's existing dir).
+    const targetInstallDir = installDir ?? resolveDefaultInstallDir(packageName, localPluginDir);
 
     // Step 1 & 2: Resolve and install package
     let resolvedPackagePath: string;
@@ -1735,6 +1747,7 @@ export function pluginLoader(
       version: resolvedVersion,
       source: localPath ? "local-filesystem" : "npm",
       manifest,
+      installDir: targetInstallDir,
     };
   }
 
@@ -1852,6 +1865,7 @@ export function pluginLoader(
         version,
         source,
         manifest: null,
+        installDir: localPluginDir,
       };
     }
 
@@ -1863,6 +1877,7 @@ export function pluginLoader(
         version,
         source,
         manifest,
+        installDir: localPluginDir,
       };
     } catch (err) {
       // Rethrow with context — callers catch and route to the errors array
@@ -2145,6 +2160,9 @@ export function pluginLoader(
           {
             packageName: discovered.packageName,
             packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+            // Null (not omitted) when the resolved dir is the shared store, so a
+            // force-repoint away from isolation is explicit rather than a no-op.
+            installDir: discovered.installDir === localPluginDir ? null : discovered.installDir,
           },
           manifest,
           { force: installOptions.force === true },
@@ -2206,6 +2224,7 @@ export function pluginLoader(
         id: string;
         packageName: string;
         packagePath: string | null;
+        installDir: string | null;
         manifestJson: PaperclipPluginManifestV1;
       } | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
@@ -2221,8 +2240,16 @@ export function pluginLoader(
         force = false,
       } = upgradeOptions;
 
+      // Reuse the plugin's existing install directory rather than always
+      // reinstalling into the shared store. A plugin already isolated from
+      // the shared store (BLO-20961) must stay isolated across upgrades, and
+      // a not-yet-isolated plugin whose packageName is now in
+      // ISOLATED_SDK_PLUGIN_PACKAGES should isolate on its next upgrade
+      // rather than waiting for an uninstall/reinstall cycle.
+      const targetInstallDir = plugin.installDir ?? resolveDefaultInstallDir(packageName, localPluginDir);
+
       log.info(
-        { pluginId, packageName, version, localPath },
+        { pluginId, packageName, version, localPath, installDir: targetInstallDir },
         "plugin-loader: upgrading plugin",
       );
 
@@ -2231,7 +2258,7 @@ export function pluginLoader(
         packageName,
         localPath,
         version,
-        installDir: localPluginDir,
+        installDir: targetInstallDir,
       });
 
       const newManifest = discovered.manifest!;
@@ -2271,6 +2298,7 @@ export function pluginLoader(
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        installDir: discovered.installDir === localPluginDir ? null : discovered.installDir,
       });
 
       return {
@@ -2293,25 +2321,37 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async cleanupInstallArtifacts(plugin: PluginRecord): Promise<void> {
+      // Isolated plugins (BLO-20961) were npm-installed into their own dir,
+      // not the shared store — uninstall/rm must target the same dir they
+      // actually live in, or this silently no-ops (wrong `npm uninstall`
+      // --prefix) and orphans the isolated install on disk forever.
+      const pluginInstallDir = plugin.installDir ?? localPluginDir;
       const managedTargets = new Set<string>();
-      const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
-      const directManagedDir = path.join(localPluginDir, plugin.packageName);
+      const managedNodeModulesDir = resolveManagedInstallPackageDir(pluginInstallDir, plugin.packageName);
+      const directManagedDir = path.join(pluginInstallDir, plugin.packageName);
 
       managedTargets.add(managedNodeModulesDir);
-      if (isPathInsideDir(directManagedDir, localPluginDir)) {
+      if (isPathInsideDir(directManagedDir, pluginInstallDir)) {
         managedTargets.add(directManagedDir);
       }
-      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
+      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, pluginInstallDir)) {
         managedTargets.add(path.resolve(plugin.packagePath));
       }
 
-      const packageJsonPath = path.join(localPluginDir, "package.json");
+      // An isolated plugin gets its own dedicated install dir (see
+      // `isolatedPluginsRoot`), so it's safe to remove the whole dir rather
+      // than just the package subtree within it.
+      if (plugin.installDir && plugin.installDir !== localPluginDir) {
+        managedTargets.add(pluginInstallDir);
+      }
+
+      const packageJsonPath = path.join(pluginInstallDir, "package.json");
       if (existsSync(packageJsonPath)) {
         try {
           const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
           await execFileAsync(
             "npm",
-            ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts", "--cache", npmCacheDir],
+            ["uninstall", plugin.packageName, "--prefix", pluginInstallDir, "--ignore-scripts", "--cache", npmCacheDir],
             { timeout: 120_000 },
           );
         } catch (err) {
@@ -2637,10 +2677,16 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
-      const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      // Isolated plugins (BLO-20961) live in their own install dir, entirely
+      // outside the shared store's node_modules — resolve everything below
+      // against that dir instead of the shared `localPluginDir` so the
+      // consistency check and entrypoint lookup see the tree that's actually
+      // theirs.
+      const pluginInstallDir = activePlugin.installDir ?? localPluginDir;
+      const packageRoot = resolvePluginPackageRoot(activePlugin, pluginInstallDir);
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
-      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
+      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, pluginInstallDir);
 
       // ------------------------------------------------------------------
       // 1b. Fail closed on a torn shared package store (BLO-18384)
@@ -2656,9 +2702,9 @@ export function pluginLoader(
       // plugin errored, while a persistent mismatch still fails well before
       // the worker initialize timeout.
       // ------------------------------------------------------------------
-      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(localPluginDir);
+      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(pluginInstallDir);
       if (!sdkConsistency.consistent) {
-        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, localPluginDir));
+        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, pluginInstallDir));
       }
 
       // ------------------------------------------------------------------
