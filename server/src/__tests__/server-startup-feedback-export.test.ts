@@ -177,7 +177,16 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
+// Spread the real module rather than enumerating exports: `@paperclipai/db`'s
+// entry point is pure re-exports (no connection is opened until `createDb` is
+// called), while its table objects are dereferenced at module-evaluation time
+// by services in `startServer`'s import graph (e.g. `issueDocumentSelect` in
+// `services/documents.ts`). An allowlist mock therefore fails at import with
+// `No "<table>" export is defined` the first time that graph grows — which is
+// what BLO-21995 hit by importing `routes/github-webhook.js` here. Only the
+// side-effecting functions below need to stay stubbed.
+vi.mock("@paperclipai/db", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@paperclipai/db")>()),
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
@@ -186,10 +195,6 @@ vi.mock("@paperclipai/db", () => ({
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
-  authUsers: {},
-  companies: {},
-  companyMemberships: {},
-  instanceUserRoles: {},
 }));
 
 vi.mock("../app.js", () => ({
