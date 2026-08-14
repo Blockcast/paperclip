@@ -2240,6 +2240,126 @@ describeEmbeddedPostgres("productivity review service", () => {
     return { runId };
   }
 
+  it("does not emit long_active_duration for an unresolved blocker with a lapsed monitor (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: episodeStart,
+      monitorNextCheckAt: new Date(now.getTime() - 60 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: seeded.companyId,
+      title: "Unresolved dependency",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: seeded.createdAt,
+      updatedAt: seeded.createdAt,
+    });
+    await db.insert(issueRelations).values({
+      companyId: seeded.companyId,
+      issueId: blockerId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not emit long_active_duration for a dependency_blocked scheduled retry (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: episodeStart,
+      monitorNextCheckAt: new Date(now.getTime() - 60 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: new Date(now.getTime() + 60 * 60 * 1000),
+      scheduledRetryReason: "dependency_blocked",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still emits long_active_duration without dependency or monitor signals (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("reports dependency-blocked accounting when another trigger still warrants review (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: now });
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: seeded.companyId,
+      title: "Unresolved dependency",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: seeded.createdAt,
+      updatedAt: seeded.createdAt,
+    });
+    await db.insert(issueRelations).values({
+      companyId: seeded.companyId,
+      issueId: blockerId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("dependency-blocked");
+  });
+
   it("does not fire long_active_duration while a capacity-class scheduled_retry is still due in the future, even though issue.executionRunId is null (BLO-23248/BLO-22331)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);

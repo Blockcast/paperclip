@@ -290,6 +290,15 @@ type ProductivityReviewEvidence = {
     errorCode: string | null;
     overdue: boolean;
   } | null;
+  // BLO-22887: elapsed time attributable to an unresolved dependency or an
+  // explicitly dependency-blocked retry. This is distinct from monitor-gated
+  // and unattended time so a review triggered by another signal stays honest.
+  dependencyGating: {
+    blockedMs: number;
+    unresolvedBlockerCount: number;
+    retryRunId: string | null;
+    retryReason: string | null;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -884,6 +893,16 @@ function formatCapacityGating(gating: NonNullable<ProductivityReviewEvidence["ca
     ? `due ${gating.scheduledRetryAt.toISOString()}, overdue and not yet promoted`
     : `due ${gating.scheduledRetryAt.toISOString()}`;
   return `${msToHumanFine(gating.stalledMs)} capacity-stalled (run \`${gating.runId}\` parked \`scheduled_retry\` on \`${gating.retryReason ?? gating.errorCode ?? "unknown"}\`, ${dueClause})`;
+}
+
+function formatDependencyGating(gating: NonNullable<ProductivityReviewEvidence["dependencyGating"]>) {
+  const blockerClause = gating.unresolvedBlockerCount > 0
+    ? `${gating.unresolvedBlockerCount} unresolved blocker(s)`
+    : "no unresolved blocker edge recorded";
+  const retryClause = gating.retryRunId
+    ? `; retry run \`${gating.retryRunId}\` carries \`${gating.retryReason ?? "dependency_blocked"}\``
+    : "";
+  return `${msToHumanFine(gating.blockedMs)} dependency-blocked (${blockerClause}${retryClause})`;
 }
 
 function isMonitorScheduledSuppression(
@@ -2481,6 +2500,24 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
 
+    // A dependency edge points from the blocker (`issueId`) to the dependent
+    // (`relatedIssueId`). Only non-terminal blockers remain unresolved.
+    const unresolvedBlockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issues.id, issueRelations.issueId))
+      .where(
+        and(
+          eq(issueRelations.companyId, sourceIssue.companyId),
+          eq(issueRelations.relatedIssueId, sourceIssue.id),
+          eq(issueRelations.type, "blocks"),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    const dependencyRetry = latestRuns.find(
+      (run) => run.status === "scheduled_retry" && run.scheduledRetryReason === "dependency_blocked",
+    ) ?? null;
+
     // BLO-21769: a run that never executed a model turn (see
     // `isNeverExecutedRun`) is infrastructure telemetry, not agent behaviour.
     // It must not extend `noCommentStreak` — the agent was never given a
@@ -2765,6 +2802,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // rather than leaving the primary-trigger line reading as pure assignee
     // inactivity.
     const capacityDominantAndDue = capacityDominant && capacityGating !== null && !capacityGating.overdue;
+    const dependencyBlocked = unresolvedBlockers.length > 0 || dependencyRetry !== null;
+    const dependencyGating = dependencyBlocked && elapsedMs !== null
+      ? {
+          blockedMs: elapsedMs,
+          unresolvedBlockerCount: unresolvedBlockers.length,
+          retryRunId: dependencyRetry?.id ?? null,
+          retryReason: dependencyRetry?.scheduledRetryReason ?? null,
+        }
+      : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
@@ -2791,7 +2837,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // bypassed the suppression bookkeeping (and its `monitorScheduledSuppressed`
     // accounting) for dozens of already-covered backlog-grace scenarios instead
     // of just narrowing the small genuinely-new case this issue targets.
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !capacityDominantAndDue;
+    const longActive = elapsedMs !== null
+      && elapsedMs >= thresholds.longActiveMs
+      && !capacityDominantAndDue
+      && !dependencyBlocked;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -2956,6 +3005,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       nonLiveHoldMs,
       monitorGating,
       capacityGating,
+      dependencyGating,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -3082,6 +3132,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.capacityGating
         ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
         : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -3164,6 +3217,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : []),
       ...(evidence.capacityGating
         ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
+        : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
