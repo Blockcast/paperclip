@@ -1201,13 +1201,13 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     try {
       // The first pass reads the first `windowRows` rows and claims the oldest.
       await boundedHeartbeat.resumeQueuedRuns();
-      expect(await adapter.waitForStarted(1)).toBe(1);
+      expect(await adapter.waitForStarted(1, 3_000)).toBe(1);
       expect(adapter.started[0]).toBe(issuelessRunIds[0]);
 
       // Free the slot. The next pass must continue from the scan boundary, so
       // it claims the oldest row PAST the window — not the head's second row.
       adapter.releaseAll();
-      expect(await adapter.waitForStarted(2)).toBe(2);
+      expect(await adapter.waitForStarted(2, 3_000)).toBe(2);
       const claimedPosition = issuelessRunIds.indexOf(adapter.started[1]);
       expect(claimedPosition).toBeGreaterThanOrEqual(windowRows);
     } finally {
