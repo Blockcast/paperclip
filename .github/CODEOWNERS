@@ -1,18 +1,27 @@
-# Replace @cryppadotta if a different maintainer or team should own release infrastructure.
+# Code owners for Blockcast/paperclip.
+#
+# GitHub silently ignores any entry naming an account without write access to
+# this repository. Such a rule parses fine but enforces nothing — no auto-requested
+# review, no code-owner gate. Verify after editing:
+#
+#   gh api "repos/Blockcast/paperclip/codeowners/errors?ref=master"   # expect {"errors":[]}
+#
+# Replace @kkroo if a different maintainer or team should own a surface. Prefer an
+# org team over a single human once one exists.
 
-.github/** @cryppadotta @devinfoley
-scripts/release*.sh @cryppadotta @devinfoley
-scripts/release-*.mjs @cryppadotta @devinfoley
-scripts/create-github-release.sh @cryppadotta @devinfoley
-scripts/rollback-latest.sh @cryppadotta @devinfoley
-doc/RELEASING.md @cryppadotta @devinfoley
-doc/PUBLISHING.md @cryppadotta @devinfoley
-doc/RELEASE-AUTOMATION-SETUP.md @cryppadotta @devinfoley
-skills/** @cryppadotta @devinfoley
+.github/** @kkroo
+scripts/release*.sh @kkroo
+scripts/release-*.mjs @kkroo
+scripts/create-github-release.sh @kkroo
+scripts/rollback-latest.sh @kkroo
+doc/RELEASING.md @kkroo
+doc/PUBLISHING.md @kkroo
+doc/RELEASE-AUTOMATION-SETUP.md @kkroo
+skills/** @kkroo
 
 # Package files — dependency changes require review
 # package.json matches recursively at all depths (covers root + all workspaces)
-package.json @cryppadotta @devinfoley
-pnpm-lock.yaml @cryppadotta @devinfoley
-pnpm-workspace.yaml @cryppadotta @devinfoley
-.npmrc @cryppadotta @devinfoley
+package.json @kkroo
+pnpm-lock.yaml @kkroo
+pnpm-workspace.yaml @kkroo
+.npmrc @kkroo

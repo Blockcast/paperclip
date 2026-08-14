@@ -18,6 +18,10 @@ platform cannot resolve automatically. Each runbook should be:
   which nothing re-drives: decide re-review vs accept without double-posting a
   review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
   `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0`.
+- [`queued-run-stranded.md`](queued-run-stranded.md) — a dispatchable
+  `heartbeat_runs.status='queued'` row is not advancing, or its age snapshot
+  cannot be refreshed safely. Trigger: `PaperclipQueuedRunStranded` or
+  `PaperclipQueuedRunAgeMetricsRefreshFailed`.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
