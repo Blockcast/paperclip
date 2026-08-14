@@ -5233,7 +5233,31 @@ export function issueRoutes(
     if (!["in_progress", "in_review"].includes(issue.status) || issue.monitorNextCheckAt) return false;
     if (Object.keys(body).length !== 1 || body.executionPolicy == null) return false;
     const currentMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
-    if (currentMonitor?.status !== "triggered") return false;
+    // Two monitor shapes leave an issue with no scheduled wake, and both are
+    // recoverable only by someone other than the assignee:
+    //
+    //  - `triggered` — the monitor fired and nobody re-armed it (BLO-24149).
+    //  - `cleared` / `convergence_stalled` — the BLO-18294 guard refused the
+    //    re-arm after N consecutive re-checks failed to narrow the gate set.
+    //
+    // The second shape is what BLO-21947 records as unrecoverable. The service
+    // layer already implements its recovery: `resetConvergenceAfterStalledClear`
+    // grants a fresh convergence budget, and `sameAssigneeResetAfterPriorStall`
+    // throws so the *assignee* still cannot grant itself one — preserving the
+    // guard's stated intent that "a non-assignee actor must make that re-arm
+    // decision". Until now no non-assignee could reach that code, so the
+    // guard's documented escape hatch had no executor at all.
+    //
+    // Note the guard force-sets the issue to `blocked` when it trips, and a
+    // monitor cannot be armed on a `blocked` issue (`issueAllowsMonitor` — the
+    // service throws MONITOR_INVALID_MESSAGE on an explicit update). Admitting
+    // `blocked` here would therefore be unreachable code, so recovery stays a
+    // deliberate two-step: return the issue to active work, then have a
+    // non-assignee re-arm it.
+    const isRecoverableLapsedMonitor =
+      currentMonitor?.status === "triggered" ||
+      (currentMonitor?.status === "cleared" && currentMonitor.clearReason === "convergence_stalled");
+    if (!isRecoverableLapsedMonitor) return false;
     // The capability this unlocks is a monitor re-arm and nothing else. A body
     // carrying only `executionPolicy` is NOT sufficient to establish that:
     // `executionPolicy` is a whole-policy replace, so a policy that merely

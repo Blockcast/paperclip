@@ -1491,6 +1491,173 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  // BLO-21947. The BLO-18294 convergence guard stops re-arming after N
+  // re-checks against an unchanged gate set and deliberately bars the assignee
+  // from granting itself a fresh budget — "a non-assignee actor must make that
+  // re-arm decision". `issue-execution-policy.ts` implements exactly that
+  // (`resetConvergenceAfterStalledClear` + `sameAssigneeResetAfterPriorStall`),
+  // but the route gate only admitted `status: "triggered"`, so no non-assignee
+  // could reach it and the escape hatch had no executor.
+  const convergenceStalledMonitorState = (overrides: Record<string, unknown> = {}) => ({
+    status: "idle",
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    returnAssignee: null,
+    reviewRequest: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+    monitor: {
+      status: "cleared",
+      nextCheckAt: null,
+      lastTriggeredAt: "2026-08-07T12:00:00.000Z",
+      attemptCount: 3,
+      notes: "pr:#1229:review unchanged",
+      scheduledBy: "assignee",
+      clearedAt: "2026-08-07T12:30:00.000Z",
+      clearReason: "convergence_stalled",
+      ...(overrides as Record<string, unknown>),
+    },
+  });
+
+  const managerChainDecide = async (input: { action: string }) => {
+    if (input.action === "issue:comment") {
+      return {
+        allowed: true,
+        action: input.action,
+        reason: "allow_manager_chain",
+        explanation: "Actor manages the assignee.",
+      };
+    }
+    if (input.action === "runtime:manage" || input.action === "issue:read") {
+      return {
+        allowed: true,
+        action: input.action,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by test grant.",
+      };
+    }
+    return {
+      allowed: false,
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "No general issue mutation grant.",
+    };
+  };
+
+  it("lets a manager-chain agent re-arm a monitor the convergence guard cleared (BLO-21947)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      executionState: convergenceStalledMonitorState(),
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(managerChainDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "manager granted a fresh convergence budget",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({
+            notes: "manager granted a fresh convergence budget",
+          }),
+        }),
+      }),
+    );
+  });
+
+  // Scope guard: the branch admits ONE additional clear reason, not every
+  // cleared monitor. A monitor cleared because the issue went terminal or lost
+  // a valid assignee is not a stalled-recovery case and must stay refused,
+  // otherwise this becomes a general cross-assignee policy write.
+  it.each(["done", "invalid_status", "invalid_assignee", "bounds_exhausted"])(
+    "still refuses a manager-chain re-arm of a monitor cleared for %s",
+    async (clearReason) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+        executionState: convergenceStalledMonitorState({ clearReason }),
+        monitorNextCheckAt: null,
+      }));
+      mockAccessService.decide.mockImplementation(managerChainDecide);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: {
+              nextCheckAt: "2026-08-07T14:00:00.000Z",
+              notes: "should not be admitted",
+              scheduledBy: "assignee",
+            },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  // No general widening: the same convergence-stalled shape from an actor with
+  // neither manager-chain nor assignment over the issue still fails closed.
+  it("keeps a convergence-stalled re-arm closed to an actor without manager-chain (BLO-21947)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      executionState: convergenceStalledMonitorState(),
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "runtime:manage" || input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "Unrelated actor.",
+      };
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "unrelated actor",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   // BLO-22860 (Ally review on #1187). The manager-chain re-arm deliberately
   // skips the ordinary mutation boundary, so its gate has to be keyed on the
   // *policy* being a monitor re-arm, not merely on the request body having a
