@@ -307,24 +307,13 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
   );
 });
 
-test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links its runbook (BLO-21116)", () => {
-  const rendered = execFileSync(
-    "helm",
-    [
-      "template",
-      "paperclip",
-      "deploy/helm/paperclip",
-      "--namespace",
-      "paperclip",
-      "-f",
-      "deploy/helm/paperclip/values.blockcast.yaml",
-      "--show-only",
-      "templates/prometheusrule.yaml",
-      "--set",
-      "prometheusRule.enabled=true",
-    ],
-    { cwd: repoRoot, encoding: "utf8" },
-  );
+test("PaperclipQueuedRunStranded is agent-keyed, freshness-gated, and fires before 30m (BLO-21116)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
 
   assert.match(rendered, /alert: PaperclipQueuedRunStranded/);
   const [, expr] = rendered.match(
@@ -340,12 +329,12 @@ test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links it
   // is young.
   assert.match(
     expr,
-    /^max\(paperclip_queued_run_oldest_age_seconds\) by \(agent_id\) > (\d+)$/,
+    /^\(max\(paperclip_queued_run_oldest_age_seconds\) by \(agent_id\) > (\d+)\) and on\(\) \(paperclip_queued_run_age_metrics_refresh_success == 1\)$/,
     "queued-run-stranded alert must threshold the per-agent age gauge, "
       + "not a summed count under a long `for:`",
   );
 
-  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  const [, ageThreshold] = expr.match(/> (\d+)\)/) ?? [];
   // The gauge is reset-then-set to 0 for every known agent on each refresh
   // (see setQueuedRunOldestAgeMetrics), so a strictly positive threshold is
   // the silent-in-steady-state guarantee.
@@ -390,3 +379,22 @@ test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links it
   );
 });
 
+test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_queued_run_age_metrics_refresh_success == 0\n/,
+    "a failed queued-run-age refresh must have its own alert",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
+    "the freshness failure alert must route responders to the queued-run runbook",
+  );
+});
