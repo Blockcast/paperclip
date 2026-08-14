@@ -5795,27 +5795,33 @@ export function issueService(db: Db) {
     );
   }
 
-  async function syncBlockedByIssueIds(
+  /**
+   * Lock the complete blocker graph in its canonical order. Every blocker
+   * mutation must take the relation advisory lock before it takes any issue
+   * row lock; callers may then safely update the issue row and mutate its
+   * relations without reacquiring either lock.
+   */
+  async function lockIssueBlockerGraphForUpdate(
+    issueId: string,
+    companyId: string,
+    blockedByIssueIds: string[],
+    dbOrTx: any = db,
+  ) {
+    await lockIssueBlockerRelations(dbOrTx, companyId, issueId);
+    await lockBlockedByIssueRowsForUpdate(issueId, companyId, blockedByIssueIds, dbOrTx);
+  }
+
+  async function syncBlockedByIssueIdsLocked(
     issueId: string,
     companyId: string,
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
-    dbOrTx: any = db,
+    dbOrTx: any,
   ): Promise<void> {
-    if (dbOrTx === db) {
-      return db.transaction((tx) =>
-        syncBlockedByIssueIds(issueId, companyId, blockedByIssueIds, actor, tx),
-      );
-    }
-
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
       throw unprocessable("Issue cannot be blocked by itself");
     }
-
-    await lockIssueBlockerRelations(dbOrTx, companyId, issueId);
-
-    await lockBlockedByIssueRowsForUpdate(issueId, companyId, deduped, dbOrTx);
 
     if (deduped.length > 0) {
       const relatedIssues = await dbOrTx
@@ -5850,6 +5856,27 @@ export function issueService(db: Db) {
         createdByUserId: actor.userId ?? null,
       })),
     );
+  }
+
+  async function syncBlockedByIssueIds(
+    issueId: string,
+    companyId: string,
+    blockedByIssueIds: string[],
+    actor: { agentId?: string | null; userId?: string | null } = {},
+    dbOrTx: any = db,
+  ): Promise<void> {
+    if (dbOrTx === db) {
+      return db.transaction((tx) =>
+        syncBlockedByIssueIds(issueId, companyId, blockedByIssueIds, actor, tx),
+      );
+    }
+
+    const deduped = [...new Set(blockedByIssueIds)];
+    if (deduped.some((candidate) => candidate === issueId)) {
+      throw unprocessable("Issue cannot be blocked by itself");
+    }
+    await lockIssueBlockerGraphForUpdate(issueId, companyId, deduped, dbOrTx);
+    await syncBlockedByIssueIdsLocked(issueId, companyId, deduped, actor, dbOrTx);
   }
 
   async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
@@ -9416,8 +9443,11 @@ export function issueService(db: Db) {
           await lockIssueParentMutationCompany(existing.companyId, tx);
         }
         if (blockedByIssueIds !== undefined) {
-          await lockIssueBlockerRelations(tx, existing.companyId, id);
-          await lockBlockedByIssueRowsForUpdate(id, existing.companyId, blockedByIssueIds, tx);
+          // Keep the blocker advisory lock outermost. The relation mutation
+          // below uses these locks rather than reacquiring them after the
+          // issue UPDATE, so recovery clears and ordinary blocker writes share
+          // one explicit lock order: graph advisory -> issue rows -> writes.
+          await lockIssueBlockerGraphForUpdate(id, existing.companyId, blockedByIssueIds, tx);
         } else if (patch.status === "in_progress") {
           await lockIssueBlockerRelations(tx, existing.companyId, id);
           const currentBlockerIssueIds = await tx
@@ -9719,9 +9749,10 @@ export function issueService(db: Db) {
         if (blockedByIssueIds !== undefined) {
           // BLO-20385 (Ally review on #970): re-assert dependency readiness here
           // rather than trusting the route's pre-write snapshot. The UPDATE above
-          // has already taken this row's exclusive lock, and every blocker-add
-          // path takes `FOR UPDATE` on the blocked row inside
-          // `syncBlockedByIssueIds`, so by this point a concurrent adder has
+          // has already taken this row's exclusive lock. The canonical graph
+          // locks were acquired before that UPDATE, and every blocker-add
+          // path takes the same advisory-plus-row sequence before it mutates,
+          // so by this point a concurrent adder has
           // either committed — and this re-read, under READ COMMITTED, sees its
           // edge — or is parked behind us and re-adds after we commit. Without
           // this, the clear below silently deletes an edge that went live after
@@ -9744,7 +9775,11 @@ export function issueService(db: Db) {
               );
             }
           }
-          await syncBlockedByIssueIds(
+          // The graph locks were taken before the issue-row update above;
+          // mutate the relations under those held locks instead of calling the
+          // public helper, which would obscure the lock order by reacquiring
+          // them after the row write.
+          await syncBlockedByIssueIdsLocked(
             updated.id,
             lockedExisting.companyId,
             blockedByIssueIds,
