@@ -84,6 +84,15 @@ const SAFE_ENV_INSPECTION_RE =
  * a nested command, which errs toward blocking — consistent with this file's
  * long-standing stance that a bare `env` inside a quoted string also matches.
  * The safe helper remains the unblocked path.
+ *
+ * DOCUMENTED RESIDUAL: values resolved at runtime. `X=env; $X` and
+ * `cat /proc/$$/environ` are ALLOWED and cannot be closed here — the classifier
+ * sees the command text, and no static pass over text can know what an
+ * expansion will evaluate to. This is a different class from the spelling
+ * variants above, which are closed by construction; it is not an enumerable
+ * gap, so a future round should not read it as one. The mitigation for this
+ * class is the fail-open-by-design guard plus server-side redaction, not more
+ * lexing.
  * ---------------------------------------------------------------------------
  */
 
@@ -115,6 +124,13 @@ interface LexResult {
   commands: LexedCommand[];
   /** Command strings needing their own pass: substitution bodies and quoted payloads. */
   nested: string[];
+  /**
+   * Redirection target words, quote-removed. Kept separately from `commands`
+   * because a target is NOT an operand — folding `env >/tmp/out` back into the
+   * word list would give `env` an operand and allow the dump — but the shell
+   * still opens the file, so the target must be classified.
+   */
+  redirections: string[];
 }
 
 function basename(word: string): string {
@@ -125,11 +141,13 @@ function basename(word: string): string {
 /**
  * Lex a command string the way a shell does, to the depth that affects which
  * token is executed. Performs quote removal and escape processing, splits on
- * command operators, and discards redirections together with their targets.
+ * command operators, and separates redirections (operator plus target) out of
+ * the word list while still recording each target.
  */
 function lexShell(input: string): LexResult {
   const commands: LexedCommand[] = [];
   const nested: string[] = [];
+  const redirections: string[] = [];
   let words: string[] = [];
   let cur: string | null = null;
   let curQuoted = false;
@@ -210,19 +228,33 @@ function lexShell(input: string): LexResult {
     return j === start + 1 ? start + 1 : j;
   };
 
-  /** Discards a redirection operator and its target, as the shell does before exec. */
+  /**
+   * Consumes a redirection operator and its target, as the shell does before
+   * exec — but RECORDS the target, because the shell still opens that file.
+   * `cat </proc/self/environ` dumps the environment without the path ever
+   * reaching argv, so discarding the target outright allows it.
+   */
   const readRedirection = (start: number): number => {
     let j = start;
     while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) j += 1;
     while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
-    // Discard the target word (quoted or bare).
+    // Capture the target word (quoted or bare) with quotes removed.
+    let target = "";
     if (j < n && (input[j] === "'" || input[j] === '"')) {
       const q = input[j];
       j += 1;
-      while (j < n && input[j] !== q) j += 1;
-      return j + 1;
+      while (j < n && input[j] !== q) {
+        target += input[j] as string;
+        j += 1;
+      }
+      j += 1;
+    } else {
+      while (j < n && !/[\s;&|()<>]/.test(input[j] as string)) {
+        target += input[j] as string;
+        j += 1;
+      }
     }
-    while (j < n && !/[\s;&|()<>]/.test(input[j] as string)) j += 1;
+    if (target) redirections.push(target);
     return j;
   };
 
@@ -330,7 +362,7 @@ function lexShell(input: string): LexResult {
     i += 1;
   }
   endCommand();
-  return { commands, nested };
+  return { commands, nested, redirections };
 }
 
 /**
@@ -384,6 +416,37 @@ function hasOperand(args: string[]): boolean {
   return false;
 }
 
+/**
+ * True when `args` names something for `declare`/`export` to act on, which is
+ * what makes them scoped rather than a dump. Any non-flag word counts,
+ * assignments included: `declare -p PATH` and `export FOO=bar` print one entry.
+ *
+ * This replaces a whole-word flag comparison (`rest.indexOf("-x")`), which was
+ * enumeration and missed most of the class. Measured against `bash -c`, with a
+ * marker variable in the environment:
+ *
+ *   declare       447 lines, marker value present  <- was ALLOWED
+ *   declare -p    460 lines, marker value present  <- was ALLOWED
+ *   declare -px   421 lines, marker value present  <- was ALLOWED
+ *   export        421 lines, marker value present  <- was ALLOWED
+ *   declare -x    421 lines, marker value present     (caught)
+ *   export -p     421 lines, marker value present     (caught)
+ *
+ * Keying on the operand instead of on flags closes bundled clusters (`-px`,
+ * `-xp`), the bare forms, and `-p` in one rule, the same way `hasOperand`
+ * handles `env`/`printenv`. `declare -f` prints function bodies and no values,
+ * so blocking it is a false positive — accepted deliberately: it costs a
+ * command nothing runs, where a false negative leaks the whole environment.
+ */
+function hasNameOperand(args: string[]): boolean {
+  for (const a of args) {
+    if (a === "--") continue;
+    if (a.length > 0 && a[0] === "-") continue;
+    return true;
+  }
+  return false;
+}
+
 /** Classifies one simple command (already quote-removed and redirection-stripped). */
 function simpleCommandDumps(words: string[]): boolean {
   if (words.length === 0) return false;
@@ -401,8 +464,8 @@ function simpleCommandDumps(words: string[]): boolean {
       if (rest.length === 0) return true;
       continue;
     }
-    if (base === "export" && rest.indexOf("-p") !== -1) return true;
-    if (base === "declare" && rest.indexOf("-x") !== -1) return true;
+    if (base === "export" && !hasNameOperand(rest)) return true;
+    if (base === "declare" && !hasNameOperand(rest)) return true;
   }
   return false;
 }
@@ -422,7 +485,10 @@ function shellPayloadIndex(words: string[]): number {
 
 function containsDump(command: string, depth: number): boolean {
   if (depth > 4) return false;
-  const { commands, nested } = lexShell(command);
+  const { commands, nested, redirections } = lexShell(command);
+  // The shell opens a redirection target even though it never enters argv, so
+  // `cat </proc/self/environ` is only reachable from the target word.
+  for (const target of redirections) if (PROC_ENVIRON_RE.test(target)) return true;
   for (const words of commands) {
     const payload = shellPayloadIndex(words);
     if (payload !== -1) {
@@ -486,6 +552,7 @@ function basename(word) {
 function lexShell(input) {
   const commands = [];
   const nested = [];
+  const redirections = [];
   let words = [];
   let cur = null;
   let curQuoted = false;
@@ -546,13 +613,16 @@ function lexShell(input) {
     let j = start;
     while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) j += 1;
     while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
+    let target = "";
     if (j < n && (input[j] === "'" || input[j] === '"')) {
       const q = input[j];
       j += 1;
-      while (j < n && input[j] !== q) j += 1;
-      return j + 1;
+      while (j < n && input[j] !== q) { target += input[j]; j += 1; }
+      j += 1;
+    } else {
+      while (j < n && !/[\s;&|()<>]/.test(input[j])) { target += input[j]; j += 1; }
     }
-    while (j < n && !/[\s;&|()<>]/.test(input[j])) j += 1;
+    if (target) redirections.push(target);
     return j;
   };
   while (i < n) {
@@ -616,7 +686,15 @@ function lexShell(input) {
     i += 1;
   }
   endCommand();
-  return { commands: commands, nested: nested };
+  return { commands: commands, nested: nested, redirections: redirections };
+}
+function hasNameOperand(args) {
+  for (const a of args) {
+    if (a === "--") continue;
+    if (a.length > 0 && a[0] === "-") continue;
+    return true;
+  }
+  return false;
 }
 function hasOperand(args) {
   const queue = args.slice();
@@ -668,8 +746,8 @@ function simpleCommandDumps(words) {
       if (rest.length === 0) return true;
       continue;
     }
-    if (base === "export" && rest.indexOf("-p") !== -1) return true;
-    if (base === "declare" && rest.indexOf("-x") !== -1) return true;
+    if (base === "export" && !hasNameOperand(rest)) return true;
+    if (base === "declare" && !hasNameOperand(rest)) return true;
   }
   return false;
 }
@@ -687,6 +765,7 @@ function shellPayloadIndex(words) {
 function containsDump(command, depth) {
   if (depth > 4) return false;
   const lexed = lexShell(command);
+  for (const target of lexed.redirections) if (PROC_ENVIRON_RE.test(target)) return true;
   for (const words of lexed.commands) {
     const payload = shellPayloadIndex(words);
     if (payload !== -1) {
