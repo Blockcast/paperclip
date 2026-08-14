@@ -149,7 +149,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow).toContain(
       "buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local",
     );
-    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
+    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(3);
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
