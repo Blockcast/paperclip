@@ -331,6 +331,10 @@ jobs:
     outputs:
       blocked: ${{ steps.check.outputs.blocked }}
     steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
       - name: Check for an existing pending production approval
         id: check
         env:
@@ -357,6 +361,10 @@ jobs:
     outputs:
       blocked: ${{ steps.check.outputs.blocked }}
     steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
       - name: Re-check for a pending production approval right before deploy
         id: check
         env:
