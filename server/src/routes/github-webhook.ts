@@ -37,7 +37,7 @@ import {
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -69,6 +69,7 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
+import { getAgentOrgChainHealth, type AgentEligibilityAgent } from "@paperclipai/shared";
 import { workProductService } from "../services/work-products.js";
 import {
   buildPullRequestWorkProductFields,
@@ -554,6 +555,10 @@ interface ResolvedEventContext {
   // needing a separate `gh pr view` shellout.
   reviewBody?: string | null;
   reviewState?: string | null;
+  // pull_request_review.submitted only — the numeric GitHub review id.
+  // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
+  // it is a stable, explicit (pr, review_id) pair rather than an opaque URL.
+  reviewId?: number | null;
   reviewAuthorLogin?: string | null;
   reviewUrl?: string | null;
   // BLO-9293: PR author login (pull_request.user.login / issue.user.login on a
@@ -866,10 +871,24 @@ function resolveEventContext(
       const prUrl = githubPrUrl(repoFullName, prNumber, readStringField(issue, "html_url"));
       const commentUrl = readStringField(comment, "html_url");
       return {
+        // BLO-23267: identifiers used to MATCH a Paperclip issue must come
+        // only from the PR's own title/body (`issue.title`/`issue.body` here
+        // -- GitHub's issue_comment payload calls the PR "issue"), never from
+        // the free-text comment body. paperclip-identifiers.ts's own operator
+        // guard says PR->issue attribution keys on branch/title/body and
+        // nothing else; commentBody used to be folded in here too, which let
+        // an identifier mentioned only in REVIEW PROSE (e.g. a reviewer
+        // narrating an unrelated incident as background) attribute a
+        // Changes-Requested wake to that unrelated issue. Live case: Ally's
+        // comment on Blockcast/paperclip#1125 narrated the BLO-20775 stall as
+        // motivation, and the substring match alone fired a wake on
+        // BLO-20775 even though #1125 has nothing to do with it -- its own
+        // linked issue (BLO-19497) is carried correctly via issue.body/title.
+        // commentBody is still returned below for display/logging, just not
+        // fed into matching.
         identifiers: extractPaperclipIdentifiers(
           issue.title as string | undefined,
           issue.body as string | undefined,
-          commentBody,
         ),
         wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
         prNumber,
@@ -897,6 +916,16 @@ function resolveEventContext(
       const reviewUser = review?.user as Record<string, unknown> | undefined;
       const reviewAuthorLogin = (reviewUser?.login as string | undefined) ?? null;
       const reviewUrl = readStringField(review, "html_url");
+      const reviewIdRaw = review?.id;
+      const reviewId = typeof reviewIdRaw === "number" ? reviewIdRaw : null;
+      // Review finding (PR #1125): `review.commit_id` is the exact,
+      // immutable commit this review was submitted against. Falling back to
+      // `pull_request.head.sha` (collected.headSha) is only correct if the
+      // branch hasn't advanced between the review being submitted and this
+      // webhook being processed -- otherwise the "Reviewed head SHA" line
+      // this drives labels feedback against a commit the reviewer never saw,
+      // defeating the stale-review signal it exists to provide.
+      const reviewCommitId = readStringField(review, "commit_id");
       return {
         identifiers: collected.ids,
         wakeReason: "github_pr_review_submitted",
@@ -905,10 +934,11 @@ function resolveEventContext(
         prTitle: collected.title,
         prUrl: collected.url,
         eventUrl: reviewUrl ?? collected.url,
-        headSha: collected.headSha,
+        headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
         reviewState,
+        reviewId,
         reviewAuthorLogin,
         reviewUrl,
       };
@@ -1764,6 +1794,15 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 
 function buildPrFeedbackExternalKey(context: ResolvedEventContext, deliveryId: string | null): string | null {
   if (context.commentId) return `github_issue_comment:${context.commentId}`;
+  // BLO-19497: an explicit (repo, pr, review_id) key rather than the opaque
+  // reviewUrl -- easier to reason about/test, and immune to GitHub ever
+  // reshaping review URLs. Falls back to reviewUrl for older/synthetic
+  // contexts that don't carry a numeric review id.
+  if (context.reviewId !== null && context.reviewId !== undefined) {
+    const repo = context.repoFullName ?? "unknown";
+    const pr = context.prNumber ?? "unknown";
+    return `github_pr_review_id:${repo}:${pr}:${context.reviewId}`;
+  }
   if (context.reviewUrl) return `github_pr_review:${context.reviewUrl}`;
   if (context.eventUrl) return `github_event:${context.eventUrl}`;
   if (deliveryId) return `github_delivery:${deliveryId}`;
@@ -1867,6 +1906,9 @@ function buildPrReviewFeedbackComment(context: ResolvedEventContext): string {
     ...(sourceUrl ? [`- Source: ${sourceUrl}`] : []),
     ...(reviewer ? [`- Reviewer: ${reviewer}`] : []),
     ...(context.reviewState ? [`- State: ${context.reviewState}`] : []),
+    // BLO-19497 AC: record the reviewed head SHA so a reader can tell a
+    // stale review (against an older push) from a current one.
+    ...(context.headSha ? [`- Reviewed head SHA: \`${context.headSha}\``] : []),
   ];
   if (body) {
     lines.push("", "Review body:", "", fencedText(body));
@@ -1881,6 +1923,12 @@ type MatchedGithubIssue = {
   assigneeAgentId: string | null;
   status: string;
   executionState: Record<string, unknown> | null;
+  // BLO-19497: needed to detect a monitor left `triggered` with no scheduled
+  // re-check -- the "assignee has no live wake path" signal AC #5 escalates
+  // on. See isIssueMonitorTriggered.
+  monitorNextCheckAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorAttemptCount: number;
 };
 
 async function hasExistingWakeWithIdempotencyKey(
@@ -1897,37 +1945,98 @@ async function hasExistingWakeWithIdempotencyKey(
   return Boolean(existing);
 }
 
+// BLO-19497: writes the github_pr_review_feedback comment for EVERY distinct
+// actionable review, independent of the issue's current status. Before this
+// fix the whole function -- comment write included -- short-circuited unless
+// `issue.status === "in_review"`. Review #1 flips status to `in_progress` as
+// part of its own reopen (below), so review #2+ on the same PR always found
+// `status !== "in_review"` and produced ZERO comment, forever, regardless of
+// how many more (distinct head_sha, review_id) reviews landed. The comment
+// write must not depend on a status transition that its own predecessor
+// already consumed.
+//
+// The reopen/reassign-to-author behavior (flipping `in_review` -> `in_progress`
+// and handing the issue back to the assignee) is still status-gated -- that
+// part legitimately only applies once, when the issue is parked in `in_review`
+// waiting on this review's outcome. If the issue already moved on (author is
+// back in_progress, or it's blocked/todo/etc.), the comment is still the full
+// notification; there is nothing to "reopen".
 async function reopenInReviewIssueForActionablePrFeedback(
   db: Db,
   issue: MatchedGithubIssue,
   context: ResolvedEventContext,
   deliveryId: string | null,
-): Promise<{ reopened: boolean; commentId: string | null; assigneeAgentId: string | null }> {
+): Promise<{ reopened: boolean; commentId: string | null; commentInserted: boolean; assigneeAgentId: string | null }> {
   const returnAssigneeAgentId = readReturnAssigneeAgentId(issue.executionState);
   const effectiveAssigneeAgentId = returnAssigneeAgentId ?? issue.assigneeAgentId;
-  if (issue.status !== "in_review" || !effectiveAssigneeAgentId) {
-    return { reopened: false, commentId: null, assigneeAgentId: effectiveAssigneeAgentId };
-  }
 
   const externalKey = buildPrFeedbackExternalKey(context, deliveryId);
   const now = new Date();
   const result = await db.transaction(async (tx) => {
-    const existingComment = externalKey
-      ? await tx
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(and(
-          eq(issueComments.issueId, issue.id),
-          sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
-          sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null)
-      : null;
+    // Review finding (PR #1125, discovered while fixing the escalation
+    // comment's own read-then-insert below): this was a SELECT-by-externalKey
+    // then INSERT-if-none-found -- the same check-then-write race. Two
+    // concurrent redeliveries of the same review can both observe "no
+    // existing feedback comment" before either commits, posting the same
+    // review's feedback twice -- and each racer's insert mints its own row
+    // id, so `commentId` (which escalateUnseenBlockingReviewFeedback keys its
+    // own dedup on) is no longer stable across the race either. Set
+    // idempotencyKey on the insert so it rides the partial unique index
+    // (issue_comments_issue_system_idempotency_idx) and use
+    // ON CONFLICT DO NOTHING + a follow-up read to resolve to whichever row
+    // actually won, mirroring the BLO-19037 dependabot-receipt pattern.
+    let commentInserted = false;
+    let commentId: string | null = null;
+    if (externalKey) {
+      const insertedRow = await tx
+        .insert(issueComments)
+        .values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          authorType: "system",
+          idempotencyKey: externalKey,
+          body: buildPrReviewFeedbackComment(context),
+          metadata: {
+            kind: "github_pr_review_feedback",
+            source: "github",
+            externalKey,
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+            deliveryId,
+          } as never,
+        })
+        .onConflictDoNothing()
+        .returning({ id: issueComments.id })
+        .then((rows) => rows[0] ?? null);
 
-    const commentId: string | null = existingComment
-      ? existingComment.id
-      : await tx
+      if (insertedRow) {
+        commentInserted = true;
+        commentId = insertedRow.id;
+      } else {
+        // Lost the race (or this is a genuine redelivery): find the row that
+        // won, via the idempotencyKey the unique index enforces on. Also
+        // check the legacy metadata-only lookup for feedback comments
+        // written before this dedup existed (no idempotencyKey set).
+        commentId = await tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.issueId, issue.id),
+            or(
+              eq(issueComments.idempotencyKey, externalKey),
+              and(
+                isNull(issueComments.idempotencyKey),
+                sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
+                sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+              ),
+            ),
+          ))
+          .limit(1)
+          .then((rows) => rows[0]?.id ?? null);
+      }
+    } else {
+      commentInserted = true;
+      commentId = await tx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -1937,7 +2046,7 @@ async function reopenInReviewIssueForActionablePrFeedback(
           metadata: {
             kind: "github_pr_review_feedback",
             source: "github",
-            externalKey: externalKey ?? null,
+            externalKey: null,
             repoFullName: context.repoFullName,
             prNumber: context.prNumber,
             deliveryId,
@@ -1945,33 +2054,197 @@ async function reopenInReviewIssueForActionablePrFeedback(
         })
         .returning({ id: issueComments.id })
         .then((rows): string | null => rows[0]?.id ?? null);
-
-    const executionState = markExecutionStateChangesRequested(issue.executionState);
-    const patch: Partial<typeof issues.$inferInsert> = {
-      status: "in_progress",
-      assigneeAgentId: effectiveAssigneeAgentId,
-      assigneeUserId: null,
-      checkoutRunId: null,
-      executionRunId: null,
-      executionAgentNameKey: null,
-      executionLockedAt: null,
-      updatedAt: now,
-    };
-    if (executionState) {
-      patch.executionState = executionState;
     }
 
-    const updated = await tx
-      .update(issues)
-      .set(patch)
-      .where(and(eq(issues.id, issue.id), eq(issues.status, "in_review")))
-      .returning({ id: issues.id })
-      .then((rows) => rows[0] ?? null);
+    let reopened = false;
+    if (issue.status === "in_review" && effectiveAssigneeAgentId) {
+      const executionState = markExecutionStateChangesRequested(issue.executionState);
+      const patch: Partial<typeof issues.$inferInsert> = {
+        status: "in_progress",
+        assigneeAgentId: effectiveAssigneeAgentId,
+        assigneeUserId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      };
+      if (executionState) {
+        patch.executionState = executionState;
+      }
 
-    return { reopened: Boolean(updated), commentId, assigneeAgentId: effectiveAssigneeAgentId };
+      const updated = await tx
+        .update(issues)
+        .set(patch)
+        .where(and(eq(issues.id, issue.id), eq(issues.status, "in_review")))
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      reopened = Boolean(updated);
+    }
+
+    return { reopened, commentId, commentInserted, assigneeAgentId: effectiveAssigneeAgentId };
   });
 
   return result;
+}
+
+// A formal "Changes Requested" review state is the blocking signal AC #5
+// escalates on -- distinct from hasActionablePrReviewFeedback's broader body
+// heuristics (which also catch findings embedded in an approved/commented
+// review). Escalation is specifically for the formal blocking state, since
+// that's the shape of the incident this issue describes (a Critical finding
+// under a Changes Requested review).
+function isBlockingReviewState(reviewState: string | null | undefined): boolean {
+  const normalized = reviewState?.trim().toLowerCase().replace(/-/g, "_");
+  return normalized === "changes_requested";
+}
+
+// Mirrors the issue-column-only branch of
+// issue-execution-policy.ts's derivePersistedMonitorState: a monitor with no
+// scheduled nextCheckAt but a prior trigger/attempt is `triggered` -- terminal,
+// nothing re-arms it but the assignee (see BLO-19497 body). The webhook route
+// doesn't load executionPolicy.monitor (the full derivation also needs the
+// policy row, which isn't worth adding to this hot path), but the raw issue
+// columns plus the already-loaded executionState.monitor.status are
+// sufficient to detect this exact wedge, which is the one the incident and
+// AC #5 are both about.
+//
+// Review finding (PR #1125, pullrequestreview-4888198804 / -4891307841):
+// the raw columns alone treat ANY row with a historical
+// monitorLastTriggeredAt/monitorAttemptCount as currently triggered, so a
+// monitor that was explicitly cleared (cancelled, superseded, or resolved
+// through the normal `cleared` transition -- see derivePersistedMonitorState)
+// still reads as triggered here and can spuriously escalate a blocking
+// review to a manager the assignee never needed. `cleared` in
+// executionState.monitor is authoritative and must take precedence over the
+// historical columns, exactly as derivePersistedMonitorState's own
+// `fromState?.status === "cleared"` branch does before its `triggered`
+// branch.
+function isIssueMonitorTriggered(issue: {
+  monitorNextCheckAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorAttemptCount: number;
+  executionState?: Record<string, unknown> | null;
+}): boolean {
+  if (issue.monitorNextCheckAt) return false;
+  const monitor = issue.executionState?.monitor as Record<string, unknown> | null | undefined;
+  if (monitor?.status === "cleared") return false;
+  return Boolean(issue.monitorLastTriggeredAt) || issue.monitorAttemptCount > 0;
+}
+
+// BLO-19497 AC #5: when a blocking review lands while the assignee's monitor
+// is triggered/nextCheckAt-null (no live wake path), escalate to the
+// assignee's manager instead of letting the finding sit unseen. Per CEO
+// disposition on the issue thread: escalate to the assignee's manager via
+// orgChainHealth.fullChain -- the first `running` ancestor, walking up. Not
+// the board -- a missed review comment is an engineering-loop failure, not a
+// governance decision.
+async function escalateUnseenBlockingReviewFeedback(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  input: {
+    issue: MatchedGithubIssue;
+    assigneeAgentId: string;
+    commentId: string | null;
+    context: ResolvedEventContext;
+    deliveryId: string | null;
+  },
+): Promise<{ escalated: boolean; managerAgentId: string | null }> {
+  const companyAgentRows: AgentEligibilityAgent[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      status: agents.status,
+      reportsTo: agents.reportsTo,
+    })
+    .from(agents)
+    .where(eq(agents.companyId, input.issue.companyId));
+
+  const assignee = companyAgentRows.find((agent) => agent.id === input.assigneeAgentId) ?? null;
+  if (!assignee) return { escalated: false, managerAgentId: null };
+
+  const manager = getAgentOrgChainHealth({ agent: assignee, agents: companyAgentRows })
+    .fullChain
+    .find((entry) => entry.relation === "ancestor" && entry.status === "running");
+  if (!manager) return { escalated: false, managerAgentId: null };
+
+  const dedupeToken =
+    input.commentId ?? input.context.reviewUrl ?? input.context.eventUrl ?? input.deliveryId ?? "unknown";
+  const idempotencyKey = `unseen_blocking_review_escalation:${input.issue.id}:${dedupeToken}`;
+  if (await hasExistingWakeWithIdempotencyKey(db, manager.id, idempotencyKey)) {
+    return { escalated: false, managerAgentId: manager.id };
+  }
+
+  // Review finding (PR #1125): a prior read-then-insert (SELECT for an
+  // existing escalation comment by metadata.externalKey, then INSERT if none
+  // was found) is a check-then-write race across paperclip-api's replicas --
+  // two concurrent redeliveries of the same review event can both observe "no
+  // existing comment" before either writes, double-posting the escalation.
+  // Set idempotencyKey on the insert so it rides the already-deployed partial
+  // unique index (issue_comments_issue_system_idempotency_idx on
+  // issueId+idempotencyKey, scoped to system comments) and use
+  // ON CONFLICT DO NOTHING to make the key authoritative in the database
+  // rather than in application logic. No legacy metadata-only rows exist for
+  // this comment kind (github_pr_review_feedback_escalation is new in this
+  // PR), so unlike reopenInReviewIssueForActionablePrFeedback's dependabot
+  // receipt there is no pre-idempotencyKey data to fall back to.
+  const prLine =
+    input.context.repoFullName && input.context.prNumber !== null
+      ? [`- PR: ${input.context.repoFullName}#${input.context.prNumber}`]
+      : [];
+  await db
+    .insert(issueComments)
+    .values({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      authorType: "system",
+      idempotencyKey,
+      body: [
+        "## Blocking review feedback escalated",
+        "",
+        `${assignee.name}'s monitor is \`triggered\` with no scheduled re-check -- no live wake path -- so this ` +
+          "Changes Requested review is being escalated to its manager instead of left unseen.",
+        "",
+        `- Assignee: ${assignee.name}`,
+        `- Escalated to: ${manager.name}`,
+        ...prLine,
+        ...(input.context.headSha ? [`- Reviewed head SHA: \`${input.context.headSha}\``] : []),
+      ].join("\n"),
+      metadata: {
+        kind: "github_pr_review_feedback_escalation",
+        source: "github",
+        externalKey: idempotencyKey,
+        escalatedToAgentId: manager.id,
+        escalatedFromAgentId: assignee.id,
+      } as never,
+    })
+    .onConflictDoNothing();
+
+  await heartbeat.wakeup(manager.id, {
+    source: "automation",
+    triggerDetail: "system",
+    reason: "unseen_blocking_review_feedback",
+    idempotencyKey,
+    payload: {
+      issueId: input.issue.id,
+      sourceAssigneeAgentId: assignee.id,
+      prNumber: input.context.prNumber,
+      repoFullName: input.context.repoFullName,
+      headSha: input.context.headSha,
+    },
+    contextSnapshot: {
+      issueId: input.issue.id,
+      taskId: input.issue.id,
+      wakeReason: "unseen_blocking_review_feedback",
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      sourceAssigneeAgentId: assignee.id,
+    },
+  });
+
+  return { escalated: true, managerAgentId: manager.id };
 }
 
 const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
@@ -2706,6 +2979,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         assigneeAgentId: issues.assigneeAgentId,
         status: issues.status,
         executionState: issues.executionState,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
       })
       .from(issues);
     const matched = matchedIssues.filter(
@@ -3007,6 +3283,53 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             logger.warn(
               { err, issueId: issue.id, prNumber: context.prNumber },
               "self-review non-convergence escalation failed (non-fatal)",
+            );
+          }
+        }
+        // BLO-19497 AC #5: a blocking review landing on an issue whose
+        // assignee has no live wake path (monitor triggered, nextCheckAt
+        // null) must not just sit in a comment nobody will read -- hand it to
+        // the manager.
+        //
+        // Review finding (PR #1125): this used to be gated on
+        // reopen.commentInserted, on the theory that redelivery of the same
+        // review always re-finds commentInserted === false and so is
+        // naturally deduped. That reasoning breaks the moment
+        // escalateUnseenBlockingReviewFeedback itself fails transiently (its
+        // own comment write or the manager wakeup throws) AFTER the feedback
+        // comment above has already landed: every subsequent redelivery of
+        // that same review permanently sees commentInserted === false and
+        // this branch never runs again, so the escalation -- the whole point
+        // of AC #5 -- silently never happens. Attempt escalation on every
+        // delivery that meets the conditions instead, and let
+        // escalateUnseenBlockingReviewFeedback's own idempotency (wake +
+        // comment, both keyed on the same externalKey/idempotencyKey) decide
+        // whether there is anything left to do.
+        if (
+          effectiveAssigneeAgentId &&
+          isBlockingReviewState(context.reviewState) &&
+          isIssueMonitorTriggered(issue)
+        ) {
+          try {
+            const escalation = await escalateUnseenBlockingReviewFeedback(db, heartbeat, {
+              issue,
+              assigneeAgentId: effectiveAssigneeAgentId,
+              commentId: reopen.commentId,
+              context,
+              deliveryId,
+            });
+            if (escalation.escalated) {
+              escalated.push({
+                issueIdentifier: issue.identifier,
+                ownerAgentId: escalation.managerAgentId,
+                ownerType: "agent",
+                cycles: 0,
+              });
+            }
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id, prNumber: context.prNumber },
+              "unseen blocking review feedback escalation failed (non-fatal)",
             );
           }
         }
