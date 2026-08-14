@@ -1241,10 +1241,20 @@ describeEmbeddedPostgres("productivity review service", () => {
   // BLO-22436: the standard remediation for a flagged platform fault is to
   // model it as a `blockedBy` edge — which, without this gate, guarantees the
   // detector keeps flagging the same issue every cycle it stays blocked. An
-  // issue with an unresolved blocker must be exempt regardless of what its
-  // run history looks like, including a genuine executed-but-silent streak
-  // that would otherwise trip `no_comment_streak`.
-  it("skips an issue with an unresolved blocker regardless of streak (BLO-22436)", async () => {
+  // issue with an unresolved blocker must be exempt on a genuine
+  // executed-but-silent streak, not merely on the dependency-gate
+  // cancellations of the test above.
+  //
+  // Runs are spaced 10 minutes apart (Ally follow-up on 37c1bd65): at the
+  // default 1-minute spacing 10 silent runs also trip `high_churn`, and the
+  // suppression would then be passing on trigger precedence
+  // (`choosePrimaryTrigger` ranks `no_comment_streak` first) rather than on
+  // the behaviour under test. Wider spacing puts 7 runs in the trailing hour,
+  // under `highChurnHourly` (10), and 10 in six hours, under
+  // `highChurnSixHours` (30) — so `no_comment_streak` is the only trigger that
+  // fires and the whole fired set is dependency-closable. The co-fired case
+  // has its own test below.
+  it("skips an issue with an unresolved blocker on a genuine executed-but-silent streak (BLO-22436)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
     await insertRuns({
@@ -1253,6 +1263,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       issueId: seeded.issueId,
       count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
       now,
+      spacingMs: 10 * 60_000,
     });
     await addBlocker({
       companyId: seeded.companyId,
@@ -1270,6 +1281,47 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.dependencyBlockedSuppressed).toBe(1);
     expect(result.skipped).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22436 (Ally follow-up on 37c1bd65): the generation gate must weigh the
+  // blocker against EVERY trigger that fired, not the primary one.
+  // `choosePrimaryTrigger` is a priority ladder, so an agent that is both
+  // silent and churning presents `no_comment_streak` — which a blocker does
+  // excuse — while carrying `high_churn` evidence underneath, which it does
+  // not. Keying the skip on the primary alone left the original evasion intact
+  // for exactly the agent worth reviewing, and the defaults make that overlap
+  // the norm rather than a corner: `noCommentStreakRuns` and `highChurnHourly`
+  // are both 10, and `insertRuns` spaces runs 60s apart, so ten silent runs in
+  // ten minutes trip both predicates at once.
+  it("still generates a review for a dependency-blocked issue whose silent streak also trips high churn (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Default 60s spacing: 10 runs inside 10 minutes, so `noComment` AND
+    // `highChurn` both fire and `choosePrimaryTrigger` returns the former.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    expect(result.dependencyBlockedSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    // The primary is still the closable one — the artifact survives because of
+    // the non-closable trigger beneath it, and that trigger's evidence is what
+    // the review has to carry.
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).toContain("runs/0 assignee-run comments in 1h");
   });
 
   // BLO-22436 (Ally follow-up): the generation gate is scoped to the same
@@ -1358,7 +1410,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // above as never-invoked — the evidence block must say so rather than
     // rendering two adjacent counts that read as independent.
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 3 (3 already counted above as never-invoked) (dominant errorCode: `issue_dependencies_blocked`, 3 of 3)",
+      "Non-executing runs in sample window (excluded from streaks above): 3 (all 3 already counted above as never-invoked; dominant errorCode: `issue_dependencies_blocked`, all 3)",
     );
   });
 
@@ -1413,7 +1465,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // the 3 dependency-gate cancellations are also never-invoked; the 10
     // genuine infra failures are not (BLO-22436 Ally follow-up).
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 13 (3 already counted above as never-invoked, 10 additional) (dominant errorCode: `job_failed`, 10 of 13)",
+      "Non-executing runs in sample window (excluded from streaks above): 13 (3 already counted above as never-invoked, 10 additional; dominant errorCode: `job_failed`, 10 of 13)",
     );
   });
 
@@ -1454,7 +1506,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     const reviews = await listProductivityReviews(seeded.companyId);
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.description).toContain(
-      "Non-executing runs in sample window (excluded from streaks above): 10 (5 already counted above as never-invoked, 5 additional) (no single dominant errorCode)",
+      "Non-executing runs in sample window (excluded from streaks above): 10 (5 already counted above as never-invoked, 5 additional; no single dominant errorCode)",
     );
   });
 
@@ -1538,6 +1590,12 @@ describeEmbeddedPostgres("productivity review service", () => {
       action: "issue.productivity_review_created",
       entityType: "issue",
       entityId: reviewId,
+      // Deliberately the pre-BLO-22436-follow-up shape, with no `firedTriggers`:
+      // this pins the legacy fallback in `isDependencyBlockedClosableRecord`.
+      // Rows written before the set existed must keep closing, or an already-open
+      // legacy review on a now-blocked source is stranded open forever — nothing
+      // else revisits it. The equivalent new-shape row is covered by the
+      // `firedTriggers: ["no_comment_streak"]` case below.
       details: { trigger: "no_comment_streak", sourceIssueId: seeded.issueId },
     });
     await addBlocker({
@@ -1603,6 +1661,115 @@ describeEmbeddedPostgres("productivity review service", () => {
       entityType: "issue",
       entityId: reviewId,
       details: { trigger: "high_churn", sourceIssueId: seeded.issueId },
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedDependencyBlockedReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
+  // BLO-22436 (Ally follow-up on 37c1bd65): the positive half of the set
+  // predicate. Without this, a regression that made
+  // `isDependencyBlockedClosableTriggerSet` return false unconditionally would
+  // pass every other test here — the legacy row above closes through the
+  // single-trigger fallback, and the co-fired row below is expected not to
+  // close at all.
+  it("closes an open review whose persisted fired set is entirely dependency-closable (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "no_comment_streak",
+        firedTriggers: ["no_comment_streak", "long_active_duration"],
+        sourceIssueId: seeded.issueId,
+      },
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedDependencyBlockedReviews).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+  });
+
+  // BLO-22436 (Ally follow-up on 37c1bd65): the close path has the same
+  // primary-vs-set hazard as the generation gate, and fixing only generation
+  // would have been defeated here — a co-fired review now survives generation
+  // and is then persisted with `trigger: "no_comment_streak"`, which the old
+  // single-trigger close predicate would have retired on the very next pass.
+  // The fired set is persisted alongside the primary precisely so this arm can
+  // ask the same question.
+  it("does not close an open review whose fired set includes high churn, even though its primary is closable (BLO-22436)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "no_comment_streak",
+        firedTriggers: ["no_comment_streak", "high_churn"],
+        sourceIssueId: seeded.issueId,
+      },
     });
     await addBlocker({
       companyId: seeded.companyId,
