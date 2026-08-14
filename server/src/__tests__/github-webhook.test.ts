@@ -19,6 +19,7 @@ import {
   issueRecoveryActions,
   issues,
   issueWorkProducts,
+  POSTGRES_POOL_MAX,
 } from "@paperclipai/db";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
@@ -47,6 +48,7 @@ import {
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
   __resetWorkflowRunSupersessionTrackingForTest,
+  derivePrReviewerWakeMaxConcurrency,
   githubWebhookRoutes,
   reconcileContendedPrReviewerWakes,
   type GithubWebhookConfig,
@@ -3173,6 +3175,187 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(runs).toHaveLength(1);
       expect(runs[0]!.agentId).toBe(reviewerId);
       expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 40_000);
+
+    // Ally's review of this PR: the bound was hardcoded to 4 and reasoned from
+    // postgres.js's *default* pool size in prose, so a deployment that shrank
+    // the pool below 9 would silently reintroduce the hard deadlock. Pinning
+    // the invariant on the derivation covers pool sizes no integration test
+    // could practically stand up.
+    it("derives the wake concurrency bound from the pool size, leaving a spare connection", () => {
+      // Each winner needs 2 connections (its lock transaction + the enqueue),
+      // so the bound must leave at least one connection over for the retry
+      // poller and the rest of the API tier on the same pool.
+      for (const poolMax of [4, 6, 9, 10, 16, 20, 50]) {
+        const bound = derivePrReviewerWakeMaxConcurrency(poolMax);
+        expect(bound).toBeGreaterThanOrEqual(1);
+        expect(bound * 2).toBeLessThan(poolMax);
+      }
+      // Never zero, even on a pathologically small pool: one winner at a time
+      // still makes progress, where zero would wedge the path entirely.
+      for (const poolMax of [1, 2, 3]) {
+        expect(derivePrReviewerWakeMaxConcurrency(poolMax)).toBe(1);
+      }
+      // The shipped pool keeps the previously-hardcoded value, so this is a
+      // refactor of *how* the bound is obtained, not a behaviour change.
+      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX)).toBe(4);
+    });
+
+    // Ally's review of this PR: `no_reviewer` re-armed on the *contention*
+    // budget (~380s over 4 attempts), sized for a competing delivery holding a
+    // lock. A rolling restart or a paused agent routinely exceeds that, so the
+    // ordinary act of deploying the reviewer would dead-letter a sanctioned
+    // review request — the exact loss this PR exists to prevent.
+    it("outlives a reviewer outage longer than the whole lock-contention budget", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 22001;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseLongOutageScope: (() => void) | null = null;
+      const longOutageScopeReleased = new Promise<void>((resolve) => {
+        releaseLongOutageScope = resolve;
+      });
+      const longOutageScopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await longOutageScopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-long-outage")
+        .set("content-type", "application/json")
+        .send(body);
+
+      releaseLongOutageScope!();
+      await longOutageScopeHolder;
+
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+
+      // Six passes spanning 45 minutes — comfortably more attempts *and* more
+      // wall-clock than the contention ladder's 4 attempts / ~380s total.
+      const base = Date.now();
+      for (const offsetMs of [10_000, 60_000, 300_000, 600_000, 1_500_000, 2_700_000]) {
+        const pass = await reconcileContendedPrReviewerWakes(
+          db,
+          reviewerConfig(reviewerId),
+          new Date(base + offsetMs),
+        );
+        expect(pass.exhausted).toBe(0);
+        expect(pass.superseded).toBe(0);
+        expect(pass.recovered).toBe(0);
+      }
+      // Still armed, and crucially never dead-lettered: availability spent its
+      // own wall-clock budget, not the contention attempt budget.
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      // The availability ladder must actually escalate. Indexing it with the
+      // (deliberately frozen) contention `attempts` would pin every re-arm to
+      // the 30s rung and poll ~720 times across a 6h outage; the separate
+      // counter is what makes the backoff grow.
+      const armed = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(armed).toHaveLength(1);
+      const armedReplay = (armed[0]!.payload as Record<string, any>).prReviewerContendedRetry;
+      expect(armedReplay.availabilityAttempts).toBe(6);
+      // The contention budget is untouched — that is the whole point.
+      expect(armedReplay.attempts).toBe(0);
+      expect(typeof armedReplay.unavailableSince).toBe("string");
+      // Last re-arm sat on the ladder's tail (15 min), not its head (30s).
+      expect(
+        new Date(armedReplay.nextAttemptAt).getTime() - (base + 2_700_000),
+      ).toBe(900_000);
+
+      // The reviewer returns after the outage and the request is still there.
+      // Clock is past the last re-arm's due time (base + 2_700_000 + 900_000).
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const recoveryPass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(base + 3_700_000),
+      );
+      expect(recoveryPass.recovered).toBe(1);
+      const outageRuns = await runsForTask(taskKey);
+      expect(outageRuns).toHaveLength(1);
+      expect(outageRuns[0]!.agentId).toBe(reviewerId);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 60_000);
+
+    // Ally's review of this PR: the due-ness filter cast `nextAttemptAt` to
+    // timestamptz for every candidate row, so one malformed record would throw
+    // and fail the whole batch — stranding every other due retry behind it.
+    it("drains a malformed retry record without poisoning the rest of the batch", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 22002;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseMalformedScope: (() => void) | null = null;
+      const malformedScopeReleased = new Promise<void>((resolve) => {
+        releaseMalformedScope = resolve;
+      });
+      const malformedScopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await malformedScopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-alongside-malformed")
+        .set("content-type", "application/json")
+        .send(body);
+
+      releaseMalformedScope!();
+      await malformedScopeHolder;
+
+      const healthyRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(healthyRows).toHaveLength(1);
+      const healthy = healthyRows[0]!;
+      const healthyPayload = (healthy.payload ?? {}) as Record<string, unknown>;
+      const healthyReplay = healthyPayload.prReviewerContendedRetry as Record<string, unknown>;
+
+      // A sibling record whose nextAttemptAt is not timestamp-castable. Written
+      // by hand because no current code path produces one — the point is that a
+      // future one, or a partially-rolled-out deploy, must not take the whole
+      // reconciler down with it.
+      await db.insert(agentWakeupRequests).values({
+        ...healthy,
+        id: randomUUID(),
+        idempotencyKey: `${healthy.idempotencyKey}-malformed`,
+        payload: {
+          ...healthyPayload,
+          prReviewerContendedRetry: { ...healthyReplay, nextAttemptAt: "not-a-timestamp" },
+        },
+      });
+
+      // One pass must both retire the garbage and dispatch the healthy record.
+      const pass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      expect(pass.recovered).toBe(1);
+      expect(pass.superseded).toBe(1);
+
+      const malformedRuns = await runsForTask(taskKey);
+      expect(malformedRuns).toHaveLength(1);
+      expect(malformedRuns[0]!.agentId).toBe(reviewerId);
     }, 40_000);
 
     it("completes rather than deadlocking when concurrent distinct-PR deliveries saturate the pool", async () => {

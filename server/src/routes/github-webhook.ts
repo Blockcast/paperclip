@@ -29,6 +29,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import {
   type Db,
+  POSTGRES_POOL_MAX,
   agents,
   agentWakeupRequests,
   companies,
@@ -37,7 +38,7 @@ import {
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -1754,25 +1755,35 @@ async function withPrReviewerTaskLock<T>(
  * A lock winner holds its lock-owning transaction's pooled connection while
  * `heartbeat.wakeup()` checks out a *second* one for its own enqueue
  * transaction. Deliveries for distinct PRs never contend on the advisory lock,
- * so nothing throttled how many could be mid-flight at once: with createDb's
+ * so nothing throttled how many could be mid-flight at once: with a
  * 10-connection pool, 11+ simultaneous distinct-PR deliveries each took a
  * connection and then waited forever for one that only a peer could release.
  * Reproduced as a hard deadlock — 12 concurrent deliveries hung past a 60s
  * test timeout rather than completing.
  *
- * Bounding the winners at 4 caps this path at 8 connections and leaves
- * headroom, so the second checkout is always satisfiable. Excess deliveries
- * queue in-process for a few milliseconds each rather than deadlocking; the
- * whole critical section is two statements plus the enqueue, so even a large
- * burst drains far inside GitHub's webhook timeout.
+ * The bound is *derived* from {@link POSTGRES_POOL_MAX} rather than asserted in
+ * prose, so shrinking the pool shrinks the bound with it instead of silently
+ * reintroducing the deadlock. Each winner needs 2 connections, and we leave at
+ * least one spare for the retry poller and the rest of the API tier sharing
+ * this pool — hence `floor(max / 2) - 1`. Excess deliveries queue in-process
+ * for a few milliseconds each; the critical section is two statements plus the
+ * enqueue, so even a large burst drains far inside GitHub's webhook timeout.
  *
  * This is a bound, not the structural fix. Doing the enqueue on the lock's own
  * connection would remove the second checkout entirely, but `enqueueWakeup`
  * opens its own transaction and threading one through it is a much wider
  * change to the wake path — deliberately left for structural review rather
  * than folded in here.
+ *
+ * Exported for test: the invariant that matters is `2 * bound < poolMax`, and
+ * pinning it as a property of the derivation covers pool sizes no integration
+ * test could practically stand up.
  */
-const PR_REVIEWER_WAKE_MAX_CONCURRENCY = 4;
+export function derivePrReviewerWakeMaxConcurrency(poolMax: number): number {
+  return Math.max(1, Math.floor(poolMax / 2) - 1);
+}
+
+const PR_REVIEWER_WAKE_MAX_CONCURRENCY = derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX);
 let prReviewerWakeInFlight = 0;
 const prReviewerWakeWaiters: Array<() => void> = [];
 
@@ -1987,13 +1998,36 @@ const PR_REVIEWER_CONTENDED_BACKOFF_MS = [5_000, 15_000, 60_000, 300_000];
 const PR_REVIEWER_CONTENDED_MAX_ATTEMPTS = PR_REVIEWER_CONTENDED_BACKOFF_MS.length;
 
 /**
+ * Reviewer *availability* is bounded separately from lock contention
+ * (BLO-21995).
+ *
+ * The ladder above is sized for a competing delivery holding the PR scope —
+ * milliseconds — and totals ~380s. Reviewer downtime is a different
+ * distribution entirely: a rolling restart, a pause for a config push, or a
+ * budget top-up routinely exceeds 6 minutes. Charging those to the contention
+ * budget would dead-letter a sanctioned review request for the ordinary
+ * operation of deploying the reviewer.
+ *
+ * So availability re-arms on its own slower ladder and is bounded by
+ * wall-clock rather than by attempt count — the question is "has the reviewer
+ * been gone too long to still be worth waking for this PR", which is a
+ * duration, not a number of polls.
+ */
+const PR_REVIEWER_UNAVAILABLE_BACKOFF_MS = [30_000, 120_000, 300_000, 900_000];
+const PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS = 6 * 60 * 60 * 1_000;
+
+/**
  * Raised when a replay finds no invokable reviewer (BLO-21995).
  *
  * Deliberately NOT an {@link HttpError}: that class means "a business rule
  * refused this and will keep refusing", which retires the record. Reviewer
  * availability is the opposite — a transient condition the durable record
- * exists to outlive — so this rides the normal transient path and is bounded by
- * the same attempt budget.
+ * exists to outlive — so this rides the transient re-arm path.
+ *
+ * It is bounded by {@link PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS} rather than by
+ * the lock-contention attempt budget: charging a reviewer restart to a ladder
+ * sized for a held advisory lock would dead-letter a sanctioned request for the
+ * ordinary act of deploying the reviewer.
  */
 class PrReviewerUnavailableError extends Error {
   constructor() {
@@ -2005,6 +2039,20 @@ class PrReviewerUnavailableError extends Error {
 /** Replay input persisted on a contended record; `buildPrReviewerWakeupOptions` is a pure function of these. */
 interface ContendedPrReviewerReplay {
   attempts: number;
+  /**
+   * Wall-clock anchor for the *availability* wait, held separately from
+   * `attempts` so a reviewer outage cannot burn the lock-contention budget
+   * (BLO-21995). Null until the first `no_reviewer` replay; cleared again if
+   * the reviewer comes back and the replay fails for some other reason.
+   */
+  unavailableSince: string | null;
+  /**
+   * Position on the availability ladder. Separate from `attempts` for the same
+   * reason, and needed on its own so the availability backoff actually
+   * escalates — indexing the ladder with the frozen `attempts` would poll at
+   * the first rung forever.
+   */
+  availabilityAttempts: number;
   nextAttemptAt: string;
   eventName: string;
   deliveryId: string | null;
@@ -2080,6 +2128,10 @@ async function persistContendedPrReviewerWake(params: {
 
   const replay: ContendedPrReviewerReplay = {
     attempts: 0,
+    // Null until a replay actually finds the reviewer gone; the availability
+    // clock starts then, not at contention time.
+    unavailableSince: null,
+    availabilityAttempts: 0,
     // Never null: a record the due-ness filter can't select is stranded
     // silently, the failure mode the provider-capacity path guards with its
     // own default delay.
@@ -2100,10 +2152,14 @@ async function persistContendedPrReviewerWake(params: {
   // `agent_wakeup_requests` is one of the largest tables in the schema and
   // drizzle runs migrations transactionally, so the index could not be built
   // CONCURRENTLY — it would hold ACCESS EXCLUSIVE across a full heap scan and
-  // stall the very wake path this change exists to protect. This lock is a
-  // different key space from the PR-scope lock (distinct prefix), so the two
-  // never alias, and it is taken after the PR-scope lock has already been
-  // released.
+  // stall the very wake path this change exists to protect.
+  //
+  // This lock shares the single-bigint advisory space with the PR-scope lock
+  // (both hash through `hashtextextended(k, 0)`), so the distinct string prefix
+  // does NOT give it a separate key space — separation rests on 64-bit
+  // collision improbability, not on construction. That is fine here: there is
+  // no lock-ordering hazard either way, because the PR-scope lock has already
+  // been released by the time this one is taken.
   const claimKey = `pr_reviewer_contended_retry:${idempotencyKey}`;
   const recorded = await db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${claimKey}, 0))`);
@@ -2171,6 +2227,16 @@ export interface ContendedPrReviewerWakeReconciliation {
   stillContended: number;
 }
 
+/**
+ * Parse a persisted replay record, validating the fields the replay actually
+ * consumes rather than just the ones it indexes on.
+ *
+ * Records outlive a deploy (an availability wait can span hours), so a version
+ * that adds a required context field will meet rows written by the previous
+ * one. Anything missing here must fail the parse — where the caller retires the
+ * row as `superseded` — rather than reaching `buildPrReviewerWakeupOptions` and
+ * producing a wake addressed to `undefined`, or a metric labelled with it.
+ */
 function parseContendedReplay(payload: unknown): ContendedPrReviewerReplay | null {
   if (!payload || typeof payload !== "object") return null;
   const replay = (payload as Record<string, unknown>).prReviewerContendedRetry;
@@ -2178,10 +2244,23 @@ function parseContendedReplay(payload: unknown): ContendedPrReviewerReplay | nul
   const candidate = replay as Partial<ContendedPrReviewerReplay>;
   if (!candidate.context || typeof candidate.context !== "object") return null;
   if (typeof candidate.context.prNumber !== "number") return null;
+  // Consumed by buildPrReviewerWakeupOptions and by the delivery metric's
+  // `reason` label respectively.
+  if (typeof candidate.context.repoFullName !== "string") return null;
+  if (typeof candidate.context.wakeReason !== "string") return null;
   if (typeof candidate.taskKey !== "string" || typeof candidate.eventName !== "string") return null;
+  if (typeof candidate.nextAttemptAt !== "string") return null;
+  // Must round-trip, not merely be a string: the due-ness query treats a
+  // non-castable value as NULL (= due), so a row that got here with garbage
+  // would otherwise replay on every pass forever instead of being retired.
+  if (Number.isNaN(Date.parse(candidate.nextAttemptAt))) return null;
   return {
     attempts: typeof candidate.attempts === "number" ? candidate.attempts : 0,
-    nextAttemptAt: typeof candidate.nextAttemptAt === "string" ? candidate.nextAttemptAt : "",
+    unavailableSince:
+      typeof candidate.unavailableSince === "string" ? candidate.unavailableSince : null,
+    availabilityAttempts:
+      typeof candidate.availabilityAttempts === "number" ? candidate.availabilityAttempts : 0,
+    nextAttemptAt: candidate.nextAttemptAt,
     eventName: candidate.eventName,
     deliveryId: typeof candidate.deliveryId === "string" ? candidate.deliveryId : null,
     taskKey: candidate.taskKey,
@@ -2221,17 +2300,25 @@ export async function reconcileContendedPrReviewerWakes(
   // Filter and order by due-ness, not requestedAt: under a backlog, older rows
   // whose backoff has escalated further out would otherwise fill the batch and
   // starve rows that are due right now (the BLO-14395 review lesson).
-  const nextAttemptAtExpr = sql`(${agentWakeupRequests.payload} -> 'prReviewerContendedRetry' ->> 'nextAttemptAt')::timestamptz`;
+  //
+  // The cast is guarded because it runs over *every* candidate row: a single
+  // record whose `nextAttemptAt` is not timestamp-castable would abort the
+  // whole query and strand every other due retry behind it. Shape-checking
+  // first yields NULL for such a row instead, and NULL is treated as due and
+  // sorted first, so the row is drained on the next pass (`parseContendedReplay`
+  // rejects it and it retires as `superseded`) rather than silently stuck.
+  const nextAttemptAtText = sql`(${agentWakeupRequests.payload} -> 'prReviewerContendedRetry' ->> 'nextAttemptAt')`;
+  const nextAttemptAtExpr = sql`(CASE WHEN ${nextAttemptAtText} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]' THEN ${nextAttemptAtText}::timestamptz END)`;
   const dueRows = await db
     .select()
     .from(agentWakeupRequests)
     .where(
       and(
         eq(agentWakeupRequests.status, PR_REVIEWER_CONTENDED_STATUS),
-        sql`${nextAttemptAtExpr} <= ${now.toISOString()}::timestamptz`,
+        sql`(${nextAttemptAtExpr} IS NULL OR ${nextAttemptAtExpr} <= ${now.toISOString()}::timestamptz)`,
       ),
     )
-    .orderBy(asc(nextAttemptAtExpr))
+    .orderBy(sql`${nextAttemptAtExpr} ASC NULLS FIRST`)
     .limit(50);
 
   for (const row of dueRows) {
@@ -2269,9 +2356,9 @@ export async function reconcileContendedPrReviewerWakes(
         // config push, mid-restart, momentarily between runs — and the whole
         // point of a durable record is to outlive exactly that. Retiring here
         // would drop a sanctioned review request because the reviewer happened
-        // to be down for the seconds this pass ran. Re-arm on the normal
-        // backoff; the attempt budget still bounds it, and a reviewer that
-        // never comes back exhausts into an alertable `dead_lettered`.
+        // to be down for the seconds this pass ran. Re-armed below on the
+        // dedicated availability ladder, bounded by wall-clock rather than by
+        // the lock-contention attempt budget.
         throw new PrReviewerUnavailableError();
       }
       // duplicate / declined are terminal for this delivery: replaying cannot
@@ -2302,7 +2389,20 @@ export async function reconcileContendedPrReviewerWakes(
         );
         continue;
       }
-      if (attempts >= PR_REVIEWER_CONTENDED_MAX_ATTEMPTS) {
+      const unavailable = err instanceof PrReviewerUnavailableError;
+      // Reviewer downtime does not consume the lock-contention budget: it
+      // re-arms on its own ladder and is bounded by how long the reviewer has
+      // been gone, not by how many times we have looked (BLO-21995).
+      const unavailableSince = unavailable
+        ? (replay.unavailableSince ?? now.toISOString())
+        : null;
+      const unavailableForMs = unavailableSince
+        ? now.getTime() - new Date(unavailableSince).getTime()
+        : 0;
+      const budgetExhausted = unavailable
+        ? unavailableForMs >= PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS
+        : attempts >= PR_REVIEWER_CONTENDED_MAX_ATTEMPTS;
+      if (budgetExhausted) {
         await retireContendedRow(
           db,
           row.id,
@@ -2314,13 +2414,30 @@ export async function reconcileContendedPrReviewerWakes(
         recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: replay.context.wakeReason });
         result.exhausted += 1;
         logger.error(
-          { err, taskKey: replay.taskKey, deliveryId: replay.deliveryId, attempts },
-          "contended PR-reviewer wake exhausted its durable retries; manual redelivery required (BLO-21995)",
+          {
+            err,
+            taskKey: replay.taskKey,
+            deliveryId: replay.deliveryId,
+            attempts,
+            wakeupRequestId: row.id,
+            ...(unavailable ? { unavailableForMs, unavailableSince } : {}),
+          },
+          // NOT "redeliver from GitHub": the contended delivery answered 200
+          // precisely so GitHub would not retain it, and GitHub only offers
+          // redelivery for deliveries it recorded as failed. There is no
+          // GitHub-side replay to perform. The full replay payload is still on
+          // this row, so the recovery is in-process — flip the status back and
+          // the next reconcile pass picks it up unchanged.
+          "contended PR-reviewer wake exhausted its durable retries; recover in-process by resetting " +
+            `agent_wakeup_requests.status from '${PR_REVIEWER_CONTENDED_EXHAUSTED_STATUS}' to ` +
+            `'${PR_REVIEWER_CONTENDED_STATUS}' for this id (BLO-21995)`,
         );
         continue;
       }
-      const backoffMs =
-        PR_REVIEWER_CONTENDED_BACKOFF_MS[attempts] ?? PR_REVIEWER_CONTENDED_BACKOFF_MS.at(-1)!;
+      const backoffMs = unavailable
+        ? (PR_REVIEWER_UNAVAILABLE_BACKOFF_MS[replay.availabilityAttempts] ??
+          PR_REVIEWER_UNAVAILABLE_BACKOFF_MS.at(-1)!)
+        : (PR_REVIEWER_CONTENDED_BACKOFF_MS[attempts] ?? PR_REVIEWER_CONTENDED_BACKOFF_MS.at(-1)!);
       await db
         .update(agentWakeupRequests)
         .set({
@@ -2328,7 +2445,14 @@ export async function reconcileContendedPrReviewerWakes(
             ...(row.payload ?? {}),
             prReviewerContendedRetry: {
               ...replay,
-              attempts,
+              // An availability wait must not spend the contention budget, or
+              // a reviewer restart dead-letters the request after ~6 minutes.
+              attempts: unavailable ? replay.attempts : attempts,
+              unavailableSince,
+              // Walks the availability ladder while the reviewer is gone, and
+              // resets once it comes back so a later outage starts over at the
+              // short rung rather than inheriting the previous one's tail.
+              availabilityAttempts: unavailable ? replay.availabilityAttempts + 1 : 0,
               nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
             },
           },
@@ -2960,7 +3084,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           );
           throw new PrReviewerTaskLockContentionError();
         }
-        if (err instanceof PrReviewerTaskLockContentionError) throw err;
         logger.error(
           {
             err,
