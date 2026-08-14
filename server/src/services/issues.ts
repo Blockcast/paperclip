@@ -6759,6 +6759,12 @@ export function issueService(db: Db) {
   const service = {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    // Exposed for the PATCH /issues/:id terminal-status transition (BLO-23206),
+    // which is the one drain site that lives in the routes layer rather than
+    // here. Cancelling an issue previously ended at most ONE run — the running
+    // one — leaving queued/scheduled_retry rows to be claimed against the dead
+    // issue on the next 30s scheduler tick.
+    cancelStaleIssueContextRuns,
 
     list: async (companyId: string, filters?: IssueFilters) => {
       if (filters?.attention === "blocked") {
