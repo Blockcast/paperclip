@@ -294,15 +294,49 @@ const MIN_OPAQUE_TOKEN_LENGTH = 20;
  * and never themselves a bearer credential: bare hex (git SHAs, hex object
  * ids) and canonical UUIDs. Also exempt a segment that reads as a
  * human-authored slug — several short hyphen/underscore-joined words rather
- * than one unbroken blob — since real opaque secrets are never chunked into
- * dictionary-shaped parts.
+ * than one unbroken blob.
+ *
+ * "Chunked into short parts" is NOT on its own evidence of readability
+ * (Important finding, #1136 review, head b78bb2e9): a delimiter-chunked
+ * opaque token such as `a1b2c3d4-e5f6g7h8-i9j0k1l2` is three parts of <=12
+ * chars and passed a pure arity/length test, so the generic backstop that is
+ * supposed to fail closed on unrecognized long values let it through. Judge
+ * the parts *lexically* instead: a slug's parts are whole words
+ * (`pending`, `merge`) or bare numbers (`20810`, an issue id), whereas the
+ * signature of an opaque chunk is letters and digits interleaved *within*
+ * one part. Require at least two word-shaped parts as well, so an all-numeric
+ * chunking (`12345678-87654321-11223344`) stays fail-closed too.
+ *
+ * Residual, deliberately accepted: a secret chunked into purely alphabetic
+ * parts (`abcdefgh-ijklmnop-qrstuvwx`) is still exempted. Separating that
+ * from a real word list needs a dictionary; the alternative — dropping the
+ * exemption — re-blanks the status slugs and evidence links this issue
+ * exists to stop over-redacting, which is the more common and more costly
+ * failure. Tier-1 keys never reach this test, so a value under a genuinely
+ * secret-named field is redacted regardless of shape.
  */
 const HEX_IDENTIFIER_RE = /^[0-9a-f]{20,64}$/i;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SLUG_WORD_PART_RE = /^[A-Za-z]+$/;
+const SLUG_NUMERIC_PART_RE = /^[0-9]+$/;
+const MAX_SLUG_PART_LENGTH = 12;
 
 function looksLikeReadableSlug(segment: string): boolean {
   const parts = segment.split(/[-_]/).filter(Boolean);
-  return parts.length >= 3 && parts.every((part) => part.length <= 12);
+  if (parts.length < 3) return false;
+  let wordParts = 0;
+  for (const part of parts) {
+    if (part.length > MAX_SLUG_PART_LENGTH) return false;
+    if (SLUG_WORD_PART_RE.test(part)) {
+      wordParts += 1;
+      continue;
+    }
+    // Bare numbers (issue ids, years, counts) are ordinary slug components.
+    // Anything else — notably letters and digits mixed inside a single
+    // part — is an opaque chunk, so fail closed.
+    if (!SLUG_NUMERIC_PART_RE.test(part)) return false;
+  }
+  return wordParts >= 2;
 }
 
 function hasOpaqueUrlPathSegment(pathname: string): boolean {
