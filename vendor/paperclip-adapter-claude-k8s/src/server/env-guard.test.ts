@@ -121,6 +121,25 @@ const blocked = [
   // Wrapper + lexical transformation combined.
   "sh -c 'e''nv'",
   "eval env >&2",
+  // Round 7 — two bypasses the lexer rewrite itself opened or left open.
+  // Redirection: the target word never enters argv, so stripping it outright
+  // hid the path from the `/proc/*/environ` scan even though the shell still
+  // opens the file. `cat /proc/self/environ` (above) blocked throughout and
+  // read as coverage of this class without being it.
+  "cat </proc/self/environ",
+  "cat < /proc/1/environ",
+  "cat <'/proc/self/environ'", // quoted target, same open
+  // Bundled short-flag clusters: whole-word `-x` comparison missed `-px`,
+  // which prints every exported variable WITH its value. Measured against
+  // `bash -c` with a marker variable set, these all emit the marker's VALUE
+  // and all classified as allow before the operand rule replaced the flag
+  // comparison: `declare` (447 lines), `declare -p` (460), `declare -px`
+  // (421), `export` (421). Only `declare -x` / `export -p` were caught.
+  "declare -px",
+  "declare -xp",
+  "declare -p",
+  "declare",
+  "export",
 ];
 const allowed = [
   // The trailing terminator deliberately does NOT include whitespace, which is
@@ -182,6 +201,16 @@ const allowed = [
   'sh -c "ls -la"', // shell payload recursed, and it is not a dump
   "sh -c 'cd /repo && npm test'",
   "echo 'a > b'",
+  // Round 7 — recording redirection targets must not turn an ordinary
+  // redirect into a dump, and must not promote the target to an operand
+  // (which would make `env >/tmp/out` above stop blocking).
+  "cat </tmp/notes.txt",
+  "sort < /etc/hostname",
+  "node script.js </dev/null",
+  "declare -f deploy", // function display, no -x in the cluster
+  "declare -p PATH", // one named variable, not the exported set
+  "export FOO=bar", // an assignment is a name operand, so it is scoped
+  "export PATH",
   "",
 ];
 
