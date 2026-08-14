@@ -575,6 +575,73 @@ jobs:
         if: matrix.group == 'general-server'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
+  vendor_claude_k8s:
+    # BLO-17980 / BLO-22506: the claude_k8s adapter templates every agent Job
+    # pod. It used to live in kkroo/paperclip-adapter-claude-k8s, outside our
+    # GitHub App installation, so a critical credential-injection finding sat
+    # there unreviewable by our CI for days. The source is now vendored at
+    # vendor/paperclip-adapter-claude-k8s/ and this job is what makes it
+    # reviewable: it runs the adapter's own suite, which contains the
+    # fail-closed guard rejecting any pod spec that carries a sensitive-named
+    # env var (/TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH/i) as a literal
+    # `value` instead of a secretKeyRef.
+    #
+    # This package is deliberately outside the pnpm workspace and the root
+    # tsconfig project references (see pnpm-workspace.yaml), so nothing else
+    # in CI compiles or exercises it. Without this job it is dead-lettered.
+    name: Vendored claude_k8s adapter
+    runs-on: arc-light
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: vendor/paperclip-adapter-claude-k8s
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: vendor/paperclip-adapter-claude-k8s/package-lock.json
+
+      # --include=dev is explicit: some runner images set `npm config omit=dev`,
+      # which silently skips typescript/vitest and turns this job into a no-op
+      # that still reports green.
+      - name: Install
+        run: npm ci --include=dev
+
+      - name: Typecheck
+        run: npx --no-install tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      # Guards the PROVENANCE.md integrity manifest. If someone edits the
+      # vendored source, this hash changes and PROVENANCE.md must be updated
+      # in the same PR — otherwise the recorded provenance silently drifts
+      # from what is actually in the tree.
+      - name: Verify provenance manifest
+        run: |
+          set -euo pipefail
+          actual=$(git ls-files \
+            | grep -vxE 'LICENSE|PROVENANCE\.md' \
+            | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          recorded=$(grep -oE '^[0-9a-f]{64}$' PROVENANCE.md | head -1)
+          echo "actual:   $actual"
+          echo "recorded: $recorded"
+          if [ -z "$recorded" ]; then
+            echo "::error::No 64-hex integrity hash found in PROVENANCE.md."
+            exit 1
+          fi
+          if [ "$actual" != "$recorded" ]; then
+            echo "::error::Vendored source changed but PROVENANCE.md integrity hash was not updated."
+            echo "Update the hash in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $actual"
+            exit 1
+          fi
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the four general-server matrix jobs,
@@ -590,6 +657,7 @@ jobs:
         opencode_responses_replay,
         opencode_k8s_seed_cold_start,
         build,
+        vendor_claude_k8s,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     timeout-minutes: 5
@@ -624,6 +692,7 @@ jobs:
           OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
           OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
         run: |
           lane_names=(
             helm_chart
@@ -633,6 +702,7 @@ jobs:
             opencode_responses_replay
             opencode_k8s_seed_cold_start
             build
+            vendor_claude_k8s
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -642,6 +712,7 @@ jobs:
             "$OPENCODE_RESPONSES_REPLAY_RESULT"
             "$OPENCODE_K8S_SEED_COLD_START_RESULT"
             "$BUILD_RESULT"
+            "$VENDOR_CLAUDE_K8S_RESULT"
           )
 
           cancelled_lanes=()
