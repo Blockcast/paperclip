@@ -305,10 +305,71 @@ jobs:
             echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:${{ steps.image_tag.outputs.value }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
-    needs: build-and-push
+  # BLO-26972: GitHub allows only ONE run to sit *pending* per concurrency
+  # group. `deploy`'s group is keyed on the release/namespace, not on this
+  # run, so a second workflow_dispatch that reaches the group while an
+  # earlier one is still parked on the paperclip-production reviewer gate
+  # does not queue behind it — GitHub cancels the earlier, already-waiting
+  # approval outright. `cancel-in-progress: false` does not prevent this: it
+  # only stops a later run from cancelling an earlier run's *in-progress*
+  # job, and a run stuck on environment-approval review is not in progress.
+  # Three consecutive production deploys died this way, unapproved, each
+  # evicted within minutes of the next dispatch.
+  #
+  # Runs BEFORE `deploy` can enter that concurrency group at all, so an
+  # existing pending approval is never a candidate for eviction in the first
+  # place. Deliberately does not depend on build-and-push, so the check
+  # resolves in seconds rather than waiting out the full image build.
+  guard-pending-deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' }}
     runs-on: arc-deploy
-    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Check for an existing pending production approval
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # status=waiting is GitHub's status for a run parked on an
+          # environment reviewer gate (as opposed to queued for a runner).
+          # This lists across ALL docker.yml runs, not just this concurrency
+          # group, because the thing we must never evict is any run already
+          # waiting on paperclip-production — the group key is what caused
+          # the bug, not what should scope the guard.
+          runs_json="$(gh api "repos/${REPO}/actions/workflows/docker.yml/runs?status=waiting&per_page=20")"
+          pending="$(printf '%s' "$runs_json" | jq -c --arg cur "$CURRENT_RUN_ID" \
+            '[.workflow_runs[] | select((.id | tostring) != $cur)] | sort_by(.created_at) | .[0] // empty')"
+          if [ -n "${pending}" ] && [ "${pending}" != "null" ]; then
+            pending_url="$(printf '%s' "$pending" | jq -r '.html_url')"
+            pending_created="$(printf '%s' "$pending" | jq -r '.created_at')"
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Deploy dispatch skipped"
+              echo "A production deployment is already waiting on approval, pending since ${pending_created}:"
+              echo "- ${pending_url}"
+              echo ""
+              echo "This dispatch will not enter the paperclip-production queue, so that pending approval is not evicted."
+              echo "Approve or reject it first, then re-dispatch this workflow if a deploy of this commit is still wanted."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    # `needs.guard-pending-deploy.result == 'success'` is required (not just
+    # `outputs.blocked != 'true'`) so a failed/errored guard check — e.g. a
+    # GitHub API hiccup — fails closed into skipping this deploy, rather than
+    # silently proceeding with an unknown pending-approval state.
+    needs: [build-and-push, guard-pending-deploy]
+    runs-on: arc-deploy
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
     # Covers the sequential 30m Helm wait and 30m post-reconcile rollout wait,
