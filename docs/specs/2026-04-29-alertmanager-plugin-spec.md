@@ -374,7 +374,15 @@ e.g. `[critical] CiliumPolicyDropsHigh · pve-3`
 ### 7.3 Priority
 
 `config.severityToPriority[alert.labels.severity]`, falling back to `medium`.
-Defaults: `critical → critical`, `warning → high`, `info → medium`.
+Defaults: `critical → critical`, `page → critical`, `warning → high`,
+`info → medium`, `ticket → low`.
+
+> **BLO-27018.** `page` and `ticket` were added after they were found missing.
+> The Blockcast rule groups emit `page` as their highest severity, so it was
+> falling through to the `medium` fallback. Any severity absent from this map
+> is also absent from the escalation-deadline map (§7.7), which nulls the
+> ladder — see the warning there. Keep the two maps' vocabularies in sync with
+> what the `PrometheusRule` groups actually emit.
 
 ### 7.4 Origin tags (so other plugins can correlate)
 
@@ -480,6 +488,23 @@ In order, first hit wins:
 4. **Default per-company on-call** (future extension; out of scope V1).
 5. **No assignee.** Issue is created unassigned — the issue still shows up in
    the company's queue, just nobody is paged.
+
+> **BLO-27018 — step 5 is not a safe resting state, and the thing that was
+> supposed to catch it was disabled.** An unassigned alert is meant to be
+> rescued by the escalation sweep, whose "no agent owner at all" branch opens a
+> board cover. That branch is unreachable when
+> `escalationDeadlineMinutes[severity]` is undefined: the deadline resolves to
+> `null`, the handler stores `nextEscalationAt: null`, and the per-minute sweep
+> early-returns on that field forever. A severity missing from the deadline map
+> therefore silently disables the *entire* safety net for that severity, not
+> just its timing.
+>
+> This is how a ~24h penstock outage (BLO-27008) produced alerts nobody was
+> woken for: `severity=page` was in neither map, and the shipped `ownerMap`
+> keyed only on `class` — a label the observability rule groups do not emit —
+> so step 2 could never match and step 5 was the guaranteed outcome. When
+> adding a route, check both the label key and the severity vocabulary against
+> what the rule groups actually emit.
 
 The lookup goes through a cached helper (mirror of
 `paperclip-plugin-linear/src/worker.ts:117–140`):
