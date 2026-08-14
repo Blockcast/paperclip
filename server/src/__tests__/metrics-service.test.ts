@@ -34,6 +34,8 @@ import {
   KNOWN_WORKFLOW_RUN_CONCLUSIONS,
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
   UNKNOWN_EXTERNAL_ADAPTER,
   UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
   UNKNOWN_PROCESS_LOST_BUCKET,
@@ -55,7 +57,7 @@ import {
   normalizeExternalLifecycleTerminalStatus,
   recordExternalLifecycleRunSilenceGap,
   setQueuedRunOldestAgeMetrics,
-  QUEUED_RUN_OLDEST_AGE_METRIC,
+  setQueuedRunAgeMetricsRefreshSuccess,
 } from "../services/metrics.js";
 import {
   incrementRoutineDispatchMetric,
@@ -679,6 +681,30 @@ describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
     setExternalLifecycleRunningRuns({ claude_k8s: 1, some_future_k8s: 3, another: 4 });
     const { body } = await renderMetrics();
     expect(body).toContain(`${EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC}{adapter="other"} 7`);
+  });
+});
+
+describe("queued-run age metrics (BLO-21116)", () => {
+  it("publishes explicit queue zeros and a separate refresh-success signal", async () => {
+    const agentA = "11111111-1111-1111-1111-111111111111";
+    const agentB = "22222222-2222-2222-2222-222222222222";
+    const known = new Set([agentA, agentB]);
+
+    setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
+    setQueuedRunAgeMetricsRefreshSuccess(true);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+    expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
+
+    // A successful next refresh with no queued rows resolves the age. A
+    // failed refresh is independently visible rather than being mistaken for
+    // a fresh zero.
+    setQueuedRunOldestAgeMetrics([], known);
+    setQueuedRunAgeMetricsRefreshSuccess(false);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
   });
 });
 

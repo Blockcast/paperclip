@@ -2358,3 +2358,108 @@ describe.sequential("plugin state routes stay board-only for agent actors (BLO-2
     expect(res.status).toBe(501);
   });
 });
+
+// ---------------------------------------------------------------------------
+// BLO-26530 — masking gaps in the merged BLO-20871 boundary, at the route level
+// ---------------------------------------------------------------------------
+
+describe.sequential("plugin config masking gaps (BLO-26530)", () => {
+  const TARGET_SECRET = "sentinel-target-bearer-do-not-leak";
+  const CONDITIONAL_SECRET = "sentinel-conditional-bearer-do-not-leak";
+
+  /** An array whose entries declare an immutable identity, plus a conditional arm. */
+  const gapSchema = {
+    type: "object",
+    properties: {
+      targets: {
+        type: "array",
+        items: {
+          type: "object",
+          "x-paperclip-identity": "name",
+          properties: {
+            name: { type: "string" },
+            url: { type: "string" },
+            token: { type: "string", writeOnly: true },
+          },
+        },
+      },
+      mode: { type: "string" },
+    },
+    if: { properties: { mode: { const: "managed" } } },
+    then: { properties: { lookaside: { type: "string", writeOnly: true } } },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRegistry.getConfig.mockReset();
+    mockRegistry.upsertConfig.mockReset();
+    ragHealthBucketCache.clear();
+    mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyA, status: "active" });
+    mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("refuses a write that posts one designated identity twice, leaving the stored credential untouched", async () => {
+    maskingPlugin(gapSchema);
+    const store = seedConfigStore({
+      targets: [{ name: "alpha", url: "https://a.example.com", token: TARGET_SECRET }],
+      mode: "direct",
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({
+        companyId: companyA,
+        configJson: {
+          targets: [
+            { name: "alpha", url: "https://a.example.com", token: "__redacted__" },
+            { name: "alpha", url: "https://attacker.example.com", token: "__redacted__" },
+          ],
+          mode: "direct",
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+    // The credential must appear in neither resulting entry, and the rejected
+    // write must not have disturbed storage.
+    expect(JSON.stringify(res.body)).not.toContain(TARGET_SECRET);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    expect(store.configJson).toEqual({
+      targets: [{ name: "alpha", url: "https://a.example.com", token: TARGET_SECRET }],
+      mode: "direct",
+    });
+  }, 20_000);
+
+  it("never emits a secret declared behind a conditional branch to an authorized reader", async () => {
+    maskingPlugin(gapSchema);
+    seedConfigStore({ mode: "managed", lookaside: CONDITIONAL_SECRET });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/config?companyId=${companyA}`);
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(CONDITIONAL_SECRET);
+    expect(res.body.configJson).toEqual({ mode: "managed", lookaside: "__redacted__" });
+  }, 20_000);
+
+  it("round-trips a conditionally declared secret losslessly", async () => {
+    maskingPlugin(gapSchema);
+    const store = seedConfigStore({ mode: "managed", lookaside: CONDITIONAL_SECRET });
+    const { app } = await createApp(adminActor());
+
+    const read = await request(app).get(`/api/plugins/${pluginId}/config?companyId=${companyA}`);
+    expect(read.status).toBe(200);
+
+    const write = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({ companyId: companyA, configJson: read.body.configJson });
+
+    expect(write.status).toBe(200);
+    expect(store.configJson).toEqual({ mode: "managed", lookaside: CONDITIONAL_SECRET });
+  }, 20_000);
+});

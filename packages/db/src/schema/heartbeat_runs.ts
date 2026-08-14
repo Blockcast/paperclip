@@ -124,5 +124,8 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    queuedAgeIdx: index("heartbeat_runs_queued_age_idx")
+      .on(table.agentId, sql`coalesce(${table.queuedAt}, ${table.createdAt})`)
+      .where(sql`${table.status} = 'queued'`),
   }),
 );

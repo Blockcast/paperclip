@@ -2366,6 +2366,77 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
   }
 }
 
+// Join a repo-relative workspace subpath onto its realized checkout, refusing
+// anything that escapes the checkout root. `cwd` is operator-supplied config,
+// so a value like "../../../etc" must not be able to point a run outside the
+// repo it declared. See BLO-25415.
+//
+// Containment is enforced twice, because the two escapes are different:
+//   - lexically, against `..` traversal and sibling-prefix paths; and
+//   - after symlink resolution, because the checkout's *contents* are
+//     repo-controlled. A repo carrying `packages/iwa -> /etc` passes the
+//     lexical check and then fs.stat() follows the link, launching the run
+//     outside the checkout on a PVC shared with every other repo.
+//
+// The realpath pass is skipped when the target does not exist: there is
+// nothing to follow, and the caller's own fs.stat() is what reports it
+// missing. Resolving the root separately matters too — the managed dir may
+// itself sit behind a symlink, which would otherwise fail containment for a
+// perfectly legitimate subpath.
+export async function resolveContainedWorkspaceSubpath(
+  checkoutDir: string,
+  subpath: string,
+): Promise<string> {
+  const root = path.resolve(checkoutDir);
+  const resolved = path.resolve(root, subpath);
+  assertPathContained(root, resolved, subpath);
+
+  const realRoot = await fs.realpath(root).catch(() => null);
+  const realResolved = await fs.realpath(resolved).catch(() => null);
+  if (realRoot && realResolved) {
+    assertPathContained(realRoot, realResolved, subpath);
+  }
+  return resolved;
+}
+
+function assertPathContained(root: string, candidate: string, subpath: string): void {
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+    throw new Error(
+      `Project workspace cwd "${subpath}" resolves outside its checkout "${root}".`,
+    );
+  }
+}
+
+// Workspace source types that own their `cwd` outright: the path is a host
+// location (or a remote provider's), not a subdirectory of a checkout we
+// manage. A relative `cwd` on one of these keeps its prior meaning rather than
+// being redirected into a managed checkout dir.
+const NON_REPO_WORKSPACE_SOURCE_TYPES = new Set(["local_path", "non_git_path", "remote_managed"]);
+
+/**
+ * Decide whether a workspace's `cwd` is a repo-relative subdirectory that must
+ * be joined onto its managed checkout, returning that subpath (or null to use
+ * `cwd` as-is).
+ *
+ * Only repo-backed workspaces qualify. `repoUrl` is required rather than
+ * inferred from `sourceType` because `source_type` is an unconstrained text
+ * column — production carries at least one row typed `"git"` rather than
+ * `"git_repo"` — and because without a repo there is nothing for the path to
+ * be relative to: `ensureManagedProjectWorkspace` would mkdir an empty
+ * directory that the subsequent stat can never satisfy. See BLO-25415.
+ */
+export function resolveRepoRelativeWorkspaceCwd(workspace: {
+  cwd?: string | null;
+  sourceType?: string | null;
+  repoUrl?: string | null;
+}): string | null {
+  const cwd = readNonEmptyString(workspace.cwd);
+  if (!cwd || cwd === REPO_ONLY_CWD_SENTINEL || path.isAbsolute(cwd)) return null;
+  if (NON_REPO_WORKSPACE_SOURCE_TYPES.has(readNonEmptyString(workspace.sourceType) ?? "")) return null;
+  if (!readNonEmptyString(workspace.repoUrl)) return null;
+  return cwd;
+}
+
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
@@ -3782,34 +3853,76 @@ function allocationFaultStatusGate(resultJson: Record<string, unknown> | null | 
   return hasAuthoritativeStatus ? "deny" : "allow";
 }
 
+// BLO-19879: checked first, above the authoritative-status short-circuit
+// below, because the gateway allocation fault carries a 400 and would
+// otherwise be rejected before any text matching runs. Still require an
+// actual 400 when resultJson carries an authoritative status, and match only
+// gateway-shaped payload text so agent-authored prose that merely quotes the
+// literal cannot turn terminal 401/403/etc. failures into scheduled retries.
+//
+// BLO-20343: the status gate covers `errorMessage` too, not just the
+// resultJson keys, so the same bytes classify the same way whichever field
+// carries them. Reaching the difference needs contradictory adapter state (an
+// errorMessage opening with a 400 gateway payload while resultJson reports an
+// authoritative non-400), which has no known producer — `api_error_status` is
+// only ever read here, straight off the SDK's final result event. Resolved
+// toward `deny` because every status that reaches it is one the retry curve
+// cannot help: 401/403 will not self-heal, 500 is deliberately terminal, and
+// 429 belongs to the rate-limit family's flat curve.
+//
+// Exported separately from isHintlessTransientUpstreamFault (BLO-21803) so the
+// finalize call site can test for this one specific shape without re-deriving
+// it, in order to distinguish a first occurrence (give BLO-19879's self-heal
+// chance) from a repeat within the same retry chain (see
+// repeatingGatewayAllocationFault below).
+export function isGatewayAllocationFault(
+  resultJson: Record<string, unknown> | null | undefined,
+  opts?: { errorMessage?: string | null },
+): boolean {
+  if (allocationFaultStatusGate(resultJson) !== "allow") return false;
+  if (resultJson) {
+    for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
+      if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
+    }
+  }
+  return looksLikeGatewayAllocationFault(opts?.errorMessage);
+}
+
+export function didRunSnapshotHitGatewayAllocationFault(input: {
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  resultJson?: Record<string, unknown> | null;
+}): boolean {
+  if (input.errorCode === "allocation_missing_standing") return true;
+  return isGatewayAllocationFault(input.resultJson, {
+    errorMessage: input.errorMessage,
+  });
+}
+
+export function isRepeatedGatewayAllocationFault(input: {
+  currentResultJson?: Record<string, unknown> | null;
+  currentErrorMessage?: string | null;
+  predecessorResultJson?: Record<string, unknown> | null;
+  predecessorErrorMessage?: string | null;
+  predecessorErrorCode?: string | null;
+}): boolean {
+  if (!isGatewayAllocationFault(input.currentResultJson, {
+    errorMessage: input.currentErrorMessage,
+  })) {
+    return false;
+  }
+  return didRunSnapshotHitGatewayAllocationFault({
+    errorCode: input.predecessorErrorCode,
+    errorMessage: input.predecessorErrorMessage,
+    resultJson: input.predecessorResultJson,
+  });
+}
+
 export function isHintlessTransientUpstreamFault(
   resultJson: Record<string, unknown> | null | undefined,
   opts?: { errorMessage?: string | null },
 ): boolean {
-  // BLO-19879: checked first, above the authoritative-status short-circuit
-  // below, because the gateway allocation fault carries a 400 and would
-  // otherwise be rejected before any text matching runs. Still require an
-  // actual 400 when resultJson carries an authoritative status, and match only
-  // gateway-shaped payload text so agent-authored prose that merely quotes the
-  // literal cannot turn terminal 401/403/etc. failures into scheduled retries.
-  //
-  // BLO-20343: the status gate covers `errorMessage` too, not just the
-  // resultJson keys, so the same bytes classify the same way whichever field
-  // carries them. Reaching the difference needs contradictory adapter state (an
-  // errorMessage opening with a 400 gateway payload while resultJson reports an
-  // authoritative non-400), which has no known producer — `api_error_status` is
-  // only ever read here, straight off the SDK's final result event. Resolved
-  // toward `deny` because every status that reaches it is one the retry curve
-  // cannot help: 401/403 will not self-heal, 500 is deliberately terminal, and
-  // 429 belongs to the rate-limit family's flat curve.
-  if (allocationFaultStatusGate(resultJson) === "allow") {
-    if (resultJson) {
-      for (const key of GATEWAY_ALLOCATION_FAULT_TEXT_KEYS) {
-        if (looksLikeGatewayAllocationFault(resultJson[key])) return true;
-      }
-    }
-    if (looksLikeGatewayAllocationFault(opts?.errorMessage)) return true;
-  }
+  if (isGatewayAllocationFault(resultJson, opts)) return true;
 
   // Two status surfaces: the Claude SDK's final result event uses
   // `api_error_status`, while the per-attempt `api_retry` events that precede
@@ -11787,14 +11900,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const workspace of realizationCandidates) {
         let projectCwd = readNonEmptyString(workspace.cwd);
         let managedWorkspaceWarning: string | null = null;
-        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
+        // A workspace cwd is either an absolute host path or — for a repo-backed
+        // workspace — a repo-relative subdirectory such as "packages/iwa". The
+        // relative form only resolves once the repo is checked out, so realize
+        // the managed checkout first and join the subpath inside it. Without
+        // this the raw relative string reached the fs.stat() below and was
+        // resolved against the API process's own cwd, which never matches: the
+        // run then failed `preferred_workspace_unrealizable` quoting a path
+        // that looks correct, and no amount of cloning could satisfy it. See
+        // BLO-25415.
+        const repoRelativeCwd = resolveRepoRelativeWorkspaceCwd(workspace);
+        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL || repoRelativeCwd) {
           try {
             const managedWorkspace = await ensureManagedProjectWorkspace({
               companyId: agent.companyId,
               projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
               repoUrl: readNonEmptyString(workspace.repoUrl),
             });
-            projectCwd = managedWorkspace.cwd;
+            projectCwd = repoRelativeCwd
+              ? await resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
+              : managedWorkspace.cwd;
             managedWorkspaceWarning = managedWorkspace.warning;
           } catch (error) {
             if (preferredWorkspace?.id === workspace.id) {
@@ -12994,6 +13119,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: "Detached child process reported activity; cleared detached warning",
     });
     return updated;
+  }
+
+  async function isImmediatePredecessorRepeatGatewayAllocationFault(
+    run: typeof heartbeatRuns.$inferSelect,
+    current: {
+      errorMessage?: string | null;
+      resultJson?: Record<string, unknown> | null;
+    },
+  ) {
+    if (!run.retryOfRunId) return false;
+    const predecessor = await db
+      .select({
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.id, run.retryOfRunId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!predecessor) return false;
+    return isRepeatedGatewayAllocationFault({
+      currentErrorMessage: current.errorMessage,
+      currentResultJson: current.resultJson,
+      predecessorErrorCode: predecessor.errorCode,
+      predecessorErrorMessage: predecessor.error,
+      predecessorResultJson: predecessor.resultJson as Record<string, unknown> | null,
+    });
   }
 
   async function patchRunIssueCommentStatus(
@@ -24071,11 +24227,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // re-dispatched. Yields to the rate-limit families (429 owns its own flat
       // curve) and to any adapter that already tagged a family itself, so the
       // local adapters' richer verdict always wins.
+      //
+      // BLO-21803: the BLO-19879 gateway-allocation-fault branch inside
+      // isHintlessTransientUpstreamFault gives allocation_missing exactly the
+      // scenario it was built for — a brief provider-blind failover window —
+      // one bounded-retry chance to self-heal. Live reproductions (BLO-20725,
+      // BLO-19411) showed the SAME org/provider/node fault recurring on the
+      // very next attempt of the same chain, days apart: that is not the
+      // transient routing blip BLO-19879 documented, it is a standing
+      // provisioning gap ("no allocation configured"), and no amount of
+      // further retrying makes one appear. This must compare against the
+      // immediate retry predecessor, not merely `scheduledRetryAttempt >= 1`:
+      // a chain can start with a different retryable family and hit its first
+      // allocation fault on attempt 1, which still deserves the BLO-19879
+      // self-heal retry.
+      const gatewayAllocationFault =
+        outcome === "failed" &&
+        !rateLimitExhaustedOverride &&
+        !providerThrottledNoProgressOverride &&
+        !adapterResult.errorFamily &&
+        isGatewayAllocationFault(adapterResult.resultJson, {
+          errorMessage: adapterResult.errorMessage,
+        });
+      const immediatePredecessorRepeatsGatewayAllocationFault = gatewayAllocationFault
+        ? await isImmediatePredecessorRepeatGatewayAllocationFault(run, {
+            errorMessage: adapterResult.errorMessage,
+            resultJson: adapterResult.resultJson,
+          })
+        : false;
+      const repeatingGatewayAllocationFault =
+        gatewayAllocationFault && immediatePredecessorRepeatsGatewayAllocationFault;
       const transientUpstreamOverride =
         outcome === "failed" &&
         !rateLimitExhaustedOverride &&
         !providerThrottledNoProgressOverride &&
         !adapterResult.errorFamily &&
+        !repeatingGatewayAllocationFault &&
         isHintlessTransientUpstreamFault(adapterResult.resultJson, {
           errorMessage: adapterResult.errorMessage,
         });
@@ -24222,24 +24409,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? "Run hit Anthropic rate limit (out of extra usage); scheduled for transient retry"
         : providerThrottledNoProgressOverride
           ? "Run hit provider throttle/deadline before any token usage; scheduled for transient retry"
-          : prReviewIncompleteOverride
-            ? prReviewIncompleteOverride.errorMessage
-            : emptyResultOverride
-              ? "Agent exited successfully but produced no result"
-              : outcome === "cancelled"
-                ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
-                : outcome === "succeeded"
-                  ? null
-                  : redactCurrentUserText(
-                      silentFailureMessage ?? adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                      currentUserRedactionOptions,
-                    );
+          : repeatingGatewayAllocationFault
+            ? "Run repeated the penstock 400 allocation_missing gateway fault on a retry of its own chain " +
+              "(BLO-21803); this is a standing provisioning gap, not the transient routing blip BLO-19879 " +
+              "covers, so no further automatic retry was scheduled — check the BYOS allocation config for " +
+              "the org/provider/node named in the error"
+            : prReviewIncompleteOverride
+              ? prReviewIncompleteOverride.errorMessage
+              : emptyResultOverride
+                ? "Agent exited successfully but produced no result"
+                : outcome === "cancelled"
+                  ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+                  : outcome === "succeeded"
+                    ? null
+                    : redactCurrentUserText(
+                        silentFailureMessage ?? adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                        currentUserRedactionOptions,
+                      );
       const recordedResponsibleUserDenialCode =
         normalizeResponsibleUserDenialCode(latestRun?.errorCode);
       const runErrorCode = rateLimitExhaustedOverride
         ? "rate_limit_exhausted"
         : providerThrottledNoProgressOverride
           ? "provider_throttled_no_progress"
+        : repeatingGatewayAllocationFault
+          ? "allocation_missing_standing"
           : prReviewIncompleteOverride
             ? prReviewIncompleteOverride.errorCode
             : emptyResultOverride

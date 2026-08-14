@@ -317,15 +317,33 @@ spec:
           # indefinitely while each individual row is young. This gauge
           # carries the server-computed age of the oldest queued row PER
           # AGENT (refreshed on every /metrics scrape from a live
-          # MIN(created_at) aggregate), so `for:` here is only riding out
+          # MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
           # scrape flapping, not standing in for the real age.
-          expr: max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}
+          # The freshness gate is load-bearing: a failed database refresh
+          # leaves the previous gauge value in memory, so stale data must not
+          # qualify a strand alert. Gate each API replica against its own
+          # refresh result before taking the fleet-wide per-agent max; an
+          # `on()` join would let one healthy replica bless another replica's
+          # stale age snapshot.
+          expr: max by (agent_id) (paperclip_queued_run_oldest_age_seconds and on(instance) (paperclip_queued_run_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}
           for: {{ .Values.prometheusRule.queuedRunStrandedFor }}
           labels:
             severity: warning
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a queued run stranded for longer than {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}s"
-            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest `queued` heartbeat run has been waiting for {{`{{ $value }}`}}s (BLO-21116). The issue it targets looks `in_progress`/assigned with an active run and generates no other alert, but nothing is executing -- and left alone this also manufactures a false productivity-review escalation reading the queue time as unattended active duration. Check whether the agent is at `maxConcurrentRuns` (capacity starvation -- other runs should still be cycling) or fully idle (a scheduler-tick or dispatch-path fault). Query `select id, agent_id, status, created_at, queued_at, now() - coalesce(queued_at, created_at) as age, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'queued' and agent_id = '{{`{{ $labels.agent_id }}`}}' order by coalesce(queued_at, created_at) asc limit 10` to find the specific rows -- ordered and aged by the same coalesce(queued_at, created_at) the gauge itself uses, so a scheduled-retry promotion cannot appear hours older here than the $value that fired. See the runbook for the starvation-vs-dropped triage."
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest `queued` heartbeat run has been waiting for {{`{{ $value }}`}}s since queue entry (BLO-21116). The age is only trusted while paperclip_queued_run_age_metrics_refresh_success is 1. The issue it targets looks `in_progress`/assigned with an active run, but nothing is executing. Query coalesce(queued_at, created_at), not created_at alone: retries promoted from scheduled_retry intentionally reset their dispatch-wait clock. See the runbook for saturation-versus-dispatch triage."
+            runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
+        - alert: PaperclipQueuedRunAgeMetricsRefreshFailed
+          # This is deliberately separate from the strand alert. A failed
+          # refresh means the age gauge is not fresh, not that the queue is
+          # empty; page on it so the freshness gate cannot hide a real strand.
+          expr: paperclip_queued_run_age_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.queuedRunAgeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip queued-run age metric refresh is failing"
+            description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
             runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
