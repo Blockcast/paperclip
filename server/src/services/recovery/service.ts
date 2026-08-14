@@ -1158,29 +1158,15 @@ export function classifyAdapterFailureForRecovery(
   }
   const resultJson = parseObject(latestRun.resultJson);
   const rawError = latestRun.error ?? "";
-  // BLO-21116: an `adapter_failed` whose own message names a response-parse
-  // failure means resultJson is an untrusted/truncated payload, not a source of
-  // classification evidence -- exclude it from the combined search string so a
-  // stray substring inside the raw blob cannot false-positive as a config or
-  // quota phrase, and never let it read as configuration_incomplete.
-  const isResponseParseFailure =
-    latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
-  const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
-    .join("\n");
-  if (
-    !isResponseParseFailure &&
-    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
-  ) {
+  // A malformed adapter response is transport-level evidence only. Its raw
+  // text and truncated result payload are untrusted and must not drive either
+  // configuration or quota recovery heuristics.
+  if (ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError)) return null;
+
+  const error = [latestRun.errorCode ?? "", rawError, JSON.stringify(resultJson)].join("\n");
+  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
     return { kind: "configuration_incomplete" };
   }
-  // Same untrusted-payload reasoning as the configuration_incomplete guard
-  // above: `error` still carries `rawError` verbatim (only `resultJson` was
-  // dropped from the join), so a response-parse-failure payload containing a
-  // phrase like "quota exceeded" or "model is at capacity" would otherwise
-  // still satisfy PROVIDER_QUOTA_ERROR_RE below and misclassify as
-  // provider_quota instead of configuration_incomplete -- the same defect
-  // class, just the other branch (Ally review, 2026-08-04).
-  if (isResponseParseFailure) return null;
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
   const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??

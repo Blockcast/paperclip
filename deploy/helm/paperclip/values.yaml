@@ -495,7 +495,9 @@ prometheusRule:
   queuedRunStrandedAgeSeconds: 1440
   # -- Scrape-flap tolerance only (BLO-21116). The ageing lives in queuedRunStrandedAgeSeconds above; it stacks on top of that threshold rather than testing independently, which is why the threshold is 1440 and not 1800.
   queuedRunStrandedFor: 5m
-  # -- Runbook for the queued-run-stranded alert, linked from its annotation.
+  # -- Alert only after sustained failed refreshes; a one-off failed scrape is logged and retried on the next scrape.
+  queuedRunAgeMetricsRefreshFailureFor: 5m
+  # -- Runbook for the queued-run-stranded and metric-freshness alerts, linked from their annotations.
   queuedRunStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
