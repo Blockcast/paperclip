@@ -96,9 +96,12 @@ jobs:
 
       - name: Reject App-attributed commits on the PR (BLO-21416)
         # Non-merge commits stamped with the shared allyblockcast[bot] App
-        # identity mean the commit was created via the GitHub REST/MCP write
-        # path (contents API, merge API, `create_or_update_file`/
-        # `push_files`) instead of `git push` — see AGENTS.md §9. Uses the
+        # identity mean either the commit was created via the GitHub
+        # REST/MCP write path (contents API, merge API,
+        # `create_or_update_file`/`push_files`), OR it was made with `git
+        # push` from a checkout whose local git config itself holds the App
+        # identity — measured on 11 of 71 sampled checkouts (BLO-23894), so
+        # `git push` is not a guaranteed fix. See AGENTS.md §9. Uses the
         # already-checked-out history (fetch-depth: 0 above), no new token.
         #
         # There is deliberately NO branch exemption. The graphify-reindex bot
@@ -181,6 +184,20 @@ jobs:
           mapfile -t changed_paths < <(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$PR_BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
+
+      # BLO-24169: this runs unconditionally (not gated on whether this PR's
+      # own diff touches a manifest) because a merge-queue batch can land a
+      # package.json bump next to a stale, already-committed pnpm-lock.yaml —
+      # the diff that broke master touched neither file in *this* PR. The
+      # "Validate dependency resolution when manifests change" step below
+      # only regenerates an in-memory lockfile for jobs to consume; it never
+      # asserts the committed lockfile itself is consistent, which is exactly
+      # the gap that let 08b6f4491 take the whole queue down.
+      - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
+        run: node ./scripts/check-lockfile-overrides-consistency.mjs
+
+      - name: Test lockfile overrides consistency guard
+        run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
 
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
@@ -280,6 +297,12 @@ jobs:
 
       - name: Typecheck workspaces whose build scripts skip TypeScript
         run: pnpm run typecheck:build-gaps
+
+      - name: Check server tests for undefined identifiers
+        run: pnpm run check:test-undefined-symbols
+
+      - name: Test undefined-identifier guard failure modes
+        run: node --test scripts/check-test-undefined-symbols.test.mjs
 
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry

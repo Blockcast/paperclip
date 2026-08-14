@@ -10,7 +10,7 @@ import {
   createDb,
   projects,
 } from "@paperclipai/db";
-import { budgetService } from "../services/budgets.ts";
+import { budgetService, buildApprovalPayload } from "../services/budgets.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -80,6 +80,40 @@ describe("budgetService", () => {
     vi.clearAllMocks();
   });
 
+  describe("buildApprovalPayload", () => {
+    const policy = {
+      id: "policy-1",
+      companyId: "company-1",
+      scopeType: "agent",
+      scopeId: "agent-1",
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 10000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+    };
+
+    it("returns a non-empty title naming the scope and the breach (BLO-22705)", () => {
+      const payload = buildApprovalPayload({
+        policy: policy as any,
+        scopeName: "Budget Agent",
+        thresholdType: "hard",
+        amountObserved: 15000,
+        windowStart: new Date("2026-08-01T00:00:00Z"),
+        windowEnd: new Date("2026-09-01T00:00:00Z"),
+      });
+
+      expect(typeof payload.title).toBe("string");
+      expect(payload.title.trim().length).toBeGreaterThan(0);
+      expect(payload.title).toContain("Budget Agent");
+      expect(payload.title).toContain("billed_cents");
+      expect(payload.title).toContain("$150.00");
+      expect(payload.title).toContain("$100.00");
+    });
+  });
+
   it("creates a hard-stop incident and pauses an agent when spend exceeds a budget", async () => {
     const policy = {
       id: "policy-1",
@@ -133,6 +167,9 @@ describe("budgetService", () => {
         companyId: "company-1",
         type: "budget_override_required",
         status: "pending",
+        payload: expect.objectContaining({
+          title: expect.stringMatching(/\S/),
+        }),
       }),
     );
     expect(dbStub.insertValues).toHaveBeenCalledWith(

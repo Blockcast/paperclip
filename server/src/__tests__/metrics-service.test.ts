@@ -4,6 +4,7 @@ import {
   AUTH_REQUEST_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
+  ROUTINE_DISPATCH_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
   ISOLATED_RUN_STARTED_METRIC,
   KNOWN_BLOCKED_REASONS,
@@ -53,7 +54,14 @@ import {
   computeExternalLifecycleSilenceGapSeconds,
   normalizeExternalLifecycleTerminalStatus,
   recordExternalLifecycleRunSilenceGap,
+  setQueuedRunOldestAgeMetrics,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
 } from "../services/metrics.js";
+import {
+  incrementRoutineDispatchMetric,
+  resetRoutineDispatchMetrics,
+  snapshotRoutineDispatchMetrics,
+} from "../services/routine-dispatch-metrics.js";
 import {
   getDepBlockedMetric,
   incrementDepBlockedMetric,
@@ -838,5 +846,83 @@ describe("computeExternalLifecycleSilenceGapSeconds + recordExternalLifecycleRun
     expect(body).not.toContain(
       `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="cancelled"}`,
     );
+  });
+});
+
+describe("routine dispatch metrics counters (BLO-23379)", () => {
+  afterEach(() => {
+    resetRoutineDispatchMetrics();
+  });
+
+  it("renders the parked-execution-issue bypass counter in Prometheus output", async () => {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${ROUTINE_DISPATCH_METRIC} counter`);
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 2`,
+    );
+  });
+
+  // BLO-25692: the stale-run bypass is a sibling label, not a replacement --
+  // both must render, or an operator cannot tell a provider-quota park from an
+  // execution that stalled or overran.
+  it("renders the stale-execution-issue bypass counter alongside the parked one", async () => {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue");
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_stale_execution_issue"} 1`,
+    );
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 1`,
+    );
+  });
+
+  it("starts at zero so a quiet routine is distinguishable from a bypassed one", () => {
+    const snap = snapshotRoutineDispatchMetrics();
+    for (const value of Object.values(snap)) {
+      expect(value).toBe(0);
+    }
+  });
+});
+
+describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
+  it("writes an explicit 0 for a known agent whose queue has drained (drop-to-0 observable)", async () => {
+    const agentA = "11111111-1111-1111-1111-111111111111";
+    const agentB = "22222222-2222-2222-2222-222222222222";
+    const known = new Set([agentA, agentB]);
+
+    setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+
+    // Next refresh: agentA's queue drained. reset-then-set must write 0, not
+    // leave the stale 54000 -- that stale value is what would keep an alert
+    // on this series from ever resolving.
+    setQueuedRunOldestAgeMetrics([], known);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(body).not.toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+  });
+
+  it("takes the oldest of multiple queued runs per agent, and collapses an unknown agent id", async () => {
+    const agentA = "33333333-3333-3333-3333-333333333333";
+    const known = new Set([agentA]);
+
+    setQueuedRunOldestAgeMetrics(
+      [
+        { agentId: agentA, ageSeconds: 120 },
+        { agentId: agentA, ageSeconds: 9000 },
+        { agentId: "not-a-known-agent", ageSeconds: 4500 },
+      ],
+      known,
+    );
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
   });
 });

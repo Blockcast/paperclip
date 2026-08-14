@@ -118,6 +118,11 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  // Bounds stamped on newly-created wake_owner recovery actions. They remain
+  // attached to the action for its lifetime, so a later config change cannot
+  // extend a recovery attempt that has already started.
+  recoveryActionMaxAttempts: number;
+  recoveryActionTimeoutMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -173,6 +178,9 @@ export interface Config {
   // the feature is opt-in per deployment because the context name belongs to
   // whoever owns the branch-protection rule, not to this server.
   prReviewGateStatusContext: string;
+  // Commit-status context for comment-shaped Ally findings. Empty by default:
+  // operators must opt in and make the context required in branch protection.
+  prCommentReviewGateStatusContext: string;
   telemetryEnabled: boolean;
 }
 
@@ -193,6 +201,28 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Configured PR reviewer agents, purely env-derived (no config-file input).
+ *
+ * Split out of loadConfig() so callers on hot paths can read it without paying
+ * loadConfig()'s synchronous config-file read — the duplicate-PR-review issue
+ * guard consults this on every agent-assigned issue creation (BLO-20526).
+ */
+export function readGithubPrReviewerAgentIds(): string[] {
+  return [
+    ...new Set(
+      (
+        process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
+        process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
+        ""
+      )
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 export function loadConfig(): Config {
@@ -472,6 +502,18 @@ export function loadConfig(): Config {
         ? false
         : process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    recoveryActionMaxAttempts: Math.max(
+      1,
+      // Preserve the existing wake-owner budget unless an operator explicitly
+      // opts into a new bound through the configurable setting.
+      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS) || 5,
+    ),
+    recoveryActionTimeoutMs: Math.max(
+      60 * 60_000,
+      // Preserve the existing six-hour horizon for deployments that do not
+      // supply an override.
+      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 6 * 60 * 60_000,
+    ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
       process.env.PAPERCLIP_WORKERS_INTERNAL_URL?.trim().replace(/\/+$/, "") || null,
@@ -490,18 +532,7 @@ export function loadConfig(): Config {
     // identifier, so PRs without a BLO-XXX in the branch/title/body still
     // get reviewed. The plural CSV setting takes precedence; the singular
     // setting remains supported for existing deployments.
-    githubPrReviewerAgentIds: [
-      ...new Set(
-        (
-          process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
-          process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
-          ""
-        )
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      ),
-    ],
+    githubPrReviewerAgentIds: readGithubPrReviewerAgentIds(),
     githubDependabotAgentId: process.env.PAPERCLIP_DEPENDABOT_AGENT_ID ?? "",
     githubDependabotMinSeverity: process.env.PAPERCLIP_DEPENDABOT_MIN_SEVERITY ?? "high",
     // GitHub App creds for server-side installation-token minting (PR-review
@@ -512,6 +543,7 @@ export function loadConfig(): Config {
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
     prReviewGateStatusContext: (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
+    prCommentReviewGateStatusContext: (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

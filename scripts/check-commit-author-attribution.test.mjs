@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 
 import {
@@ -12,6 +13,7 @@ import {
   COMMITS_API_MAX,
   findAttributionOffenses,
   findLocalRangeOffenses,
+  GRANDFATHERED_OFFENSE_SHAS,
   resolveSince,
   runAudit,
   sortByMergedAtDesc,
@@ -68,6 +70,86 @@ test("findAttributionOffenses defaults an absent parentCount to 1 (non-merge)", 
   assert.equal(offenses.length, 1);
 });
 
+test("findAttributionOffenses with an allowlist clears an App-attributed commit whose sha is a member (BLO-23894)", () => {
+  const offenses = findAttributionOffenses(
+    [
+      {
+        sha: "962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        authorEmail: APP_NOREPLY_EMAIL,
+        authorDate: "2026-08-05T16:46:12Z",
+        parentCount: 1,
+        message: "pre-cutoff API write",
+      },
+    ],
+    { allowlist: new Set(["962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) },
+  );
+  assert.deepEqual(offenses, []);
+});
+
+test("findAttributionOffenses with an allowlist still flags an App-attributed commit whose sha is NOT a member, even if authored long ago (fail closed on unenumerated history)", () => {
+  const offenses = findAttributionOffenses(
+    [
+      {
+        sha: "notpinnedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        authorEmail: APP_NOREPLY_EMAIL,
+        authorDate: "2020-01-01T00:00:00Z",
+        parentCount: 1,
+        message: "old but unenumerated API write",
+      },
+    ],
+    { allowlist: new Set(["962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) },
+  );
+  assert.equal(offenses.length, 1);
+});
+
+test("findAttributionOffenses with an allowlist is immune to a backdated authorDate on a non-allowlisted sha (BLO-23894 — this is the forgery the date-cutoff design allowed)", () => {
+  const offenses = findAttributionOffenses(
+    [
+      {
+        sha: "forgedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        authorEmail: APP_NOREPLY_EMAIL,
+        // Backdated via GIT_AUTHOR_DATE to well before the cutoff, but this
+        // sha was never enumerated — the allowlist does not care what the
+        // caller-controlled authorDate says.
+        authorDate: "2020-01-01T00:00:00Z",
+        parentCount: 1,
+        message: "freshly authored, backdated to dodge the old date cutoff",
+      },
+    ],
+    { allowlist: GRANDFATHERED_OFFENSE_SHAS },
+  );
+  assert.equal(offenses.length, 1);
+});
+
+test("findAttributionOffenses without an allowlist ignores sha membership entirely (audit mode stays historical)", () => {
+  const offenses = findAttributionOffenses([
+    {
+      sha: [...GRANDFATHERED_OFFENSE_SHAS][0],
+      authorEmail: APP_NOREPLY_EMAIL,
+      authorDate: "2026-08-05T16:46:12Z",
+      parentCount: 1,
+      message: "pre-cutoff API write",
+    },
+  ]);
+  assert.equal(offenses.length, 1);
+});
+
+test("findAttributionOffenses with an allowlist fails closed on a missing sha", () => {
+  const offenses = findAttributionOffenses(
+    [{ authorEmail: APP_NOREPLY_EMAIL, parentCount: 1, message: "no sha" }],
+    { allowlist: GRANDFATHERED_OFFENSE_SHAS },
+  );
+  assert.equal(offenses.length, 1);
+});
+
+test("GRANDFATHERED_OFFENSE_SHAS is a non-empty set of full 40-char lowercase hex shas", () => {
+  assert.ok(GRANDFATHERED_OFFENSE_SHAS.size > 0);
+  for (const sha of GRANDFATHERED_OFFENSE_SHAS) {
+    assert.match(sha, /^[0-9a-f]{40}$/, `${sha} is not a full lowercase sha`);
+  }
+});
+
+
 test("findLocalRangeOffenses reads non-merge commits from a real git range and flags App-attributed ones", () => {
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-"));
   try {
@@ -119,6 +201,153 @@ test("findLocalRangeOffenses excludes merge commits via --no-merges", () => {
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
+
+test("findLocalRangeOffenses grandfathers an App-attributed commit whose sha is explicitly allowlisted (BLO-23894)", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
+      GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
+    });
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    // Real PR #962 shape (BLO-23894): App-stamped author, rebased in by a
+    // human hours later — the offense is unsatisfiable, so its sha is pinned.
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set([head]) }), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses still flags an App-attributed commit whose sha is not allowlisted, regardless of a backdated authorDate (BLO-23894 — closes the date-forgery hole)", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-not-allowlisted-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    // Backdated to well before the cutoff — under the old date-cutoff design
+    // this alone would have cleared the gate. It must not, now.
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "backdated api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
+      GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z",
+    });
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    const offenses = findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set() });
+    assert.equal(offenses.length, 1);
+    assert.equal(offenses[0].message, "backdated api-path commit");
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses keeps grandfathering a pinned commit across an ordinary merge-based branch update (PR #1265 review)", () => {
+  // Pins the trade-off documented on findAttributionOffenses: SHA-pinning
+  // survives the "Update branch" merge this repo's queue actually uses
+  // (verified via PR #1265's own mergeStateStatus) because a merge leaves
+  // the original commit's sha untouched.
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-merge-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q", "-b", "main"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["checkout", "-q", "-b", "feature"]);
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
+      GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
+    });
+    const pinnedSha = git(["rev-parse", "HEAD"]).trim();
+
+    // Base moves forward after the cutoff; the feature branch is updated via
+    // a merge (GitHub's default "Update branch"), not a rebase.
+    git(["checkout", "-q", "main"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
+    git(["checkout", "-q", "feature"]);
+    git(["-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "Merge branch main into feature", "main", "-q"]);
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    // The pinned commit's own sha is unchanged by the merge — still present
+    // in the range alongside the unrelated main-branch commit pulled in.
+    const shasInRange = git(["log", "--no-merges", "--format=%H", `${base}..${head}`]).trim().split("\n");
+    assert.ok(shasInRange.includes(pinnedSha));
+
+    assert.deepEqual(
+      findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set([pinnedSha]) }).map((o) => o.message),
+      [],
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses does NOT carry a pinned grandfather through an explicit git rebase — the rewritten commit needs its new sha added (documented trade-off, BLO-23894)", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-rebase-"));
+  try {
+    const git = (args, env) =>
+      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+    git(["init", "-q", "-b", "main"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["checkout", "-q", "-b", "feature"]);
+    git(["config", "user.email", APP_NOREPLY_EMAIL]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
+      GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
+    });
+    const pinnedSha = git(["rev-parse", "HEAD"]).trim();
+
+    git(["checkout", "-q", "main"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
+    git(["checkout", "-q", "feature"]);
+    git(["-c", "commit.gpgsign=false", "rebase", "main", "-q"]);
+    const rebasedHead = git(["rev-parse", "HEAD"]).trim();
+
+    // Rebase rewrites the commit: new sha, even though the diff is identical.
+    assert.notEqual(rebasedHead, pinnedSha);
+
+    // The original pin no longer matches — fails closed rather than silently
+    // passing.
+    assert.equal(
+      findLocalRangeOffenses({ repoRoot, base, head: rebasedHead, allowlist: new Set([pinnedSha]) }).length,
+      1,
+    );
+
+    // The fix is cheap and forgery-free: add the new sha.
+    assert.deepEqual(
+      findLocalRangeOffenses({ repoRoot, base, head: rebasedHead, allowlist: new Set([rebasedHead]) }),
+      [],
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
 
 test("auditRepoCommitAttribution flags App-attributed commits across the injected PR's own commit list", async () => {
   const commitsPage = JSON.stringify([

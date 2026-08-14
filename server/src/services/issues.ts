@@ -69,6 +69,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -80,6 +81,7 @@ import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
@@ -106,6 +108,10 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import {
+  assertNotDuplicatePrReviewIssue,
+  lockPrReviewIssueScopes,
+} from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -4039,6 +4045,11 @@ async function listSuccessfulRunHandoffMapForIssues(
     }
   }
 
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Unconditional here because
+  // every caller of this helper is a read path; the route-side twin takes a
+  // `foldTerminal` opt-out because one of its callers gates an activity-row write.
+  await resolveSuccessfulRunHandoffForTerminalIssues(dbOrTx, companyId, states);
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
@@ -8573,6 +8584,18 @@ export function issueService(db: Db) {
         return await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
+        if (issueData.assigneeAgentId) {
+          // Acquire the PR scope before the title/idempotency locks below. The
+          // later duplicate check intentionally stays after replay so a prior
+          // successful create remains idempotent while the transaction lock
+          // makes any racing webhook wake visible first.
+          await lockPrReviewIssueScopes(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
+        }
         if (allowDuplicate === false) {
           const titleGuardKey =
             `issue-create:title:${companyId}:${issueData.parentId ?? "root"}:${normalizedTitle}`;
@@ -8638,6 +8661,20 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
+        }
+        if (issueData.assigneeAgentId) {
+          // Guarded here rather than in routes/issues.ts so every create path is
+          // covered — POST /issues, POST /issues/:id/children, and the
+          // accepted-plan decomposition bulk create all funnel through here.
+          // It runs after idempotency/recent-title replay so a successful create
+          // keeps replaying as the same issue instead of turning into a hard
+          // rejection if a live PR review appears between attempts (BLO-20526).
+          await assertNotDuplicatePrReviewIssue(tx, {
+            companyId,
+            assigneeAgentId: issueData.assigneeAgentId,
+            title: issueData.title,
+            description: issueData.description,
+          });
         }
 
         // Create can mutate the same issue graph as update via parentId and
@@ -9646,8 +9683,14 @@ export function issueService(db: Db) {
             })
           ) {
             throw unprocessable(
-              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
-              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). " +
+                "Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient. " +
+                `A cheap status-only recovery run, which may not author deliverables, records its verdict at PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} instead.`,
+              {
+                reason: "no_execution_run_and_no_pr_evidence",
+                issueId: id,
+                statusOnlyDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+              },
             );
           }
         }
