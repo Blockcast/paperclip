@@ -37,7 +37,7 @@ import {
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -47,6 +47,7 @@ import {
   recordDependabotWebhookDiagnostic,
 } from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
 import {
@@ -77,7 +78,6 @@ import {
   pullRequestExternalId,
 } from "../services/pull-request-work-products.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
-import { HttpError } from "../errors.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -1748,6 +1748,626 @@ async function withPrReviewerTaskLock<T>(
   }
 }
 
+/**
+ * Cap on concurrent PR-reviewer wake attempts (BLO-21995).
+ *
+ * A lock winner holds its lock-owning transaction's pooled connection while
+ * `heartbeat.wakeup()` checks out a *second* one for its own enqueue
+ * transaction. Deliveries for distinct PRs never contend on the advisory lock,
+ * so nothing throttled how many could be mid-flight at once: with createDb's
+ * 10-connection pool, 11+ simultaneous distinct-PR deliveries each took a
+ * connection and then waited forever for one that only a peer could release.
+ * Reproduced as a hard deadlock — 12 concurrent deliveries hung past a 60s
+ * test timeout rather than completing.
+ *
+ * Bounding the winners at 4 caps this path at 8 connections and leaves
+ * headroom, so the second checkout is always satisfiable. Excess deliveries
+ * queue in-process for a few milliseconds each rather than deadlocking; the
+ * whole critical section is two statements plus the enqueue, so even a large
+ * burst drains far inside GitHub's webhook timeout.
+ *
+ * This is a bound, not the structural fix. Doing the enqueue on the lock's own
+ * connection would remove the second checkout entirely, but `enqueueWakeup`
+ * opens its own transaction and threading one through it is a much wider
+ * change to the wake path — deliberately left for structural review rather
+ * than folded in here.
+ */
+const PR_REVIEWER_WAKE_MAX_CONCURRENCY = 4;
+let prReviewerWakeInFlight = 0;
+const prReviewerWakeWaiters: Array<() => void> = [];
+
+async function acquirePrReviewerWakeSlot(): Promise<void> {
+  if (prReviewerWakeInFlight < PR_REVIEWER_WAKE_MAX_CONCURRENCY) {
+    prReviewerWakeInFlight += 1;
+    return;
+  }
+  // The releaser hands its slot straight to the next waiter without touching
+  // the counter, so a slot can never be double-claimed by a waiter that wakes
+  // concurrently with a fresh caller.
+  await new Promise<void>((resolve) => prReviewerWakeWaiters.push(resolve));
+}
+
+function releasePrReviewerWakeSlot(): void {
+  const next = prReviewerWakeWaiters.shift();
+  if (next) {
+    next();
+    return;
+  }
+  prReviewerWakeInFlight -= 1;
+}
+
+/**
+ * Outcome of one PR-reviewer wake attempt. Every branch except `queued` is a
+ * terminal no-op for this delivery: replaying it would not change the result,
+ * so the retry worker retires the durable record rather than re-arming it.
+ */
+type PrReviewerWakeOutcome = "queued" | "duplicate" | "no_reviewer" | "declined";
+
+/**
+ * Assign a reviewer for one PR event and enqueue its wake, serialized on the
+ * PR scope.
+ *
+ * Extracted from the webhook route (BLO-21995) so the durable retry worker can
+ * replay a delivery through *exactly* this path. That sharing is what makes the
+ * retry safe: reacquiring the same PR-scope advisory lock here means a replay
+ * races concurrent live deliveries under the same mutual exclusion as the
+ * original, so it cannot assign a second reviewer to a PR that already has one.
+ * Re-running the idempotency probe under that lock is what keeps a replay (or a
+ * GitHub redelivery of the same event) to exactly one wake.
+ *
+ * Throws {@link PrReviewerTaskLockTimeoutError} when the PR scope stays
+ * contended for the whole timeout; the caller owns durability from there.
+ */
+async function attemptPrReviewerWake(params: {
+  db: Db;
+  config: GithubWebhookConfig;
+  context: ResolvedEventContext & { prNumber: number };
+  eventName: string;
+  deliveryId: string | null;
+  reviewerAgentIds: readonly string[];
+}): Promise<PrReviewerWakeOutcome> {
+  const { db, config, context, eventName, deliveryId, reviewerAgentIds } = params;
+  const heartbeat = heartbeatService(db, {
+    pluginWorkerManager: config.pluginWorkerManager,
+    ...config.heartbeatOptions,
+  });
+  const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
+  const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
+  const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
+  // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
+  // request rows for the same PR+reason before enqueueing.
+  // Request-scoped keys also dedup terminal completed/cancelled rows, so a
+  // GitHub redelivery of one event cannot re-run work that already ran or
+  // was retired by converted_to_draft (BLO-18953).
+  const idempotentStatuses = idempotentWakeStatuses(
+    prReviewerWakeIdempotencyScope(context, deliveryId),
+  );
+  // Bound *before* taking the advisory lock: waiting for a slot must not itself
+  // hold a pooled connection, or the queue would recreate the exhaustion it
+  // exists to prevent.
+  await acquirePrReviewerWakeSlot();
+  try {
+    return await withPrReviewerTaskLock(db, buildPrReviewerTaskLockKeys(context), async (tx) => {
+      // The wake insert commits through heartbeat's own transaction. Keep
+      // this transaction-scoped lock held until that commit is visible so
+      // concurrent first events for one PR re-check affinity instead of
+      // assigning the same task to different reviewers.
+      const existingWake = await tx
+        .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            inArray(agentWakeupRequests.agentId, [...reviewerAgentIds]),
+            // Case-insensitive on the repo segment, for the same reason the
+            // task-key lookups are. Phase one retains legacy-spelled writes
+            // for old-reader safety, but normalized rows may already exist
+            // from a canary or interrupted rollout. Byte-exact equality
+            // would make those rows invisible and let a redelivery queue a
+            // duplicate — worst when the original run is terminal and task
+            // coalescing has nothing live to catch it. Reviewer keys are
+            // `pr_review:<repo>:<n>:<suffix>`, so they carry the shared
+            // predicate's `pr_review:` prefix; the suffix segments (wake
+            // reason, numeric comment id, GitHub delivery uuid) are already
+            // lowercase, so folding case cannot merge two distinct requests.
+            matchesTaskKey(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            inArray(agentWakeupRequests.status, idempotentStatuses),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existingWake) {
+        logger.info(
+          {
+            existingWakeId: existingWake.id,
+            existingWakeStatus: existingWake.status,
+            idempotencyKey,
+            event: eventName,
+            deliveryId,
+            wakeReason: context.wakeReason,
+            prNumber: context.prNumber,
+            repoFullName: context.repoFullName,
+          },
+          "github webhook reviewer wake skipped: duplicate idempotency key",
+        );
+        return "duplicate";
+      }
+
+      const reviewerAgentId =
+        (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
+        (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
+      if (!reviewerAgentId) {
+        logger.warn(
+          {
+            configuredReviewerCount: reviewerAgentIds.length,
+            event: eventName,
+            prNumber: context.prNumber,
+            repoFullName: context.repoFullName,
+          },
+          "github webhook reviewer wake skipped: no configured reviewer is active",
+        );
+        return "no_reviewer";
+      }
+
+      // BLO-18859: every suppression gate is behind us and a reviewer is
+      // resolved, so this delivery is now committed to producing a wake.
+      // Counting `received` here (rather than at signature verification)
+      // makes `received - queued` a measure of real loss between intent and
+      // durability — deduped/self-echo/no-reviewer deliveries are correct
+      // no-ops and would otherwise swamp that gap in steady state.
+      recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
+
+      const wakeResult = await heartbeat.wakeup(reviewerAgentId, reviewerWakeupOptions);
+      // A truthy result means the durable agent_wakeup_requests row is
+      // committed AND a run was enqueued/coalesced; from here the wake
+      // survives this process dying. Any transient dispatch failure inside
+      // wakeup() has already been retried and counted as `retried` by
+      // wakeupWithDispatchRetry, so this only fires on real durability.
+      //
+      // A `null` result is NOT a success: enqueueWakeup resolves null
+      // (without throwing) when a scheduling gate declines the wake — it
+      // writes a status="skipped" row and no run. Counting that as `queued`
+      // reported a healthy received+queued funnel for a review that never
+      // ran, hiding exactly the BLO-18847 symptom this counter exists to
+      // surface. No reconciler pass re-arms a skipped row, so it is
+      // terminal for this delivery.
+      if (wakeResult) {
+        recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
+        return "queued";
+      }
+      // The terminal `suppressed` increment is NOT emitted here: the wake
+      // path owns it, because only `enqueueWakeup` knows which gate
+      // declined and the suppression metric's `cause` label needs that. The
+      // same applies to an HttpError refusal, which never reaches this line
+      // at all — it propagates to the caller's catch, and counting it here
+      // would have been impossible (BLO-18859 review follow-up).
+      logger.warn(
+        {
+          agentId: reviewerAgentId,
+          event: eventName,
+          githubDeliveryId: deliveryId,
+          prNumber: context.prNumber,
+          repoFullName: context.repoFullName,
+          wakeReason: context.wakeReason,
+        },
+        "github webhook reviewer wake did not queue a run; a gate declined it "
+          + "(check agent_wakeup_requests for the skipped row's reason) or the "
+          + "provider-capacity gate deferred it to a scheduled_retry run",
+      );
+      return "declined";
+    });
+  } finally {
+    releasePrReviewerWakeSlot();
+  }
+}
+
+/**
+ * Durable-retry states for a PR-reviewer wake that never reached heartbeat
+ * because its PR scope stayed contended (BLO-21995).
+ *
+ * These deliberately sit OUTSIDE {@link IDEMPOTENT_REVIEWER_WAKE_STATUSES}: a
+ * pending retry record must not satisfy the idempotency probe, or the replay
+ * would treat its own record as an already-delivered wake and retire itself
+ * without ever waking anyone. Exactly-once is enforced the other way round —
+ * the replay re-runs the probe under the PR lock, so whichever of {live
+ * delivery, replay} gets there second sees the first one's `queued` row and
+ * stands down.
+ */
+const PR_REVIEWER_CONTENDED_STATUS = "pr_reviewer_dispatch_contended";
+const PR_REVIEWER_CONTENDED_RECOVERED_STATUS = "pr_reviewer_dispatch_recovered";
+const PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS = "pr_reviewer_dispatch_superseded";
+const PR_REVIEWER_CONTENDED_EXHAUSTED_STATUS = "pr_reviewer_dispatch_exhausted";
+
+/**
+ * Contention is transient by construction — the competing delivery holds the
+ * scope only for its own wake — so the first re-attempt is seconds away, not
+ * minutes. The tail is long enough to outlast a slow heartbeat enqueue without
+ * spinning.
+ */
+const PR_REVIEWER_CONTENDED_BACKOFF_MS = [5_000, 15_000, 60_000, 300_000];
+const PR_REVIEWER_CONTENDED_MAX_ATTEMPTS = PR_REVIEWER_CONTENDED_BACKOFF_MS.length;
+
+/**
+ * Raised when a replay finds no invokable reviewer (BLO-21995).
+ *
+ * Deliberately NOT an {@link HttpError}: that class means "a business rule
+ * refused this and will keep refusing", which retires the record. Reviewer
+ * availability is the opposite — a transient condition the durable record
+ * exists to outlive — so this rides the normal transient path and is bounded by
+ * the same attempt budget.
+ */
+class PrReviewerUnavailableError extends Error {
+  constructor() {
+    super("no configured reviewer is currently active for this PR");
+    this.name = "PrReviewerUnavailableError";
+  }
+}
+
+/** Replay input persisted on a contended record; `buildPrReviewerWakeupOptions` is a pure function of these. */
+interface ContendedPrReviewerReplay {
+  attempts: number;
+  nextAttemptAt: string;
+  eventName: string;
+  deliveryId: string | null;
+  taskKey: string;
+  context: ResolvedEventContext & { prNumber: number };
+}
+
+/**
+ * Persist a PR-reviewer wake that lost its scope lock, so a worker can replay
+ * it (BLO-21995).
+ *
+ * Before this, a contended delivery answered HTTP 200 with
+ * `reviewerWakeFired: false` and nothing written — and because GitHub only
+ * redelivers deliveries it recorded as *failed*, a 200 put the event beyond
+ * reach of even manual redelivery. The wake was gone.
+ *
+ * The reviewer stored here is provisional and is NOT the assignment decision:
+ * it exists to satisfy the row's `agent_id`, and the replay re-resolves the
+ * reviewer under the PR lock (affinity first), so a concurrent winner's choice
+ * takes precedence. Nothing downstream reads this column as authoritative.
+ *
+ * Because it is only an FK anchor, reviewer *availability* is deliberately not
+ * a precondition for recording. A reviewer that is paused or mid-restart at
+ * this instant is a transient condition, and the contended delivery outlives
+ * it; refusing to persist would turn a seconds-long blip into a permanently
+ * lost review request — the exact loss this function exists to prevent.
+ *
+ * Returns true when a durable record exists for this delivery (including one a
+ * concurrent redelivery already wrote). False means nothing will ever retry it,
+ * and the caller must fail the delivery so GitHub keeps it redeliverable.
+ */
+async function persistContendedPrReviewerWake(params: {
+  db: Db;
+  context: ResolvedEventContext & { prNumber: number };
+  eventName: string;
+  deliveryId: string | null;
+  reviewerAgentIds: readonly string[];
+  taskKey: string;
+}): Promise<boolean> {
+  const { db, context, eventName, deliveryId, reviewerAgentIds, taskKey } = params;
+  const wakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
+  const idempotencyKey = wakeupOptions.idempotencyKey;
+
+  // Prefer a reviewer that is actually invokable so the provisional pick is
+  // usually the one the replay lands on anyway, but fall back to any
+  // *configured* reviewer row: the column is an FK anchor, not a decision.
+  const provisionalAgentId =
+    (await findActivePrReviewerForTask(db, reviewerAgentIds, taskKey)) ??
+    (await selectPrReviewerAgentId(db, reviewerAgentIds, taskKey)) ??
+    (await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(inArray(agents.id, [...reviewerAgentIds]))
+      .limit(1)
+      .then((rows) => rows[0]?.id ?? null));
+  if (!provisionalAgentId) {
+    // Not "no reviewer is available" — "no configured reviewer exists as an
+    // agent row at all", so there is no company to file the record under and
+    // no FK target. Genuinely unrecordable; the caller 503s instead.
+    logger.error(
+      { taskKey, deliveryId, event: eventName, repoFullName: context.repoFullName },
+      "github webhook reviewer wake lost to lock contention and no configured reviewer row exists to record it against",
+    );
+    return false;
+  }
+  const provisionalAgent = await db
+    .select({ companyId: agents.companyId })
+    .from(agents)
+    .where(eq(agents.id, provisionalAgentId))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (!provisionalAgent) return false;
+
+  const replay: ContendedPrReviewerReplay = {
+    attempts: 0,
+    // Never null: a record the due-ness filter can't select is stranded
+    // silently, the failure mode the provider-capacity path guards with its
+    // own default delay.
+    nextAttemptAt: new Date(Date.now() + PR_REVIEWER_CONTENDED_BACKOFF_MS[0]).toISOString(),
+    eventName,
+    deliveryId,
+    taskKey,
+    context,
+  };
+  // One retry record per delivery, claimed atomically. A plain
+  // select-then-insert races: two simultaneous redeliveries of the same
+  // x-github-delivery id would both observe no row and both write one. The
+  // duplicate cannot produce a second reviewer wake (the PR-scope advisory lock
+  // still serializes the replays), but it would over-count the
+  // `deferred`/`retried` funnel and double the reconciler's work.
+  //
+  // Serialized on an advisory lock rather than a unique index because
+  // `agent_wakeup_requests` is one of the largest tables in the schema and
+  // drizzle runs migrations transactionally, so the index could not be built
+  // CONCURRENTLY — it would hold ACCESS EXCLUSIVE across a full heap scan and
+  // stall the very wake path this change exists to protect. This lock is a
+  // different key space from the PR-scope lock (distinct prefix), so the two
+  // never alias, and it is taken after the PR-scope lock has already been
+  // released.
+  const claimKey = `pr_reviewer_contended_retry:${idempotencyKey}`;
+  const recorded = await db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${claimKey}, 0))`);
+    const existing = await tx
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          eq(agentWakeupRequests.status, PR_REVIEWER_CONTENDED_STATUS),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return false;
+    await tx.insert(agentWakeupRequests).values({
+      companyId: provisionalAgent.companyId,
+      agentId: provisionalAgentId,
+      source: wakeupOptions.source ?? "automation",
+      triggerDetail: wakeupOptions.triggerDetail ?? null,
+      reason: wakeupOptions.reason ?? null,
+      payload: { ...wakeupOptions.payload, prReviewerContendedRetry: replay },
+      status: PR_REVIEWER_CONTENDED_STATUS,
+      idempotencyKey,
+    });
+    return true;
+  });
+  if (!recorded) {
+    // A concurrent redelivery of this same delivery id already recorded it.
+    // Still durable, so the caller must not 503 and invite a third replay.
+    logger.info(
+      { taskKey, deliveryId, event: eventName, idempotencyKey },
+      "contended PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
+    );
+    return true;
+  }
+
+  // `received` marks intent-to-wake, which a contended delivery genuinely has —
+  // it got past every suppression gate and only lost a race. Pairing it with
+  // `deferred` keeps the funnel's "durably recorded, not yet dispatched" arm
+  // honest, exactly as the provider-capacity deferral does.
+  recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
+  recordGithubReviewRequestDelivery({ state: "deferred", reason: context.wakeReason });
+  logger.warn(
+    {
+      taskKey,
+      deliveryId,
+      event: eventName,
+      prNumber: context.prNumber,
+      repoFullName: context.repoFullName,
+      wakeReason: context.wakeReason,
+      idempotencyKey,
+      provisionalAgentId,
+      nextAttemptAt: replay.nextAttemptAt,
+    },
+    "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
+  );
+  return true;
+}
+
+export interface ContendedPrReviewerWakeReconciliation {
+  recovered: number;
+  superseded: number;
+  exhausted: number;
+  stillContended: number;
+}
+
+function parseContendedReplay(payload: unknown): ContendedPrReviewerReplay | null {
+  if (!payload || typeof payload !== "object") return null;
+  const replay = (payload as Record<string, unknown>).prReviewerContendedRetry;
+  if (!replay || typeof replay !== "object") return null;
+  const candidate = replay as Partial<ContendedPrReviewerReplay>;
+  if (!candidate.context || typeof candidate.context !== "object") return null;
+  if (typeof candidate.context.prNumber !== "number") return null;
+  if (typeof candidate.taskKey !== "string" || typeof candidate.eventName !== "string") return null;
+  return {
+    attempts: typeof candidate.attempts === "number" ? candidate.attempts : 0,
+    nextAttemptAt: typeof candidate.nextAttemptAt === "string" ? candidate.nextAttemptAt : "",
+    eventName: candidate.eventName,
+    deliveryId: typeof candidate.deliveryId === "string" ? candidate.deliveryId : null,
+    taskKey: candidate.taskKey,
+    context: candidate.context as ResolvedEventContext & { prNumber: number },
+  };
+}
+
+/**
+ * Replay PR-reviewer wakes that lost their scope lock (BLO-21995).
+ *
+ * Runs on the heartbeat scheduler tick. Each due record is replayed through
+ * {@link attemptPrReviewerWake}, which reacquires the PR-scope advisory lock —
+ * so a replay is serialized against live deliveries for the same PR and cannot
+ * assign a second reviewer.
+ *
+ * Two schedulers may pick up the same record concurrently; that is safe rather
+ * than merely tolerated. Both replays contend for the one PR lock, and the
+ * loser's idempotency probe finds the winner's `queued` row and returns
+ * `duplicate`. The terminal UPDATE is additionally guarded on the row still
+ * being `contended`, so the outcome recorded is whichever transition landed
+ * first rather than a clobber.
+ */
+export async function reconcileContendedPrReviewerWakes(
+  db: Db,
+  config: GithubWebhookConfig,
+  now: Date = new Date(),
+): Promise<ContendedPrReviewerWakeReconciliation> {
+  const result: ContendedPrReviewerWakeReconciliation = {
+    recovered: 0,
+    superseded: 0,
+    exhausted: 0,
+    stillContended: 0,
+  };
+  const reviewerAgentIds = configuredPrReviewerAgentIds(config);
+  if (reviewerAgentIds.length === 0) return result;
+
+  // Filter and order by due-ness, not requestedAt: under a backlog, older rows
+  // whose backoff has escalated further out would otherwise fill the batch and
+  // starve rows that are due right now (the BLO-14395 review lesson).
+  const nextAttemptAtExpr = sql`(${agentWakeupRequests.payload} -> 'prReviewerContendedRetry' ->> 'nextAttemptAt')::timestamptz`;
+  const dueRows = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.status, PR_REVIEWER_CONTENDED_STATUS),
+        sql`${nextAttemptAtExpr} <= ${now.toISOString()}::timestamptz`,
+      ),
+    )
+    .orderBy(asc(nextAttemptAtExpr))
+    .limit(50);
+
+  for (const row of dueRows) {
+    const replay = parseContendedReplay(row.payload);
+    if (!replay) {
+      await retireContendedRow(db, row.id, PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS, "unparseable retry record");
+      result.superseded += 1;
+      continue;
+    }
+    const attempts = replay.attempts + 1;
+    // Counted up-front so a pass that throws somewhere unexpected still shows
+    // as an attempt rather than looking like it never ran.
+    recordGithubReviewRequestDelivery({ state: "retried", reason: replay.context.wakeReason });
+
+    try {
+      const outcome = await attemptPrReviewerWake({
+        db,
+        config,
+        context: replay.context,
+        eventName: replay.eventName,
+        deliveryId: replay.deliveryId,
+        reviewerAgentIds,
+      });
+      if (outcome === "queued") {
+        await retireContendedRow(db, row.id, PR_REVIEWER_CONTENDED_RECOVERED_STATUS, null);
+        result.recovered += 1;
+        logger.info(
+          { taskKey: replay.taskKey, deliveryId: replay.deliveryId, attempts },
+          "contended PR-reviewer wake recovered by durable retry (BLO-21995)",
+        );
+        continue;
+      }
+      if (outcome === "no_reviewer") {
+        // NOT terminal. Reviewer availability is transient — paused for a
+        // config push, mid-restart, momentarily between runs — and the whole
+        // point of a durable record is to outlive exactly that. Retiring here
+        // would drop a sanctioned review request because the reviewer happened
+        // to be down for the seconds this pass ran. Re-arm on the normal
+        // backoff; the attempt budget still bounds it, and a reviewer that
+        // never comes back exhausts into an alertable `dead_lettered`.
+        throw new PrReviewerUnavailableError();
+      }
+      // duplicate / declined are terminal for this delivery: replaying cannot
+      // change either. `duplicate` is the expected outcome when the delivery
+      // that won the original race did the work.
+      await retireContendedRow(db, row.id, PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS, outcome);
+      result.superseded += 1;
+    } catch (err) {
+      const contended = err instanceof PrReviewerTaskLockTimeoutError;
+      // An HttpError is a business-rule refusal (the agent got paused, the
+      // company went inactive): the underlying condition resolved into a
+      // durable decline, not a transient failure. Retrying it four times
+      // cannot change the answer, and letting it reach the exhaustion branch
+      // would emit a `dead_lettered` that pages for a delivery nothing was
+      // ever going to accept. Mirrors how the generic dispatch reconciler
+      // treats the same class.
+      if (err instanceof HttpError) {
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          err.message,
+        );
+        result.superseded += 1;
+        logger.info(
+          { err, taskKey: replay.taskKey, deliveryId: replay.deliveryId },
+          "contended PR-reviewer wake superseded: replay refused by a business rule (BLO-21995)",
+        );
+        continue;
+      }
+      if (attempts >= PR_REVIEWER_CONTENDED_MAX_ATTEMPTS) {
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_EXHAUSTED_STATUS,
+          err instanceof Error ? err.message : String(err),
+        );
+        // Terminal and queryable/alertable — the one outcome where a sanctioned
+        // review request really is dropped, so it must never be silent.
+        recordGithubReviewRequestDelivery({ state: "dead_lettered", reason: replay.context.wakeReason });
+        result.exhausted += 1;
+        logger.error(
+          { err, taskKey: replay.taskKey, deliveryId: replay.deliveryId, attempts },
+          "contended PR-reviewer wake exhausted its durable retries; manual redelivery required (BLO-21995)",
+        );
+        continue;
+      }
+      const backoffMs =
+        PR_REVIEWER_CONTENDED_BACKOFF_MS[attempts] ?? PR_REVIEWER_CONTENDED_BACKOFF_MS.at(-1)!;
+      await db
+        .update(agentWakeupRequests)
+        .set({
+          payload: {
+            ...(row.payload ?? {}),
+            prReviewerContendedRetry: {
+              ...replay,
+              attempts,
+              nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
+            },
+          },
+          error: err instanceof Error ? err.message : String(err),
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, row.id),
+            eq(agentWakeupRequests.status, PR_REVIEWER_CONTENDED_STATUS),
+          ),
+        );
+      result.stillContended += 1;
+      if (!contended) {
+        logger.warn(
+          { err, taskKey: replay.taskKey, deliveryId: replay.deliveryId, attempts },
+          "contended PR-reviewer wake retry failed; re-armed (BLO-21995)",
+        );
+      }
+    }
+  }
+
+  return result;
+}
+
+async function retireContendedRow(
+  db: Db,
+  id: string,
+  status: string,
+  error: string | null,
+): Promise<void> {
+  await db
+    .update(agentWakeupRequests)
+    .set({ status, error, finishedAt: new Date(), updatedAt: new Date() })
+    .where(
+      and(eq(agentWakeupRequests.id, id), eq(agentWakeupRequests.status, PR_REVIEWER_CONTENDED_STATUS)),
+    );
+}
+
 function prFeedbackBody(context: ResolvedEventContext): string | null {
   return context.reviewBody ?? context.commentBody ?? null;
 }
@@ -2293,140 +2913,42 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         return false;
       }
       try {
-        const heartbeat = heartbeatService(db, {
-          pluginWorkerManager: config.pluginWorkerManager,
-          ...config.heartbeatOptions,
+        const outcome = await attemptPrReviewerWake({
+          db,
+          config,
+          context,
+          eventName,
+          deliveryId,
+          reviewerAgentIds,
         });
-        const reviewerWakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
-        const reviewerTaskKey = reviewerWakeupOptions.payload.taskKey;
-        const idempotencyKey = reviewerWakeupOptions.idempotencyKey;
-        // taskKey scopes active-run coalescing; idempotencyKey scopes duplicate
-        // request rows for the same PR+reason before enqueueing.
-        // Request-scoped keys also dedup terminal completed/cancelled rows, so a
-        // GitHub redelivery of one event cannot re-run work that already ran or
-        // was retired by converted_to_draft (BLO-18953).
-        const idempotentStatuses = idempotentWakeStatuses(
-          prReviewerWakeIdempotencyScope(context, deliveryId),
-        );
-        const dispatchReviewerWake = async (tx: DbTransaction) => {
-          // The wake insert commits through heartbeat's own transaction. Keep
-          // this transaction-scoped lock held until that commit is visible so
-          // concurrent first events for one PR re-check affinity instead of
-          // assigning the same task to different reviewers.
-          const existingWake = await tx
-            .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
-            .from(agentWakeupRequests)
-            .where(
-              and(
-                inArray(agentWakeupRequests.agentId, reviewerAgentIds),
-                // Case-insensitive on the repo segment, for the same reason the
-                // task-key lookups are. Phase one retains legacy-spelled writes
-                // for old-reader safety, but normalized rows may already exist
-                // from a canary or interrupted rollout. Byte-exact equality
-                // would make those rows invisible and let a redelivery queue a
-                // duplicate — worst when the original run is terminal and task
-                // coalescing has nothing live to catch it. Reviewer keys are
-                // `pr_review:<repo>:<n>:<suffix>`, so they carry the shared
-                // predicate's `pr_review:` prefix; the suffix segments (wake
-                // reason, numeric comment id, GitHub delivery uuid) are already
-                // lowercase, so folding case cannot merge two distinct requests.
-                matchesTaskKey(agentWakeupRequests.idempotencyKey, idempotencyKey),
-                inArray(agentWakeupRequests.status, idempotentStatuses),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (existingWake) {
-            logger.info(
-              {
-                existingWakeId: existingWake.id,
-                existingWakeStatus: existingWake.status,
-                idempotencyKey,
-                event: eventName,
-                deliveryId,
-                wakeReason: context.wakeReason,
-                prNumber: context.prNumber,
-                repoFullName: context.repoFullName,
-              },
-              "github webhook reviewer wake skipped: duplicate idempotency key",
-            );
-            return false;
-          }
-
-          const reviewerAgentId =
-            (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
-            (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
-          if (!reviewerAgentId) {
-            logger.warn(
-              {
-                configuredReviewerCount: reviewerAgentIds.length,
-                event: eventName,
-                prNumber: context.prNumber,
-                repoFullName: context.repoFullName,
-              },
-              "github webhook reviewer wake skipped: no configured reviewer is active",
-            );
-            return false;
-          }
-
-          // BLO-18859: every suppression gate is behind us and a reviewer is
-          // resolved, so this delivery is now committed to producing a wake.
-          // Counting `received` here (rather than at signature verification)
-          // makes `received - queued` a measure of real loss between intent and
-          // durability — deduped/self-echo/no-reviewer deliveries are correct
-          // no-ops and would otherwise swamp that gap in steady state.
-          recordGithubReviewRequestDelivery({ state: "received", reason: context.wakeReason });
-
-          const wakeResult = await heartbeat.wakeup(reviewerAgentId, reviewerWakeupOptions);
-          // A truthy result means the durable agent_wakeup_requests row is
-          // committed AND a run was enqueued/coalesced; from here the wake
-          // survives this process dying. Any transient dispatch failure inside
-          // wakeup() has already been retried and counted as `retried` by
-          // wakeupWithDispatchRetry, so this only fires on real durability.
-          //
-          // A `null` result is NOT a success: enqueueWakeup resolves null
-          // (without throwing) when a scheduling gate declines the wake — it
-          // writes a status="skipped" row and no run. Counting that as `queued`
-          // reported a healthy received+queued funnel for a review that never
-          // ran, hiding exactly the BLO-18847 symptom this counter exists to
-          // surface. No reconciler pass re-arms a skipped row, so it is
-          // terminal for this delivery.
-          if (wakeResult) {
-            recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
-            return true;
-          }
-          // The terminal `suppressed` increment is NOT emitted here: the wake
-          // path owns it, because only `enqueueWakeup` knows which gate
-          // declined and the suppression metric's `cause` label needs that. The
-          // same applies to an HttpError refusal, which never reaches this line
-          // at all — it propagates to the catch below, and counting it here
-          // would have been impossible (BLO-18859 review follow-up).
-          logger.warn(
-            {
-              agentId: reviewerAgentId,
-              event: eventName,
-              githubDeliveryId: deliveryId,
-              prNumber: context.prNumber,
-              repoFullName: context.repoFullName,
-              wakeReason: context.wakeReason,
-            },
-            "github webhook reviewer wake did not queue a run; a gate declined it "
-              + "(check agent_wakeup_requests for the skipped row's reason) or the "
-              + "provider-capacity gate deferred it to a scheduled_retry run",
-          );
-          // Matches every other suppression gate in this closure, so the 200
-          // response body cannot claim reviewerWakeFired for a wake that did
-          // not produce a run.
-          return false;
-        };
-        try {
-          return await withPrReviewerTaskLock(
+        return outcome === "queued";
+      } catch (err) {
+        if (err instanceof PrReviewerTaskLockTimeoutError) {
+          // BLO-21995: a concurrent delivery for this same PR held the scope for
+          // the whole timeout. Nothing reached heartbeat, so there is no partial
+          // state — the wake just needs to happen later. GitHub never redelivers
+          // on its own, so dropping it here loses it permanently.
+          const recorded = await persistContendedPrReviewerWake({
             db,
-            buildPrReviewerTaskLockKeys(context),
-            dispatchReviewerWake,
-          );
-        } catch (err) {
-          if (!(err instanceof PrReviewerTaskLockTimeoutError)) throw err;
+            context,
+            eventName,
+            deliveryId,
+            reviewerAgentIds,
+            taskKey: buildPrReviewerWakeupOptions(context, eventName, deliveryId).payload.taskKey,
+          });
+          if (recorded) {
+            // Durable: the reconciler owns it from here. Answer 200 so GitHub
+            // does not also queue this delivery for manual redelivery, which
+            // would be a second replay racing our own.
+            //
+            // Not `true`: the response must not claim a run that only a later
+            // reconciler pass will enqueue.
+            return false;
+          }
+          // Nothing was recorded, so there is no worker that will ever retry
+          // this. Fall back to the pre-BLO-21995 behaviour and fail the
+          // delivery, which at least leaves it manually redeliverable in
+          // GitHub's UI rather than silently lost behind a 200.
           logger.warn(
             {
               agentIds: reviewerAgentIds,
@@ -2434,11 +2956,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               prNumber: context.prNumber,
               repoFullName: context.repoFullName,
             },
-            "github webhook reviewer lock timed out; asking GitHub to retry",
+            "github webhook reviewer lock timed out and no durable retry was recorded; asking GitHub to retry",
           );
           throw new PrReviewerTaskLockContentionError();
         }
-      } catch (err) {
         if (err instanceof PrReviewerTaskLockContentionError) throw err;
         logger.error(
           {
