@@ -86,7 +86,7 @@ spec:
             summary: "Paperclip agent has {{ .Values.prometheusRule.zeroTokenStreakThreshold }}+ consecutive zero-token runs"
             description: "Agent {{`{{ $labels.agent_id }}`}} on adapter {{`{{ $labels.adapter }}`}} has completed {{ .Values.prometheusRule.zeroTokenStreakThreshold }} or more consecutive terminal runs with zero token usage. This catches poisoned-session/pre-model throttle loops like BLO-10866 within minutes."
         - alert: PaperclipAgentJobBackoffLimitExceeded
-          expr: (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason="BackoffLimitExceeded"}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) or (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) unless on (namespace) sum by (namespace) (kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason=~".+"}))) > 0
+          expr: (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason="BackoffLimitExceeded"}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) or (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) unless on (namespace) sum by (namespace) (kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason=~".+"})))  > 0
           for: {{ .Values.prometheusRule.backoffLimitExceededFor }}
           labels:
             severity: warning
@@ -296,6 +296,55 @@ spec:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
             description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
+    - name: paperclip-queued-run-stranded
+      rules:
+        - alert: PaperclipQueuedRunStranded
+          # BLO-21116. A `heartbeat_runs` row sitting at status='queued' for a
+          # long time means an issue looks `in_progress`/assigned with an
+          # active run, but nothing is executing and nothing else pages on it
+          # -- the exact "invisible strand" this issue reports. It is a
+          # distinct failure shape from PaperclipPrReviewWakeTerminalFailed
+          # above: that alert covers a wake that reached a terminal `failed`
+          # state with nothing left to retry it; this one covers a run that IS
+          # still schedulable (queued, not failed) but has not been dispatched
+          # -- concurrency starvation, a scheduler-tick gap, or a scheduled
+          # retry that promoted to `queued` and then stalled behind other work.
+          #
+          # Gauge, not a summed count under `for:`, for the same reason as the
+          # wake-terminal-failed rule: `for:` measures how long the EXPRESSION
+          # has been true, and a summed count lets one short strand clearing
+          # exactly as a fresh one appears keep the expression true
+          # indefinitely while each individual row is young. This gauge
+          # carries the server-computed age of the oldest queued row PER
+          # AGENT (refreshed on every /metrics scrape from a live
+          # MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
+          # scrape flapping, not standing in for the real age.
+          # The freshness gate is load-bearing: a failed database refresh
+          # leaves the previous gauge value in memory, so stale data must not
+          # qualify a strand alert. Gate each API replica against its own
+          # refresh result before taking the fleet-wide per-agent max; an
+          # `on()` join would let one healthy replica bless another replica's
+          # stale age snapshot.
+          expr: max by (agent_id) (paperclip_queued_run_oldest_age_seconds and on(instance) (paperclip_queued_run_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}
+          for: {{ .Values.prometheusRule.queuedRunStrandedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a queued run stranded for longer than {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}s"
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest `queued` heartbeat run has been waiting for {{`{{ $value }}`}}s since queue entry (BLO-21116). The age is only trusted while paperclip_queued_run_age_metrics_refresh_success is 1. The issue it targets looks `in_progress`/assigned with an active run, but nothing is executing. Query coalesce(queued_at, created_at), not created_at alone: retries promoted from scheduled_retry intentionally reset their dispatch-wait clock. See the runbook for saturation-versus-dispatch triage."
+            runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
+        - alert: PaperclipQueuedRunAgeMetricsRefreshFailed
+          # This is deliberately separate from the strand alert. A failed
+          # refresh means the age gauge is not fresh, not that the queue is
+          # empty; page on it so the freshness gate cannot hide a real strand.
+          expr: paperclip_queued_run_age_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.queuedRunAgeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip queued-run age metric refresh is failing"
+            description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
+            runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

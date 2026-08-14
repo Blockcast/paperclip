@@ -198,6 +198,32 @@ export function applyCcrotateCapacityDecision(
 export const MAX_TRANSIENT_RETRY_HORIZON_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Longest provider capacity outage on record (BLO-22844), used only to derive
+ * {@link TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS} below. Do not widen this ad hoc
+ * when a longer outage is observed without re-deriving the attempt count that
+ * depends on it — that decoupling is exactly BLO-23525's failure mode.
+ */
+export const LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS = 124.8 * 60 * 60 * 1000;
+
+/**
+ * Minimum attempt count for any bounded-retry family whose `retryNotBefore`
+ * floor gets clamped by {@link clampTransientRetryHorizon} (BLO-23525).
+ *
+ * A cap without a matching attempt ceiling just moves the exhaustion trap:
+ * `scheduleBoundedRetryForRun`'s generic transient-upstream ceiling is 4
+ * attempts, sized for ordinary exponential backoff (2m/10m/30m/2h) with no
+ * floor in play. Once a floor is clamped to `MAX_TRANSIENT_RETRY_HORIZON_MS`
+ * per attempt, 4 attempts cover only 96h — short of the 124.8h outage BLO-22844
+ * recorded, so a run would still be stranded 28.8h before the provider
+ * actually recovered. This is the smallest attempt count whose product with
+ * the cap does not fall short, derived rather than hand-picked so the two
+ * cannot drift apart silently again.
+ */
+export const TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS = Math.ceil(
+  LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS / MAX_TRANSIENT_RETRY_HORIZON_MS,
+);
+
+/**
  * Clamp a provider-advertised retry floor so a finalized run cannot park past
  * the horizon ceiling.
  *

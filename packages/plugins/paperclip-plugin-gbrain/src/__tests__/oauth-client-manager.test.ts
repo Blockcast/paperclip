@@ -7,6 +7,7 @@ import {
   loadClients,
   loadClientsFromAuthbot,
   loadClientsFromFile,
+  NoOAuthClientError,
 } from "../oauth-client-manager.js";
 
 function mockTokenResponse(body: unknown, status = 200): typeof fetch {
@@ -155,6 +156,15 @@ describe("OAuthClientManager", () => {
     });
     await expect(mgr.getToken("not-configured")).rejects.toThrow(/no client configured/);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("throws a NoOAuthClientError (not a generic Error) for an unknown agent (BLO-23403)", async () => {
+    const mgr = new OAuthClientManager({
+      tokenUrl: "http://gbrain/token",
+      clients: { a: { client_id: "c", client_secret: "s" } },
+      fetch: vi.fn(),
+    });
+    await expect(mgr.getToken("not-configured")).rejects.toBeInstanceOf(NoOAuthClientError);
   });
 
   it("invalidate() drops the cache so the next call re-fetches", async () => {

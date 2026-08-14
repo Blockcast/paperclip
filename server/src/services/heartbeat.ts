@@ -230,6 +230,7 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  buildIssueMonitorDispatchRearmPatch,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
   exhaustedMonitorClearReason,
@@ -309,7 +310,12 @@ import {
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
-import { resolveCcrotateCapacityRetry, clampTransientRetryHorizon, applyCcrotateCapacityDecision } from "./ccrotate-capacity-retry.js";
+import {
+  resolveCcrotateCapacityRetry,
+  clampTransientRetryHorizon,
+  applyCcrotateCapacityDecision,
+  TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+} from "./ccrotate-capacity-retry.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -591,6 +597,10 @@ const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 // poll interval lets the sweep re-check capacity soon. PEN-382.
 export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 export const CCROTATE_CAPACITY_RETRY_REASON = "ccrotate_capacity";
+export const ISSUE_MONITOR_DISPATCH_LAPSE_MS = 15 * 60 * 1000;
+const ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS = 5 * 60 * 1000;
+const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
+const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
 
 /**
  * Context-snapshot key holding how many GitHub review-request *deliveries* a
@@ -653,7 +663,17 @@ const K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS = Math.max(
 );
 // Backstop so a pool that never recovers eventually stops re-deferring and
 // surfaces for operator attention instead of looping forever. PEN-382.
-export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 24;
+//
+// BLO-22860 raised this from 24. It is not an independent knob: it is the
+// second half of the horizon cap above, and the two MUST be sized together.
+// Before the cap, attempts were paced by the provider's own `resumeAt`, so 24
+// of them spanned however long the provider asked for. Capping each hop makes
+// the ceiling bind on wall clock instead — at the 4h maximum hop, 24 attempts
+// would have covered only ~3.5 days, converting the 5.2-day window observed on
+// BLO-22844 into a hard exhaustion (strictly worse than the uncapped park this
+// issue set out to fix). 48 attempts cover ~7.5 days, clearing both windows on
+// record with headroom. Shorten the cap or the max hop and this must grow.
+export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 48;
 // When adapter resolution momentarily falls back to the no-op `process`
 // adapter for a non-process agent type (e.g. claude_k8s briefly unresolved),
 // we treat it as a transient miss and schedule a quick bounded retry instead
@@ -1195,6 +1215,31 @@ function resolveAutomaticRunRetryOpts(
   return undefined;
 }
 
+/**
+ * BLO-25517: `8446c1011` ("bind issue locks only for running runs") and
+ * `76304affd` (PR #1245, BLO-18012, "Recover unavailable OpenCode sessions")
+ * landed ~15 minutes apart and disagreed about whether a `scheduled_retry`
+ * run holds `issues.executionRunId` while parked. `8446c1011` set the global
+ * default: it does not — `scheduleBoundedRetryForRun` always clears the
+ * issue's execution lock before parking a run in `scheduled_retry`, and
+ * `issueExecutionRetryLockAvailable` below treats a `null` lock as available.
+ * A parked run holding the lock is what strands an issue no other run can
+ * claim.
+ *
+ * `76304affd` needed the OpenCode-recovery path (`session_unavailable`,
+ * `zero_token_session_reset`) to survive a retry cycle even when the issue
+ * has fallen back to `todo` (not `in_progress`) and even though nothing
+ * holds its lock in the meantime. Rather than reverting to the old
+ * hold-the-lock-while-parked semantic, that need is met by a narrower
+ * predicate scoped only to this recovery case: these two reasons are
+ * included here so `evaluateScheduledRetryGate` still runs the
+ * `issueExecutionRetryLockAvailable` claim-conflict check at *scheduling*
+ * time (refusing to park if a different run has since taken the issue), but
+ * are excluded from `requiresInProgressIssueRetry` below so scheduling does
+ * not also require `in_progress`. The issue itself stays unlocked
+ * (`executionRunId: null`) for the whole parked window, same as every other
+ * retry reason.
+ */
 function requiresIssueExecutionRetryLock(retryReason: string | null | undefined) {
   return (
     retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -1216,6 +1261,9 @@ function issueExecutionRetryLockAvailable(
   );
 }
 
+// See BLO-25517 comment above requiresIssueExecutionRetryLock: session_unavailable
+// and zero_token_session_reset are deliberately excluded here so their retries can
+// be scheduled for a `todo` (not just `in_progress`) issue.
 function requiresInProgressIssueRetry(retryReason: string | null | undefined) {
   return (
     requiresIssueExecutionRetryLock(retryReason) &&
@@ -1980,9 +2028,23 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
   attempt: number,
   now = new Date(),
   random: () => number = Math.random,
+  // BLO-23525: a run whose retryNotBefore floor is being clamped (see
+  // scheduleBoundedRetryForRun) needs more attempts than the exponential
+  // curve has hops for, so it can keep re-probing until the clamped floor's
+  // coverage catches up with the longest recorded outage. Hintless callers
+  // never pass this, so their ceiling — and therefore their behavior — is
+  // unchanged: attempt still cannot exceed the curve's own length there,
+  // because maxAttempts defaults to it.
+  maxAttempts: number = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
 ) {
   if (!Number.isInteger(attempt) || attempt <= 0) return null;
-  const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[attempt - 1];
+  if (attempt > maxAttempts) return null;
+  // Beyond the curve's own hops, hold at the last (largest) one rather than
+  // returning null — the caller's clamped floor is what actually decides
+  // `dueAt` past this point (it is far larger than any hop here), this only
+  // has to stay non-null so the attempt is not misreported as exhausted.
+  const lastHopIndex = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length - 1;
+  const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[Math.min(attempt - 1, lastHopIndex)];
   if (typeof baseDelayMs !== "number") return null;
   const sample = Math.min(1, Math.max(0, random()));
   const jitterMultiplier = 1 + (((sample * 2) - 1) * BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO);
@@ -1992,7 +2054,7 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     baseDelayMs,
     delayMs,
     dueAt: new Date(now.getTime() + delayMs),
-    maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    maxAttempts,
   };
 }
 
@@ -2302,6 +2364,77 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+// Join a repo-relative workspace subpath onto its realized checkout, refusing
+// anything that escapes the checkout root. `cwd` is operator-supplied config,
+// so a value like "../../../etc" must not be able to point a run outside the
+// repo it declared. See BLO-25415.
+//
+// Containment is enforced twice, because the two escapes are different:
+//   - lexically, against `..` traversal and sibling-prefix paths; and
+//   - after symlink resolution, because the checkout's *contents* are
+//     repo-controlled. A repo carrying `packages/iwa -> /etc` passes the
+//     lexical check and then fs.stat() follows the link, launching the run
+//     outside the checkout on a PVC shared with every other repo.
+//
+// The realpath pass is skipped when the target does not exist: there is
+// nothing to follow, and the caller's own fs.stat() is what reports it
+// missing. Resolving the root separately matters too — the managed dir may
+// itself sit behind a symlink, which would otherwise fail containment for a
+// perfectly legitimate subpath.
+export async function resolveContainedWorkspaceSubpath(
+  checkoutDir: string,
+  subpath: string,
+): Promise<string> {
+  const root = path.resolve(checkoutDir);
+  const resolved = path.resolve(root, subpath);
+  assertPathContained(root, resolved, subpath);
+
+  const realRoot = await fs.realpath(root).catch(() => null);
+  const realResolved = await fs.realpath(resolved).catch(() => null);
+  if (realRoot && realResolved) {
+    assertPathContained(realRoot, realResolved, subpath);
+  }
+  return resolved;
+}
+
+function assertPathContained(root: string, candidate: string, subpath: string): void {
+  if (candidate !== root && !candidate.startsWith(`${root}${path.sep}`)) {
+    throw new Error(
+      `Project workspace cwd "${subpath}" resolves outside its checkout "${root}".`,
+    );
+  }
+}
+
+// Workspace source types that own their `cwd` outright: the path is a host
+// location (or a remote provider's), not a subdirectory of a checkout we
+// manage. A relative `cwd` on one of these keeps its prior meaning rather than
+// being redirected into a managed checkout dir.
+const NON_REPO_WORKSPACE_SOURCE_TYPES = new Set(["local_path", "non_git_path", "remote_managed"]);
+
+/**
+ * Decide whether a workspace's `cwd` is a repo-relative subdirectory that must
+ * be joined onto its managed checkout, returning that subpath (or null to use
+ * `cwd` as-is).
+ *
+ * Only repo-backed workspaces qualify. `repoUrl` is required rather than
+ * inferred from `sourceType` because `source_type` is an unconstrained text
+ * column — production carries at least one row typed `"git"` rather than
+ * `"git_repo"` — and because without a repo there is nothing for the path to
+ * be relative to: `ensureManagedProjectWorkspace` would mkdir an empty
+ * directory that the subsequent stat can never satisfy. See BLO-25415.
+ */
+export function resolveRepoRelativeWorkspaceCwd(workspace: {
+  cwd?: string | null;
+  sourceType?: string | null;
+  repoUrl?: string | null;
+}): string | null {
+  const cwd = readNonEmptyString(workspace.cwd);
+  if (!cwd || cwd === REPO_ONLY_CWD_SENTINEL || path.isAbsolute(cwd)) return null;
+  if (NON_REPO_WORKSPACE_SOURCE_TYPES.has(readNonEmptyString(workspace.sourceType) ?? "")) return null;
+  if (!readNonEmptyString(workspace.repoUrl)) return null;
+  return cwd;
 }
 
 async function ensureManagedProjectWorkspace(input: {
@@ -5615,6 +5748,75 @@ function isEffectivelyDependencyReadyForDispatch(
 ) {
   if (readiness?.isDependencyReady ?? true) return true;
   return allowsIssueInteractionWake(contextSnapshot);
+}
+
+/**
+ * The single definition of "is this queued run's issue actually claimable
+ * right now" (BLO-22091). Every dispatch lane's eligibility test
+ * (`foundReadyCritical`, `foundReadyRecovery`, `foundReadyAbsolute`) calls
+ * this and nothing else, so a future change to any one screen cannot
+ * silently desynchronize the lanes from what the claim path actually
+ * accepts — the exact shape of leaks 2-5 (BLO-21792), which were each one
+ * site re-deriving this verdict slightly differently from the others.
+ *
+ * Three screens, matching what `claimQueuedRun` applies to a routine
+ * (non-reopen) queued run:
+ *   1. The issue must exist and be non-terminal (`TERMINAL_ISSUE_STATUSES`).
+ *   2. It must not be a k8s-isolation retry still waiting on its timestamp.
+ *   3. It must be dependency-ready, or exempted via a verified issue-
+ *      interaction wake (`isEffectivelyDependencyReadyForDispatch` above).
+ *
+ * `claimQueuedRun`'s own dependency-blocker gate calls
+ * `isEffectivelyDependencyReadyForDispatch` directly rather than this whole
+ * predicate, and the `dispatchRank` invocation below calls the narrower
+ * sibling `isDispatchRankReady` instead of this — see that function's
+ * comment for why terminal-status can't be folded in there without
+ * reintroducing an unbounded wait for a different exemption.
+ */
+function isRunClaimable(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  issue: { status: string } | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): boolean {
+  if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
+  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
+}
+
+/**
+ * `dispatchRank`'s `ready` screen (BLO-22091). Deliberately narrower than
+ * `isRunClaimable` above: it omits the terminal-issue check on purpose.
+ *
+ * By the time a row reaches the ranking step, `queuedRuns` has already been
+ * pruned for terminal issues by the main scan via `evaluateQueuedRunStaleness`
+ * — the same function `claimQueuedRun` itself uses — which lets a
+ * `resumeIntent`/wake-comment-carrying row survive against a done/cancelled
+ * issue so a comment can reopen it. That pruning is authoritative and
+ * resume-intent-aware; this function must not re-exclude what it already
+ * decided to keep. If it did, `dispatchRank`'s `!ready` branch never ages
+ * (a row that "cannot be claimed" must not escalate to the front, however
+ * long it has waited — see that function) so a legitimately-claimable
+ * reopened row would rank `12+` forever and starve exactly the way this
+ * ticket exists to prevent, just via a different exemption than leak 5's.
+ *
+ * The lanes above don't have this problem: they already excluded terminal
+ * issues from their own candidate batches unconditionally before this fix
+ * (via `criticalIssueById`'s filter, lane B's `candidates` filter, and lane
+ * C's inline check), so a resume-intent-exempted terminal row was already
+ * never surfaced as "found ready" by any lane — `isRunClaimable` preserves
+ * that pre-existing behavior rather than changing it. Only `dispatchRank`'s
+ * `ready` previously had *no* terminal screen at all (trusting the upstream
+ * prune), so adding the full `isRunClaimable` there — rather than this
+ * narrower sibling — would have been a net new regression, not a fix.
+ */
+function isDispatchRankReady(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): boolean {
+  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }
 
 async function listUnresolvedBlockerSummaries(
@@ -10727,6 +10929,130 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : {};
 
+    if (monitor?.serviceName === ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE) {
+      const watchedRunId = monitor.gateSignals
+        ?.find((signal) => signal.startsWith(ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX))
+        ?.slice(ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX.length) ?? null;
+      const readWatchedRun = async () => watchedRunId
+        ? await db
+          .select({
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+            agentId: heartbeatRuns.agentId,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, watchedRunId))
+          .then((rows) => rows[0] ?? null)
+        : null;
+      const watchedRunIsWaiting = (
+        run: { status: string; startedAt: Date | null } | null,
+      ): run is { status: string; startedAt: null; agentId: string } =>
+        Boolean(run) && run!.status === "queued" && !run!.startedAt;
+      const settleWatchdogAsRecovered = async (
+        run: { status: string; startedAt: Date | null } | null,
+        redispatched: boolean,
+      ) => {
+        await db
+          .update(issues)
+          .set({
+            ...buildIssueMonitorClearedPatch({
+              issue: claimed,
+              policy,
+              clearReason: "dispatch_skipped",
+              clearedAt: input.now,
+            }),
+            updatedAt: input.now,
+          })
+          .where(eq(issues.id, claimed.id));
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_dispatch_watchdog_recovered",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            watchedRunId,
+            watchedRunStatus: run?.status ?? "missing",
+            watchedRunStartedAt: run?.startedAt?.toISOString() ?? null,
+            redispatched,
+          },
+        });
+        return { outcome: "skipped" as const, reason: "watched run is no longer waiting for dispatch" };
+      };
+
+      const watchedRun = await readWatchedRun();
+      if (!watchedRunIsWaiting(watchedRun)) {
+        return settleWatchdogAsRecovered(watchedRun, false);
+      }
+
+      // The watched run is STILL queued. Falling through to enqueueWakeup here
+      // accomplishes nothing: this issue's task scope already owns that queued
+      // run, so coalescePendingTaskScopeWake merges into it and returns without
+      // ever calling startNextQueuedRunForAgent. The triggered patch would then
+      // clear monitorNextCheckAt, leaving the issue re-lapsed with the same
+      // undeliverable run — the watchdog would "recover" the strand forever
+      // without moving it (BLO-22860). Push the dispatcher directly instead.
+      await startNextQueuedRunForAgent(watchedRun.agentId, {
+        reason: "issue_monitor_dispatch_watchdog",
+      });
+      const redispatchedRun = await readWatchedRun();
+      if (!watchedRunIsWaiting(redispatchedRun)) {
+        return settleWatchdogAsRecovered(redispatchedRun, true);
+      }
+
+      // Still stuck after an explicit dispatch pass. Re-arm rather than consume
+      // the timer, but count the attempt so this is bounded: once maxAttempts is
+      // reached the clearReason path below surfaces/escalates the issue instead
+      // of polling a run that never moves.
+      if (!clearReason) {
+        const retryCheckAt = new Date(input.now.getTime() + ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS);
+        const retryPolicy = normalizeIssueExecutionPolicy({
+          ...policy,
+          monitor: { ...monitor, nextCheckAt: retryCheckAt.toISOString() },
+        });
+        if (retryPolicy?.monitor) {
+          await db
+            .update(issues)
+            .set({
+              ...buildIssueMonitorDispatchRearmPatch({
+                issue: claimed,
+                policy: retryPolicy,
+                attemptCount: nextAttemptCount,
+              }),
+              updatedAt: input.now,
+            })
+            .where(eq(issues.id, claimed.id));
+          await logActivity(db, {
+            companyId: claimed.companyId,
+            actorType: input.actorType,
+            actorId: input.actorId,
+            agentId: input.agentId,
+            runId: input.runId,
+            action: "issue.monitor_dispatch_watchdog_redispatched",
+            entityType: "issue",
+            entityId: claimed.id,
+            details: {
+              identifier: claimed.identifier,
+              watchedRunId,
+              watchedRunAgentId: watchedRun.agentId,
+              nextCheckAt: retryCheckAt.toISOString(),
+              monitorAttemptCount: nextAttemptCount,
+            },
+          });
+          return {
+            outcome: "rearmed" as const,
+            reason: "watched run is still queued after an explicit dispatch pass",
+          };
+        }
+      }
+      // Attempts exhausted — fall through to clearIssueMonitorAndRecover so the
+      // strand is surfaced to a human/recovery lane rather than polled forever.
+    }
+
     if (clearReason) {
       return clearIssueMonitorAndRecover({
         claimed,
@@ -10946,6 +11272,85 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
+    const lapseThreshold = new Date(now.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    const lapsed = await db
+      .select({ issue: issueMonitorDispatchColumns, run: heartbeatRuns })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          isNull(issues.monitorNextCheckAt),
+          lte(issues.monitorLastTriggeredAt, lapseThreshold),
+          inArray(issues.status, ["in_progress", "in_review"]),
+          eq(heartbeatRuns.status, "queued"),
+          isNull(heartbeatRuns.startedAt),
+          lte(heartbeatRuns.createdAt, lapseThreshold),
+        ),
+      )
+      .orderBy(asc(issues.monitorLastTriggeredAt), asc(issues.id))
+      .limit(50);
+
+    for (const candidate of lapsed) {
+      const state = parseIssueExecutionState(candidate.issue.executionState);
+      const previousMonitor = state?.monitor ?? null;
+      if (previousMonitor?.status !== "triggered") continue;
+      const nextCheckAt = new Date(now.getTime() + ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS);
+      const previousPolicy = normalizeIssueExecutionPolicy(candidate.issue.executionPolicy ?? null);
+      const policy = normalizeIssueExecutionPolicy({
+        mode: previousPolicy?.mode ?? "normal",
+        commentRequired: previousPolicy?.commentRequired ?? true,
+        stages: previousPolicy?.stages ?? [],
+        monitor: {
+          nextCheckAt: nextCheckAt.toISOString(),
+          notes: previousMonitor.notes ?? "Re-check monitor wake dispatch",
+          scheduledBy: previousMonitor.scheduledBy ?? "assignee",
+          kind: previousMonitor.kind ?? undefined,
+          serviceName: ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE,
+          timeoutAt: previousMonitor.timeoutAt ?? undefined,
+          maxAttempts: previousMonitor.maxAttempts ?? undefined,
+          recoveryPolicy: previousMonitor.recoveryPolicy ?? undefined,
+          gateSignals: [`${ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX}${candidate.run.id}`],
+        },
+      });
+      if (!policy?.monitor) continue;
+      const rearmed = await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorDispatchRearmPatch({ issue: candidate.issue, policy }),
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, candidate.issue.id),
+            eq(issues.executionRunId, candidate.run.id),
+            isNull(issues.monitorNextCheckAt),
+            eq(issues.monitorLastTriggeredAt, candidate.issue.monitorLastTriggeredAt!),
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      if (!rearmed) continue;
+      await logActivity(db, {
+        companyId: candidate.issue.companyId,
+        actorType: "system",
+        actorId: "heartbeat_scheduler",
+        agentId: null,
+        runId: null,
+        action: "issue.monitor_rearmed_after_dispatch_lapse",
+        entityType: "issue",
+        entityId: candidate.issue.id,
+        details: {
+          identifier: candidate.issue.identifier,
+          watchedRunId: candidate.run.id,
+          watchedRunCreatedAt: candidate.run.createdAt.toISOString(),
+          nextCheckAt: nextCheckAt.toISOString(),
+          lapseMs: ISSUE_MONITOR_DISPATCH_LAPSE_MS,
+        },
+      });
+    }
+
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
@@ -11418,14 +11823,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const workspace of realizationCandidates) {
         let projectCwd = readNonEmptyString(workspace.cwd);
         let managedWorkspaceWarning: string | null = null;
-        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
+        // A workspace cwd is either an absolute host path or — for a repo-backed
+        // workspace — a repo-relative subdirectory such as "packages/iwa". The
+        // relative form only resolves once the repo is checked out, so realize
+        // the managed checkout first and join the subpath inside it. Without
+        // this the raw relative string reached the fs.stat() below and was
+        // resolved against the API process's own cwd, which never matches: the
+        // run then failed `preferred_workspace_unrealizable` quoting a path
+        // that looks correct, and no amount of cloning could satisfy it. See
+        // BLO-25415.
+        const repoRelativeCwd = resolveRepoRelativeWorkspaceCwd(workspace);
+        if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL || repoRelativeCwd) {
           try {
             const managedWorkspace = await ensureManagedProjectWorkspace({
               companyId: agent.companyId,
               projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
               repoUrl: readNonEmptyString(workspace.repoUrl),
             });
-            projectCwd = managedWorkspace.cwd;
+            projectCwd = repoRelativeCwd
+              ? await resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
+              : managedWorkspace.cwd;
             managedWorkspaceWarning = managedWorkspace.warning;
           } catch (error) {
             if (preferredWorkspace?.id === workspace.id) {
@@ -14273,6 +14690,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           error: null,
           errorCode: null,
+          // BLO-21116 (Ally review, onprem-k8s#2013): this row can have sat in
+          // scheduled_retry backoff for hours; queuedAt resets its dispatch
+          // wait clock to this promotion instant so the age gauge measures
+          // time queued for a slot, not lifetime since createdAt.
+          queuedAt: now,
           updatedAt: now,
         })
         .where(
@@ -14402,6 +14824,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
+    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    // BLO-23438/BLO-23525: every family reaching this branch with a floor
+    // that will be clamped (see `clampTransientHorizon`, applied further
+    // below) needs enough attempts for the clamp's per-attempt ceiling to add
+    // up to the longest recorded outage. `rate_limit_exhausted` already
+    // clears that bar at its own 12-attempt ceiling (12 * 24h = 288h).
+    // `provider_quota` is excluded because its floor is never clamped — it is
+    // a contractual session/billing boundary, not a capacity estimate, so
+    // raising its attempt count here would just burn retries against a wall.
+    // That leaves generic `transient_upstream`: its ordinary ceiling (4) is
+    // sized for hintless exponential backoff and covers only 96h once a floor
+    // is clamped to 24h per attempt — short of BLO-22844's 124.8h. Raise it
+    // only when a floor is actually present so hintless transient-upstream
+    // retries (no floor) keep their original 4-attempt ceiling untouched.
+    const clampTransientHorizon =
+      transientRetryNotBefore !== null && transientRecovery?.errorFamily !== "provider_quota";
     // Pick the schedule curve based on the recovery family. Rate-limit gets
     // a flat short delay (gate is the actual decider); generic transient
     // upstream gets the original exponential backoff. Upstream's explicit
@@ -14410,7 +14848,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isRateLimitFamily = transientRecovery?.errorFamily === "rate_limit_exhausted";
     const maxAttemptsForFamily = isRateLimitFamily
       ? RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS
-      : maxAttempts;
+      : clampTransientHorizon
+        ? Math.max(maxAttempts, TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS)
+        : maxAttempts;
     const computedBaseSchedule = opts?.delayMs != null
       ? nextAttempt <= maxAttemptsForFamily
         ? {
@@ -14424,7 +14864,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : nextAttempt <= maxAttemptsForFamily
         ? isRateLimitFamily
           ? computeRateLimitHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
-          : computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
+          : computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random, maxAttemptsForFamily)
         : null;
     const baseSchedule = computedBaseSchedule
       ? { ...computedBaseSchedule, maxAttempts: maxAttemptsForFamily }
@@ -14433,7 +14873,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent.adapterType === "codex_local" && transientRecovery?.errorFamily === "transient_upstream"
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
-    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
@@ -14517,15 +14956,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // a ceiling any run finalized with a far-future `retryNotBefore` parks until
     // that instant — the in-run k8s ccrotate path breaks out precisely to hand
     // this scheduler a multi-day reset, so clamping the capacity gate alone
-    // leaves this route to the same freeze wide open.
-    //
-    // `provider_quota` is deliberately exempt. That family carries a contractual
-    // window boundary (a session/billing reset), not a capacity estimate:
-    // retrying before it fails deterministically, so clamping would just burn
-    // attempts against a wall. The horizons this ticket is about are capacity
-    // guesses, which are the ones that go stale or arrive fabricated.
-    const clampTransientHorizon =
-      transientRetryNotBefore !== null && transientRecovery?.errorFamily !== "provider_quota";
+    // leaves this route to the same freeze wide open. `clampTransientHorizon`
+    // (computed above, alongside the attempt ceiling it is paired with) is
+    // reused here rather than re-derived, so the cap and the ceiling can never
+    // read that condition differently for the same run.
     const clampedTransientRetry =
       clampTransientHorizon && transientRetryNotBefore
         ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
@@ -15735,11 +16169,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
-      const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      issueDependencyReadyForAutoCheckout = unresolvedBlockerCount === 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      issueDependencyReadyForAutoCheckout = readiness?.isDependencyReady ?? true;
+      // Consumes the exact same predicate every dispatch lane and dispatchRank
+      // call for this screen (`isRunClaimable`, BLO-22091) instead of
+      // re-deriving the blocker-count/interaction-wake boolean locally — that
+      // local re-derivation is how leak 5 (BLO-21792) happened: this gate and
+      // the lanes agreed by convention, not by construction, until they didn't.
+      if (!isEffectivelyDependencyReadyForDispatch(context, readiness)) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
-        logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
+        logger.info(
+          { runId: run.id, issueId, unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? 0 },
+          "claimQueuedRun: cancelled blocked queued run",
+        );
         return null;
       }
 
@@ -20175,15 +20616,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         for (const { issue } of criticalBatch) issueById.set(issue.id, issue);
         // Dependency-ready is not necessarily claimable: isolation retries
         // remain queued until their retry timestamp. Keep paging past them so
-        // a deferred head row cannot hide runnable emergency work.
+        // a deferred head row cannot hide runnable emergency work. Calls the
+        // single `isRunClaimable` predicate (BLO-22091) rather than
+        // re-deriving its screens here.
         foundReadyCritical = criticalRuns.some((run) => {
           const snapshot = parseObject(run.contextSnapshot);
           const issueId = readNonEmptyString(snapshot.issueId);
-          return Boolean(
-            issueId
-            && isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
-            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
-          );
+          const issue = issueId ? issueById.get(issueId) : null;
+          return isRunClaimable(snapshot, issue, issueId ? batchReadiness.get(issueId) : null, dispatchNow);
         });
         if (foundReadyCritical || criticalLaneExhausted) break;
       }
@@ -20291,14 +20731,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const batchReadiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates);
         for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
+        // Calls the single `isRunClaimable` predicate (BLO-22091) rather than
+        // re-deriving its screens here; `candidates` is already terminal-
+        // filtered above, so the issue lookup below is never null in practice.
         foundReadyRecovery = candidates.some((run) => {
           const snapshot = parseObject(run.contextSnapshot);
           const issueId = readNonEmptyString(snapshot.issueId);
-          return Boolean(
-            issueId
-            && isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
-            && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
-          );
+          const issue = issueId ? issueById.get(issueId) : null;
+          return isRunClaimable(snapshot, issue, issueId ? batchReadiness.get(issueId) : null, dispatchNow);
         });
         if (foundReadyRecovery || recoveryLaneExhausted) break;
       }
@@ -20456,22 +20896,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           for (const [issueId, readiness] of batchReadiness) dependencyReadiness.set(issueId, readiness);
           // "Eligible" must mean the same thing the claim loop means, or the
           // lane stops paging on a row that will not in fact be claimed and the
-          // masking survives in a narrower form. A row counts only if it has a
-          // live issue, is *effectively* dependency-ready (see
-          // `isEffectivelyDependencyReadyForDispatch` — a blocked issue whose
-          // wake is an interaction wake IS claimable), and is not an isolation
-          // retry still waiting on its timestamp — the same screens the claim
-          // path applies, matching how lane A defines `foundReadyCritical`.
+          // masking survives in a narrower form. Calls the single
+          // `isRunClaimable` predicate (BLO-22091) — the same one lane A, lane
+          // B, and the dispatchRank invocation below call — so this can no
+          // longer independently drift from what `claimQueuedRun` decides.
           foundReadyAbsolute = batch.some((run) => {
             const snapshot = parseObject(run.contextSnapshot);
             const issueId = readNonEmptyString(snapshot.issueId);
-            if (!issueId) return false;
-            const issue = issueById.get(issueId);
-            if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
-            return Boolean(
-              isEffectivelyDependencyReadyForDispatch(snapshot, batchReadiness.get(issueId))
-              && !isK8sIsolationRetryDeferred(snapshot, dispatchNow)
-            );
+            const issue = issueId ? issueById.get(issueId) : null;
+            return isRunClaimable(snapshot, issue, issueId ? batchReadiness.get(issueId) : null, dispatchNow);
           });
           if (foundReadyAbsolute || absoluteLaneExhausted) break;
         }
@@ -20759,10 +21192,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const queuedRun of queuedRuns) {
         const snapshot = parseObject(queuedRun.contextSnapshot);
         const issueId = readNonEmptyString(snapshot.issueId);
-        const ready = issueId
-          ? isEffectivelyDependencyReadyForDispatch(snapshot, dependencyReadiness.get(issueId))
-          : true;
         const issue = issueId ? issueById.get(issueId) : null;
+        // Calls the single `isRunClaimable` predicate (BLO-22091) so a row's
+        // rank can never disagree with the lanes above about what "ready"
+        // means for the screens that stay identical at every stage. This
+        // previously called `isEffectivelyDependencyReadyForDispatch` alone,
+        // which only screens dependency-readiness: an isolation-retry-
+        // deferred row that was otherwise dependency-ready read `ready: true`
+        // here, so once it aged past the absolute floor it ranked
+        // `ABSOLUTE_STARVATION_DISPATCH_RANK` — the very front of the queue —
+        // despite `claimQueuedRun` refusing it unconditionally at claim time.
+        // Deliberately `isDispatchRankReady`, not the lanes' `isRunClaimable`
+        // — see that function's comment for why terminal-status must stay
+        // out of this specific screen.
+        const ready = issueId ? isDispatchRankReady(snapshot, dependencyReadiness.get(issueId), dispatchNow) : true;
         // Require both recoveryActionId AND source:"issue_recovery_action" (every
         // enqueueWakeup call in recovery/service.ts stamps both together) so this
         // stays an explicit, narrowly-scoped coupling rather than any future wake
@@ -21083,6 +21526,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: null,
         processStartedAt: null,
         contextSnapshot: context,
+        // BLO-21116 (Ally review, onprem-k8s#2013): this run was already
+        // running, so its createdAt can be old; queuedAt resets its
+        // dispatch-wait clock to this re-queue instant, same reasoning as
+        // promoteScheduledRetryRun above.
+        queuedAt: now,
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))

@@ -59,6 +59,8 @@ import {
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
   mergeModelProfileAdapterConfig,
+  resolveContainedWorkspaceSubpath,
+  resolveRepoRelativeWorkspaceCwd,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
@@ -3935,6 +3937,156 @@ describe("isNonPrimaryWorkspaceTarget", () => {
         rowsInCreationOrder: [{ id: "paperclip-primary-ws", isPrimary: true }],
       }),
     ).toBe(true);
+  });
+});
+
+describe("resolveContainedWorkspaceSubpath", () => {
+  // BLO-25415: a git_repo workspace may declare a repo-relative cwd such as
+  // "packages/iwa". Before the fix that raw string reached fs.stat() and was
+  // resolved against the API process's cwd, so the run failed
+  // `preferred_workspace_unrealizable` naming a path that looked correct while
+  // the real checkout sat on disk untouched.
+  it("joins a repo-relative subpath onto the realized checkout", async () => {
+    await expect(
+      resolveContainedWorkspaceSubpath("/managed/pim-multicast-gateway", "packages/iwa"),
+    ).resolves.toBe("/managed/pim-multicast-gateway/packages/iwa");
+  });
+
+  it("normalizes redundant segments that stay inside the checkout", async () => {
+    await expect(
+      resolveContainedWorkspaceSubpath("/managed/repo", "./packages/../packages/iwa"),
+    ).resolves.toBe("/managed/repo/packages/iwa");
+  });
+
+  it("allows the checkout root itself", async () => {
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", ".")).resolves.toBe("/managed/repo");
+  });
+
+  it("refuses a subpath that escapes the checkout", async () => {
+    // cwd is operator-supplied config, so traversal must not point a run at an
+    // unrelated repo on the shared PVC.
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", "../other-repo")).rejects.toThrow(
+      /resolves outside its checkout/,
+    );
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", "../../../etc")).rejects.toThrow(
+      /resolves outside its checkout/,
+    );
+  });
+
+  it("refuses a sibling directory sharing the checkout name prefix", async () => {
+    // Guards the startsWith() containment check against "/managed/repo-evil"
+    // being treated as inside "/managed/repo".
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", "../repo-evil")).rejects.toThrow(
+      /resolves outside its checkout/,
+    );
+  });
+
+  it("refuses a subpath that escapes via a symlink inside the checkout", async () => {
+    // The lexical check alone is not enough: the checkout's *contents* are
+    // repo-controlled, so a repo carrying `packages/iwa -> /etc` passes
+    // path.resolve() and then fs.stat() follows the link, launching the run
+    // outside the checkout on a PVC shared with every other repo.
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "blo25415-symlink-"));
+    try {
+      const checkout = path.join(tmp, "repo");
+      const outside = path.join(tmp, "outside");
+      await fs.mkdir(path.join(checkout, "packages"), { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+      await fs.symlink(outside, path.join(checkout, "packages", "iwa"));
+
+      await expect(resolveContainedWorkspaceSubpath(checkout, "packages/iwa")).rejects.toThrow(
+        /resolves outside its checkout/,
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("allows a symlink that stays inside the checkout", async () => {
+    // Only escapes are refused — an in-repo symlink is legitimate.
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "blo25415-symlink-ok-"));
+    try {
+      const checkout = path.join(tmp, "repo");
+      await fs.mkdir(path.join(checkout, "packages", "real"), { recursive: true });
+      await fs.symlink(path.join(checkout, "packages", "real"), path.join(checkout, "iwa"));
+
+      await expect(resolveContainedWorkspaceSubpath(checkout, "iwa")).resolves.toBe(
+        path.join(checkout, "iwa"),
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("allows a subpath when the checkout root itself sits behind a symlink", async () => {
+    // The managed dir may be reached through a symlink (e.g. a PVC mount
+    // indirection). Resolving root and target independently keeps that from
+    // failing containment for a perfectly legitimate subpath.
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "blo25415-symlink-root-"));
+    try {
+      const realCheckout = path.join(tmp, "real-repo");
+      const linkedCheckout = path.join(tmp, "linked-repo");
+      await fs.mkdir(path.join(realCheckout, "packages", "iwa"), { recursive: true });
+      await fs.symlink(realCheckout, linkedCheckout);
+
+      await expect(resolveContainedWorkspaceSubpath(linkedCheckout, "packages/iwa")).resolves.toBe(
+        path.join(linkedCheckout, "packages", "iwa"),
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveRepoRelativeWorkspaceCwd", () => {
+  // BLO-25415: only a repo-backed workspace has a checkout for a relative cwd
+  // to be relative to. Redirecting other source types into a managed checkout
+  // dir would change their meaning — and, via ensureManagedProjectWorkspace's
+  // repoUrl-less branch, mkdir an empty directory on the shared PVC that the
+  // subsequent stat can never satisfy.
+  const repoUrl = "https://github.com/Blockcast/pim-multicast-gateway.git";
+
+  it("returns the subpath for a repo-backed workspace with a relative cwd", () => {
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git_repo", repoUrl }),
+    ).toBe("packages/iwa");
+  });
+
+  it("accepts a repo-backed workspace whose source_type is not the canonical spelling", () => {
+    // source_type is an unconstrained text column; production carries a "git"
+    // row. An allowlist keyed on "git_repo" would silently skip it.
+    expect(resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git", repoUrl })).toBe(
+      "packages/iwa",
+    );
+  });
+
+  it("leaves an absolute cwd untouched", () => {
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "/managed/repo/packages/iwa", sourceType: "git_repo", repoUrl }),
+    ).toBeNull();
+  });
+
+  it("leaves an empty cwd and the repo-only sentinel untouched", () => {
+    expect(resolveRepoRelativeWorkspaceCwd({ cwd: null, sourceType: "git_repo", repoUrl })).toBeNull();
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "/__paperclip_repo_only__", sourceType: "git_repo", repoUrl }),
+    ).toBeNull();
+  });
+
+  it("leaves a relative local_path / non_git_path / remote_managed cwd untouched", () => {
+    // These own their cwd outright — they must keep the prior semantics rather
+    // than being redirected into a managed checkout.
+    for (const sourceType of ["local_path", "non_git_path", "remote_managed"]) {
+      expect(resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType, repoUrl })).toBeNull();
+    }
+  });
+
+  it("leaves a relative cwd untouched when the workspace has no repo", () => {
+    // Nothing for the path to be relative to; taking the managed-checkout
+    // branch would create an empty directory and still fail the stat.
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git_repo", repoUrl: null }),
+    ).toBeNull();
   });
 });
 

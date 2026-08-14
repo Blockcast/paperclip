@@ -78,6 +78,15 @@ export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_complete
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
+// BLO-21116: age of the oldest `queued` heartbeatRuns row per agent. A
+// dispatchable run sitting in `queued` for a long time is exactly the
+// "invisible strand" this issue reports -- it looks like an active issue with
+// an assignee and a run, but nothing is executing, and nothing else pages on
+// it. Labeled by bounded agent_id (same allow-list guardrail as
+// CONCURRENT_RUN_BLOCKED_METRIC) so `max(...) by (agent_id) > threshold`
+// identifies which agent is starved.
+export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
+export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -914,6 +923,7 @@ let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = nul
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
+let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -926,6 +936,7 @@ let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
+let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 
 function ensureRegistry(): {
@@ -950,6 +961,8 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
+  queuedRunOldestAgeGauge: Gauge<"agent_id">;
+  queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
 } {
   if (
@@ -962,6 +975,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
+    || !queuedRunAgeMetricsRefreshSuccess
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -974,6 +988,7 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
+    || !queuedRunOldestAge
     || !authRequest
   ) {
     registry = new Registry();
@@ -1043,6 +1058,14 @@ function ensureRegistry(): {
       help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
       registers: [registry],
     });
+    queuedRunAgeMetricsRefreshSuccess = new Gauge({
+      name: QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent queued-run-age database refresh completed before metrics exposition; "
+        + "0 when it failed, so stale queued-run ages cannot be read as fresh.",
+      registers: [registry],
+    });
+    queuedRunAgeMetricsRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -1265,6 +1288,19 @@ function ensureRegistry(): {
         githubWorkflowRunConclusion.inc({ conclusion, supersession }, 0);
       }
     }
+    queuedRunOldestAge = new Gauge({
+      name: QUEUED_RUN_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest `queued` heartbeat run for an agent (BLO-21116). "
+        + "Refreshed on scrape from a live MIN(coalesce(queued_at, created_at)) aggregate, not a Prometheus "
+        + "`for:` clause -- same reasoning as " + AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC
+        + ": `for:` measures how long the alert expression has been true, not the age of "
+        + "any one row. Reset-then-set every refresh (see setQueuedRunOldestAgeMetrics) so an "
+        + "agent whose queue drains to empty reads back an explicit 0 rather than a frozen "
+        + "stale value or an absent series. Labeled by bounded agent_id.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1292,6 +1328,7 @@ function ensureRegistry(): {
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
+    queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -1304,6 +1341,7 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
+    queuedRunOldestAgeGauge: queuedRunOldestAge,
     authRequestCounter: authRequest,
   };
 }
@@ -1475,6 +1513,36 @@ export function setExternalRuntimeReservationMetrics(input: {
   const metrics = ensureRegistry();
   metrics.externalRuntimeReservationsActiveGauge.set(Math.max(0, input.active));
   metrics.externalRuntimeReservationOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/**
+ * Publish the oldest queued-run age per known agent. Reset-then-set is
+ * deliberate: an agent whose queue drains must read 0 rather than retaining a
+ * stale age that would keep the stranded-run alert open forever.
+ */
+export function setQueuedRunOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().queuedRunOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/** Mark whether the queued-run age gauge was refreshed from the database. */
+export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -1772,7 +1840,7 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
   ].join("\n");
   const routineDispatchSnapshot = snapshotRoutineDispatchMetrics();
   const routineDispatchBody = [
-    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park.`,
+    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park. routine_dispatch_bypassed_stale_execution_issue = a fire proceeded past an execution issue whose run was left queued or running past the run-age horizon.`,
     `# TYPE ${ROUTINE_DISPATCH_METRIC} counter`,
     ...Object.entries(routineDispatchSnapshot).map(
       ([outcome, value]) => `${ROUTINE_DISPATCH_METRIC}{outcome="${outcome}"} ${value}`,
@@ -1795,6 +1863,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
+  queuedRunAgeMetricsRefreshSuccess = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -1807,6 +1876,7 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
+  queuedRunOldestAge = null;
   authRequest = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
