@@ -17579,6 +17579,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // This exemption is deliberately WIDE — a wake-comment-carrying row
+    // survives a terminal issue — and BLO-23206 confirmed it must stay that
+    // way, after an attempt to narrow it to `!resumeIntent` broke two
+    // cross-agent handoff tests.
+    //
+    // The reason is structural, not incidental. The harmful case is a run
+    // waking ITSELF about ITS OWN comment on an issue IT just closed; the
+    // legitimate case is that same closing comment @-mentioning a DIFFERENT
+    // agent ("please review after I finish"), which must still be delivered.
+    // Telling those apart requires knowing which run authored the comment and
+    // which agent the wake targets — a relationship that only exists inside
+    // `releaseIssueExecutionAndPromote`, where the deferred batch is promoted.
+    // This function sees only `(run row, issue)`, so any verdict it reaches is
+    // necessarily too blunt: keep both cases (the original leak) or kill both
+    // (a silent cross-agent handoff drop). The screen therefore lives at the
+    // promotion source instead — see `suppressSelfDirectedTerminalWake` there.
     if (issue.status === "done" || issue.status === "cancelled") {
       if (!resumeIntent && !wakeCommentId) {
         return {
@@ -27238,6 +27254,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             deferredComments.length > 0 &&
             deferredComments.every((comment) => comment.createdByRunId === run.id);
         }
+        // BLO-23206: drop a wake that is BOTH self-authored and self-directed on
+        // an issue that is already terminal — a run waking ITSELF about ITS OWN
+        // comment on work IT just closed. That is the 128-runs/373-agent-minute
+        // leak: the closing comment ("cancelling as a duplicate of X") carries a
+        // wakeCommentId, which exempts the promoted row from the terminal-status
+        // prune in `evaluateQueuedRunStaleness`, so the announcement of the
+        // closure is itself what dispatches a run against the closed issue.
+        //
+        // The screen has to live here rather than at that prune. The prune sees
+        // only `(run row, issue)`; separating this from a legitimate handoff
+        // needs `issueComments.createdByRunId` joined against the run that was
+        // ending when the wake was deferred, which exists only in this block.
+        //
+        // All three conjuncts are load-bearing — the discriminator is DIRECTION,
+        // not authorship:
+        //   - self-authored alone is not enough. A closing comment that
+        //     @-mentions a DIFFERENT agent ("please review after I finish") is
+        //     also authored by the closing run, and dropping it would silently
+        //     lose a cross-agent handoff. `deferred.agentId !== run.agentId`
+        //     keeps those.
+        //   - self-directed alone is not enough. A run legitimately re-wakes
+        //     itself on a HUMAN follow-up comment; that comment is not
+        //     self-authored, so it survives.
+        //   - non-terminal issues are untouched: self-directed continuation on
+        //     live work is a normal flow, and only closed work is the leak.
+        const suppressSelfDirectedTerminalWake =
+          deferredCommentWakeIsSelfAuthored &&
+          deferred.agentId === run.agentId &&
+          (issue.status === "done" || issue.status === "cancelled");
+        if (suppressSelfDirectedTerminalWake) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error:
+                `Deferred wake suppressed: self-authored comment waking its own author on an issue already ${issue.status}`,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =

@@ -10680,6 +10680,24 @@ export function issueRoutes(
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
+    // BLO-23206: the predicate above ends at most ONE run — the running one, via
+    // resolveActiveIssueRun, which returns null for anything not `running`.
+    // Queued and scheduled_retry rows for the same issue survived the close and
+    // were claimed against it on the next 30s scheduler tick. Drain those too,
+    // on either terminal status: `done` closes work just as dead as `cancelled`,
+    // and the drain only targets never-started runs so it cannot kill the run
+    // that is marking the issue done.
+    //
+    // Captured here rather than re-read at the drain site below, because
+    // `updateFields.status` is mutated further down (the move-to-todo branch).
+    // That branch only fires when the status was undefined, so it cannot
+    // currently collide with a terminal write — but relying on that is a
+    // temporal coupling a later edit would silently break.
+    const terminalStatusForDrain =
+      (updateFields.status === "cancelled" || updateFields.status === "done") &&
+      existing.status !== updateFields.status
+        ? (updateFields.status as "cancelled" | "done")
+        : null;
     if (resumeRequested === true && !commentBody) {
       res.status(400).json({ error: "Follow-up intent requires a comment" });
       await recordDeniedIssueWrite(req, existing, "issue:mutate", {
@@ -11364,6 +11382,71 @@ export function issueRoutes(
           issueId: existing.id,
           details: { source: "issue_status_cancelled", issueId: existing.id },
         });
+      }
+    }
+
+    // BLO-23206: drain the never-started runs the block above cannot reach.
+    //
+    // Deliberately AFTER svc.update has committed the terminal status. Running
+    // it inside that transaction would be worse, not better: the drain would be
+    // invisible to a concurrent scheduler tick until commit, while the issue
+    // that tick reads is still NON-terminal, so it would claim a row we had
+    // just drained and we would have cancelled nothing.
+    //
+    // This ordering leaves a residual window — between the commit and the drain
+    // a tick can still claim a row — and that window is ACCEPTED here, not
+    // closed. It is not closed because the claim-time guard in
+    // `evaluateQueuedRunStaleness` deliberately spares any row carrying a
+    // wakeCommentId (see the comment there: the self-directed/handoff
+    // distinction is undecidable at that layer), so for exactly the rows this
+    // issue is about, the guard is not a backstop. What closes the promoted-row
+    // case is `suppressSelfDirectedTerminalWake` at the promotion source; a run
+    // enqueued directly by the closing comment on this PATCH is still out of
+    // reach of both and is tracked separately.
+    //
+    // Best-effort: a failure here leaves the pre-existing behaviour rather than
+    // failing the PATCH the caller asked for.
+    let drainedQueuedRunCount = 0;
+    if (terminalStatusForDrain) {
+      try {
+        drainedQueuedRunCount = await svc.cancelStaleIssueContextRuns({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          keepRunId: actor.runId ?? null,
+          reason: `Cancelled because the issue reached terminal status (${terminalStatusForDrain}) before this queued run could start`,
+          errorCode: "issue_terminal_status",
+        });
+        // A drained row may have been holding the issue's pre-claim execution
+        // lock (BLO-20321), which would otherwise outlive it and read as a live
+        // owner. This only clears a pointer that names a terminal or missing
+        // run, and its restore-promotion step is guarded on `in_progress`, so
+        // it cannot resurrect the status we just wrote.
+        await svc.clearExecutionRunIfTerminal(existing.id);
+        if (drainedQueuedRunCount > 0) {
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "heartbeat.cancelled",
+            entityType: "issue",
+            entityId: existing.id,
+            issueId: existing.id,
+            details: {
+              source: "issue_terminal_status_drain",
+              issueId: existing.id,
+              terminalStatus: terminalStatusForDrain,
+              drainedRunCount: drainedQueuedRunCount,
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: existing.id, terminalStatus: terminalStatusForDrain },
+          "failed to drain queued runs for terminal issue",
+        );
       }
     }
 

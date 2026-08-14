@@ -9,6 +9,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueExecutionDecisions,
@@ -49,6 +50,10 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
+    // Must precede heartbeatRuns: any test that cancels a RUNNING run writes
+    // heartbeat_run_events, whose FK then blocks the heartbeatRuns delete and
+    // fails every subsequent test in the file rather than just its own.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
@@ -758,6 +763,83 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         error: "Cancelled because the issue was released",
       },
     });
+  });
+
+  // BLO-23206. The cancel path used to end at most ONE run — the running one,
+  // via resolveActiveIssueRun — so queued and scheduled_retry rows for the same
+  // issue survived the close and were claimed against it on the next scheduler
+  // tick. This is the cancel-path analogue of the release test above.
+  it("cancels queued and scheduled issue-context runs when an issue is cancelled", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cancelled duplicate with queued runs behind it",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    const staleContext = await seedQueuedIssueContextRuns({ companyId, agentId, issueId });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "cancelled", comment: "Cancelling as a duplicate." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const runs = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, [
+        staleContext.queuedRunId,
+        staleContext.scheduledRunId,
+      ]));
+    expect(Object.fromEntries(runs.map((run) => [run.id, {
+      status: run.status,
+      errorCode: run.errorCode,
+    }]))).toEqual({
+      [staleContext.queuedRunId]: {
+        status: "cancelled",
+        errorCode: "issue_terminal_status",
+      },
+      [staleContext.scheduledRunId]: {
+        status: "cancelled",
+        errorCode: "issue_terminal_status",
+      },
+    });
+
+    const wakeups = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.id, [
+        staleContext.queuedWakeupId,
+        staleContext.scheduledWakeupId,
+      ]));
+    for (const wakeup of wakeups) {
+      expect(wakeup.status).toBe("skipped");
+    }
+
+    // The execution lock does not outlive the drained runs.
+    const [issueAfter] = await db
+      .select({
+        status: issues.status,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueAfter.status).toBe("cancelled");
+    expect(issueAfter.executionRunId).toBeNull();
+    expect(issueAfter.executionLockedAt).toBeNull();
   });
 
   it("lets the current assignee recover a timed_out stale checkout owner during PATCH", async () => {

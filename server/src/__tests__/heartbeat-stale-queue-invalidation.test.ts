@@ -1427,6 +1427,61 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
+  // BLO-23206 pins the floor of the terminal-status exemption in
+  // `evaluateQueuedRunStaleness`: a deliberate resume/reopen must still start,
+  // even though the issue it names is already terminal. The leak this ticket
+  // fixed was tempting to fix by narrowing that exemption; doing so also broke
+  // cross-agent handoffs, so the exemption stayed wide and the screen moved to
+  // the promotion source instead. This test is what makes an over-eager
+  // re-narrowing fail loudly here rather than silently stranding reopens.
+  it("still runs a queued run on a terminal issue when the wake carries explicit resume intent", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Closed task with an explicit resume request",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_comment_mentioned",
+      contextExtras: {
+        wakeCommentId: randomUUID(),
+        resumeIntent: true,
+        followUpRequested: true,
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    // Wait for the fully-settled state, not merely "no longer queued": leaving
+    // an adapter execution in flight past the end of the test leaks a
+    // mockAdapterExecute call into the next one.
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+  });
+
   it("cancels non-interaction queued runs when the issue execution lock cannot be acquired", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
