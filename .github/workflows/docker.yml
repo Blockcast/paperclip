@@ -327,6 +327,14 @@ jobs:
     runs-on: arc-deploy
     timeout-minutes: 5
     permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
       actions: read
     outputs:
       blocked: ${{ steps.check.outputs.blocked }}
@@ -357,6 +365,14 @@ jobs:
     runs-on: arc-deploy
     timeout-minutes: 5
     permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
       actions: read
     outputs:
       blocked: ${{ steps.check.outputs.blocked }}

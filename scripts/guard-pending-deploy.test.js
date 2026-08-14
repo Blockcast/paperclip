@@ -67,3 +67,20 @@ test("both guard jobs checkout the script before invoking it", () => {
   assert.equal((guardJobs.match(/name: Checkout workflow scripts/g) ?? []).length, 2);
   assert.equal((guardJobs.match(/run: \.github\/scripts\/guard-pending-deploy\.sh/g) ?? []).length, 2);
 });
+
+// A job-level `permissions:` block replaces the workflow-level one outright
+// instead of merging into it, so the `contents: read` at the top of docker.yml
+// does not reach these jobs. Omit it and actions/checkout cannot clone, the
+// job fails before the guard script runs, and `deploy` — which requires both
+// guards to succeed — is skipped on every dispatch. Both jobs are gated on
+// `workflow_dispatch` against master, so no PR run ever exercises them; this
+// assertion is the only thing standing between that mistake and a silently
+// dead deploy path.
+test("both guard jobs grant contents: read so actions/checkout can clone", () => {
+  for (const job of ["guard-pending-deploy", "guard-pending-deploy-final"]) {
+    const block = workflow.split(`\n  ${job}:\n`)[1]?.split("\n    outputs:")[0];
+    assert.ok(block, `${job}: job block not found`);
+    assert.match(block, /^      contents: read$/m, `${job}: must grant contents: read`);
+    assert.match(block, /^      actions: read$/m, `${job}: must grant actions: read`);
+  }
+});
