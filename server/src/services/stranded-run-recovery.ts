@@ -20,7 +20,7 @@
 export const STRANDED_RUN_RECOVERY_MIN_AGE_MS = 30 * 60 * 1000;
 
 /** Statuses in which a run demonstrably has not been dispatched yet. */
-const UNDISPATCHED_HEARTBEAT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
+export const UNDISPATCHED_HEARTBEAT_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 
 export type StrandedRunRecoveryCandidate = {
   status: string;

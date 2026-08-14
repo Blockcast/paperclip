@@ -5222,6 +5222,67 @@ export function issueRoutes(
     );
   }
 
+  /**
+   * BLO-21947: the one mutation shape a managing agent may carry on a report's
+   * issue in order to break a monitor convergence stall.
+   *
+   * `assertCanManageIssueMonitor` grew a manager recovery branch, but a manager
+   * never reached it: `issue:mutate` denies here first (`allow_manager_chain`
+   * in authorization.ts is gated to `issue:comment`), so the guard returns
+   * before the monitor check runs and the branch was dead code for the only
+   * actor class it was written for. The route-level test in
+   * `issue-execution-policy-routes.test.ts` pins that composition — the
+   * authorization-service tests call `access.decide` directly and cannot see it.
+   *
+   * Shape-gated rather than a blanket allow, for the PR #814 reason: this helper
+   * guards ~two dozen mutation routes including `DELETE /issues/:id`, so the
+   * widening has to describe the exact patch it is for.
+   *   * the monitor must ALREADY be cleared for `convergence_stalled`, re-derived
+   *     from stored state — never asserted by the caller. That is the auditable
+   *     precondition, and the only state in which the platform itself refuses to
+   *     let the assignee self-recover.
+   *   * the body may carry nothing but the monitor re-arm. `comment` rides along
+   *     because a manager already holds `issue:comment` on a report's issue via
+   *     `allow_manager_chain`, so permitting it widens nothing — and an
+   *     unexplained re-arm is exactly what this grant should not encourage.
+   */
+  function isConvergenceStallMonitorRecoveryPatch(
+    issue: { executionState?: unknown; executionPolicy?: unknown },
+    body: Record<string, unknown>,
+  ) {
+    const monitorState = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+    if (monitorState?.status !== "cleared" || monitorState.clearReason !== "convergence_stalled") return false;
+    const keys = Object.keys(body);
+    if (!keys.includes("executionPolicy")) return false;
+    if (!keys.every((key) => key === "executionPolicy" || key === "comment")) return false;
+    const policy = body.executionPolicy;
+    if (!policy || typeof policy !== "object" || Array.isArray(policy)) return false;
+    const patch = policy as Record<string, unknown>;
+    if (!patch.monitor) return false;
+    // The route normalizes `req.body.executionPolicy` in place *before* this
+    // guard runs, so `mode`, `commentRequired` and `stages` are always present
+    // with schema defaults even when the caller sent nothing but `monitor`.
+    // Counting keys here silently never matches — compare against the defaults.
+    if (patch.mode !== undefined && patch.mode !== "normal") return false;
+    if (patch.commentRequired !== undefined && patch.commentRequired !== true) return false;
+    if (patch.stages !== undefined && !(Array.isArray(patch.stages) && patch.stages.length === 0)) return false;
+    if (patch.reviewPreset !== undefined || patch.authorizationPolicy !== undefined) return false;
+    // A policy write REPLACES the whole `executionPolicy` rather than merging,
+    // so a monitor-only body erases any `stages` / `reviewPreset` /
+    // `authorizationPolicy` the issue already carries. Re-arming a stalled
+    // monitor must not silently destroy another agent's review configuration as
+    // a side effect, so fail closed whenever there is something to destroy —
+    // the board path stays available for those.
+    const existingPolicy = issue.executionPolicy;
+    if (existingPolicy && typeof existingPolicy === "object" && !Array.isArray(existingPolicy)) {
+      const current = existingPolicy as Record<string, unknown>;
+      if (Array.isArray(current.stages) && current.stages.length > 0) return false;
+      if (current.reviewPreset != null || current.authorizationPolicy != null) return false;
+      if (current.mode !== undefined && current.mode !== "normal") return false;
+    }
+    return true;
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -5237,6 +5298,7 @@ export function issueRoutes(
       checkoutRunId?: string | null;
       executionRunId?: string | null;
       executionState?: unknown;
+      executionPolicy?: unknown;
     },
     options: {
       allowBlockedCorrection?: boolean;
@@ -5271,6 +5333,10 @@ export function issueRoutes(
        * route whose blast radius you have actually checked.
        */
       allowCreatorOrManagerChainOwnership?: boolean;
+      // BLO-21947: opt-in, set only by `PATCH /issues/:id` — the single route
+      // that can re-arm a monitor. Every other caller of this helper leaves it
+      // unset and is structurally unaffected.
+      allowConvergenceStallMonitorRecovery?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -5312,6 +5378,27 @@ export function issueRoutes(
         : null;
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
+      // BLO-21947: convergence-stall monitor recovery. The relation is decided
+      // in authorization.ts (manager-chain AND an explicit `tasks:assign`
+      // grant); the patch shape and the stalled precondition are enforced by
+      // `isConvergenceStallMonitorRecoveryPatch` above, mirroring how
+      // coordination-metadata splits relation from field allowlist.
+      if (
+        options.allowConvergenceStallMonitorRecovery &&
+        isConvergenceStallMonitorRecoveryPatch(issue, req.body as Record<string, unknown>)
+      ) {
+        const recoveryDecision = await access.decide({
+          actor: req.actor,
+          action: "issue:recover_monitor",
+          resource: {
+            type: "issue",
+            companyId: issue.companyId,
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId,
+          },
+        });
+        if (recoveryDecision.allowed) return true;
+      }
       if (
         options.allowCreatorOrManagerChainOwnership &&
         isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
@@ -9842,6 +9929,11 @@ export function issueRoutes(
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
         allowCreatorOrManagerChainOwnership: true,
+        // BLO-21947: PATCH is the only route that can re-arm a stalled monitor,
+        // so it is the only one that opts into the manager recovery bypass. The
+        // helper additionally requires the monitor to be cleared for
+        // `convergence_stalled` and the body to carry nothing but the re-arm.
+        allowConvergenceStallMonitorRecovery: true,
       },
     ))) return;
     // BLO-18797: the delegate-recovery bypass authorized this patch *because*
