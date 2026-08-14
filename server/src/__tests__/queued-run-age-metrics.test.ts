@@ -168,38 +168,56 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     // PostgreSQL 18 can prefer a skip scan over an older company/status index
     // for this synthetic one-company data set. Remove those competing indexes
     // in this disposable database so the regression proves the dedicated
-    // queue-age index independently of planner-version cost heuristics.
-    await db.execute(sql`DROP INDEX heartbeat_runs_agent_dispatch_idx`);
-    await db.execute(sql`DROP INDEX heartbeat_runs_company_status_last_output_idx`);
-    await db.execute(sql`DROP INDEX heartbeat_runs_company_status_process_started_idx`);
+    // queue-age index independently of planner-version cost heuristics, then
+    // restore the schema in finally so a later test cannot inherit the altered
+    // planner surface.
+    try {
+      await db.execute(sql`DROP INDEX IF EXISTS heartbeat_runs_agent_dispatch_idx`);
+      await db.execute(sql`DROP INDEX IF EXISTS heartbeat_runs_company_status_last_output_idx`);
+      await db.execute(sql`DROP INDEX IF EXISTS heartbeat_runs_company_status_process_started_idx`);
 
-    const rows = await db.execute(sql`
-      EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-      SELECT agent_id, min(coalesce(queued_at, created_at)) AS oldest_queued_at
-      FROM heartbeat_runs
-      WHERE status = 'queued'
-      GROUP BY agent_id
-    `);
-    const root = ((rows[0] as { "QUERY PLAN": Array<{ Plan: PlanNode }> })["QUERY PLAN"])[0]?.Plan;
-    expect(root).toBeDefined();
+      const rows = await db.execute(sql`
+        EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT agent_id, min(coalesce(queued_at, created_at)) AS oldest_queued_at
+        FROM heartbeat_runs
+        WHERE status = 'queued'
+        GROUP BY agent_id
+      `);
+      const root = ((rows[0] as { "QUERY PLAN": Array<{ Plan: PlanNode }> })["QUERY PLAN"])[0]?.Plan;
+      expect(root).toBeDefined();
 
-    const nodes: PlanNode[] = [];
-    const visit = (node: PlanNode | undefined) => {
-      if (!node) return;
-      nodes.push(node);
-      for (const child of node.Plans ?? []) visit(child);
-    };
-    visit(root);
+      const nodes: PlanNode[] = [];
+      const visit = (node: PlanNode | undefined) => {
+        if (!node) return;
+        nodes.push(node);
+        for (const child of node.Plans ?? []) visit(child);
+      };
+      visit(root);
 
-    const heartbeatScanNodes = nodes.filter((node) => node["Relation Name"] === "heartbeat_runs");
-    expect(heartbeatScanNodes).not.toHaveLength(0);
-    expect(heartbeatScanNodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(false);
-    expect(
-      heartbeatScanNodes.some((node) =>
-        ["Index Scan", "Index Only Scan", "Bitmap Heap Scan"].includes(String(node["Node Type"])),
-      ),
-    ).toBe(true);
-    expect(nodes.some((node) => node["Index Name"] === "heartbeat_runs_queued_age_idx")).toBe(true);
+      const heartbeatScanNodes = nodes.filter((node) => node["Relation Name"] === "heartbeat_runs");
+      expect(heartbeatScanNodes).not.toHaveLength(0);
+      expect(heartbeatScanNodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(false);
+      expect(
+        heartbeatScanNodes.some((node) =>
+          ["Index Scan", "Index Only Scan", "Bitmap Heap Scan"].includes(String(node["Node Type"])),
+        ),
+      ).toBe(true);
+      expect(nodes.some((node) => node["Index Name"] === "heartbeat_runs_queued_age_idx")).toBe(true);
+    } finally {
+      await db.execute(sql`
+        CREATE INDEX IF NOT EXISTS heartbeat_runs_agent_dispatch_idx
+        ON heartbeat_runs USING btree (agent_id, status, created_at, id)
+        WHERE status IN ('queued', 'scheduled_retry')
+      `);
+      await db.execute(sql`
+        CREATE INDEX IF NOT EXISTS heartbeat_runs_company_status_last_output_idx
+        ON heartbeat_runs USING btree (company_id, status, last_output_at)
+      `);
+      await db.execute(sql`
+        CREATE INDEX IF NOT EXISTS heartbeat_runs_company_status_process_started_idx
+        ON heartbeat_runs USING btree (company_id, status, process_started_at)
+      `);
+    }
   });
 });
 

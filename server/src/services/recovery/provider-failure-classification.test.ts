@@ -120,6 +120,29 @@ describe("classifyAdapterFailureForRecovery", () => {
     })).toBeNull();
   });
 
+  it("preserves an authoritative provider_quota code when its message mentions JSON parsing", () => {
+    const now = new Date("2026-07-15T20:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "JSON parsing failed while recording the provider quota response.",
+      resultJson: null,
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+      parsedResetTime: false,
+    });
+  });
+
+  it("preserves an authoritative configuration_incomplete code when its message mentions JSON parsing", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "configuration_incomplete",
+      error: "JSON parsing failed while reading the configuration response.",
+      resultJson: null,
+    })).toEqual({ kind: "configuration_incomplete" });
+  });
+
   it("still classifies a genuine configuration failure reported via adapter_failed alongside an unrelated resultJson blob", () => {
     // The parse-failure guard must be narrowly scoped to the parse-failure
     // shape -- a real config error without that shape keeps classifying.

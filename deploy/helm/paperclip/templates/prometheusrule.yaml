@@ -321,8 +321,11 @@ spec:
           # scrape flapping, not standing in for the real age.
           # The freshness gate is load-bearing: a failed database refresh
           # leaves the previous gauge value in memory, so stale data must not
-          # qualify a strand alert.
-          expr: (max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}) and on() (paperclip_queued_run_age_metrics_refresh_success == 1)
+          # qualify a strand alert. Gate each API replica against its own
+          # refresh result before taking the fleet-wide per-agent max; an
+          # `on()` join would let one healthy replica bless another replica's
+          # stale age snapshot.
+          expr: max by (agent_id) (paperclip_queued_run_oldest_age_seconds and on(instance) (paperclip_queued_run_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}
           for: {{ .Values.prometheusRule.queuedRunStrandedFor }}
           labels:
             severity: warning

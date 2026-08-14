@@ -329,12 +329,11 @@ test("PaperclipQueuedRunStranded is agent-keyed, freshness-gated, and fires befo
   // is young.
   assert.match(
     expr,
-    /^\(max\(paperclip_queued_run_oldest_age_seconds\) by \(agent_id\) > (\d+)\) and on\(\) \(paperclip_queued_run_age_metrics_refresh_success == 1\)$/,
-    "queued-run-stranded alert must threshold the per-agent age gauge, "
-      + "not a summed count under a long `for:`",
+    /^max by \(agent_id\) \(paperclip_queued_run_oldest_age_seconds and on\(instance\) \(paperclip_queued_run_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "queued-run-stranded alert must gate each replica's age before taking the per-agent max",
   );
 
-  const [, ageThreshold] = expr.match(/> (\d+)\)/) ?? [];
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
   // The gauge is reset-then-set to 0 for every known agent on each refresh
   // (see setQueuedRunOldestAgeMetrics), so a strictly positive threshold is
   // the silent-in-steady-state guarantee.
