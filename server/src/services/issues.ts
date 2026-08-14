@@ -9875,6 +9875,20 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        // Deletion mutates the same parent edges update/create protect: the
+        // `parentId = null` sweep below row-locks every child, then the delete
+        // row-locks the parent. Without the company graph lock as the outermost
+        // acquisition here, a concurrent reparent that takes it first can lock
+        // those rows in the opposite order and deadlock (40P01 -> 500).
+        // Read the company with a plain select so we take no row lock before it.
+        const owningCompanyId = await tx
+          .select({ companyId: issues.companyId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows: Array<{ companyId: string }>) => rows[0]?.companyId ?? null);
+        if (!owningCompanyId) return null;
+        await lockIssueParentMutationCompany(owningCompanyId, tx);
+
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)

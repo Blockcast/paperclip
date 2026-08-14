@@ -7969,6 +7969,63 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  /**
+   * Runs `start` against a held company graph lock so every operation it launches
+   * parks at that same boundary, then releases them together.
+   *
+   * Bare `Promise.allSettled` proves nothing about concurrency: a connection-pool
+   * schedule that runs one call to completion before the other begins still
+   * produces the expected results, so these regressions could stay green even if
+   * the lock invariant regressed. Holding the lock from a control transaction and
+   * polling `pg_stat_activity` for the waiters asserts the overlap actually
+   * happened, mirroring the stale-workspace test's lock-wait probe above.
+   */
+  async function withIssueGraphOverlapBarrier<T>(
+    companyId: string,
+    expectedWaiters: number,
+    start: () => Promise<T>,
+  ): Promise<T> {
+    const barrierHeld = deferred<void>();
+    const releaseBarrier = deferred<void>();
+    const control = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
+      );
+      barrierHeld.resolve();
+      await releaseBarrier.promise;
+    });
+    await barrierHeld.promise;
+
+    const pending = start();
+    // Keep the rejection handled while we poll; `pending` is still returned so the
+    // caller observes the real settlement.
+    pending.catch(() => {});
+
+    let observedWaiters = 0;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiters: number }>`
+          select count(*)::int as waiters
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+            and wait_event = 'advisory'
+            and query ~* 'pg_advisory_xact_lock'
+        `);
+        observedWaiters = Number(Array.from(waitingRows)[0]?.waiters ?? 0);
+        if (observedWaiters >= expectedWaiters) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    } finally {
+      releaseBarrier.resolve();
+      await control;
+    }
+    expect(observedWaiters).toBeGreaterThanOrEqual(expectedWaiters);
+    return pending;
+  }
+
   it("returns cycle validation instead of deadlocking concurrent reciprocal reparent updates", async () => {
     const companyId = randomUUID();
     const issueAId = randomUUID();
@@ -7998,10 +8055,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueAId, { parentId: issueBId }),
-      svc.update(issueBId, { parentId: issueAId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueAId, { parentId: issueBId }),
+        svc.update(issueBId, { parentId: issueAId }),
+      ]),
+    );
     const fulfilled = results.filter((result) => result.status === "fulfilled");
     const rejected = results.filter((result) => result.status === "rejected");
 
@@ -8064,10 +8123,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issueAId }),
-      svc.update(issueYId, { parentId: issueBId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issueAId }),
+        svc.update(issueYId, { parentId: issueBId }),
+      ]),
+    );
     const fulfilled = results.filter((result) => result.status === "fulfilled");
     const rejected = results.filter((result) => result.status === "rejected");
 
@@ -8126,10 +8187,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
-      svc.update(issueYId, { parentId: issueQId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
+        svc.update(issueYId, { parentId: issueQId }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -8186,10 +8249,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
-      svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+        svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -8245,15 +8310,17 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
-      svc.create(companyId, {
-        title: "New dependent",
-        status: "todo",
-        priority: "medium",
-        blockedByIssueIds: [issuePId, issueZId],
-      }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+        svc.create(companyId, {
+          title: "New dependent",
+          status: "todo",
+          priority: "medium",
+          blockedByIssueIds: [issuePId, issueZId],
+        }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -8276,6 +8343,64 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
         expect.objectContaining({ id: issueZId }),
       ],
     });
+  });
+
+  it("serializes concurrent deletion and reparent onto the deleted parent without deadlocking", async () => {
+    const companyId = randomUUID();
+    // remove() sweeps children before locking the parent row, while update()
+    // locks the parent first. Ordering the ids P < C is what let the two paths
+    // take the same rows in opposite order and abort with 40P01 (a 500) before
+    // remove() joined the company graph lock.
+    const parentId = "00000000-0000-4000-8000-00000000000a";
+    const childId = "ffffffff-ffff-4fff-bfff-fffffffffffe";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Parent under deletion",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: childId,
+        companyId,
+        title: "Child being reparented",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    // Both paths must park on the company graph lock. Before the fix remove()
+    // never requested it, so only one waiter appears and the barrier fails here.
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.remove(parentId),
+        svc.update(childId, { parentId }),
+      ]),
+    );
+
+    for (const result of results) {
+      if (result.status !== "rejected") continue;
+      const reason = result.reason as { status?: number; message?: string };
+      expect(String(reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      expect(reason?.status ?? 0).toBeLessThan(500);
+    }
+
+    // The delete owns the parent either way, so both orderings converge: whether
+    // the reparent lands first and is swept, or is rejected against an already
+    // deleted parent, the parent is gone and the child is detached.
+    expect(results[0].status).toBe("fulfilled");
+    await expect(svc.getById(parentId)).resolves.toBeNull();
+    const child = await svc.getById(childId);
+    expect(child?.parentId ?? null).toBeNull();
   });
 
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
