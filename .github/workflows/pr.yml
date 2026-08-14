@@ -135,6 +135,12 @@ jobs:
       - name: Test ffmpeg muxer detection (BLO-23128)
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
 
+      - name: Test production environment protection guard (BLO-22329)
+        run: |
+          node --test \
+            ./.github/scripts/tests/check-production-environment-protection.test.mjs \
+            ./.github/scripts/tests/post-environment-protection-alert.test.mjs
+
       - name: Validate Designer fast-uri security floor
         run: node ./scripts/designer-fast-uri-security.test.js
 
