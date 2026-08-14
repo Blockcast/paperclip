@@ -374,6 +374,48 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
   });
 
+  // Important finding (#1136 review, head b78bb2e9): the readable-slug
+  // exemption keyed on arity + part length alone, so a delimiter-chunked
+  // opaque token satisfied it (3 parts, each <=12) and escaped the generic
+  // backstop that is supposed to fail closed on unrecognized long values.
+  // The paired benign value is the one the exemption exists for, so this
+  // cannot pass by simply deleting the exemption.
+  it("redacts a delimiter-chunked opaque token under an ambiguous key while keeping a real word slug readable", () => {
+    const result = redactEventPayload({
+      author: "a1b2c3d4-e5f6g7h8-i9j0k1l2",
+      authoritative_state: "pending_human_merge_review",
+    });
+
+    expect(result?.author).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.authoritative_state).toBe("pending_human_merge_review");
+  });
+
+  // Same exemption, all-numeric chunking: no part mixes letters and digits,
+  // so a word/number lexical test alone would still admit it. At least two
+  // word-shaped parts are required, which a bare number grouping never has.
+  it("redacts an all-numeric chunked token under an ambiguous key", () => {
+    const result = redactEventPayload({
+      author_reference: "12345678-87654321-11223344",
+    });
+
+    expect(result?.author_reference).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // The same predicate gates URL path segments, so the tightening has to hold
+  // on that branch too — and must not re-blank an issue-numbered branch slug,
+  // which mixes word parts with a bare number.
+  it("redacts a delimiter-chunked opaque URL path segment but keeps an issue-numbered branch slug readable", () => {
+    const result = redactEventPayload({
+      author_link: "https://example.test/evidence/blo-20810-redaction-followup-critical-findings",
+      base_url: "https://hooks.slack.test/services/T000/x9y8z7w6-v5u4t3s2-r1q0p9o8",
+    });
+
+    expect(result?.author_link).toBe(
+      "https://example.test/evidence/blo-20810-redaction-followup-critical-findings",
+    );
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
   // Residual finding (#943 review, post-tiering): `auth`/`secret` as a whole
   // token in a short key (<=2 tokens) is an ordinary credential field name,
   // not the "author"/"no_secrets_in_payload" collision Tier 2 exists for —
