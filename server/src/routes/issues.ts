@@ -11568,6 +11568,65 @@ export function issueRoutes(
       }
     }
 
+    // BLO-22856: until this check, checkout was the only issue-mutating route
+    // that never consulted the `issue:mutate` boundary. It gated solely on
+    // `tasks:assign` above — and only in the cross-assignee case, so a
+    // self-assigned checkout was authorized by nothing but company access.
+    // `tasks:assign` and `issue:mutate` admit different actor sets, so an actor
+    // could clear checkout, move the row `blocked`/`todo` -> `in_progress` and
+    // take the run lock, and then be denied by every endpoint that could undo
+    // it: upsert-document, PATCH, and release all run the boundary this skipped.
+    // That is a one-way door — the row strands `in_progress` until an
+    // out-of-band `stranded_assigned_issue` recovery action clears it, because
+    // the actor cannot even release its own checkout.
+    //
+    // The watchdog gate is the half that leaks without any race. Its own
+    // comment on `assertTaskWatchdogScopedIssueMutationAllowed` states the
+    // invariant — resolve the scope "before any current-run bypass so stale or
+    // forged watchdog context cannot inherit broader execution-lock authority" —
+    // and checkout violated it by never resolving the scope at all. A watchdog
+    // run could therefore check out an issue outside the watched subtree and
+    // then be refused by release, which does run the gate (403 out-of-subtree,
+    // 409 stale fingerprint). Run it unconditionally here, exactly as release
+    // does, including for the recovery owner: release grants that actor no
+    // watchdog exemption either, so exempting it here would reopen the gap.
+    //
+    // A non-null result IS the verdict, mirroring
+    // `assertAgentIssueMutationAllowed`'s `if (watchdogDecision !== null)
+    // return watchdogDecision`. A valid in-subtree watchdog scope deliberately
+    // widens past the ordinary boundary, so stacking the boundary check on top
+    // of an allow would deny mutations release permits — the opposite of the
+    // symmetry this change exists to establish.
+    let watchdogScopeAuthorized = false;
+    if (req.actor.type === "agent") {
+      const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, {
+        deniedWriteAction: "issue:mutate",
+      });
+      if (watchdogDecision === false) return;
+      watchdogScopeAuthorized = watchdogDecision === true;
+    }
+
+    // Deliberately placed AFTER the `tasks:assign` gate so every denial that
+    // fires today keeps its current status and message; this only closes states
+    // that currently succeed. The recovery owner is exempt for the same reason
+    // `POST /issues/:id/release` exempts it via `allowRecoveryActionOwner`: that
+    // actor is authorized BY the active recovery action rather than by the
+    // ordinary boundary (which denies, since the row is assigned to someone
+    // else), and `svc.checkout` re-validates the action atomically in the
+    // UPDATE's WHERE clause.
+    if (req.actor.type === "agent" && !allowSourceScopedRecoveryOwnerCheckout && !watchdogScopeAuthorized) {
+      const checkoutBoundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+      if (!checkoutBoundaryDecision.allowed) {
+        await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+          reason: deniedBoundaryReason(checkoutBoundaryDecision.reason),
+          boundaryReason: checkoutBoundaryDecision.reason,
+          responseStatus: 403,
+        });
+        respondIssueBoundaryDenied(res, checkoutBoundaryDecision);
+        return;
+      }
+    }
+
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
