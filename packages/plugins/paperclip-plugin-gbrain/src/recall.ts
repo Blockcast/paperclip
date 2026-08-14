@@ -20,6 +20,8 @@
 import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from "node:zlib";
 import type { GbrainCallable } from "./pages.js";
 import { agentSlug, issueSlug, projectSlug } from "./identity.js";
+import { GbrainCallError } from "./gbrain-client.js";
+import { NoOAuthClientError } from "./oauth-client-manager.js";
 
 export const RECALL_STATE_KEY = "gbrain-context";
 export const DEFAULT_RECALL_DEPTH = 2;
@@ -41,6 +43,22 @@ export interface PrefetchResult {
   issuePageSlug: string | null;
   graph: unknown | null;
   reason?: string;
+  /**
+   * Set when the failure is a permanent provisioning gap (agent has no
+   * gbrain OAuth client) rather than a genuine error — buildCacheEntry
+   * downgrades this to a non-error status (BLO-23403).
+   */
+  reasonKind?: "no-oauth-client";
+}
+
+/**
+ * True when `err` is (or wraps, via GbrainCallError.cause) a
+ * NoOAuthClientError — i.e. the agent was never provisioned with a gbrain
+ * OAuth client, as opposed to a real transport/auth failure.
+ */
+function isNoOAuthClientError(err: unknown): boolean {
+  if (err instanceof NoOAuthClientError) return true;
+  return err instanceof GbrainCallError && err.cause instanceof NoOAuthClientError;
 }
 
 interface TraversalCandidate {
@@ -93,7 +111,13 @@ export async function prefetchRunContext(input: PrefetchInput): Promise<Prefetch
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, issuePageSlug: slug, graph: null, reason: `traverse_graph failed: ${msg}` };
+    return {
+      ok: false,
+      issuePageSlug: slug,
+      graph: null,
+      reason: `traverse_graph failed: ${msg}`,
+      reasonKind: isNoOAuthClientError(err) ? "no-oauth-client" : undefined,
+    };
   }
 }
 
@@ -363,7 +387,15 @@ export function buildCacheEntry(input: {
 }): CachedRecall {
   const fetchedAtIso = input.nowIso ?? new Date().toISOString();
   if (!input.result.ok) {
-    const status = input.result.issuePageSlug ? "error" : "skipped";
+    // No OAuth client is a permanent provisioning gap, not a transient
+    // failure — never classify it as "error" (BLO-23403). A configured
+    // client that then fails auth/transport still lands in "error" below.
+    const status =
+      input.result.reasonKind === "no-oauth-client"
+        ? "skipped"
+        : input.result.issuePageSlug
+          ? "error"
+          : "skipped";
     return {
       fetchedAtIso,
       issuePageSlug: input.result.issuePageSlug,

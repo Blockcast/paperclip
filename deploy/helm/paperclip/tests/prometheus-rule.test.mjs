@@ -39,7 +39,6 @@ test("Blockcast values do not render a PrometheusRule (paperclip-ci-deploy has n
     "values.blockcast.yaml must keep prometheusRule.enabled=false until paperclip-ci-deploy is granted RBAC on prometheusrules.monitoring.coreos.com",
   );
 });
-
 test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains usable once RBAC exists)", () => {
   const rendered = execFileSync(
     "helm",
@@ -304,5 +303,88 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     rendered,
     /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?runbook_url: "[^"]*runbooks\/agent-wakeup-terminal-failed\.md"/,
     "terminal-failed alert must link the runbook from its annotation",
+  );
+});
+
+test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links its runbook (BLO-21116)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipQueuedRunStranded/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "queued-run-stranded alert must render an expr");
+
+  // Must threshold the per-agent age gauge, not a summed queued-run count
+  // under a long `for:` -- same reasoning as the terminal-failed alert above:
+  // a `for:` clause measures how long the EXPRESSION has stayed true, and a
+  // summed count across agents lets one agent's strand clearing exactly as
+  // another's appears keep the expression permanently true while any one row
+  // is young.
+  assert.match(
+    expr,
+    /^max\(paperclip_queued_run_oldest_age_seconds\) by \(agent_id\) > (\d+)$/,
+    "queued-run-stranded alert must threshold the per-agent age gauge, "
+      + "not a summed count under a long `for:`",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh
+  // (see setQueuedRunOldestAgeMetrics), so a strictly positive threshold is
+  // the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // `for:` is scrape-flap tolerance only -- the ageing lives in the threshold
+  // above. It must stay short so it does not stack on top of the age
+  // threshold and delay the page well past the AC's ~30m intent.
+  assert.ok(forWindow, "queued-run-stranded alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
+  );
+
+  // BLO-21116's own AC is "firing before the age exceeds ~30m" -- the FIRST
+  // real-clock moment the alert can fire, which is threshold + for, not the
+  // threshold in isolation. Checking each independently is exactly the gap
+  // Ally's review caught here: a bare threshold of 1800s (30m) with this
+  // same 5m `for:` does not fire until 2100s (35m) of real age, past the AC,
+  // even though 1800 alone looks compliant and 5m alone looks short.
+  assert.ok(
+    Number(ageThreshold) + forMinutes * 60 <= 1800,
+    `age threshold ${ageThreshold}s plus for-window ${forWindow} stacks to `
+      + `${Number(ageThreshold) + forMinutes * 60}s, past the 1800s (30m) BLO-21116 AC`,
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunStranded[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
+    "queued-run-stranded alert must link the runbook from its annotation",
   );
 });

@@ -1,0 +1,9 @@
+{
+  "//": "Typecheck-only view of the server package that INCLUDES src/__tests__. tsconfig.json excludes tests so they stay out of dist/, and because `typecheck` and `build` share that one config, tests were never typechecked at all -- an undefined symbol in a test reached master and wedged the merge queue for ~3.7h (BLO-24983). This config exists so scripts/check-test-undefined-symbols.mjs can see test files. It is deliberately NOT error-free: fully typing the test fixtures is ~740 errors of separate work. Only the undefined-identifier class is gated. Do not wire this into `build`, and do not gate on tsc's exit code -- see the script.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src"],
+  "exclude": ["dist", "node_modules"]
+}

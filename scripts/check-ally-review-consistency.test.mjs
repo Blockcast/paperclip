@@ -4,6 +4,11 @@ import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
+  ALLY_APP_REVIEWER_ID,
+  ALLY_APP_REVIEWER_LOGIN,
+  ALLY_USER_REVIEWER_ID,
+  ALLY_USER_REVIEWER_LOGIN,
+  assertHeadSha,
   assertPrListComplete,
   attestedHead,
   findPrViolations,
@@ -12,6 +17,7 @@ import {
   hasStillPresentDisposition,
   isAllyLogin,
   isMainModule,
+  isRequiredApprovalPair,
   operativeAllyReviews,
 } from "./check-ally-review-consistency.mjs";
 
@@ -175,7 +181,7 @@ describe("findPrViolations", () => {
     };
     const violations = findPrViolations(pr);
     assert.equal(violations.length, 2);
-    assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 operative Ally verdicts/);
+    assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 operative Ally reviews/);
     assert.match(violations[1], /^I2b PR #876 @ff1c72db: standing APPROVED \(4829069732\)/);
   });
 
@@ -319,5 +325,181 @@ describe("assertPrListComplete", () => {
 
   it("tolerates a nullish list", () => {
     assert.doesNotThrow(() => assertPrListComplete(undefined, "o/r", 10));
+  });
+});
+
+/** The mandated two-principal protected-merge shape. */
+function requiredApprovalPair(app = {}, user = {}) {
+  return [
+    {
+      ...review({
+        id: 11,
+        state: "APPROVED",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\nApp artifact.`,
+      }),
+      user: { login: ALLY_APP_REVIEWER_LOGIN, id: ALLY_APP_REVIEWER_ID },
+      ...app,
+    },
+    {
+      ...review({
+        id: 12,
+        state: "APPROVED",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\nUser-seat approval.`,
+      }),
+      user: { login: ALLY_USER_REVIEWER_LOGIN, id: ALLY_USER_REVIEWER_ID },
+      ...user,
+    },
+  ];
+}
+
+describe("I1 accepts only the protected-merge approval pair", () => {
+  it("accepts exactly one independently attested App/User approval pair", () => {
+    const reviews = requiredApprovalPair();
+    const violations = findPrViolations({ number: 1129, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+  });
+
+  it("does not require the two independent reviews to have byte-identical prose", () => {
+    const reviews = requiredApprovalPair(
+      { body: `Reviewed head: ${HEAD}\n\nApp reviewed the implementation.` },
+      { body: `Reviewed head: ${HEAD}\n\nUser seat independently approved the change.` },
+    );
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
+    assert.deepEqual(findPrViolations({ number: 1130, headSha: HEAD, reviews }), []);
+  });
+
+  it("rejects an extra operative retry instead of collapsing it", () => {
+    const [app, user] = requiredApprovalPair();
+    const reviews = [app, user, { ...user, id: 13 }];
+    const violations = findPrViolations({ number: 1193, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.match(
+      violations.find((v) => v.startsWith("I1")) ?? "",
+      /^I1 PR #1193 @ff1c72db: 3 operative Ally reviews/,
+    );
+  });
+
+  it("rejects a lookalike identity even when it carries the User-seat ID", () => {
+    const [app, user] = requiredApprovalPair();
+    const reviews = [app, { ...user, user: { login: "blockcast-ally", id: ALLY_USER_REVIEWER_ID } }];
+    const violations = findPrViolations({ number: 1194, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+  });
+
+  it("rejects a canonical login with an unexpected immutable ID", () => {
+    const [app, user] = requiredApprovalPair();
+    const reviews = [app, { ...user, user: { login: ALLY_USER_REVIEWER_LOGIN, id: 42 } }];
+    const violations = findPrViolations({ number: 1195, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+  });
+
+  it("requires both required identities to submit APPROVED reviews", () => {
+    const [app, user] = requiredApprovalPair({}, { state: "COMMENTED" });
+    const reviews = [app, user];
+    const violations = findPrViolations({ number: 1196, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+  });
+
+  it("fails closed when either required approval omits its exact-head attestation", () => {
+    const [app, user] = requiredApprovalPair({ body: "Approved without an attestation." });
+    const reviews = [app, user];
+    const violations = findPrViolations({ number: 1197, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+    assert.equal(violations.filter((v) => v.startsWith("I2d")).length, 1);
+  });
+
+  it("fails closed when either required approval attests a stale head", () => {
+    const [app, user] = requiredApprovalPair({ body: `Reviewed head: ${OTHER}` });
+    const reviews = [app, user];
+    const violations = findPrViolations({ number: 1198, headSha: HEAD, reviews });
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.equal(violations.filter((v) => v.startsWith("I1")).length, 1);
+    assert.equal(violations.filter((v) => v.startsWith("I3")).length, 1);
+  });
+
+  it("does not accept a review recorded against an old commit as current-head evidence", () => {
+    const [app, user] = requiredApprovalPair({}, { commit_id: OTHER });
+
+    assert.equal(isRequiredApprovalPair([app, user], HEAD), false);
+  });
+});
+
+describe("I2d — APPROVED with no attestation line", () => {
+  it("fires on the #1114 shape: a short APPROVED that attests nothing", () => {
+    const reviews = [
+      review({
+        id: 4879433972,
+        state: "APPROVED",
+        body: "Approved the current CI head. The implementation is unchanged; this head only retriggers checks.",
+      }),
+    ];
+    const violations = findPrViolations({ number: 1114, headSha: HEAD, reviews });
+    assert.equal(violations.filter((v) => v.startsWith("I2d")).length, 1);
+  });
+
+  it("does not fire on an APPROVED that does attest the head", () => {
+    const reviews = [review({ id: 1, state: "APPROVED" })];
+    assert.deepEqual(
+      findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
+      [],
+    );
+  });
+
+  it("does not fire on a COMMENTED review with no attestation — only an approval claims soundness", () => {
+    const reviews = [review({ id: 1, state: "COMMENTED", body: "no attestation here" })];
+    assert.deepEqual(
+      findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
+      [],
+    );
+  });
+});
+
+describe("assertHeadSha", () => {
+  it("passes a well-formed 40-hex head", () => {
+    const row = { number: 1, headRefOid: HEAD };
+    assert.equal(assertHeadSha(row, "o/r"), row);
+  });
+
+  for (const bad of [undefined, null, "", "not-a-sha", HEAD.slice(0, 39), HEAD.toUpperCase()]) {
+    it(`throws on ${JSON.stringify(bad)} rather than asserting nothing`, () => {
+      assert.throws(() => assertHeadSha({ number: 7, headRefOid: bad }, "o/r"), /no usable headRefOid/);
+    });
+  }
+
+  it("names the PR so the failure is actionable", () => {
+    assert.throws(() => assertHeadSha({ number: 42, headRefOid: null }, "o/r"), /o\/r#42/);
+  });
+});
+
+describe("a falsy head would otherwise silently pass a maximal violation", () => {
+  it("finds every invariant broken at the real head", () => {
+    const reviews = [
+      review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
+      review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
+    ];
+    assert.ok(findPrViolations({ number: 9, headSha: HEAD, reviews }).length >= 4);
+  });
+
+  it("finds nothing at all when the head is falsy — which is why assertHeadSha exists", () => {
+    const reviews = [
+      review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
+      review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
+    ];
+    for (const head of [undefined, null, ""]) {
+      assert.deepEqual(findPrViolations({ number: 9, headSha: head, reviews }), []);
+    }
   });
 });

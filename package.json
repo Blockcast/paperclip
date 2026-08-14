@@ -16,6 +16,7 @@
     "build": "pnpm run preflight:workspace-links && pnpm -r build",
     "typecheck": "pnpm run preflight:workspace-links && pnpm -r typecheck",
     "typecheck:build-gaps": "pnpm run preflight:workspace-links && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && pnpm --filter @paperclipai/server build && node scripts/run-typecheck-build-gaps.mjs",
+    "check:test-undefined-symbols": "node scripts/check-test-undefined-symbols.mjs",
     "test": "pnpm run test:run",
     "test:watch": "pnpm run preflight:workspace-links && vitest",
     "test:run": "pnpm run preflight:workspace-links && node scripts/run-vitest-stable.mjs",

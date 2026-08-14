@@ -33,3 +33,8 @@ platform cannot resolve automatically. Each runbook should be:
   (not failing) and is silently freezing the `master` merge queue. Trigger:
   `master` hasn't advanced in >90 min with the queue non-empty, or the
   position-1 entry's `merge_group` run shows no state change for that long.
+- [`queued-run-stranded.md`](queued-run-stranded.md) — a `heartbeat_runs` row
+  sitting at `status='queued'` for a long time: the issue it targets looks
+  actively in-progress but nothing is executing, and it manufactures false
+  productivity-review escalations. Trigger: alert `PaperclipQueuedRunStranded`,
+  or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.

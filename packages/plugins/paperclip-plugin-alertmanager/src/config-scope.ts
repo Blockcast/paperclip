@@ -251,3 +251,44 @@ export async function resolveCompanyScope(
 
   return { config, token };
 }
+
+/**
+ * Resolve one company's config for a single `check-alert-escalations`
+ * dispatch (BLO-20957: the host now dispatches the sweep once per company
+ * configured for this plugin, each with its own invocation scope, rather
+ * than a process-wide dispatch that only ever worked for one company).
+ *
+ * Unlike `resolveCompanyScope`, a missing or misrouted config for this
+ * dispatch resolves to `null` instead of throwing — the escalation sweep is
+ * a scheduled job with no inbound delivery to retry against, so those cases
+ * are a "skip and log" condition, not a retryable failure. A `ctx.config.get`
+ * RPC failure still propagates (the caller lets it fail the job run so it
+ * shows up in `plugin_job_runs`, rather than silently skipping a company on
+ * a transient blip). This also never resolves a bearer token — the sweep
+ * only reads and updates issues, it does not authenticate inbound webhook
+ * traffic.
+ *
+ * Returns `null` when there is no stored config for `companyId`, or when the
+ * stored config's `defaultCompanyId` names a *different* tenant (a
+ * misconfigured row — refuse rather than sweep under the wrong tenant).
+ */
+export async function resolveEscalationSweepConfig(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<AlertmanagerPluginConfig | null> {
+  const raw = (await ctx.config.get(companyId)) as
+    | Record<string, unknown>
+    | null
+    | undefined;
+  if (isEmptyConfig(raw)) return null;
+  const config = buildConfig(raw as unknown as AlertmanagerPluginConfig);
+  if (!config.defaultCompanyId) {
+    config.defaultCompanyId = companyId;
+  } else if (config.defaultCompanyId !== companyId) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: company ${companyId} has defaultCompanyId=${config.defaultCompanyId} — refusing to sweep its alerts under another tenant`,
+    );
+    return null;
+  }
+  return config;
+}

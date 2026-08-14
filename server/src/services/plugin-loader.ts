@@ -153,6 +153,36 @@ export function isTransientActivationError(err: unknown): boolean {
 }
 
 /**
+ * Retry policy for activation failures. This intentionally remains separate
+ * from the compatibility classifier above: the latter preserves the behavior
+ * that current master exposes, while activation retries require provenance from
+ * `startWorker()` so a plugin-reported failure cannot borrow the retry budget.
+ */
+const INITIALIZE_TIMEOUT_ERR_MARKER = 'RPC call "initialize" timed out after';
+
+function isWorkerStartupError(
+  err: unknown,
+): err is { name: string; transient: boolean } {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "WorkerStartupError" &&
+    typeof (err as { transient?: unknown }).transient === "boolean"
+  );
+}
+
+/**
+ * Classify only failures that should consume the expensive activation retry
+ * budget. Typed `WorkerStartupError` provenance is authoritative; the narrow
+ * string fallback is solely for an untyped initialize-timeout rejection.
+ */
+export function isTransientActivationRetryError(err: unknown): boolean {
+  if (isWorkerStartupError(err)) return err.transient;
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes(INITIALIZE_TIMEOUT_ERR_MARKER);
+}
+
+/**
  * Each attempt can burn the full 60s initialize budget, so this schedule is
  * deliberately short: two extra attempts, ~10s of added delay. Bounded boot
  * concurrency (PLUGIN_ACTIVATION_CONCURRENCY) removes most of the contention
@@ -2735,6 +2765,25 @@ export function pluginLoader(
           }
           break;
         } catch (err) {
+          // Drop the failed handle before sleeping. A worker that crashed during
+          // startup can own a restart timer; leaving it registered across the
+          // retry delay lets it start itself inside the next retry window.
+          const releaseFailedWorker = async (): Promise<void> => {
+            if (!workerManager.getWorker(pluginId)) return;
+            try {
+              await workerManager.stopWorker(pluginId);
+            } catch (stopErr) {
+              log.warn(
+                {
+                  pluginId,
+                  pluginKey,
+                  err: stopErr instanceof Error ? stopErr.message : String(stopErr),
+                },
+                "plugin-loader: failed to stop worker before activation retry",
+              );
+            }
+          };
+
           if (
             isSdkInstallRaceError(err) &&
             sdkRaceAttempt < SDK_INSTALL_RACE_RETRY_DELAYS_MS.length
@@ -2751,6 +2800,7 @@ export function pluginLoader(
               },
               "plugin-loader: SDK install race detected, retrying worker spawn",
             );
+            await releaseFailedWorker();
             await sleep(delay);
             continue;
           }
@@ -2761,7 +2811,7 @@ export function pluginLoader(
           // give the SDK race 7 attempts instead of 5.
           if (
             !isSdkInstallRaceError(err) &&
-            isTransientActivationError(err) &&
+            isTransientActivationRetryError(err) &&
             transientAttempt < TRANSIENT_ACTIVATION_RETRY_DELAYS_MS.length
           ) {
             const delay = TRANSIENT_ACTIVATION_RETRY_DELAYS_MS[transientAttempt]!;
@@ -2777,6 +2827,7 @@ export function pluginLoader(
               },
               "plugin-loader: transient worker startup failure, retrying before marking plugin errored",
             );
+            await releaseFailedWorker();
             await sleep(delay);
             continue;
           }
