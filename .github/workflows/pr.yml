@@ -83,6 +83,12 @@ jobs:
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
+      - name: Reject App-attributed commits on the PR (BLO-21416)
+        run: node ./scripts/check-commit-author-attribution.mjs
+
+      - name: Test commit-author-attribution check
+        run: node --test ./scripts/check-commit-author-attribution.test.mjs
+
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
