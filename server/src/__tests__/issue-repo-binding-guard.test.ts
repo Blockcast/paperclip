@@ -397,9 +397,70 @@ describeEmbeddedPostgres("BLO-20341 issue repo binding guard", () => {
       description: "Fix lives in https://github.com/Blockcast/paperclip.",
     });
 
-    expect(signal?.kind).toBe("unbound_issue");
+    expect(signal?.kind).toBe("no_binding");
     const body = formatIssueRepoBindingComment(signal!);
     expect(body).toContain("no workspace at all");
     expect(body).toContain("Blockcast/paperclip");
+  });
+
+  // Ally review on PR #1323: `unbound_issue` used to conflate "no workspace
+  // resolved" with "a workspace resolved but carries no repoUrl", and then
+  // printed "no workspace at all" for both. `project_workspaces.repo_url` is
+  // nullable, so the second is an ordinary shape with a different fix.
+  it("distinguishes a workspace with no repoUrl from having no workspace", async () => {
+    const seed = await seedTwoProjectCompany();
+    const urllessProjectId = randomUUID();
+    const urllessWorkspaceId = randomUUID();
+
+    await db.insert(projects).values({
+      id: urllessProjectId,
+      companyId: seed.companyId,
+      name: "Local-only project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: urllessWorkspaceId,
+      companyId: seed.companyId,
+      projectId: urllessProjectId,
+      name: "local-checkout",
+      isPrimary: true,
+      repoUrl: null,
+    });
+
+    const signal = await evaluateIssueRepoBinding({
+      db,
+      companyId: seed.companyId,
+      parentId: seed.parentIssueId,
+      projectId: urllessProjectId,
+      projectWorkspaceId: urllessWorkspaceId,
+      executionWorkspaceId: null,
+      description: "Fix lives in https://github.com/Blockcast/paperclip.",
+    });
+
+    expect(signal?.kind).toBe("binding_without_repo_url");
+    // The workspace it IS bound to must survive into the advisory — that is
+    // the whole difference from `no_binding`, and what makes it actionable.
+    expect(signal?.boundWorkspaceName).toBe("local-checkout");
+    expect(signal?.boundSource).toBe("project_workspace");
+
+    const body = formatIssueRepoBindingComment(signal!);
+    expect(body).toContain("local-checkout");
+    expect(body).toContain("no `repoUrl` set");
+    expect(body).not.toContain("no workspace at all");
+    // ...and the recommended fix is to populate the workspace, not re-home.
+    expect(body).toContain("set that workspace's `repoUrl`");
+  });
+
+  it("escapes a backtick in a user-set workspace name", () => {
+    const body = formatIssueRepoBindingComment({
+      kind: "bound_mismatch",
+      boundRepoSlug: "blockcast/trafficcontrol",
+      boundRepoDisplay: "Blockcast/trafficcontrol",
+      boundWorkspaceName: "weird`name",
+      boundSource: "project_workspace",
+      references: [],
+    });
+    // The span must survive the backtick rather than closing early on it.
+    expect(body).toContain("``weird`name``");
   });
 });

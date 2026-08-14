@@ -120,9 +120,16 @@ const GITHUB_RESERVED_OWNERS = new Set([
   "login",
   "marketplace",
   "notifications",
+  // Both spellings are live site routes; `github.com/organizations/<org>/settings/apps/new`
+  // occurs in this org's runbook prose and used to read as owner `organizations`.
+  "organizations",
   "orgs",
   "pricing",
   "pulls",
+  // Belt-and-braces for the REST shape `api.github.com/repos/o/r`. The host
+  // anchor already rejects that URL; this keeps `github.com/repos/…` from
+  // reading as an owner if the host rule is ever loosened.
+  "repos",
   "search",
   "settings",
   "sponsors",
@@ -212,13 +219,25 @@ const FILE_EXTENSION_PATTERN =
 
 const SEGMENT = "[A-Za-z0-9][A-Za-z0-9._-]*";
 
+/**
+ * Guards the left edge of the host so `github.com` has to BE the host rather
+ * than merely end it. Without this, `api.github.com/repos/o/r/pulls/1`,
+ * `docs.github.com/en/actions`, `gist.github.com/user/sha` and
+ * `notgithub.com/o/r` all matched and their next two path segments were read
+ * as `owner/repo`. Those land in the `url` tier, which no denylist or cue rule
+ * filters, so each produced an advisory naming a repository that does not
+ * exist. A host character before `github.com` disqualifies the match; `/`,
+ * whitespace, `(`, `<` and `:` do not.
+ */
+const HOST_LEFT_EDGE = "(?<![A-Za-z0-9._-])";
+
 const HTTPS_REPO_PATTERN = new RegExp(
-  `(?:https?://)?(?:www\\.)?github\\.com/(${SEGMENT})/(${SEGMENT})((?:/[A-Za-z0-9._-]+)*)`,
+  `${HOST_LEFT_EDGE}(?:https?://)?(?:www\\.)?github\\.com/(${SEGMENT})/(${SEGMENT})((?:/[A-Za-z0-9._-]+)*)`,
   "gi",
 );
 
 const SSH_REPO_PATTERN = new RegExp(
-  `git@github\\.com:(${SEGMENT})/(${SEGMENT})`,
+  `${HOST_LEFT_EDGE}git@github\\.com:(${SEGMENT})/(${SEGMENT})`,
   "gi",
 );
 
@@ -297,12 +316,14 @@ export function extractRepoReferences(
 
   const record = (reference: RepoReference | null) => {
     if (!reference) return;
-    const existing = byKey.get(reference.key);
-    // A URL match is strictly better evidence than a cued slug for the same
-    // repo, so let it win if both appear.
-    if (existing && !(existing.confidence === "cued_slug" && reference.confidence === "url")) {
-      return;
-    }
+    // First writer wins. The URL tiers below are scanned before the backtick
+    // tier, so the first reference recorded for a key is always the
+    // most-confident one and a later `cued_slug` can never displace a `url`.
+    // An earlier revision carried an `existing cued_slug -> url` upgrade
+    // branch here; that scan order made it unreachable, so it is gone rather
+    // than left reading as a live invariant it never enforced. Reorder the
+    // scans below and this comment stops being true.
+    if (byKey.has(reference.key)) return;
     byKey.set(reference.key, reference);
   };
 
