@@ -232,6 +232,17 @@ type PullRequestEvidenceRow = {
 
 type ProductivityReviewEvidence = {
   trigger: ProductivityReviewTrigger;
+  // BLO-22436 (Ally follow-up on 37c1bd65): every trigger whose predicate fired
+  // this pass, in `choosePrimaryTrigger`'s ladder order — `trigger` is only the
+  // head of this list. Any gate that decides whether an *external* condition
+  // excuses the review must consult the whole set: `choosePrimaryTrigger` is a
+  // priority ladder, not a classification, so a single dispositive-looking
+  // primary can be hiding a co-fired trigger the same condition does not excuse
+  // at all. The concrete case is a blocked source that is both silent and
+  // churning: `no_comment_streak` wins the ladder and is dependency-closable,
+  // but the `high_churn` evidence underneath it records runs that did execute
+  // and did burn cost, which no blocker retroactively excuses.
+  firedTriggers: ProductivityReviewTrigger[];
   triggerReasons: string[];
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
@@ -336,6 +347,7 @@ type ProductivityReviewFinishEvidence = Pick<
   | "sourceIssue"
   | "generatedAt"
   | "trigger"
+  | "firedTriggers"
   | "noCommentStreak"
   | "runCountLastHour"
   | "commentCountLastHour"
@@ -343,6 +355,7 @@ type ProductivityReviewFinishEvidence = Pick<
 
 type MonitorScheduledSuppression = {
   trigger: "long_active_duration";
+  firedTriggers: ProductivityReviewTrigger[];
   triggerReasons: string[];
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
@@ -368,6 +381,7 @@ type PendingMonitorForReviewSuppression = {
 
 type ApprovalGatedSuppression = {
   trigger: "long_active_duration";
+  firedTriggers: ProductivityReviewTrigger[];
   triggerReasons: string[];
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
@@ -1049,6 +1063,37 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 //   - missing/unknown provenance — fails closed.
 function isDependencyBlockedClosableTrigger(trigger: unknown) {
   return trigger === "no_comment_streak" || trigger === "long_active_duration";
+}
+
+// BLO-22436 (Ally follow-up on 37c1bd65): the set form of the predicate above,
+// and the one every dependency gate must use. Keying on the *primary* trigger
+// alone reopens the evasion `isDependencyBlockedClosableTrigger` exists to
+// refuse, because `choosePrimaryTrigger` is a priority ladder: `no_comment_streak`
+// outranks `high_churn`, so an agent burning runs *and* staying silent — the
+// exact shape worth reviewing — presents a closable primary while carrying
+// non-closable evidence underneath. The defaults make that overlap the norm
+// rather than a corner (`noCommentStreakRuns` and `highChurnHourly` are both 10),
+// so ten silent runs inside an hour trip both predicates at once.
+//
+// Requires a non-empty set: an empty/absent list is unknown provenance and fails
+// closed, matching the single-trigger predicate's treatment of a missing trigger.
+function isDependencyBlockedClosableTriggerSet(triggers: unknown) {
+  return Array.isArray(triggers) && triggers.length > 0 && triggers.every(isDependencyBlockedClosableTrigger);
+}
+
+// Close-path form: the persisted `details.firedTriggers` when the review was
+// minted with one, else the single `details.trigger` for rows written before
+// BLO-22436's follow-up. The fallback is deliberately the *old* behaviour and
+// not fail-closed: an already-open legacy review on a source that is now
+// blocked has no other path back — `createOrUpdateReview` is the only thing
+// that refreshes an open review and generation now skips blocked sources — so
+// refusing to close it would strand it open forever, which is the very defect
+// the close path was added to fix.
+function isDependencyBlockedClosableRecord(trigger: unknown, firedTriggers: unknown) {
+  if (firedTriggers === undefined || firedTriggers === null) {
+    return isDependencyBlockedClosableTrigger(trigger);
+  }
+  return isDependencyBlockedClosableTriggerSet(firedTriggers);
 }
 
 function formatTrigger(trigger: ProductivityReviewTrigger) {
@@ -1976,6 +2021,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           source: "productivity_review.reconcile",
           sourceIssueId: evidence.sourceIssue.id,
           trigger: evidence.trigger,
+          // BLO-22436: persisted so the close path can apply the same
+          // whole-set test the generation gate does. Rows written before this
+          // field existed carry only `trigger`; see the fallback in
+          // `closeOpenSuppressedReviews`.
+          firedTriggers: evidence.firedTriggers,
           noCommentStreak: evidence.noCommentStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
@@ -2259,6 +2309,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     const reviewTriggerById = new Map<string, unknown>();
+    const reviewFiredTriggersById = new Map<string, unknown>();
     const reviewIds = reviewRows.map((review) => review.id);
     for (const chunk of reviewIds.length > 0 ? [reviewIds] : []) {
       const triggerRows = await db
@@ -2274,7 +2325,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         )
         .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
       for (const row of triggerRows) {
-        if (!reviewTriggerById.has(row.entityId)) reviewTriggerById.set(row.entityId, row.details?.trigger);
+        if (!reviewTriggerById.has(row.entityId)) {
+          reviewTriggerById.set(row.entityId, row.details?.trigger);
+          // Read from the same newest-activity row as `trigger`, inside the
+          // same first-wins guard, so the primary and the set can never be
+          // sourced from different generations of the same review.
+          reviewFiredTriggersById.set(row.entityId, row.details?.firedTriggers);
+        }
       }
     }
 
@@ -2294,7 +2351,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const closableSourceIdsByCompany = new Map<string, Set<string>>();
     for (const review of reviewRows) {
       if (!review.originId) continue;
-      if (!isDependencyBlockedClosableTrigger(reviewTriggerById.get(review.id))) continue;
+      if (!isDependencyBlockedClosableRecord(reviewTriggerById.get(review.id), reviewFiredTriggersById.get(review.id))) continue;
       const sourceIssue = sourceIssueById.get(review.originId);
       if (!sourceIssue || sourceIssue.companyId !== review.companyId) continue;
       const forCompany = closableSourceIdsByCompany.get(review.companyId) ?? new Set<string>();
@@ -2349,9 +2406,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         }
       }
       // `dependencyBlockedSourceIssueIds` is keyed by source issue id, not
-      // review id, and is only populated from reviews whose trigger already
-      // passed `isDependencyBlockedClosableTrigger` (above). Re-checking the
-      // trigger here too (Ally review, BLO-22436) makes this arm locally
+      // review id, and is only populated from reviews whose trigger record
+      // already passed `isDependencyBlockedClosableRecord` (above). Re-checking
+      // it here too (Ally review, BLO-22436) makes this arm locally
       // correct on its own terms — today it's redundant only because
       // `issues_active_productivity_review_uq` guarantees at most one active
       // review per source, so a non-closable review can't share this
@@ -2360,7 +2417,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // reviews through this branch.
       if (
         !suppressedBy &&
-        isDependencyBlockedClosableTrigger(trigger) &&
+        isDependencyBlockedClosableRecord(trigger, reviewFiredTriggersById.get(review.id)) &&
         dependencyBlockedSourceIssueIds.has(sourceIssue.id)
       ) {
         suppressedBy = "dependency_blocked";
@@ -3007,6 +3064,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn });
     if (!trigger) return null;
 
+    // BLO-22436 (Ally follow-up): recorded in `choosePrimaryTrigger`'s ladder
+    // order so `firedTriggers[0] === trigger` always holds. Built from the same
+    // four booleans the ladder reads, rather than re-deriving the predicates,
+    // so the set cannot drift from the primary it is supposed to contain.
+    const firedTriggers: ProductivityReviewTrigger[] = [];
+    if (runtimeFailure) firedTriggers.push("runtime_failure_streak");
+    if (noComment) firedTriggers.push("no_comment_streak");
+    if (highChurn) firedTriggers.push("high_churn");
+    if (longActive) firedTriggers.push("long_active_duration");
+
     const triggerReasons: string[] = [];
     if (runtimeFailure) {
       triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
@@ -3054,6 +3121,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (approvalGate) {
         return {
           trigger,
+          firedTriggers,
           triggerReasons,
           sourceIssue,
           sourceAgent,
@@ -3072,6 +3140,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (trigger === "long_active_duration" && monitor) {
       return {
         trigger,
+        firedTriggers,
         triggerReasons,
         sourceIssue,
         sourceAgent,
@@ -3144,6 +3213,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     return {
       trigger,
+      firedTriggers,
       triggerReasons,
       sourceIssue,
       sourceAgent,
@@ -3282,23 +3352,32 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Never-invoked runs excluded (terminal, \`issueCommentStatus: not_applicable\`, BLO-26165): ${evidence.neverInvokedRunCount}`,
       ...(evidence.nonExecutingRunCount > 0
         ? [
-            `- Non-executing runs in sample window (excluded from streaks above): ${evidence.nonExecutingRunCount}${
-              evidence.nonExecutingAlsoNeverInvokedCount > 0
-                ? ` (${evidence.nonExecutingAlsoNeverInvokedCount} already counted above as never-invoked${
-                    evidence.nonExecutingAlsoNeverInvokedCount < evidence.nonExecutingRunCount
-                      ? `, ${evidence.nonExecutingRunCount - evidence.nonExecutingAlsoNeverInvokedCount} additional`
-                      : ""
-                  })`
-                : ""
-            }${
-              evidence.nonExecutingDominantErrorCode
-                ? ` (dominant errorCode: ${
-                    evidence.nonExecutingDominantErrorCode.code
-                      ? `\`${evidence.nonExecutingDominantErrorCode.code}\``
-                      : "none recorded"
-                  }, ${evidence.nonExecutingDominantErrorCode.count} of ${evidence.nonExecutingRunCount})`
-                : " (no single dominant errorCode)"
-            }`,
+            // BLO-22436 (Ally suggestion on 37c1bd65): one parenthetical group,
+            // not two adjacent ones — the overlap note and the dominant-errorCode
+            // note are both qualifications of the same count, and `all N` drops
+            // the `N of N` echo the total-overlap case used to render.
+            `- Non-executing runs in sample window (excluded from streaks above): ${evidence.nonExecutingRunCount} (${
+              [
+                ...(evidence.nonExecutingAlsoNeverInvokedCount > 0
+                  ? [
+                      evidence.nonExecutingAlsoNeverInvokedCount < evidence.nonExecutingRunCount
+                        ? `${evidence.nonExecutingAlsoNeverInvokedCount} already counted above as never-invoked, ${evidence.nonExecutingRunCount - evidence.nonExecutingAlsoNeverInvokedCount} additional`
+                        : `all ${evidence.nonExecutingAlsoNeverInvokedCount} already counted above as never-invoked`,
+                    ]
+                  : []),
+                evidence.nonExecutingDominantErrorCode
+                  ? `dominant errorCode: ${
+                      evidence.nonExecutingDominantErrorCode.code
+                        ? `\`${evidence.nonExecutingDominantErrorCode.code}\``
+                        : "none recorded"
+                    }, ${
+                      evidence.nonExecutingDominantErrorCode.count === evidence.nonExecutingRunCount
+                        ? `all ${evidence.nonExecutingRunCount}`
+                        : `${evidence.nonExecutingDominantErrorCode.count} of ${evidence.nonExecutingRunCount}`
+                    }`
+                  : "no single dominant errorCode",
+              ].join("; ")
+            })`,
           ]
         : []),
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
@@ -3389,6 +3468,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded: ${evidence.neverInvokedRunCount}`,
+      // BLO-22436 (Ally suggestion on 37c1bd65): the never-invoked count is
+      // ambiguous on its own — it says nothing about *why* those runs could not
+      // comment. Carry the non-executing count and its overlap here too, so the
+      // comment that lands in a manager's notifications tells the same story as
+      // the description it summarises.
+      ...(evidence.nonExecutingRunCount > 0
+        ? [
+            `- Non-executing runs excluded: ${evidence.nonExecutingRunCount}${
+              evidence.nonExecutingAlsoNeverInvokedCount > 0
+                ? evidence.nonExecutingAlsoNeverInvokedCount < evidence.nonExecutingRunCount
+                  ? ` (${evidence.nonExecutingAlsoNeverInvokedCount} of them already counted as never-invoked)`
+                  : " (all of them already counted as never-invoked)"
+                : ""
+            }`,
+          ]
+        : []),
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
@@ -3604,6 +3699,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           source: "productivity_review.reconcile",
           sourceIssueId: evidence.sourceIssue.id,
           trigger: evidence.trigger,
+          firedTriggers: evidence.firedTriggers,
           noCommentStreak: evidence.noCommentStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
@@ -3660,6 +3756,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (monitor) {
         await recordMonitorScheduledSuppression({
           trigger: evidence.trigger,
+          firedTriggers: evidence.firedTriggers,
           triggerReasons: evidence.triggerReasons,
           sourceIssue: evidence.sourceIssue,
           sourceAgent: evidence.sourceAgent,
@@ -3723,6 +3820,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         const monitor = error.monitor;
         await recordMonitorScheduledSuppression({
           trigger: "long_active_duration",
+          firedTriggers: evidence.firedTriggers,
           triggerReasons: evidence.triggerReasons,
           sourceIssue: evidence.sourceIssue,
           sourceAgent: evidence.sourceAgent,
@@ -3754,6 +3852,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       sourceIssue,
       generatedAt,
       trigger: "long_active_duration",
+      // The reservation is the only surviving record of why this review exists,
+      // and it is long-active by construction (`reserveLongActiveProductivityReviewIssue`
+      // is the sole writer). Recording exactly that keeps the persisted set
+      // consistent with the persisted primary and leaves this path's close
+      // behaviour identical to what the single `trigger` gave it before.
+      firedTriggers: ["long_active_duration"],
       noCommentStreak: 0,
       runCountLastHour: 0,
       commentCountLastHour: 0,
@@ -4173,10 +4277,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // `long_active_duration`) unless blocked issues are exempt from those:
     // fixing the previous review's cause becomes the cause of the next one.
     //
-    // Scoped to `isDependencyBlockedClosableTrigger` — the same trigger set
-    // the close path (`reconcileProductivityReviews`'s dependency-blocked
-    // close loop, above) already trusts — rather than skipping regardless of
-    // trigger (Ally review, BLO-22436). `high_churn` and
+    // Scoped to `isDependencyBlockedClosableTriggerSet` over *every* trigger
+    // that fired — not the primary one (Ally review, BLO-22436, twice).
+    // `high_churn` and
     // `runtime_failure_streak` must still be able to fire while blocked: a
     // `blockedBy` edge is agent-writable (`paperclipUpdateIssue`) and
     // interaction wakes are deliberately allowed to dispatch on a blocked
@@ -4184,7 +4287,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // unconditional skip here would let a flagged agent retire its own
     // cost-accountability artifact one cycle early by adding the edge before
     // generation runs — exactly the evasion `isDependencyBlockedClosableTrigger`
-    // was written to refuse at close time. Checked after `collectEvidence`
+    // was written to refuse at close time. Keying on `evidence.trigger` alone
+    // left that evasion intact for the overlapping case, which the thresholds
+    // make the *common* one: `choosePrimaryTrigger` ranks `no_comment_streak`
+    // above `high_churn`, so an agent burning runs and staying silent presents a
+    // closable primary and took the churn evidence down with it. Checked after
+    // `collectEvidence`
     // (below) rather than filtering the candidate up front, since the trigger
     // is what determines whether the blocker is dispositive and evidence is
     // already collected for every other candidate that reaches this point.
@@ -4234,7 +4342,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
       if (
         dependencyBlockedSourceIssueIds.has(candidate.id) &&
-        isDependencyBlockedClosableTrigger(evidence.trigger)
+        isDependencyBlockedClosableTriggerSet(evidence.firedTriggers)
       ) {
         result.dependencyBlockedSuppressed += 1;
         continue;
