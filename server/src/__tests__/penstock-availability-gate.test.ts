@@ -321,4 +321,162 @@ describe("createPenstockAvailabilityGate", () => {
     expect(result).toEqual({ allow: true });
     expect(log.warn).toHaveBeenCalled();
   });
+  // BLO-27147: the gate was introduced for the 2026-06-30 Anthropic exhaustion
+  // (BLO-12953) and guarded on `adapterType !== "claude_k8s"`, which made it a
+  // structural no-op for every opencode_k8s/codex IC. These cover the widening.
+  it("denies an opencode_k8s agent when the codex pool is rate limited", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          state: "rate_limited",
+          reason: "penstock.capacity_rate_limited",
+          resume_at: "2026-06-30T08:03:11.000Z",
+          retry_after_seconds: 191,
+        }),
+        { status: 200 },
+      ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    const result = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "gpt-5.6-sol",
+        env: { OPENAI_BASE_URL: { value: "https://api.penstock.run/v1" } },
+      },
+      now: new Date("2026-06-30T08:00:00.000Z"),
+      env: { OPENAI_API_KEY: "psk_test" },
+    });
+
+    expect(result).toMatchObject({
+      allow: false,
+      provider: "codex",
+      reason: "penstock.model_capacity_unavailable",
+      model: "gpt-5.6-sol",
+      retryAfterSeconds: 191,
+    });
+    expect(result.allow === false ? result.resumeAt?.toISOString() : null).toBe("2026-06-30T08:03:11.000Z");
+    // The provider query parameter must be codex, not the hardcoded anthropic.
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "https://api.penstock.run/v1/pools/default/capacity?provider=codex&model=gpt-5.6-sol",
+    );
+  });
+
+  it("allows an opencode_k8s agent when the codex pool has capacity", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+        { status: 200 },
+      ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    const result = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "gpt-5.6-terra",
+        env: { OPENAI_BASE_URL: { value: "https://api.penstock.run/v1" } },
+      },
+      now: new Date("2026-06-30T08:00:00.000Z"),
+      env: { OPENAI_API_KEY: "psk_test" },
+    });
+
+    expect(result).toEqual({ allow: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails open for codex without attempting the Anthropic messages probe", async () => {
+    // 404 makes the capacity readback inconclusive. For anthropic that falls
+    // back to a /v1/messages probe; codex has no such probe, so it must fail
+    // open after exactly one call rather than POST an Anthropic-shaped body
+    // at an OpenAI endpoint.
+    const fetchMock = vi.fn(async () => new Response("", { status: 404 }));
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    const result = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "gpt-5.6-sol",
+        env: { OPENAI_BASE_URL: { value: "https://api.penstock.run/v1" } },
+      },
+      now: new Date("2026-06-30T08:00:00.000Z"),
+      env: { OPENAI_API_KEY: "psk_test" },
+    });
+
+    expect(result).toEqual({ allow: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0]![1] as RequestInit).method).toBe("GET");
+  });
+
+  it("allows an opencode_k8s agent whose base URL is not Penstock-backed", async () => {
+    const fetchMock = vi.fn();
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    const result = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "gpt-5.6-sol",
+        env: { OPENAI_BASE_URL: { value: "https://api.openai.com/v1" } },
+      },
+      now: new Date("2026-06-30T08:00:00.000Z"),
+      env: { OPENAI_API_KEY: "psk_test" },
+    });
+
+    expect(result).toEqual({ allow: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keys the cache per provider so codex and anthropic do not collide", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            state: "exhausted",
+            reason: "penstock.capacity_exhausted",
+            retry_after_seconds: 42,
+          }),
+          { status: 200 },
+        ),
+      );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+    const now = new Date("2026-06-30T08:00:00.000Z");
+
+    const anthropic = await gate.checkAdapter({
+      adapterType: "claude_k8s",
+      agentId: "agent-cto",
+      adapterConfig: {
+        model: "shared-model",
+        env: { ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/v1" } },
+      },
+      now,
+      env: { ANTHROPIC_API_KEY: "psk_test" },
+    });
+    const codex = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "shared-model",
+        env: { OPENAI_BASE_URL: { value: "https://api.penstock.run/v1" } },
+      },
+      now,
+      env: { OPENAI_API_KEY: "psk_test" },
+    });
+
+    // Same origin, path and model: only the provider differs. A cache key that
+    // omitted the provider would serve anthropic's allow to codex.
+    expect(anthropic).toEqual({ allow: true });
+    expect(codex).toMatchObject({ allow: false, provider: "codex" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });
