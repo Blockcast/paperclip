@@ -95,7 +95,12 @@ These need different fixes; do not assume one covers both.
 
 - **Saturation (starvation).** The agent is at `maxConcurrentRuns` running
   pods, and other queued runs for the same agent are cycling through slots
-  while this one is not. Confirm with
+  while this one is not. This is a dispatch fairness problem: inspect
+  `dispatchRank` in `server/src/services/heartbeat.ts` and its BLO-16253
+  comments. The normal aging lanes preserve ranks 0–1 for explicit
+  critical-priority work, so a sustained stream of fresh critical work can
+  keep routine work waiting until the absolute starvation ceiling is reached.
+  Confirm with
   `kubectl get pods -n paperclip -l paperclip.io/agent-id=<id>`; if the pod
   count equals `maxConcurrentRuns` and none belongs to the stranded run, this
   is starvation rather than a lost dispatch.
@@ -144,10 +149,15 @@ The age gauge is reset-then-set for every known agent on each successful
 
 The chart rule in `deploy/helm/paperclip/templates/prometheusrule.yaml` is a
 mirror on Blockcast: `prometheusRule.enabled` is false in
-`values.blockcast.yaml`. The production rule must also be landed in both
-lockstep `Blockcast/onprem-k8s` alert files and synced through the
-`monitoring-rules` Argo application. Merging this repository alone does not
-make the alert live; verify `/api/v1/rules` after deployment.
+`values.blockcast.yaml`. The production rule must also be landed in the two
+lockstep `Blockcast/onprem-k8s` alert files: the authoritative
+`monitoring/prometheus-configmap.yaml` key
+`paperclip-runtime-alerts.rules.yml` and the CRD documentation copy. Then
+manually sync the `monitoring-rules` Argo application (BLO-19095). Merging
+this repository alone does not make the alert live. Before treating the
+signal as production observability, verify the rendered rule in Prometheus
+at `/api/v1/rules` after deployment; the onprem-k8s change and Argo sync must
+be confirmed separately.
 
 ## References
 

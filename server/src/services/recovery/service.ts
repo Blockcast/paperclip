@@ -1158,15 +1158,25 @@ export function classifyAdapterFailureForRecovery(
   }
   const resultJson = parseObject(latestRun.resultJson);
   const rawError = latestRun.error ?? "";
-  // A malformed adapter response is transport-level evidence only. Its raw
-  // text and truncated result payload are untrusted and must not drive either
-  // configuration or quota recovery heuristics.
-  if (ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError)) return null;
-
-  const error = [latestRun.errorCode ?? "", rawError, JSON.stringify(resultJson)].join("\n");
-  if (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+  // An `adapter_failed` whose own message names a response-parse failure means
+  // resultJson is an untrusted/truncated payload, not classification evidence.
+  // Keep the guard scoped to that durable error code: provider_quota and
+  // configuration_incomplete are authoritative classifications and must not be
+  // discarded merely because their human-readable message contains the same
+  // phrase.
+  const isResponseParseFailure =
+    latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
+  const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
+    .join("\n");
+  if (
+    !isResponseParseFailure &&
+    (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
+  ) {
     return { kind: "configuration_incomplete" };
   }
+  // The raw parse-failure text can itself contain quota-like words, so do not
+  // let an adapter_failed transport fault enter the provider-quota path.
+  if (isResponseParseFailure) return null;
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
   const persistedRetryAt = readNonEmptyString(resultJson.retryNotBefore) ??
