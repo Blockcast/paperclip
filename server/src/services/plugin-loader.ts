@@ -133,30 +133,17 @@ function isSdkInstallRaceError(err: unknown): boolean {
  * single manual `/enable` with no other change.
  *
  * The timeout is a symptom of boot contention, not of a broken plugin, so it is
- * retried rather than latched. Deliberately narrow: only the initialize budget
- * and a worker that died during startup qualify. A plugin that reports a real
- * fault (`initialize returned ok=false`, a manifest error, a missing
- * entrypoint) still fails closed on the first attempt.
- */
-const TRANSIENT_ACTIVATION_ERR_MARKERS = [
-  "timed out after",
-  "Worker initialize failed",
-  "Worker exited during startup",
-];
-
-export function isTransientActivationError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  // An explicit ok=false is the plugin answering "I am broken" inside the
-  // budget — a real fault, not contention. Never retry it.
-  if (msg.includes("initialize returned ok=false")) return false;
-  return TRANSIENT_ACTIVATION_ERR_MARKERS.some((marker) => msg.includes(marker));
-}
-
-/**
- * Retry policy for activation failures. This intentionally remains separate
- * from the compatibility classifier above: the latter preserves the behavior
- * that current master exposes, while activation retries require provenance from
- * `startWorker()` so a plugin-reported failure cannot borrow the retry budget.
+ * retried rather than latched.
+ *
+ * A message-substring classifier used to live here (BLO-22095). It could not
+ * work: `startWorker()` applies the `Worker initialize failed for "<id>"`
+ * prefix to *every* initialize failure, so matching that prefix also matched a
+ * plugin that threw — bad credentials, missing config, any explicit RPC
+ * rejection — and retried it three times while this comment claimed the
+ * opposite. It also listed a `Worker exited during startup` marker that no
+ * production site has ever thrown. It was superseded by the typed classifier
+ * below, left behind with no call sites, and is now removed rather than left
+ * to mislead the next reader.
  */
 const INITIALIZE_TIMEOUT_ERR_MARKER = 'RPC call "initialize" timed out after';
 
