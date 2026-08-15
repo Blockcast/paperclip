@@ -29,12 +29,13 @@ type ProcessLossRetryResult =
    * A new retry run was queued by this call.
    *
    * `issueLockOwnedByRetry` reports whether the retry actually ends up holding
-   * the issue's execution lock. It is NOT implied by the retry existing: the
-   * hand-over is a guarded UPDATE (`execution_run_id = <original run>`) and the
-   * stale-issue-lock sweeper treats the crash-marked original — `interrupted`,
-   * therefore terminal — as cleanable for the whole duration of recovery. If
-   * the sweeper clears the lock first, the guarded UPDATE matches zero rows and
-   * the retry owns nothing. Callers must not infer ownership from `kind`.
+   * the issue's execution lock. For a freshly `created` retry that is always
+   * `false`, and not by accident: master's "bind issue locks only for running
+   * runs" rule (8446c1011) means enqueue RELEASES the original's lock rather
+   * than handing it to the queued retry, and lazy locking stamps
+   * `issues.execution_run_id` at CLAIM time instead. An `adopted` retry may own
+   * one, because it may already have been claimed, so that arm reads the row.
+   * Callers must not infer ownership from `kind`.
    *
    * `retryContinuesContextIssue` is the *decision* callers actually need, and
    * it is deliberately NOT the same question (BLO-21623, Ally round 9). Lock
@@ -13919,7 +13920,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return {
           retryRun: racedRetry,
           created: false as const,
-          issueLockTransferred: false,
           issueLockUnavailable: false as const,
         };
       }
@@ -13945,7 +13945,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return {
           retryRun: null,
           created: false as const,
-          issueLockTransferred: false,
           issueLockUnavailable: true as const,
         };
       }
@@ -14005,15 +14004,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
 
-      // Guarded on `execution_run_id = run.id`, so it is a no-op if the issue's
-      // lock has already moved on — most likely cleared by `sweepStaleIssueLocks`,
-      // which sees the crash-marked original as terminal and therefore cleanable
-      // for the whole of recovery. Capture whether it landed: reporting `created`
-      // while this matched zero rows is what let recovery record that the retry
-      // owned a lock it never acquired.
-      let issueLockTransferred = false;
+      // Master's "bind issue locks only for running runs" rule (8446c1011):
+      // the retry is `queued`, so enqueue RELEASES the original's lock instead
+      // of handing it over. The dispatcher stamps `execution_run_id` when it
+      // claims the retry — lazy locking, `reconcileDetachedQueuedRuns`
+      // (BLO-21621). Still guarded on `execution_run_id = run.id`, so it is a
+      // no-op once the lock has moved on — most likely cleared by
+      // `sweepStaleIssueLocks`, which sees the crash-marked original as
+      // terminal and therefore cleanable for the whole of recovery.
       if (issueId) {
-        const transferred = await tx
+        await tx
           .update(issues)
           .set({
             checkoutRunId: null,
@@ -14022,15 +14022,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionLockedAt: null,
             updatedAt: now,
           })
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
-          .returning({ id: issues.id });
-        issueLockTransferred = transferred.length > 0;
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
       }
 
       return {
         retryRun,
         created: true as const,
-        issueLockTransferred,
         issueLockUnavailable: false as const,
       };
     });
@@ -14088,7 +14085,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return {
       kind: "created",
       run: queued.retryRun,
-      issueLockOwnedByRetry: queued.issueLockTransferred,
+      // Always false, and not a shortcut: the transaction above RELEASED the
+      // context lock rather than handing it to this `queued` retry, because
+      // issue locks bind only to running runs (8446c1011). The dispatcher
+      // stamps it at claim time. Reporting the release outcome here would
+      // invert the meaning — a successful release is precisely the case where
+      // the retry owns nothing.
+      issueLockOwnedByRetry: false,
       retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
     };
   }

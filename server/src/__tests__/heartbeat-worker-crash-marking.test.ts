@@ -636,10 +636,11 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     const retries = await retriesOf(run.id);
     expect(retries).toHaveLength(1);
     const [issueAfterRecovery] = await db.select().from(issues).where(eq(issues.id, "11111111-1111-1111-1111-111111111111"));
-    // The retry re-points the lock at itself (enqueueProcessLossRetry's own
-    // update), not a bare release — the point under test is only that this
-    // did not happen prematurely on the failed pass above.
-    expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
+    // Released, not handed to the retry: issue locks bind only to running runs
+    // (8446c1011), and the retry is `queued` — the dispatcher stamps the lock
+    // when it claims. The point under test is that this release did not happen
+    // prematurely on the failed pass above, where it was still `run.id`.
+    expect(issueAfterRecovery!.executionRunId).toBeNull();
   });
 
   // ---- (g) the one unbounded call cannot outlive the claim lease -----------
@@ -775,7 +776,8 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     const [issueAfterFailure] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issueAfterFailure!.executionRunId).toBe(run.id);
 
-    // Replay with a healthy agent load: the retry is created and takes the lock.
+    // Replay with a healthy agent load: the retry is created and the lock is
+    // released for it to claim (issue locks bind only to running runs).
     const healthy = service();
     const second = await healthy.reconcileWorkerCrashedRuns({
       now: new Date(afterFailure.crashRecoveryNextAttemptAt!.getTime() + 1000),
@@ -785,7 +787,7 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     const retries = await retriesOf(run.id);
     expect(retries).toHaveLength(1);
     const [issueAfterRecovery] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
+    expect(issueAfterRecovery!.executionRunId).toBeNull();
   });
 
   // ---- (j) a failed terminal write must report the run unresolved ----------
@@ -1053,7 +1055,7 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     const retries = await retriesOf(run.id);
     expect(retries).toHaveLength(1);
     const [issueAfterRecovery] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(issueAfterRecovery!.executionRunId).toBe(retries[0]!.id);
+    expect(issueAfterRecovery!.executionRunId).toBeNull();
   });
 
   // ---- (j) the stale-lock sweeper racing the issue-lock hand-over ----------
@@ -1159,11 +1161,14 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     const retries = await retriesOf(run.id);
     expect(retries).toHaveLength(1);
 
-    // The hand-over still lands and is NOT clobbered by the unconditional
-    // release: its clearing UPDATE is keyed on `execution_run_id = <this run>`,
-    // which the transferred lock no longer matches.
+    // The context lock is released rather than handed over — issue locks bind
+    // only to running runs (8446c1011) and the retry is `queued`. What this
+    // test pins is the SIBLING half below: the unconditional sibling release
+    // must not promote the deferred wake, because the retry still continues
+    // the context issue (`retryContinuesContextIssue`), which is the predicate
+    // promotion is gated on — not lock ownership.
     const [contextAfter] = await db.select().from(issues).where(eq(issues.id, contextIssueId));
-    expect(contextAfter!.executionRunId).toBe(retries[0]!.id);
+    expect(contextAfter!.executionRunId).toBeNull();
     const [wakeAfter] = await db
       .select()
       .from(agentWakeupRequests)
