@@ -83,6 +83,82 @@
  * advisory only (never blocks a merge) and stays a complete historical
  * record, including pre-cutoff violations, so `findAttributionOffenses` only
  * filters by allowlist when a caller opts in via `{ allowlist }`.
+ *
+ * ## The App stamps its noreply address in more than one spelling (BLO-26647)
+ *
+ * `commit.authorEmail !== APP_NOREPLY_EMAIL` used to be a single `!==`
+ * against the one `<id>+allyblockcast[bot]@users.noreply.github.com` literal.
+ * Confirmed against `GET /repos/{owner}/{repo}/commits/{sha}` (author.login,
+ * author.id, author.type all resolve to the App, id `290875700`), the same
+ * installation also lands commits under a bare `allyblockcast[bot]@…` (no
+ * numeric prefix) and, once, a WRONG numeric prefix
+ * (`220200645+allyblockcast[bot]@…`) — the id is caller-supplied at commit
+ * time (whatever `git config user.email` or the REST payload said), not a
+ * verified property of the write, so it varies by write path even though
+ * every one of these is the same shared credential. `APP_NOREPLY_EMAIL_PATTERN`
+ * now matches the `allyblockcast[bot]` local-part with an OPTIONAL numeric
+ * prefix of ANY digits, not just `290875700`, on the exact
+ * `users.noreply.github.com` domain — see the `220200645` and `allyblockcast`
+ * (no `[bot]`) resolutions below for why "any digits" and "domain-scoped
+ * local-part" are each load-bearing, not sloppy.
+ *
+ * ### The bare form is NOT exclusive to the App — author NAME is what
+ * ### distinguishes a real exemption from a real offense
+ *
+ * `git log` on this repo's own history shows the exact same bare email,
+ * `allyblockcast[bot]@users.noreply.github.com`, under author names `CTO`,
+ * `CTO (Paperclip agent)`, `Staff Engineer`, and plain `allyblockcast[bot]`
+ * — none of those are the graphify-reindex bot; they are ordinary agent
+ * commits that landed via a write path stamping the bare form instead of the
+ * id-prefixed one. GitHub resolves `author.login` from the commit EMAIL, not
+ * the name, so all of those are the App account (id 290875700) exactly as
+ * much as the id-prefixed form is — broadening the email match to the bare
+ * form is therefore correct and was not optional.
+ *
+ * The one bare-email author name that must stay clear is
+ * `graphify-reindex (allyblockcast)` — a scheduled knowledge-graph-refresh
+ * job (`origin/bot/graphify-reindex`, e.g. `09d69ca8d`), not a per-agent
+ * write path. Its commits happen to resolve to the same App account via the
+ * same email-matching logic GitHub itself uses, but this gate exists to
+ * recover WHICH AGENT wrote something, and graphify-reindex isn't an agent —
+ * it's one well-known, singular process, already carved out by name in
+ * `NON_AGENT_PROCESS_AUTHOR_NAMES` (previously carved out only by accident,
+ * because the old exact-match string happened not to cover its bare email —
+ * see the now-corrected test in check-commit-author-attribution.test.mjs).
+ * `pr.yml` deliberately does not exempt by branch name instead (forgeable,
+ * and empty on `merge_group` — see that test's comment) — this is the one
+ * legitimate exemption and it is name-keyed for exactly that reason.
+ *
+ * ### `220200645+allyblockcast[bot]@users.noreply.github.com` is NOT a second
+ * ### installation — it is an unresolvable, malformed stamp, and IS matched
+ *
+ * The one commit carrying this id (`d41030016`, PR-merged 2026-08-10) has NO
+ * `author` object at all in `GET /repos/{owner}/{repo}/commits/{sha}` — only
+ * `committer` (a human, `kkroo`) is present. GitHub could not resolve
+ * `220200645` to any account, App or user. This is not a second legitimate
+ * App installation; it reads as a manually-typed or copy-paste-mangled
+ * `--author`/`GIT_AUTHOR_...` override that got the numeric prefix wrong.
+ * Because it still carries the `allyblockcast[bot]` local part and erases
+ * the true author exactly as badly (worse — it doesn't even resolve), it is
+ * deliberately caught by `APP_NOREPLY_EMAIL_PATTERN`'s any-digits prefix
+ * rather than exempted. If a genuinely second App installation ever appears,
+ * name it here explicitly rather than relying on this catch-all.
+ *
+ * ### `allyblockcast@users.noreply.github.com` (no `[bot]`) is a DIFFERENT,
+ * ### real, resolvable identity — deliberately NOT matched
+ *
+ * Two real commits (`7fb261047`, `c367f99fe`) carrying this exact bare,
+ * no-`[bot]` email resolve via the API to `author.login: "allyblockcast"`,
+ * `author.id: 296676656` — a distinct GitHub account from the App
+ * (`allyblockcast[bot]`, id `290875700`). Their author *names* differ
+ * (`allyblockcast`, `PlatformSREEngineer (Ally)`) despite sharing this one
+ * account, which means this second account has its own version of the
+ * shared-identity problem BLO-21416 describes — just not the one this gate
+ * (scoped to installation `290875700`) is chartered to catch. Recorded here
+ * rather than silently matched (would misattribute it to the wrong
+ * installation) or silently dropped (would hide a real second instance of
+ * the underlying problem) — worth its own follow-up issue if per-agent
+ * attribution on THAT account starts to matter.
  */
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -90,6 +166,31 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 export const APP_NOREPLY_EMAIL = "290875700+allyblockcast[bot]@users.noreply.github.com";
+
+/**
+ * Matches every observed spelling of the shared App noreply address: an
+ * OPTIONAL numeric prefix (any digits — see the `220200645` resolution in
+ * the module docblock for why this isn't pinned to `290875700`) followed by
+ * the literal `allyblockcast[bot]` local part, on the exact
+ * `users.noreply.github.com` domain. Deliberately does NOT match
+ * `allyblockcast@users.noreply.github.com` (no `[bot]`) — that resolves to a
+ * different, real GitHub account (id 296676656); see the module docblock.
+ */
+export const APP_NOREPLY_EMAIL_PATTERN = /^(?:\d+\+)?allyblockcast\[bot\]@users\.noreply\.github\.com$/;
+
+/**
+ * Author names known to be a non-agent automated process that happens to
+ * share the App's bare noreply email (BLO-26647) rather than a per-agent
+ * write path this gate is chartered to attribute. Exemption is by author
+ * NAME, not email, because the email alone cannot distinguish them — see
+ * the module docblock. Add new entries here, with a citation of the real
+ * commit/branch that justifies the carve-out, rather than broadening the
+ * email pattern to exclude them.
+ */
+export const NON_AGENT_PROCESS_AUTHOR_NAMES = new Set([
+  "graphify-reindex (allyblockcast)", // origin/bot/graphify-reindex, e.g. 09d69ca8d
+]);
+
 export const DEFAULT_AUDIT_REPOS = ["Blockcast/trafficcontrol", "Blockcast/paperclip"];
 
 /** Default lookback for `--audit-merged`, in days. */
@@ -148,6 +249,17 @@ export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
  * above (a closed, non-growing condition) or for a grandfathered commit
  * whose SHA changed because it was rebased rather than merge-updated (see
  * the docblock trade-off) — never for an ordinary new PR.
+ *
+ * One later addition (`#1076` below, BLO-26647) is a same-shape exception:
+ * a pre-cutoff, App-attributed, non-merge commit that the ORIGINAL sweep's
+ * predicate should have caught but didn't, because that sweep matched the
+ * old exact-string email and this commit carries the bare-variant spelling.
+ * It is not a new kind of grandfather, just one the narrower matcher missed
+ * — no re-sweep of all 168 PRs under the broadened predicate was performed
+ * for this change; only the two instances flagged on BLO-26647 itself
+ * (`6e7440da2` on #1076, added below) and #1293 (explicitly not grandfathered
+ * per the issue thread — its author is recoverable and it may merge before
+ * this lands) were checked.
  */
 export const GRANDFATHERED_OFFENSE_SHAS = new Set([
   // #927
@@ -182,6 +294,11 @@ export const GRANDFATHERED_OFFENSE_SHAS = new Set([
   "b54c3bc2635b5b8e5836c4959734d854a24cae88",
   // #1165
   "d3e6ea9fc7ed472ff3c4cb9448b3144298827fc2",
+  // #1076 (BLO-26647) — bare-variant form (`allyblockcast[bot]@…`, no
+  // numeric prefix); only escaped the old exact-match string, not this gate's
+  // predicate. Genuine pre-cutoff App write (author name "allyblockcast[bot]",
+  // not graphify-reindex), authored 2026-08-07T04:47:38Z.
+  "6e7440da271f5df50de35ec8bfeed5afaf70f168",
 ]);
 
 const UNIT_SEPARATOR = "\u001f";
@@ -190,10 +307,16 @@ const RECORD_SEPARATOR = "\u001e";
 /**
  * Shared assertion: given normalized non-merge-or-merge-tagged commit
  * records, return the ones stamped with the shared App identity.
- * `commits` entries: { sha, authorEmail, authorDate, parentCount, message,
- * context? }. A `parentCount` of 2+ is a merge commit and is always out of
- * scope, independent of which mode produced the record (defensive — mode 1
- * already excludes these via `--no-merges`).
+ * `commits` entries: { sha, authorName, authorEmail, authorDate,
+ * parentCount, message, context? }. A `parentCount` of 2+ is a merge commit
+ * and is always out of scope, independent of which mode produced the record
+ * (defensive — mode 1 already excludes these via `--no-merges`).
+ *
+ * An email is App-attributed when it matches `APP_NOREPLY_EMAIL_PATTERN`
+ * (any spelling — see the module docblock) AND `authorName` is not a known
+ * non-agent process (`NON_AGENT_PROCESS_AUTHOR_NAMES`, e.g.
+ * graphify-reindex) — the email alone cannot make that distinction since
+ * both share the bare form.
  *
  * `allowlist`, if given (a `Set` of full 40-char lowercase SHAs), additionally
  * clears any commit whose `sha` is a member — BLO-23894's grandfather clause,
@@ -207,7 +330,8 @@ const RECORD_SEPARATOR = "\u001e";
 export function findAttributionOffenses(commits, { allowlist } = {}) {
   return commits.filter((commit) => {
     if ((commit.parentCount ?? 1) > 1) return false;
-    if (commit.authorEmail !== APP_NOREPLY_EMAIL) return false;
+    if (!APP_NOREPLY_EMAIL_PATTERN.test(commit.authorEmail ?? "")) return false;
+    if (NON_AGENT_PROCESS_AUTHOR_NAMES.has(commit.authorName)) return false;
     if (allowlist === undefined) return true;
     return !allowlist.has(String(commit.sha ?? "").toLowerCase());
   });
@@ -219,8 +343,8 @@ function parseLocalGitLog(rawOutput) {
     .map((record) => record.trim())
     .filter(Boolean)
     .map((record) => {
-      const [sha, authorEmail, authorDate, subject] = record.split(UNIT_SEPARATOR);
-      return { sha, authorEmail, authorDate, parentCount: 1, message: subject ?? "" };
+      const [sha, authorName, authorEmail, authorDate, subject] = record.split(UNIT_SEPARATOR);
+      return { sha, authorName, authorEmail, authorDate, parentCount: 1, message: subject ?? "" };
     });
 }
 
@@ -239,7 +363,7 @@ export function findLocalRangeOffenses({
   execFile = execFileSync,
   allowlist = GRANDFATHERED_OFFENSE_SHAS,
 } = {}) {
-  const format = `%H${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%aI${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
+  const format = `%H${UNIT_SEPARATOR}%an${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%aI${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
   const rawOutput = execFile(
     "git",
     ["log", "--no-merges", `--format=${format}`, `${base}..${head}`],
@@ -329,6 +453,7 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
     }
     const normalized = commits.map((commit) => ({
       sha: commit.sha,
+      authorName: commit.commit?.author?.name ?? null,
       authorEmail: commit.commit?.author?.email ?? null,
       authorDate: commit.commit?.author?.date ?? null,
       parentCount: commit.parents?.length ?? 1,
@@ -433,7 +558,7 @@ async function main() {
     // never actually saw.
     if (offenses.length > 0) {
       console.error(
-        `\n${offenses.length} non-merge commit(s) carry the shared App identity (${APP_NOREPLY_EMAIL}) instead of a per-agent author. See BLO-21416 / AGENTS.md §9.`,
+        `\n${offenses.length} non-merge commit(s) carry the shared allyblockcast[bot] App identity (id 290875700, any spelling matching ${APP_NOREPLY_EMAIL_PATTERN}) instead of a per-agent author. See BLO-21416 / AGENTS.md §9.`,
       );
     }
     if (windowTruncated.length > 0) {

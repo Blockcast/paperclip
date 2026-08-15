@@ -254,15 +254,23 @@ re-derive it or re-file it as a fresh misattribution report:
 - **Merge and squash-merge commits are legitimately App-attributed** — GitHub
   itself creates those via the merge API on your behalf. This is out of
   scope; don't flag them.
-- **The gate matches only the numeric-prefixed App email
-  (`290875700+allyblockcast[bot]@users.noreply.github.com`), deliberately not
-  the bare `allyblockcast[bot]@users.noreply.github.com`.** That bare form is
-  the `graphify-reindex` bot's own legitimate `git push` identity, verified
-  against real PRs (#789, #944) — widening the match would flag its
-  commits. If your checkout's local `user.email` shows the bare form, that
-  is still a misconfigured checkout (see above): fix the local config; do
-  not ask the gate to catch it, it cannot distinguish the two cases by email
-  alone.
+- **The gate matches every observed spelling of the App noreply address**
+  (`290875700+allyblockcast[bot]@…`, the bare `allyblockcast[bot]@…`, and any
+  other numeric prefix) **, not just the numeric-prefixed form** (BLO-26647 —
+  the original narrower match let 15+ commits through, 7 of them after the
+  gate's own cutoff, purely on spelling). If your checkout's local
+  `user.email` shows any of these, that is a misconfigured checkout (see
+  above): fix the local config — the gate will now catch it either way, so
+  fixing it locally is about keeping your own commits correctly attributed,
+  not about dodging the check.
+- **The one deliberate exemption is the `graphify-reindex` bot**, a scheduled
+  knowledge-graph-refresh job that also pushes under the bare
+  `allyblockcast[bot]@users.noreply.github.com` address (verified against
+  real PRs #789, #944). Since email can't distinguish it from a genuine
+  agent commit sharing that same bare address, the exemption is keyed on
+  author NAME instead (`graphify-reindex (allyblockcast)`, in
+  `NON_AGENT_PROCESS_AUTHOR_NAMES`). Don't add a new exemption by widening
+  the email pattern — name the new case explicitly, the same way.
 - CI enforces this going forward on every `paperclip` PR
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers

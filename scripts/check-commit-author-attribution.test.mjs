@@ -8,12 +8,14 @@ import test from "node:test";
 
 import {
   APP_NOREPLY_EMAIL,
+  APP_NOREPLY_EMAIL_PATTERN,
   auditRepoCommitAttribution,
   AUDIT_PR_LIST_MAX,
   COMMITS_API_MAX,
   findAttributionOffenses,
   findLocalRangeOffenses,
   GRANDFATHERED_OFFENSE_SHAS,
+  NON_AGENT_PROCESS_AUTHOR_NAMES,
   resolveSince,
   runAudit,
   sortByMergedAtDesc,
@@ -36,26 +38,103 @@ test("findAttributionOffenses ignores a per-agent author email", () => {
 
 test("findAttributionOffenses ignores the graphify-reindex bot's git-push identity", () => {
   // The graphify-reindex bot commits via `git push` under
-  // `graphify-reindex (allyblockcast) <allyblockcast[bot]@users.noreply.github.com>`,
-  // which is NOT the REST write-path stamp this gate matches (that one carries
-  // the numeric App-user prefix, `290875700+...`). Verified against the real
-  // PRs Blockcast/paperclip#789 and #944: both pass this gate unmodified.
+  // `graphify-reindex (allyblockcast) <allyblockcast[bot]@users.noreply.github.com>`
+  // (real branch: origin/bot/graphify-reindex, e.g. 09d69ca8d). That email is
+  // the exact bare form the App itself also uses (BLO-26647 — see the module
+  // docblock: several genuine agent commits share this same bare email under
+  // author names like "CTO" and plain "allyblockcast[bot]"), so email alone
+  // cannot tell them apart. The author NAME is what distinguishes this one
+  // known non-agent process — NON_AGENT_PROCESS_AUTHOR_NAMES — from a real
+  // offense.
   //
   // This is why pr.yml carries no `bot/graphify-reindex` branch exemption — an
   // exemption there would have been a fork bypass (`github.head_ref` says
   // nothing about which repository the branch lives in) and a merge-queue
   // false-reject (`head_ref` is empty on `merge_group`), guarding against a
-  // rejection that does not occur. If this test starts failing, the bot has
-  // moved onto the REST write path: fix the bot, do not re-add an exemption.
+  // rejection that does not occur. If this test starts failing because the
+  // bot's author name changed, update NON_AGENT_PROCESS_AUTHOR_NAMES to match
+  // — do not re-add a branch-based exemption.
   const offenses = findAttributionOffenses([
     {
       sha: "35340799",
+      authorName: "graphify-reindex (allyblockcast)",
       authorEmail: "allyblockcast[bot]@users.noreply.github.com",
       parentCount: 1,
       message: "chore(graphify): refresh knowledge graphs",
     },
   ]);
   assert.deepEqual(offenses, []);
+});
+
+test("findAttributionOffenses flags the bare allyblockcast[bot] email when the author name is NOT the graphify-reindex exemption (BLO-26647)", () => {
+  // Same email as the test above, different author name — this is the shape
+  // of the 18 commits BLO-26647 found escaping the old exact-match gate
+  // (author names "CTO", "Staff Engineer", plain "allyblockcast[bot]").
+  const offenses = findAttributionOffenses([
+    {
+      sha: "6c0e9c336f1457c0006bacbcdace1d343cd7f7ef",
+      authorName: "allyblockcast[bot]",
+      authorEmail: "allyblockcast[bot]@users.noreply.github.com",
+      parentCount: 1,
+      message: "ci: push refresh-lockfile through the commitperclip App token",
+    },
+  ]);
+  assert.equal(offenses.length, 1);
+});
+
+test("findAttributionOffenses flags a wrong/unresolvable numeric prefix on the allyblockcast[bot] local part (BLO-26647 — 220200645 is not a legitimate second installation)", () => {
+  // d41030016 (BLO-26647): GET /repos/.../commits/{sha} returns NO `author`
+  // object at all for this id — it does not resolve to any GitHub account,
+  // App or user. Not a second installation to name and exempt; a malformed
+  // stamp that erases attribution at least as badly as the real App, so the
+  // any-digits prefix in APP_NOREPLY_EMAIL_PATTERN deliberately catches it.
+  const offenses = findAttributionOffenses([
+    {
+      sha: "d41030016524cb606438ed8132742eebcca2fa91",
+      authorName: "allyblockcast[bot]",
+      authorEmail: "220200645+allyblockcast[bot]@users.noreply.github.com",
+      parentCount: 1,
+      message: "fix(sweep): validate thresholds and delimit the untrusted issue region",
+    },
+  ]);
+  assert.equal(offenses.length, 1);
+});
+
+test("findAttributionOffenses does NOT flag allyblockcast@users.noreply.github.com (no [bot]) — a different, real, resolvable identity (BLO-26647)", () => {
+  // 7fb261047 / c367f99fe: GET /repos/.../commits/{sha} resolves this exact
+  // bare, no-[bot] email to author.login "allyblockcast", id 296676656 — a
+  // distinct GitHub account from the App (allyblockcast[bot], id 290875700)
+  // this gate is chartered to catch. Deliberately out of scope; see the
+  // module docblock for why silently matching it would misattribute it to
+  // the wrong installation.
+  const offenses = findAttributionOffenses([
+    {
+      sha: "7fb26104f77382811c3aa3a2d540a5a89869e091",
+      authorName: "allyblockcast",
+      authorEmail: "allyblockcast@users.noreply.github.com",
+      parentCount: 1,
+      message: "fix: reject empty payload.title on approval create (BLO-21032)",
+    },
+    {
+      sha: "c367f99fef176dd9786b61f9c003463892104b62",
+      authorName: "PlatformSREEngineer (Ally)",
+      authorEmail: "allyblockcast@users.noreply.github.com",
+      parentCount: 1,
+      message: "fix(ci): verify patch content hash, not just path, in lockfile-overrides guard",
+    },
+  ]);
+  assert.deepEqual(offenses, []);
+});
+
+test("APP_NOREPLY_EMAIL_PATTERN matches every BLO-26647 spelling except the no-[bot] form", () => {
+  assert.match(APP_NOREPLY_EMAIL, APP_NOREPLY_EMAIL_PATTERN);
+  assert.match("allyblockcast[bot]@users.noreply.github.com", APP_NOREPLY_EMAIL_PATTERN);
+  assert.match("220200645+allyblockcast[bot]@users.noreply.github.com", APP_NOREPLY_EMAIL_PATTERN);
+  assert.doesNotMatch("allyblockcast@users.noreply.github.com", APP_NOREPLY_EMAIL_PATTERN);
+});
+
+test("NON_AGENT_PROCESS_AUTHOR_NAMES carries the one known graphify-reindex exemption", () => {
+  assert.ok(NON_AGENT_PROCESS_AUTHOR_NAMES.has("graphify-reindex (allyblockcast)"));
 });
 
 test("findAttributionOffenses excludes merge commits even when App-attributed (scope boundary)", () => {
@@ -146,6 +225,57 @@ test("GRANDFATHERED_OFFENSE_SHAS is a non-empty set of full 40-char lowercase he
   assert.ok(GRANDFATHERED_OFFENSE_SHAS.size > 0);
   for (const sha of GRANDFATHERED_OFFENSE_SHAS) {
     assert.match(sha, /^[0-9a-f]{40}$/, `${sha} is not a full lowercase sha`);
+  }
+});
+
+test("GRANDFATHERED_OFFENSE_SHAS includes the #1076 bare-variant grandfather (BLO-26647)", () => {
+  assert.ok(GRANDFATHERED_OFFENSE_SHAS.has("6e7440da271f5df50de35ec8bfeed5afaf70f168"));
+});
+
+test("findLocalRangeOffenses reads author name from the real git range, flagging a bare-email commit under a non-exempt name (BLO-26647)", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-bare-"));
+  try {
+    const git = (args) => execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" });
+    git(["init", "-q"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    // Bare form, no numeric prefix — the write path BLO-26647 found several
+    // agent commits actually landing under (author names "CTO", "Staff
+    // Engineer", plain "allyblockcast[bot]").
+    git(["config", "user.name", "allyblockcast[bot]"]);
+    git(["config", "user.email", "allyblockcast[bot]@users.noreply.github.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "bare-email api-path commit", "-q"]);
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    const offenses = findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set() });
+    assert.equal(offenses.length, 1);
+    assert.equal(offenses[0].message, "bare-email api-path commit");
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses exempts the same bare email under the graphify-reindex author name (BLO-26647)", () => {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-graphify-"));
+  try {
+    const git = (args) => execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" });
+    git(["init", "-q"]);
+    git(["config", "user.name", "Test"]);
+    git(["config", "user.email", "base@example.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    git(["config", "user.name", "graphify-reindex (allyblockcast)"]);
+    git(["config", "user.email", "allyblockcast[bot]@users.noreply.github.com"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "chore(graphify): refresh knowledge graphs", "-q"]);
+    const head = git(["rev-parse", "HEAD"]).trim();
+
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set() }), []);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
   }
 });
 
