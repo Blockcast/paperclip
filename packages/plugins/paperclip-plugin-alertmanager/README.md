@@ -59,7 +59,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
-| `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
+| `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24, clamped to a 720h (30-day) ceiling. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
@@ -228,6 +228,15 @@ issue**, not on the close itself (the plugin never sees the close), and the
 anchor is not refreshed by later re-fires — otherwise the window would slide
 forever and never expire. Closing the issue again after a re-open starts a fresh
 window. Set `operatorSuppressionHours: 0` to restore the old unbounded mute.
+
+Any other value is clamped to `MAX_OPERATOR_SUPPRESSION_HOURS` (720h / 30 days)
+before it is converted to milliseconds. Rejecting only non-finite input is not
+enough: the conversion multiplies by 3.6e6, so anything above ~5e301 overflows
+to `Infinity` and `now - anchor >= Infinity` is never true — and a merely large
+finite value (1e15 hours is ~1e11 years) never expires either. Both re-create
+the unbounded mute this section exists to prevent, reachable through a config
+typo rather than a code path. `0` stays the one explicit, documented way to ask
+for indefinite suppression on purpose.
 
 **Known asymmetry, deliberate:** if the state row is lost *and* the issue is
 terminal, `recoverStateFromIssue()` declines to adopt it and a fresh issue is

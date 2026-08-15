@@ -12,6 +12,7 @@ import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk"
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
+  MAX_OPERATOR_SUPPRESSION_HOURS,
   WEBHOOK_KEYS,
   alertStateRef,
   legacyInstanceAlertStateRef,
@@ -168,13 +169,17 @@ async function readAlertState(
  * Milliseconds an operator-closed issue suppresses re-fires, or `null` for
  * "suppress indefinitely" (`operatorSuppressionHours: 0`, the pre-BLO-24234
  * behaviour). A negative or non-finite setting is treated as unset rather than
- * silently disabling suppression in either direction.
+ * silently disabling suppression in either direction, and an over-large one is
+ * clamped to `MAX_OPERATOR_SUPPRESSION_HOURS` so the millisecond conversion
+ * cannot overflow to `Infinity` (or to a finite-but-geological window) and
+ * re-create the unbounded mute. The clamped value is what the operator-facing
+ * labels report, so a clamped config shows up as the window it actually got.
  */
 function operatorSuppressionMs(config: AlertmanagerPluginConfig): number | null {
   const hours = config.operatorSuppressionHours;
   const effective =
     typeof hours === "number" && Number.isFinite(hours) && hours >= 0
-      ? hours
+      ? Math.min(hours, MAX_OPERATOR_SUPPRESSION_HOURS)
       : DEFAULT_OPERATOR_SUPPRESSION_HOURS;
   return effective === 0 ? null : effective * 60 * 60 * 1000;
 }

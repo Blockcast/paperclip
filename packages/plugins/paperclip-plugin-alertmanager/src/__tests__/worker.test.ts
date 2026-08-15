@@ -21,6 +21,7 @@ import {
   BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
   BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
   DEFAULT_ISSUE_ROUTE_MAP,
+  MAX_OPERATOR_SUPPRESSION_HOURS,
 } from "../constants.js";
 import { ORIGIN_KIND } from "../types.js";
 import type {
@@ -1988,5 +1989,77 @@ describe("decideRefire", () => {
         NOW,
       ),
     ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
+  });
+
+  // -------------------------------------------------------------------------
+  // Clamp (Ally review on #1349). `Number.isFinite` is checked on the
+  // configured hours, but the window is that value * 3.6e6 — so a finite
+  // input can still produce a non-finite window, and `now - anchor >= Infinity`
+  // is never true. That is the unbounded mute BLO-24234 removed, reachable
+  // again through a config typo.
+  // -------------------------------------------------------------------------
+
+  it("clamps a window whose millisecond conversion would overflow to Infinity", () => {
+    // 1e308 is finite and positive, so it passes the isFinite guard, but
+    // 1e308 * 3.6e6 === Infinity. Pre-clamp this suppressed forever.
+    for (const huge of [1e308, Number.MAX_VALUE]) {
+      expect(
+        decideRefire(
+          { status: "cancelled" },
+          { resolvedAt: null, operatorSuppressedAt: ago(24 * 31) },
+          cfg(huge),
+          NOW,
+        ).kind,
+      ).toBe("reopen");
+    }
+  });
+
+  it("clamps a finite-but-geological window", () => {
+    // 1e15 hours never overflows — it is just ~1e11 years. A finiteness check
+    // on the product alone would let this through; only a ceiling catches it.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: null, operatorSuppressedAt: ago(24 * 31) },
+        cfg(1e15),
+        NOW,
+      ).kind,
+    ).toBe("reopen");
+  });
+
+  it("clamps to exactly MAX_OPERATOR_SUPPRESSION_HOURS, not to the default", () => {
+    // Just inside the ceiling stays suppressed — the clamp must not collapse
+    // an over-large value down to the 24h default, which would silently
+    // shorten a deliberate long mute rather than bounding it.
+    const overCeiling = MAX_OPERATOR_SUPPRESSION_HOURS * 10;
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: null, operatorSuppressedAt: ago(MAX_OPERATOR_SUPPRESSION_HOURS - 1) },
+        cfg(overCeiling),
+        NOW,
+      ).kind,
+    ).toBe("suppressed");
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: null, operatorSuppressedAt: ago(MAX_OPERATOR_SUPPRESSION_HOURS) },
+        cfg(overCeiling),
+        NOW,
+      ).kind,
+    ).toBe("reopen");
+  });
+
+  it("leaves 0 as the explicit opt-in to indefinite suppression", () => {
+    // The clamp must not turn the documented "mute forever" escape hatch into
+    // a 30-day window; Math.min(0, ceiling) is still 0.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: null, operatorSuppressedAt: ago(24 * 365 * 100) },
+        cfg(0),
+        NOW,
+      ).kind,
+    ).toBe("suppressed");
   });
 });
