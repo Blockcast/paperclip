@@ -2090,6 +2090,40 @@ function isCurrentIssueExecutionRun(
   );
 }
 
+// BLO-22666 / BLO-18858: a pending `in_review` stage that is live-locked belongs
+// to exactly one run. Reports the *second run of the issue's own assignee* — the
+// only actor that both (a) clears every ordinary authorization boundary and (b)
+// has no business mutating or deciding the stage the lock holder is sitting on.
+//
+// Deliberately narrow, and the narrowness is the point: by the time callers reach
+// this, the actor may legitimately be a mention-granted peer reviewer, a
+// manager-chain actor, a recovery owner, a human, or a `currentParticipant` that
+// has drifted off `assigneeAgentId`. None of those hold the checkout and all of
+// them are supposed to be able to approve, so the `assigneeAgentId === actor`
+// term must stay. Widening past it re-breaks the approval-by-comment path this
+// issue exists to protect.
+function isForeignRunOfLockedPendingReview(
+  req: Request,
+  issue: {
+    status: string;
+    assigneeAgentId?: string | null;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+    executionState?: unknown;
+  },
+) {
+  if (req.actor.type !== "agent") return false;
+  const actorAgentId = req.actor.agentId;
+  if (!actorAgentId) return false;
+  if (issue.status !== "in_review") return false;
+  if (issue.assigneeAgentId !== actorAgentId) return false;
+  // An unlocked row is exactly what BLO-22666's checkout half made claimable;
+  // fencing it here would re-close the door #1117 opened.
+  if (issue.checkoutRunId == null && issue.executionRunId == null) return false;
+  if (parseIssueExecutionState(issue.executionState)?.status !== "pending") return false;
+  return !isCurrentIssueExecutionRun(req, issue);
+}
+
 function summarizeIssueMonitor(
   issue: {
     monitorNextCheckAt?: Date | null;
@@ -5809,6 +5843,19 @@ export function issueRoutes(
     }
     if (issue.assigneeAgentId === null) {
       return true;
+    }
+    // BLO-22666 AC2: fence the same agent's *other* run off a live-locked pending
+    // `in_review` stage. Placed here on purpose — deliberately AFTER the recovery
+    // -action owner (:isActiveRecoveryActionOwner), creator/manager-chain recovery
+    // and unassigned early-returns above, so none of those rescue paths can be
+    // fenced; and deliberately BEFORE the blocked-correction and
+    // execution-stage-participant early returns below, which are exactly the two
+    // ways run B would otherwise decide run A's stage without ever reaching the
+    // `in_progress`-only checkout assertion at the bottom of this function.
+    if (isForeignRunOfLockedPendingReview(req, issue)) {
+      const reviewRunId = requireAgentRunId(req, res);
+      if (!reviewRunId) return false;
+      await svc.assertPendingReviewRunOwnership(issue.id, actorAgentId, reviewRunId);
     }
     if (options.allowBlockedCorrection && isAgentBlockedCorrectionForActiveExecutionStage(req, issue)) {
       return true;
@@ -11986,7 +12033,33 @@ export function issueRoutes(
       (activeRecoveryActionForCheckout.status === "active" || activeRecoveryActionForCheckout.status === "escalated") &&
       activeRecoveryActionForCheckout.ownerAgentId === req.body.agentId;
 
-    if (issue.assigneeAgentId !== req.body.agentId && !allowSourceScopedRecoveryOwnerCheckout) {
+    // BLO-22666 AC3: the pending stage is pinned to this agent as its
+    // `currentParticipant`, but the issue belongs to somebody else. The stage
+    // decision is already authorized for this actor on `PATCH /issues/:id`; this
+    // lets it take the lock first so that decision is atomic instead of racing.
+    //
+    // It bypasses the `tasks:assign` self-appointment door below because it is
+    // NOT a self-appointment: the service-side claim writes only the lock
+    // columns and leaves `assigneeAgentId` untouched, so nothing here can widen
+    // into general issue ownership. The pin is re-asserted inside the claiming
+    // UPDATE, so this read is a fast path, not the authorization.
+    const allowExecutionStageParticipantClaim =
+      req.actor.type === "agent" &&
+      req.actor.agentId === req.body.agentId &&
+      issue.status === "in_review" &&
+      issue.assigneeAgentId !== req.body.agentId &&
+      (() => {
+        const state = parseIssueExecutionState(issue.executionState);
+        if (state?.status !== "pending") return false;
+        const participant = state.currentParticipant;
+        return participant?.type === "agent" && participant.agentId === req.body.agentId;
+      })();
+
+    if (
+      issue.assigneeAgentId !== req.body.agentId &&
+      !allowSourceScopedRecoveryOwnerCheckout &&
+      !allowExecutionStageParticipantClaim
+    ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
           issueId: issue.id,
@@ -12091,6 +12164,7 @@ export function issueRoutes(
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
       allowSourceScopedRecoveryOwner: allowSourceScopedRecoveryOwnerCheckout,
+      allowExecutionStageParticipantClaim,
       recoveryActionId: activeRecoveryActionForCheckout?.id ?? null,
       recoveryActionStatus: activeRecoveryActionForCheckout?.status ?? null,
     });
@@ -13458,6 +13532,32 @@ export function issueRoutes(
       if (req.body.idempotencyKey && shouldAutoApproveReviewComment) {
         res.status(400).json({ error: "Idempotent comments cannot approve review stages" });
         return;
+      }
+
+      // BLO-22666 AC2: an approval-shaped comment is a state transition — it
+      // moves the issue to `done` and inserts an execution decision. When the
+      // stage is live-locked, only the run holding it may make that transition,
+      // so the same agent's second run is refused here.
+      //
+      // Scoped to the auto-approval branch rather than to commenting: run B
+      // posting an ordinary comment (a handoff note, a finding) is legitimate and
+      // is how a losing run leaves its work behind. And because
+      // isForeignRunOfLockedPendingReview requires `assigneeAgentId === actor`,
+      // the mention-granted peer reviewer, the manager-chain actor, the recovery
+      // owner and a drifted `currentParticipant` all still approve by comment
+      // exactly as before — the path this branch exists to serve.
+      if (shouldAutoApproveReviewComment && isForeignRunOfLockedPendingReview(req, currentIssue)) {
+        // isForeignRunOfLockedPendingReview only returns true for an agent actor
+        // carrying an agentId, so this narrowing always holds; it is written as a
+        // guard rather than an assertion so a future change to that predicate
+        // fails closed here instead of throwing on a non-null assertion.
+        if (req.actor.type === "agent" && req.actor.agentId) {
+          await svc.assertPendingReviewRunOwnership(
+            currentIssue.id,
+            req.actor.agentId,
+            req.actor.runId ?? null,
+          );
+        }
       }
 
       // Persist the comment and the auto-approval state transition atomically when both apply.

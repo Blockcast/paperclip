@@ -15,6 +15,7 @@ const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  assertPendingReviewRunOwnership: vi.fn(),
   checkout: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
@@ -642,6 +643,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.assertPendingReviewRunOwnership.mockReset();
     mockIssueService.checkout.mockReset();
     mockIssueService.checkout.mockResolvedValue(makeIssue({
       status: "in_progress",
@@ -782,6 +784,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.assertPendingReviewRunOwnership.mockResolvedValue({ owned: true, fenced: false });
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -2864,7 +2867,7 @@ describe("agent issue mutation checkout ownership", () => {
       peerAgentId,
       ["blocked"],
       actor.runId,
-      { allowSourceScopedRecoveryOwner: false, recoveryActionId: null, recoveryActionStatus: null },
+      { allowSourceScopedRecoveryOwner: false, allowExecutionStageParticipantClaim: false, recoveryActionId: null, recoveryActionStatus: null },
     );
   });
 
@@ -2907,7 +2910,7 @@ describe("agent issue mutation checkout ownership", () => {
         peerAgentId,
         ["blocked"],
         actor.runId,
-        { allowSourceScopedRecoveryOwner: true, recoveryActionId, recoveryActionStatus: status },
+        { allowSourceScopedRecoveryOwner: true, allowExecutionStageParticipantClaim: false, recoveryActionId, recoveryActionStatus: status },
       );
     },
   );
@@ -4639,6 +4642,220 @@ describe("agent issue mutation checkout ownership", () => {
     const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
     expect(patch.executionState).toMatchObject({
       reviewRequest: { instructions: "Review the ownership guard." },
+    });
+  });
+
+  // BLO-22666 AC2. The fixture that matters is `assigneeAgentId: ownerAgentId`
+  // with the lock held by ownerRunId: the actor is the issue's OWN assignee, so
+  // it clears every ordinary boundary, but it is a second run of that agent and
+  // must not decide the stage run A is sitting on (BLO-18858).
+  //
+  // Reverting the fence in `ensureAgentCheckoutOwnership` makes this fail: the
+  // PATCH short-circuits at the participant-decision early return and
+  // assertPendingReviewRunOwnership is never called.
+  describe("pending in_review run ownership (BLO-22666)", () => {
+    function lockedPendingReviewForOwner(overrides: Record<string, unknown> = {}) {
+      return makePendingReviewIssueForAgent(ownerAgentId, {
+        assigneeAgentId: ownerAgentId,
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+        ...overrides,
+      });
+    }
+
+    function allowCommentDecide() {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: input.action === "issue:comment" ? "allow_self" : "allow_company_agent",
+        explanation: "Allowed by test boundary.",
+      }));
+    }
+
+    it("fences a second run of the assignee off a live-locked pending in_review PATCH", async () => {
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(mockIssueService.assertPendingReviewRunOwnership).toHaveBeenCalledWith(
+        issueId,
+        ownerAgentId,
+        "88888888-8888-4888-8888-888888888888",
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it("surfaces the service conflict as a 409 and refuses the write", async () => {
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      mockIssueService.assertPendingReviewRunOwnership.mockRejectedValue(
+        conflict("Issue run ownership conflict", {
+          issueId,
+          reason: "pending_review_stage_locked_by_another_run",
+        }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not fence the run that actually holds the lock", async () => {
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    // The regression this fence must never cause. A peer reviewer holds no
+    // checkout by construction, so widening the predicate past
+    // `assigneeAgentId === actor` would deadlock every review stage.
+    it("does not fence a non-assignee reviewer that holds no checkout", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, {
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: ownerRunId,
+          executionRunId: ownerRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    // An unlocked assigned in_review row is exactly what #1117 made checkoutable.
+    it("does not fence an unlocked pending in_review row", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await lockedPendingReviewForOwner({ checkoutRunId: null, executionRunId: null }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    it("refuses an approval-shaped comment from a second run of the assignee", async () => {
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      const reviewBody = "## Review: APPROVED";
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      allowCommentDecide();
+      mockIssueService.assertPendingReviewRunOwnership.mockRejectedValue(
+        conflict("Issue run ownership conflict", { issueId }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      // Neither the comment nor the `done` transition lands.
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // The fence is scoped to the auto-approval branch, not to commenting: a
+    // losing run must still be able to leave its findings on the thread.
+    it("still accepts an ordinary comment from a second run of the assignee", async () => {
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      allowCommentDecide();
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-handoff",
+        issueId,
+        companyId,
+        body: "Run B handing off.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: ownerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Run B handing off." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    it("lets the lock-holding run resolve its own stage by approval comment", async () => {
+      const reviewBody = "## Review: APPROVED";
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      allowCommentDecide();
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-owner-approval",
+        issueId,
+        companyId,
+        body: reviewBody,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: ownerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    // BLO-22666 AC3: the stage is pinned to an agent that is NOT the assignee, so
+    // the ordinary checkout predicate can never match it. Reverting the route
+    // flag drops `allowExecutionStageParticipantClaim` and the claim never
+    // reaches the service.
+    it("passes the participant-claim flag for a drifted currentParticipant", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, { assigneeAgentId: ownerAgentId }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["in_review"] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.checkout).toHaveBeenCalledWith(
+        issueId,
+        peerAgentId,
+        ["in_review"],
+        expect.any(String),
+        expect.objectContaining({ allowExecutionStageParticipantClaim: true }),
+      );
+    });
+
+    it("does not offer the participant claim to an agent the stage is not pinned to", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(staleAgentId, { assigneeAgentId: ownerAgentId }),
+      );
+
+      await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["in_review"] });
+
+      expect(mockIssueService.checkout).toHaveBeenCalledWith(
+        issueId,
+        peerAgentId,
+        ["in_review"],
+        expect.any(String),
+        expect.objectContaining({ allowExecutionStageParticipantClaim: false }),
+      );
     });
   });
 
