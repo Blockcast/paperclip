@@ -85,14 +85,56 @@ spec:
           annotations:
             summary: "Paperclip agent has {{ .Values.prometheusRule.zeroTokenStreakThreshold }}+ consecutive zero-token runs"
             description: "Agent {{`{{ $labels.agent_id }}`}} on adapter {{`{{ $labels.adapter }}`}} has completed {{ .Values.prometheusRule.zeroTokenStreakThreshold }} or more consecutive terminal runs with zero token usage. This catches poisoned-session/pre-model throttle loops like BLO-10866 within minutes."
-        - alert: PaperclipAgentJobBackoffLimitExceeded
-          expr: (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason="BackoffLimitExceeded"}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) or (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) unless on (namespace) sum by (namespace) (kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason=~".+"})))  > 0
-          for: {{ .Values.prometheusRule.backoffLimitExceededFor }}
+        # BLO-23413: PaperclipAgentJobBackoffLimitExceeded REMOVED. Verified
+        # against LIVE series on the Blockcast cluster, not the expression
+        # alone: kube_job_status_failed DOES carry reason="BackoffLimitExceeded"
+        # at failure time (disproving this alert's own original diagnosis),
+        # but every per-Job series carries exactly ONE post-failure scrape
+        # sample before kube-state-metrics stops reporting the Job, and
+        # rate()/increase() need >=2 samples to compute anything -- so this
+        # alert has never been able to fire and cannot be repaired by tuning
+        # the expression. A permanently-inert rule is worse than none.
+        # Superseded by PaperclipAgentHeartbeatStale below, an OUTCOME-side
+        # alert that does not depend on any K8s Job/pod signal surviving.
+        # See BLO-23413 and Blockcast/onprem-k8s#2380 for the full writeup
+        # (this chart copy renders nowhere live, see the file header).
+        - alert: PaperclipAgentHeartbeatStale
+          # BLO-23413 review fix -- two separate defects, both proven against a
+          # live Prometheus rather than by reading the expression:
+          #
+          # 1. PARSE. This was written `age > N * on (agent_id) interval`, which
+          #    binds the `on (agent_id)` modifier to the `*`, whose LEFT operand
+          #    is the scalar N. PromQL allows vector matching only between two
+          #    instant vectors, so the rule failed to parse and evaluated to a
+          #    query error -- i.e. it could never fire, the same
+          #    silently-inert-rule failure this alert exists to replace.
+          #    Control: `up > 3 * on (instance) up` -> HTTP 400 on a metric that
+          #    definitely exists, so the 400 is the shape, not a missing series.
+          #
+          # 2. DUPLICATE MATCH. Simply moving the parens is NOT sufficient here.
+          #    These gauges are published from the reconcileFailedWakeDispatches
+          #    pass, and every control-plane pod that runs it exports its own
+          #    copy: paperclip_agent_wakeup_terminal_failed_unresolved (same
+          #    pass, same registry) is live on 3 pods x 16 agents = 48 series.
+          #    With 3 series per agent_id on both sides, `on (agent_id)` is a
+          #    many-to-many match and errors at RUNTIME:
+          #      wakeup_terminal_failed_unresolved
+          #        > on (agent_id) (3 * wakeup_terminal_failed_unresolved)
+          #    -> HTTP 422 "found duplicate series for the match group".
+          #    `max by (agent_id)` collapses each side to one series per agent
+          #    BEFORE the join, giving a 1:1 match, exactly one alert per dark
+          #    agent, and an alert identity that survives a pod restart (no
+          #    instance/pod label churn). Verified on that same 3-pod metric:
+          #    the aggregated form returns 200, and with the multiplier dropped
+          #    to 0.5 it returns a real series -- so it is genuinely matching,
+          #    not vacuously empty.
+          expr: max by (agent_id) (paperclip_agent_heartbeat_age_seconds) > on (agent_id) ({{ .Values.prometheusRule.agentHeartbeatStaleMultiplier }} * max by (agent_id) (paperclip_agent_heartbeat_interval_seconds))
+          for: {{ .Values.prometheusRule.agentHeartbeatStaleFor }}
           labels:
             severity: warning
           annotations:
-            summary: "Paperclip agent Kubernetes Jobs are hitting BackoffLimitExceeded"
-            description: "One or more ac-* Paperclip agent Jobs in namespace {{`{{ $labels.namespace }}`}} are failing with BackoffLimitExceeded, or this cluster's kube-state-metrics omits Job failure reason labels and an ac-* Job failed. Check the matching Job/Pod logs and the zero-token streak alert for poisoned-session loops."
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has not heartbeated in {{ .Values.prometheusRule.agentHeartbeatStaleMultiplier }}x its configured interval"
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s lastHeartbeatAt is {{`{{ $value | printf \"%.0f\" }}`}}s old, more than {{ .Values.prometheusRule.agentHeartbeatStaleMultiplier }}x its own configured heartbeat.intervalSec (BLO-23413). This is an OUTCOME-side signal: it does not read any K8s Job/pod evidence, so it still fires after the Job that last ran the agent has been reaped. status='error' does NOT block dispatch, so a stuck agent needs a live-execution-path fix, not a status clear."
         - alert: PaperclipAgentPodUnschedulable
           # BLO-16224: keys on kube_pod_status_scheduled{condition="false"} (PodScheduled=False
           # -- the scheduler has not placed the pod) rather than kube_pod_status_unschedulable,
