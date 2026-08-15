@@ -7,6 +7,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueStatus,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -244,6 +245,46 @@ const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 // bounded retry lease. It deliberately does not spend another recovery-action attempt: that
 // attempt was already reserved by the escalation which failed to dispatch its wake.
 const STRANDED_RECOVERY_WAKE_BACKSTOP_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * Issue statuses whose active recovery actions `reconcileStrandedAssignedIssues` can select.
+ * These are the dispatchable ones: the repair is to re-drive the owner.
+ */
+export const STRANDED_ASSIGNED_ISSUE_STATUSES = [
+  "todo",
+  "in_progress",
+  "in_review",
+] as const satisfies readonly IssueStatus[];
+
+/**
+ * Issue statuses whose active recovery actions `reconcileStrandedRecoveryWakeBackstop` can
+ * select. `blocked` is woken; `backlog` is folded (see the sweep's doc comment, BLO-25907).
+ */
+export const STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES = [
+  "blocked",
+  "backlog",
+] as const satisfies readonly IssueStatus[];
+
+/**
+ * Statuses the backstop resolves rather than wakes. Kept separate from the candidate list so
+ * the coverage-union invariant can distinguish "selected and woken" from "selected and folded"
+ * — both count as covered, but only the former may enqueue a wake.
+ */
+export const STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES = [
+  "backlog",
+] as const satisfies readonly IssueStatus[];
+
+/**
+ * Every non-terminal issue status must be selectable by at least one recovery sweep, or an
+ * active recovery action on it is a zombie no reconciler can service (BLO-25907, BLO-16074
+ * gap 3). `issue-recovery-actions.test.ts` asserts this union covers
+ * `ISSUE_STATUSES` minus the terminal ones, so adding a status without routing it to a sweep
+ * fails the suite instead of silently reopening the hole.
+ */
+export const RECOVERY_SWEEP_COVERED_ISSUE_STATUSES = [
+  ...STRANDED_ASSIGNED_ISSUE_STATUSES,
+  ...STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
+] as const satisfies readonly IssueStatus[];
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -1158,11 +1199,12 @@ export function classifyAdapterFailureForRecovery(
   }
   const resultJson = parseObject(latestRun.resultJson);
   const rawError = latestRun.error ?? "";
-  // BLO-21116: an `adapter_failed` whose own message names a response-parse
-  // failure means resultJson is an untrusted/truncated payload, not a source of
-  // classification evidence -- exclude it from the combined search string so a
-  // stray substring inside the raw blob cannot false-positive as a config or
-  // quota phrase, and never let it read as configuration_incomplete.
+  // An `adapter_failed` whose own message names a response-parse failure means
+  // resultJson is an untrusted/truncated payload, not classification evidence.
+  // Keep the guard scoped to that durable error code: provider_quota and
+  // configuration_incomplete are authoritative classifications and must not be
+  // discarded merely because their human-readable message contains the same
+  // phrase.
   const isResponseParseFailure =
     latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
   const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
@@ -1173,13 +1215,8 @@ export function classifyAdapterFailureForRecovery(
   ) {
     return { kind: "configuration_incomplete" };
   }
-  // Same untrusted-payload reasoning as the configuration_incomplete guard
-  // above: `error` still carries `rawError` verbatim (only `resultJson` was
-  // dropped from the join), so a response-parse-failure payload containing a
-  // phrase like "quota exceeded" or "model is at capacity" would otherwise
-  // still satisfy PROVIDER_QUOTA_ERROR_RE below and misclassify as
-  // provider_quota instead of configuration_incomplete -- the same defect
-  // class, just the other branch (Ally review, 2026-08-04).
+  // The raw parse-failure text can itself contain quota-like words, so do not
+  // let an adapter_failed transport fault enter the provider-quota path.
   if (isResponseParseFailure) return null;
   if (latestRun.errorCode !== "provider_quota" && !PROVIDER_QUOTA_ERROR_RE.test(error)) return null;
 
@@ -6323,7 +6360,7 @@ export function recoveryService(
       .where(
         and(
           isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress", "in_review"]),
+          inArray(issues.status, STRANDED_ASSIGNED_ISSUE_STATUSES),
           or(
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
@@ -8773,6 +8810,19 @@ export function recoveryService(
    * `reconcileStrandedAssignedIssues`'s status filter. Some blocked issues are deliberately
    * terminal from the ordinary stranded-work sweep; only an active recovery action proves
    * that an owner wake is still the intended next step.
+   *
+   * `backlog` is also selected here, but is *folded* rather than woken (BLO-25907). It used
+   * to be selected by nothing: `reconcileStrandedAssignedIssues` covers
+   * todo/in_progress/in_review and this sweep covered only blocked, so an assigned backlog
+   * issue carrying an active action was invisible to both and nothing ever re-drove it —
+   * BLO-16074 sat that way for 27 days with `updatedAt == createdAt`. Waking is the wrong
+   * repair because backlog deliberately means "not dispatchable", so re-delivering an owner
+   * wake would contradict the status. Resolving the action is the honest repair: it keeps
+   * the active set truthful without claiming a backlog issue is schedulable. Selecting it
+   * here rather than relying only on the write-time fold in
+   * `classifySourceRecoveryRevalidation` is what heals rows that are *already* parked, since
+   * that classifier only runs when something writes to the issue and the failure mode is
+   * that nothing does.
    */
   async function reconcileStrandedRecoveryWakeBackstop(opts?: {
     runId?: string | null;
@@ -8783,6 +8833,7 @@ export function recoveryService(
     const result = {
       checked: 0,
       healed: 0,
+      backlogParkedResolved: 0,
       noOwnerSkipped: 0,
       causeSkipped: 0,
       exhaustedSkipped: 0,
@@ -8806,7 +8857,7 @@ export function recoveryService(
     const queryCandidates = (afterActionId: string | null) => {
       const filters = [
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        eq(issues.status, "blocked"),
+        inArray(issues.status, STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
@@ -8823,6 +8874,7 @@ export function recoveryService(
           actionTimeoutAt: issueRecoveryActions.timeoutAt,
           actionLastAttemptAt: issueRecoveryActions.lastAttemptAt,
           issueId: issues.id,
+          issueStatus: issues.status,
           identifier: issues.identifier,
           totalCount: sql<number>`count(*) over()::int`,
         })
@@ -8859,6 +8911,55 @@ export function recoveryService(
     }
 
     for (const candidate of candidates) {
+      // `backlog` is selected so the action cannot become a zombie, but it is folded rather
+      // than woken: the status means "deliberately not dispatchable", so re-delivering an
+      // owner wake would contradict the park. Resolving keeps the active set honest. This
+      // runs ahead of the owner/cause/cooldown gates on purpose — those gates decide whether
+      // a *wake* is worth attempting, and none of them apply to an action that is never
+      // going to be serviced at all.
+      if ((STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES as readonly string[])
+        .includes(candidate.issueStatus)) {
+        const resolutionNote =
+          `Recovery action became stale because the source issue is parked in ${candidate.issueStatus}, `
+          + "which is not dispatchable, so no sweep will re-drive its owner.";
+        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: candidate.companyId,
+          sourceIssueId: candidate.issueId,
+          actionId: candidate.actionId,
+          status: "cancelled",
+          outcome: "cancelled",
+          resolutionNote,
+        });
+        if (!resolved) {
+          result.claimLost += 1;
+          continue;
+        }
+        result.backlogParkedResolved += 1;
+        result.issueIds.push(candidate.issueId);
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "stranded_recovery_wake_backstop",
+          agentId: candidate.actionOwnerAgentId,
+          runId: opts?.runId ?? null,
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: candidate.issueId,
+          details: {
+            source: "recovery.stranded_recovery_wake_backstop",
+            identifier: candidate.identifier,
+            status: candidate.issueStatus,
+            recoveryActionId: resolved.id,
+            recoveryActionStatus: resolved.status,
+            outcome: resolved.outcome,
+            resolutionNote: resolved.resolutionNote,
+            recoveryCause: candidate.actionCause,
+            recoveryOwnerAgentId: candidate.actionOwnerAgentId,
+          },
+        });
+        continue;
+      }
+
       const ownerAgentId = candidate.actionOwnerAgentId;
       if (!ownerAgentId) {
         result.noOwnerSkipped += 1;
@@ -8972,7 +9073,7 @@ export function recoveryService(
           details: {
             source: "recovery.stranded_recovery_wake_backstop",
             identifier: candidate.identifier,
-            status: "blocked",
+            status: candidate.issueStatus,
             wakeupRunId: wake.id,
             recoveryActionId: candidate.actionId,
             recoveryCause: candidate.actionCause,

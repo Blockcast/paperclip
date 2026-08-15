@@ -1,11 +1,14 @@
 import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
-import { setQueuedRunOldestAgeMetrics } from "./metrics.js";
+import {
+  setQueuedRunAgeMetricsRefreshSuccess,
+  setQueuedRunOldestAgeMetrics,
+} from "./metrics.js";
 
 /**
  * Refresh the per-agent oldest-`queued`-run-age gauge (BLO-21116). Recomputed
- * live on every scrape from a MIN(created_at) aggregate over `heartbeatRuns`
+ * live on every scrape from a MIN(coalesce(queued_at, created_at)) aggregate over `heartbeatRuns`
  * status='queued', the same "compute on scrape, never trust a stale cache"
  * shape as {@link refreshExternalRuntimeReservationMetrics}. `heartbeatRuns`
  * is the correct table for this: a `queued` row is a run Paperclip has
@@ -30,25 +33,36 @@ import { setQueuedRunOldestAgeMetrics } from "./metrics.js";
  * a sibling gauge.
  */
 export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Promise<void> {
-  const [agentRows, oldestByAgent] = await Promise.all([
-    db.select({ id: agents.id }).from(agents),
-    db
-      .select({
-        agentId: heartbeatRuns.agentId,
-        oldestQueuedAt: sql<Date | string | null>`min(coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}))`,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"))
-      .groupBy(heartbeatRuns.agentId),
-  ]);
+  try {
+    const [agentRows, oldestByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      // Keep this predicate in the same simple form as the queue-only age
+      // index from migration 0217 so scrapes never scan heartbeat history.
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          oldestQueuedAt: sql<Date | string | null>`min(coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}))`,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "queued"))
+        .groupBy(heartbeatRuns.agentId),
+    ]);
 
-  const knownAgentIds = new Set(agentRows.map((row) => row.id));
-  const entries = oldestByAgent
-    .filter((row) => row.agentId !== null && row.oldestQueuedAt)
-    .map((row) => ({
-      agentId: row.agentId,
-      ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestQueuedAt as Date | string).getTime()) / 1000),
-    }));
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    const entries = oldestByAgent
+      .filter((row) => row.agentId !== null && row.oldestQueuedAt)
+      .map((row) => ({
+        agentId: row.agentId,
+        ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestQueuedAt as Date | string).getTime()) / 1000),
+      }));
 
-  setQueuedRunOldestAgeMetrics(entries, knownAgentIds);
+    setQueuedRunOldestAgeMetrics(entries, knownAgentIds);
+    setQueuedRunAgeMetricsRefreshSuccess(true);
+  } catch (error) {
+    // Do not replace the last age snapshot with synthetic zeros: that would
+    // hide a real strand. The companion freshness gauge makes the stale data
+    // ineligible for the stranded-run alert and pages its own failure alert.
+    setQueuedRunAgeMetricsRefreshSuccess(false);
+    throw error;
+  }
 }
