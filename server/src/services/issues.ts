@@ -136,10 +136,22 @@ import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
+import {
+  ROUTINE_EXECUTION_ORIGIN_KIND,
+  postRoutineSchedulerFailureHeartbeat,
+  type RoutineSchedulerHeartbeatIssue,
+  type SchedulerHeartbeatAddComment,
+} from "./recovery/routine-scheduler-heartbeat.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+
+/** BLO-27572: a routine-execution cancellation observed under the row lock, held
+ * until the transaction commits so the receipt is posted outside it. */
+type PendingRoutineCancellationReceipt =
+  | { issue: RoutineSchedulerHeartbeatIssue; previousStatus: string }
+  | null;
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
@@ -6619,7 +6631,15 @@ export function issueService(db: Db) {
     });
   }
 
-  return {
+  // BLO-27572: `update` needs `addComment` to post the routine cancellation
+  // receipt, but both are properties of the same object literal below, so
+  // `update` cannot name it directly without making the literal
+  // self-referential (which defeats TypeScript's inference for it). Bound
+  // immediately after the literal is constructed and read only from inside
+  // `update`, which cannot run until the factory has returned.
+  let addCommentPort!: SchedulerHeartbeatAddComment;
+
+  const service = {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
 
@@ -9150,6 +9170,21 @@ export function issueService(db: Db) {
         expectedCurrentExecutionState?: Record<string, unknown> | null;
         /** Pins the policy from which an execution-stage transition was derived. */
         expectedCurrentExecutionPolicy?: Record<string, unknown> | null;
+        /**
+         * BLO-27572: suppress the scheduler-side failure heartbeat that a
+         * routine-execution cancellation otherwise leaves on the routine's alert
+         * surface. Set by exactly one caller —
+         * `cancelDuplicateSuppressedRoutineExecutionIssue` — where the window is
+         * NOT dark: the issue was cancelled because another open execution issue
+         * already owns the dispatch lock and is doing the work. A receipt there
+         * would manufacture a false dark-window alarm.
+         *
+         * Explicit rather than inferred, matching the per-branch suppression the
+         * strand-time path already uses: silence is the dangerous default in this
+         * subsystem, so every instance of it should be a decision someone wrote
+         * down, not a fall-through.
+         */
+        suppressRoutineSchedulerFailureHeartbeat?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -9172,8 +9207,18 @@ export function issueService(db: Db) {
         expectedCurrentExecutionRunId,
         expectedCurrentExecutionState,
         expectedCurrentExecutionPolicy,
+        suppressRoutineSchedulerFailureHeartbeat,
         ...issueData
       } = data;
+
+      // BLO-27572: set inside `runUpdate` under the row lock, consumed after the
+      // transaction commits. Declared out here so the deferred post can see it.
+      // Read through the accessor rather than directly: the variable is only ever
+      // assigned from inside `runUpdate`, so control-flow analysis still has it
+      // narrowed to `null` at the read site and would type its fields as `never`.
+      let pendingRoutineCancellationReceipt: PendingRoutineCancellationReceipt = null;
+      const readPendingRoutineCancellationReceipt = (): PendingRoutineCancellationReceipt =>
+        pendingRoutineCancellationReceipt;
 
       if (expectedCurrentStatus !== undefined && existing.status !== expectedCurrentStatus) {
         throw conflict("Issue status changed before the update could be applied", {
@@ -9834,10 +9879,50 @@ export function issueService(db: Db) {
               );
           }
         }
+        // BLO-27572: a routine-execution issue retired to `cancelled` by an agent
+        // or a human is a correct call, but the window it owned still produced no
+        // runbook emission. Record the transition here, under the row lock, and
+        // post the receipt after commit (below) — never inside this transaction.
+        if (
+          issueData.status === "cancelled" &&
+          lockedExisting.status !== "cancelled" &&
+          lockedExisting.originKind === ROUTINE_EXECUTION_ORIGIN_KIND &&
+          !suppressRoutineSchedulerFailureHeartbeat
+        ) {
+          pendingRoutineCancellationReceipt = {
+            issue: lockedExisting,
+            previousStatus: lockedExisting.status,
+          };
+        }
         return enriched;
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      const updateResult = dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
+
+      // BLO-27572: deliberately after the write, on `db` rather than `dbOrTx`, and
+      // last — mirroring the strand-time call site in `recovery/service.ts`. This
+      // writes a comment to a *different* issue (the routine's alert surface), so
+      // inside the transaction a failed post would roll back a cancellation that
+      // is otherwise correct and already decided. The helper swallows its own
+      // errors for the same reason.
+      //
+      // It shares the `scheduler-heartbeat:<routineId>:<windowKey>` idempotency
+      // key with the strand-time receipt, so a window that stranded and was then
+      // cancelled keeps exactly one row.
+      const cancellationReceipt = readPendingRoutineCancellationReceipt();
+      if (cancellationReceipt) {
+        const { issue: cancelledIssue, previousStatus } = cancellationReceipt;
+        await postRoutineSchedulerFailureHeartbeat(
+          { db, addComment: addCommentPort, logger },
+          {
+            issue: cancelledIssue,
+            disposition: { kind: "cancelled", previousStatus },
+            prefix: cancelledIssue.identifier?.split("-")[0] || "PAP",
+          },
+        );
+      }
+
+      return updateResult;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
@@ -11433,4 +11518,7 @@ export function issueService(db: Db) {
       }));
     },
   };
+
+  addCommentPort = service.addComment as SchedulerHeartbeatAddComment;
+  return service;
 }
