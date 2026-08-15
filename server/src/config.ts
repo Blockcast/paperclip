@@ -344,6 +344,18 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 60 * 60_000,
     max: 7 * 24 * 60 * 60_000,
   },
+  // BLO-24782. Floor well above a continuation run's turnaround: the BLO-16146
+  // race this grace exists to avoid is measured in seconds, so no operator
+  // setting may shrink it to where the sweep can beat a run that is legitimately
+  // about to re-arm. Ceiling is 28x the default and far past the worst lapse ever
+  // measured (~207h), so an override above it is asking for a bound that does not
+  // bound — and `Infinity` in particular would restore the unbounded belief this
+  // setting exists to remove, which `resolveNumericSetting` rejects outright.
+  lapsedMonitorGraceMs: {
+    fallback: 6 * 60 * 60_000,
+    min: 15 * 60_000,
+    max: 7 * 24 * 60 * 60_000,
+  },
 } as const satisfies Record<string, NumericSettingBounds>;
 
 /**
@@ -879,13 +891,10 @@ export function loadConfig(): Config {
       NUMERIC_SETTING_BOUNDS.recoveryActionTimeoutMs,
       "recoveryActionTimeoutMs",
     ),
-    lapsedMonitorGraceMs: Math.max(
-      // Floor well above a continuation run's turnaround. The BLO-16146 race
-      // this grace exists to avoid is measured in seconds, so no operator
-      // setting may shrink it to the point where the sweep can beat a run
-      // that is legitimately about to re-arm.
-      15 * 60_000,
-      Number(process.env.LAPSED_MONITOR_GRACE_MS) || 6 * 60 * 60_000,
+    lapsedMonitorGraceMs: resolveNumericSetting(
+      [process.env.LAPSED_MONITOR_GRACE_MS],
+      NUMERIC_SETTING_BOUNDS.lapsedMonitorGraceMs,
+      "lapsedMonitorGraceMs",
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
