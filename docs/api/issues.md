@@ -100,10 +100,22 @@ Contract notes:
   `true` and `agentGroupCount` reports the real number. There is no silent row
   cap; a company with hundreds of thousands of open issues still returns every
   agent group.
-- **The response is self-checkable.** `sum(agents[].openCount)` always equals
-  `totals.openAssignedToAgents`, and `openAssignedToAgents + openAssignedToUsers
-  + openUnassigned` always equals `totals.open`. A consumer that wants a
-  belt-and-braces check can assert these rather than trusting the endpoint.
+- **The response is self-checkable.** `openAssignedToAgents +
+  openAssignedToUsers + openUnassigned` always equals `totals.open` — every
+  `totals` field is company-wide and exact regardless of truncation.
+  `sum(agents[].openCount)` equals `totals.openAssignedToAgents` **only when
+  `complete` is `true`**. A consumer that wants a belt-and-braces check can
+  assert these rather than trusting the endpoint, but must gate the first
+  assertion on `complete`.
+- **What truncation does and does not cost.** When `truncated` is `true` the
+  `totals` are still exact and still company-wide; what is missing is the tail
+  of the *grouping*. `agentGroupCount` reports the true number of agents with
+  open work, so `agentGroupCount - agents.length` is exactly how many groups
+  were dropped, and `sum(agents[].openCount)` becomes a strict lower bound on
+  `totals.openAssignedToAgents`. Because `agents` is ordered by `openCount`
+  descending, the groups that survive truncation are the largest ones. A
+  consumer that needs every group must treat `complete: false` as a hard
+  failure rather than reconciling the difference.
 - **`highestPriorityIssue` is deterministic**: priority rank (`critical`,
   `high`, `medium`, `low`, then anything else) ascending, then `createdAt`
   ascending, then `id` ascending. Stable across calls on unchanged data, so it
