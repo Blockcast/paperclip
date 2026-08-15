@@ -11,6 +11,18 @@ export interface SelfPodSecretVolume {
   secretName: string;
   mountPath: string;
   defaultMode: number | undefined;
+  /**
+   * The source volume's `items:` key selector, when it has one.
+   *
+   * A source volume that projects a single key out of a multi-key Secret must
+   * keep projecting a single key after propagation. Dropping this widened the
+   * Job pod's view of the Secret to *every* key in it — the agent pod ended up
+   * holding more key material than the container the mount was copied from.
+   *
+   * Optional, mirroring `V1SecretVolumeSource.items` upstream: most mounts
+   * project the whole Secret and legitimately have no selector.
+   */
+  items?: k8s.V1KeyToPath[];
 }
 
 export interface SelfPodInfo {
@@ -166,6 +178,7 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
         secretName: vol.secret.secretName,
         mountPath: vm.mountPath,
         defaultMode: vol.secret.defaultMode,
+        items: vol.secret.items ? [...vol.secret.items] : undefined,
       });
     }
   }
