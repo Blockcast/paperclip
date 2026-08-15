@@ -2,7 +2,11 @@ import type { ExecutionWorkspace } from "./types/workspace-runtime.js";
 
 type ExecutionWorkspaceGuardTarget = Pick<ExecutionWorkspace, "closedAt" | "mode" | "name" | "status">;
 
-const CLOSED_EXECUTION_WORKSPACE_STATUSES = new Set<ExecutionWorkspace["status"]>(["archived", "cleanup_failed"]);
+const CLOSED_EXECUTION_WORKSPACE_STATUSES = new Set<ExecutionWorkspace["status"]>([
+  "cleanup_pending",
+  "archived",
+  "cleanup_failed",
+]);
 
 export function isClosedIsolatedExecutionWorkspace(
   workspace: Pick<ExecutionWorkspaceGuardTarget, "closedAt" | "mode" | "status"> | null | undefined,

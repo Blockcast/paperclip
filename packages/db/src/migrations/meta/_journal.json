@@ -1478,6 +1478,13 @@
       "when": 1786682096165,
       "tag": "0218_plugin_install_dir",
       "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1786682097165,
+      "tag": "0219_execution_workspace_cleanup_eligible_index",
+      "breakpoints": true
     }
   ]
 }
