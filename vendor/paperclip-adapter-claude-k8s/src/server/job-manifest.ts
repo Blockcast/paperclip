@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
+import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -453,6 +454,43 @@ export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): st
   ];
   return containers.flatMap((c) =>
     findLiteralSensitiveEnvVars(c.env ?? []).map((name) => `${c.name || "<unnamed>"}/${name}`),
+  );
+}
+
+/**
+ * Defense-in-depth backstop for the inheritance allowlist (BLO-22514).
+ *
+ * The primary control is in `getSelfPodInfo()`, which filters the server pod's
+ * env before it ever reaches this file. This is the second line: it re-checks
+ * the *assembled* pod spec for server-only credential names and lets
+ * buildJobManifest throw rather than return a manifest that would hand an agent
+ * the JWT signing key or the database URL.
+ *
+ * Worth having as well as the upstream filter for two reasons. The upstream
+ * filter guards one function; this guards the artifact, so a future code path
+ * that reintroduces a server credential by some route other than
+ * `selfPod.inheritedEnv` is still caught. And `SelfPodInfo` is a plain object
+ * that tests and callers can construct directly — as `makeSelfPod()` in the
+ * test suite does — so the type system alone never guarantees the values in it
+ * came through the filter.
+ *
+ * Unlike `findLiteralSensitiveEnvVars`, this flags an entry whatever its
+ * source: a `secretKeyRef` hides the value from `GET Pod` but the kubelet still
+ * resolves it into the container's environment, which is the whole point of
+ * this issue.
+ *
+ * Returns `container/ENV_NAME` so the failure names the offending container.
+ */
+export function findServerOnlyEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((c) =>
+    (c.env ?? [])
+      .filter((e) => e.name && SERVER_ONLY_ENV_DENY.has(e.name))
+      .map((e) => `${c.name || "<unnamed>"}/${e.name}`),
   );
 }
 
@@ -1490,6 +1528,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (literalSensitiveNames.length > 0) {
     throw new Error(
       `claude_k8s: refusing to build Job manifest — sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
+    );
+  }
+
+  // Fail-closed backstop for the inheritance allowlist (BLO-22514). Checked on
+  // the assembled spec for the same reason as the guard above: it covers every
+  // container, including ones added later. A server-only credential reaching an
+  // agent pod is a control-plane compromise, so refuse to build rather than
+  // return a manifest that leaks it.
+  const serverOnlyNames = findServerOnlyEnvVarsInPodSpec(job.spec!.template.spec!);
+  if (serverOnlyNames.length > 0) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
     );
   }
 

@@ -96,9 +96,43 @@ const SAFE_ENV_INSPECTION_RE =
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * ---------------------------------------------------------------------------
+ * DECISION (BLO-22514): this guard stays FAIL-OPEN. Recorded here rather than
+ * only on the issue, because the next person to read `exit 0` on a security
+ * hook will reasonably wonder whether it was an oversight. It was not.
+ *
+ * BLO-22514 asked the question because the guard both fails open on any error
+ * and demonstrably did not fire against a live `printenv "$V"` in 2026-08. Both
+ * observations are accurate. The conclusion still lands on fail-open, for three
+ * reasons:
+ *
+ *   1. The blast radius is asymmetric. This hook runs inside the agent's own
+ *      runtime and is advisory: failing closed wedges EVERY agent run in the
+ *      fleet on any parse error or malformed hook event, against a benefit that
+ *      is bounded by point 2.
+ *   2. It cannot be made complete, so "fail closed" would buy less than it
+ *      looks. See the DOCUMENTED RESIDUAL above: `X=env; $X` and
+ *      `cat /proc/$$/environ` resolve at runtime, and no static pass over
+ *      command text can classify them. A classifier that cannot be complete is
+ *      the wrong place to put a hard stop.
+ *   3. Most decisively, BLO-22514 removed what this guard was standing in front
+ *      of. Agent pods no longer inherit the server's control-plane secrets (see
+ *      inherit-allowlist.ts), so a successful environment dump now discloses
+ *      agent-scoped provider credentials the agent already holds and uses —
+ *      not the JWT signing key, the database URL, or the GitHub App key. The
+ *      guard's role drops from "last line before control-plane compromise" to
+ *      hygiene, which argues further against paying an availability cost for it.
+ *
+ * The real control is the allowlist, not this hook. Treat this as
+ * defense-in-depth and keep it non-load-bearing; if a future change makes an
+ * environment dump consequential again, revisit BOTH this decision and the
+ * reason the dump became consequential.
+ * ---------------------------------------------------------------------------
+ */
+
 /** Backtick, written as an escape because the pod script below is a `String.raw` template. */
 const BACKTICK = "\x60";
-
 /** Utilities that dump the whole environment when given no operand. */
 const ENV_DUMP_UTILS = ["env", "printenv"];
 
