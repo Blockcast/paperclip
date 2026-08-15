@@ -7,6 +7,7 @@ import {
   BranchClaimConflictError,
   computeBranchClaimKey,
   releaseBranchRunClaim,
+  releaseBranchRunClaimForKey,
 } from "../services/branch-run-claims.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -474,5 +475,128 @@ describeEmbeddedPostgres("branch run claims", () => {
       agentId,
     });
     expect(second).toBeTruthy();
+  });
+
+  // BLO-21602 (Ally round-3, Important #1). The claim is now taken BEFORE the
+  // execution workspace is realized, using the durable
+  // `execution_workspaces.branch_name` -- otherwise a losing sibling has
+  // already restored/checked out the shared working tree by the time it
+  // discovers the conflict, which is the divergent-sibling hazard itself.
+  //
+  // Realization can legitimately resolve a different branch than the recorded
+  // one (a forward-branch reconcile), so executeRun re-keys: acquire the
+  // resolved key, then drop the provisional one. These tests pin the two
+  // properties that step depends on and that a naive implementation breaks --
+  // (a) the run must not be left holding BOTH keys, and (b) dropping the
+  // provisional key must not disturb the resolved claim it just took.
+  describe("re-key after workspace realization", () => {
+    it("frees the provisional branch for other runs once the run re-keys off it", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const mover = await seedIssueAndRunningRun({ companyId, agentId, title: "Re-keying run" });
+      const provisionalKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "recorded-branch",
+      });
+      const resolvedKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "reconciled-branch",
+      });
+
+      // Pre-realization claim, from the persisted workspace row.
+      await acquireBranchRunClaim(db, {
+        companyId,
+        branchKey: provisionalKey,
+        executionWorkspaceId: null,
+        issueId: mover.issueId,
+        runId: mover.runId,
+        agentId,
+      });
+      // Realization resolved a different branch: take it, then drop the old.
+      await acquireBranchRunClaim(db, {
+        companyId,
+        branchKey: resolvedKey,
+        executionWorkspaceId: null,
+        issueId: mover.issueId,
+        runId: mover.runId,
+        agentId,
+      });
+      await releaseBranchRunClaimForKey(db, {
+        runId: mover.runId,
+        branchKey: provisionalKey,
+        reason: "rekeyed_after_workspace_realization",
+      });
+
+      const active = await db
+        .select()
+        .from(branchRunClaims)
+        .where(eq(branchRunClaims.heartbeatRunId, mover.runId))
+        .then((rows) => rows.filter((row) => row.releasedAt === null));
+      expect(active).toHaveLength(1);
+      expect(active[0]!.branchKey).toBe(resolvedKey);
+
+      // The abandoned branch must be claimable by a genuinely different run;
+      // if the re-key leaked, this is where the branch would deadlock.
+      const other = await seedIssueAndRunningRun({ companyId, agentId, title: "Other issue" });
+      const reclaimed = await acquireBranchRunClaim(db, {
+        companyId,
+        branchKey: provisionalKey,
+        executionWorkspaceId: null,
+        issueId: other.issueId,
+        runId: other.runId,
+        agentId,
+      });
+      expect(reclaimed.heartbeatRunId).toBe(other.runId);
+    });
+
+    it("releaseBranchRunClaimForKey leaves the run's other branch claim intact", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const holder = await seedIssueAndRunningRun({ companyId, agentId, title: "Holder" });
+      const keptKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "kept-branch",
+      });
+      const droppedKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "dropped-branch",
+      });
+
+      for (const branchKey of [keptKey, droppedKey]) {
+        await acquireBranchRunClaim(db, {
+          companyId,
+          branchKey,
+          executionWorkspaceId: null,
+          issueId: holder.issueId,
+          runId: holder.runId,
+          agentId,
+        });
+      }
+
+      await releaseBranchRunClaimForKey(db, {
+        runId: holder.runId,
+        branchKey: droppedKey,
+        reason: "rekeyed_after_workspace_realization",
+      });
+
+      const rows = await db
+        .select()
+        .from(branchRunClaims)
+        .where(eq(branchRunClaims.heartbeatRunId, holder.runId));
+      const kept = rows.find((row) => row.branchKey === keptKey);
+      const dropped = rows.find((row) => row.branchKey === droppedKey);
+      expect(kept?.releasedAt).toBeNull();
+      expect(dropped?.releasedAt).not.toBeNull();
+      expect(dropped?.releaseReason).toBe("rekeyed_after_workspace_realization");
+
+      // And the still-held branch must still refuse a sibling.
+      const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+      await expect(acquireBranchRunClaim(db, {
+        companyId,
+        branchKey: keptKey,
+        executionWorkspaceId: null,
+        issueId: challenger.issueId,
+        runId: challenger.runId,
+        agentId,
+      })).rejects.toBeInstanceOf(BranchClaimConflictError);
+    });
   });
 });
