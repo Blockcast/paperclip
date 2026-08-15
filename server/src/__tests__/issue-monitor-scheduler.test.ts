@@ -26,8 +26,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.js";
-import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.js";
+import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS } from "../services/heartbeat.js";
+import {
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "../services/issue-execution-policy.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -287,6 +291,168 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).toContain("issue.monitor_triggered");
   });
 
+  it("re-arms a triggered monitor when its wake-carrying run does not dispatch", async () => {
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db
+      .update(issues)
+      .set({ executionRunId: queuedRun.id })
+      .where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: lapseDetectedAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt?.getTime()).toBeGreaterThan(lapseDetectedAt.getTime());
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor).toMatchObject({
+      serviceName: "paperclip_monitor_dispatch",
+      gateSignals: [`heartbeat_run:${queuedRun.id}`],
+    });
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({ status: "scheduled" });
+    expect(issue.monitorAttemptCount, "a wake that never dispatched does not consume an attempt").toBe(0);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action)).toContain("issue.monitor_rearmed_after_dispatch_lapse");
+
+  });
+
+  it("re-dispatches and re-arms when the watchdog fires on a run that is still queued", async () => {
+    // Regression for BLO-22860: the watchdog re-armed a monitor but left the
+    // stale run queued. When it fired, enqueueWakeup coalesced into that same
+    // queued run without dispatching, and the triggered patch cleared
+    // monitorNextCheckAt — so the issue re-lapsed with the same undeliverable
+    // run, forever. skipQueuedRunDispatch keeps the run queued across the
+    // watchdog fire, which is exactly the stuck-dispatcher case.
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    // Pass 1: the tick detects the lapse and arms the watchdog monitor.
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    const armed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(armed.monitorNextCheckAt, "watchdog armed").not.toBeNull();
+    const watchdogDueAt = armed.monitorNextCheckAt!;
+
+    // Pass 2: the watchdog fires while the watched run is STILL queued.
+    await heartbeat.tickTimers(new Date(watchdogDueAt.getTime() + 1000));
+
+    // Settle the deliberately-stuck run before asserting, so a failing
+    // expectation cannot strand afterEach's drain (which waits for zero
+    // queued/running runs) and cascade into the rest of the file.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: watchdogDueAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(
+      issue.monitorNextCheckAt,
+      "the watchdog must not consume the timer while the run is still stuck",
+    ).not.toBeNull();
+    expect(issue.monitorNextCheckAt!.getTime()).toBeGreaterThan(watchdogDueAt.getTime());
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      serviceName: "paperclip_monitor_dispatch",
+    });
+    expect(
+      issue.monitorAttemptCount,
+      "a watchdog fire that did dispatch work consumes an attempt, so the retry loop is bounded",
+    ).toBeGreaterThan(armed.monitorAttemptCount ?? 0);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_dispatch_watchdog_redispatched");
+  });
+
+  it("clears the watchdog once the watched run leaves the dispatch queue", async () => {
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    const armed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const watchdogDueAt = armed.monitorNextCheckAt!;
+
+    // The run finally starts before the watchdog fires.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: new Date(watchdogDueAt.getTime() - 1000) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    await heartbeat.tickTimers(new Date(watchdogDueAt.getTime() + 1000));
+
+    // Settle the run before the assertions so afterEach's drain can proceed.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed", finishedAt: new Date(watchdogDueAt.getTime() + 2000) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt, "watchdog stands down once dispatch happened").toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "dispatch_skipped",
+    });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_dispatch_watchdog_recovered");
+  });
+
   it("wakes a cross-agent review participant for provider quota monitors", async () => {
     const { companyId, issueId, agentId: assigneeAgentId } = await seedFixture({
       issueStatus: "in_review",
@@ -422,6 +588,70 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_skipped");
+  });
+
+  // BLO-23061: a monitor armed WITHOUT an explicit maxAttempts is unbounded, so
+  // `exhaustedMonitorClearReason` never returns "max_attempts_exhausted" and the
+  // configured `recoveryPolicy: "wake_owner"` can never fire. Observed live on
+  // BLO-22305: 19 agent runs in 31 hours, each re-arming with an unchanged
+  // signature, no escalation, no human ever notified. The escalation machinery
+  // is complete and tested (see the test below) — it is simply unreachable
+  // without a default ceiling.
+  it("bounds a monitor armed without an explicit maxAttempts so owner recovery can still fire", async () => {
+    const { issueId, agentId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: {
+        // Deliberately NO maxAttempts — this is the live shape on BLO-22305 and
+        // BLO-22361, both of which carry recoveryPolicy but maxAttempts: null.
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "max_attempts_exhausted",
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_recovery");
+  });
+
+  // Characterization test pinning the exact exhaustion boundary, so the shared
+  // limit helper cannot silently shift it by one. The scheduler compares
+  // `nextAttemptCount > maxAttempts` where `nextAttemptCount = prior + 1`, which
+  // is equivalent to `prior >= maxAttempts`. One attempt below the ceiling must
+  // still dispatch normally.
+  it("still dispatches one attempt below the default monitor ceiling", async () => {
+    const { issueId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+      monitor: {
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = createHeartbeat();
+
+    const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    expect(result.enqueued).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+    });
   });
 
   it("clears exhausted monitors and queues bounded owner recovery instead of another due check", async () => {

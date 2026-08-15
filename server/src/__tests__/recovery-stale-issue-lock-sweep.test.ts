@@ -3,10 +3,12 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
   createDb,
+  detachedQueuedRunRecoveries,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -57,6 +59,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -244,13 +247,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(second.cleared).toBe(0);
   });
 
-  // BLO-18995: four enqueue paths stamp executionRunId/executionLockedAt at
-  // *enqueue* time next to a freshly-inserted `queued` run instead of lazily at
-  // claim time. `queued` is neither missing nor terminal, so isCleanable()
-  // returned false forever and this sweeper — the designated backstop — never
-  // cleared the lock, while enqueueWakeup parked every later wake for the issue
-  // as `deferred_issue_execution` behind a holder that may never start. There
-  // was no timeout anywhere in the path. Observed live on BLO-18939.
+  // BLO-18995: preserve upgrade cleanup for pre-claim locks written by older
+  // deployments, even though current enqueue paths no longer create them.
   it("clears an execution lock held past the timeout by a run that never started (BLO-18995)", async () => {
     const { companyId, agentId, queuedRunId } = await seed();
     const issueId = randomUUID();
@@ -291,6 +289,13 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, queuedRunId))
       .then((rows) => rows[0]);
     expect(run?.status).toBe("queued");
+
+    const detachment = await db
+      .select({ issueId: detachedQueuedRunRecoveries.issueId, status: detachedQueuedRunRecoveries.status })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.sourceRunId, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(detachment).toEqual({ issueId, status: "detached" });
 
     const audit = await db
       .select({ details: activityLog.details })
@@ -617,7 +622,175 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(row?.executionLockedAt?.getTime()).toBe(refreshedLockedAt.getTime());
   });
 
-  it("promotes the oldest eligible deferred issue wake after clearing an expired pre-claim lock", async () => {
+  // Ally's review suggestion on #905 (BLO-19566). The widened same-run checkout
+  // allowance decides eligibility from a snapshot read during the scan, so the
+  // holder's run status can change before the compare-and-swap lands. Pin the
+  // resulting contract so a future change to either side has to state its intent.
+  //
+  // This test originally asserted the opposite — that the CAS re-checks the three
+  // lock columns but NOT the run's status, so a holder that goes live mid-sweep
+  // still loses its lock. BLO-19848 (f0985fa53, #906) deliberately changed that:
+  // the CAS now re-reads the holder's run row FOR UPDATE and re-evaluates
+  // staleness against the *current* status. A run that has genuinely started is
+  // therefore no longer eligible, and the sweep declines.
+  //
+  // Master's semantics win here on merit, not just precedence. The old rationale
+  // argued only that clearing was *harmless* (claimQueuedRun re-acquires under
+  // `or(isNull(executionRunId), eq(executionRunId, self))`), which is a case for
+  // it being survivable, not for it being right. Re-validating under FOR UPDATE
+  // is strictly more conservative: it avoids releasing the lock of a run that is
+  // at that moment executing, which is exactly the window where a concurrent
+  // claim could dispatch a second run for the same issue.
+  //
+  // Master moved again in 8446c1011 ("bind issue locks only for running runs"),
+  // which stops the deferred-wake promotion stamping executionRunId onto a
+  // freshly queued run. That is a *different* seam: it removes one producer of
+  // pre-claim locks, whereas the two tests below cover the sweeper that has to
+  // cope with the ones already written by older deployments. Both sides of the
+  // merge therefore survive — they are not competing statements of one contract.
+  it("declines to clear the lock when the holder starts after the scan (BLO-19566, BLO-19848)", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const staleLockedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Same-run pre-claim holder that starts mid-sweep",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: queuedRunId,
+      executionRunId: queuedRunId,
+      executionLockedAt: staleLockedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    let sweepPromise: ReturnType<typeof heartbeat.sweepStaleIssueLocks> | null = null;
+
+    // Hold the issue row so the sweep parks on the CAS after it has scanned,
+    // then flip the holder queued -> running inside that window.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      sweepPromise = heartbeat.sweepStaleIssueLocks();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date() })
+        .where(eq(heartbeatRuns.id, queuedRunId));
+    });
+
+    expect(sweepPromise).not.toBeNull();
+    const result = await sweepPromise!;
+
+    // The scan saw `queued` with a 7h-stale lock, but the in-transaction re-read
+    // sees `running` with startedAt=now — neither pre-claim-expired nor
+    // running-silent — so the lock survives the race.
+    expect(result.cleared).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    // The sweep remains non-destructive: a run that just started is never
+    // cancelled or failed by lock recovery.
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
+
+    // And the live holder keeps the lock it is actively using.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRunId).toBe(queuedRunId);
+    expect(row?.executionRunId).toBe(queuedRunId);
+    expect(row?.executionLockedAt?.getTime()).toBe(staleLockedAt.getTime());
+    expect(row?.status).toBe("in_progress");
+  });
+
+  it("leaves the deferred wake parked when the holder starts after the scan (BLO-19566, BLO-19848)", async () => {
+    // Same race, but with a deferred issue wake queued behind the lock. The
+    // concern is a second run being dispatched for an issue whose original
+    // holder just went live. Since BLO-19848 the lock is not released at all in
+    // this window, so the wake stays parked and is promoted later by
+    // releaseIssueExecutionAndPromote when the live holder actually finishes —
+    // which is the path that guarantees exactly one dispatch.
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Same-run pre-claim holder with a deferred wake behind it",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      checkoutRunId: queuedRunId,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_comment_followup",
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    const heartbeat = heartbeatService(db);
+    let sweepPromise: ReturnType<typeof heartbeat.sweepStaleIssueLocks> | null = null;
+
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      sweepPromise = heartbeat.sweepStaleIssueLocks();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date() })
+        .where(eq(heartbeatRuns.id, queuedRunId));
+    });
+
+    expect(sweepPromise).not.toBeNull();
+    const result = await sweepPromise!;
+    expect(result.cleared).toBe(0);
+
+    // The started holder is untouched.
+    const holder = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0]);
+    expect(holder?.status).toBe("running");
+
+    // No promotion happened, so nothing was dispatched behind the live holder.
+    // This is the load-bearing assertion: the race must not fan out into a
+    // second run for the same issue.
+    const promoted = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(promoted?.status).toBe("deferred_issue_execution");
+  });
+
+  it("promotes the oldest eligible deferred issue wake without binding its queued run", async () => {
     const { companyId, agentId, queuedRunId } = await seed();
     const issueId = randomUUID();
     const deferredWakeId = randomUUID();
@@ -714,9 +887,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(issue?.executionRunId).toBe(wake?.runId);
-    expect(issue?.executionAgentNameKey).toBe("coder");
-    expect(issue?.executionLockedAt).not.toBeNull();
+    expect(issue).toEqual({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
 
     const originalRun = await db
       .select({ status: heartbeatRuns.status })
@@ -724,6 +899,192 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, queuedRunId))
       .then((rows) => rows[0]);
     expect(originalRun?.status).toBe("queued");
+  });
+
+  it("applies session reset lineage and attempt accounting during stale-lock promotion", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    const taskKey = randomUUID();
+    await db.update(agents).set({ adapterType: "opencode_k8s" }).where(eq(agents.id, agentId));
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId, taskKey } })
+      .where(eq(heartbeatRuns.id, queuedRunId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired holder with deferred session reset",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      checkoutRunId: null,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    const otherTaskKey = randomUUID();
+    await db.insert(agentTaskSessions).values([
+      {
+        companyId,
+        agentId,
+        adapterType: "opencode_k8s",
+        taskKey,
+        sessionParamsJson: { sessionId: "poisoned-session" },
+        sessionDisplayId: "poisoned-session",
+      },
+      {
+        companyId,
+        agentId,
+        adapterType: "opencode_k8s",
+        taskKey: otherTaskKey,
+        sessionParamsJson: { sessionId: "other-task-session" },
+        sessionDisplayId: "other-task-session",
+      },
+      {
+        companyId,
+        agentId,
+        adapterType: "opencode_local",
+        taskKey,
+        sessionParamsJson: { sessionId: "other-adapter-session" },
+        sessionDisplayId: "other-adapter-session",
+      },
+    ]);
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          taskKey,
+          wakeReason: "issue_zero_token_session_reset",
+          retryReason: "zero_token_session_reset",
+          retryOfRunId: queuedRunId,
+          scheduledRetryAttempt: 2,
+        },
+      },
+      status: "deferred_issue_execution",
+      requestedAt: new Date(Date.now() - 5 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const remainingSessions = await db
+      .select({ adapterType: agentTaskSessions.adapterType, taskKey: agentTaskSessions.taskKey })
+      .from(agentTaskSessions)
+      .where(eq(agentTaskSessions.agentId, agentId));
+    expect(remainingSessions).toEqual(
+      expect.arrayContaining([
+        { adapterType: "opencode_k8s", taskKey: otherTaskKey },
+        { adapterType: "opencode_local", taskKey },
+      ]),
+    );
+    expect(remainingSessions).toHaveLength(2);
+    const promotedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.wakeupRequestId, deferredWakeId))
+      .then((rows) => rows[0] ?? null);
+    expect(promotedRun).toMatchObject({
+      retryOfRunId: queuedRunId,
+      scheduledRetryAttempt: 2,
+    });
+    expect(promotedRun?.contextSnapshot).toMatchObject({
+      retryReason: "zero_token_session_reset",
+      taskKey,
+    });
+  });
+
+  it("cancels stale-lock session reset promotion when newer issue execution supersedes its lineage", async () => {
+    const { companyId, agentId, queuedRunId } = await seed();
+    const issueId = randomUUID();
+    const deferredWakeId = randomUUID();
+    const taskKey = randomUUID();
+    await db.update(agents).set({ adapterType: "opencode_k8s" }).where(eq(agents.id, agentId));
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId, taskKey } })
+      .where(eq(heartbeatRuns.id, queuedRunId));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Expired holder with superseded session reset",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      executionRunId: queuedRunId,
+      executionLockedAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "opencode_k8s",
+      taskKey,
+      sessionParamsJson: { sessionId: "still-current-session" },
+      sessionDisplayId: "still-current-session",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "failed",
+      contextSnapshot: { issueId, taskKey },
+      createdAt: new Date(Date.now() + 1_000),
+      updatedAt: new Date(Date.now() + 1_000),
+      finishedAt: new Date(Date.now() + 1_000),
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          taskKey,
+          retryReason: "zero_token_session_reset",
+          retryOfRunId: queuedRunId,
+          scheduledRetryAttempt: 1,
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const wake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toMatchObject({
+      status: "cancelled",
+      runId: null,
+      error: "Deferred session reset was superseded by newer issue execution",
+    });
+    await expect(
+      db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)),
+    ).resolves.toHaveLength(1);
+    const promotedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.wakeupRequestId, deferredWakeId));
+    expect(promotedRuns).toHaveLength(0);
   });
 
   it("promotes a deferred issue-scoped wake for a non-assignee without taking the issue lock", async () => {

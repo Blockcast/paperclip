@@ -370,6 +370,25 @@ export const SYSTEM_ISSUE_DOCUMENT_KEYS = [
 ] as const;
 export type SystemIssueDocumentKey = (typeof SYSTEM_ISSUE_DOCUMENT_KEYS)[number];
 
+/**
+ * The one issue-document key a cheap status-only recovery run may write (BLO-25868).
+ *
+ * Such a run is barred from authoring deliverables — it must not invent work
+ * product — but it IS authorized to reach a status conclusion. Those two facts
+ * used to deadlock: the done gate refuses a close that has no execution run and
+ * no PR link unless a run-attributed durable artifact exists
+ * (`no_execution_run_and_no_pr_evidence`), while the artifact route refused this
+ * actor outright. A non-code deliverable with no PR therefore could not be
+ * closed by the run that owned it, and re-waking never helped.
+ *
+ * This key is the narrow escape: a verdict recording WHY the run concluded the
+ * issue is resolved, citing evidence that already existed. It is deliberately
+ * NOT a system key and NOT `plan`, so it qualifies for the done gate; and it is
+ * the ONLY key the status-only bar exempts, so plans and deliverable documents
+ * stay barred. See `done-gate.ts` and `assertDeliverableMutationAllowedByRunContext`.
+ */
+export const ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY = "status-adjudication" as const;
+
 const SYSTEM_ISSUE_DOCUMENT_KEY_SET = new Set<string>(SYSTEM_ISSUE_DOCUMENT_KEYS);
 
 export function isSystemIssueDocumentKey(key: string): key is SystemIssueDocumentKey {
@@ -641,6 +660,20 @@ export const APPROVAL_STATUSES = [
   "cancelled",
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
+
+/**
+ * Statuses in which an approval has not yet been answered by the board.
+ *
+ * Single source of truth for three things that MUST agree, because a drift between
+ * them turns an idempotent replay into a raw unique-violation 500:
+ *   1. the create-side dedupe lookup (`approvalService.createWithIdempotency`),
+ *   2. the partial unique indexes on `approvals.idempotency_key`,
+ *   3. which approvals can still be resolved.
+ * Migration `0210_approval_create_idempotency.sql` hardcodes this set in SQL — it is
+ * frozen history and cannot import, so a change here needs a follow-up migration.
+ */
+export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
+export type ApprovalUndecidedStatus = (typeof APPROVAL_UNDECIDED_STATUSES)[number];
 
 export const SECRET_PROVIDERS = [
   "local_encrypted",

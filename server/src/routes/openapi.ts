@@ -73,6 +73,7 @@ import {
   updateUserSecretValueSchema,
   // Approval
   createApprovalSchema,
+  listApprovalsQuerySchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
@@ -840,15 +841,37 @@ const AUTHENTICATED_OPERATIONS = new Set([
   "GET /api/plugins/rag-health",
 ]);
 
+// Every operation whose handler enforces instance admin. `BOARD_ONLY_PREFIXES`
+// would otherwise classify most of these as plain `board`, understating the
+// privilege boundary for spec-driven consumers. The openapi-routes suite walks
+// the route sources and fails if a handler calls `assertInstanceAdmin` without a
+// matching entry here, so keep this in sync with the routes rather than by hand.
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
-  "POST /api/plugins/install",
   "POST /api/instance/reset",
   "POST /api/instance/database-backups",
+  "GET /api/instance/scheduler-heartbeats",
   "POST /api/service-account-tokens",
+  "GET /api/admin/users",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
+  "GET /api/admin/users/{userId}/company-access",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/adapters/install",
+  "PATCH /api/adapters/{type}",
+  "PATCH /api/adapters/{type}/override",
+  "DELETE /api/adapters/{type}",
+  "POST /api/adapters/{type}/reload",
+  "POST /api/adapters/{type}/reinstall",
+  "POST /api/plugins/install",
+  "DELETE /api/plugins/{pluginId}",
+  "POST /api/plugins/{pluginId}/enable",
+  "POST /api/plugins/{pluginId}/disable",
+  "POST /api/plugins/{pluginId}/upgrade",
+  "GET /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config/test",
+  "POST /api/plugins/{pluginId}/jobs/{jobId}/trigger",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -1509,7 +1532,7 @@ registry.registerPath({
   method: "get",
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
-  summary: "Get current agent inbox (lite)",
+  summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -2841,8 +2864,14 @@ registry.registerPath({
   path: "/api/companies/{companyId}/approvals",
   tags: ["approvals"],
   summary: "List approvals in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "view=full (default) returns whole payload bodies. Use view=count or view=summary for a cheap " +
+    "existence check before filing a new approval — summary omits payload and adds a derived label.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: listApprovalsQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3070,8 +3099,17 @@ registry.registerPath({
   path: "/api/companies/{companyId}/activity",
   tags: ["activity"],
   summary: "List company activity",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      entityType: z.string().optional(),
+      entityId: z.string().optional(),
+      action: z.string().optional(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3100,7 +3138,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List activity for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3109,7 +3147,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List runs for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3118,7 +3156,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List issues for a heartbeat run",
   request: { params: z.object({ runId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
@@ -3716,6 +3754,21 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     query: z.object({
       lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/parked-agents",
+  tags: ["runs"],
+  summary: "List agents parked on a scheduled retry, and when each is due to run again",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      reason: z.string().min(1).max(64).optional(),
       limit: z.coerce.number().int().min(1).max(1000).optional(),
     }),
   },
@@ -4976,6 +5029,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Get company-scoped plugin config",
+  description:
+    "Requires instance admin. Secret-bearing values are returned as `__redacted__`; " +
+    "posting the response back unchanged preserves the stored secret.",
   request: {
     params: z.object({ pluginId: z.string() }),
     query: z.object({ companyId: z.string() }),
@@ -4988,6 +5044,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Set company-scoped plugin config",
+  description:
+    "Requires instance admin. A field sent as `__redacted__` keeps its stored value; " +
+    "the sentinel is never persisted.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
@@ -5000,6 +5059,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config/test",
   tags: ["plugins"],
   summary: "Test company-scoped plugin config",
+  description:
+    "Requires instance admin. Restores masked (`__redacted__`) fields from stored config " +
+    "before handing them to the plugin worker.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),

@@ -1179,7 +1179,7 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect((await readRun(run.id)).crashRecoveryCompletedAt).not.toBeNull();
   });
 
-  // BLO-21526: migration 0211 declines to build the candidate index inline on a
+  // BLO-21526: migration 0218 declines to build the candidate index inline on a
   // populated table (an inline build would hold ACCESS EXCLUSIVE for its
   // duration) and raises a NOTICE instead — which the production client
   // swallows via `onnotice: () => {}`. So a populated deployment records 0211 as

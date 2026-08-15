@@ -18,6 +18,10 @@ platform cannot resolve automatically. Each runbook should be:
   which nothing re-drives: decide re-review vs accept without double-posting a
   review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
   `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0`.
+- [`queued-run-stranded.md`](queued-run-stranded.md) — a dispatchable
+  `heartbeat_runs.status='queued'` row is not advancing, or its age snapshot
+  cannot be refreshed safely. Trigger: `PaperclipQueuedRunStranded` or
+  `PaperclipQueuedRunAgeMetricsRefreshFailed`.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
@@ -28,3 +32,19 @@ platform cannot resolve automatically. Each runbook should be:
   confirmed alive. Trigger: `k8s_guard_decision` log line with
   `reason: "live_job_for_active_run"`, or
   `claude_k8s_concurrent_run_blocked_total{reason="live_job_for_active_run"}`.
+- [`merge-queue-stalled-head.md`](merge-queue-stalled-head.md) — when to
+  manually dequeue a head-of-queue PR whose `merge_group` check is stuck
+  (not failing) and is silently freezing the `master` merge queue. Trigger:
+  `master` hasn't advanced in >90 min with the queue non-empty, or the
+  position-1 entry's `merge_group` run shows no state change for that long.
+- [`queued-run-stranded.md`](queued-run-stranded.md) — a `heartbeat_runs` row
+  sitting at `status='queued'` for a long time: the issue it targets looks
+  actively in-progress but nothing is executing, and it manufactures false
+  productivity-review escalations. Trigger: alert `PaperclipQueuedRunStranded`,
+  or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
+  — you are adjudicating an open productivity review and the reviewed issue's
+  monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
+  run): the supported one-call repair path, and why the `PATCH {status:
+  "todo"}` bounce is superseded. Trigger: review evidence reads `monitor
+  lapsed at …, never re-armed`.

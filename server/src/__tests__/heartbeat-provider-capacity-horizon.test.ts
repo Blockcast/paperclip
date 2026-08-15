@@ -36,7 +36,9 @@ import {
   isHintlessTransientUpstreamFault,
   isRateLimitExhausted,
   parseProviderCapacityResetHorizon,
+  resolveProviderCapacityHorizon,
 } from "../services/heartbeat.js";
+import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../services/provider-capacity-horizon-bound.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -64,6 +66,24 @@ const BLO_18278_ERROR_MESSAGE = (resetIso: string) =>
 // What the SDK's final event carries for this fault. `api_error_status` 429 is
 // the surface isRateLimitExhausted keys on.
 const BLO_18278_RESULT_JSON = { api_error_status: 429 } as const;
+const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
+
+// BLO-18285: the horizon production actually emitted, from run b48c8b30 on this
+// very issue — 319565s = 88.8h, 3.7x the 24h cap. The cap was calibrated on the
+// single ~2h40m sample BLO-18278 observed, so the first longer real window fell
+// straight through it.
+const OVER_CAP_RETRY_SECONDS = 319565;
+// The literal instant run b48c8b30 was handed. Only ever used with that run's
+// own clock passed in explicitly — it is in the past now, so a suite that
+// replayed it against the live clock would resolve `none` (already elapsed) and
+// quietly assert nothing. The e2e adapters below build the same message shape
+// around a live-clock instant instead.
+const BLO_18285_OVER_CAP_RESET_ISO = "2026-08-06T21:59:59.671Z";
+const BLO_18285_OVER_CAP_RUN_STARTED_AT = Date.parse("2026-08-03T05:13:56.000Z");
+const BLO_18285_OVER_CAP_MESSAGE = (resetIso: string) =>
+  `API Error: Request rejected (429) · BYOS provider capacity for 'anthropic' is temporarily ` +
+  `unavailable; capacity may reset at ${resetIso}; retry in ${OVER_CAP_RETRY_SECONDS}s`;
+const BLO_18285_OVER_CAP_ERROR_MESSAGE = BLO_18285_OVER_CAP_MESSAGE(BLO_18285_OVER_CAP_RESET_ISO);
 
 describe("parseProviderCapacityResetHorizon", () => {
   const now = Date.parse("2026-07-26T18:50:31.000Z");
@@ -107,7 +127,7 @@ describe("parseProviderCapacityResetHorizon", () => {
     ).toBeNull();
   });
 
-  it("ignores an absurd horizon rather than sidelining an issue for days", () => {
+  it("refuses to park verbatim on an absurd horizon", () => {
     expect(
       parseProviderCapacityResetHorizon({ errorMessage: "capacity may reset at 2031-01-01T00:00:00.000Z" }, now),
     ).toBeNull();
@@ -117,6 +137,138 @@ describe("parseProviderCapacityResetHorizon", () => {
   it("returns null for unrelated failures", () => {
     expect(parseProviderCapacityResetHorizon({ errorMessage: "TypeError: x is not a function" }, now)).toBeNull();
     expect(parseProviderCapacityResetHorizon({ resultJson: null, errorMessage: null }, now)).toBeNull();
+  });
+});
+
+// BLO-18285. `parseProviderCapacityResetHorizon` answers one question — "may we
+// park on this instant verbatim?" — and its `null` therefore says nothing about
+// whether a horizon was advertised at all. Callers that route the fault need
+// that distinction, because discarding an over-cap horizon drops the run onto
+// the flat 90s curve that strands it.
+describe("resolveProviderCapacityHorizon separates silence from an over-cap advertisement", () => {
+  const now = Date.parse("2026-07-26T18:50:31.000Z");
+  const CAP_MS = PROVIDER_CAPACITY_MAX_HORIZON_MS;
+
+  it("reports a within-cap horizon as usable", () => {
+    const resetIso = new Date(now + ADVERTISED_RESET_SECONDS * 1000).toISOString();
+    const resolved = resolveProviderCapacityHorizon({ errorMessage: BLO_18278_ERROR_MESSAGE(resetIso) }, now);
+    expect(resolved.kind).toBe("usable");
+    expect(resolved.kind === "usable" && resolved.at.toISOString()).toBe(resetIso);
+  });
+
+  it("reports genuine silence as none", () => {
+    expect(resolveProviderCapacityHorizon({ errorMessage: "TypeError: x is not a function" }, now).kind).toBe("none");
+    expect(resolveProviderCapacityHorizon({ resultJson: null, errorMessage: null }, now).kind).toBe("none");
+  });
+
+  // The exact payload from run b48c8b30 on BLO-18285, replayed at that run's
+  // own clock: 88.8h out, 3.7x the cap. The message states the window twice —
+  // `capacity may reset at 2026-08-06T21:59:59.671Z` and `retry in 319565s`,
+  // which agree to 1.3s — and the absolute form is authoritative, so that is
+  // the instant reported as advertised. On master this whole reading was
+  // indistinguishable from the `none` case above, which is what put it on the
+  // 90s curve.
+  it("reports the 88.8h b48c8b30 advertisement as over_horizon, parked at the cap", () => {
+    const runStartedAt = BLO_18285_OVER_CAP_RUN_STARTED_AT;
+    const resolved = resolveProviderCapacityHorizon(
+      { errorMessage: BLO_18285_OVER_CAP_ERROR_MESSAGE },
+      runStartedAt,
+    );
+    expect(resolved.kind).toBe("over_horizon");
+    if (resolved.kind !== "over_horizon") throw new Error("unreachable");
+    expect(resolved.advertisedAt.toISOString()).toBe(BLO_18285_OVER_CAP_RESET_ISO);
+    expect(resolved.parkAt.getTime()).toBe(runStartedAt + CAP_MS);
+
+    // The park is far shorter than what was asked for — that is the point. We
+    // bound the blast radius of a figure we do not trust, while still never
+    // returning inside a window this long the way the 90s curve did.
+    expect(resolved.advertisedAt.getTime() - runStartedAt).toBeGreaterThan(CAP_MS * 3);
+    expect(resolved.parkAt.getTime()).toBeLessThan(resolved.advertisedAt.getTime());
+  });
+
+  it("treats an over-cap absolute timestamp the same way", () => {
+    const resolved = resolveProviderCapacityHorizon(
+      { errorMessage: "capacity may reset at 2031-01-01T00:00:00.000Z" },
+      now,
+    );
+    expect(resolved.kind).toBe("over_horizon");
+    expect(resolved.kind === "over_horizon" && resolved.parkAt.getTime()).toBe(now + CAP_MS);
+  });
+
+  // An elapsed horizon describes a window that has already reopened, so there
+  // is nothing to wait for — it must stay `none` and take the normal curve
+  // rather than being parked for 24h.
+  it("keeps an already-elapsed horizon as none, not over_horizon", () => {
+    expect(
+      resolveProviderCapacityHorizon({ errorMessage: "capacity may reset at 2020-01-01T00:00:00.000Z" }, now).kind,
+    ).toBe("none");
+  });
+
+  // Ordering guard: a usable horizon anywhere in the candidate set beats an
+  // over-cap reading seen earlier, so the remembered over_horizon can never
+  // shadow a value we could have parked on exactly.
+  it("prefers a usable horizon over an over-cap one seen first", () => {
+    const usableIso = new Date(now + 60_000).toISOString();
+    const resolved = resolveProviderCapacityHorizon(
+      {
+        errorMessage: BLO_18285_OVER_CAP_ERROR_MESSAGE,
+        resultJson: { result: `capacity may reset at ${usableIso}` },
+      },
+      now,
+    );
+    expect(resolved.kind).toBe("usable");
+    expect(resolved.kind === "usable" && resolved.at.toISOString()).toBe(usableIso);
+  });
+
+  // BLO-18285 review follow-up: model prose may not drive the 24h park.
+  //
+  // `resultJson.result` and `resultJson.summary` are the agent's own text
+  // (claude-local assigns the SDK final-result event verbatim), which is why the
+  // hint-less classifier's TRANSIENT_UPSTREAM_TEXT_KEYS already excludes them.
+  // The over-cap park is the stronger claim of the two — it sidelines an issue
+  // for a full day on a figure we have explicitly decided not to trust — so
+  // prose that merely *quotes* some unrelated far-future reset must not reach
+  // it. Before this, an agent writing "the gateway said capacity resets
+  // 2031-01-01" into its own summary was enough.
+  it("refuses to park on an over-cap horizon that only model prose stated", () => {
+    for (const key of ["result", "summary"] as const) {
+      const resolved = resolveProviderCapacityHorizon(
+        { resultJson: { [key]: "capacity may reset at 2031-01-01T00:00:00.000Z" } },
+        now,
+      );
+      expect(resolved.kind).toBe("none");
+    }
+    // Same for the relative form.
+    expect(
+      resolveProviderCapacityHorizon({ resultJson: { result: "retry in 319565s" } }, now).kind,
+    ).toBe("none");
+  });
+
+  // The machine-authored surfaces still reach it — otherwise the fix would have
+  // disabled the disposition rather than bounded it. This is the control for the
+  // case above: same payload shape, trusted field, opposite outcome.
+  it("still parks on an over-cap horizon from a machine-authored field", () => {
+    for (const key of ["message", "error"] as const) {
+      const resolved = resolveProviderCapacityHorizon(
+        { resultJson: { [key]: "capacity may reset at 2031-01-01T00:00:00.000Z" } },
+        now,
+      );
+      expect(resolved.kind).toBe("over_horizon");
+      expect(resolved.kind === "over_horizon" && resolved.parkAt.getTime()).toBe(now + CAP_MS);
+    }
+  });
+
+  // Prose is untrusted for the over-cap claim only. Which fields may supply a
+  // *usable* instant was settled in BLO-18278 and is asserted above — this pins
+  // that the narrowing did not silently change it.
+  it("still reads a within-cap horizon from model prose", () => {
+    const usableIso = new Date(now + 60_000).toISOString();
+    const resolved = resolveProviderCapacityHorizon(
+      { resultJson: { summary: `capacity may reset at ${usableIso}` } },
+      now,
+    );
+    expect(resolved.kind).toBe("usable");
+    expect(resolved.kind === "usable" && resolved.at.toISOString()).toBe(usableIso);
   });
 });
 
@@ -145,6 +297,10 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const HINTED_429_TEST_ADAPTER = "provider_capacity_horizon_test";
 const UNHINTED_429_TEST_ADAPTER = "provider_capacity_horizon_control_test";
+const STRUCTURED_429_TEST_ADAPTER = "provider_capacity_horizon_structured_test";
+const OVER_CAP_429_TEST_ADAPTER = "provider_capacity_horizon_over_cap_test";
+const PROSE_OVER_CAP_429_TEST_ADAPTER = "provider_capacity_horizon_prose_over_cap_test";
+const NON_429_OVER_CAP_TEST_ADAPTER = "provider_capacity_horizon_non_429_over_cap_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -176,6 +332,12 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
   const advertisedResetAt = new Date(Date.now() + ADVERTISED_RESET_SECONDS * 1000);
   const advertisedResetIso = advertisedResetAt.toISOString();
 
+  // BLO-18285: the same fault shape, but advertising 88.8h — past the 24h cap.
+  // Built off the live clock rather than replaying b48c8b30's literal instant,
+  // which is now in the past and would resolve as an elapsed horizon.
+  const overCapAdvertisedAt = new Date(Date.now() + OVER_CAP_RETRY_SECONDS * 1000);
+  const overCapAdvertisedIso = overCapAdvertisedAt.toISOString();
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-provider-capacity-horizon-");
     db = createDb(tempDb.connectionString);
@@ -204,8 +366,10 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
       testEnvironment: testEnvironment(HINTED_429_TEST_ADAPTER),
     });
 
-    // Control: the same 429 with the capacity horizon stripped — the shape we
-    // get when the provider rejects without advertising a reset.
+    // Control: the same 429 with the capacity horizon stripped from the server
+    // parse surfaces — the shape we get when the provider rejects without
+    // advertising a reset. It deliberately tries to smuggle persisted reset
+    // fields through adapter-owned resultJson; finalization must strip them.
     registerServerAdapter({
       type: UNHINTED_429_TEST_ADAPTER,
       execute: async () => ({
@@ -213,15 +377,102 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
         signal: null,
         timedOut: false,
         errorMessage: "API Error: Request rejected (429) · provider capacity temporarily unavailable",
-        resultJson: { ...BLO_18278_RESULT_JSON } as Record<string, unknown>,
+        resultJson: {
+          ...BLO_18278_RESULT_JSON,
+          providerCapacityResetAt: advertisedResetIso,
+          providerCapacityResetProvenance: {
+            source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+            errorFamily: "rate_limit_exhausted",
+            observedStatusCode: 429,
+          },
+        } as Record<string, unknown>,
       }),
       testEnvironment: testEnvironment(UNHINTED_429_TEST_ADAPTER),
+    });
+
+    // The structured counterpart: claude-local/codex-local parse the horizon
+    // adapter-side and hand back `retryNotBefore`, which makes the server's
+    // prose parser skip this result entirely. Before the follow-up fix that
+    // meant such a run reached recovery with NO provenance at all and was
+    // forced into the generic rate-limit/quota wording — discarding a 429 we
+    // can substantiate from `api_error_status` sitting right beside the hint.
+    registerServerAdapter({
+      type: STRUCTURED_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        // No prose horizon anywhere — the parser must not be what rescues this.
+        errorMessage: "API Error: Request rejected (429) · provider capacity temporarily unavailable",
+        retryNotBefore: advertisedResetIso,
+        resultJson: { ...BLO_18278_RESULT_JSON } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(STRUCTURED_429_TEST_ADAPTER),
+    });
+
+    // BLO-18285: identical to HINTED, except the advertised window is 88.8h —
+    // past the cap. Same prose shape, same 429 surface, no structured hint.
+    registerServerAdapter({
+      type: OVER_CAP_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: BLO_18285_OVER_CAP_MESSAGE(overCapAdvertisedIso),
+        resultJson: { ...BLO_18278_RESULT_JSON } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(OVER_CAP_429_TEST_ADAPTER),
+    });
+
+    // BLO-18285 review follow-up: a GENUINE structured 429 whose only far-future
+    // reset sits in model-authored prose. `errorMessage` states the 429 and no
+    // horizon; `result` is the agent's own summary, which merely quotes one.
+    // Both of the over-cap gate's inputs are individually satisfied — a real 429
+    // and a parseable over-cap instant — so before the candidate narrowing this
+    // parked the issue for 24h on the strength of text the model wrote.
+    registerServerAdapter({
+      type: PROSE_OVER_CAP_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "API Error: Request rejected (429) · provider capacity temporarily unavailable",
+        resultJson: {
+          ...BLO_18278_RESULT_JSON,
+          result:
+            `I hit a throttle. Earlier the gateway mentioned capacity may reset at ` +
+            `${overCapAdvertisedIso}, so I stopped here.`,
+        } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(PROSE_OVER_CAP_429_TEST_ADAPTER),
+    });
+
+    // BLO-18285 review follow-up: the negative counterpart for the 429 gate
+    // itself. The over-cap instant here is machine-authored and trusted, but the
+    // structured status is 401, not 429 — a credential/cap-window rejection that
+    // the throttle families also cover. The 24h park is reserved for a capacity
+    // 429 we can substantiate, so this must keep the ordinary schedule. Pins the
+    // conservative side of the gate against being widened by accident.
+    registerServerAdapter({
+      type: NON_429_OVER_CAP_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: BLO_18285_OVER_CAP_MESSAGE(overCapAdvertisedIso),
+        resultJson: { api_error_status: 401 } as Record<string, unknown>,
+      }),
+      testEnvironment: testEnvironment(NON_429_OVER_CAP_TEST_ADAPTER),
     });
   }, 120_000);
 
   afterAll(async () => {
     unregisterServerAdapter(HINTED_429_TEST_ADAPTER);
     unregisterServerAdapter(UNHINTED_429_TEST_ADAPTER);
+    unregisterServerAdapter(STRUCTURED_429_TEST_ADAPTER);
+    unregisterServerAdapter(OVER_CAP_429_TEST_ADAPTER);
+    unregisterServerAdapter(PROSE_OVER_CAP_429_TEST_ADAPTER);
+    unregisterServerAdapter(NON_429_OVER_CAP_TEST_ADAPTER);
     await cleanupHeartbeatTestState(db, heartbeat, {
       errorLabel: "provider capacity horizon cleanup",
       drainTimeoutMs: 30_000,
@@ -292,6 +543,14 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
     expect(resultJson?.transientRetryNotBefore).toBe(advertisedResetIso);
     expect(resultJson?.providerCapacityResetAt).toBe(advertisedResetIso);
+    expect(resultJson?.providerCapacityResetProvenance).toEqual({
+      source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+      observedStatusField: "api_error_status",
+      observedCause: "rate_limit_exhausted",
+      horizonSource: "server_prose_parse",
+    });
 
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
@@ -316,6 +575,45 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(scheduledInMs).toBeGreaterThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 10);
   }, 60_000);
 
+  // The structured sibling of the case above. An adapter that parses the
+  // horizon itself skips the server's prose parser, so before this fix it
+  // reached recovery with no provenance and lost the 429 diagnosis — on exactly
+  // the adapters that report the fault most precisely.
+  it("substantiates a structured retryNotBefore paired with an observed 429", async () => {
+    const { agentId } = await seedAgent(STRUCTURED_429_TEST_ADAPTER);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("rate_limit_exhausted");
+
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
+    expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
+
+    // The horizon is re-derived server-side and re-emitted canonically rather
+    // than trusted verbatim, so the value the comment can quote is ours.
+    expect(resultJson?.providerCapacityResetAt).toBe(advertisedResetIso);
+    expect(resultJson?.providerCapacityResetProvenance).toEqual({
+      source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+      observedStatusField: "api_error_status",
+      observedCause: "rate_limit_exhausted",
+      horizonSource: "adapter_structured_retry_not_before",
+    });
+
+    // And it still parks at the advertised instant rather than stranding.
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(advertisedResetIso);
+  }, 60_000);
+
   // Pins the causal claim: it is the advertised horizon, not merely the 429
   // family, that moves the schedule. The same fault without one still parks in
   // `scheduled_retry` (so it does not strand either) but takes the flat hop.
@@ -332,6 +630,7 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
     expect(resultJson?.retryNotBefore ?? null).toBeNull();
     expect(resultJson?.providerCapacityResetAt ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetProvenance ?? null).toBeNull();
 
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
@@ -342,5 +641,145 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
 
     const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
     expect(scheduledInMs).toBeLessThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 2);
+  }, 60_000);
+
+  // BLO-18285. The gap between the two tests above: a 429 that advertises a
+  // window PAST the cap. On master the cap collapsed that reading into the same
+  // `null` as the no-hint control, so this fault took the flat 90s hop — with
+  // 12 attempts that is ~18min of post-gate retries against an 88.8h window,
+  // every one of them landing inside it, ending in BackoffLimitExceeded and a
+  // `stranded_assigned_issue`. Live proof: run b48c8b30 on BLO-18285 itself.
+  //
+  // Note what this test does NOT assert. A single over-cap failure parks in
+  // `scheduled_retry` on master too — the strand comes from exhausting the
+  // chain, not from the first hop — so "did not strand" would pass either way
+  // and prove nothing. The load-bearing assertion is the schedule: ~24h out
+  // instead of ~90s. That is what makes the chain unable to exhaust inside the
+  // window in the first place.
+  it("parks an over-cap 429 at the horizon cap instead of discarding it", async () => {
+    const { agentId } = await seedAgent(OVER_CAP_429_TEST_ADAPTER);
+    const startedAt = Date.now();
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("rate_limit_exhausted");
+
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
+
+    // Both scheduler surfaces carry the capped park, not the advertised 88.8h
+    // instant and not null. On master all three of these are null.
+    const parkedIso = resultJson?.retryNotBefore as string | undefined;
+    expect(parkedIso).toBeTruthy();
+    expect(resultJson?.transientRetryNotBefore).toBe(parkedIso);
+    expect(resultJson?.providerCapacityResetAt).toBe(parkedIso);
+    expect(parkedIso).not.toBe(overCapAdvertisedIso);
+
+    // Provenance records BOTH numbers: what we parked on, and what was actually
+    // asked for. Without the latter the 88.8h advertisement — the whole reason
+    // this is not a verbatim park — is unrecoverable from the persisted run.
+    expect(resultJson?.providerCapacityResetProvenance).toEqual({
+      source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+      observedStatusField: "api_error_status",
+      observedCause: "rate_limit_exhausted",
+      horizonSource: "server_prose_parse_over_horizon_park",
+      advertisedResetAt: overCapAdvertisedIso,
+      horizonCapMs: PROVIDER_CAPACITY_MAX_HORIZON_MS,
+    });
+
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(parkedIso);
+
+    // The assertion that fails on master: the continuation sits at the cap,
+    // three orders of magnitude past the 90s hop it used to take. Measured from
+    // before `invoke`, so the elapsed run time makes it drift slightly past the
+    // cap — the park itself is computed at finalization.
+    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
+    expect(scheduledInMs).toBeGreaterThan(PROVIDER_CAPACITY_MAX_HORIZON_MS * 0.9);
+    expect(scheduledInMs).toBeLessThanOrEqual(PROVIDER_CAPACITY_MAX_HORIZON_MS + 60_000);
+  }, 60_000);
+
+  // BLO-18285 review follow-up, and the counterpart to the test above: the same
+  // real 429, the same over-cap instant, but stated only in model-authored prose.
+  // It must take the ordinary flat hop, NOT the 24h park.
+  //
+  // This is the whole failure mode in one case. An agent that writes "capacity
+  // may reset at <far future>" into its own result — quoting an older fault,
+  // speculating, or simply being wrong — could otherwise sideline its issue for a
+  // full day, and the 429 gate would not catch it because the 429 is genuine.
+  // The two signals were independently true and wrongly treated as corroborating.
+  it("does not park a 429 whose over-cap horizon appears only in model prose", async () => {
+    const { agentId } = await seedAgent(PROSE_OVER_CAP_429_TEST_ADAPTER);
+    const startedAt = Date.now();
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("rate_limit_exhausted");
+
+    // No park was derived at all: prose cannot supply the over-cap claim, and
+    // there is no machine-authored horizon anywhere in this payload.
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
+    expect(resultJson?.retryNotBefore ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetAt ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetProvenance ?? null).toBeNull();
+
+    // Still parks in `scheduled_retry`, so this does not reintroduce a strand —
+    // it takes the rate-limit family's normal schedule, which is the correct
+    // disposition for a 429 that told us nothing we can trust.
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+
+    // The load-bearing assertion, and the one that fails without the narrowing:
+    // ~90s out, not ~24h.
+    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
+    expect(scheduledInMs).toBeLessThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 2);
+    expect(scheduledInMs).toBeLessThan(PROVIDER_CAPACITY_MAX_HORIZON_MS * 0.1);
+  }, 60_000);
+
+  // BLO-18285 review follow-up: the 429 gate's own negative case. Trusted,
+  // machine-authored, over-cap horizon — but the structured status is 401. The
+  // capped park is deliberately reserved for a capacity 429, because the throttle
+  // families also fire for credential cap-windows and legacy quota signals where
+  // a 24h sideline is the wrong answer.
+  it("does not park an over-cap horizon when the structured status is not 429", async () => {
+    const { agentId } = await seedAgent(NON_429_OVER_CAP_TEST_ADAPTER);
+    const startedAt = Date.now();
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id, 20_000);
+    expect(failedRun?.status).toBe("failed");
+
+    const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
+    expect(resultJson?.providerCapacityResetAt ?? null).toBeNull();
+    expect(resultJson?.providerCapacityResetProvenance ?? null).toBeNull();
+
+    await expect
+      .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
+      .toBe(1);
+
+    const retryRun = await retryRowOf(run!.id);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
+    expect(scheduledInMs).toBeLessThan(PROVIDER_CAPACITY_MAX_HORIZON_MS * 0.1);
   }, 60_000);
 });

@@ -74,6 +74,16 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
+    // Nullable, no column default (BLO-21116 review follow-up): stamped only
+    // by the specific transitions that put a run back into `queued` after it
+    // was something else (promoteScheduledRetryRun, deferRunForK8sIsolationConflict).
+    // A fresh `queued` insert leaves this null and ages off createdAt via the
+    // coalesce in refreshQueuedRunAgeMetrics -- createdAt IS the queue-entry
+    // time for a brand-new row, so there is nothing to stamp there. Without
+    // this column the age gauge read a promoted retry's full `scheduled_retry`
+    // backoff (hours) as queued-dispatch wait (minutes), manufacturing the
+    // exact false-stranded-run signal BLO-21116 exists to kill.
+    queuedAt: timestamp("queued_at", { withTimezone: true }),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     // Generated stored columns mirroring the hot context_snapshot keys.
     // See migration 0079. Populated automatically by Postgres on insert /
@@ -133,6 +143,9 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    queuedAgeIdx: index("heartbeat_runs_queued_age_idx")
+      .on(table.agentId, sql`coalesce(${table.queuedAt}, ${table.createdAt})`)
+      .where(sql`${table.status} = 'queued'`),
     // BLO-19722: serves the startup crash-recovery candidate scan, which is
     // bounded by batch size and ordered oldest-first rather than by wall time.
     // The partial predicate keeps this index near-empty in steady state — only
@@ -141,7 +154,7 @@ export const heartbeatRuns = pgTable(
     // start is an empty index probe.
     //
     // On a populated database this index is created out of band with
-    // `CREATE INDEX CONCURRENTLY` (see migration 0209); recovery is correct
+    // `CREATE INDEX CONCURRENTLY` (see migration 0219); recovery is correct
     // without it, degrading to a sequential scan that still finds every
     // candidate. Declared here so drizzle's schema diff stays clean and so
     // fresh/bootstrap databases get it automatically.

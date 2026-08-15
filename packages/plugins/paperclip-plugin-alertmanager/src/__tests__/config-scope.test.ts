@@ -15,10 +15,16 @@ import {
   CompanyScopeUnavailableError,
   isEmptyConfig,
   resolveCompanyScope,
+  resolveEscalationSweepConfig,
   resolveWebhookToken,
 } from "../config-scope.js";
 import type { AlertmanagerPluginConfig } from "../types.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import {
+  getCredentialHealth,
+  recordCredentialResolution,
+  resetCredentialHealth,
+} from "../credential-health.js";
 
 const COMPANY_A = "aaced805-3491-4ee5-9b14-cdf70cb81d47";
 const TOKEN = "a".repeat(64);
@@ -53,6 +59,9 @@ const inlineConfig = (): AlertmanagerPluginConfig =>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Module-level map shared across cases; several scope-resolution failures
+  // now record into it, so leaking state between tests would be a false pass.
+  resetCredentialHealth();
 });
 
 describe("isEmptyConfig", () => {
@@ -247,5 +256,231 @@ describe("resolveCompanyScope", () => {
       CompanyScopeUnavailableError,
     );
     expect(mocks.logger.error).toHaveBeenCalled();
+  });
+});
+
+describe("resolveEscalationSweepConfig (BLO-20957)", () => {
+  const COMPANY_B = "b1d3f3d3-adc9-48af-beb1-013a18368d84";
+
+  it("resolves each company's own config independently for its own dispatch", async () => {
+    // The host now dispatches `check-alert-escalations` once per configured
+    // company (BLO-20957), each with its own invocation scope, instead of a
+    // single process-wide dispatch tied to whichever company saved config
+    // last (BLO-20595). Two dispatches for two companies must never bleed
+    // into each other.
+    const { ctx, mocks } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, escalationDelayMinutes: 5 },
+        [COMPANY_B]: { defaultCompanyId: COMPANY_B, escalationDelayMinutes: 30 },
+      },
+    });
+
+    const a = await resolveEscalationSweepConfig(ctx, COMPANY_A);
+    const b = await resolveEscalationSweepConfig(ctx, COMPANY_B);
+
+    expect(a?.defaultCompanyId).toBe(COMPANY_A);
+    expect(b?.defaultCompanyId).toBe(COMPANY_B);
+    expect(mocks.config.get).toHaveBeenCalledWith(COMPANY_A);
+    expect(mocks.config.get).toHaveBeenCalledWith(COMPANY_B);
+  });
+
+  it("adopts the dispatch's company as defaultCompanyId when the row omits it", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: { [COMPANY_A]: { webhookToken: TOKEN } },
+    });
+
+    const config = await resolveEscalationSweepConfig(ctx, COMPANY_A);
+
+    expect(config?.defaultCompanyId).toBe(COMPANY_A);
+  });
+
+  it("returns null, not another tenant's config, for a company with no stored config", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A } },
+    });
+
+    await expect(resolveEscalationSweepConfig(ctx, COMPANY_B)).resolves.toBeNull();
+  });
+
+  it("refuses to sweep one company's alerts under another company's defaultCompanyId", async () => {
+    const { ctx, mocks } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B },
+      },
+    });
+
+    await expect(resolveEscalationSweepConfig(ctx, COMPANY_A)).resolves.toBeNull();
+    expect(mocks.logger.error).toHaveBeenCalled();
+  });
+
+  it("propagates a config-read failure so the run records as failed, rather than skipping silently", async () => {
+    const { ctx, mocks } = mkCtx({
+      configByCompany: { [COMPANY_A]: { defaultCompanyId: COMPANY_A } },
+    });
+    mocks.config.get.mockRejectedValueOnce(new Error("db down"));
+
+    await expect(resolveEscalationSweepConfig(ctx, COMPANY_A)).rejects.toThrow("db down");
+  });
+});
+
+describe("credential health from the scope-resolution path (BLO-20572)", () => {
+  const COMPANY_B = "b1d3f3d3-adc9-48af-beb1-013a18368d84";
+
+  // `resolveCompanyScope` has exits that throw BEFORE `handleWebhook` runs, so
+  // the recorder inside the handler never sees them. Recording only there left
+  // `onHealth()` answering `ok` for a company rejecting 100% of deliveries —
+  // exactly the silent-outage class this signal exists to end.
+
+  it("goes degraded when a company's webhookTokenRef cannot be used", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookTokenRef: SECRET_REF },
+      },
+    });
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    const health = getCredentialHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.message).toContain(COMPANY_A);
+    expect(health.details).toEqual({ companyIds: [COMPANY_A] });
+  });
+
+  it("never exposes the secret ref or a resolved value in health output", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: {
+          defaultCompanyId: COMPANY_A,
+          webhookTokenRef: SECRET_REF,
+        },
+      },
+      resolveSecret: async () => TOKEN,
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    // Assert it is actually reporting the fault first, so this cannot pass
+    // vacuously against an empty (all-ok) health payload.
+    const health = getCredentialHealth();
+    expect(health.status).toBe("degraded");
+    const serialized = JSON.stringify(health);
+    expect(serialized).not.toContain(SECRET_REF);
+    expect(serialized).not.toContain(TOKEN);
+  });
+
+  it("goes degraded when a company has no stored config at all", async () => {
+    // Neither webhookToken nor webhookTokenRef — the literal AC condition.
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_B)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth().details).toEqual({ companyIds: [COMPANY_B] });
+  });
+
+  it("stays ok on a transient config-read failure, so infra noise cannot flap health", async () => {
+    // Deliberate: a config-RPC blip may not hold on retry. Flapping the health
+    // surface on it would train operators to ignore the signal.
+    const { ctx, mocks } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN },
+      },
+    });
+    mocks.config.get.mockRejectedValueOnce(new Error("db down"));
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("stays ok for a routing-only mismatch, which is not a credential fault", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B, webhookToken: TOKEN },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    // Company A has a perfectly good token; saying otherwise would misreport it.
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("goes degraded when a company has BOTH a routing mismatch and no credential", async () => {
+    // The routing check used to run before credential resolution and throw
+    // first, so a company failing both checks at once never reached the
+    // recorder — health stayed "ok" for a company rejecting every delivery.
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth().status).toBe("degraded");
+    expect(getCredentialHealth().details).toEqual({ companyIds: [COMPANY_A] });
+  });
+
+  it("clears a stale degraded entry once the credential is fixed, even if a routing mismatch remains", async () => {
+    // A prior delivery recorded company A as missing a credential.
+    recordCredentialResolution(COMPANY_A, null);
+    expect(getCredentialHealth().status).toBe("degraded");
+
+    // The operator adds a valid inline token but never fixes the unrelated
+    // defaultCompanyId mismatch. The delivery still fails — routing is still
+    // wrong — but the credential fault is gone and must stop being reported.
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_B, webhookToken: TOKEN },
+      },
+    });
+
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("recovers once the company's credential is fixed, with no restart", async () => {
+    const { ctx } = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookTokenRef: SECRET_REF },
+      },
+    });
+    await expect(resolveCompanyScope(ctx, COMPANY_A)).rejects.toThrow(
+      CompanyScopeUnavailableError,
+    );
+    expect(getCredentialHealth().status).toBe("degraded");
+
+    // Operator swaps the ref for an inline token; the next delivery resolves a
+    // scope and `handleWebhook` records the success that clears the fault.
+    const fixed = mkCtx({
+      configByCompany: {
+        [COMPANY_A]: { defaultCompanyId: COMPANY_A, webhookToken: TOKEN },
+      },
+    });
+    const scope = await resolveCompanyScope(fixed.ctx, COMPANY_A);
+    expect(scope?.token).toBe(TOKEN);
+    recordCredentialResolution(COMPANY_A, scope?.token ?? null);
+
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
   });
 });

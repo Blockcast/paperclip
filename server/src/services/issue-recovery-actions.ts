@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -12,6 +12,27 @@ import type {
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
+const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
+// Written by `buildStrandedRecoveryActionEvidence` in recovery/service.ts.
+const LATEST_RUN_AGENT_ID_EVIDENCE_KEY = "latestRunAgentId";
+
+// How long after a recovery transfer the previous owner keeps the comment-only
+// handoff channel opened by BLO-18906 / #827.
+//
+// #827 justified that widening as "state-bounded": active/escalated only, so
+// resolving or cancelling the action lapses it. Measured on 2026-07-31 that bound
+// is nearly inert — 0 of 119 active recovery actions had ever been resolved, and
+// the resulting grants ran to a median age of 9 days (p90 12d, max 51d) across 117
+// issues the grantee did not own. Nothing drains the queue (BLO-19124), so in
+// practice the grant never lapsed at all.
+//
+// 24h is chosen to cover the actual use case and little else: the channel exists so
+// the agent that was just taken off the issue can write down the diagnosis it is
+// still holding. That is a single wake's work, and an agent that has not posted its
+// handoff within a day no longer has a fresh diagnosis worth the standing access.
+// The value is intentionally here rather than inline at the authorization call site
+// so the grant's lifetime is tunable in one place (BLO-20263).
+export const RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -77,6 +98,81 @@ function withSourceScopedWakeHorizonEvidence(
   return next;
 }
 
+// The instant the handoff TTL runs from: the most recent transfer that took the
+// issue away from `previousOwnerAgentId`.
+//
+// This deliberately does NOT anchor on `lastAttemptAt`, which the AC for BLO-20263
+// offered as a candidate. `upsertSourceScopedUnlocked` rewrites `lastAttemptAt` on
+// EVERY sweep of an unresolved action (`lastAttemptAt: input.lastAttemptAt ?? now`),
+// so a TTL measured from it would be pushed forward for as long as the action stays
+// open — which is forever, per the same measurement that motivated the bound. That
+// would ship a TTL that never expires: strictly worse than no TTL, because it reads
+// as bounded.
+//
+// It is also not plain `createdAt`. The active row is REUSED across reassignments
+// (one active row per (company, issue) via `issue_recovery_actions_active_source_uq`),
+// and the sweep rewrites `previousOwnerAgentId` from the issue's current assignee.
+// So a row created 9 days ago can name a previous owner transferred away 10 minutes
+// ago; anchoring on `createdAt` would deny that agent the channel BLO-18906 exists
+// to give it, silently regressing #827 for exactly the case it was built for.
+//
+// Hence a dedicated anchor, refreshed only when `previousOwnerAgentId` actually
+// changes — i.e. on a real transfer, never on ordinary sweep churn. At most one
+// agent holds this grant on an issue at a time, for at most the TTL after the
+// transfer that named them. `createdAt` remains the read-side fallback for rows
+// written before this key existed.
+function readRecoveryHandoffGrantAnchorAt(evidence: unknown): Date | null {
+  if (!isRecord(evidence)) return null;
+  return toValidDate(evidence[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY]);
+}
+
+/**
+ * The agent whose run actually failed, per the sweep's own evidence.
+ *
+ * This is the only field that separates the two shapes which both satisfy
+ * `input.previousOwnerAgentId === existing.ownerAgentId` — see the churn predicate
+ * in `upsertSourceScopedUnlocked`. Absent or malformed (legacy rows, and callers
+ * like `pr_review_non_convergence` that carry no run) reads as `null`, which the
+ * predicate treats as churn: that preserves the existing anchor rather than
+ * refreshing it, so an unidentifiable sweep can never extend a grant.
+ */
+function readLatestRunAgentId(evidence: unknown): string | null {
+  if (!isRecord(evidence)) return null;
+  const value = evidence[LATEST_RUN_AGENT_ID_EVIDENCE_KEY];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function withRecoveryHandoffGrantAnchorEvidence(
+  evidence: unknown,
+  anchorAt: Date | null,
+): Record<string, unknown> {
+  const next = isRecord(evidence) ? { ...evidence } : {};
+  if (anchorAt) {
+    next[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY] = anchorAt.toISOString();
+  }
+  return next;
+}
+
+/**
+ * Whether a recovery action's handoff comment grant is still inside its TTL.
+ *
+ * `createdAt` is the fallback anchor for rows written before the evidence key
+ * existed. Those are the 117 rows this ticket was filed about: all far older than
+ * the TTL, so they lapse on the first request after deploy, which is the point.
+ */
+export function recoveryHandoffGrantIsWithinTtl(input: {
+  evidence: unknown;
+  createdAt: Date | string | null;
+  now?: Date;
+}): boolean {
+  const anchorAt = readRecoveryHandoffGrantAnchorAt(input.evidence) ?? toValidDate(input.createdAt);
+  // No usable anchor at all (unparseable `createdAt` on a row with no evidence key)
+  // means we cannot show the grant is fresh, so it does not hold. Fail closed.
+  if (!anchorAt) return false;
+  const now = input.now ?? new Date();
+  return now.getTime() - anchorAt.getTime() <= RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS;
+}
+
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
     id: row.id,
@@ -124,7 +220,7 @@ function isUniqueRecoveryActionConflict(error: unknown) {
   );
 }
 
-export function issueRecoveryActionService(db: Db) {
+export function issueRecoveryActionService(db: DbOrTransaction) {
   const upsertQueues = new Map<string, Promise<void>>();
 
   async function runExclusiveUpsert<T>(
@@ -257,20 +353,69 @@ export function issueRecoveryActionService(db: Db) {
       const wakeHorizonAt = isNewlyBoundedSequence
         ? (input.timeoutAt ?? null)
         : carriedWakeHorizonAt;
+      // BLO-20263: refresh the handoff-grant anchor only when the transfer actually
+      // moves the issue away from a different source agent. Every sweep passes
+      // `previousOwnerAgentId: issue.assigneeAgentId`, and the prior recovery sweep
+      // reassigns that source issue to `existing.ownerAgentId`. When the input names
+      // that owner, this is recovery seeing its own reassignment, not a fresh handoff
+      // subject. Keep the original previous owner and anchor so recovery-driven
+      // CTO/CEO/manager churn cannot turn the TTL into a sliding window.
+      //
+      // BLO-20263 (review follow-up): owner equality ALONE cannot decide that, because
+      // two different situations produce it and they want opposite outcomes:
+      //
+      //   1. Replay churn. A's run failed, recovery handed the issue to B and reassigned
+      //      it to B. The next sweep re-observes A's SAME failed run and passes the
+      //      current assignee B back as `previousOwnerAgentId`. B never ran, so B is not
+      //      a handoff subject — preserve A and A's anchor.
+      //   2. B genuinely failed after taking over. B ran, B's own run failed, and this
+      //      sweep routes ownership onward to C. Here B is exactly the agent losing
+      //      `allow_self` while holding the freshest diagnosis, so B must become the
+      //      grant subject with a fresh anchor — that is the whole point of #827.
+      //
+      // Both satisfy `input.previousOwnerAgentId === existing.ownerAgentId`. What
+      // separates them is WHOSE run failed: in (1) the failed run belongs to A, in (2)
+      // it belongs to B. So consult the run identity the sweep already records in its
+      // own evidence rather than inferring from owner identity, which cannot tell them
+      // apart. Unknown run agent reads as churn (fail closed: preserve, never refresh).
+      const inputPreviousOwnerAgentId = input.previousOwnerAgentId ?? existing.previousOwnerAgentId;
+      const failedRunAgentId = readLatestRunAgentId(input.evidence);
+      const isFailedRunByCurrentOwner = failedRunAgentId !== null &&
+        failedRunAgentId === input.previousOwnerAgentId;
+      const isRecoveryDrivenOwnerChurn = input.previousOwnerAgentId !== null &&
+        input.previousOwnerAgentId !== undefined &&
+        input.previousOwnerAgentId === existing.ownerAgentId &&
+        !isFailedRunByCurrentOwner;
+      const nextPreviousOwnerAgentId = isRecoveryDrivenOwnerChurn
+        ? existing.previousOwnerAgentId
+        : inputPreviousOwnerAgentId;
+      const isNewHandoffTransfer = nextPreviousOwnerAgentId !== existing.previousOwnerAgentId;
+      const handoffGrantAnchorAt = isNewHandoffTransfer
+        ? now
+        : readRecoveryHandoffGrantAnchorAt(existing.evidence);
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.recoveryIssueId ?? null,
           kind: input.kind,
-          status: "active",
+          // BLO-24662: `escalated` is sticky. A row reaches it only by burning the
+          // creation-anchored `timeoutAt`, and that horizon is fixed for the life of the
+          // action — no owner change restores it (see the `timeoutAt` preservation note
+          // below). Re-setting `active` here would silently un-retire an action on the very
+          // next sweep and put it straight back into the invisible state the transition
+          // exists to end.
+          status: existing.status === "escalated" ? "escalated" : "active",
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
-          previousOwnerAgentId: input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
+          previousOwnerAgentId: nextPreviousOwnerAgentId,
           returnOwnerAgentId: input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
+          evidence: withRecoveryHandoffGrantAnchorEvidence(
+            withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
+            handoffGrantAnchorAt,
+          ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
@@ -335,9 +480,13 @@ export function issueRecoveryActionService(db: Db) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? null,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: withSourceScopedWakeHorizonEvidence(
-            input.evidence ?? {},
-            (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+          evidence: withRecoveryHandoffGrantAnchorEvidence(
+            withSourceScopedWakeHorizonEvidence(
+              input.evidence ?? {},
+              (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+            ),
+            // Creating the row IS the transfer, so it anchors the TTL.
+            now,
           ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
@@ -392,6 +541,71 @@ export function issueRecoveryActionService(db: Db) {
       );
   }
 
+  /**
+   * BLO-24662: retire recovery actions that have burned their creation-anchored horizon.
+   *
+   * `strandedRecoveryWakeAttemptsExhausted` already stops every sweep from waking anyone
+   * for these, but nothing ever wrote that fact to the row, so a spent action kept
+   * reporting `status: "active"` indefinitely. On BLO-20995 that was a
+   * `stranded_assigned_issue` action sitting at `attemptCount: 0 / 5` more than 13h past
+   * its `timeoutAt` and still reading as active — the mechanism that exists to catch
+   * strandings, itself stranded, and invisible precisely because `active` is the healthy
+   * value.
+   *
+   * `escalated` rather than a terminal status, deliberately. It is the status the schema
+   * already reserves for "past automatic recovery, needs a human", the attention feed
+   * already renders it at `severity: high`, and — critically — it stays inside
+   * `ACTIVE_RECOVERY_ACTION_STATUSES`, so the row keeps holding
+   * `issue_recovery_actions_active_source_uq`. A terminal status would free that slot and
+   * let the next sweep open a brand-new action with a fresh budget and a fresh horizon,
+   * reinstating the unbounded re-fire loop BLO-18996 closed.
+   *
+   * Only rows that carry a budget are eligible (`maxAttempts is not null`), matching the
+   * gate in `strandedRecoveryWakeAttemptsExhausted`: the monitor-only and manual-repair
+   * shapes are expected to sit open across many sweeps and a `timeoutAt` on those belongs
+   * to the provider-quota scheduler's `retryAt`, not to a wake horizon.
+   *
+   * The `status` re-check inside the UPDATE is what makes concurrent sweeps safe: only
+   * rows this call actually transitioned come back, so the caller announces once.
+   */
+  async function escalateExpiredWakeHorizons(input: {
+    now?: Date;
+    companyId?: string | null;
+    limit?: number;
+  } = {}): Promise<IssueRecoveryAction[]> {
+    const now = input.now ?? new Date();
+    const limit = Math.max(1, Math.floor(input.limit ?? 200));
+    const candidatePredicates = [
+      eq(issueRecoveryActions.status, "active"),
+      isNotNull(issueRecoveryActions.maxAttempts),
+      isNotNull(issueRecoveryActions.timeoutAt),
+      lte(issueRecoveryActions.timeoutAt, now),
+    ];
+    if (input.companyId) {
+      candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
+    }
+
+    const candidateIds = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(and(...candidatePredicates))
+      .orderBy(asc(issueRecoveryActions.timeoutAt))
+      .limit(limit)
+      .then((rows) => rows.map((row) => row.id));
+    if (candidateIds.length === 0) return [];
+
+    const updated = await db
+      .update(issueRecoveryActions)
+      .set({ status: "escalated", updatedAt: now })
+      .where(and(
+        inArray(issueRecoveryActions.id, candidateIds),
+        eq(issueRecoveryActions.status, "active"),
+      ))
+      .returning();
+
+    return updated.map(toReadModel);
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -434,6 +648,7 @@ export function issueRecoveryActionService(db: Db) {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    escalateExpiredWakeHorizons,
     upsertSourceScoped,
     releaseWakeAttempt,
   };

@@ -196,9 +196,20 @@ async function claimRunWithExternalRuntimeSlotOutcome(
     outcome = { claimed: null, taskBlocked: false };
   }
 
-  recordExternalRuntimeReservationEvent(outcome.claimed ? "reserved" : "contended");
-  refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
   return outcome;
+}
+
+/**
+ * Emit one claim event per dispatch attempt instead of per slot probe.
+ *
+ * A pool claim probes slots until it finds a free one. A probe that encounters
+ * an occupied slot is an internal step of that one dispatch attempt, not a
+ * separate contention event. Recording here keeps the metric aligned with the
+ * externally visible claim result and avoids one aggregate refresh per probe.
+ */
+function recordExternalRuntimeClaimAttempt(db: Db, claimedAt: Date, claimed: boolean) {
+  recordExternalRuntimeReservationEvent(claimed ? "reserved" : "contended");
+  refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
 }
 
 export async function claimRunWithExternalRuntimeSlot(
@@ -215,6 +226,7 @@ export async function claimRunWithExternalRuntimeSlot(
     slotId,
     options,
   );
+  recordExternalRuntimeClaimAttempt(db, claimedAt, Boolean(outcome.claimed));
   return outcome.claimed;
 }
 
@@ -234,9 +246,16 @@ export async function claimRunWithExternalRuntimeSlotPool(
       slotId,
       options,
     );
-    if (outcome.claimed) return outcome.claimed;
-    if (outcome.taskBlocked) return null;
+    if (outcome.claimed) {
+      recordExternalRuntimeClaimAttempt(db, claimedAt, true);
+      return outcome.claimed;
+    }
+    if (outcome.taskBlocked) {
+      recordExternalRuntimeClaimAttempt(db, claimedAt, false);
+      return null;
+    }
   }
+  recordExternalRuntimeClaimAttempt(db, claimedAt, false);
   return null;
 }
 
@@ -588,7 +607,7 @@ export async function recordExternalRuntimeJobIdentity(
   },
 ): Promise<ExternalRuntimeReservation | null> {
   const now = input.now ?? new Date();
-  const reservation = await db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     const existing = await tx
       .select()
       .from(externalRuntimeReservations)
@@ -620,8 +639,12 @@ export async function recordExternalRuntimeJobIdentity(
       await tx
         .update(heartbeatRuns)
         .set({ externalRunId: input.jobName, updatedAt: now })
-        .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
-      return existing;
+        .where(and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.status, "running"),
+          sql`${heartbeatRuns.externalRunId} IS DISTINCT FROM ${input.jobName}`,
+        ));
+      return { reservation: existing, transitioned: false };
     }
     if (existing.state !== "launching" && existing.state !== "launched") {
       throw new Error(`External runtime reservation for run ${input.runId} is not launchable from ${existing.state}`);
@@ -643,13 +666,17 @@ export async function recordExternalRuntimeJobIdentity(
     await tx
       .update(heartbeatRuns)
       .set({ externalRunId: input.jobName, updatedAt: now })
-      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "running")));
-    return updated;
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.status, "running"),
+        sql`${heartbeatRuns.externalRunId} IS DISTINCT FROM ${input.jobName}`,
+      ));
+    return { reservation: updated, transitioned: existing.state !== "launched" };
   });
 
-  if (reservation) {
+  if (outcome?.transitioned) {
     recordExternalRuntimeReservationEvent("launched");
     refreshExternalRuntimeReservationMetricsBestEffort(db, now, "launch");
   }
-  return reservation;
+  return outcome?.reservation ?? null;
 }
