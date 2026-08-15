@@ -28,10 +28,54 @@ Ship a PR a reviewer can land without follow-up clarifying questions. The aim is
 
 ## Branch hygiene before opening
 
-- Rebase or merge from the target base so the diff is current.
+- Rebase from the target base so the diff is current — but **only if the repo has
+  no merge queue**. If it does, skip this entirely and see "Repos with a merge
+  queue" below: syncing a PR there is not merely unnecessary, it can permanently
+  break the PR.
 - Squash WIP commits into reviewable units. Prefer one commit per logical change; do not force one-commit-per-PR if the work is genuinely multi-step.
 - Confirm tests, typecheck, and lint pass locally. Note any deliberate skips in the PR body.
 - Remove debug prints, commented-out code, and `TODO` markers that are not tracked.
+
+## Repos with a merge queue: never sync a PR, enqueue it
+
+Check once, before you touch the branch:
+
+```bash
+gh api repos/<owner>/<repo>/rulesets --jq '.[].id' \
+  | xargs -I{} gh api repos/<owner>/<repo>/rulesets/{} \
+      --jq '.rules[]|select(.type=="merge_queue").parameters.merge_method'
+```
+
+If that prints a merge method, the repo has a queue. Then:
+
+- **Do not call `PUT /repos/<owner>/<repo>/pulls/<n>/update-branch`. Do not
+  `git merge <base>` into the PR branch. Do not use the "Update branch" button.**
+  A PR being `BEHIND` is not a reason to act — the queue rebases each entry onto
+  the current base and runs the required checks itself in `merge_group`.
+- **Enqueue instead**: `gh pr merge <n> --repo <owner>/<repo> --rebase`. The
+  warning `! The merge strategy for <base> is set by the merge queue` means it
+  was enqueued, not that it failed. Read the queue entry back to confirm —
+  `state` and `mergedAt` stay `OPEN` / `null` while it sits in the queue, so
+  neither the exit code nor those fields tell you anything.
+
+Syncing anyway costs you the PR, in two independent ways:
+
+1. `update-branch` gives the PR a head that Actions never runs, so no check
+   suite is created for it. Where required checks are enforced on the PR head,
+   the required context can never report and the PR can never be enqueued.
+   Nothing short of a real tree-changing push recovers it — close/reopen,
+   draft→ready, and re-requesting the suite were all measured to create zero
+   runs.
+2. On a `REBASE` queue, any merge commit on the branch makes it
+   non-rebaseable. `mergeable_state` reads `clean` while `rebaseable` is
+   `false`, and GitHub ejects the entry at head-of-queue before creating a
+   build. Put `rebaseable` in any gate check on such a repo; `mergeable` alone
+   is unsound there.
+
+A genuine conflict (`mergeable_state: dirty`) is the one case needing branch
+work — resolve it by squash-linearizing onto the base, never by merging the
+base in, and prove content is preserved by comparing blob SHAs before you
+force-push.
 
 ## Stacked PRs for dependent work
 
@@ -490,6 +534,10 @@ review had caught.
 - PR description that says "see commits". Reviewers should not need to read the log.
 - Mixing refactor and behavior change in the same PR with no separation in the body.
 - "Address feedback" commits that bundle unrelated edits. One commit per round of feedback is fine; one commit for everything in flight is not.
+- Clicking "Update branch", calling `update-branch`, or merging the base into a
+  PR branch on a repo that has a merge queue, because the PR reads `BEHIND`. The
+  queue already rebases; the sync destroys the head's checks and can leave the PR
+  permanently unenqueueable. See "Repos with a merge queue" above.
 - Force-pushing during active review without telling the reviewer.
 - Writing the body to this skill's generic structure in a repo that ships its own
   PR template. The template's headings win; ours are the fallback. Discovering the
