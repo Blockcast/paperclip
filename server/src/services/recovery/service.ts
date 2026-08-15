@@ -6678,6 +6678,7 @@ export function recoveryService(
           companyId: issueThreadInteractions.companyId,
           issueId: issueThreadInteractions.issueId,
           status: issueThreadInteractions.status,
+          createdAt: issueThreadInteractions.createdAt,
         })
         .from(issueThreadInteractions)
         .where(eq(issueThreadInteractions.status, "pending")),

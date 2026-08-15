@@ -542,7 +542,12 @@ describe("issue graph liveness classifier", () => {
       {
         name: "pending interaction",
         issue: baseReviewIssue,
-        pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending" }],
+        pendingInteractions: [{
+          companyId,
+          issueId: reviewIssueId,
+          status: "pending",
+          createdAt: new Date(),
+        }],
       },
       {
         name: "pending approval",
@@ -570,6 +575,37 @@ describe("issue graph liveness classifier", () => {
 
       expect(findings, testCase.name).toEqual([]);
     }
+  });
+
+  it("flags an in_review issue when its only pending interaction is older than 24 hours", () => {
+    const reviewIssueId = "review-stale-interaction-1";
+    const findings = classifyIssueGraphLiveness({
+      issues: [issue({
+        id: reviewIssueId,
+        identifier: "PAP-2281",
+        title: "Stale confirmation",
+        status: "in_review",
+        assigneeAgentId: coderId,
+        executionState: null,
+      })],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [{
+        companyId,
+        issueId: reviewIssueId,
+        status: "pending",
+        createdAt: new Date("2026-05-31T23:59:59.000Z"),
+      }],
+      now: new Date("2026-06-02T00:00:00.000Z"),
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "in_review_without_action_path",
+      recoveryIssueId: reviewIssueId,
+      reason: expect.stringContaining("older than 24h"),
+      recommendedAction: expect.stringContaining("resolve or withdraw"),
+    });
   });
 
   it("still flags a stalled in_review issue when its blocker has an active run", () => {
