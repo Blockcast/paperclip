@@ -1315,6 +1315,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       maxAttempts: defaultRecoveryActionMaxAttempts,
     });
 
+    // BLO-19124: every wake_owner action is created bounded. This assertion
+    // previously read `maxAttempts: null`, which pinned the defect in place —
+    // an unbounded action fires one wake_owner, parks the issue in `blocked`,
+    // and is then invisible to the only sweep that could retry it.
+    expect(action.maxAttempts).not.toBeNull();
+    expect(action.timeoutAt).not.toBeNull();
+    expect(new Date(action.timeoutAt as Date).getTime()).toBeGreaterThan(Date.now());
+
     expect(action.evidence).toMatchObject({
       sourceIssueId: input.issueId,
       previousStatus: input.previousStatus,

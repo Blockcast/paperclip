@@ -505,7 +505,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1,
+          attemptCount: isNewOwnerSequence ? 1 : sql`${issueRecoveryActions.attemptCount} + 1`,
           maxAttempts: inputMaxAttempts,
           // BLO-18996: PRESERVE the existing horizon, once the row is actually bounded.
           // `timeoutAt` is the one bound on this row that owner churn cannot reset, and it
@@ -628,6 +628,208 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   }
 
   /**
+   * Candidate pool for the recovery reaper (BLO-19124).
+   *
+   * Returns live actions oldest-attempt-first across all companies. Due-ness,
+   * backoff and bound checks are applied by the caller in TypeScript rather
+   * than in SQL: the live set is small (low hundreds), the arithmetic depends
+   * on config the DB does not know, and keeping it in TS makes the policy
+   * directly unit-testable without a fixed clock in the query.
+   *
+   * Rows with a NULL lastAttemptAt are excluded — there is nothing to measure a
+   * backoff from, and the upsert path always writes one.
+   *
+   * The SQL predicate keeps the LIMIT from being occupied by monitor/manual/board
+   * actions the reaper will never act on.
+   */
+  async function listActiveCandidatesForReap(limit: number): Promise<IssueRecoveryAction[]> {
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          isNotNull(issueRecoveryActions.lastAttemptAt),
+          sql`${issueRecoveryActions.wakePolicy} ->> 'type' = 'wake_owner'`,
+        ),
+      )
+      .orderBy(asc(issueRecoveryActions.lastAttemptAt))
+      .limit(limit);
+    return rows.map(toReadModel);
+  }
+
+  function companyListPredicates(input: {
+    companyId: string;
+    kind?: IssueRecoveryActionKind | null;
+    statuses?: IssueRecoveryActionStatus[] | null;
+    ownerAgentId?: string | null;
+    outcome?: IssueRecoveryActionOutcome | null;
+  }) {
+    const predicates = [eq(issueRecoveryActions.companyId, input.companyId)];
+    if (input.kind) predicates.push(eq(issueRecoveryActions.kind, input.kind));
+    if (input.statuses && input.statuses.length > 0) {
+      predicates.push(inArray(issueRecoveryActions.status, input.statuses));
+    }
+    if (input.ownerAgentId) {
+      predicates.push(eq(issueRecoveryActions.ownerAgentId, input.ownerAgentId));
+    }
+    if (input.outcome) predicates.push(eq(issueRecoveryActions.outcome, input.outcome));
+    return predicates;
+  }
+
+  /**
+   * Row-level listing, including terminal rows. The pre-existing surfaces are
+   * active-only by construction (getActiveForIssue / listActiveForIssues) or
+   * aggregate-only (recovery-observability), so there was no way to ask "which
+   * actions, whose, and how old" — which is what draining a backlog needs.
+   */
+  async function listForCompany(input: {
+    companyId: string;
+    kind?: IssueRecoveryActionKind | null;
+    statuses?: IssueRecoveryActionStatus[] | null;
+    ownerAgentId?: string | null;
+    outcome?: IssueRecoveryActionOutcome | null;
+    limit: number;
+    offset?: number;
+  }): Promise<IssueRecoveryAction[]> {
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(...companyListPredicates(input)))
+      .orderBy(desc(issueRecoveryActions.createdAt))
+      .limit(input.limit)
+      .offset(input.offset ?? 0);
+    return rows.map(toReadModel);
+  }
+
+  async function countForCompany(input: {
+    companyId: string;
+    kind?: IssueRecoveryActionKind | null;
+    statuses?: IssueRecoveryActionStatus[] | null;
+    ownerAgentId?: string | null;
+    outcome?: IssueRecoveryActionOutcome | null;
+  }): Promise<number> {
+    const [row] = await db
+      .select({ value: sql<number>`count(*)::int` })
+      .from(issueRecoveryActions)
+      .where(and(...companyListPredicates(input)));
+    return row?.value ?? 0;
+  }
+
+  /**
+   * Records a reaper re-arm. Conditioned on the row still being live and, when
+   * provided, still at the attempt count the reaper listed. That compare-and-set
+   * makes competing reapers converge on one recorded attempt for a candidate
+   * without relying on an advisory lock.
+   */
+  async function recordReapAttempt(
+    actionId: string,
+    expectedAttemptCount?: number,
+    attemptedAt: Date = new Date(),
+  ): Promise<IssueRecoveryAction | null> {
+    const now = attemptedAt;
+    const predicates = [
+      eq(issueRecoveryActions.id, actionId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+    ];
+    if (expectedAttemptCount !== undefined) {
+      predicates.push(eq(issueRecoveryActions.attemptCount, expectedAttemptCount));
+    }
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+        lastAttemptAt: now,
+        updatedAt: now,
+      })
+      .where(and(...predicates))
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
+  /**
+   * Records that the reaper inspected a live action but deliberately did not
+   * consume an attempt. This preserves the "do not burn retries for a
+   * legitimate blocker" behavior while still moving the row out of the oldest
+   * candidate window until the next backoff interval.
+   */
+  async function recordReapNoop(
+    actionId: string,
+    expectedAttemptCount?: number,
+    attemptedAt: Date = new Date(),
+  ): Promise<IssueRecoveryAction | null> {
+    const now = attemptedAt;
+    const predicates = [
+      eq(issueRecoveryActions.id, actionId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+    ];
+    if (expectedAttemptCount !== undefined) {
+      predicates.push(eq(issueRecoveryActions.attemptCount, expectedAttemptCount));
+    }
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        lastAttemptAt: now,
+        updatedAt: now,
+      })
+      .where(and(...predicates))
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
+  /**
+   * Terminates a single action by id. Used by the reaper for `expired`; unlike
+   * resolveActiveForIssue this targets one row rather than "whatever is active
+   * for this issue".
+   *
+   * Targeting the id is NOT on its own enough to avoid terminating a recovery
+   * episode the reaper never observed, because a fresh escalation does not
+   * create a fresh row: `issue_recovery_actions_active_source_uq` allows only
+   * one active row per source issue, so `upsertSourceScopedUnlocked` REFRESHES
+   * this same id in place — new owner, bumped `attemptCount`, cleared
+   * `outcome`/`resolvedAt`. The reaper reads a candidate at attempt N, restores
+   * the source issue (an issue UPDATE plus a comment insert, so a real window),
+   * and only then terminates. A refresh landing inside that window leaves a
+   * stale reaper resolving a live, newly-owned action: the issue keeps the live
+   * status the reaper gave it, but the new owner's recovery is silently gone,
+   * and the sweep that would notice sees no active row.
+   *
+   * `expectedAttemptCount` closes that window with the same compare-and-set
+   * predicate `recordReapAttempt`/`recordReapNoop` already use — the caller
+   * passes the attempt count it listed, and a refreshed row simply fails to
+   * match. Optional so non-reaper callers that legitimately mean "terminate
+   * whatever is active under this id" keep the unconditional behaviour.
+   */
+  async function terminateById(input: {
+    actionId: string;
+    status: Extract<IssueRecoveryActionStatus, "resolved" | "cancelled">;
+    outcome: IssueRecoveryActionOutcome;
+    resolutionNote?: string | null;
+    expectedAttemptCount?: number;
+  }): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const predicates = [
+      eq(issueRecoveryActions.id, input.actionId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+    ];
+    if (input.expectedAttemptCount !== undefined) {
+      predicates.push(eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount));
+    }
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        status: input.status,
+        outcome: input.outcome,
+        resolutionNote: input.resolutionNote ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(...predicates))
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
+  /**
    * BLO-24662: retire recovery actions that have burned their creation-anchored horizon.
    *
    * `strandedRecoveryWakeAttemptsExhausted` already stops every sweep from waking anyone
@@ -733,6 +935,12 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   return {
     getActiveForIssue,
     listActiveForIssues,
+    listActiveCandidatesForReap,
+    listForCompany,
+    countForCompany,
+    recordReapAttempt,
+    recordReapNoop,
+    terminateById,
     resolveActiveForIssue,
     escalateExpiredWakeHorizons,
     upsertSourceScoped,

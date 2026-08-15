@@ -19464,6 +19464,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function reapRecoveryActions() {
+    return recovery.reapRecoveryActions();
+  }
+
   // BLO-21621: a queued run can outlive an issue lock that once named it. A
   // NULL lock pointer is not evidence of that defect: normal lazy-lock queue
   // rows leave executionRunId NULL until claim, and can legitimately wait for
@@ -30380,6 +30384,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    reapRecoveryActions,
 
     sweepStaleIssueLocks,
 

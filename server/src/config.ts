@@ -7,6 +7,10 @@ import { config as loadDotenv, parse as parseDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
 import {
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  DEFAULT_RECOVERY_ACTION_TIMEOUT_MS,
+} from "./services/recovery/recovery-action-bounds.js";
+import {
   AUTH_BASE_URL_MODES,
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
@@ -118,11 +122,22 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
-  // Bounds stamped on newly-created wake_owner recovery actions. They remain
-  // attached to the action for its lifetime, so a later config change cannot
-  // extend a recovery attempt that has already started.
+  // Bounds for source-scoped recovery actions (BLO-19124). Before these
+  // existed an action fired exactly one wake_owner and then lived forever:
+  // escalation parks the source issue in `blocked`, and the only sweep that
+  // could re-attempt it (reconcileStrandedAssignedIssues) selects
+  // todo/in_progress/in_review — so escalation evicted its own issue from the
+  // one retry path. The reaper below re-arms unresolved actions on a backoff
+  // and terminates them into outcome="expired" once a bound is reached.
+  recoveryActionRetryBaseMs: number;
+  recoveryActionRetryMaxMs: number;
   recoveryActionMaxAttempts: number;
   recoveryActionTimeoutMs: number;
+  // Burst safety: a single bulk event once created 59 actions for one owner in
+  // a day. The reaper restores at most this many issues per owner per tick so
+  // recovery never depends on an owner absorbing N simultaneous wakes.
+  recoveryActionReapPerOwnerPerTick: number;
+  recoveryActionReapPerTick: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -502,17 +517,40 @@ export function loadConfig(): Config {
         ? false
         : process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    recoveryActionRetryBaseMs: Math.max(
+      60_000,
+      Number(process.env.RECOVERY_ACTION_RETRY_BASE_MS) || 30 * 60_000,
+    ),
+    recoveryActionRetryMaxMs: Math.max(
+      60_000,
+      Number(process.env.RECOVERY_ACTION_RETRY_MAX_MS) || 6 * 60 * 60_000,
+    ),
+    // Both env families are honoured, with the reaper-specific name taking
+    // precedence: these bounds are stamped onto the row at escalation and are
+    // then read by BOTH the reaper and escalation's own runaway backstop
+    // (`strandedRecoveryWakeAttemptsExhausted`). Defaulting to the
+    // STRANDED_RECOVERY_* values keeps a deployment that only sets the older
+    // knob behaving exactly as it did before the reaper existed, rather than
+    // silently widening the BLO-18996 wake horizon.
     recoveryActionMaxAttempts: Math.max(
       1,
-      // Preserve the existing wake-owner budget unless an operator explicitly
-      // opts into a new bound through the configurable setting.
-      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS) || 5,
+      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS)
+        || Number(process.env.STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS)
+        || DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
     ),
     recoveryActionTimeoutMs: Math.max(
       60 * 60_000,
-      // Preserve the existing six-hour horizon for deployments that do not
-      // supply an override.
-      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 6 * 60 * 60_000,
+      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS)
+        || Number(process.env.STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS)
+        || DEFAULT_RECOVERY_ACTION_TIMEOUT_MS,
+    ),
+    recoveryActionReapPerOwnerPerTick: Math.max(
+      1,
+      Number(process.env.RECOVERY_ACTION_REAP_PER_OWNER_PER_TICK) || 2,
+    ),
+    recoveryActionReapPerTick: Math.max(
+      1,
+      Number(process.env.RECOVERY_ACTION_REAP_PER_TICK) || 25,
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:

@@ -338,6 +338,11 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "blocked",
   "escalated",
   "cancelled",
+  // Terminal outcome written by the recovery reaper when an action exhausts its
+  // attempt/timeout bound without the owner resolving it. Distinct from
+  // "cancelled" (which means the action went stale and was folded away) so the
+  // drain rate can separate "recovery worked" from "recovery gave up".
+  "expired",
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 
