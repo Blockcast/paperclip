@@ -33,6 +33,11 @@ import {
   type SlackMessage,
 } from "./slack-api.js";
 import { registerTool, registerTools } from "./tools.js";
+import {
+  withStateLock,
+  watchQueueLockKey,
+  costAccumulatorLockKey,
+} from "./state-lock.js";
 import { SlackAdapter } from "./adapter.js";
 import {
   routeMessageToAgent,
@@ -1248,98 +1253,109 @@ const plugin = definePlugin({
       const companies = await listTargetCompanies(ctx);
       let posted = false;
       for (const company of companies) {
-        // Check the flag before resolving anything. Secret resolution draws on
-        // a shared budget, so a company that has the digest switched off should
-        // not cost one every day just to be skipped.
-        if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
-        const scope = await resolveCompanyJobScope(
-          ctx,
-          company.id,
-          "daily-digest",
-        );
-        if (!scope) continue;
-        const { config, token } = scope;
-        const channelId = await resolveChannel(
-          ctx,
-          company.id,
-          config.defaultChannelId,
-        );
-        if (!channelId) continue;
-        const issues = await ctx.issues.list({
-          companyId: company.id,
-          limit: 200,
-          offset: 0,
-        });
-        const now = new Date();
-        const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        let tasksCompleted = 0;
-        let tasksCreated = 0;
-        for (const issue of issues) {
-          const updated = new Date(issue.updatedAt);
-          const created = new Date(issue.createdAt);
-          if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
-          if (created >= dayAgo) tasksCreated++;
-        }
-        const agents = await ctx.agents.list({
-          companyId: company.id,
-          limit: 100,
-          offset: 0,
-        });
-        const agentsActive = agents.filter(
-          (a) => a.status === "active" || a.status === "running",
-        ).length;
-        const dateKey = now.toISOString().slice(0, 10);
-        const dailyCost = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        });
-        const totalCost = dailyCost
-          ? String((dailyCost as number).toFixed(2))
-          : "0.00";
-        const topAgentCosts = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-        });
-        let topAgent = "";
-        if (topAgentCosts && typeof topAgentCosts === "object") {
-          const costs = topAgentCosts as Record<string, number>;
-          let maxCost = 0;
-          for (const [name, cost] of Object.entries(costs)) {
-            if (cost > maxCost) {
-              maxCost = cost;
-              topAgent = name;
+        // Each company's whole body is isolated: an unreachable Slack channel,
+        // a revoked token or a failing host call for one tenant must not abort
+        // the loop and silently deny every later tenant its digest (BLO-23143,
+        // Ally finding 1 on #996).
+        try {
+          // Check the flag before resolving anything. Secret resolution draws on
+          // a shared budget, so a company that has the digest switched off should
+          // not cost one every day just to be skipped.
+          if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
+          const scope = await resolveCompanyJobScope(
+            ctx,
+            company.id,
+            "daily-digest",
+          );
+          if (!scope) continue;
+          const { config, token } = scope;
+          const channelId = await resolveChannel(
+            ctx,
+            company.id,
+            config.defaultChannelId,
+          );
+          if (!channelId) continue;
+          const issues = await ctx.issues.list({
+            companyId: company.id,
+            limit: 200,
+            offset: 0,
+          });
+          const now = new Date();
+          const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          let tasksCompleted = 0;
+          let tasksCreated = 0;
+          for (const issue of issues) {
+            const updated = new Date(issue.updatedAt);
+            const created = new Date(issue.createdAt);
+            if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
+            if (created >= dayAgo) tasksCreated++;
+          }
+          const agents = await ctx.agents.list({
+            companyId: company.id,
+            limit: 100,
+            offset: 0,
+          });
+          const agentsActive = agents.filter(
+            (a) => a.status === "active" || a.status === "running",
+          ).length;
+          const dateKey = now.toISOString().slice(0, 10);
+          const dailyCost = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          });
+          const totalCost = dailyCost
+            ? String((dailyCost as number).toFixed(2))
+            : "0.00";
+          const topAgentCosts = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          });
+          let topAgent = "";
+          if (topAgentCosts && typeof topAgentCosts === "object") {
+            const costs = topAgentCosts as Record<string, number>;
+            let maxCost = 0;
+            for (const [name, cost] of Object.entries(costs)) {
+              if (cost > maxCost) {
+                maxCost = cost;
+                topAgent = name;
+              }
             }
           }
+          await postMessage(
+            ctx,
+            token,
+            channelId,
+            formatDailyDigest({
+              tasksCompleted,
+              tasksCreated,
+              agentsActive,
+              totalCost,
+              topAgent,
+            }),
+          );
+          posted = true;
+          // Clean up previous day's cost state
+          const yesterday = new Date(now.getTime() - 86400000)
+            .toISOString()
+            .slice(0, 10);
+          await ctx.state.delete({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyCost(yesterday),
+          });
+          await ctx.state.delete({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
+          });
+        } catch (err) {
+          ctx.logger.error(
+            "Daily digest failed for company; continuing with remaining companies",
+            { companyId: company.id, err },
+          );
         }
-        await postMessage(
-          ctx,
-          token,
-          channelId,
-          formatDailyDigest({
-            tasksCompleted,
-            tasksCreated,
-            agentsActive,
-            totalCost,
-            topAgent,
-          }),
-        );
-        posted = true;
-        // Clean up previous day's cost state
-        const yesterday = new Date(now.getTime() - 86400000)
-          .toISOString()
-          .slice(0, 10);
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(yesterday),
-        });
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
-        });
       }
       if (posted) {
         ctx.logger.info("Daily digest posted to Slack");
@@ -1358,36 +1374,46 @@ const plugin = definePlugin({
       if (cost <= 0) return;
       if (!(await isDailyDigestEnabled(ctx, event.companyId))) return;
       const dateKey = new Date().toISOString().slice(0, 10);
-      const currentTotal = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.dailyCost(dateKey),
-      });
-      await ctx.state.set(
-        {
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        },
-        ((currentTotal as number | null) ?? 0) + cost,
-      );
       const agentName = String(
         payload.agentName ?? payload.name ?? event.entityId,
       );
-      const agentCosts = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-      });
-      const costs = (agentCosts as Record<string, number> | null) ?? {};
-      costs[agentName] = (costs[agentName] ?? 0) + cost;
-      await ctx.state.set(
-        {
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+      // Both accumulators are read-modify-write against a state API with no
+      // atomic increment, so concurrent cost events for one company would
+      // otherwise each read the same total and the last `set` would win —
+      // silently under-reporting the digest (BLO-23143, Ally finding 3 on
+      // #996). Serialize the whole sequence per company+day.
+      await withStateLock(
+        costAccumulatorLockKey(event.companyId, dateKey),
+        async () => {
+          const currentTotal = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          });
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: STATE_KEYS.dailyCost(dateKey),
+            },
+            ((currentTotal as number | null) ?? 0) + cost,
+          );
+          const agentCosts = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          });
+          const costs = (agentCosts as Record<string, number> | null) ?? {};
+          costs[agentName] = (costs[agentName] ?? 0) + cost;
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+            },
+            costs,
+          );
         },
-        costs,
       );
     });
     // Collect watchable events before the bootstrap credential gate below.
@@ -1407,33 +1433,40 @@ const plugin = definePlugin({
     ] as const;
     for (const eventType of watchableEvents) {
       ctx.events.on(eventType, async (event) => {
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        // Keep last 100 events
-        recentEvents.push({
-          eventType: event.eventType,
-          payload: event.payload as Record<string, unknown>,
-        });
-        if (recentEvents.length > 100) {
-          recentEvents.splice(0, recentEvents.length - 100);
-        }
-        await ctx.state.set(
-          {
+        // Append under the company's queue lock. Without it two events
+        // arriving together both read the same array and the second `set`
+        // drops the first (BLO-23143, Ally finding 2 on #996). The drain in
+        // check-watches takes the same lock, so an append can never be
+        // clobbered by the queue reset either.
+        await withStateLock(watchQueueLockKey(event.companyId), async () => {
+          const recentEventsRaw = await ctx.state.get({
             scopeKind: "company",
             scopeId: event.companyId,
             stateKey: "recent-watch-events",
-          },
-          recentEvents,
-        );
+          });
+          const recentEvents = Array.isArray(recentEventsRaw)
+            ? (recentEventsRaw as Array<{
+                eventType: string;
+                payload: Record<string, unknown>;
+              }>)
+            : [];
+          // Keep last 100 events
+          recentEvents.push({
+            eventType: event.eventType,
+            payload: event.payload as Record<string, unknown>,
+          });
+          if (recentEvents.length > 100) {
+            recentEvents.splice(0, recentEvents.length - 100);
+          }
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: "recent-watch-events",
+            },
+            recentEvents,
+          );
+        });
       });
     }
     // Escalation timeout job
@@ -1532,29 +1565,70 @@ const plugin = definePlugin({
         );
         if (!scope) continue;
         const { token } = scope;
-        // Get recent events from state (populated by event listeners below)
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        if (recentEvents.length > 0) {
-          await checkWatches(ctx, token, company.id, recentEvents);
-          // Clear after processing
-          await ctx.state.set(
-            {
+        // Atomic swap: take the queue and reset it in one locked step, then
+        // do the slow work outside the lock. Reading, awaiting checkWatches
+        // and only then writing `[]` — as this did — destroys every event that
+        // arrives while checkWatches is invoking agents and posting to Slack
+        // (BLO-23143, Ally finding 2 on #996).
+        const recentEvents = await withStateLock(
+          watchQueueLockKey(company.id),
+          async () => {
+            const recentEventsRaw = await ctx.state.get({
               scopeKind: "company",
               scopeId: company.id,
               stateKey: "recent-watch-events",
-            },
-            [],
-          );
+            });
+            const drained = Array.isArray(recentEventsRaw)
+              ? (recentEventsRaw as Array<{
+                  eventType: string;
+                  payload: Record<string, unknown>;
+                }>)
+              : [];
+            if (drained.length > 0) {
+              await ctx.state.set(
+                {
+                  scopeKind: "company",
+                  scopeId: company.id,
+                  stateKey: "recent-watch-events",
+                },
+                [],
+              );
+            }
+            return drained;
+          },
+        );
+        if (recentEvents.length > 0) {
+          try {
+            await checkWatches(ctx, token, company.id, recentEvents);
+          } catch (err) {
+            // The swap above already emptied the queue, so a failure here
+            // would otherwise drop the whole batch — the old read-then-clear
+            // order at least left it in place. Put it back, ahead of anything
+            // that arrived meanwhile, and let the next tick retry it.
+            await withStateLock(watchQueueLockKey(company.id), async () => {
+              const currentRaw = await ctx.state.get({
+                scopeKind: "company",
+                scopeId: company.id,
+                stateKey: "recent-watch-events",
+              });
+              const current = Array.isArray(currentRaw)
+                ? (currentRaw as typeof recentEvents)
+                : [];
+              const restored = [...recentEvents, ...current];
+              await ctx.state.set(
+                {
+                  scopeKind: "company",
+                  scopeId: company.id,
+                  stateKey: "recent-watch-events",
+                },
+                restored.slice(-100),
+              );
+            });
+            ctx.logger.error(
+              "check-watches failed for company; re-queued its events",
+              { companyId: company.id, err },
+            );
+          }
         }
       }
     });
