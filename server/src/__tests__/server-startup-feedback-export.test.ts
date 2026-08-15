@@ -184,6 +184,10 @@ vi.mock("@paperclipai/db", () => ({
   getPostgresDataDirectory: vi.fn(),
   inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
   applyPendingMigrations: vi.fn(),
+  // BLO-21526 wired this into every startup migration pass (server/src/index.ts).
+  // Returns the deferred indexes it had to build; an empty array is the
+  // steady-state "nothing pending" answer and keeps the caller's loop a no-op.
+  ensurePendingConcurrentIndexes: vi.fn(async () => []),
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
