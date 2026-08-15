@@ -21,6 +21,8 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
+  issueRecoveryActions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -30,6 +32,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { recoveryService } from "../services/recovery/service.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -871,6 +874,26 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
       (event) => event.eventType === "lifecycle" && (event.message ?? "").includes("terminal status"),
     );
     expect(cancellationEvents).toHaveLength(1);
+
+    // BLO-25411: the cancellation above is an expected dispatch race, not
+    // stranded work. Recovery previously read the cancelled run as a lost
+    // execution path and moved the issue to `blocked` + reassigned it, undoing
+    // an intentional terminal disposition. `d7c28c3a0` made the sweep treat the
+    // marker as stale lifecycle evidence; this pins the terminal half of that
+    // contract so the issue is never reopened, reassigned, or commented on.
+    // The reopened-after-terminal-cancellation half is covered by
+    // "re-dispatches an issue reopened after terminal dispatch cancellation"
+    // in issue-recovery-actions.test.ts.
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const recoveryResult = await recovery.reconcileStrandedAssignedIssues();
+    expect(recoveryResult.escalated).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(finalIssue).toMatchObject({ status: "done", assigneeAgentId: agentId });
   }, 60_000);
 
   /**
