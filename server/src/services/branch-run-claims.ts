@@ -1,6 +1,6 @@
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { branchRunClaims, heartbeatRuns } from "@paperclipai/db";
+import { branchRunClaims, externalRuntimeReservations, heartbeatRuns } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
 import { logger } from "../middleware/logger.js";
 
@@ -125,6 +125,37 @@ async function getHeartbeatRunState(
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) ? "terminal" : "live";
 }
 
+/**
+ * BLO-21602 (Ally round-3, Important #2): a terminal run STATUS does not mean
+ * the worker is gone. `cancelled` / `timed_out` / `interrupted` are imposed
+ * from outside, so the row goes terminal while the local process or K8s Job
+ * is still alive and can still write to the branch. Handing the branch to a
+ * sibling at that moment reproduces the divergent-commit hazard this table
+ * exists to prevent.
+ *
+ * The trustworthy "worker is actually gone" signal already maintained by this
+ * codebase is the run's external runtime reservation: the reconciler in
+ * heartbeat.ts only releases one after verifying by exact Job name + uid that
+ * the Job is genuinely gone or finished, and explicitly skips any reservation
+ * whose Job is still active (BLO-18995). So an unreleased reservation means
+ * "may still be running" and its absence means "quiesced".
+ *
+ * Runs with no reservation at all (in-process adapters) are treated as
+ * quiesced -- there is no external Job to outlive the row.
+ */
+async function isHolderRunQuiesced(db: BranchClaimReadDb, runId: string): Promise<boolean> {
+  const reservation = await db
+    .select({ id: externalRuntimeReservations.id })
+    .from(externalRuntimeReservations)
+    .where(and(
+      eq(externalRuntimeReservations.runId, runId),
+      isNull(externalRuntimeReservations.releasedAt),
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return reservation === null;
+}
+
 export async function acquireBranchRunClaim(
   db: Db,
   input: {
@@ -169,11 +200,41 @@ export async function acquireBranchRunClaim(
           throw new BranchClaimConflictError(input.runId, input.branchKey, existing.heartbeatRunId, existing.issueId);
         }
 
+        // BLO-21602 (Ally round-3, Important #2): the holder's row is
+        // terminal, but if it got there by external imposition
+        // (cancelled / timed_out / interrupted) the trigger only stamped
+        // releasePendingAt -- its worker may still be alive and writing to
+        // this branch. Superseding here would hand the branch to this run
+        // mid-write, which is the divergent-commit hazard itself.
+        //
+        // Hold the branch until either the holder is quiesced (its external
+        // runtime reservation is gone -- see isHolderRunQuiesced) or its
+        // lease expires. A terminal run renews nothing, so the lease is a
+        // hard upper bound and the branch cannot deadlock behind a worker
+        // that never reports. The refused challenger is deferred back to
+        // `queued` with backoff by deferRunForBranchClaimConflict, so it
+        // simply retries after the grace window.
+        const leaseExpired = existing.expiresAt.getTime() <= now.getTime();
+        if (existing.releasePendingAt && !leaseExpired) {
+          if (!(await isHolderRunQuiesced(tx, existing.heartbeatRunId))) {
+            throw new BranchClaimConflictError(
+              input.runId,
+              input.branchKey,
+              existing.heartbeatRunId,
+              existing.issueId,
+            );
+          }
+        }
+
         await tx
           .update(branchRunClaims)
           .set({
             releasedAt: now,
-            releaseReason: holderState === "missing" ? "holder_run_missing" : "holder_run_terminal",
+            releaseReason: holderState === "missing"
+              ? "holder_run_missing"
+              : existing.releasePendingAt
+                ? (leaseExpired ? "holder_release_pending_lease_expired" : "holder_quiesced")
+                : "holder_run_terminal",
             updatedAt: now,
           })
           .where(and(eq(branchRunClaims.id, existing.id), isNull(branchRunClaims.releasedAt)));
@@ -186,6 +247,7 @@ export async function acquireBranchRunClaim(
             claimingRunId: input.runId,
             claimingIssueId: input.issueId,
             holderState,
+            holderReleasePendingAt: existing.releasePendingAt?.toISOString() ?? null,
             previousExpiresAt: existing.expiresAt.toISOString(),
           },
           "Superseded a stale branch run claim",

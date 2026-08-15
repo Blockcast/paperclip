@@ -29,6 +29,12 @@ export const branchRunClaims = pgTable(
     acquiredAt: timestamp("acquired_at", { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     lastRenewedAt: timestamp("last_renewed_at", { withTimezone: true }).notNull().defaultNow(),
+    // BLO-21602: set when the holding run went terminal by EXTERNAL
+    // imposition (cancelled / timed_out / interrupted) and its worker may
+    // therefore still be alive and writing to the branch. The claim is still
+    // held (releasedAt stays null) until quiescence is confirmed or the lease
+    // expires -- see release_branch_run_claim_for_terminal_run().
+    releasePendingAt: timestamp("release_pending_at", { withTimezone: true }),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     releaseReason: text("release_reason"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
