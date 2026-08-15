@@ -257,6 +257,10 @@ import {
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import {
+  collectDueExecutionWorkspaces,
+  finalizeRunScopedExecutionWorkspace,
+} from "./execution-workspace-cleanup.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -6189,7 +6193,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
       requestedShouldReuseExisting &&
       input.existingExecutionWorkspaceStatus !== null &&
       input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      !["cleanup_pending", "cleanup_failed", "archived"].includes(input.existingExecutionWorkspaceStatus),
   };
 }
 
@@ -22184,6 +22188,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the finally block below must not treat this exit as a completion.
     let abandonedForLiveOwnJob = false;
     let runScratch: HeartbeatRunScratch | null = null;
+    let runScopedExecutionWorkspaceId: string | null = null;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -23228,7 +23233,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               providerRef: executionWorkspace.worktreePath,
               lastUsedAt: new Date(),
               openedAt: new Date(),
-              metadata: nextExecutionWorkspaceMetadata,
+              metadata:
+                executionWorkspace.created &&
+                parseObject(hostExecutionWorkspaceConfig.workspaceStrategy).runScope === "per_run"
+                  ? { ...nextExecutionWorkspaceMetadata, cleanupOwnerRunId: run.id }
+                  : nextExecutionWorkspaceMetadata,
             })
           : null;
     } catch (error) {
@@ -23320,6 +23329,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
     await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
+    if (
+      persistedExecutionWorkspace &&
+      executionWorkspace.created &&
+      parseObject(hostExecutionWorkspaceConfig.workspaceStrategy).runScope === "per_run"
+    ) {
+      runScopedExecutionWorkspaceId = persistedExecutionWorkspace.id;
+    }
     await recordWorkspaceConfigFreshnessOperation({
       recorder: workspaceOperationRecorder,
       runId: run.id,
@@ -25765,6 +25781,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               failureReason: latestRun?.error ?? undefined,
             });
             await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+            if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+              try {
+                const cleanupSweep = runScopedExecutionWorkspaceId
+                  ? await finalizeRunScopedExecutionWorkspace({
+                    db,
+                    companyId: run.companyId,
+                    executionWorkspaceId: runScopedExecutionWorkspaceId,
+                    runId: run.id,
+                  })
+                  : await collectDueExecutionWorkspaces({ db, companyId: run.companyId });
+                logger.info(
+                  { runId: run.id, executionWorkspaceId: runScopedExecutionWorkspaceId, ...cleanupSweep },
+                  "run-scoped execution workspace cleanup sweep completed",
+                );
+              } catch (cleanupError) {
+                logger.warn(
+                  { err: cleanupError, runId: run.id, executionWorkspaceId: runScopedExecutionWorkspaceId },
+                  "run-scoped execution workspace cleanup sweep failed",
+                );
+              }
+            }
             if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
               const scratchForCleanup = runScratch;
               let scratchCleanup: Awaited<ReturnType<typeof cleanupHeartbeatRunScratch>> | null = null;

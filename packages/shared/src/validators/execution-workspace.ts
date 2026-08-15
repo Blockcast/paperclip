@@ -8,6 +8,7 @@ export const executionWorkspaceStatusSchema = z.enum([
   "active",
   "idle",
   "in_review",
+  "cleanup_pending",
   "archived",
   "cleanup_failed",
 ]);
