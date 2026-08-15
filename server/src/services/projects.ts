@@ -570,6 +570,59 @@ export function resolveProjectNameForUniqueShortname(
 }
 
 /**
+ * Walk candidate workspaces in creation order and promote the first one that
+ * still exists, retrying past rows that were concurrently removed.
+ *
+ * Termination (BLO-26184): every pass marks exactly one id as tried, and the
+ * next candidate is always drawn from the *untried* remainder, so a project
+ * holding N workspaces can burn at most N passes. `maxAttempts` is therefore
+ * not the real bound — it is a safety valve against an unbounded stream of
+ * concurrent INSERTs, deliberately set far above any plausible workspace count
+ * so that genuine candidate exhaustion always wins the race to terminate.
+ *
+ * The previous implementation capped this at 5. That cap was low enough to be
+ * reached by real candidates: a project with >5 workspaces whose promotions
+ * kept losing the race would exit the loop with `candidateId` still pointing at
+ * an untried row, having already demoted everything — and the caller's warning
+ * only covered the exhausted case, so it exited silently. Hence the split
+ * `result` below: callers must be able to tell "nothing left to promote" from
+ * "gave up with work remaining".
+ */
+export async function promoteFirstSurvivingWorkspace(input: {
+  initialCandidateId: string;
+  tryPromote: (workspaceId: string) => Promise<boolean>;
+  listCandidateIds: () => Promise<string[]>;
+  maxAttempts?: number;
+}): Promise<{
+  result: "promoted" | "candidates_exhausted" | "attempt_cap_reached";
+  promotedId: string | null;
+  triedIds: string[];
+}> {
+  const maxAttempts = input.maxAttempts ?? 1_000;
+  const triedIds = new Set<string>();
+  let candidateId: string | null = input.initialCandidateId;
+  let attempts = 0;
+
+  while (candidateId && attempts < maxAttempts) {
+    attempts += 1;
+    triedIds.add(candidateId);
+
+    if (await input.tryPromote(candidateId)) {
+      return { result: "promoted", promotedId: candidateId, triedIds: Array.from(triedIds) };
+    }
+
+    const remaining = await input.listCandidateIds();
+    candidateId = remaining.find((id) => !triedIds.has(id)) ?? null;
+  }
+
+  return {
+    result: candidateId === null ? "candidates_exhausted" : "attempt_cap_reached",
+    promotedId: null,
+    triedIds: Array.from(triedIds),
+  };
+}
+
+/**
  * Demote every workspace on a project and promote exactly `keepWorkspaceId`
  * (BLO-26184). Callers hold `keepWorkspaceId` from a SELECT that ran before
  * this function's own statements, so it is not guaranteed to still exist by
@@ -586,12 +639,14 @@ export function resolveProjectNameForUniqueShortname(
  *
  * Fix: verify the promote UPDATE actually affected a row; if the target was
  * concurrently removed, re-pick a surviving candidate and retry rather than
- * leaving the project premoted-to-nobody. Bounded by the number of distinct
- * candidates tried, so it always terminates — either a row gets promoted, or
- * every candidate the project ever had was concurrently deleted out from
- * under it, in which case a structured warning fires instead of an assertion,
- * because 0 remaining workspaces is a legitimate empty-project state, not a
- * bug in this function.
+ * leaving the project premoted-to-nobody. The walk itself lives in
+ * `promoteFirstSurvivingWorkspace` below, which owns the termination argument.
+ *
+ * Whichever way the walk ends without promoting, a structured warning fires
+ * rather than an assertion: 0 remaining workspaces is a legitimate
+ * empty-project state, not a bug in this function. What must never happen is
+ * returning *quietly* after the demote-all — the whole point of this function
+ * is that a project is never silently left at 0 primaries.
  */
 async function ensureSinglePrimaryWorkspace(
   dbOrTx: any,
@@ -611,44 +666,57 @@ async function ensureSinglePrimaryWorkspace(
       ),
     );
 
-  const triedIds = new Set<string>();
-  let candidateId: string | null = input.keepWorkspaceId;
-  const MAX_ATTEMPTS = 5;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS && candidateId; attempt += 1) {
-    triedIds.add(candidateId);
-    const promoted = await dbOrTx
-      .update(projectWorkspaces)
-      .set({ isPrimary: true, updatedAt: new Date() })
-      .where(
-        and(
-          eq(projectWorkspaces.companyId, input.companyId),
-          eq(projectWorkspaces.projectId, input.projectId),
-          eq(projectWorkspaces.id, candidateId),
-        ),
-      )
-      .returning({ id: projectWorkspaces.id });
-    if (promoted.length > 0) return;
+  const outcome = await promoteFirstSurvivingWorkspace({
+    initialCandidateId: input.keepWorkspaceId,
+    tryPromote: async (workspaceId) => {
+      const promoted = await dbOrTx
+        .update(projectWorkspaces)
+        .set({ isPrimary: true, updatedAt: new Date() })
+        .where(
+          and(
+            eq(projectWorkspaces.companyId, input.companyId),
+            eq(projectWorkspaces.projectId, input.projectId),
+            eq(projectWorkspaces.id, workspaceId),
+          ),
+        )
+        .returning({ id: projectWorkspaces.id });
+      return promoted.length > 0;
+    },
+    listCandidateIds: async () => {
+      const remaining: Array<{ id: string }> = await dbOrTx
+        .select({ id: projectWorkspaces.id })
+        .from(projectWorkspaces)
+        .where(
+          and(
+            eq(projectWorkspaces.companyId, input.companyId),
+            eq(projectWorkspaces.projectId, input.projectId),
+          ),
+        )
+        .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+      return remaining.map((row) => row.id);
+    },
+  });
 
-    const remaining: Array<{ id: string }> = await dbOrTx
-      .select({ id: projectWorkspaces.id })
-      .from(projectWorkspaces)
-      .where(
-        and(
-          eq(projectWorkspaces.companyId, input.companyId),
-          eq(projectWorkspaces.projectId, input.projectId),
-        ),
-      )
-      .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
-    candidateId = remaining.find((row) => !triedIds.has(row.id))?.id ?? null;
-  }
+  if (outcome.result === "promoted") return;
 
-  if (candidateId === null) {
-    logger.warn(
-      { companyId: input.companyId, projectId: input.projectId, triedWorkspaceIds: Array.from(triedIds) },
-      "ensureSinglePrimaryWorkspace: every candidate workspace was concurrently removed; "
-        + "project has 0 remaining workspaces or all were deleted mid-promotion",
-    );
-  }
+  // Every row is demoted by this point, so both remaining outcomes leave the
+  // project at 0 primaries and both must be loud. Previously only the
+  // exhausted branch warned, so hitting the attempt cap returned silently —
+  // the exact "guess indistinguishable from a choice" failure this issue is
+  // about, re-created inside its own fix.
+  logger.warn(
+    {
+      companyId: input.companyId,
+      projectId: input.projectId,
+      triedWorkspaceIds: outcome.triedIds,
+      result: outcome.result,
+    },
+    outcome.result === "candidates_exhausted"
+      ? "ensureSinglePrimaryWorkspace: every candidate workspace was concurrently removed; "
+        + "project has 0 remaining workspaces or all were deleted mid-promotion"
+      : "ensureSinglePrimaryWorkspace: hit the concurrent-insert safety cap with candidates still "
+        + "untried; project is left with 0 primaries and needs manual inspection",
+  );
 }
 
 export function projectService(db: Db) {
