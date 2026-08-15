@@ -1859,7 +1859,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
   });
 
-  describe("BLO-22105: refresh regenerates the description on a trigger flip", () => {
     it("regenerates the Manager Decision block when a no_comment_streak review flips to runtime_failure_streak", async () => {
       const now = new Date("2026-04-28T12:00:00.000Z");
       const seeded = await seedAssignedIssue();
@@ -2094,7 +2093,6 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(afterRefresh?.description).toBe(concurrentlyEditedDescription);
       expect(afterRefresh?.description).not.toContain("Primary trigger: `runtime_failure_streak`");
     });
-  });
 
   it("allows only one productivity review per source issue in 24 hours", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -2840,8 +2838,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     scheduledRetryAt: Date;
     scheduledRetryReason?: string | null;
     errorCode?: string | null;
+    id?: string;
   }) {
-    const runId = randomUUID();
+    const runId = input.id ?? randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId: input.companyId,
@@ -2853,6 +2852,74 @@ describeEmbeddedPostgres("productivity review service", () => {
       scheduledRetryAt: input.scheduledRetryAt,
       scheduledRetryAttempt: 0,
       scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    return { runId };
+  }
+
+  // BLO-19604/BLO-21621: a run that never reached `startedAt` — still sitting
+  // `queued`, or already cancelled out from under it by the detached-queued-run
+  // sweep (`queued_run_detached_from_issue`). Either way the assignee never got
+  // a turn on it.
+  async function insertNeverDispatchedRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+    status?: "queued" | "cancelled";
+    errorCode?: string | null;
+    // BLO-23624 (Ally finding 1): the sweep can cancel a queued run any time
+    // after it was created — defaults to an instant cancellation, but a
+    // fixture modeling a run that genuinely sat queued for a while before
+    // being cancelled must pass this explicitly, since
+    // `noExecutableTurnBreakdown` now caps a terminal run's contribution at
+    // its own `finishedAt` rather than at the next run's `createdAt`.
+    finishedAt?: Date | null;
+  }) {
+    const runId = randomUUID();
+    const status = input.status ?? "cancelled";
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      startedAt: null,
+      finishedAt: status === "cancelled" ? (input.finishedAt ?? input.createdAt) : null,
+      errorCode: input.errorCode ?? "queued_run_detached_from_issue",
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    return { runId };
+  }
+
+  // BLO-21769/BLO-23624: a terminal run whose liveness classification came
+  // back `failed` after burning zero input/output tokens — the runtime never
+  // reached a model turn (e.g. `provider_throttled_no_progress`).
+  async function insertZeroTokenFailureRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+    errorCode?: string | null;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "failed",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      startedAt: input.createdAt,
+      finishedAt: new Date(input.createdAt.getTime() + 1_000),
+      livenessState: "failed",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      errorCode: input.errorCode ?? "provider_throttled_no_progress",
       contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
       createdAt: input.createdAt,
       updatedAt: input.createdAt,
@@ -2885,7 +2952,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
-  it("still fires long_active_duration once an overdue capacity retry sits unpromoted, naming the capacity stall rather than the assignee (BLO-22331 no-indefinite-suppression guard)", async () => {
+  it("still fires long_active_duration once an overdue capacity retry sits unpromoted, naming the no-executable-turn mix rather than the assignee (BLO-22331 no-indefinite-suppression guard, generalized by BLO-23624)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
@@ -2908,13 +2975,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
-    expect(review?.description).toContain("capacity-stalled behind an overdue");
+    expect(review?.description).toContain("currently behind an overdue");
     expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
     expect(review?.description).toContain(`run \`${runId}\``);
-    expect(review?.description).toContain(`Capacity-stall accounting:`);
+    expect(review?.description).toContain(`No-executable-turn accounting:`);
   });
 
-  it("surfaces the capacity-stalled bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC)", async () => {
+  it("surfaces the no-executable-turn bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC, generalized by BLO-23624)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
@@ -2928,14 +2995,15 @@ describeEmbeddedPostgres("productivity review service", () => {
       now: episodeStart,
     });
     // The most recent run for the issue is the still-future capacity retry —
-    // `latestRuns[0]`, so it (not the older terminal runs) drives
-    // `capacityGating`. It must be STRICTLY newer than every streak run:
-    // `insertRuns` stamps its newest row at exactly `now`, so seeding this at
-    // `episodeStart` too tied the head of the `desc(createdAt), desc(id)`
-    // ordering, leaving the winner to be decided by which `randomUUID()` sorted
-    // higher — a ~50/50 flake that passed locally and failed in CI.
-    // `scheduled_retry` is in ACTIVE_RUN_STATUSES, not TERMINAL_RUN_STATUSES, so
-    // moving it later keeps it out of the `no_comment_streak` walk unchanged.
+    // the chronologically-last run, so it (not the older terminal runs) drives
+    // `noExecutableTurnGating`. It must be STRICTLY newer than every streak
+    // run: `insertRuns` stamps its newest row at exactly `now`, so seeding
+    // this at `episodeStart` too tied the head of the `desc(createdAt),
+    // desc(id)` ordering, leaving the winner to be decided by which
+    // `randomUUID()` sorted higher — a ~50/50 flake that passed locally and
+    // failed in CI. `scheduled_retry` is in ACTIVE_RUN_STATUSES, not
+    // TERMINAL_RUN_STATUSES, so moving it later keeps it out of the
+    // `no_comment_streak` walk unchanged.
     await insertCapacityScheduledRetryRun({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -2955,8 +3023,193 @@ describeEmbeddedPostgres("productivity review service", () => {
     // eligible on elapsed time (7h > default 6h threshold) but suppressed.
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(review?.description).not.toContain("Primary trigger: `long_active_duration`");
-    expect(review?.description).toContain("Capacity-stall accounting:");
-    expect(review?.description).toContain("capacity-stalled");
+    expect(review?.description).toContain("No-executable-turn accounting:");
+    expect(review?.description).toContain("capacity park");
+  });
+
+  // BLO-23624: the worked example from the issue (BLO-23427, decomposed from
+  // BLO-22887) — three distinct no-executable-turn mechanisms stacked in one
+  // episode, none individually dominant enough under the old capacity-only
+  // numerator (65.8% capacity share alone), but 100% dominant under the
+  // widened union. Per-mechanism durations mirror the issue's own table
+  // exactly: 54s zero-token throttle, 6h dispatch backlog, 11h35m capacity
+  // park (current, still due). Timestamps are strictly distinct per run to
+  // avoid the `desc(createdAt), desc(id)` tiebreak flake called out in the
+  // issue and reproduced by #1188.
+  it("does not fire long_active_duration on a mixed-mechanism episode (BLO-23427 decomposition: throttle + dispatch backlog + capacity park)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const throttleAt = new Date(now.getTime() - (54_000 + 6 * 60 * 60 * 1000 + (11 * 60 + 35) * 60 * 1000));
+    const backlogAt = new Date(throttleAt.getTime() + 54_000);
+    const capacityAt = new Date(backlogAt.getTime() + 6 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: throttleAt });
+
+    await insertZeroTokenFailureRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: throttleAt,
+    });
+    await insertNeverDispatchedRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: backlogAt,
+      status: "cancelled",
+      // Sat genuinely queued for the full 6h — the sweep only cancelled it
+      // once the capacity retry took over, not the instant it was created
+      // (see finding-1 fix note on the helper).
+      finishedAt: capacityAt,
+    });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: capacityAt,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-23624 boundary AC: a 14h43m dispatch-backlog window beside an 11h35m
+  // capacity park lands at ~44% capacity share (under the old, capacity-only
+  // 50% dominance test — would have fired) but ~100% no-executable-turn share
+  // under the widened union — must not fire.
+  it("does not fire long_active_duration at the ~44%-capacity-share boundary once dispatch backlog is folded into the same bucket (BLO-23624 boundary AC)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const backlogAt = new Date(now.getTime() - ((14 * 60 + 43) * 60 * 1000 + (11 * 60 + 35) * 60 * 1000));
+    const capacityAt = new Date(backlogAt.getTime() + (14 * 60 + 43) * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: backlogAt });
+
+    await insertNeverDispatchedRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: backlogAt,
+      status: "cancelled",
+      // Sat genuinely queued for the full 14h43m — see finding-1 fix note.
+      finishedAt: capacityAt,
+    });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: capacityAt,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-23624 review finding 1 (Ally, PR #1268): a terminal no-executable-turn
+  // run's segment must close at its own `finishedAt`, not at whenever the next
+  // run happens to have been created — otherwise a run that died in 60s
+  // silently absorbs a multi-hour gap where *no run existed at all* into the
+  // no-executable-turn bucket, hiding a genuinely unattended stall. Here a
+  // dispatch-backlog run is cancelled almost immediately, then nothing is
+  // dispatched again for ~7h. Under the pre-fix behaviour (segment closes at
+  // the next run's `createdAt`) the 60s run would have absorbed the whole
+  // gap and suppressed the trigger; with the fix, only its own 60s counts,
+  // leaving the review eligible to fire.
+  it("does not let a quickly-cancelled dispatch-backlog run absorb the unattended gap before the next run (BLO-23624 review finding 1)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+
+    await insertNeverDispatchedRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      status: "cancelled",
+      finishedAt: new Date(episodeStart.getTime() + 60_000),
+    });
+    // Still genuinely queued when the episode ends — no `finishedAt`, so its
+    // own short tail segment (createdAt to now) is legitimately open and
+    // correctly counted, but it cannot retroactively cover the ~7h gap
+    // before it either.
+    await insertNeverDispatchedRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: new Date(now.getTime() - 10 * 60 * 1000),
+      status: "queued",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-23624 review finding 2 (Ally, PR #1268): `noExecutableTurnBreakdown`
+  // reverses `latestRuns`, which the query orders `desc(createdAt), desc(id)`.
+  // On a `createdAt` tie, only a matching `id` tie-break recovers the correct
+  // "current" run — `Array.prototype.sort` is stable, so comparing on
+  // `createdAt` alone leaves tied rows in their *input* order (already
+  // `desc(id)`), and `chronological.at(-1)` would then pick the *lowest* id,
+  // the exact inverse of `latestRuns[0]`. Explicit ids (rather than
+  // `randomUUID()`) make the ordering deterministic instead of a ~50/50
+  // flake. The capacity retry — due five days out — must win the tie and be
+  // treated as current so the trigger stays suppressed; picking the ordinary
+  // executed run instead would zero out the no-executable-turn bucket and
+  // let the review fire.
+  it("breaks a createdAt tie by id when picking the current run, not insertion order (BLO-23624 review finding 2)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+
+    // Lower id: must lose the tie-break and NOT be treated as current, even
+    // though nothing else distinguishes insertion order from it.
+    await db.insert(heartbeatRuns).values({
+      id: "00000000-0000-4000-8000-000000000000",
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: episodeStart,
+      finishedAt: new Date(episodeStart.getTime() + 30_000),
+      livenessState: "advanced",
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      createdAt: episodeStart,
+      updatedAt: episodeStart,
+    });
+
+    // Higher id, identical createdAt: must win the tie-break and be treated
+    // as the current, still-due capacity retry.
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000),
+      id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("suppresses long-active productivity reviews for deliberate future monitor waits", async () => {
@@ -3013,14 +3266,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
-  // BLO-19604 live reproduction (BLO-19570 against BLO-18285): the issue entered
-  // in_progress 7h ago (past the 6h threshold), but the assignee has been actively
-  // dispatching and completing runs the whole time — only the run enqueued right
-  // alongside the original checkout is still stuck `queued`, never dispatched. Prior
-  // to the fix, elapsed time was computed purely from the issue's own `startedAt`, so
-  // the queued run's age was irrelevant but the raw checkout age alone still tripped
-  // `long_active_duration` even though real work was landing minutes before this
-  // evaluation. The episode anchor must track the most recent *dispatched* run instead.
   it("does not raise long_active_duration when only a queued, never-dispatched run is stale but recent runs were actually dispatched", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const sevenHoursAgo = new Date(now.getTime() - 7 * 60 * 60 * 1000);
@@ -3062,16 +3307,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
-  // BLO-22016 live reproduction (BLO-18846 / run `9e49405e`): the issue was checked out
-  // ~12h ago and its current execution holder (`executionRunId`) is still `queued` — it
-  // never reached `startedAt` at all, so no work has executed in this episode. Before the
-  // fix, `activeStartedAt` fell back to the checkout timestamp whenever there was no
-  // in-episode dispatch, so this reported ~12h of "active" time despite zero tokens ever
-  // executing. That is a dispatch-lag problem (surfaced via `queuedUndispatchedRunCount`
-  // in evidence, tracked separately under BLO-21116 et al.), not a long-active-episode
-  // problem. Uses `pinExecutionRun` (not `insertRuns`) so `sourceIssue.executionRunId`
-  // is populated, matching the real checkout invariant — a checked-out issue always has
-  // an execution holder, whether or not that holder has started.
   it("does not raise long_active_duration when the current execution holder is still queued and has never started (BLO-22016 / BLO-18846)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
@@ -3097,12 +3332,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
-  // Contrast case: no run row exists at all since checkout — nothing was even attempted,
-  // as distinct from "a run was queued but never started" above. This is the existing,
-  // deliberately-tested "unattended episode" scenario (see the monitor-gating tests
-  // below, e.g. "reports the whole episode as unattended when no monitor was ever
-  // armed") and must keep firing on raw wall-clock time; the BLO-22016 fix must not
-  // desensitize this case just because it also involves zero dispatched runs.
   it("still raises long_active_duration when a checked-out issue has no run at all, unlike a queued-never-started run", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
@@ -3121,9 +3350,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
-  // Control: once the previously-queued run actually starts executing and stays live past
-  // the threshold, the trigger must still fire — the fix must not desensitize the detector
-  // for genuine stalls, only for queue residency that was never real work.
   it("still creates a long_active_duration review once the run actually starts and runs past the threshold", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
@@ -3154,13 +3380,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
-  // Ally review on PR #1036: `mostRecentDispatchAt` must be a true `max(startedAt)`, not
-  // "the `startedAt` of whichever sampled run happens to have the greatest `createdAt`".
-  // Here an older-created run is dispatched *more* recently than a newer-created run that
-  // was dispatched almost immediately — creation order and dispatch order diverge. Scanning
-  // `createdAt`-ordered runs for the first non-null `startedAt` would hit the newer-created,
-  // earlier-dispatched run first and anchor the episode to a stale timestamp, crossing the
-  // 6h threshold and firing a false `long_active_duration`.
   it("anchors elapsed time to the true max(startedAt) when creation order and dispatch order diverge", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
@@ -3218,10 +3437,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
-  // BLO-19604 AC2: `run.nextAction` is only populated by that run's own liveness
-  // classification, which can miss a `Next` line the assignee posted in a plain issue
-  // comment. Reporting "none recorded" in that case reads as "no next step exists" when
-  // one plainly does — the report must recover it from the assignee's own comments.
   it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -3257,12 +3472,6 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
-  // Ally review on PR #1036: the `commentNextAction` fallback (added above) must find a
-  // `Next:` line even when the comment has no `createdByRunId` at all — a genuinely plain
-  // issue comment, not one merely detached from the run it was posted alongside. The
-  // `latestComments` query used for report rendering inner-joins `heartbeatRuns` on that
-  // column and would silently exclude this comment, which is exactly the case the fallback
-  // exists to recover.
   it("recovers a Next line from an assignee comment with no createdByRunId link", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

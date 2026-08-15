@@ -40,8 +40,8 @@ import {
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
 } from "./pull-request-work-products.js";
-import { extractNextActionFromText } from "./run-liveness.js";
 import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import { extractNextActionFromText } from "./run-liveness.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -105,23 +105,37 @@ const MAX_PARENT_WALK_DEPTH = 25;
 // constant rather than an import to avoid coupling the detector to the recovery
 // service's module graph.
 const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
-// BLO-23248/BLO-22331: a capacity-class `scheduled_retry` — the fleet's
-// ccrotate/penstock model-provider pool is exhausted, not a per-run hiccup —
-// parks the assignee's issue for hours to days with nothing the assignee can
-// do about it. Mirrors CCROTATE_CAPACITY_RETRY_REASON in heartbeat.ts,
-// duplicated locally (not imported) because heartbeat.ts imports
-// productivityReviewService from this module; importing back would be
-// circular. scheduledRetryReason is the primary signal; errorCode is a
-// fallback for rows written before the reason was recorded on this path.
+// BLO-23248/BLO-22331/BLO-19604/BLO-23624: three distinct mechanisms all
+// produce the same null hypothesis — "the assignee was never given an
+// executable turn" — which BLO-23248 originally tracked under a single
+// capacity-only bucket. Widened here (BLO-23624) into one `noExecutableTurn`
+// classification so the dominance test below sees the union, not just
+// whichever mechanism happened to be active when it was first diagnosed:
+//   - capacity park: a capacity-class `scheduled_retry` — the fleet's
+//     ccrotate/penstock model-provider pool is exhausted, not a per-run
+//     hiccup. Mirrors CCROTATE_CAPACITY_RETRY_REASON in heartbeat.ts,
+//     duplicated locally (not imported) because heartbeat.ts imports
+//     productivityReviewService from this module; importing back would be
+//     circular. scheduledRetryReason is the primary signal; errorCode is a
+//     fallback for rows written before the reason was recorded on this path.
+//   - dispatch backlog (BLO-19604): a run that never reached `startedAt`,
+//     whether it is still sitting `queued` or was already `cancelled` out
+//     from under it (e.g. the BLO-21621 sweep's
+//     `queued_run_detached_from_issue`) — the assignee never got a turn on
+//     it either way.
+//   - zero-token adapter throttle: a terminal run whose liveness came back
+//     `failed` after burning zero input/output tokens — reuses
+//     `isNeverExecutedRun`, the same signature `runtime_failure_streak` keys
+//     on for the identical reason (BLO-21769).
 const CAPACITY_RETRY_REASON = "ccrotate_capacity";
 const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
-// Share of the active episode that must be capacity-stalled before
-// `long_active_duration` treats the episode as a fleet-capacity artifact
-// rather than assignee inactivity (BLO-23248 AC2). Chosen so a brand-new
-// capacity park (which is nearly all of a fresh episode) always suppresses,
-// while an episode that was already long *before* the retry started still
-// fires on its own unattended time.
-const CAPACITY_STALL_DOMINANT_SHARE = 0.5;
+// Share of the active episode that must be no-executable-turn time before
+// `long_active_duration` treats the episode as a fleet/dispatch artifact
+// rather than assignee inactivity (BLO-23248 AC2, widened by BLO-23624).
+// Chosen so a brand-new park/backlog/throttle streak (which is nearly all of
+// a fresh episode) always suppresses, while an episode that was already long
+// *before* it started still fires on its own unattended time.
+const NO_EXECUTABLE_TURN_DOMINANT_SHARE = 0.5;
 // BLO-26165: `heartbeatRuns.issueCommentStatus` defaults to (and is explicitly
 // re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts)
 // for any run whose wake reason never required a comment in the first place —
@@ -189,6 +203,33 @@ type ProductivityReviewThresholds = {
   monitorLapseServiceGraceMs: number;
   monitorSchedulerIntervalMs: number;
   monitorDispatchBatchSize: number;
+};
+
+// BLO-23624: the three run-level mechanisms that all mean "the assignee was
+// never given an executable turn" — see the constants block above for the
+// per-mechanism detail.
+type NoExecutableTurnMechanism = "capacity_park" | "dispatch_backlog" | "zero_token_throttle";
+
+type NoExecutableTurnGating = {
+  noExecutableTurnMs: number;
+  mechanismMs: Record<NoExecutableTurnMechanism, number>;
+  // The run heading the episode as of `now` (chronologically last in
+  // `latestRuns`), and its classification — null when that run does not
+  // itself classify as no-executable-turn, even if earlier runs in the
+  // episode did.
+  currentRunId: string | null;
+  currentMechanism: NoExecutableTurnMechanism | null;
+  scheduledRetryAt: Date | null;
+  retryReason: string | null;
+  errorCode: string | null;
+  // Only meaningful when currentMechanism is "capacity_park": whether that
+  // retry's own due time has already passed.
+  overdue: boolean;
+  // Whether the current run's block is still open — i.e. still actually
+  // blocking the assignee right now, not just a historical contributor to
+  // the dominance share. See `noExecutableTurnBreakdown` for the per-
+  // mechanism definition of "open".
+  currentBlockOpen: boolean;
 };
 
 type PullRequestEvidence = {
@@ -310,18 +351,12 @@ type ProductivityReviewEvidence = {
     firedAt: Date | null;
     successorRunId: string | null;
   } | null;
-  // BLO-23248: elapsed time attributable to the issue's current run sitting
-  // in a capacity-class `scheduled_retry` (fleet model-provider exhaustion) —
-  // a third bucket distinct from monitor-gated and unattended time. null when
-  // the current run (latestRuns[0]) is not such a retry.
-  capacityGating: {
-    stalledMs: number;
-    runId: string;
-    scheduledRetryAt: Date;
-    retryReason: string | null;
-    errorCode: string | null;
-    overdue: boolean;
-  } | null;
+  // BLO-23248/BLO-23624: elapsed time attributable to a no-executable-turn
+  // run — the union of capacity park, dispatch backlog, and zero-token
+  // throttle (see the constants above) — a third bucket distinct from
+  // monitor-gated and unattended time. null when no run in the episode
+  // classifies as one of those three mechanisms.
+  noExecutableTurnGating: NoExecutableTurnGating | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -627,37 +662,147 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
 }
 
 /**
- * BLO-23248/BLO-22331: the fleet-capacity-retry state of the run currently
- * heading this issue's execution history (`latestRuns[0]`), independent of
- * `issue.executionRunId`. That pointer reads null for the entire time a run
- * sits parked in `scheduled_retry`: `scheduleBoundedRetryForRun` clears the
- * issue's execution lock the moment it inserts the retry row (heartbeat.ts),
- * so `nonLiveExecutionHoldSince` — which only clamps a hold it can see via
- * `issue.executionRunId` — never engages for this state, and the full
- * wall-clock park gets counted as unattended (root cause: BLO-22331).
- * `latestRuns` is scoped to this issue and ordered by `createdAt` desc (see
- * `issueRunScopeSql`), so its head is this episode's current attempt
- * regardless of which pointer the issue row carries.
- *
- * Returns null unless the current run is a capacity-class `scheduled_retry`.
- * A transient-failure or dependency-blocked retry is a different, per-run
- * condition the assignee can legitimately be asked about, so it is
- * deliberately excluded — this only covers the fleet-wide model-provider
- * exhaustion shape.
+ * BLO-23624: classifies a single run against the union null hypothesis "the
+ * assignee was never given an executable turn on this run" — the broader
+ * condition BLO-23248/BLO-22331's capacity-only bucket was defending without
+ * naming (see the constants block above for the three mechanisms). Returns
+ * null for a run that represents genuine, assignee-attributable turn time.
  */
-function currentCapacityScheduledRetry(
+function classifyNoExecutableTurnRun(
+  run: HeartbeatRunRow,
+): { mechanism: NoExecutableTurnMechanism; scheduledRetryAt: Date | null; retryReason: string | null; errorCode: string | null } | null {
+  if (run.status === "scheduled_retry") {
+    const isCapacityClass =
+      run.scheduledRetryReason === CAPACITY_RETRY_REASON || run.errorCode === CAPACITY_RETRY_ERROR_CODE;
+    if (!isCapacityClass) return null;
+    const scheduledRetryAt = coerceDate(run.scheduledRetryAt);
+    if (!scheduledRetryAt) return null;
+    return {
+      mechanism: "capacity_park",
+      scheduledRetryAt,
+      retryReason: run.scheduledRetryReason,
+      errorCode: run.errorCode,
+    };
+  }
+  // BLO-19604/BLO-22016: a run that never reached `startedAt` never gave the
+  // assignee a turn, whatever became of it afterward — still parked in the
+  // dispatch queue, or already cancelled out from under it (e.g. the
+  // BLO-21621 sweep's `queued_run_detached_from_issue`).
+  if (!run.startedAt && (run.status === "queued" || run.status === "cancelled")) {
+    return { mechanism: "dispatch_backlog", scheduledRetryAt: null, retryReason: null, errorCode: run.errorCode };
+  }
+  if (isNeverExecutedRun(run)) {
+    return { mechanism: "zero_token_throttle", scheduledRetryAt: null, retryReason: null, errorCode: run.errorCode };
+  }
+  return null;
+}
+
+/**
+ * BLO-23248/BLO-22331/BLO-23624: sums the portion of
+ * `[attributableStartAt, attributableEndAt)` attributable to a
+ * no-executable-turn run, walking `latestRuns` in chronological order and
+ * attributing each inter-run interval to whichever run was "current" (most
+ * recently created) during that interval — the same run that would have been
+ * `latestRuns[0]` had the evaluation happened at that moment. This is
+ * independent of `issue.executionRunId`, which reads null for the entire
+ * time a run sits parked in `scheduled_retry`
+ * (`scheduleBoundedRetryForRun` clears it the moment it inserts the retry
+ * row — heartbeat.ts) or never-dispatched-queued — root cause of BLO-22331.
+ * `latestRuns` arrives ordered `desc(createdAt), desc(id)` (see the query in
+ * `collectEvidence`), so it is reversed here.
+ *
+ * `overdue`/`currentBlockOpen` preserve BLO-22331's non-indefinite-
+ * suppression guard: a capacity `scheduled_retry` past its own
+ * `scheduledRetryAt` is a broken promise the system made and failed to keep,
+ * so suppression lifts and the stall becomes visible again. The other two
+ * mechanisms have no comparable due time — a `queued` dispatch-backlog run is
+ * "open" only while it is genuinely still `queued` (the BLO-21621 sweep is
+ * what bounds that, not this detector), and a terminal dispatch-backlog or
+ * zero-token run occupies a fixed, already-closed window that cannot itself
+ * justify suppressing a *later*, otherwise-uncovered stall.
+ */
+function noExecutableTurnBreakdown(
   latestRuns: HeartbeatRunRow[],
+  attributableStartAt: Date,
+  attributableEndAt: Date,
   now: Date,
-): { run: HeartbeatRunRow; scheduledRetryAt: Date; overdue: boolean } | null {
-  const currentRun = latestRuns[0];
-  if (!currentRun || currentRun.status !== "scheduled_retry") return null;
-  const isCapacityClass =
-    currentRun.scheduledRetryReason === CAPACITY_RETRY_REASON
-    || currentRun.errorCode === CAPACITY_RETRY_ERROR_CODE;
-  if (!isCapacityClass) return null;
-  const scheduledRetryAt = coerceDate(currentRun.scheduledRetryAt);
-  if (!scheduledRetryAt) return null;
-  return { run: currentRun, scheduledRetryAt, overdue: scheduledRetryAt.getTime() <= now.getTime() };
+): NoExecutableTurnGating | null {
+  if (attributableEndAt.getTime() <= attributableStartAt.getTime()) return null;
+  // `latestRuns` arrives ordered `desc(createdAt), desc(id)`; reversing that
+  // ordering requires the same two-key sort, ascending. `createdAt` alone
+  // ties on a same-millisecond insert (the exact flake #1188 hit — see
+  // `c4aa1d1`), and a JS stable sort on a tied key preserves descending-id
+  // input order, which is the *opposite* of what `.at(-1)` needs to recover
+  // `latestRuns[0]`. Without the `id` tie-break, a tie silently picks the
+  // wrong run as "current" and can flip `currentBlockOpen`.
+  const chronological = [...latestRuns].sort(
+    (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
+
+  const mechanismMs: Record<NoExecutableTurnMechanism, number> = {
+    capacity_park: 0,
+    dispatch_backlog: 0,
+    zero_token_throttle: 0,
+  };
+  let noExecutableTurnMs = 0;
+
+  for (let i = 0; i < chronological.length; i += 1) {
+    const run = chronological[i]!;
+    const classification = classifyNoExecutableTurnRun(run);
+    if (!classification) continue;
+    const segmentStart = latestDate(run.createdAt, attributableStartAt) ?? attributableStartAt;
+    const next = chronological[i + 1];
+    const segmentEndCandidate = next ? next.createdAt : attributableEndAt;
+    let segmentEnd = segmentEndCandidate.getTime() < attributableEndAt.getTime()
+      ? segmentEndCandidate
+      : attributableEndAt;
+    // A terminal no-executable-turn run (a `cancelled` dispatch-backlog run,
+    // or a zero-token `failed` run) stopped mattering the moment it
+    // finished — attributing the gap up to whenever the *next* run happened
+    // to be created would let a run that died in 60s swallow a 10h gap
+    // before its retry. Open states (`scheduled_retry` still pending its own
+    // due time, or a dispatch-backlog run still genuinely `queued`) have no
+    // `finishedAt` yet and legitimately park through to the next run.
+    const isTerminalNoTurnRun =
+      classification.mechanism === "zero_token_throttle" ||
+      (classification.mechanism === "dispatch_backlog" && run.status === "cancelled");
+    if (isTerminalNoTurnRun) {
+      const finishedAt = coerceDate(run.finishedAt);
+      if (finishedAt && finishedAt.getTime() < segmentEnd.getTime()) {
+        segmentEnd = finishedAt.getTime() > segmentStart.getTime() ? finishedAt : segmentStart;
+      }
+    }
+    const segmentMs = segmentEnd.getTime() - segmentStart.getTime();
+    if (segmentMs <= 0) continue;
+    mechanismMs[classification.mechanism] += segmentMs;
+    noExecutableTurnMs += segmentMs;
+  }
+
+  if (noExecutableTurnMs === 0) return null;
+
+  const currentRun = chronological.at(-1) ?? null;
+  const currentClassification = currentRun ? classifyNoExecutableTurnRun(currentRun) : null;
+  const currentIsActiveStatus = Boolean(
+    currentRun && ACTIVE_RUN_STATUSES.includes(currentRun.status as (typeof ACTIVE_RUN_STATUSES)[number]),
+  );
+  const overdue = Boolean(
+    currentClassification?.mechanism === "capacity_park"
+      && currentClassification.scheduledRetryAt
+      && currentClassification.scheduledRetryAt.getTime() <= now.getTime(),
+  );
+  const currentBlockOpen = Boolean(currentClassification) && currentIsActiveStatus && !overdue;
+
+  return {
+    noExecutableTurnMs,
+    mechanismMs,
+    currentRunId: currentClassification ? currentRun!.id : null,
+    currentMechanism: currentClassification?.mechanism ?? null,
+    scheduledRetryAt: currentClassification?.scheduledRetryAt ?? null,
+    retryReason: currentClassification?.retryReason ?? null,
+    errorCode: currentClassification?.errorCode ?? null,
+    overdue,
+    currentBlockOpen,
+  };
 }
 
 function isTerminalIssueStatus(status: string | null | undefined) {
@@ -914,11 +1059,51 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
 }
 
-function formatCapacityGating(gating: NonNullable<ProductivityReviewEvidence["capacityGating"]>) {
-  const dueClause = gating.overdue
-    ? `due ${gating.scheduledRetryAt.toISOString()}, overdue and not yet promoted`
-    : `due ${gating.scheduledRetryAt.toISOString()}`;
-  return `${msToHumanFine(gating.stalledMs)} capacity-stalled (run \`${gating.runId}\` parked \`scheduled_retry\` on \`${gating.retryReason ?? gating.errorCode ?? "unknown"}\`, ${dueClause})`;
+const NO_EXECUTABLE_TURN_MECHANISM_LABELS: Record<NoExecutableTurnMechanism, string> = {
+  capacity_park: "capacity park",
+  dispatch_backlog: "dispatch backlog",
+  zero_token_throttle: "zero-token throttle",
+};
+
+// BLO-23624 AC: names the mechanism mix rather than reporting a single
+// undifferentiated figure, so a mixed-mechanism episode (e.g. BLO-23427: a
+// dispatch-backlog cancellation, a zero-token throttle failure, and a
+// capacity park) reads as three named contributors, not one.
+function describeNoExecutableTurnMechanismMix(mechanismMs: Record<NoExecutableTurnMechanism, number>) {
+  return (Object.keys(mechanismMs) as NoExecutableTurnMechanism[])
+    .filter((mechanism) => mechanismMs[mechanism] > 0)
+    .map((mechanism) => `${msToHumanFine(mechanismMs[mechanism])} ${NO_EXECUTABLE_TURN_MECHANISM_LABELS[mechanism]}`)
+    .join(", ");
+}
+
+function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvidence["noExecutableTurnGating"]>) {
+  const mix = describeNoExecutableTurnMechanismMix(gating.mechanismMs);
+  let currentClause = "";
+  if (gating.currentMechanism === "capacity_park" && gating.scheduledRetryAt) {
+    const dueClause = gating.overdue
+      ? `due ${gating.scheduledRetryAt.toISOString()}, overdue and not yet promoted`
+      : `due ${gating.scheduledRetryAt.toISOString()}`;
+    currentClause = `; current run \`${gating.currentRunId}\` parked \`scheduled_retry\` on \`${gating.retryReason ?? gating.errorCode ?? "unknown"}\`, ${dueClause}`;
+  } else if (gating.currentMechanism === "dispatch_backlog") {
+    currentClause = `; current run \`${gating.currentRunId}\` never reached \`startedAt\``;
+  } else if (gating.currentMechanism === "zero_token_throttle") {
+    currentClause = `; current run \`${gating.currentRunId}\` failed with zero tokens executed`;
+  }
+  return `${msToHumanFine(gating.noExecutableTurnMs)} no-executable-turn time (${mix})${currentClause}`;
+}
+
+// BLO-23624: the `longActive` trigger-reason qualifier — only rendered when
+// the episode is no-executable-turn-dominant. Mirrors the capacity-only
+// version this replaces: when the current block is still open the trigger
+// itself is suppressed (this note is unreachable), so the only path that
+// reaches here is a dominant-but-no-longer-open block, most commonly an
+// overdue, unpromoted capacity retry (BLO-22331's guard).
+function formatNoExecutableTurnTriggerNote(gating: NonNullable<ProductivityReviewEvidence["noExecutableTurnGating"]>) {
+  const mix = describeNoExecutableTurnMechanismMix(gating.mechanismMs);
+  if (gating.currentMechanism === "capacity_park" && gating.overdue && gating.scheduledRetryAt) {
+    return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), currently behind an overdue \`scheduled_retry\` (run \`${gating.currentRunId}\`, due ${gating.scheduledRetryAt.toISOString()}, not yet promoted); this is a fleet-capacity signal, not assignee inactivity`;
+  }
+  return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), but the current run is no longer blocked, so this is not being suppressed`;
 }
 
 function isMonitorScheduledSuppression(
@@ -2992,43 +3177,34 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
     const latestPullRequest = toPullRequestEvidence(progressPullRequestRow ?? latestPullRequestRow, now);
-    // BLO-23248: the portion of elapsedMs attributable to the current run
-    // sitting in a capacity-class scheduled_retry, reported as its own
-    // evidence bucket distinct from monitor-gated/unattended (BLO-22331).
-    // stalledSince clamps to the episode start so a retry chain that outlives
-    // this episode (rare, but possible across a park→dispatch→re-park cycle)
-    // cannot report more capacity-stall time than the episode actually spans.
-    const capacityRetry = currentCapacityScheduledRetry(latestRuns, now);
-    const capacityGating = capacityRetry && attributableStartAt && elapsedMs !== null
-      ? (() => {
-          const stalledSince = latestDate(capacityRetry.run.createdAt, attributableStartAt) ?? attributableStartAt;
-          const stalledMs = Math.max(0, Math.min(elapsedMs, now.getTime() - stalledSince.getTime()));
-          return {
-            stalledMs,
-            runId: capacityRetry.run.id,
-            scheduledRetryAt: capacityRetry.scheduledRetryAt,
-            retryReason: capacityRetry.run.scheduledRetryReason,
-            errorCode: capacityRetry.run.errorCode,
-            overdue: capacityRetry.overdue,
-          };
-        })()
+    // BLO-23248/BLO-23624: the portion of elapsedMs attributable to a
+    // no-executable-turn run anywhere in the episode (not just the current
+    // one), reported as its own evidence bucket distinct from
+    // monitor-gated/unattended (BLO-22331). Segments are clamped inside
+    // `noExecutableTurnBreakdown` to [attributableStartAt, attributableEndAt),
+    // so a retry/backlog chain that outlives this episode cannot report more
+    // no-executable-turn time than the episode actually spans.
+    const noExecutableTurnGating = attributableStartAt && elapsedMs !== null
+      ? noExecutableTurnBreakdown(latestRuns, attributableStartAt, attributableEndAt, now)
       : null;
-    const capacityDominant = Boolean(
-      capacityGating
+    const noExecutableTurnDominant = Boolean(
+      noExecutableTurnGating
         && elapsedMs !== null
         && elapsedMs > 0
-        && capacityGating.stalledMs / elapsedMs > CAPACITY_STALL_DOMINANT_SHARE,
+        && noExecutableTurnGating.noExecutableTurnMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE,
     );
-    // Only suppress while the retry is genuinely still backing off
-    // (`scheduledRetryAt` in the future). Per BLO-22331 AC, this must not
-    // become indefinite: once due passes and the run sits unpromoted, that is
-    // itself the wedged-retry-chain signal the detector should surface (see
-    // BLO-22094's overdue-scheduled-retry gauge for the fleet-level view) —
-    // so `longActive` is allowed to fire again, with the evidence block and
-    // trigger-reason qualifier below naming the capacity stall explicitly
+    // Only suppress while the run currently heading the episode is still
+    // actually blocked (`currentBlockOpen`) — e.g. a capacity retry genuinely
+    // still backing off, or a dispatch-backlog run still sitting `queued`.
+    // Per BLO-22331 AC, this must not become indefinite: once a capacity
+    // retry's due time passes and it sits unpromoted, that is itself the
+    // wedged-retry-chain signal the detector should surface (see BLO-22094's
+    // overdue-scheduled-retry gauge for the fleet-level view) — so
+    // `longActive` is allowed to fire again, with the evidence block and
+    // trigger-reason qualifier below naming the mechanism mix explicitly
     // rather than leaving the primary-trigger line reading as pure assignee
     // inactivity.
-    const capacityDominantAndDue = capacityDominant && capacityGating !== null && !capacityGating.overdue;
+    const noExecutableTurnDominantAndOpen = noExecutableTurnDominant && Boolean(noExecutableTurnGating?.currentBlockOpen);
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     // Reuses `noCommentStreakRuns` as the sample-size threshold: both streaks
@@ -3036,10 +3212,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // disjoint filters (turn-executing vs never-executed). A separate config
     // knob would be redundant surface for the same question.
     const runtimeFailure = runtimeFailureStreak >= thresholds.noCommentStreakRuns;
-    // BLO-23248: while the dominant share of the episode is capacity-stalled
-    // AND that retry is still due in the future (fleet model-provider
-    // exhaustion the assignee cannot act on), long_active_duration does not
-    // fire — mirrors how a pending monitor/approval gate suppresses this same
+    // BLO-23248/BLO-23624: while the dominant share of the episode is
+    // no-executable-turn time AND the current block is still open (fleet
+    // model-provider exhaustion, dispatch backlog, or a zero-token throttle
+    // the assignee cannot act on), long_active_duration does not fire —
+    // mirrors how a pending monitor/approval gate suppresses this same
     // trigger below, just folded into the boolean rather than a parallel gate
     // object, since (like those gates) this only ever affects
     // `long_active_duration` specifically and never the other triggers.
@@ -3055,7 +3232,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // bypassed the suppression bookkeeping (and its `monitorScheduledSuppressed`
     // accounting) for dozens of already-covered backlog-grace scenarios instead
     // of just narrowing the small genuinely-new case this issue targets.
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !capacityDominantAndDue;
+    const longActive =
+      elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !noExecutableTurnDominantAndOpen;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -3085,14 +3263,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
     }
     if (longActive) {
-      // BLO-23248: this only fires while capacity-dominant when the retry is
-      // *overdue* (capacityDominantAndDue already excluded the still-backing-off
-      // case above) — a stuck retry chain the assignee still cannot act on, so
-      // name the cause explicitly rather than reading as assignee inactivity.
-      const capacityNote = capacityDominant && capacityGating
-        ? ` — ${msToHuman(capacityGating.stalledMs)} of that is capacity-stalled behind an overdue \`scheduled_retry\` (run \`${capacityGating.runId}\`, due ${capacityGating.scheduledRetryAt.toISOString()}, not yet promoted); this is a fleet-capacity signal, not assignee inactivity`
+      // BLO-23624: this only fires while no-executable-turn-dominant when the
+      // current block is no longer open (`noExecutableTurnDominantAndOpen`
+      // already excluded the still-open case above) — most commonly a stuck,
+      // overdue retry chain the assignee still cannot act on — so name the
+      // cause explicitly rather than reading as assignee inactivity.
+      const noExecutableTurnNote = noExecutableTurnDominant && noExecutableTurnGating
+        ? formatNoExecutableTurnTriggerNote(noExecutableTurnGating)
         : "";
-      triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}${capacityNote}`);
+      triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}${noExecutableTurnNote}`);
     }
     if (highChurn) {
       triggerReasons.push(
@@ -3200,11 +3379,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       : await findCommentNextAction(sourceIssue, sourceAgent, thresholds, now);
     const nextAction = structuredNextAction ?? commentNextAction;
 
-    // BLO-19604 AC4: a run that never left `queued` no longer inflates elapsed (see
-    // `activeStartedAt` above), but silently dropping it out of the picture would leave a
-    // reviewer with no explanation for why the episode looks shorter than the issue's raw
-    // age. Surface it explicitly instead of reaping it here — reaping/re-dispatch ceilings
-    // are the dispatcher's job (BLO-21116 / BLO-19954), not this evaluator's.
+    // Queued-but-never-dispatched runs are excluded from the elapsed-time figure but
+    // reported explicitly, so a reviewer has an explanation for why the episode looks
+    // shorter than the issue's raw age. Reaping/re-dispatch ceilings are the
+    // dispatcher's job (BLO-21116 / BLO-19954), not this evaluator's.
     const queuedUndispatchedRuns = latestRuns.filter((run) => run.status === "queued" && !run.startedAt);
     const oldestQueuedUndispatchedRun = queuedUndispatchedRuns.reduce<HeartbeatRunRow | null>(
       (oldest, run) => (!oldest || run.createdAt.getTime() < oldest.createdAt.getTime() ? run : oldest),
@@ -3235,7 +3413,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       elapsedMs,
       nonLiveHoldMs,
       monitorGating,
-      capacityGating,
+      noExecutableTurnGating,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -3389,8 +3567,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
-      ...(evidence.capacityGating
-        ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
+      ...(evidence.noExecutableTurnGating
+        ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -3488,8 +3666,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
-      ...(evidence.capacityGating
-        ? [`- Capacity-stall accounting: ${formatCapacityGating(evidence.capacityGating)}`]
+      ...(evidence.noExecutableTurnGating
+        ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
