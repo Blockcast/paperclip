@@ -5,7 +5,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { projectService } from "../services/projects.js";
+import { projectService, promoteFirstSurvivingWorkspace } from "../services/projects.js";
 import { PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC, __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -212,4 +212,85 @@ describeEmbeddedPostgres("project primary-workspace provenance", () => {
       expect(healed?.workspaces.filter((w) => w.isPrimary)).toHaveLength(1);
     },
   );
+});
+
+// BLO-26184 review follow-up: the first cut of the concurrent-removal retry
+// capped itself at 5 attempts, which is a number real candidates can reach.
+// A project with >5 workspaces whose promotions kept losing the race exited the
+// loop with candidates still untried and every row already demoted — silently,
+// because the caller only warned on the exhausted branch. These cases pin the
+// walk's contract directly; they need no database, so they run on every host
+// rather than only where embedded Postgres is available.
+describe("promoteFirstSurvivingWorkspace", () => {
+  it("keeps walking past the old 5-attempt cap when the initial target and five more are removed", async () => {
+    // The SELECT still sees all seven rows; each of the first six is deleted by
+    // a racing transaction in the window before its own promote UPDATE lands.
+    const ids = ["w1", "w2", "w3", "w4", "w5", "w6", "w7"];
+    const doomed = new Set(["w1", "w2", "w3", "w4", "w5", "w6"]);
+    const attempted: string[] = [];
+
+    const outcome = await promoteFirstSurvivingWorkspace({
+      initialCandidateId: "w1",
+      tryPromote: async (id) => {
+        attempted.push(id);
+        return !doomed.has(id);
+      },
+      listCandidateIds: async () => ids,
+    });
+
+    expect(outcome.result).toBe("promoted");
+    expect(outcome.promotedId).toBe("w7");
+    // Seven attempts: the old MAX_ATTEMPTS = 5 gave up two candidates short.
+    expect(attempted).toEqual(["w1", "w2", "w3", "w4", "w5", "w6", "w7"]);
+  });
+
+  it("never retries a candidate it has already tried", async () => {
+    const attempted: string[] = [];
+
+    const outcome = await promoteFirstSurvivingWorkspace({
+      initialCandidateId: "a",
+      tryPromote: async (id) => {
+        attempted.push(id);
+        return false;
+      },
+      // A stable list: without the tried-set guard this would loop on "a".
+      listCandidateIds: async () => ["a", "b"],
+    });
+
+    expect(attempted).toEqual(["a", "b"]);
+    expect(outcome.result).toBe("candidates_exhausted");
+    expect(outcome.promotedId).toBeNull();
+  });
+
+  it("reports candidates_exhausted when every workspace was concurrently removed", async () => {
+    const outcome = await promoteFirstSurvivingWorkspace({
+      initialCandidateId: "gone",
+      tryPromote: async () => false,
+      listCandidateIds: async () => [],
+    });
+
+    expect(outcome.result).toBe("candidates_exhausted");
+    expect(outcome.promotedId).toBeNull();
+    expect(outcome.triedIds).toEqual(["gone"]);
+  });
+
+  it("reports attempt_cap_reached — not exhaustion — when it gives up with candidates left", async () => {
+    // An endless supply of fresh candidates that never promote: the only way
+    // out is the safety valve. The caller must be able to distinguish this
+    // from exhaustion, because here the project still has promotable rows.
+    let issued = 0;
+    const outcome = await promoteFirstSurvivingWorkspace({
+      initialCandidateId: "c0",
+      tryPromote: async () => false,
+      listCandidateIds: async () => {
+        issued += 1;
+        return Array.from({ length: issued + 1 }, (_, i) => `c${i}`);
+      },
+      maxAttempts: 3,
+    });
+
+    expect(outcome.result).toBe("attempt_cap_reached");
+    expect(outcome.promotedId).toBeNull();
+    expect(outcome.triedIds).toHaveLength(3);
+  });
 });
