@@ -8791,6 +8791,21 @@ function buildRunEventRuntimeProgress(input: {
   };
 }
 
+// The only wakeReasons that structurally guarantee a review actually EXISTS,
+// and therefore the only ones allowed to tell a PR author that a reviewer
+// posted findings and that they should push a follow-up commit. See the
+// author branch in buildPaperclipTaskMarkdown.
+//
+// An allowlist rather than a denylist on purpose: every other wakeReason --
+// today's lifecycle events (opened/reopened/synchronize/ready_for_review),
+// review_requested, and whatever is added next -- carries no review, so an
+// unrecognized reason must fail into "no findings recorded" rather than into a
+// false claim that findings exist.
+const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
+  "github_pr_review_submitted",
+  "github_pr_review_feedback",
+]);
+
 export function buildPaperclipTaskMarkdown(input: {
   issue: {
     id: string;
@@ -8907,6 +8922,26 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.requestCommentBody) {
         lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
       }
+    } else if (prReview.prRole === "author" && !AUTHOR_REVIEW_CONTENT_WAKE_REASONS.has(prReview.wakeReason)) {
+      // BLO-20886 generalizes the BLO-19522 branch above. That branch names one
+      // reasonless wakeReason; the author-role wake loop also covers plain PR
+      // lifecycle events (opened/reopened/synchronize/ready_for_review) that
+      // carry no review data at all, and those fell through to the feedback
+      // directive for the same reason review_requested did. Observed live:
+      // paperclip#953 had zero reviews (`gh api .../pulls/953/reviews` empty)
+      // when this directive told the woken agent "a reviewer just posted
+      // findings on YOUR pull request" and to push a follow-up commit.
+      //
+      // Gating on an ALLOWLIST of wakeReasons that structurally guarantee a
+      // review exists -- rather than adding lifecycle reasons to a denylist --
+      // is what makes this hold for the next wakeReason someone introduces: a
+      // new reason is reasonless until it is proven otherwise, which fails in
+      // the safe direction.
+      lines.push(
+        "",
+        "GitHub PR event directive:",
+        `Wake reason: ${quoteTaskScalar(prReview.wakeReason)}. No review findings are recorded for this PR yet, so do not push new commits on the strength of unconfirmed feedback. If you are this PR's author, confirm current state with \`gh pr view\` / \`gh api repos/<owner>/<repo>/pulls/${prReview.prNumber}/reviews\` before acting. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.`,
+      );
     } else if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
       const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;

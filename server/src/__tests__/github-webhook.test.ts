@@ -64,6 +64,10 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
+import {
+  resolveLinkSourceForIdentifier,
+  resolveOwningPaperclipIdentifiers,
+} from "../services/paperclip-identifiers.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "../services/pull-request-work-products.js";
 import { issueService } from "../services/issues.js";
 import { errorHandler } from "../middleware/index.js";
@@ -128,6 +132,618 @@ describe("github-webhook pure helpers", () => {
     expect(__test_extractPaperclipIdentifiers("frontend-X-44")).toEqual([]);
     // Punctuation around match is fine.
     expect(__test_extractPaperclipIdentifiers("(BLO-3182): work")).toEqual(["BLO-3182"]);
+  });
+
+  it("resolves the PR's OWNING identifier as title > labeled Fixes:/Closes:/Refs: body line > branch, never a bare Related: mention (BLO-20886)", () => {
+    // Title outranks everything else.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/BLO-9-stale-branch",
+        title: "fix BLO-1 thing",
+        body: "Refs: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // No title ref: a labeled body line outranks the branch. This ordering is
+    // load-bearing -- branches get repurposed, so a branch ref goes stale
+    // while the curated title/body stays current (observed: #909's branch says
+    // blo-20049 while both its title and body name BLO-20467, the issue it
+    // actually fixes). Ranking the branch above them would reintroduce this
+    // ticket's own defect.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-20049-stale-branch",
+        title: "fix(alertmanager-plugin): resolve webhook token per delivery",
+        body: "- Fixes: BLO-20467",
+      }),
+    ).toEqual({ owning: ["BLO-20467"] });
+
+    // Branch is the LAST resort, and matches case-insensitively so that a
+    // conventional lowercase branch resolves at all -- the identifier pattern
+    // is uppercase-only, which left the branch tier inert and failed 24 of 175
+    // recent PRs closed to `no_owning_reference`, dropping author wakes that
+    // should have been delivered.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886-pr-review-wake-routing" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "qa/blo-21079-master-artifact" }),
+    ).toEqual({ owning: ["BLO-21079"] });
+    // ...but only when nothing curated resolved: a `Related:`-only body still
+    // does not promote a Related: entry, and the branch answers instead.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-1-thing",
+        body: "Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // No branch/title: a Fixes:/Closes:/Resolves:/Refs: labeled line counts,
+    // colon optional -- this repo's own PR bodies use both "Closes: BLO-1"
+    // and the natural-language "Closes BLO-1 and BLO-2" (multiple owners).
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Fixes: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Closes BLO-1 and BLO-2" }),
+    ).toEqual({ owning: ["BLO-1", "BLO-2"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "closed: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] }); // case-insensitive, closing-keyword variant
+
+    // The exact incident shape: Refs: wins, Related: never counts as owning.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Refs:    BLO-19132\nRelated: BLO-20810, BLO-20129, BLO-19079\n",
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+
+    // A bare Related: list with no owning line at all resolves to nothing --
+    // not to the first (or any) Related: entry.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Related: BLO-20810, BLO-20129" }),
+    ).toEqual({ owning: [] });
+
+    // Nothing anywhere.
+    expect(resolveOwningPaperclipIdentifiers({})).toEqual({ owning: [] });
+  });
+
+  it("treats a markdown-bulleted owning reference as owning -- the PR template's own house style (BLO-20886)", () => {
+    // .github/PULL_REQUEST_TEMPLATE.md renders "## Linked Issues or Issue
+    // Description" as a bullet list, so real PR bodies in this repo write
+    // `- Refs: BLO-1`, not a bare `Refs: BLO-1` line. An earlier revision of
+    // this rule anchored the keyword to the start of the line and therefore
+    // matched nothing on the majority of real bodies, failing every such PR
+    // closed to `no_owning_reference` and dropping an author wake that should
+    // have been delivered. Each of these is a real formatting shape.
+    for (const body of [
+      "- Refs: BLO-1",
+      "* Refs: BLO-1",
+      "+ Fixes: BLO-1",
+      "1. Closes: BLO-1",
+      "  - Resolves: BLO-1", // indented sub-bullet
+      "- Refs: [BLO-1](https://paperclip.blockcast.net/BLO/issues/BLO-1)", // markdown link
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ body })).toEqual({ owning: ["BLO-1"] });
+    }
+
+    // A bulleted Related: is still never owning -- the list marker must not
+    // become a way to smuggle an informational mention into the owning tier.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "- Related: BLO-2, BLO-3" }),
+    ).toEqual({ owning: [] });
+
+    // PR #953's body verbatim (trimmed to the section that matters): a
+    // bulleted `Refs:` owner alongside a bulleted `Related:` list. This is the
+    // shape the live misroute actually had -- the pre-existing test above uses
+    // a synthesized bare-line form that does not reproduce it.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: [
+          "## Linked Issues or Issue Description",
+          "",
+          "- Refs: [BLO-19132](https://paperclip.blockcast.net/BLO/issues/BLO-19132)",
+          "- Supersedes: #945",
+          "- Related: [BLO-20810](https://paperclip.blockcast.net/BLO/issues/BLO-20810), [BLO-20129](https://paperclip.blockcast.net/BLO/issues/BLO-20129), [BLO-19079](https://paperclip.blockcast.net/BLO/issues/BLO-19079)",
+        ].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
+  it("ignores owning-looking Markdown code and trailing non-owning labels (BLO-20886)", () => {
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: [
+          "```md",
+          "Refs: BLO-2",
+          "```",
+          "~~~",
+          "Fixes: BLO-3",
+          "~~~~",
+          "    Closes: BLO-4",
+          "\tResolves: BLO-5",
+          "Refs: BLO-1; Related: BLO-6",
+        ].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "```\nRefs: BLO-2\n```\n    Fixes: BLO-3",
+      }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not let a list-prefixed pseudo-closer reopen a fence (BLO-20886)", () => {
+    // A closing fence admits only the marker run and whitespace. The OPENING
+    // grammar tolerates a list marker (a fence nested in a list item is
+    // ordinary Markdown), and reusing it to detect the close meant a `- ``` `
+    // line -- which CommonMark renders as fenced CONTENT -- ended the block
+    // early and exposed the following example as an ownership claim.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "- ```", "Refs: BLO-777", "```"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // Same for a numbered-list prefix, and for a tilde fence.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["~~~", "1. ~~~", "Fixes: BLO-778", "~~~"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // The genuine closer still closes: an owning line AFTER a real fence is
+    // owning, so this did not simply wedge every fence open.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "Refs: BLO-2", "```", "Refs: BLO-1"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("closes a fence indented by its list container, without loosening a root fence (BLO-20886)", () => {
+    // CommonMark measures a closing fence's three-space allowance from the
+    // fence's CONTAINER, not from column zero. Bounding it at three raw spaces
+    // meant a fence opened inside a list item never closed: the scanner
+    // swallowed the rest of the body and suppressed every genuinely visible
+    // owning line after it, dropping a wake that should have been delivered.
+    //
+    // Every expectation here was checked against a real CommonMark
+    // implementation (marked 16.4.2) rather than read off the spec.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- outer", "  - inner:", "", "  ```md", "  Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-555"] });
+
+    // A fence opened on its own list-marker line closes at the item's content
+    // indent.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- ```md", "  Refs: BLO-999", "  ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-555"] });
+
+    // The counter-case that keeps this from becoming a leak: with NO list
+    // container, a four-space `` ``` `` is fenced content, not a closer, so the
+    // fence stays open and everything after it stays unowning. marked agrees --
+    // it renders BLO-555 inside the code block. This is the fail-closed
+    // direction and must not regress into an early close.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```md", "Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // Same when the opener carries its own 1-3 spaces but no container: the
+    // allowance does not grow with the opener's own indent, only with the
+    // container's.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["   ```md", "   Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("treats mixed space-tab indentation as code by expanded columns (BLO-20886)", () => {
+    // CommonMark expands tabs to 4-column stops, so ` \t`, `  \t` and `   \t`
+    // are all four columns of indent -- an indented code block, exactly like
+    // `    `. Matching only the two literal prefixes `\t` and `    ` left the
+    // mixed forms eligible to declare an owner from inside a code example.
+    for (const indent of [" \t", "  \t", "   \t", "\t", "    ", "     "]) {
+      expect(
+        resolveOwningPaperclipIdentifiers({ body: `${indent}Refs: BLO-888` }),
+      ).toEqual({ owning: [] });
+    }
+
+    // Up to three columns is still a normal line, not code.
+    for (const indent of ["", " ", "  ", "   "]) {
+      expect(
+        resolveOwningPaperclipIdentifiers({ body: `${indent}Refs: BLO-1` }),
+      ).toEqual({ owning: ["BLO-1"] });
+    }
+  });
+
+  it("hides house-reference labels inside code, comments and indents (BLO-21312/BLO-20886)", () => {
+    // The house tier was added last and scanned the RAW body, so it skipped
+    // the fence/comment/indent filtering the closing-keyword tier already had.
+    // An `Issue:` line that renders as nothing -- or as a quoted example --
+    // could therefore route an author-directed "push a follow-up commit" wake
+    // to an issue no reader of the PR would call its owner.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["```", "Issue: BLO-111", "```"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-222", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "    Paperclip task: BLO-333" }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "  \tPaperclip issue: BLO-334" }),
+    ).toEqual({ owning: [] });
+
+    // A fenced example does not suppress a real house label elsewhere.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "Issue: BLO-111", "```", "Issue: BLO-1"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("measures the indented-code threshold from the list container (BLO-23893)", () => {
+    // The four-column code threshold is relative to the enclosing CONTAINER,
+    // exactly as the closing-fence allowance already was. A list continuation
+    // expands to four RAW columns while sitting only two columns inside the
+    // item's content, so measuring from column zero threw away an ordinary
+    // visible paragraph as "code" and lost the owner it declared. marked 16.4.2
+    // renders this as `<li>item\n   Refs: BLO-1</li>` -- a paragraph, no <pre>.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "- item\n \tRefs: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // The counter-cases that keep this from becoming a leak. Four columns PAST
+    // the container is still code, at root and at depth -- marked renders both
+    // inside <pre><code>. This is the direction that matters: the relative
+    // measurement must not make genuinely-fenced-off text eligible to own.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["- item", "", "      Refs: BLO-999"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- a", "  - b", "", "        Refs: BLO-999"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // With no container at all the threshold is unchanged from column zero, so
+    // the BLO-20886 mixed space-tab case above does not regress.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "  \tRefs: BLO-999" }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not open an HTML comment from an indented-code delimiter (BLO-23893)", () => {
+    // Comment state used to advance before the indented-code early-out, so a
+    // `    <!--` -- which CommonMark renders literally, escaped, inside
+    // <pre><code> -- opened a comment that then swallowed every following
+    // VISIBLE line up to the next `-->`, suppressing an owner a reader of the
+    // PR can plainly see. Fail-closed, but still a dropped wake.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["    <!--", "Issue: BLO-1"].join("\n") }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["    <!--", "Refs: BLO-2"].join("\n") }),
+    ).toEqual({ owning: ["BLO-2"] });
+
+    // The converse must hold too: indentation does not create a code block
+    // INSIDE an open HTML block, so an indented `-->` still closes the comment
+    // rather than wedging it open forever. marked closes it here.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!--", "    hidden -->", "Issue: BLO-3"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-3"] });
+
+    // And the fail-closed guarantees are untouched: a real comment still hides
+    // its body, an unterminated one still swallows the rest, and a comment
+    // opened on a fence-opener line still hides its own body.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-999", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-999"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```x <!--", "```", "Issue: BLO-999", "-->"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not manufacture a branch owner from a version number (BLO-20886)", () => {
+    // Uppercasing a whole branch to match the uppercase-only identifier
+    // pattern also turns ordinary words-followed-by-a-number into
+    // "identifiers". Measured over the 200 most recently-updated PRs in this
+    // repo, that invented UNDICI-7, URI-3, ADDRESS-10, PR-870, FOLD-977 and
+    // EXPANSION-5. A spurious owner is not harmless: it hands an
+    // author-directed "push a follow-up commit" wake to whoever is assigned
+    // the same-named issue, which is this ticket's own defect.
+    for (const branch of [
+      "blo-21612-undici-7.29.0",
+      "blo-21611-fast-uri-3.1.5",
+      "blo-21613-ip-address-10.3.1",
+      "blo-21610-brace-expansion-5.0.9",
+      "sre/blo-20867-fold-977-metrics",
+    ]) {
+      const { owning } = resolveOwningPaperclipIdentifiers({ branch });
+      expect(owning).toHaveLength(1);
+      expect(owning[0]).toMatch(/^BLO-\d+$/);
+    }
+
+    // A branch carrying no ref at all still resolves nothing, rather than
+    // coining one from a trailing digit.
+    expect(resolveOwningPaperclipIdentifiers({ branch: "relay-wave-0" })).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "migration-members-page" }),
+    ).toEqual({ owning: [] });
+
+    // The real ref still resolves, at the branch start or after any `/`.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886-pr-review-wake-routing" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(resolveOwningPaperclipIdentifiers({ branch: "blo-21610-thing" })).toEqual({
+      owning: ["BLO-21610"],
+    });
+  });
+
+  it("does not manufacture a branch owner from a Dependabot path (BLO-20886 round 6)", () => {
+    // The segment anchor alone only discriminates when the package name sits
+    // MID-segment (`blo-21612-undici-7.29.0`). Dependabot puts it at the START
+    // of a segment, so `undici-7` clears the anchor and the following `.`
+    // supplies the word boundary -- the leak the anchor was believed to close.
+    // Each of these manufactured an owner before the version-continuation
+    // guard, and each would route a dependency PR's author wake to whoever is
+    // assigned the same-named issue.
+    for (const branch of [
+      "dependabot/npm_and_yarn/undici-7.29.0",
+      "dependabot/npm_and_yarn/types/node-20.11.5",
+      "dependabot/github_actions/actions/checkout-4.2.0",
+      "dependabot/npm_and_yarn/fast-uri-3.1.5",
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // The guard keys on `.` + any word character, which never occurs inside a
+    // real ref. Real refs continue with `-`, `/` or end, so no shape regresses.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "cto/blo-20886-round5-ownership-leaks" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886" })).toEqual({
+      owning: ["BLO-20886"],
+    });
+  });
+
+  it("does not manufacture a branch owner from a wildcard version or a bot namespace (BLO-20886 round 7)", () => {
+    // A `.<digit>` guard left WILDCARD versions live. A dependency PR names no
+    // issue in its title or body, so the branch tier is the only one consulted
+    // and a manufactured token would be the PR's SOLE owner.
+    for (const branch of ["renovate/node-20.x", "renovate/undici-7.x", "bump-undici-7.29.0"]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // A version guard cannot be the whole answer, and this is the measurement
+    // that shows it: these carry NO version suffix for the guard to key on, yet
+    // still manufactured `NODE-20` / `UNDICI-7`. Skipping the two reserved bot
+    // namespaces is what closes them -- a dependency bot names its branch after
+    // the package it bumps, so nothing in one is an ownership claim.
+    for (const branch of [
+      "renovate/node-20",
+      "dependabot/npm_and_yarn/undici-7",
+      "renovate/blo-1-not-an-owner",
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // Ordinary branches keep their refs, including the sub-issue `/` form.
+    expect(resolveOwningPaperclipIdentifiers({ branch: "kkroo/blo-19132-approval-dedupe-v2" })).toEqual({
+      owning: ["BLO-19132"],
+    });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "blo-21610-brace-expansion-5.0.9" }),
+    ).toEqual({ owning: ["BLO-21610"] });
+  });
+
+  it("classifies a lowercase branch-only owner as branch_ref, not body_ref (BLO-20886 round 6)", () => {
+    // Ownership accepts a lowercase branch case-insensitively, but link-source
+    // classification used the uppercase-only broad extractor, so the very shape
+    // branchTemplate produces resolved to nothing here and fell through to
+    // `body_ref`. With a related issue also named in the body, both candidates
+    // then carried equal strength and insertion order decided which one a
+    // merged PR was persisted against -- losing the authoritative branch owner
+    // to a bare `Related:` mention.
+    const fields = {
+      branch: "cto/blo-20886-round5-ownership-leaks",
+      title: "fix(github-webhook): close ownership-parsing leaks",
+      body: "Refs: BLO-20886\nRelated: BLO-19132",
+    };
+    expect(resolveLinkSourceForIdentifier("BLO-20886", fields)).toBe("branch_ref");
+    // The related-only identifier is still body-sourced, and the branch tier
+    // does not start claiming identifiers it does not carry.
+    expect(resolveLinkSourceForIdentifier("BLO-19132", fields)).toBe("body_ref");
+    // An uppercase branch keeps working, and a Dependabot branch stays unowned.
+    expect(resolveLinkSourceForIdentifier("BLO-20886", { branch: "CTO/BLO-20886-x" })).toBe(
+      "branch_ref",
+    );
+    expect(
+      resolveLinkSourceForIdentifier("UNDICI-7", {
+        branch: "dependabot/npm_and_yarn/undici-7.29.0",
+      }),
+    ).toBeNull();
+  });
+
+  it("falls back to a non-closing house-reference body line when title/keyword/branch all resolve nothing (BLO-21312)", () => {
+    // `github_pr_review_requested` arrives via `issue_comment`, whose payload
+    // carries no `pull_request.head.ref` -- `branch` is never populated on
+    // that path, so the case-insensitive branch tier (BLO-20886) is
+    // structurally unreachable there. These are the real house-label shapes
+    // observed on Blockcast/paperclip#931, #963, #976, #916.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue: https://paperclip.blockcast.net/BLO/issues/BLO-20172",
+      }),
+    ).toEqual({ owning: ["BLO-20172"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "- Paperclip task: [BLO-20396](https://paperclip.blockcast.net/BLO/issues/BLO-20396)",
+      }),
+    ).toEqual({ owning: ["BLO-20396"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip QA task: https://paperclip.blockcast.net/BLO/issues/BLO-21079",
+      }),
+    ).toEqual({ owning: ["BLO-21079"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip issue: https://paperclip.blockcast.net/BLO/issues/BLO-19771",
+      }),
+    ).toEqual({ owning: ["BLO-19771"] });
+
+    // Still never widens far enough to make a bare `Related:` mention owning,
+    // even alongside a house label elsewhere in the same body -- the
+    // BLO-20886 guarantee holds unchanged.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Related: BLO-1, BLO-2\nIssue: BLO-3\n",
+      }),
+    ).toEqual({ owning: ["BLO-3"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Related: BLO-1, BLO-2\n" }),
+    ).toEqual({ owning: [] });
+
+    // Ranked below the closing-keyword tier: a Fixes:/Closes:/Refs: line
+    // still wins over a house label in the same body.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Fixes: BLO-1\nPaperclip issue: BLO-2\n",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // Ranked below the branch tier too: on a `pull_request` event (branch
+    // populated), the measured branch answer still wins over an unmeasured
+    // house label in the same body.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-1-thing",
+        body: "Paperclip issue: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // Title still outranks a house label.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        title: "fix BLO-1 thing",
+        body: "Paperclip issue: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // The colon is mandatory for this weaker tier (unlike the closing-keyword
+    // tier, where "Closes BLO-1" is unambiguous natural language). "Issue" is
+    // an ordinary noun that also starts ordinary sentences, so an optional
+    // colon here would treat prose as an ownership claim. Neither of these is
+    // a house label -- both must resolve to nothing.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue filed a related bug, see BLO-1",
+      }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue description for BLO-2",
+      }),
+    ).toEqual({ owning: [] });
+
+    // A house-reference line carrying a second, explicitly different label on
+    // the SAME line must resolve only the house label's own direct value --
+    // the semicolon-separated Related: mention must not become owning just
+    // because it shares a line with a real house label (BLO-20886's
+    // guarantee applied to this new tier).
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue: BLO-1; Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip issue: BLO-1, Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("keeps owning-looking text unreachable inside list-nested fences and unclosed fences (BLO-20886)", () => {
+    // A fence nested in a list item is ordinary Markdown -- it is how a bullet
+    // quotes an example PR body -- but its opening line starts with the list
+    // marker. A root-level-only fence scanner never opened a fence here, so the
+    // indented `Refs:` line inside the example declared an owner and could
+    // capture an author-directed "push a follow-up commit" wake.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["- ```md", "  Refs: BLO-999", "  ```"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["1. ~~~", "   Closes: BLO-998", "   ~~~"].join("\n") }),
+    ).toEqual({ owning: [] });
+
+    // CommonMark allows only whitespace after a CLOSING fence's marker run, so
+    // ``` js inside an open fence is content. Treating it as the close reopened
+    // the remainder of the block to the ownership scan.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "example:", "``` js", "Refs: BLO-997", "```"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // An unterminated fence swallows the rest of the body rather than falling
+    // back to matching -- ambiguity fails closed, never toward a guessed owner.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["```", "Refs: BLO-996"].join("\n") }),
+    ).toEqual({ owning: [] });
+
+    // The fence rules must not swallow the real thing: a closed fence releases
+    // the lines after it, and the repo's bulleted house style still owns.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- ```md", "  Refs: BLO-999", "  ```", "- Refs: BLO-19132"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
+  it("never lets an HTML comment declare an owner (BLO-20886)", () => {
+    // A comment renders as nothing, so an owner declared inside one is
+    // invisible to every human reading the PR -- an unexplainable misroute.
+    // The opener and its `-->` sit on different lines in the repo's own
+    // PULL_REQUEST_TEMPLATE.md, so the state has to cross the line loop.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Refs: BLO-888", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(resolveOwningPaperclipIdentifiers({ body: "<!-- Refs: BLO-887 -->" })).toEqual({
+      owning: [],
+    });
+    // A comment cannot hide the fence that would otherwise contain it, either.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!-- ```", "-->", "Refs: BLO-886"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-886"] });
+    // Unterminated: the rest of the body stays commented out, failing closed.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Refs: BLO-885"].join("\n") }),
+    ).toEqual({ owning: [] });
+    // A visible owner beside a commented decoy resolves to the visible one only.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!-- Fixes: BLO-884 -->", "Refs: BLO-19132"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
   });
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
@@ -1011,6 +1627,33 @@ describe("github-webhook pure helpers", () => {
       commentAuthorLogin: "allyblockcast[bot]",
     });
     expect(ctx ? __test_shouldFirePrReviewerWake(ctx) : true).toBe(false);
+  });
+
+  it("keeps a lowercase branch-only owner in the candidate identifiers (BLO-20886)", () => {
+    // The owning tiers uppercase the branch (real branches are lowercase and
+    // PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only); the broad `identifiers`
+    // extraction does not. A PR whose ONLY ref is a lowercase branch therefore
+    // resolved an owner while `identifiers` came back empty -- and the route
+    // drops such a delivery at the `no_paperclip_identifier` gate before the
+    // owner is ever consulted. Past that gate it is still unreachable, because
+    // author wakes are `matched.filter(m => owning.includes(m.identifier))`
+    // and `matched` derives from `identifiers`. Either way the wake this
+    // module exists to deliver is lost, so the owner must appear in both.
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 962,
+        title: "tidy up the webhook",
+        body: "No issue reference in this body at all.",
+        head: { ref: "fix/blo-20886-only", sha: "deadbeef" },
+        user: { login: "kkroo" },
+      },
+      review: { state: "changes_requested", body: "please fix", user: { login: "ally" } },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    expect(ctx?.owningIdentifiers).toEqual(["BLO-20886"]);
+    expect(ctx?.identifiers).toContain("BLO-20886");
   });
 
   it("extracts review body / state / author from pull_request_review.submitted so the assignee wake can render it inline (BLO-6300)", () => {
@@ -2881,7 +3524,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
         number: 18859,
         title: "Delivery funnel counters",
         body: null,
-        head: { ref: "platform/blo-18859-github-delivery-metrics" },
+        // Deliberately carries no Paperclip ref in branch, title or body: this
+        // test is about the reviewer-wake delivery counters, and needs the
+        // route to stop at `no_paperclip_identifier` so nothing else runs. The
+        // branch used to read `platform/blo-18859-...`, which only stayed
+        // inert because a lowercase branch-only ref was silently dropped
+        // before routing (BLO-20886) -- scaffolding that stopped being inert
+        // once that was fixed.
+        head: { ref: "platform/github-delivery-metrics" },
       },
       repository: { full_name: "Blockcast/paperclip" },
     };
@@ -3436,7 +4086,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
         number: 18860,
         title: "Suppressed delivery",
         body: null,
-        head: { ref: "platform/blo-18859-suppressed" },
+        // No Paperclip ref anywhere, for the same reason as above.
+        head: { ref: "platform/suppressed-delivery" },
       },
       repository: { full_name: "Blockcast/paperclip" },
     };
@@ -4829,6 +5480,275 @@ describeEmbeddedPostgres("github-webhook route", () => {
         ":Blockcast/paperclip:582:github_pr_review_requested:comment:4871387911",
       ),
     });
+  });
+
+  it("routes an author wake to the PR's owning Refs: issue, never an unrelated Related: backlink assignee (BLO-20886)", async () => {
+    // Reproduces the live incident (Blockcast/paperclip#953): the PR body
+    // carried `Refs: BLO-19132` (the owning issue) plus
+    // `Related: BLO-20810, BLO-20129, BLO-19079` -- three bare informational
+    // mentions. Before this fix, the author-wake loop treated every matched
+    // identifier as equally-weighted and woke BLO-20129's assignee (the
+    // THIRD Related: entry) with a "push a follow-up commit" directive for a
+    // PR that agent had no relationship to at all.
+    //
+    // All four identifiers share the BLO prefix (as in the real incident),
+    // so they're seeded as four issues under ONE company/agent set --
+    // seedIssueWithIdentifier creates a fresh company per call and company
+    // issue_prefix is unique, so four BLO- calls would collide.
+    const { companyId } = await seedCompanyAndAgent();
+    async function seedBloIssue(identifier: string) {
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${identifier}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: Number(identifier.split("-")[1]),
+        identifier,
+      });
+      return { agentId, issueId };
+    }
+    const refsIssue = await seedBloIssue("BLO-19132");
+    const relatedB = await seedBloIssue("BLO-20810");
+    const relatedC = await seedBloIssue("BLO-20129");
+    const relatedD = await seedBloIssue("BLO-19079");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 953,
+        title: "approval dedupe v2",
+        body: "Refs:    BLO-19132\nRelated: BLO-20810, BLO-20129, BLO-19079\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/953",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/953" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328634,
+        body: "@ally review exact head d9f28c1e0e6595ce8de9515bf0158b04d136a204",
+        html_url: "https://github.com/Blockcast/paperclip/pull/953#issuecomment-5156328634",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-19132", agentId: refsIssue.agentId }]);
+
+    const allWakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [
+        refsIssue.agentId,
+        relatedB.agentId,
+        relatedC.agentId,
+        relatedD.agentId,
+      ]));
+    // Only the Refs: owner was ever woken -- not one of the three Related:
+    // assignees, and specifically never BLO-20129's (relatedC), the one that
+    // fired live.
+    expect(allWakes.map((w) => w.agentId)).toEqual([refsIssue.agentId]);
+  });
+
+  it("suppresses the author wake with a logged reason when a PR carries only Related: mentions and no owning reference (BLO-20886)", async () => {
+    // No Refs:/Fixes:/Closes:/Resolves: line and no branch/title ref -- the
+    // PR names issues but doesn't claim ownership of any of them. Acceptance
+    // criterion: this must drop with a suppressionReason, not fall through to
+    // an arbitrary Related: assignee.
+    const relatedOnly = await seedIssueWithIdentifier("BLO-20811");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 954,
+        title: "misc cleanup",
+        body: "Related: BLO-20811\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/954",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/954" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328700,
+        body: "@ally review please",
+        html_url: "https://github.com/Blockcast/paperclip/pull/954#issuecomment-5156328700",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886-no-owner")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([]);
+    expect(res.body.skipped).toContainEqual({
+      issueIdentifier: null,
+      reason: "no_owning_reference",
+    });
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, relatedOnly.agentId));
+    expect(wakes).toHaveLength(0);
+  });
+
+  it("routes an issue_comment @ally-review author wake to a PR's owning issue named only by a house-reference label, not a Related: mention (BLO-21312)", async () => {
+    // github_pr_review_requested arrives via issue_comment, whose payload
+    // carries no pull_request.head.ref -- BLO-20886's branch-tier recovery
+    // can never reach this path. This PR's title and body carry no
+    // Fixes:/Closes:/Resolves:/Refs: line, only a "Paperclip issue:" house
+    // label (the real shape observed on Blockcast/paperclip#916) plus an
+    // unrelated Related: mention -- reproducing the gap and its guardrail in
+    // one payload. Both issues share the BLO prefix (as in the real PR body),
+    // so they're seeded under one company -- seedIssueWithIdentifier creates
+    // a fresh company per call and company issue_prefix is unique, so two
+    // BLO- calls would collide.
+    const { companyId } = await seedCompanyAndAgent();
+    async function seedBloIssue(identifier: string) {
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${identifier}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: Number(identifier.split("-")[1]),
+        identifier,
+      });
+      return { agentId, issueId };
+    }
+    const owner = await seedBloIssue("BLO-19771");
+    const relatedOnly = await seedBloIssue("BLO-20811");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 916,
+        title: "fix(pipelines): retire exited stage automation issues",
+        body: "## Linked Issues or Issue Description\n\nPaperclip issue: https://paperclip.blockcast.net/BLO/issues/BLO-19771\nRelated: BLO-20811\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/916",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/916" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328800,
+        body: "@ally review please",
+        html_url: "https://github.com/Blockcast/paperclip/pull/916#issuecomment-5156328800",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-21312-house-label")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-19771", agentId: owner.agentId }]);
+    expect(res.body.skipped).not.toContainEqual(
+      expect.objectContaining({ reason: "no_owning_reference" }),
+    );
+
+    const allWakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [owner.agentId, relatedOnly.agentId]));
+    // Only the house-label owner was woken -- never the Related: mention.
+    expect(allWakes.map((w) => w.agentId)).toEqual([owner.agentId]);
+  });
+
+  it("delivers a lowercase branch-only author wake end-to-end (BLO-20886)", async () => {
+    // Route-level companion to the pure-helper test above. The owning tiers
+    // match the branch case-insensitively but the broad `identifiers`
+    // extraction is uppercase-only, so a PR whose ONLY ref is a lowercase
+    // branch resolved an owner and then died at the `no_paperclip_identifier`
+    // gate before that owner was ever consulted -- a dropped author wake that
+    // no test covered, because every existing branch fixture also carries the
+    // ref in its title or body.
+    const owner = await seedIssueWithIdentifier("BLO-20886");
+    const app = buildApp();
+    const payload = {
+      action: "submitted",
+      pull_request: {
+        number: 962,
+        title: "fix(github-webhook): tidy the receiver",
+        body: "No issue reference anywhere in this body.",
+        html_url: "https://github.com/Blockcast/paperclip/pull/962",
+        head: { ref: "sre/blo-20886-pr-review-wake-routing", sha: "17532d7f" },
+        user: { login: "kkroo" },
+      },
+      review: {
+        state: "changes_requested",
+        body: "one nit",
+        html_url: "https://github.com/Blockcast/paperclip/pull/962#pullrequestreview-1",
+        user: { login: "someone-else" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request_review")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886-lowercase-branch")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    // Specifically NOT dropped as `no_paperclip_identifier`.
+    expect(res.body.ignored).toBeUndefined();
+    expect(res.body.wakes).toEqual([
+      { issueIdentifier: "BLO-20886", agentId: owner.agentId },
+    ]);
   });
 
   it("dedupes an @ally comment redelivery on the author wake after it completed or was cancelled (BLO-18953)", async () => {

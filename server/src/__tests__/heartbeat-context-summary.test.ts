@@ -245,6 +245,98 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).not.toContain("Latest review body:");
   });
 
+  // BLO-20886: github_pr_review_requested fires on a bare `@ally review` ASK
+  // -- no review has been posted -- and the author-role wake loop also
+  // covers plain PR lifecycle events with no review data at all. Both used
+  // to render the review-feedback directive unconditionally, telling the
+  // woken agent "a reviewer just posted findings on YOUR pull request" and
+  // to push a follow-up commit against a PR with zero recorded reviews
+  // (observed live: Blockcast/paperclip#953).
+  //
+  // review_requested is claimed by the more specific BLO-19522 branch above,
+  // which says the same true thing in more useful words (it names the
+  // requester and carries the anti-loop instruction). What BLO-20886 adds is
+  // the allowlist that catches every OTHER reasonless wakeReason -- the
+  // lifecycle events asserted below, and any reason added later.
+  it("does not instruct a push when no review has actually been submitted", () => {
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+      },
+    });
+    expect(requestedMarkdown).not.toContain("just posted findings on YOUR pull request");
+    expect(requestedMarkdown).not.toContain("push a follow-up commit");
+    expect(requestedMarkdown).not.toContain("GitHub PR review feedback directive:");
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+
+    // A lifecycle event carries no review either, and no branch above claims
+    // it -- so it must land on the generic directive rather than fall through
+    // to the feedback one.
+    for (const wakeReason of [
+      "github_pr_opened",
+      "github_pr_reopened",
+      "github_pr_synchronize",
+      "github_pr_ready_for_review",
+    ]) {
+      const lifecycleMarkdown = buildPaperclipTaskMarkdown({
+        issue: null,
+        prReview: {
+          wakeReason,
+          prNumber: 35,
+          repoFullName: "Blockcast/paperclip",
+          event: "pull_request",
+          prRole: "author",
+        },
+      });
+      expect(lifecycleMarkdown).not.toContain("YOUR pull request");
+      expect(lifecycleMarkdown).not.toContain("push a follow-up commit");
+      expect(lifecycleMarkdown).not.toContain("GitHub PR review feedback directive:");
+      expect(lifecycleMarkdown).toContain("GitHub PR event directive:");
+      expect(lifecycleMarkdown).toContain(`"${wakeReason}"`);
+      expect(lifecycleMarkdown).toContain("No review findings are recorded for this PR yet");
+    }
+
+    // The allowlist is what makes this hold for a wakeReason nobody has
+    // written yet: unrecognized must fail into "no findings", not into a
+    // false claim that findings exist.
+    const unknownMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_some_future_reason",
+        prNumber: 36,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+      },
+    });
+    expect(unknownMarkdown).toContain("GitHub PR event directive:");
+    expect(unknownMarkdown).not.toContain("GitHub PR review feedback directive:");
+  });
+
+  // Real review content must still get the author-shaped directive -- this
+  // fix narrows WHEN "YOUR pull request" fires, it doesn't remove it.
+  it("still asserts 'YOUR pull request' for an actionable review-feedback comment wake", () => {
+    const feedbackMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_feedback",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewAuthorLogin: "ally",
+      },
+    });
+    expect(feedbackMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(feedbackMarkdown).toContain("YOUR pull request");
+  });
+
   it("adds accepted-plan continuation guidance for standard-work issues when the wake is flagged as a plan continuation", () => {
     const acceptedConfirmation = buildPaperclipTaskMarkdown({
       issue: {
