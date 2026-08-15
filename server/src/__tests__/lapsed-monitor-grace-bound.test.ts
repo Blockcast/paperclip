@@ -73,6 +73,20 @@ describe("BLO-24782 lapsed monitor grace bound", () => {
         isLapsedMonitorStillLive({ lastTriggeredAt: "not-a-timestamp", now: NOW, graceMs: GRACE }),
       ).toBe(false);
     });
+
+    // This is why the config layer must never hand this predicate a non-finite grace,
+    // and it is the mechanism behind the review finding on #1330: the predicate itself
+    // is correct, so an infinite `graceMs` reinstates the unbounded belief without any
+    // code here being wrong. Guarding the parse is the only place this can be stopped.
+    it("would read even the oldest abandoned monitor as live if handed an infinite grace", () => {
+      expect(
+        isLapsedMonitorStillLive({
+          lastTriggeredAt: at(207.5 * 60 * 60_000),
+          now: NOW,
+          graceMs: Number.POSITIVE_INFINITY,
+        }),
+      ).toBe(true);
+    });
   });
 
   describe("lapsedMonitorGraceMs config", () => {
@@ -111,6 +125,50 @@ describe("BLO-24782 lapsed monitor grace bound", () => {
       const config = loadConfig();
       expect(config.lapsedMonitorGraceMs).toBe(3 * 60 * 60_000);
       expect(config.recoveryActionTimeoutMs).toBe(6 * 60 * 60_000);
+    });
+
+    // BLO-24782 review finding: `Number("Infinity")` is truthy, so the old
+    // `Number(env) || default` fallback never fired, and `Math.max(floor, Infinity)`
+    // is `Infinity`. That made the grace infinite — a `triggered` monitor would read
+    // as a live wake path forever, which is precisely the stranded-issue failure this
+    // bound exists to remove. One env typo silently reverted the fix.
+    it.each(["Infinity", "+Infinity", "1e999"])(
+      "rejects the non-finite override %s and falls back to the default",
+      (value) => {
+        process.env.LAPSED_MONITOR_GRACE_MS = value;
+        const { lapsedMonitorGraceMs } = loadConfig();
+        expect(Number.isFinite(lapsedMonitorGraceMs)).toBe(true);
+        expect(lapsedMonitorGraceMs).toBe(6 * 60 * 60_000);
+      },
+    );
+
+    it("rejects -Infinity rather than flooring it, so the intent stays legible", () => {
+      process.env.LAPSED_MONITOR_GRACE_MS = "-Infinity";
+      expect(loadConfig()).toMatchObject({ lapsedMonitorGraceMs: 6 * 60 * 60_000 });
+    });
+
+    // A finite override can still be effectively infinite: 1e308 ms is ~1e297 years.
+    // Rejecting only non-finite input would leave that half of the hole open.
+    it("clamps a finite but absurd override to the seven-day ceiling", () => {
+      process.env.LAPSED_MONITOR_GRACE_MS = "1e308";
+      expect(loadConfig()).toMatchObject({ lapsedMonitorGraceMs: 7 * 24 * 60 * 60_000 });
+    });
+
+    it("falls back to the default for unparseable, empty, and non-positive overrides", () => {
+      for (const value of ["not-a-number", "", "0", "-1"]) {
+        process.env.LAPSED_MONITOR_GRACE_MS = value;
+        expect(loadConfig().lapsedMonitorGraceMs).toBe(6 * 60 * 60_000);
+      }
+    });
+
+    it("keeps every resolved grace finite across the whole override space", () => {
+      for (const value of ["Infinity", "1e999", "1e308", "abc", "", "0", "-1", "-Infinity", "1000"]) {
+        process.env.LAPSED_MONITOR_GRACE_MS = value;
+        const { lapsedMonitorGraceMs } = loadConfig();
+        expect(Number.isFinite(lapsedMonitorGraceMs)).toBe(true);
+        expect(lapsedMonitorGraceMs).toBeGreaterThanOrEqual(15 * 60_000);
+        expect(lapsedMonitorGraceMs).toBeLessThanOrEqual(7 * 24 * 60 * 60_000);
+      }
     });
   });
 });
