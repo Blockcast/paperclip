@@ -46,7 +46,12 @@ function makePod(image: string, nodeSelectorValue: string) {
         {
           name: "paperclip",
           image,
-          env: [{ name: "CLUSTER_TAG", value: nodeSelectorValue }],
+          // PAPERCLIP_API_URL rather than an arbitrary name: since BLO-22514
+          // getSelfPodInfo() allowlists inherited env, so a synthetic var would
+          // be filtered out and this test would assert on `undefined` for a
+          // reason unrelated to cache keying. This one is allowlisted and its
+          // value is per-cluster, which is exactly what the assertion needs.
+          env: [{ name: "PAPERCLIP_API_URL", value: `http://${nodeSelectorValue}.svc:3000` }],
           volumeMounts: [],
         },
       ],
@@ -126,7 +131,7 @@ describe("getSelfPodInfo cache keying", () => {
     const b = await getSelfPodInfo(KC_B);
     expect(b.image).toBe("registry/b:v2");
     expect(b.nodeSelector).toEqual({ workload: "cluster-b" });
-    expect(b.inheritedEnv.CLUSTER_TAG).toBe("cluster-b");
+    expect(b.inheritedEnv.PAPERCLIP_API_URL).toBe("http://cluster-b.svc:3000");
   });
 
   it("still caches per kubeconfig (second call does not re-hit the API)", async () => {
@@ -198,5 +203,123 @@ describe("getSelfPodInfo secret volume capture", () => {
     const source = (podFixtures[KC] as { spec: { volumes: Array<{ name: string; secret?: { items?: unknown[] } }> } })
       .spec.volumes.find((v) => v.name === "gbrain-authbot-service-key");
     expect(scoped?.items).not.toBe(source?.secret?.items);
+  });
+});
+
+/**
+ * BLO-22514: getSelfPodInfo() is the single chokepoint for what the server pod
+ * hands down to agent Job pods. job-manifest.ts replays its output in four
+ * separate places, so filtering here — rather than at each replay site — is
+ * what stops a new replay site from reintroducing the leak.
+ */
+describe("getSelfPodInfo inheritance allowlist (BLO-22514)", () => {
+  const KC = "/tmp/kubeconfig-allowlist";
+
+  beforeEach(async () => {
+    process.env.HOSTNAME = "paperclip-abc123";
+    process.env.PAPERCLIP_NAMESPACE = "paperclip";
+    const { resetCache } = await import("./k8s-client.js");
+    resetCache();
+  });
+
+  afterEach(() => {
+    delete process.env.PAPERCLIP_NAMESPACE;
+  });
+
+  function podWithEnv(
+    env: unknown[],
+    opts: { volumes?: unknown[]; volumeMounts?: unknown[]; envFrom?: unknown[] } = {},
+  ) {
+    return {
+      spec: {
+        containers: [
+          {
+            name: "paperclip",
+            image: "registry/paperclip:v1",
+            env,
+            envFrom: opts.envFrom ?? [],
+            volumeMounts: opts.volumeMounts ?? [],
+          },
+        ],
+        volumes: opts.volumes ?? [],
+        nodeSelector: {},
+        imagePullSecrets: [],
+        tolerations: [],
+      },
+    };
+  }
+
+  it("drops server-only literals and keeps agent-needed ones", async () => {
+    podFixtures[KC] = podWithEnv([
+      { name: "PAPERCLIP_AGENT_JWT_SECRET", value: "master-signing-key" },
+      { name: "DATABASE_URL", value: "postgres://user:pw@host/db" },
+      { name: "GITHUB_APP_PRIVATE_KEY", value: "-----BEGIN RSA-----" },
+      { name: "PAPERCLIP_API_URL", value: "http://paperclip-api.paperclip.svc:3000" },
+      { name: "ANTHROPIC_BASE_URL", value: "https://api.penstock.run/anthropic" },
+      { name: "PATH", value: "/usr/local/bin:/usr/bin" },
+    ]);
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    expect(info.inheritedEnv).not.toHaveProperty("PAPERCLIP_AGENT_JWT_SECRET");
+    expect(info.inheritedEnv).not.toHaveProperty("DATABASE_URL");
+    expect(info.inheritedEnv).not.toHaveProperty("GITHUB_APP_PRIVATE_KEY");
+
+    expect(info.inheritedEnv.PAPERCLIP_API_URL).toBe("http://paperclip-api.paperclip.svc:3000");
+    expect(info.inheritedEnv.ANTHROPIC_BASE_URL).toBe("https://api.penstock.run/anthropic");
+    expect(info.inheritedEnv.PATH).toBe("/usr/local/bin:/usr/bin");
+  });
+
+  it("filters secretKeyRef entries on the same basis as literals", async () => {
+    // The BLO-22506 analysis called secretKeyRef-sourced vars "fine" because
+    // they do not surface through `GET Pod`. They are not: the kubelet resolves
+    // them into the container environment, so the agent reads them either way.
+    podFixtures[KC] = podWithEnv([
+      {
+        name: "PAPERCLIP_AGENT_JWT_SECRET",
+        valueFrom: { secretKeyRef: { name: "paperclip-jwt", key: "secret" } },
+      },
+      {
+        name: "ANTHROPIC_AUTH_TOKEN",
+        valueFrom: { secretKeyRef: { name: "paperclip-penstock-org-key", key: "token" } },
+      },
+    ]);
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    const names = info.inheritedEnvValueFrom.map((e) => e.name);
+    expect(names).not.toContain("PAPERCLIP_AGENT_JWT_SECRET");
+    expect(names).toContain("ANTHROPIC_AUTH_TOKEN");
+  });
+
+  it("keeps agent-facing secret volumes and drops the rest", async () => {
+    podFixtures[KC] = podWithEnv([], {
+      volumes: [
+        { name: "github-merge-token", secret: { secretName: "paperclip-github-merge-token" } },
+        { name: "db-creds", secret: { secretName: "paperclip-db-credentials" } },
+      ],
+      volumeMounts: [
+        { name: "github-merge-token", mountPath: "/paperclip/.secrets/github-merge-token" },
+        { name: "db-creds", mountPath: "/paperclip/.secrets/db" },
+      ],
+    });
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    expect(info.secretVolumes.map((v) => v.secretName)).toEqual([
+      "paperclip-github-merge-token",
+    ]);
+  });
+
+  it("drops every envFrom source by default", async () => {
+    // envFrom injects whole objects under names the allowlist never observes,
+    // so it cannot be reconciled with per-name filtering.
+    podFixtures[KC] = podWithEnv([], {
+      envFrom: [{ secretRef: { name: "paperclip-server-secrets" } }],
+    });
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    expect(info.inheritedEnvFrom).toEqual([]);
   });
 });
