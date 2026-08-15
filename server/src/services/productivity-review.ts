@@ -698,6 +698,62 @@ function classifyNoExecutableTurnRun(
 }
 
 /**
+ * BLO-22436: the span a run was demonstrably executing.
+ *
+ * Used only to protect the no-executable-turn buckets from over-exclusion. A
+ * run sitting `queued` while a *different* run works the same issue is not a
+ * missing turn — the assignee had one, on the sibling row — so that overlap has
+ * to come back out of `noExecutableTurnMs` before it suppresses the trigger.
+ *
+ * Liveness matches `nonLiveExecutionHoldSince`: a `running` row counts until it
+ * goes silent past NON_LIVE_EXECUTION_SILENCE_MS, and one carrying a past
+ * `scheduledRetryAt` starts at that park boundary rather than at its preserved
+ * pre-park `startedAt`, for the reason `liveSegmentStartedAt` documents —
+ * otherwise a promoted row's live span would swallow its own park.
+ */
+function runLiveInterval(run: HeartbeatRunRow, now: Date): { start: number; end: number } | null {
+  const startedAt = coerceDate(run.startedAt);
+  if (!startedAt || Number.isNaN(startedAt.getTime())) return null;
+  const parkEndedAt = liveSegmentStartedAt(run, now);
+  const start = parkEndedAt && parkEndedAt.getTime() > startedAt.getTime() ? parkEndedAt : startedAt;
+
+  const lastSignal = latestDate(run.lastUsefulActionAt, run.lastOutputAt, startedAt);
+  let end: Date | null;
+  if (TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number])) {
+    end = coerceDate(run.finishedAt) ?? lastSignal;
+  } else if (run.status === "running") {
+    const silentFrom = lastSignal ? lastSignal.getTime() + NON_LIVE_EXECUTION_SILENCE_MS : now.getTime();
+    end = new Date(Math.min(now.getTime(), silentFrom));
+  } else {
+    // queued / scheduled_retry carrying a startedAt: a row that executed and has
+    // since re-parked. Its live span ended at its last signal.
+    end = lastSignal;
+  }
+  if (!end) return null;
+  return end.getTime() > start.getTime() ? { start: start.getTime(), end: end.getTime() } : null;
+}
+
+/** Milliseconds of `[start, end)` not covered by any span in `liveSpans`. */
+function msOutsideLiveSpans(start: number, end: number, liveSpans: { start: number; end: number }[]) {
+  if (end <= start) return 0;
+  const overlapping = liveSpans
+    .map((span) => ({ start: Math.max(span.start, start), end: Math.min(span.end, end) }))
+    .filter((span) => span.end > span.start)
+    .sort((a, b) => a.start - b.start);
+
+  let covered = 0;
+  let cursor = start;
+  for (const span of overlapping) {
+    if (span.start > cursor) cursor = span.start;
+    if (span.end > cursor) {
+      covered += span.end - cursor;
+      cursor = span.end;
+    }
+  }
+  return end - start - covered;
+}
+
+/**
  * BLO-23248/BLO-22331/BLO-23624: sums the portion of
  * `[attributableStartAt, attributableEndAt)` attributable to a
  * no-executable-turn run, walking `latestRuns` in chronological order and
@@ -746,6 +802,19 @@ function noExecutableTurnBreakdown(
   };
   let noExecutableTurnMs = 0;
 
+  // BLO-22436: subtract any span a *different* run was demonstrably executing.
+  // Without this, one stray `queued` sibling of a live run covers almost the
+  // whole episode — the segment below runs from that row's `createdAt` to
+  // `attributableEndAt` regardless of what else was happening — and the
+  // dominant-share test then suppresses `long_active_duration` outright. A
+  // freshly-enqueued run is the normal state of an actively-woken issue, so
+  // unguarded this desensitizes the trigger on exactly the issues that *are*
+  // running. Measured on the BLO-25722 overlap case: 6h 50m of a 7h episode
+  // excluded while a run was live throughout, `created` 1 → 0.
+  const liveSpans = chronological
+    .map((run) => runLiveInterval(run, now))
+    .filter((span): span is { start: number; end: number } => span !== null);
+
   for (let i = 0; i < chronological.length; i += 1) {
     const run = chronological[i]!;
     const classification = classifyNoExecutableTurnRun(run);
@@ -772,7 +841,7 @@ function noExecutableTurnBreakdown(
         segmentEnd = finishedAt.getTime() > segmentStart.getTime() ? finishedAt : segmentStart;
       }
     }
-    const segmentMs = segmentEnd.getTime() - segmentStart.getTime();
+    const segmentMs = msOutsideLiveSpans(segmentStart.getTime(), segmentEnd.getTime(), liveSpans);
     if (segmentMs <= 0) continue;
     mechanismMs[classification.mechanism] += segmentMs;
     noExecutableTurnMs += segmentMs;
