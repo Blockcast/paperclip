@@ -19,7 +19,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { DEP_BLOCKED_RETRY_REASON, heartbeatService } from "../services/heartbeat.js";
+import {
+  DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+  DEP_BLOCKED_PRIOR_ATTEMPTS_KEY,
+  DEP_BLOCKED_RETRY_REASON,
+  heartbeatService,
+} from "../services/heartbeat.js";
 import { getDepBlockedMetric, resetDepBlockedMetrics } from "../services/dep-blocked-metrics.js";
 import {
   composeSweepWakeFramePage,
@@ -1752,5 +1757,284 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .then((rows) => rows[0] ?? null);
     expect(issueLock?.executionRunId).toBe(resolvedWake?.id);
     expect(getDepBlockedMetric("dep_blocked_reset")).toBe(1);
+  });
+
+  // BLO-19566 AC-3. The issue was filed as an "unbounded dependency_blocked
+  // retry storm" after observing scheduledRetryAttempt: 55. The cap
+  // (DEP_BLOCKED_MAX_RETRY_ATTEMPTS) already existed and 55 was *under* it, so
+  // the filed mechanism was wrong — but the cap had no test, was recorded only
+  // on the run, and reset whenever the blocker set changed. These three cover
+  // exactly those gaps.
+  describe("dependency-blocked retry budget", () => {
+    async function seedBlockedIssue(options: { blockerCount?: number } = {}) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const blockedIssueId = randomUUID();
+      const blockerIds = Array.from({ length: options.blockerCount ?? 1 }, () => randomUUID());
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+      await db.insert(issues).values([
+        ...blockerIds.map((id, index) => ({
+          id,
+          companyId,
+          title: `Blocker ${index + 1}`,
+          status: "in_progress" as const,
+          priority: "high" as const,
+        })),
+        {
+          id: blockedIssueId,
+          companyId,
+          title: "Blocked",
+          status: "todo" as const,
+          priority: "medium" as const,
+          assigneeAgentId: agentId,
+        },
+      ]);
+      // Only the first blocker is wired up; callers add the rest to move the set.
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIds[0],
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+
+      return { companyId, agentId, blockedIssueId, blockerIds };
+    }
+
+    async function scheduleDepBlockedRun(agentId: string, blockedIssueId: string) {
+      const wake = await heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: blockedIssueId },
+        contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+      });
+      expect(wake).toBeNull();
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(run).not.toBeNull();
+      return run!;
+    }
+
+    /** Park the run at `attempt` and make it due, then run the promotion pass. */
+    async function promoteAtAttempt(runId: string, attempt: number) {
+      await db
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAttempt: attempt, scheduledRetryAt: new Date(Date.now() - 60_000) })
+        .where(eq(heartbeatRuns.id, runId));
+      await heartbeatService(db, { skipQueuedRunDispatch: true }).promoteDueScheduledRetries(
+        new Date(),
+      );
+    }
+
+    it("stops at the cap, releases the issue, and records the cap on the issue", async () => {
+      const { agentId, blockedIssueId, blockerIds } = await seedBlockedIssue();
+      const run = await scheduleDepBlockedRun(agentId, blockedIssueId);
+
+      // The dep-blocked run holds the execution slot; the cap has to give it back.
+      await db
+        .update(issues)
+        .set({ executionRunId: run.id, executionAgentNameKey: "codexcoder" })
+        .where(eq(issues.id, blockedIssueId));
+
+      await promoteAtAttempt(run.id, DEP_BLOCKED_MAX_RETRY_ATTEMPTS);
+
+      const exhausted = await db
+        .select({
+          status: heartbeatRuns.status,
+          error: heartbeatRuns.error,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, run.id))
+        .then((rows) => rows[0] ?? null);
+      expect(exhausted).toMatchObject({
+        status: "cancelled",
+        errorCode: "issue_dependencies_blocked",
+      });
+      expect(exhausted?.error).toContain(`${DEP_BLOCKED_MAX_RETRY_ATTEMPTS} attempts`);
+      expect(getDepBlockedMetric("dep_blocked_exhausted")).toBe(1);
+
+      // Attempts stop: nothing is left scheduled to poll this issue again.
+      const stillScheduled = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+          ),
+        );
+      expect(stillScheduled).toHaveLength(0);
+
+      const released = await db
+        .select({
+          executionRunId: issues.executionRunId,
+          executionAgentNameKey: issues.executionAgentNameKey,
+        })
+        .from(issues)
+        .where(eq(issues.id, blockedIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(released?.executionRunId).toBeNull();
+      expect(released?.executionAgentNameKey).toBeNull();
+
+      // AC-3 asks for the cap on the *issue*, not just heartbeat_runs.error.
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, blockedIssueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain(
+        `**${DEP_BLOCKED_MAX_RETRY_ATTEMPTS} of ${DEP_BLOCKED_MAX_RETRY_ATTEMPTS}**`,
+      );
+      expect(comments[0].body).toContain(blockerIds[0]);
+      expect(comments[0].body).toContain("issue_blockers_resolved");
+    });
+
+    it("carries the spent budget across a blocker-set change so churn cannot reset the cap", async () => {
+      const { companyId, agentId, blockedIssueId, blockerIds } = await seedBlockedIssue({
+        blockerCount: 2,
+      });
+      const firstRun = await scheduleDepBlockedRun(agentId, blockedIssueId);
+
+      const spentBeforeChange = 40;
+      await db
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAttempt: spentBeforeChange })
+        .where(eq(heartbeatRuns.id, firstRun.id));
+
+      // Move the blocker set. Before BLO-19566 this cancelled the run and the
+      // replacement started at attempt 0, so a flapping blocker set bought an
+      // unlimited budget.
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIds[1],
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+      const rescheduleWake = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: blockedIssueId },
+        contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+      });
+      expect(rescheduleWake).toBeNull();
+
+      const replacement = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(replacement).not.toBeNull();
+      expect(replacement!.id).not.toBe(firstRun.id);
+      expect(replacement!.scheduledRetryAttempt).toBe(0);
+      expect(
+        (replacement!.contextSnapshot as Record<string, unknown>)[DEP_BLOCKED_PRIOR_ATTEMPTS_KEY],
+      ).toBe(spentBeforeChange);
+
+      // The replacement's own counter is well under the cap; only the carried
+      // total pushes it over. On master this re-deferred instead of stopping.
+      await promoteAtAttempt(replacement!.id, DEP_BLOCKED_MAX_RETRY_ATTEMPTS - spentBeforeChange);
+
+      const exhausted = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, replacement!.id))
+        .then((rows) => rows[0] ?? null);
+      expect(exhausted).toMatchObject({
+        status: "cancelled",
+        errorCode: "issue_dependencies_blocked",
+      });
+      expect(getDepBlockedMetric("dep_blocked_exhausted")).toBe(1);
+    });
+
+    it("earns a fresh budget when the blockers genuinely resolve", async () => {
+      const { companyId, agentId, blockedIssueId, blockerIds } = await seedBlockedIssue({
+        blockerCount: 2,
+      });
+      const firstRun = await scheduleDepBlockedRun(agentId, blockedIssueId);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAttempt: 50 })
+        .where(eq(heartbeatRuns.id, firstRun.id));
+
+      // Real progress: the blocker closes. That ends the blocked episode, so the
+      // spent attempts are forgiven rather than carried.
+      await db
+        .update(issues)
+        .set({ status: "done", updatedAt: new Date() })
+        .where(eq(issues.id, blockerIds[0]));
+      const resolvedWake = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: { issueId: blockedIssueId, resolvedBlockerIssueId: blockerIds[0] },
+        contextSnapshot: {
+          issueId: blockedIssueId,
+          wakeReason: "issue_blockers_resolved",
+          resolvedBlockerIssueId: blockerIds[0],
+        },
+      });
+      expect(resolvedWake?.status).toBe("queued");
+
+      // Blocked again later by a different issue — a new episode, not a
+      // continuation of the old one.
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIds[1],
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+        .where(eq(issues.id, blockedIssueId));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "completed", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, resolvedWake!.id));
+
+      const secondEpisode = await scheduleDepBlockedRun(agentId, blockedIssueId);
+      expect(secondEpisode.scheduledRetryAttempt).toBe(0);
+      expect(
+        (secondEpisode.contextSnapshot as Record<string, unknown>)[DEP_BLOCKED_PRIOR_ATTEMPTS_KEY],
+      ).toBeUndefined();
+    });
   });
 });

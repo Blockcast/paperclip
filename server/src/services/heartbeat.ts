@@ -703,10 +703,60 @@ export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
 export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 72;
+// The budget is per *blocked episode*, not per blocker set. Whenever the
+// unresolved blocker set changes the scheduled run is cancelled
+// (`dep_blockers_changed`) and the next wake inserts a fresh one at attempt 0,
+// so without carrying the spent attempts forward a flapping blocker set resets
+// the budget indefinitely — the unbounded polling BLO-19566 was filed about.
+// Attempts are forgiven only when the blockers genuinely resolve, which ends
+// the episode.
+export const DEP_BLOCKED_PRIOR_ATTEMPTS_KEY = "depBlockedPriorAttempts";
+
+/** Attempts already spent by earlier runs of the same blocked episode. */
+export function readDepBlockedPriorAttempts(contextSnapshot: unknown): number {
+  const raw = parseObject(contextSnapshot)[DEP_BLOCKED_PRIOR_ATTEMPTS_KEY];
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
+
+/** Total attempts spent on this blocked episode, across cancel/recreate cycles. */
+export function depBlockedEpisodeAttempts(run: {
+  contextSnapshot: unknown;
+  scheduledRetryAttempt: number | null;
+}): number {
+  return readDepBlockedPriorAttempts(run.contextSnapshot) + (run.scheduledRetryAttempt ?? 0);
+}
 
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
 }
+
+/**
+ * Body for the issue-side record written when the dep-blocked budget is spent.
+ *
+ * BLO-19566 AC-3 asks for the cap to be "recorded on the issue". Before this the
+ * only trace was `heartbeat_runs.error` plus a run event, so from the issue the
+ * polling simply stopped with nothing explaining why — indistinguishable from a
+ * scheduler that had forgotten about it.
+ */
+export function depBlockedExhaustionComment(input: {
+  attempts: number;
+  maxAttempts: number;
+  blockerLabels: string[];
+}): string {
+  const blockers = input.blockerLabels.length
+    ? input.blockerLabels.map((label) => `\`${label}\``).join(", ")
+    : "none recorded";
+  return [
+    `Dependency-blocked retries stopped at the cap: **${input.attempts} of ${input.maxAttempts}** attempts spent without the blockers resolving.`,
+    "",
+    `- Unresolved blockers: ${blockers}`,
+    "- No further dependency polling is scheduled for this issue.",
+    "- It will still wake automatically on `issue_blockers_resolved` when a blocker resolves, so no action is required if the blockers are simply slow.",
+    "",
+    "If the blockers are not going to resolve, re-scope or close this issue rather than waiting.",
+  ].join("\n");
+}
+
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -14535,14 +14585,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (depIssueId) {
         const readiness = (await issuesSvc.listDependencyReadiness(dueRun.companyId, [depIssueId])).get(depIssueId);
         if (readiness && !readiness.isDependencyReady) {
+          const priorAttempts = readDepBlockedPriorAttempts(dueRun.contextSnapshot);
           const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
-          if (nextAttempt > DEP_BLOCKED_MAX_RETRY_ATTEMPTS) {
+          // Budget is spent across the whole blocked episode, not just this run.
+          const nextEpisodeAttempt = priorAttempts + nextAttempt;
+          if (nextEpisodeAttempt > DEP_BLOCKED_MAX_RETRY_ATTEMPTS) {
+            const spentAttempts = priorAttempts + (dueRun.scheduledRetryAttempt ?? 0);
             const exhausted = await db
               .update(heartbeatRuns)
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: `dependency-blocked retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; blockers never resolved`,
+                error: `dependency-blocked retry exhausted after ${spentAttempts} attempts; blockers never resolved`,
                 errorCode: "issue_dependencies_blocked",
                 updatedAt: now,
               })
@@ -14564,6 +14618,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 message: "dependency-blocked retry exhausted; blockers never resolved within the retry budget",
                 payload: {
                   scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
+                  episodeAttempts: spentAttempts,
+                  priorAttempts,
                   maxAttempts: DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
                   unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
                 },
@@ -14593,6 +14649,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               await restoreCheckoutPromotedStatus(db, {
                 issueId: depIssueId,
                 companyId: exhausted.companyId,
+              });
+              // BLO-19566 AC-3: record the cap on the issue. Without this the
+              // polling just stops, with the only trace on a run row nobody
+              // reads from the issue.
+              const blockerLabels = readiness.unresolvedBlockerIssueIds.length
+                ? await db
+                    .select({ identifier: issues.identifier, id: issues.id })
+                    .from(issues)
+                    .where(
+                      and(
+                        eq(issues.companyId, exhausted.companyId),
+                        inArray(issues.id, readiness.unresolvedBlockerIssueIds),
+                      ),
+                    )
+                    .then((rows) => rows.map((row) => row.identifier ?? row.id))
+                : [];
+              await db.insert(issueComments).values({
+                companyId: exhausted.companyId,
+                issueId: depIssueId,
+                body: depBlockedExhaustionComment({
+                  attempts: spentAttempts,
+                  maxAttempts: DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+                  blockerLabels,
+                }),
               });
             }
             return { outcome: "not_promoted", run: exhausted };
@@ -27332,6 +27412,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
+        // Dep-blocked attempts already spent on this blocked episode, carried
+        // across a cancel/recreate driven by blocker-set churn. Stays 0 when the
+        // blockers genuinely resolve — that ends the episode and earns a fresh
+        // budget (BLO-19566 AC-3).
+        let carriedDepBlockedAttempts = 0;
+
         if (
           activeExecutionRun &&
           activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON &&
@@ -27379,6 +27465,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             );
             if (cancelled) {
+              // The issue is still blocked — only the blocker *set* moved. Carry
+              // the spent budget onto the replacement run so churn in the blocker
+              // set cannot reset the cap (BLO-19566 AC-3).
+              carriedDepBlockedAttempts = depBlockedEpisodeAttempts(activeExecutionRun);
               activeExecutionRun = null;
             }
           }
@@ -27391,6 +27481,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...enrichedContextSnapshot,
             unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: dependencyReadiness.unresolvedBlockerCount,
+            ...(carriedDepBlockedAttempts > 0
+              ? { [DEP_BLOCKED_PRIOR_ATTEMPTS_KEY]: carriedDepBlockedAttempts }
+              : {}),
           };
           const wakeupRequest = await tx
             .insert(agentWakeupRequests)
