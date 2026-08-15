@@ -234,6 +234,44 @@ export function readGithubPrReviewerAgentIds(): string[] {
   ];
 }
 
+/** Default horizon: an un-re-armed watch is believed for six hours. */
+export const LAPSED_MONITOR_GRACE_DEFAULT_MS = 6 * 60 * 60_000;
+/**
+ * Floor well above a continuation run's turnaround. The BLO-16146 race this
+ * grace exists to avoid is measured in seconds, so no operator setting may
+ * shrink it to the point where the sweep can beat a run that is legitimately
+ * about to re-arm.
+ */
+export const LAPSED_MONITOR_GRACE_MIN_MS = 15 * 60_000;
+/**
+ * Ceiling. Seven days is 28x the default and far past the worst lapse ever
+ * measured (~207h), so any override above it is asking for a bound that does
+ * not bound.
+ */
+export const LAPSED_MONITOR_GRACE_MAX_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * Resolve `LAPSED_MONITOR_GRACE_MS` to a finite, clamped horizon.
+ *
+ * BLO-24782: the naive `Math.max(floor, Number(env) || default)` reading is
+ * unsafe in a way that is specific to this setting. `Number("Infinity")` is
+ * `Infinity` — truthy, so the `|| default` fallback never fires — and it
+ * survives `Math.max`, yielding an infinite grace. A `triggered` monitor would
+ * then read as a live wake path forever, silently restoring the exact
+ * stranded-issue failure this bound exists to remove: one env typo reverts the
+ * fix. Non-finite input is therefore rejected outright rather than clamped, so
+ * it falls back to the default instead of quietly meaning "never expire".
+ *
+ * The upper clamp closes the same hole's finite half: `1e308` passes
+ * `Number.isFinite` but is not a bound in any useful sense.
+ */
+export function resolveLapsedMonitorGraceMs(raw: string | undefined): number {
+  const parsed = Number(raw);
+  // Rejects Infinity/-Infinity and NaN (unset, empty, or unparseable).
+  if (!Number.isFinite(parsed) || parsed <= 0) return LAPSED_MONITOR_GRACE_DEFAULT_MS;
+  return Math.min(LAPSED_MONITOR_GRACE_MAX_MS, Math.max(LAPSED_MONITOR_GRACE_MIN_MS, parsed));
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
@@ -523,14 +561,7 @@ export function loadConfig(): Config {
       // supply an override.
       Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 6 * 60 * 60_000,
     ),
-    lapsedMonitorGraceMs: Math.max(
-      // Floor well above a continuation run's turnaround. The BLO-16146 race
-      // this grace exists to avoid is measured in seconds, so no operator
-      // setting may shrink it to the point where the sweep can beat a run
-      // that is legitimately about to re-arm.
-      15 * 60_000,
-      Number(process.env.LAPSED_MONITOR_GRACE_MS) || 6 * 60 * 60_000,
-    ),
+    lapsedMonitorGraceMs: resolveLapsedMonitorGraceMs(process.env.LAPSED_MONITOR_GRACE_MS),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
       process.env.PAPERCLIP_WORKERS_INTERNAL_URL?.trim().replace(/\/+$/, "") || null,
