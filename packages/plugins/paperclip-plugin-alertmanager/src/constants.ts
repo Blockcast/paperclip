@@ -93,6 +93,24 @@ export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
  */
 export const DEFAULT_OPERATOR_SUPPRESSION_HOURS = 24;
 
+/**
+ * Ceiling on `operatorSuppressionHours`, applied before it is converted to
+ * milliseconds.
+ *
+ * Validating the configured value for finiteness is not enough on its own: the
+ * conversion multiplies by 3.6e6, so any input above ~5e301 overflows to
+ * `Infinity`, and `now - anchor >= Infinity` is never true. A merely large
+ * finite value is no better — 1e15 hours is ~1e11 years. Either way the window
+ * never expires, which is exactly the unbounded mute BLO-24234 exists to
+ * remove, reachable through a config typo rather than a code path.
+ *
+ * 30 days is well past any plausible deliberate mute while still guaranteeing
+ * the multiplication stays finite and the window always ends. `0` remains the
+ * explicit, documented opt-in to indefinite suppression, so clamping here
+ * takes nothing away that an operator can't still ask for on purpose.
+ */
+export const MAX_OPERATOR_SUPPRESSION_HOURS = 24 * 30;
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {
