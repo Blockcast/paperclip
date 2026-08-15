@@ -3237,6 +3237,10 @@ function githubContextMetadata(context: ResolvedEventContext) {
     ...(context.commentUrl ? { githubCommentUrl: context.commentUrl } : {}),
     ...(context.reviewUrl ? { githubReviewUrl: context.reviewUrl } : {}),
     // BLO-9293: PR author login for the reviewer self-review-skip gate.
+    // BLO-20886 AC3: also gates the author wake's "YOUR pull request"
+    // possessive and its push instruction — owning-issue routing picks the
+    // right ISSUE, but that issue's assignee is not necessarily the PR's
+    // author (a `kkroo/blo-*` branch resolves to an agent's issue).
     ...(context.prAuthorLogin ? { githubPrAuthorLogin: context.prAuthorLogin } : {}),
     ...(context.identifiers.length > 0 ? { githubPaperclipIdentifiers: context.identifiers } : {}),
   };
