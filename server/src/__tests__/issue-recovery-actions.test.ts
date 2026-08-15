@@ -4895,6 +4895,209 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(alertSurfaceComments).toHaveLength(1);
       expect(alertSurfaceComments[0]!.idempotencyKey).toBe(`agent-health:${windowKey}:c722100afingerprint`);
     });
+
+    // BLO-27572: retiring a stranded window by cancelling its execution issue is
+    // a correct call, but it must still leave a receipt -- otherwise disposition
+    // becomes a second way to manufacture silence, which is the exact failure
+    // this alarm exists to remove. The strand-time sweep is not involved here:
+    // this goes through the ordinary issue-update path, as an agent or a human
+    // would.
+    it("posts a heartbeat when a routine execution is cancelled through the ordinary issue-update path", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-07T00:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 504,
+      });
+
+      await issueService(db).update(issue.id, { status: "cancelled" });
+
+      const alertSurfaceComments = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(alertSurfaceComments).toHaveLength(1);
+      const windowKey = triggeredAt.toISOString();
+      expect(alertSurfaceComments[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${routineId}:${windowKey}`,
+      );
+      // The receipt names the routine, the window, the execution issue and the
+      // disposition, and stays a timestamped observation rather than a terminal
+      // claim about the window.
+      expect(alertSurfaceComments[0]!.body).toContain(routineId);
+      expect(alertSurfaceComments[0]!.body).toContain(windowKey);
+      expect(alertSurfaceComments[0]!.body).toContain(issue.identifier!);
+      expect(alertSurfaceComments[0]!.body).toContain("carried no");
+      expect(alertSurfaceComments[0]!.body).toContain(`agent-health:${windowKey}:*`);
+      expect(alertSurfaceComments[0]!.body).toContain("retired to `cancelled`");
+      expect(alertSurfaceComments[0]!.body).toContain("from `in_progress`");
+    });
+
+    // Control for the cancel-time path: the receipt-absence predicate is the
+    // same one the strand-time path uses, so a window that already emitted
+    // normally gets no scheduler row no matter how its execution issue ends.
+    it("does not post a heartbeat when a cancelled window already carries a normal agent-health receipt", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-07T06:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 505,
+      });
+      const windowKey = triggeredAt.toISOString();
+      await db.insert(issueComments).values({
+        id: randomUUID(),
+        companyId,
+        issueId: alertIssueId,
+        authorType: "system",
+        body: "Agent health sweep completed normally for this window.",
+        idempotencyKey: `agent-health:${windowKey}:c722100afingerprint`,
+      });
+
+      await issueService(db).update(issue.id, { status: "cancelled" });
+
+      const alertSurfaceComments = await db
+        .select({ idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(alertSurfaceComments).toHaveLength(1);
+      expect(alertSurfaceComments[0]!.idempotencyKey).toBe(`agent-health:${windowKey}:c722100afingerprint`);
+    });
+
+    // BLO-19954 + BLO-27572: the one cancellation that must stay silent. This
+    // issue was cancelled *because* another open execution issue already owns
+    // the dispatch lock and is doing the work -- the window is not dark, so a
+    // receipt here would manufacture a false dark-window alarm.
+    it("does not post a heartbeat when a duplicate-suppressed routine execution is cancelled", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-07T12:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 506,
+      });
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const duplicateSuppressedRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "cancelled",
+        error: "another open routine-execution issue owns this dispatch lock",
+        errorCode: "routine_execution_duplicate_suppressed",
+        contextSnapshot: { issueId: issue.id },
+        livenessState: null,
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: duplicateSuppressedRun,
+      });
+
+      // The cancellation itself still happened -- this asserts silence, not
+      // inaction, so a regression that stopped cancelling would not pass here.
+      const [afterCancel] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issue.id));
+      expect(afterCancel!.status).toBe("cancelled");
+
+      const alertSurfaceComments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(alertSurfaceComments).toHaveLength(0);
+    });
+
+    // BLO-27572 AC4: strand-time and cancel-time receipts share the
+    // `scheduler-heartbeat:<routineId>:<windowKey>` key, so a window that
+    // stranded and was then retired keeps exactly one row rather than raising
+    // the same dark window twice.
+    it("collapses a strand-time and a later cancel-time receipt onto one row", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-08-07T18:00:00.000Z");
+      const { issue } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        issueNumber: 507,
+      });
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const staleKillRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "External lifecycle Job stale-killed",
+        errorCode: "external_lifecycle_stale_killed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: null,
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: staleKillRun,
+      });
+
+      const afterStrand = await db
+        .select({ idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterStrand).toHaveLength(1);
+
+      // An owner now retires the stranded window. The receipt already exists,
+      // so this must not add a second one.
+      await issueService(db).update(issue.id, { status: "cancelled" });
+
+      const windowKey = triggeredAt.toISOString();
+      const afterCancel = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterCancel).toHaveLength(1);
+      expect(afterCancel[0]!.idempotencyKey).toBe(`scheduler-heartbeat:${routineId}:${windowKey}`);
+      // The surviving row is the original strand-time one, not a rewrite.
+      expect(afterCancel[0]!.body).toContain("external_lifecycle_stale_killed");
+    });
   });
 
   /**

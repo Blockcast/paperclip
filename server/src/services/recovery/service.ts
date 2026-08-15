@@ -77,12 +77,11 @@ import {
 } from "./successful-run-handoff.js";
 import {
   RECOVERY_ORIGIN_KINDS,
-  buildAgentHealthReceiptKeyLikePattern,
   buildIssueGraphLivenessLeafKey,
-  buildSchedulerFailureHeartbeatKey,
   isStrandedIssueRecoveryOriginKind,
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";
+import { postRoutineSchedulerFailureHeartbeat } from "./routine-scheduler-heartbeat.js";
 import {
   classifyIssueGraphLiveness,
   type IssueLivenessFinding,
@@ -5431,7 +5430,16 @@ export function recoveryService(
         .limit(1);
       if (!fresh || isTerminalIssueStatus(fresh.status)) return null;
 
-      const updated = await issuesSvc.update(fresh.id, { status: "cancelled" }, tx);
+      // BLO-27572: explicitly suppress the scheduler-side failure heartbeat that
+      // the ordinary cancellation transition now posts. This is the one
+      // cancellation that must stay silent: the window is NOT dark, because
+      // another open execution issue already owns the dispatch lock and is doing
+      // the work. A receipt here would manufacture a false dark-window alarm.
+      const updated = await issuesSvc.update(
+        fresh.id,
+        { status: "cancelled", suppressRoutineSchedulerFailureHeartbeat: true },
+        tx,
+      );
       if (!updated) return null;
 
       await logActivity(db, {
@@ -5469,103 +5477,6 @@ export function recoveryService(
     });
   }
 
-  // BLO-21395: cross-post a deduplicated failure receipt to the routine's alert
-  // surface (`routines.parentIssueId`) when a scheduled window strands before
-  // user code ever ran. The in-run pre-flight heartbeat lives inside the
-  // runbook itself and cannot fire for this class of failure -- capacity waits,
-  // stale-kills, and other pre-execution lifecycle failures never hand control
-  // to user code at all -- so silence here is otherwise indistinguishable from
-  // health on the routine's tracking issue. Scoped strictly to `originKind ===
-  // "routine_execution"`; every other stranded-issue escalation path is
-  // unaffected.
-  //
-  // BLO-24543: the predicate is receipt absence for THIS window on the alert
-  // surface, not run status or an activity proxy. The prior `lastUsefulActionAt
-  // IS NOT NULL` check was too permissive -- BLO-21235's run set that column
-  // 3s in off a single checkout-shaped activity event, then succeeded without
-  // ever reaching the runbook's own emission step, then stranded. That proxy
-  // suppressed the receipt on the exact window this predicate exists to catch.
-  // A window that already carries the runbook's own `agent-health:<windowKey>:*`
-  // receipt on the alert surface got a normal emission and needs no scheduler
-  // receipt; this is the only thing that suppresses emission now.
-  //
-  // The receipt is phrased as a timestamped observation ("as of <T>, this
-  // window carried no receipt"), never a terminal claim ("this window will
-  // never run"). That sentence cannot be falsified by a later retry that
-  // succeeds and emits normally -- the pair reads as "stranded, then
-  // recovered," not a contradiction -- so this intentionally does not wait
-  // for the window to become unretriable and does not retract/supersede a
-  // receipt once posted. Emitting the correct-but-early receipt trades a
-  // possible harmless "stranded, then recovered" pair for the latency that is
-  // the entire point of this alarm; a queue-age or "never ran" threshold would
-  // be undecidable at emission time (a run can sit `queued` for a very long
-  // time and then execute normally) and is deliberately not added.
-  async function postRoutineSchedulerFailureHeartbeat(input: {
-    issue: typeof issues.$inferSelect;
-    recoveryCause: StrandedRecoveryCause;
-    latestRun: LatestIssueRun;
-    prefix: string;
-  }) {
-    const { issue, recoveryCause, latestRun, prefix } = input;
-    if (issue.originKind !== "routine_execution" || !issue.originId) return;
-
-    try {
-      const routine = await db
-        .select({ id: routines.id, parentIssueId: routines.parentIssueId, title: routines.title })
-        .from(routines)
-        .where(and(eq(routines.companyId, issue.companyId), eq(routines.id, issue.originId)))
-        .then((rows) => rows[0] ?? null);
-      // No configured alert surface -- nothing to cross-post to. Not an error:
-      // most routines don't parent their executions under a tracking issue.
-      if (!routine || !routine.parentIssueId) return;
-
-      const run = issue.originRunId
-        ? await db
-          .select({ triggeredAt: routineRuns.triggeredAt })
-          .from(routineRuns)
-          .where(eq(routineRuns.id, issue.originRunId))
-          .then((rows) => rows[0] ?? null)
-        : null;
-      const windowKey = (run?.triggeredAt ?? issue.createdAt).toISOString();
-
-      const hasNormalEmission = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(and(
-          eq(issueComments.issueId, routine.parentIssueId),
-          sql`${issueComments.idempotencyKey} LIKE ${buildAgentHealthReceiptKeyLikePattern(windowKey)}`,
-        ))
-        .limit(1)
-        .then((rows) => rows.length > 0);
-      if (hasNormalEmission) return;
-
-      const idempotencyKey = buildSchedulerFailureHeartbeatKey({ routineId: routine.id, windowKey });
-      const failureClass = latestRun?.errorCode ?? recoveryCause;
-      const observedAt = new Date().toISOString();
-
-      await issuesSvc.addComment(
-        routine.parentIssueId,
-        [
-          `**Scheduler-side failure heartbeat.** As of \`${observedAt}\`, window \`${windowKey}\` of routine ` +
-            `\`${routine.title}\` (\`${routine.id}\`) carried no \`agent-health:${windowKey}:*\` receipt on this ` +
-            `issue; execution issue ${issueUiLink(issue, prefix)} stranded with class \`${failureClass}\`.`,
-          "",
-          `- Routine run: \`${issue.originRunId ?? "unknown"}\``,
-          `- Idempotency key: \`${idempotencyKey}\``,
-        ].join("\n"),
-        {},
-        { authorType: "system", idempotencyKey },
-      );
-    } catch (err) {
-      // Never let a missing/renamed alert surface or a transient DB error break
-      // the stranded-issue escalation this heartbeat rides along with.
-      logger.warn(
-        { err, issueId: issue.id, routineId: issue.originId },
-        "failed to post scheduler-side failure heartbeat",
-      );
-    }
-  }
-
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -5580,6 +5491,12 @@ export function recoveryService(
     };
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // `isRoutineExecutionDuplicateSuppressedRun` is a type predicate, so the
+    // negative branch below narrows `input.latestRun` all the way to `null`.
+    // Capture the unnarrowed value first — the scheduler receipt still needs its
+    // error code further down.
+    const latestRunForReceipt: LatestIssueRun = input.latestRun;
+
     if (isRoutineExecutionDuplicateSuppressedRun(input.latestRun)) {
       return cancelDuplicateSuppressedRoutineExecutionIssue(input.issue, input.latestRun);
     }
@@ -6025,12 +5942,17 @@ export function recoveryService(
     // roll back an escalation that is otherwise correct and already decided. `null` means
     // the provider-quota park path, which must not emit — see the early return above.
     if (escalation.schedulerFailureHeartbeat) {
-      await postRoutineSchedulerFailureHeartbeat({
-        issue: escalation.fresh,
-        recoveryCause: escalation.recoveryCause,
-        latestRun: input.latestRun,
-        prefix: escalation.schedulerFailureHeartbeat.prefix,
-      });
+      await postRoutineSchedulerFailureHeartbeat(
+        { db, addComment: issuesSvc.addComment, logger },
+        {
+          issue: escalation.fresh,
+          disposition: {
+            kind: "stranded",
+            failureClass: latestRunForReceipt?.errorCode ?? escalation.recoveryCause,
+          },
+          prefix: escalation.schedulerFailureHeartbeat.prefix,
+        },
+      );
     }
 
     return escalation.updated;
