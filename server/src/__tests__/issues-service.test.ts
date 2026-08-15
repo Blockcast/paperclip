@@ -7406,6 +7406,204 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     // work-children, so we should not wake it. See PCL-2418.
     expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
   });
+
+  // BLO-22909 (Ally, follow-on to BLO-20385 / #970). The delegate-recovery
+  // unpark patch shape mandates `blockedByIssueIds: []` and then applies it, so
+  // the readiness check that authorizes it and the clear that follows must
+  // observe the same snapshot. The route-level pre-check reads readiness on its
+  // own connection, and adding a blocker edge changes neither status nor
+  // assignee — so it slips past `expectedCurrentStatus` and
+  // `expectedCurrentAssigneeAgentId` alike. These pin the write-time guard.
+  describe("unpark unresolved-blocker precondition", () => {
+    async function seedUnparkScenario() {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      const dependentId = randomUUID();
+      const doneBlockerId = randomUUID();
+      const liveBlockerId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Delegate",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Unpark project",
+        status: "in_progress",
+      });
+      await db.insert(issues).values([
+        {
+          id: doneBlockerId,
+          companyId,
+          projectId,
+          title: "Stale blocker (terminal)",
+          status: "done",
+          priority: "medium",
+        },
+        {
+          id: liveBlockerId,
+          companyId,
+          projectId,
+          title: "Live blocker",
+          status: "in_progress",
+          priority: "medium",
+        },
+        {
+          id: dependentId,
+          companyId,
+          projectId,
+          title: "Parked dependent",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+        },
+      ]);
+
+      return { companyId, projectId, assigneeAgentId, dependentId, doneBlockerId, liveBlockerId };
+    }
+
+    const unparkPatch = {
+      status: "todo" as const,
+      blockedByIssueIds: [] as string[],
+      expectedCurrentStatus: "blocked",
+      expectedNoUnresolvedBlockers: true,
+    };
+
+    async function readBlockedBy(issueId: string) {
+      const summaries = await svc.getRelationSummaries(issueId);
+      return summaries.blockedBy.map((relation) => relation.id).sort();
+    }
+
+    it("clears genuinely stale terminal edges — the case the recovery patch exists for", async () => {
+      const { dependentId, doneBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      const updated = await svc.update(dependentId, { ...unparkPatch });
+
+      expect(updated?.status).toBe("todo");
+      expect(await readBlockedBy(dependentId)).toEqual([]);
+    });
+
+    it("refuses and leaves edges intact when a blocker is unresolved (no race)", async () => {
+      const { dependentId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [liveBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        details: {
+          reason: "delegate_recovery_unresolved_blockers",
+          unresolvedBlockerCount: 1,
+          unresolvedBlockerIssueIds: [liveBlockerId],
+        },
+      });
+
+      // The edge must survive, and the row must stay parked.
+      expect(await readBlockedBy(dependentId)).toEqual([liveBlockerId]);
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, dependentId))
+        .then((rows) => rows[0] ?? null);
+      expect(row?.status).toBe("blocked");
+    });
+
+    it("refuses when a blocker is committed after the readiness read but before the write", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // The route's pre-check: readiness read on its own connection, well before
+      // the write. It legitimately sees nothing unresolved and admits the patch.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        unresolvedBlockerCount: 0,
+      });
+
+      // ...and *then* someone adds a live blocker and commits. This is the
+      // window #970 left open: neither optimistic guard notices, because the
+      // status is still `blocked` and the assignee is unchanged.
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, liveBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
+    });
+
+    it("re-reads readiness inside the write transaction, not from the pre-transaction snapshot", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // The pre-check passes: at this instant nothing is unresolved.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        unresolvedBlockerCount: 0,
+      });
+
+      // A concurrent writer adds the live blocker but has NOT committed yet, so
+      // it holds the company issue-parent advisory lock that every
+      // blockedByIssueIds write takes.
+      const blockerAdded = deferred<void>();
+      const releaseBlockerAdd = deferred<void>();
+      const concurrentBlockerAdd = db.transaction(async (tx) => {
+        await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, liveBlockerId] }, tx);
+        blockerAdded.resolve();
+        await releaseBlockerAdd.promise;
+      });
+      await blockerAdded.promise;
+
+      // The unpark now runs concurrently and must block on that advisory lock —
+      // which is the whole point of evaluating the precondition *after* it.
+      const unpark = svc.update(dependentId, { ...unparkPatch });
+      const unparkExpectation = expect(unpark).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+
+      const lockWaitDeadline = Date.now() + 10_000;
+      let unparkWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'pg_advisory_xact_lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          unparkWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      // Assert the interleaving actually happened. Without this the test could
+      // pass vacuously by running the two transactions in sequence.
+      expect(unparkWaitingForLock).toBe(true);
+
+      releaseBlockerAdd.resolve();
+      await concurrentBlockerAdd;
+      await unparkExpectation;
+
+      // Both edges survive: the unpark saw the newly-committed blocker.
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
+    });
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
