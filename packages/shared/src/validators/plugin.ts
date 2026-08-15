@@ -1130,6 +1130,8 @@ export const installPluginSchema = z.object({
   version: z.string().min(1).optional(),
   /** Set by loader for local-path installs so the worker can be resolved. */
   packagePath: z.string().min(1).optional(),
+  /** npm prefix containing this plugin; null clears isolation. */
+  installDir: z.string().min(1).nullable().optional(),
 });
 
 export type InstallPlugin = z.infer<typeof installPluginSchema>;

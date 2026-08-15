@@ -13,6 +13,10 @@ import {
   type PluginRuntimeServices,
 } from "../services/plugin-loader.js";
 import {
+  ISOLATED_SDK_PLUGIN_PACKAGES,
+  resolveDefaultInstallDir,
+} from "../bootstrap/isolated-sdk-plugins.js";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -230,6 +234,29 @@ describe("checkSharedDependencyConsistency", () => {
     expect(result.lockfileState).toBe("invalid");
     expect(result.diagnostic).toContain("Unable to read valid JSON");
     expect(result.diagnostic).toContain("package-lock.json");
+  });
+});
+
+describe("BLO-20961 isolated SDK store", () => {
+  it("keeps isolated installs outside the shared store across a second boot tear", async () => {
+    const sharedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-shared-"));
+    const isolatedDir = resolveDefaultInstallDir(ISOLATED_SDK_PLUGIN_PACKAGES[0], sharedDir);
+    await mkdir(isolatedDir, { recursive: true });
+
+    await writeLockfileVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeLockfileVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+
+    const firstBoot = await checkSharedDependencyConsistency(isolatedDir, SDK_PACKAGE);
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
+    const secondBootShared = await checkSharedDependencyConsistency(sharedDir, SDK_PACKAGE);
+    const secondBootIsolated = await checkSharedDependencyConsistency(isolatedDir, SDK_PACKAGE);
+
+    expect(secondBootShared.consistent).toBe(false);
+    expect(secondBootIsolated).toEqual(firstBoot);
+    expect(secondBootIsolated.consistent).toBe(true);
+    await rm(sharedDir, { recursive: true, force: true });
   });
 });
 
@@ -508,5 +535,39 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     expect(startWorker).not.toHaveBeenCalled();
     expect(markError).toHaveBeenCalledTimes(1);
     expect(markError).toHaveBeenCalledWith(installedRow.id, expect.stringContaining("Torn plugin store detected"));
+  }, 35_000);
+
+  it("activates a legacy SDK consumer from its isolated store after a second boot tears only the shared store", async () => {
+    const fixture = await createFixturePluginPackage();
+    const sharedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
+    cleanupPaths.add(sharedDir);
+    const isolatedDir = resolveDefaultInstallDir(ISOLATED_SDK_PLUGIN_PACKAGES[0], sharedDir);
+    cleanupPaths.add(isolatedDir);
+    await mkdir(isolatedDir, { recursive: true });
+    await writeLockfileVersion(sharedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
+    await writeLockfileVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+
+    const [plugin] = await db.insert(plugins).values({
+      pluginKey: fixture.manifest.id,
+      packageName: ISOLATED_SDK_PLUGIN_PACKAGES[0],
+      version: fixture.manifest.version,
+      apiVersion: fixture.manifest.apiVersion,
+      categories: fixture.manifest.categories as never,
+      manifestJson: fixture.manifest as never,
+      status: "ready",
+      packagePath: fixture.packageRoot,
+      installDir: isolatedDir,
+    }).returning();
+    if (!plugin) throw new Error("isolated fixture plugin row not inserted");
+
+    const { runtimeServices, startWorker, markError } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    const result = await loader.loadSingle(plugin.id);
+
+    expect(result.success).toBe(true);
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(markError).not.toHaveBeenCalled();
   }, 35_000);
 });

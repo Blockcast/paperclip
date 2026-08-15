@@ -692,6 +692,8 @@ export interface PluginRecord {
   installOrder: number | null;
   /** Resolved package path for local-path installs; used to find worker entrypoint. */
   packagePath: string | null;
+  /** npm prefix containing this plugin; null means the shared plugin store. */
+  installDir: string | null;
   /** Most recent error message, or operator-provided disable reason. */
   lastError: string | null;
   /** Timestamp when the plugin was first installed. */

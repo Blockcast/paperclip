@@ -34,6 +34,8 @@ export const plugins = pgTable(
     installOrder: integer("install_order"),
     /** Resolved package path for local-path installs; used to find worker entrypoint. */
     packagePath: text("package_path"),
+    /** npm prefix containing this plugin; null means the shared plugin store. */
+    installDir: text("install_dir"),
     lastError: text("last_error"),
     installedAt: timestamp("installed_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

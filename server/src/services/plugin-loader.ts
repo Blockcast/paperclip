@@ -50,6 +50,10 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import {
+  isIsolatedSdkPluginPackage,
+  resolveDefaultInstallDir,
+} from "../bootstrap/isolated-sdk-plugins.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -597,6 +601,8 @@ export interface DiscoveredPlugin {
   source: PluginSource;
   /** The parsed and validated manifest if available, null if discovery-only. */
   manifest: PaperclipPluginManifestV1 | null;
+  /** npm prefix containing this plugin. */
+  installDir: string;
 }
 
 /**
@@ -1584,7 +1590,7 @@ export function pluginLoader(
       throw new Error("Either packageName or localPath must be provided");
     }
 
-    const targetInstallDir = installDir ?? localPluginDir;
+    const targetInstallDir = installDir ?? resolveDefaultInstallDir(packageName, localPluginDir);
 
     // Step 1 & 2: Resolve and install package
     let resolvedPackagePath: string;
@@ -1718,7 +1724,53 @@ export function pluginLoader(
       version: resolvedVersion,
       source: localPath ? "local-filesystem" : "npm",
       manifest,
+      installDir: targetInstallDir,
     };
+  }
+
+  /** Move pre-isolation rows out of the shared store before activation. */
+  async function reconcileLegacyIsolatedInstall(plugin: PluginRecord): Promise<PluginRecord> {
+    if (plugin.installDir || plugin.packagePath || !isIsolatedSdkPluginPackage(plugin.packageName)) {
+      return plugin;
+    }
+
+    const installDir = resolveDefaultInstallDir(plugin.packageName, localPluginDir);
+    const discovered = await fetchAndValidate({
+      packageName: plugin.packageName,
+      version: plugin.version,
+      installDir,
+    });
+    const manifest = discovered.manifest;
+    if (!manifest || manifest.id !== plugin.pluginKey) {
+      throw new Error(`Legacy plugin reinstall for '${plugin.packageName}' returned a different plugin identity`);
+    }
+
+    const updated = await registry.update(plugin.id, {
+      packageName: discovered.packageName,
+      version: discovered.version,
+      manifest,
+      installDir: discovered.installDir,
+    });
+    if (!updated) throw new Error(`Plugin disappeared during isolated-store migration: ${plugin.id}`);
+    log.info({ pluginId: plugin.id, pluginKey: plugin.pluginKey, installDir }, "plugin-loader: migrated legacy plugin");
+    return updated as PluginRecord;
+  }
+
+  async function reconcileLegacyIsolatedInstallsAtStartup(): Promise<void> {
+    const installed = (await registry.listInstalled()) as PluginRecord[];
+    for (const plugin of installed) {
+      const eligible = plugin.status === "ready" ||
+        (plugin.status === "error" && plugin.lastError?.includes("Torn plugin store detected"));
+      if (!eligible) continue;
+      try {
+        const migrated = await reconcileLegacyIsolatedInstall(plugin);
+        if (plugin.status === "error" && migrated.installDir !== plugin.installDir) {
+          await registry.updateStatus(migrated.id, { status: "ready", lastError: null });
+        }
+      } catch (err) {
+        log.warn({ pluginId: plugin.id, packageName: plugin.packageName, err }, "plugin-loader: legacy plugin migration failed");
+      }
+    }
   }
 
   /**
@@ -1835,6 +1887,7 @@ export function pluginLoader(
         version,
         source,
         manifest: null,
+        installDir: localPluginDir,
       };
     }
 
@@ -1846,6 +1899,7 @@ export function pluginLoader(
         version,
         source,
         manifest,
+        installDir: localPluginDir,
       };
     } catch (err) {
       // Rethrow with context — callers catch and route to the errors array
@@ -2128,6 +2182,7 @@ export function pluginLoader(
           {
             packageName: discovered.packageName,
             packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+            installDir: discovered.installDir === localPluginDir ? null : discovered.installDir,
           },
           manifest,
           { force: installOptions.force === true },
@@ -2189,6 +2244,7 @@ export function pluginLoader(
         id: string;
         packageName: string;
         packagePath: string | null;
+        installDir: string | null;
         manifestJson: PaperclipPluginManifestV1;
       } | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
@@ -2204,6 +2260,8 @@ export function pluginLoader(
         force = false,
       } = upgradeOptions;
 
+      const targetInstallDir = plugin.installDir ?? resolveDefaultInstallDir(packageName, localPluginDir);
+
       log.info(
         { pluginId, packageName, version, localPath },
         "plugin-loader: upgrading plugin",
@@ -2214,7 +2272,7 @@ export function pluginLoader(
         packageName,
         localPath,
         version,
-        installDir: localPluginDir,
+        installDir: targetInstallDir,
       });
 
       const newManifest = discovered.manifest!;
@@ -2254,6 +2312,7 @@ export function pluginLoader(
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        installDir: discovered.installDir === localPluginDir ? null : discovered.installDir,
       });
 
       return {
@@ -2276,25 +2335,26 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async cleanupInstallArtifacts(plugin: PluginRecord): Promise<void> {
+      const pluginInstallDir = plugin.installDir ?? localPluginDir;
       const managedTargets = new Set<string>();
-      const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
-      const directManagedDir = path.join(localPluginDir, plugin.packageName);
+      const managedNodeModulesDir = resolveManagedInstallPackageDir(pluginInstallDir, plugin.packageName);
+      const directManagedDir = path.join(pluginInstallDir, plugin.packageName);
 
       managedTargets.add(managedNodeModulesDir);
-      if (isPathInsideDir(directManagedDir, localPluginDir)) {
+      if (isPathInsideDir(directManagedDir, pluginInstallDir)) {
         managedTargets.add(directManagedDir);
       }
-      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
+      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, pluginInstallDir)) {
         managedTargets.add(path.resolve(plugin.packagePath));
       }
 
-      const packageJsonPath = path.join(localPluginDir, "package.json");
+      const packageJsonPath = path.join(pluginInstallDir, "package.json");
       if (existsSync(packageJsonPath)) {
         try {
           const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
           await execFileAsync(
             "npm",
-            ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts", "--cache", npmCacheDir],
+            ["uninstall", plugin.packageName, "--prefix", pluginInstallDir, "--ignore-scripts", "--cache", npmCacheDir],
             { timeout: 120_000 },
           );
         } catch (err) {
@@ -2355,6 +2415,8 @@ export function pluginLoader(
       }
 
       log.info("plugin-loader: loading all ready plugins");
+
+      await reconcileLegacyIsolatedInstallsAtStartup();
 
       // Fetch all plugins in ready status, ordered by installOrder
       const readyPlugins = (await registry.listByStatus("ready")) as PluginRecord[];
@@ -2435,10 +2497,12 @@ export function pluginLoader(
         );
       }
 
-      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      let plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) {
         throw new Error(`Plugin not found: ${pluginId}`);
       }
+
+      plugin = await reconcileLegacyIsolatedInstall(plugin);
 
       // If the plugin is in 'installed' status, transition it to 'ready' first.
       // lifecycleManager.load() transitions the status AND activates the plugin
@@ -2620,10 +2684,11 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
-      const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      const pluginInstallDir = activePlugin.installDir ?? localPluginDir;
+      const packageRoot = resolvePluginPackageRoot(activePlugin, pluginInstallDir);
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
-      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
+      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, pluginInstallDir);
 
       // ------------------------------------------------------------------
       // 1b. Fail closed on a torn shared package store (BLO-18384)
@@ -2639,9 +2704,9 @@ export function pluginLoader(
       // plugin errored, while a persistent mismatch still fails well before
       // the worker initialize timeout.
       // ------------------------------------------------------------------
-      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(localPluginDir);
+      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(pluginInstallDir);
       if (!sdkConsistency.consistent) {
-        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, localPluginDir));
+        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, pluginInstallDir));
       }
 
       // ------------------------------------------------------------------
