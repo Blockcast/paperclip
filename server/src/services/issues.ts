@@ -101,7 +101,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
@@ -168,6 +168,22 @@ function preserveInReviewExecutionStageCheckoutCondition() {
     ${issues.status} = 'in_review'
     AND ${issues.executionState} ->> 'status' = 'pending'
     AND coalesce(${issues.executionState} -> 'currentParticipant', 'null'::jsonb) <> 'null'::jsonb
+  )`;
+}
+
+// BLO-22666 AC3: the row-level half of the `currentParticipant` claim — the
+// stage is still pending AND pinned to this agent. Written as a SQL predicate so
+// it can be re-asserted inside the claiming UPDATE, making the claim a genuine
+// compare-and-swap against a stage that may advance underneath it.
+//
+// Mirrors the null-safety of preserveInReviewExecutionStageCheckoutCondition:
+// `->>` on a JSONB `null` yields SQL NULL, and `NULL = <agentId>` is NULL rather
+// than true, so an absent or user-typed participant can never match.
+function pendingExecutionStageAgentParticipantCondition(agentId: string) {
+  return sql`(
+    ${issues.executionState} ->> 'status' = 'pending'
+    AND ${issues.executionState} -> 'currentParticipant' ->> 'type' = 'agent'
+    AND ${issues.executionState} -> 'currentParticipant' ->> 'agentId' = ${agentId}
   )`;
 }
 
@@ -9922,6 +9938,7 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
       options: {
         allowSourceScopedRecoveryOwner?: boolean;
+        allowExecutionStageParticipantClaim?: boolean;
         recoveryActionId?: string | null;
         recoveryActionStatus?: string | null;
       } = {},
@@ -10053,6 +10070,61 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      // BLO-22666 AC3: a pending review/approval stage can be pinned to a
+      // `currentParticipant` whose id has drifted off `assigneeAgentId` — a prior
+      // reassignment, or a stage routed to a reviewer that was never the
+      // assignee. `routes/issues.ts` already authorizes that participant to
+      // DECIDE the stage, but the checkout predicate above ORs only
+      // unassigned / same-run-assignee / recovery-owner, so the participant could
+      // never take the lock and its decision raced whoever else held it.
+      //
+      // This claim is deliberately NOT the ordinary checkout: it writes the lock
+      // columns and nothing else. `assigneeAgentId`, `assigneeUserId`, `status`
+      // and `startedAt` are all left alone, so claiming a stage cannot be used as
+      // a back door to general issue ownership — the participant gets exactly the
+      // atomicity it needs to decide, and the row still belongs to its assignee
+      // once the stage resolves.
+      if (
+        options.allowExecutionStageParticipantClaim &&
+        current.status === "in_review" &&
+        current.assigneeAgentId !== agentId
+      ) {
+        const claimed = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (
+          tx,
+          checkoutExecutionPatch,
+        ) =>
+          tx
+            .update(issues)
+            .set({
+              checkoutRunId,
+              ...checkoutExecutionPatch,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.status, "in_review"),
+                // Re-assert the participant pin inside the UPDATE rather than
+                // trusting the row read above: the stage can advance between the
+                // read and the write, and a claim on an already-decided stage
+                // would pin the lock to an agent with nothing left to decide.
+                pendingExecutionStageAgentParticipantCondition(agentId),
+                // Never steal a live lock — free-or-ours only.
+                checkoutRunId
+                  ? or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId))
+                  : isNull(issues.checkoutRunId),
+                executionLockCondition,
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null)
+        );
+        if (claimed) {
+          const [enrichedClaim] = await withIssueLabels(db, [claimed]);
+          return enrichedClaim;
+        }
+      }
 
       if (options.allowSourceScopedRecoveryOwner && current.assigneeAgentId !== agentId) {
         throw conflict("Issue checkout failed — authorization or status mismatch", {
@@ -10575,6 +10647,75 @@ export function issueService(db: Db) {
         executionRunId: latest.executionRunId,
         actorAgentId,
         actorRunId,
+      });
+    },
+
+    // BLO-22666: the `in_review` counterpart of assertCheckoutOwner, kept as a
+    // separate entry point rather than widening that one. assertCheckoutOwner is
+    // keyed on `in_progress` in eight places and owns the whole stale-lock
+    // adoption ladder; teaching it a second status would put the two-runs-of-one
+    // -agent fence and the adoption ladder in the same blast radius, and this
+    // predicate has already produced four Criticals.
+    //
+    // Only ever called for the same-agent case (the caller establishes
+    // `assigneeAgentId === actorAgentId`), so it can be a plain ownership
+    // question with no adoption: it clears locks held by TERMINAL runs first —
+    // otherwise a dead run A would fence its own agent's run B forever — then
+    // re-reads and fences only if a live foreign run still holds the row.
+    assertPendingReviewRunOwnership: async (
+      id: string,
+      actorAgentId: string,
+      actorRunId: string | null,
+    ) => {
+      await clearExecutionRunIfTerminal(id);
+      await clearCheckoutRunIfTerminal(id);
+      const current = await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!current) throw notFound("Issue not found");
+
+      // Re-derive the fenced shape from the freshly-read row. The caller decided
+      // to fence off a snapshot; if the row has since left `in_review`, lost its
+      // pending stage, changed hands, or been released, there is nothing to
+      // fence and the ordinary boundary decision stands.
+      const executionState = parseIssueExecutionState(current.executionState);
+      const fenced =
+        current.status === "in_review" &&
+        current.assigneeAgentId === actorAgentId &&
+        executionState?.status === "pending" &&
+        (current.checkoutRunId != null || current.executionRunId != null);
+      if (!fenced) return { owned: true as const, fenced: false as const };
+
+      // Same run-identity test as isCurrentIssueExecutionRun: hold every lock
+      // column that is set, so a run owning only one of a divergent pair does
+      // not read as the owner.
+      const ownsCheckout = current.checkoutRunId === actorRunId;
+      const ownsExecution = current.executionRunId === actorRunId;
+      const owned =
+        actorRunId != null &&
+        (ownsCheckout || ownsExecution) &&
+        (current.checkoutRunId == null || ownsCheckout) &&
+        (current.executionRunId == null || ownsExecution);
+      if (owned) return { owned: true as const, fenced: true as const };
+
+      throw conflict("Issue run ownership conflict", {
+        issueId: current.id,
+        status: current.status,
+        assigneeAgentId: current.assigneeAgentId,
+        checkoutRunId: current.checkoutRunId,
+        executionRunId: current.executionRunId,
+        actorAgentId,
+        actorRunId,
+        reason: "pending_review_stage_locked_by_another_run",
       });
     },
 
