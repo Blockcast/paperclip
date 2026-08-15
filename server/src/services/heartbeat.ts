@@ -301,6 +301,7 @@ import {
   terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
   recordExternalLifecycleRunSilenceGap,
+  setAgentLivenessMetrics,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -28805,8 +28806,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await publishGithubReviewDeadLetterGauge(now);
     await publishAgentWakeupTerminalFailedGauge(now);
+    await publishAgentLivenessGauges(now);
 
     return { recovered, superseded, exhausted, stillFailing };
+  }
+
+  /**
+   * Publish the fleet-wide outcome-side agent-liveness gauges (BLO-23413):
+   * seconds since lastHeartbeatAt and the agent's own configured intervalSec
+   * (for heartbeat.enabled agents), and seconds spent in status='error' (for
+   * every agent). Runs once per reconcileFailedWakeDispatches pass, i.e. once
+   * per heartbeat-scheduler tick (config.heartbeatSchedulerIntervalMs,
+   * default 30s) plus once at startup recovery -- the same cadence the
+   * wake-terminal-failed gauge above already relies on.
+   *
+   * Fleet-wide (no companyId filter), matching every other gauge publisher in
+   * this file: this control plane is one Prometheus scrape target for every
+   * company it serves, and agent_id is a globally unique key.
+   */
+  async function publishAgentLivenessGauges(now: Date) {
+    try {
+      const rows = await db
+        .select({
+          id: agents.id,
+          status: agents.status,
+          runtimeConfig: agents.runtimeConfig,
+          lastHeartbeatAt: agents.lastHeartbeatAt,
+          updatedAt: agents.updatedAt,
+          createdAt: agents.createdAt,
+        })
+        .from(agents);
+
+      const entries = rows.map((row) => {
+        const policy = resolveHeartbeatPolicyForRuntimeConfig(row.runtimeConfig);
+        // A never-heartbeated agent (lastHeartbeatAt null) is anchored on
+        // its createdAt rather than treated as ageless -- a heartbeat-enabled
+        // agent that has NEVER run is exactly the kind of dark agent this
+        // metric exists to surface, not a reason to omit it.
+        const heartbeatAnchor = row.lastHeartbeatAt ?? row.createdAt;
+        const heartbeatAgeSeconds = heartbeatAnchor
+          ? Math.max(0, (now.getTime() - new Date(heartbeatAnchor).getTime()) / 1000)
+          : null;
+        const errorDurationSeconds = row.status === "error"
+          ? Math.max(0, (now.getTime() - new Date(row.updatedAt).getTime()) / 1000)
+          : 0;
+        return {
+          agentId: row.id,
+          heartbeatEnabled: policy.enabled,
+          heartbeatAgeSeconds,
+          heartbeatIntervalSeconds: policy.enabled ? policy.intervalSec : null,
+          errorDurationSeconds,
+        };
+      });
+
+      setAgentLivenessMetrics(entries);
+    } catch (err) {
+      logger.warn({ err }, "failed to publish agent-liveness gauges (BLO-23413)");
+    }
   }
 
   /**

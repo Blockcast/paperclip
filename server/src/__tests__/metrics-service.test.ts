@@ -58,6 +58,11 @@ import {
   recordExternalLifecycleRunSilenceGap,
   setQueuedRunOldestAgeMetrics,
   setQueuedRunAgeMetricsRefreshSuccess,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
+  setAgentLivenessMetrics,
+  AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
+  AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
+  AGENT_ERROR_DURATION_SECONDS_METRIC,
 } from "../services/metrics.js";
 import {
   incrementRoutineDispatchMetric,
@@ -705,6 +710,73 @@ describe("queued-run age metrics (BLO-21116)", () => {
     body = (await renderMetrics()).body;
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
     expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
+  });
+});
+
+describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () => {
+  it("publishes heartbeat age + interval only for heartbeat-enabled agents, and error duration for every agent", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-enabled",
+        heartbeatEnabled: true,
+        heartbeatAgeSeconds: 120,
+        heartbeatIntervalSeconds: 1800,
+        errorDurationSeconds: 0,
+      },
+      {
+        agentId: "agent-disabled",
+        heartbeatEnabled: false,
+        heartbeatAgeSeconds: 99999,
+        heartbeatIntervalSeconds: 3600,
+        errorDurationSeconds: 45,
+      },
+    ]);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${AGENT_HEARTBEAT_AGE_SECONDS_METRIC} gauge`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-enabled"} 120`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-enabled"} 1800`);
+    // heartbeat-disabled agent is expected to be dark, so it must not appear
+    // on the age/interval gauges at all -- not even as a 0.
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-disabled"}`);
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-disabled"}`);
+    // error duration is published for every agent regardless of heartbeat.enabled.
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-enabled"} 0`);
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-disabled"} 45`);
+  });
+
+  it("reset-then-sets so an agent dropped from the next snapshot disappears rather than freezing stale", async () => {
+    setAgentLivenessMetrics([
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-b", heartbeatEnabled: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+    ]);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-b"} 20`);
+
+    // Next publish: agent-b is gone (deleted, or heartbeat disabled).
+    setAgentLivenessMetrics([
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+    ]);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-a"} 40`);
+    expect(body).not.toContain('agent_id="agent-b"');
+  });
+
+  it("clamps negative values to 0 and skips non-finite ages", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-c",
+        heartbeatEnabled: true,
+        heartbeatAgeSeconds: Number.NaN,
+        heartbeatIntervalSeconds: -5,
+        errorDurationSeconds: -10,
+      },
+    ]);
+    const { body } = await renderMetrics();
+    // NaN age is skipped entirely (no bogus series), negative interval clamps to 0.
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-c"}`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-c"} 0`);
   });
 });
 

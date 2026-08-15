@@ -455,10 +455,10 @@ prometheusRule:
   zeroTokenFor: 2m
   # -- Regex for Kubernetes Job names owned by Paperclip agents.
   agentJobNameRegex: "ac-.*"
-  # -- Rate window for BackoffLimitExceeded Job failures.
-  backoffLimitExceededWindow: 5m
-  # -- How long the BackoffLimitExceeded rate condition must persist before firing.
-  backoffLimitExceededFor: 2m
+  # -- Fire PaperclipAgentHeartbeatStale when an agent's lastHeartbeatAt age exceeds this multiple of its own configured heartbeat.intervalSec (BLO-23413).
+  agentHeartbeatStaleMultiplier: 3
+  # -- How long the stale-heartbeat condition must persist before firing (scrape-flap tolerance only; the ageing lives in the multiplier threshold).
+  agentHeartbeatStaleFor: 2m
   # -- Warn when process_lost reaps exceed this many per rolling 24h (BLO-16184 numerator).
   processLostWarnPerDay: 20
   # -- How long the elevated process_lost daily count must persist before warning.

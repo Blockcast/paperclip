@@ -906,6 +906,44 @@ export function normalizeProcessLossClassification(classification: string | null
     : UNKNOWN_PROCESS_LOSS_CLASSIFICATION;
 }
 
+/**
+ * Outcome-side per-agent liveness gauges (BLO-23413).
+ *
+ * Every alert on this fleet prior to these watched a CAUSE (a K8s Job or pod
+ * failing). None watched the OUTCOME: an agent that has simply stopped
+ * executing. A cause-side alert clears the moment the Job is reaped, so an
+ * agent that dies after its Job/pod signal disappears stays dark with
+ * nothing firing (see the BLO-23413 incident: 12.5h undetected). These three
+ * gauges make that outcome directly observable and alertable without reading
+ * the agent's DB record.
+ *
+ * `agent_id` cardinality here is bounded by the real `agents` table roster
+ * (the publisher iterates committed rows itself), not by caller-supplied
+ * input, so it does not need the normalize-to-"unknown" guard the
+ * request-driven counters above use.
+ */
+export const AGENT_HEARTBEAT_AGE_SECONDS_METRIC = "paperclip_agent_heartbeat_age_seconds";
+/**
+ * The agent's own configured `heartbeat.intervalSec`, republished as a gauge
+ * so an alert can threshold the age metric as a MULTIPLE of each agent's own
+ * interval (`age > N * interval`) with a single PromQL `on(agent_id)` join,
+ * rather than hard-coding one fleet-wide threshold that is wrong for every
+ * agent not running the modal interval.
+ */
+export const AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC = "paperclip_agent_heartbeat_interval_seconds";
+/**
+ * Seconds the agent has continuously held `status = 'error'`, 0 otherwise.
+ * `error` is not a scheduling gate (it is assignable/invokable, see
+ * agent-eligibility.ts) so this is diagnostic time-in-state, not an outage
+ * signal by itself -- it exists to answer "how long has this been true"
+ * fleet-wide from Prometheus rather than by reading each agent record.
+ * `agents` has no dedicated `status`-transition timestamp, so this uses
+ * `updatedAt` as the best-available proxy for when `error` was entered; any
+ * other write to the row while still in `error` would reset the apparent
+ * start, making this a slight underestimate, never an overestimate.
+ */
+export const AGENT_ERROR_DURATION_SECONDS_METRIC = "paperclip_agent_status_error_duration_seconds";
+
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
@@ -938,6 +976,9 @@ let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
+let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
+let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
+let agentErrorDuration: Gauge<"agent_id"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -964,6 +1005,9 @@ function ensureRegistry(): {
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
+  agentHeartbeatAgeGauge: Gauge<"agent_id">;
+  agentHeartbeatIntervalGauge: Gauge<"agent_id">;
+  agentErrorDurationGauge: Gauge<"agent_id">;
 } {
   if (
     !registry
@@ -990,6 +1034,9 @@ function ensureRegistry(): {
     || !githubWorkflowRunConclusion
     || !queuedRunOldestAge
     || !authRequest
+    || !agentHeartbeatAge
+    || !agentHeartbeatInterval
+    || !agentErrorDuration
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1314,6 +1361,41 @@ function ensureRegistry(): {
         authRequest.inc({ operation, outcome }, 0);
       }
     }
+    agentHeartbeatAge = new Gauge({
+      name: AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
+      help:
+        "Seconds since the agent's lastHeartbeatAt, labeled by agent_id, published only for "
+        + "agents with heartbeat.enabled=true (BLO-23413). Outcome-side: unlike every prior "
+        + "agent alert, this does not depend on any K8s Job/pod signal surviving, so it stays "
+        + "correct even after the Job that last ran the agent has been reaped. Read alongside "
+        + AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC
+        + " to threshold as a multiple of the agent's OWN configured interval rather than one "
+        + "fleet-wide constant.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentHeartbeatInterval = new Gauge({
+      name: AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
+      help:
+        "The agent's own configured heartbeat.intervalSec, republished as a gauge so "
+        + AGENT_HEARTBEAT_AGE_SECONDS_METRIC
+        + " can be thresholded per-agent via `on(agent_id)` join instead of one fleet-wide "
+        + "constant that is wrong for every agent not on the modal interval (BLO-23413).",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentErrorDuration = new Gauge({
+      name: AGENT_ERROR_DURATION_SECONDS_METRIC,
+      help:
+        "Seconds the agent has continuously held status='error', 0 otherwise, labeled by "
+        + "agent_id, for every agent in the fleet (BLO-23413). 'error' is not a scheduling "
+        + "gate -- it is assignable and invokable -- so this is diagnostic time-in-state, not "
+        + "an outage signal on its own. Uses updatedAt as the best-available proxy for when "
+        + "error was entered (agents has no dedicated status-transition timestamp), so a "
+        + "concurrent unrelated write to the row understates rather than overstates the age.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -1343,6 +1425,9 @@ function ensureRegistry(): {
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     authRequestCounter: authRequest,
+    agentHeartbeatAgeGauge: agentHeartbeatAge,
+    agentHeartbeatIntervalGauge: agentHeartbeatInterval,
+    agentErrorDurationGauge: agentErrorDuration,
   };
 }
 
@@ -1820,6 +1905,53 @@ export function recordAuthRequest(input: {
   return labels;
 }
 
+/**
+ * Publish the fleet-wide agent-liveness gauges (BLO-23413). Called once per
+ * heartbeat-scheduler tick with a full snapshot of the current agent roster,
+ * so this is a rewrite of durable state rather than a delta -- same
+ * reset-then-set contract as {@link setExternalLifecycleRunningRuns} and the
+ * wake-terminal-failed gauges: an agent that is deleted, or whose heartbeat
+ * gets disabled, or that leaves `error`, drops (or zeros) out of the gauge on
+ * the very next publish rather than freezing at its last-known value forever.
+ *
+ * `heartbeatAgeSeconds`/`heartbeatIntervalSeconds` are only set for entries
+ * with `heartbeatEnabled: true` -- a heartbeat-disabled agent is expected to
+ * be dark, so publishing an ever-growing age for it would just be noise the
+ * alert has to filter back out.
+ */
+export function setAgentLivenessMetrics(
+  entries: ReadonlyArray<{
+    agentId: string;
+    heartbeatEnabled: boolean;
+    heartbeatAgeSeconds: number | null;
+    heartbeatIntervalSeconds: number | null;
+    errorDurationSeconds: number;
+  }>,
+): void {
+  const metrics = ensureRegistry();
+  metrics.agentHeartbeatAgeGauge.reset();
+  metrics.agentHeartbeatIntervalGauge.reset();
+  metrics.agentErrorDurationGauge.reset();
+  for (const entry of entries) {
+    if (typeof entry.agentId !== "string" || entry.agentId.length === 0) continue;
+    if (entry.heartbeatEnabled) {
+      if (Number.isFinite(entry.heartbeatAgeSeconds)) {
+        metrics.agentHeartbeatAgeGauge.set({ agent_id: entry.agentId }, Math.max(0, entry.heartbeatAgeSeconds as number));
+      }
+      if (Number.isFinite(entry.heartbeatIntervalSeconds)) {
+        metrics.agentHeartbeatIntervalGauge.set(
+          { agent_id: entry.agentId },
+          Math.max(0, entry.heartbeatIntervalSeconds as number),
+        );
+      }
+    }
+    metrics.agentErrorDurationGauge.set(
+      { agent_id: entry.agentId },
+      Number.isFinite(entry.errorDurationSeconds) ? Math.max(0, entry.errorDurationSeconds) : 0,
+    );
+  }
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -1878,6 +2010,9 @@ export function __resetMetricsForTest(): void {
   githubWorkflowRunConclusion = null;
   queuedRunOldestAge = null;
   authRequest = null;
+  agentHeartbeatAge = null;
+  agentHeartbeatInterval = null;
+  agentErrorDuration = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();
