@@ -50,7 +50,11 @@ import {
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
-import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import {
+  extractPaperclipIdentifiers,
+  resolveOwningPaperclipIdentifiers,
+  type OwningIdentifierResolution,
+} from "../services/paperclip-identifiers.js";
 import {
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
@@ -622,6 +626,12 @@ async function countPrReviewFeedbackCycles(
 
 interface ResolvedEventContext {
   identifiers: string[];
+  // BLO-20886: the identifier(s) that OWN this PR (branch/title/labeled
+  // Fixes:/Closes:/Refs: line), as opposed to `identifiers` which is every
+  // BLO-#### mentioned anywhere, including an informational `Related:` list.
+  // Only wakeReasons that drive an author-directed ("prRole: author") wake
+  // consult this -- see resolveOwningPaperclipIdentifiers for the rule.
+  owningIdentifiers?: string[];
   wakeReason: string;
   prNumber: number | null;
   repoFullName: string | null;
@@ -691,7 +701,53 @@ function clampReviewBody(value: string | null | undefined): string | null {
   return `${cut}\n…(truncated)`;
 }
 
+/**
+ * Resolve a webhook payload into the routing context, guaranteeing the
+ * invariant that every resolved OWNER is also a wake candidate.
+ *
+ * `identifiers` (every ref the PR mentions anywhere) and `owningIdentifiers`
+ * (the ones that actually own it) are extracted by different rules, and the
+ * owning tiers are deliberately more permissive in one place: tier 3
+ * uppercases the branch, because real branches are lowercase
+ * (`sre/blo-20886-...`) and PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only.
+ * The broad set does not. So a PR whose ONLY ref is a lowercase branch --
+ * `fix/blo-20886-only`, nothing in title or body -- resolved an owner while
+ * `identifiers` came back empty, and the route then dropped the delivery at
+ * the `no_paperclip_identifier` gate before the owner could be used. Even past
+ * that gate the owner was unreachable: author wakes are computed as
+ * `matched.filter(m => owning.includes(m.identifier))`, and `matched` derives
+ * from `identifiers`, so an owner missing from the broad set silently yields
+ * no candidates. Both failures land on the wake this module exists to deliver.
+ *
+ * The union is taken here, once, rather than in each event branch so the
+ * invariant cannot be missed by a case added later.
+ *
+ * Deliberately NOT fixed by uppercasing the branch inside the broad
+ * extraction: that would also fold stale branch refs into `identifiers` for
+ * PRs whose branch and title disagree (#909's branch says `blo-20049` while
+ * title and body both name BLO-20467, the issue it actually fixes -- 8 such
+ * disagreements across the 175 PRs measured for the tier ordering). Those refs
+ * are exactly what the tier ranking exists to keep OUT of ownership; widening
+ * the broad set with them would spread that noise to every other consumer to
+ * fix a gate problem. Unioning the resolved owners adds the one identifier the
+ * tiers already decided was authoritative, and nothing else.
+ */
 function resolveEventContext(
+  eventName: string,
+  payload: Record<string, unknown>,
+  options: Parameters<typeof resolveEventContextRaw>[2] = {},
+): ResolvedEventContext | null {
+  const context = resolveEventContextRaw(eventName, payload, options);
+  if (!context) return null;
+  const owning = context.owningIdentifiers ?? [];
+  if (owning.length === 0) return context;
+  const identifiers = new Set(context.identifiers);
+  for (const identifier of owning) identifiers.add(identifier);
+  if (identifiers.size === context.identifiers.length) return context;
+  return { ...context, identifiers: Array.from(identifiers) };
+}
+
+function resolveEventContextRaw(
   eventName: string,
   payload: Record<string, unknown>,
   options: {
@@ -739,6 +795,7 @@ function resolveEventContext(
     if (!pr) {
       return {
         ids: [] as string[],
+        owning: { owning: [] } as OwningIdentifierResolution,
         number: null as number | null,
         title: null as string | null,
         url: null as string | null,
@@ -758,6 +815,7 @@ function resolveEventContext(
     const user = pr.user as Record<string, unknown> | undefined;
     return {
       ids: extractPaperclipIdentifiers(branch, title, body),
+      owning: resolveOwningPaperclipIdentifiers({ branch, title, body }),
       number,
       title: title ?? null,
       url: githubPrUrl(repoFullName, number, readStringField(pr, "html_url")),
@@ -965,6 +1023,15 @@ function resolveEventContext(
       const prNumber = (issue.number as number | undefined) ?? null;
       const prUrl = githubPrUrl(repoFullName, prNumber, readStringField(issue, "html_url"));
       const commentUrl = readStringField(comment, "html_url");
+      const issueTitle = issue.title as string | undefined;
+      const issueBody = issue.body as string | undefined;
+      // Owning resolution deliberately excludes commentBody: the comment is
+      // the @ally ASK that triggered this event, not an ownership claim about
+      // the PR (see resolveOwningPaperclipIdentifiers). No branch tier here
+      // either -- issue_comment payloads don't carry pull_request.head.ref --
+      // so this path relies on title, a closing-keyword body line, or (BLO-21312)
+      // a non-closing house-reference body line (Issue:/Paperclip task:/etc.).
+      const owning = resolveOwningPaperclipIdentifiers({ title: issueTitle, body: issueBody });
       return {
         // BLO-23267: identifiers used to MATCH a Paperclip issue must come
         // only from the PR's own title/body (`issue.title`/`issue.body` here
@@ -985,10 +1052,11 @@ function resolveEventContext(
           issue.title as string | undefined,
           issue.body as string | undefined,
         ),
+        owningIdentifiers: owning.owning,
         wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
         prNumber,
         repoFullName,
-        prTitle: (issue.title as string | undefined) ?? null,
+        prTitle: issueTitle ?? null,
         prUrl,
         eventUrl: commentUrl ?? prUrl,
         commentId: (comment?.id as number | undefined) ?? null,
@@ -1039,6 +1107,7 @@ function resolveEventContext(
       }
       return {
         identifiers: collected.ids,
+        owningIdentifiers: collected.owning.owning,
         wakeReason: "github_pr_review_submitted",
         prNumber: collected.number,
         repoFullName,
@@ -1091,6 +1160,7 @@ function resolveEventContext(
       const merged = pr?.merged === true;
       return {
         identifiers: collected.ids,
+        owningIdentifiers: collected.owning.owning,
         wakeReason: reasonByAction[action] ?? "github_pull_request",
         prNumber: collected.number,
         repoFullName,
@@ -3931,6 +4001,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
+        // BLO-23893: `reviewerWakeFired` is computed for EVERY delivery but
+        // used to be reported only on the two `no_paperclip_identifier`
+        // exits. That was invisible until the BLO-20886 owning-union fix
+        // landed: a PR whose only ref is a lowercase branch (the BLO-21995
+        // fixtures) no longer exits at that gate, so it reaches here instead
+        // and the field silently vanished from the response. The reviewer
+        // wake's outcome is a property of the delivery, not of which exit it
+        // happens to take -- report it on every path that has computed it.
+        reviewerWakeFired,
+        reviewerRunsCancelled,
       });
       return;
     }
@@ -4001,7 +4081,50 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       );
     }
 
-    for (const issue of suppressAuthorWake ? [] : matched) {
+    // BLO-20886: an author-directed wake (prRole: "author", set below via
+    // isPrWake) asserts ownership of the PR ("YOUR pull request") and, for
+    // review-shaped reasons, instructs a push. Firing it for every issue in
+    // `matched` -- which includes issues named only via an informational
+    // `Related:` mention -- sent that directive to the assignee of an issue
+    // with no relationship to the PR at all (observed live: PR #953 matched
+    // BLO-19132 via `Refs:` and BLO-20810/BLO-20129/BLO-19079 via `Related:`;
+    // the wake landed on BLO-20129's assignee). Restrict the author-wake loop
+    // to the PR's OWNING issue(s) only -- resolveOwningPaperclipIdentifiers's
+    // branch > title > labeled Fixes:/Closes:/Refs: rule. `matched` keeps its
+    // full breadth for the back-link comment and merged-PR forward-capture
+    // above, which are informational and correctly link every mentioned
+    // issue. When no owning issue resolves (none found), the author wake is
+    // dropped with a logged suppressionReason rather than falling through to
+    // a lower-priority or unlabeled mention.
+    const isPrWake = context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+    let authorWakeCandidates = matched;
+    if (isPrWake) {
+      const owning = context.owningIdentifiers ?? [];
+      if (owning.length === 0) {
+        authorWakeCandidates = [];
+        if (matched.length > 0) {
+          const suppressionReason = "no_owning_reference";
+          skipped.push({ issueIdentifier: null, reason: suppressionReason });
+          logger.info(
+            {
+              deliveryId,
+              event: eventName,
+              wakeReason: context.wakeReason,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+              identifiers: context.identifiers,
+              matchedIdentifiers: matched.map((m) => m.identifier),
+              suppressionReason,
+            },
+            "github webhook suppressed author-directed PR wake: no confidently-resolved owning issue",
+          );
+        }
+      } else {
+        authorWakeCandidates = matched.filter((m) => m.identifier && owning.includes(m.identifier));
+      }
+    }
+
+    for (const issue of suppressAuthorWake ? [] : authorWakeCandidates) {
       // Terminal-status issues don't need to wake -- the assignee
       // shouldn't reopen `done`/`cancelled` work just because a stale
       // CI ping arrived.
@@ -4126,9 +4249,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // PR-shaped wakes carry an `prRole: "author"` marker so the
       // heartbeat directive flips from reviewer-shaped ("review this PR")
       // to author-shaped ("a reviewer just posted findings on YOUR PR").
-      // Non-PR wakes (CI completion, etc.) leave prRole unset.
-      const isPrWake =
-        context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+      // Non-PR wakes (CI completion, etc.) leave prRole unset. (isPrWake is
+      // hoisted above this loop -- see the authorWakeCandidates comment.)
 
       // BLO-13247: the actionableReviewFeedback branch above already
       // precheck-and-skips on its own idempotency key before this point, but
@@ -4272,6 +4394,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       wakes,
       skipped,
       reopened,
+      // BLO-23893: see the `no_matching_issue` exit above -- the reviewer
+      // wake's outcome belongs on every response that computed it, not only
+      // on the early-exit paths.
+      reviewerWakeFired,
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
