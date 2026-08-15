@@ -142,6 +142,21 @@ const REPO_CUE_PATTERN =
   /\b(repo|repos|repository|repositories|vendor|vendors|vendored|upstream|fork|forked|clone|cloned|monorepo|codebase|remote|submodule|mirror|github)\b/i;
 
 /**
+ * First segment of a backticked `a/b` that means "CI check or commit-status
+ * context", which is conventionally namespaced exactly like `owner/repo`.
+ * Measured in the 2026-08-15 sweep: `review/ally-complete` — the legacy commit
+ * status posted by `require-ally-review.py` — extracted as owner `review`,
+ * naming a repository that does not exist. These names are discussed in issue
+ * prose alongside genuine repo cue words, so the cue tier cannot filter them.
+ */
+const STATUS_CONTEXT_PREFIX_DENYLIST = new Set([
+  "checks",
+  "review",
+  "status",
+  "statuses",
+]);
+
+/**
  * Words that make "git ref" the likely reading instead. Branch names are
  * spelled exactly like `owner/repo` (`codex/blo-17910-settlement-core`), and
  * prose about a branch almost always mentions one of these. A negative cue
@@ -171,6 +186,10 @@ const BRANCH_PREFIX_DENYLIST = new Set([
   "hotfix",
   "main",
   "master",
+  // `origin/main` and `origin/master` are remote-tracking refs and are spelled
+  // exactly like `owner/repo`. Measured in the 2026-08-15 sweep: both appeared
+  // in issue prose near a repo cue word and extracted as owner `origin`.
+  "origin",
   "perf",
   "platformsre",
   "refactor",
@@ -213,9 +232,16 @@ const CITATION_PATH_SEGMENTS = new Set([
 /** How far either side of a bare slug we look for a cue word. */
 const CUE_WINDOW_CHARS = 60;
 
-/** A trailing `.ts`/`.md`/… means the second segment is a file, not a repo. */
+/**
+ * A trailing `.ts`/`.md`/… means the second segment is a file, not a repo.
+ *
+ * The C-family and other compiled-language extensions are not decoration: the
+ * 2026-08-15 sweep found `bgpd/bgp_mvpn.c` (a path inside `frr`) extracted as
+ * owner `bgpd`, repo `bgp_mvpn.c`. Several repos here are C/C++ (`frr`,
+ * `libmmt`) or Go, and file paths from them appear in issue prose constantly.
+ */
 const FILE_EXTENSION_PATTERN =
-  /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json|ya?ml|sh|bash|py|go|rs|sql|txt|toml|lock|css|scss|html|xml|ini|conf|env|png|jpe?g|svg|gif|pdf)$/i;
+  /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json|ya?ml|sh|bash|py|go|rs|sql|txt|toml|lock|css|scss|html|xml|ini|conf|env|png|jpe?g|svg|gif|pdf|c|h|cc|cpp|cxx|hpp|hh|java|rb|php|proto|tf|tfvars|gradle|mk|cmake|patch|diff|log|csv|tsv)$/i;
 
 const SEGMENT = "[A-Za-z0-9][A-Za-z0-9._-]*";
 
@@ -349,6 +375,7 @@ export function extractRepoReferences(
     const [, owner, repo] = slugMatch;
     if (SOURCE_DIRECTORY_DENYLIST.has(owner.toLowerCase())) continue;
     if (BRANCH_PREFIX_DENYLIST.has(owner.toLowerCase())) continue;
+    if (STATUS_CONTEXT_PREFIX_DENYLIST.has(owner.toLowerCase())) continue;
     if (FILE_EXTENSION_PATTERN.test(repo)) continue;
     // Single-character segments are noise (`a/b`), never real repo slugs here.
     if (owner.length < 2 || repo.length < 2) continue;

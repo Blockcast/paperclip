@@ -309,4 +309,32 @@ describe("parseRepoIdentity", () => {
     expect(repoOwnerFromUrl("https://github.com/Blockcast/paperclip.git")).toBe("Blockcast");
     expect(repoOwnerFromUrl(null)).toBeNull();
   });
+
+  // Regression: every one of these was measured extracting a bogus `owner/repo`
+  // in the 2026-08-15 sweep over 387 real child issues (BLO-20341). Together
+  // they were 4 of the 5 references the cue tier accepted on an unknown owner,
+  // and they caused 3 of 36 firings to be wholly spurious. `knownOwners` is
+  // seeded here exactly as the guard seeds it, so the cue path is the only way
+  // in — which is the path each of these has to be rejected by.
+  describe("sweep-measured cue-tier false positives (BLO-20341)", () => {
+    const knownOwners = new Set(["Blockcast", "kkroo", "paperclipai"]);
+    const cases: [string, string][] = [
+      ["review/ally-complete", "the `review/ally-complete` status on that repository is pending"],
+      ["origin/main", "in this repository nothing is unpushed against `origin/main` right now"],
+      ["origin/master", "the repo shows `origin/master` already carries the fix"],
+      ["bgpd/bgp_mvpn.c", "upstream repo change lands in `bgpd/bgp_mvpn.c` for the MVPN path"],
+    ];
+    for (const [label, text] of cases) {
+      it(`extracts nothing from ${label}`, () => {
+        expect(extractRepoReferences(text, { knownOwners })).toEqual([]);
+      });
+    }
+
+    it("still extracts a real known-owner slug from the same shaped prose", () => {
+      const refs = extractRepoReferences("in this repository see `Blockcast/frr` for the port", {
+        knownOwners,
+      });
+      expect(refs.map((ref) => ref.slug)).toEqual(["blockcast/frr"]);
+    });
+  });
 });
