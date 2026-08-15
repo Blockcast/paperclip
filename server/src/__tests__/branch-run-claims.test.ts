@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, branchRunClaims, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, branchRunClaims, companies, createDb, externalRuntimeReservations, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   acquireBranchRunClaim,
   BranchClaimConflictError,
@@ -597,6 +597,175 @@ describeEmbeddedPostgres("branch run claims", () => {
         runId: challenger.runId,
         agentId,
       })).rejects.toBeInstanceOf(BranchClaimConflictError);
+    });
+  });
+
+  // BLO-21602 (Ally round-3, Important #2). A terminal run STATUS is not a
+  // gone WORKER. cancelled / timed_out / interrupted are imposed from
+  // outside, so the row goes terminal while the process or K8s Job is still
+  // alive and may still be writing to the branch. Releasing on those the
+  // instant the status flips hands the branch to a sibling mid-write --
+  // exactly the divergent-commit hazard this table exists to prevent.
+  describe("quiescence-gated release for externally-terminated holders", () => {
+    async function reserveExternalRuntime(input: {
+      companyId: string;
+      agentId: string;
+      runId: string;
+      slotId: number;
+      releasedAt?: Date | null;
+    }) {
+      await db.insert(externalRuntimeReservations).values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: input.runId,
+        slotId: input.slotId,
+        state: input.releasedAt ? "released" : "launched",
+        jobName: `job-${input.runId.slice(0, 8)}`,
+        releasedAt: input.releasedAt ?? null,
+      });
+    }
+
+    async function seedCancelledHolderWithClaim(input: {
+      companyId: string;
+      agentId: string;
+      branchKey: string;
+      reservationReleasedAt?: Date | null;
+      leaseMs?: number;
+    }) {
+      const holder = await seedIssueAndRunningRun({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        title: "Cancelled holder",
+      });
+      await reserveExternalRuntime({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: holder.runId,
+        slotId: 1,
+        releasedAt: input.reservationReleasedAt ?? null,
+      });
+      await acquireBranchRunClaim(db, {
+        companyId: input.companyId,
+        branchKey: input.branchKey,
+        executionWorkspaceId: null,
+        issueId: holder.issueId,
+        runId: holder.runId,
+        agentId: input.agentId,
+        ...(input.leaseMs === undefined ? {} : { leaseMs: input.leaseMs }),
+      });
+      // Cancellation terminalizes the row; the worker is not gone yet.
+      await db.update(heartbeatRuns)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, holder.runId));
+      return holder;
+    }
+
+    it("keeps the branch when a cancelled holder's worker has not quiesced", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const branchKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "cancelled-but-live-worker",
+      });
+      const holder = await seedCancelledHolderWithClaim({ companyId, agentId, branchKey });
+
+      // The trigger must have stamped release_pending_at, NOT released_at:
+      // the claim is still held.
+      const pending = await db
+        .select()
+        .from(branchRunClaims)
+        .where(eq(branchRunClaims.heartbeatRunId, holder.runId))
+        .then((rows) => rows[0]);
+      expect(pending?.releasePendingAt).not.toBeNull();
+      expect(pending?.releasedAt).toBeNull();
+
+      const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+      await expect(acquireBranchRunClaim(db, {
+        companyId,
+        branchKey,
+        executionWorkspaceId: null,
+        issueId: challenger.issueId,
+        runId: challenger.runId,
+        agentId,
+      })).rejects.toBeInstanceOf(BranchClaimConflictError);
+    });
+
+    it("hands the branch over once the cancelled holder's runtime reservation is gone", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const branchKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "cancelled-and-quiesced",
+      });
+      await seedCancelledHolderWithClaim({
+        companyId,
+        agentId,
+        branchKey,
+        reservationReleasedAt: new Date(),
+      });
+
+      const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+      const acquired = await acquireBranchRunClaim(db, {
+        companyId,
+        branchKey,
+        executionWorkspaceId: null,
+        issueId: challenger.issueId,
+        runId: challenger.runId,
+        agentId,
+      });
+      expect(acquired.heartbeatRunId).toBe(challenger.runId);
+    });
+
+    it("does not deadlock the branch behind a worker that never reports quiesced", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const branchKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "cancelled-never-quiesces",
+      });
+      // Lease already expired at acquire time; a terminal run renews nothing,
+      // so the lease is the hard upper bound on how long a non-reporting
+      // worker can hold the branch.
+      await seedCancelledHolderWithClaim({ companyId, agentId, branchKey, leaseMs: -1000 });
+
+      const challenger = await seedIssueAndRunningRun({ companyId, agentId, title: "Challenger" });
+      const acquired = await acquireBranchRunClaim(db, {
+        companyId,
+        branchKey,
+        executionWorkspaceId: null,
+        issueId: challenger.issueId,
+        runId: challenger.runId,
+        agentId,
+      });
+      expect(acquired.heartbeatRunId).toBe(challenger.runId);
+    });
+
+    it("still releases immediately when the worker reached a terminal state itself", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const branchKey = computeBranchClaimKey({
+        repoUrl: "https://github.com/Blockcast/paperclip.git",
+        branchName: "succeeded-holder",
+      });
+      const holder = await seedIssueAndRunningRun({ companyId, agentId, title: "Holder" });
+      // An unreleased reservation is present on purpose: `succeeded` means the
+      // worker got there under its own control and is in teardown, so it must
+      // NOT be gated on reservation cleanup that trails it.
+      await reserveExternalRuntime({ companyId, agentId, runId: holder.runId, slotId: 2 });
+      const claim = await acquireBranchRunClaim(db, {
+        companyId,
+        branchKey,
+        executionWorkspaceId: null,
+        issueId: holder.issueId,
+        runId: holder.runId,
+        agentId,
+      });
+      await db.update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, holder.runId));
+
+      const row = await db
+        .select()
+        .from(branchRunClaims)
+        .where(eq(branchRunClaims.id, claim.id))
+        .then((rows) => rows[0]);
+      expect(row?.releasedAt).not.toBeNull();
     });
   });
 });
