@@ -204,6 +204,20 @@ describe("alert escalation", () => {
     expect(escalationDeadlineMs({ ...alert(), labels: { ...alert().labels, class: "fast" } }, config({ issueRouteMap: { class: { fast: { escalationDeadlineMinutes: 2 } } } }))).toBe(2 * 60_000);
   });
 
+  // BLO-27018: `page` is the highest severity the Blockcast rule groups emit
+  // and it was absent from the deadline map. A null deadline makes the webhook
+  // handler store `nextEscalationAt: null`, which the sweep early-returns on
+  // forever — so the "no agent owner → board cover" safety net below could
+  // never fire for a page alert. Regression guard for that null.
+  it("arms the escalation ladder for severity=page", () => {
+    expect(escalationDeadlineMs(alert("page"), config())).toBe(30 * 60_000);
+  });
+
+  // `ticket` is the low-urgency severity: it should stay off the ladder.
+  it("leaves severity=ticket off the escalation ladder", () => {
+    expect(escalationDeadlineMs(alert("ticket"), config())).toBeNull();
+  });
+
   it("wakes the current owner first, then advances to reportsTo", async () => {
     const due = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 0 };
     const first = sweepContext(due);

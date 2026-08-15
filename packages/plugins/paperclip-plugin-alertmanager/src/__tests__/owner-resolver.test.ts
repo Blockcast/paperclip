@@ -4,7 +4,7 @@ import {
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
-import { DEFAULT_OWNER_MAP, STATE_KEYS } from "../constants.js";
+import { DEFAULT_OWNER_MAP, BLOCKCAST_PLATFORM_SRE_AGENT_ID, STATE_KEYS } from "../constants.js";
 import type { AlertmanagerAlert, OwnerMap } from "../types.js";
 
 const alert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAlert => ({
@@ -135,6 +135,44 @@ describe("resolveOwnerEmail — pure resolution chain", () => {
       email: "support@blockcast.net",
       agentId: null,
       source: "owner-map",
+    });
+  });
+
+  // BLO-27018: observability rule groups emit `team`, never `class`. Before
+  // this route every alert they produced resolved to `no-match` and was filed
+  // unassigned — nobody was woken for a ~24h penstock outage (BLO-27008).
+  it("routes team=devops alerts to the platform/SRE agent even with no class label", () => {
+    const a = alert({
+      labels: {
+        alertname: "LLMProxyProviderHighErrorRatio",
+        severity: "page",
+        team: "devops",
+        provider: "anthropic",
+      },
+    });
+
+    expect(resolveOwnerEmail(a, DEFAULT_OWNER_MAP)).toEqual({
+      email: null,
+      agentId: BLOCKCAST_PLATFORM_SRE_AGENT_ID,
+      source: "owner-map",
+    });
+  });
+
+  // Guards the deliberate scoping decision: `team: platform` carries ~10x the
+  // alert volume of `team: devops` and must not be auto-assigned by default.
+  it("leaves team=platform alerts unrouted by default", () => {
+    const a = alert({
+      labels: {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "warning",
+        team: "platform",
+      },
+    });
+
+    expect(resolveOwnerEmail(a, DEFAULT_OWNER_MAP)).toEqual({
+      email: null,
+      agentId: null,
+      source: "no-match",
     });
   });
 
