@@ -102,6 +102,12 @@ export interface Config {
   // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
   strandedBlockedIssueReconcilerEnabled: boolean;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Approval-enforcement reconciler (BLO-24631): re-reads the object that
+  // enforces an approved decision and raises when it disagrees with what was
+  // decided. Worker-tier only, same rationale as the reconcilers above.
+  approvalEnforcementReconcilerEnabled: boolean;
+  approvalEnforcementReconcilerIntervalMinutes: number;
+  approvalEnforcementReconcilerGraceHours: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -201,6 +207,20 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Numeric env var where `0` is a meaningful value. `Number(x) || fallback`
+ * cannot express this: it folds an explicit `0` into the fallback, so an
+ * operator who configures zero silently gets the default instead. Only an
+ * unset, blank, or non-finite value falls back here.
+ */
+function numericEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === "") return fallback;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 /**
@@ -425,6 +445,28 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES) || 15,
   );
+  // Approval-enforcement reconciler (BLO-24631). Enabled by default: an
+  // approved decision that never reaches its enforcing object is invisible to
+  // everyone involved — the board reads it as approved, the requester reads it
+  // as resolved — so detection has to be on by default to be worth anything.
+  // 60m interval: enforced state changes rarely and each pass is a couple of
+  // indexed reads. 6h grace after `decidedAt` so a freshly-approved decision
+  // that simply has not been applied *yet* is not reported as drift.
+  const approvalEnforcementReconcilerEnabled =
+    process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED === "true"
+      : true;
+  const approvalEnforcementReconcilerIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES) || 60,
+  );
+  // `0` is a valid, documented grace: report drift on the first pass after the
+  // decision. It therefore has to survive parsing rather than be folded into
+  // the 6h default the way `|| 6` would fold it.
+  const approvalEnforcementReconcilerGraceHours = Math.max(
+    0,
+    numericEnv(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_GRACE_HOURS, 6),
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -471,6 +513,9 @@ export function loadConfig(): Config {
     prReconcilerEnrichLoc,
     strandedBlockedIssueReconcilerEnabled,
     strandedBlockedIssueReconcilerIntervalMinutes,
+    approvalEnforcementReconcilerEnabled,
+    approvalEnforcementReconcilerIntervalMinutes,
+    approvalEnforcementReconcilerGraceHours,
     databaseBackupRetentionDays,
     databaseBackupDir,
     serveUi:

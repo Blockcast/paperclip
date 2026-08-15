@@ -201,6 +201,14 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    activeApprovalEnforcementDriftIdx: uniqueIndex("issues_active_approval_enforcement_drift_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'approval_enforcement_drift'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
     activeTaskWatchdogIdx: uniqueIndex("issues_active_task_watchdog_uq")
       .on(table.companyId, table.originKind, table.originId)
       .where(
