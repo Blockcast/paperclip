@@ -8806,6 +8806,42 @@ const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
   "github_pr_review_feedback",
 ]);
 
+// BLO-20886 AC3: was this PR provably written by someone other than the woken agent?
+//
+// Owning-issue routing (routes/github-webhook.ts) fixed *which* issue receives
+// the author-directed wake, but it does not make the recipient the PR's author.
+// An agent's issue can legitimately own a PR a HUMAN wrote: `kkroo/blo-19132-*`
+// resolves to BLO-19132 through the branch tier, so BLO-19132's assignee is
+// woken and told "YOUR pull request ... push a follow-up commit" about a branch
+// they do not own. That is the original paperclip#953 damage path, and it is not
+// hypothetical -- 3 of the 100 most recent paperclip PRs are `kkroo/blo-*`.
+// Pushing there is actively harmful when the PR exists precisely to have a
+// non-bot author (#953 did), since a bot commit destroys that independence.
+//
+// Every agent authors through the same GitHub App installation, so we cannot
+// tell WHICH agent wrote a bot-authored PR -- but we can tell for certain when
+// NO agent did. A PR authored by anyone other than the configured bot identity
+// was provably not written by the woken agent, so the possessive and the push
+// instruction are both dropped for it.
+//
+// Fails OPEN (returns null, keeping today's wording) when the author login is
+// absent: an unknown author is not *proof* of third-party authorship, and the
+// bot-authored case is by far the common one. The gate only ever fires on a
+// positive, signed-webhook mismatch.
+//
+// Returns the author's login rather than a boolean so it stays narrowed for the
+// directive text, which names the real author so the agent can see at a glance
+// why the PR is not theirs.
+function resolveThirdPartyPrAuthor(prReview: { prAuthorLogin?: string | null }): string | null {
+  const raw = prReview.prAuthorLogin;
+  if (!raw) return null;
+  const author = normalizeGithubAuthorHandle(raw);
+  if (author.length === 0) return null;
+  const configured = normalizeGithubAuthorHandle(loadConfig().prReviewerBotLogin ?? "");
+  if (configured.length === 0) return null;
+  return author === configured ? null : raw;
+}
+
 export function buildPaperclipTaskMarkdown(input: {
   issue: {
     id: string;
@@ -8846,6 +8882,10 @@ export function buildPaperclipTaskMarkdown(input: {
     reviewAuthorLogin?: string | null;
     requestCommentBody?: string | null;
     requestCommentAuthorLogin?: string | null;
+    // BLO-20886 AC3: `pull_request.user.login` from the signed webhook. Gates
+    // the "YOUR pull request" possessive and the push instruction — see
+    // resolveThirdPartyPrAuthor.
+    prAuthorLogin?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
 }) {
@@ -8912,10 +8952,13 @@ export function buildPaperclipTaskMarkdown(input: {
       // review, which re-posts the marker and spins the loop that the #583
       // author-filter and PC#822's marker were both meant to keep closed.
       const requesterLabel = prReview.requestCommentAuthorLogin ?? "Someone";
+      const thirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
       lines.push(
         "",
         "GitHub PR review request directive:",
-        `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
+        thirdPartyAuthor
+          ? `${requesterLabel} requested a review on pull request #${prReview.prNumber}, which is owned by your issue but was authored by ${quoteTaskScalar(thirdPartyAuthor)} — NOT by you. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`
+          : `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
         "The reviewer was woken separately by this same event — you do NOT need to request the review again. Re-posting a `<!-- paperclip:review-request -->` comment here would only re-trigger this wake.",
         "If you were already waiting on this review, treat this run as a no-op: verify with `gh api repos/{owner}/{repo}/pulls/{n}/reviews` (and check for a comment-shaped `## Ally` review, which files no review object), then return to what you were doing. Act only on a review that actually exists.",
       );
@@ -8945,13 +8988,27 @@ export function buildPaperclipTaskMarkdown(input: {
     } else if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
       const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
+      // BLO-20886 AC3: a real review DOES exist on this branch (the wakeReason
+      // allowlist guarantees it), so the findings are genuine — but they are not
+      // necessarily findings on a PR the woken agent wrote. When the signed
+      // webhook names a third-party author, drop the possessive and the push
+      // instruction: writing to someone else's branch is the #953 damage path,
+      // and on a PR that exists to have a non-bot author a bot commit destroys
+      // the independence the PR was opened to establish.
+      const thirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
+      const prLabel = thirdPartyAuthor ? `pull request #${prReview.prNumber}` : "YOUR pull request";
       lines.push(
         "",
         "GitHub PR review feedback directive:",
         stateLabel
-          ? `${reviewerLabel} just submitted a review on YOUR pull request (state: ${stateLabel}).`
-          : `${reviewerLabel} just posted findings on YOUR pull request.`,
+          ? `${reviewerLabel} just submitted a review on ${prLabel} (state: ${stateLabel}).`
+          : `${reviewerLabel} just posted findings on ${prLabel}.`,
       );
+      if (thirdPartyAuthor) {
+        lines.push(
+          `This PR was authored by ${quoteTaskScalar(thirdPartyAuthor)}, NOT by you — it is linked to you only because it references your issue. Do NOT push commits to it. Read the findings, and if they need action on your side, comment on the PR or act in your own branch.`,
+        );
+      }
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
@@ -8965,9 +9022,11 @@ export function buildPaperclipTaskMarkdown(input: {
         "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
       lines.push(
         "",
-        normalizedReviewState === "approved"
-          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
-          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
+        thirdPartyAuthor
+          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here) so you know where it leaves your issue. You are not this PR's author: do NOT commit to its branch. Raise anything that needs changing as a PR comment, or act in your own branch. ${commonClosing}`
+          : normalizedReviewState === "approved"
+            ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+            : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
