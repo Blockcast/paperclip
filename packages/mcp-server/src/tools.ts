@@ -194,8 +194,13 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
 
 const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
-  action: z.enum(["approve", "reject", "requestRevision", "resubmit"]),
+  action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
+  // Withdrawal is the only action here an agent is authorized to take, and its
+  // route requires a non-empty reason. Accept a dedicated `reason` so callers do
+  // not have to learn that `decisionNote` is overloaded, but keep reading
+  // `decisionNote` as a fallback for callers that already do.
+  reason: z.string().optional(),
   payloadJson: z.string().optional(),
 });
 
@@ -729,9 +734,26 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, or resubmit an approval",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. `approve`, `reject`, and `requestRevision` are board-only — an agent calling them gets `403 Board access required`. `withdraw` is the action an agent has: the requesting agent may rescind its own ask, so a card that went moot is yours to clear rather than something to ask a human to close. You can only withdraw cards you filed, and only while they are still pending; withdrawing another agent's card is refused (403), as is withdrawing one already decided (409). `withdraw` requires a non-empty `reason` (or `decisionNote`) — the audit trail relies on it to tell a moot request apart from an abandoned one.",
       approvalDecisionSchema,
-      async ({ approvalId, action, decisionNote, payloadJson }) => {
+      async ({ approvalId, action, decisionNote, reason, payloadJson }) => {
+        if (action === "withdraw") {
+          // Refuse here rather than letting an empty reason reach the server as a
+          // bare 400: the caller learns which field to fill, and a withdrawal can
+          // never silently lose the note the audit trail depends on.
+          const withdrawReason = (reason ?? decisionNote ?? "").trim();
+          if (!withdrawReason) {
+            throw new Error(
+              "withdraw requires a non-empty reason: pass `reason` (or `decisionNote`) saying why the request became moot",
+            );
+          }
+          return client.requestJson(
+            "POST",
+            `/approvals/${encodeURIComponent(approvalId)}/withdraw`,
+            { body: { reason: withdrawReason } },
+          );
+        }
+
         const path =
           action === "approve"
             ? `/approvals/${encodeURIComponent(approvalId)}/approve`

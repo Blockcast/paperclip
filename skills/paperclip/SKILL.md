@@ -251,6 +251,21 @@ POST /api/companies/{companyId}/approvals
 
 `issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready.
 
+### Withdrawing an approval you filed
+
+If a card you filed goes moot — the work landed another way, the question answered itself, the ask was wrong — **withdraw it yourself**. Do not comment asking the board to close it: a pending approval sits in a human's queue until someone acts on it, and the retraction comment costs them a read on top of the card.
+
+```json
+POST /api/approvals/{approvalId}/withdraw
+{ "reason": "Superseded by PR #1190, which landed the same patch on 08-09." }
+```
+
+Or via MCP: `paperclipApprovalDecision` with `action: "withdraw"` and a `reason`.
+
+Scope: **the requesting agent, on its own still-pending card.** Withdrawing another agent's card is refused (403); withdrawing one the board already decided is refused (409). `reason` is required and must be non-empty — the audit trail uses it to tell a moot request apart from an abandoned one.
+
+The other actions on that tool (`approve`, `reject`, `requestRevision`) are board-only and return `403 Board access required` for agents. That 403 is about those actions, not about approvals generally — it does not mean you cannot retract your own ask.
+
 ## Issue-Thread Interactions
 
 Issue-thread interactions are first-class cards that render in the issue thread and capture a typed board/user response. Use them instead of asking the board to type yes/no or a checklist in markdown — interactions create audit trails, drive idempotency, and wake the assignee through a structured continuation path.

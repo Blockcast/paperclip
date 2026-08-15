@@ -546,6 +546,86 @@ describe("paperclip MCP tools", () => {
     expect(JSON.parse(String(init.body))).toEqual({});
   });
 
+  it("routes approval withdraw to the requester-scoped withdraw endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "Superseded by PR #1190.",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/withdraw",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Superseded by PR #1190." });
+  });
+
+  it("falls back to decisionNote as the withdraw reason", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      decisionNote: "Question answered itself.",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Question answered itself." });
+  });
+
+  it("refuses a withdraw with a blank reason instead of dropping it", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    const response = await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "   ",
+    });
+
+    // Fails loudly and locally: the audit trail relies on the reason to tell a
+    // moot request from an abandoned one, so this must never reach the server
+    // as a withdrawal with no note.
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain("withdraw requires a non-empty reason");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves requester and pending scoping to the server for withdraw", async () => {
+    // The route rejects withdrawing another agent's card (403) and the service
+    // rejects withdrawing an already-decided one (409). Pin that the tool sends
+    // no actor or status override that could widen either check.
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ error: "Only requesting agent can withdraw this approval" }, 403),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    const response = await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "Not mine to withdraw.",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(Object.keys(JSON.parse(String(init.body)))).toEqual(["reason"]);
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain("Only requesting agent can withdraw this approval");
+  });
+
   it("rejects invalid generic request paths", async () => {
     vi.stubGlobal("fetch", vi.fn());
 
