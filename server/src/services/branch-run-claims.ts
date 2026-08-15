@@ -249,6 +249,38 @@ export async function releaseBranchRunClaim(
     .then((rows) => rows[0] ?? null);
 }
 
+/**
+ * Releases only the claim this run holds on ONE specific branch key, leaving
+ * any other claim it holds intact. Used when a run acquires its branch claim
+ * before the execution workspace is realized (from the durable
+ * `execution_workspaces.branch_name`) and realization then resolves a
+ * different branch: the run takes the new key first, then drops the
+ * provisional one here, so it is never simultaneously the recorded holder of
+ * two branches and never leaves the provisional key claimed after moving off
+ * it. Unlike `releaseBranchRunClaim`, which is the end-of-run sweep, this is
+ * deliberately narrow.
+ */
+export async function releaseBranchRunClaimForKey(
+  db: Db,
+  input: { runId: string; branchKey: string; reason: string; now?: Date },
+): Promise<BranchRunClaim | null> {
+  const now = input.now ?? new Date();
+  return db
+    .update(branchRunClaims)
+    .set({
+      releasedAt: now,
+      releaseReason: input.reason,
+      updatedAt: now,
+    })
+    .where(and(
+      eq(branchRunClaims.heartbeatRunId, input.runId),
+      eq(branchRunClaims.branchKey, input.branchKey),
+      isNull(branchRunClaims.releasedAt),
+    ))
+    .returning()
+    .then((rows) => rows[0] ?? null);
+}
+
 export async function getActiveBranchRunClaimForRun(db: Db, runId: string): Promise<BranchRunClaim | null> {
   return db
     .select()

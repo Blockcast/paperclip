@@ -135,6 +135,7 @@ import {
   acquireBranchRunClaim,
   BranchClaimConflictError,
   computeBranchClaimKey,
+  releaseBranchRunClaimForKey,
 } from "./branch-run-claims.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
@@ -22952,6 +22953,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       issueId,
     });
+    // BLO-21602 (Ally round-3, Important #1): claim the branch BEFORE the
+    // workspace is realized, not after. `provisionExecutionWorkspaceForFreshnessDecision`
+    // below restores/checks out the shared working tree -- that is already a
+    // mutation of the contended resource. Claiming only after it returns
+    // means a losing sibling has by then reset, checked out, or otherwise
+    // rewritten the branch's working tree before it ever discovers the
+    // conflict, which is precisely the divergent-sibling hazard this issue is
+    // about.
+    //
+    // The durable `(repoUrl, branch)` identity for the reuse/restore path is
+    // already on the persisted execution_workspaces row, so it is knowable
+    // here without realizing anything. That is also exactly the contended
+    // case from the incident: a parent and a child issue both resolving to
+    // one shared workspace. A brand-new workspace has no persisted branch
+    // yet and cannot collide with an existing claim, so it is correctly
+    // claimed post-realization by the re-key step further down.
+    let activeBranchClaimKey: string | null = null;
+    if (issueRef && reusableExistingExecutionWorkspace?.branchName) {
+      activeBranchClaimKey = computeBranchClaimKey({
+        repoUrl: reusableExistingExecutionWorkspace.repoUrl ?? null,
+        branchName: reusableExistingExecutionWorkspace.branchName,
+      });
+      await acquireBranchRunClaim(db, {
+        companyId: agent.companyId,
+        branchKey: activeBranchClaimKey,
+        executionWorkspaceId: reusableExistingExecutionWorkspace.id,
+        issueId: issueRef.id,
+        runId: run.id,
+        agentId: agent.id,
+      });
+    }
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
@@ -23128,9 +23160,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // see contention between two DIFFERENT issues that resolve to the same
     // branch (parent + child sharing one execution workspace, or any
     // operator_branch/reuse_existing pairing) -- each independently passes
-    // its own issue-scoped ownership check. Claim the branch itself here,
-    // right after it's resolved to a concrete name, so a sibling run already
-    // holding it is refused before this run can produce a divergent commit.
+    // its own issue-scoped ownership check.
+    //
+    // The pre-realization claim above already covers the reuse/restore path.
+    // This is the re-key step: a fresh workspace has no persisted branch to
+    // claim early, and a restore can legitimately resolve to a different
+    // branch than the one recorded (a forward-branch reconcile). Either way
+    // the authoritative branch is only known now, so claim it -- and drop the
+    // provisional claim if the key moved, so this run never holds two.
     // Throwing BranchClaimConflictError here is caught by the outer
     // `catch (outerErr)` below and deferred back to `queued`, mirroring
     // ExternalRuntimeIsolationConflictError / deferRunForK8sIsolationConflict.
@@ -23138,20 +23175,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // lifetime of the adapter invocation below (see branchClaimRenewalTimer)
     // so a run that legitimately runs past DEFAULT_BRANCH_CLAIM_LEASE_MS
     // never has its lease lapse out from under it.
-    let activeBranchClaimKey: string | null = null;
     if (issueRef && branchNameForInitialPersistence) {
-      activeBranchClaimKey = computeBranchClaimKey({
+      const resolvedBranchClaimKey = computeBranchClaimKey({
         repoUrl: persistedExecutionWorkspace?.repoUrl ?? executionWorkspace.repoUrl ?? null,
         branchName: branchNameForInitialPersistence,
       });
-      await acquireBranchRunClaim(db, {
-        companyId: agent.companyId,
-        branchKey: activeBranchClaimKey,
-        executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
-        issueId: issueRef.id,
-        runId: run.id,
-        agentId: agent.id,
-      });
+      if (resolvedBranchClaimKey !== activeBranchClaimKey) {
+        await acquireBranchRunClaim(db, {
+          companyId: agent.companyId,
+          branchKey: resolvedBranchClaimKey,
+          executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+          issueId: issueRef.id,
+          runId: run.id,
+          agentId: agent.id,
+        });
+        if (activeBranchClaimKey) {
+          await releaseBranchRunClaimForKey(db, {
+            runId: run.id,
+            branchKey: activeBranchClaimKey,
+            reason: "rekeyed_after_workspace_realization",
+          });
+        }
+        activeBranchClaimKey = resolvedBranchClaimKey;
+      }
     }
     await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
     await recordWorkspaceConfigFreshnessOperation({
