@@ -1059,6 +1059,33 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  // BLO-22909: the scoped-recovery-owner restore reaches the same
+  // `blockedByIssueIds: []` clear as the delegate-recovery unpark, but through a
+  // body that carries a third key (`comment`), so `isCreatorOrManagerChainRecoveryPatch`
+  // — which requires exactly two — returns false and the delegate-only pins do not
+  // apply. Its readiness pre-check is still route-level and pre-write, so without a
+  // write-time re-assertion a blocker committed in between is silently deleted.
+  it("pins the write-time blocker guard on a source-scoped recovery owner restore", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "todo",
+        blockedByIssueIds: [],
+        comment: "Restoring the original owner after stale recovery block cleared.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch.expectedNoUnresolvedBlockers).toBe(true);
+    // Delegate-only: this is not the 2-key manager-chain shape, so the
+    // authorization-snapshot pins must not be imposed here.
+    expect(patch.expectedCurrentStatus).toBeUndefined();
+    expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
+  });
+
   it("rejects source-scoped recovery owner blocker clearing when blockers remain unresolved", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
@@ -4405,6 +4432,11 @@ describe("agent issue mutation checkout ownership", () => {
         status: "todo",
         expectedCurrentStatus: "blocked",
         expectedCurrentAssigneeAgentId: ownerAgentId,
+        // BLO-22909: the blocker set is pinned too. Status and assignee are
+        // column equalities the UPDATE's WHERE can re-check; "no live blockers"
+        // is not, so it is re-evaluated inside the update transaction. Without
+        // this flag reaching the service the write-time guard never runs.
+        expectedNoUnresolvedBlockers: true,
       });
       expect(patch.blockedByIssueIds).toEqual([]);
     },
@@ -4484,6 +4516,10 @@ describe("agent issue mutation checkout ownership", () => {
     const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
     expect(patch.expectedCurrentStatus).toBeUndefined();
     expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
+    // BLO-22909: the assignee patching their own issue is not the
+    // delegate-recovery path, so it must not acquire the extra write-time
+    // blocker guard either — the flag forces a company-scoped advisory lock.
+    expect(patch.expectedNoUnresolvedBlockers).toBeUndefined();
   });
 
   it.each([

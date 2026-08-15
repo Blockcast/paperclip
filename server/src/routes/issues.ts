@@ -10702,6 +10702,27 @@ export function issueRoutes(
       });
       return;
     }
+    // BLO-22909: every arm above refuses this patch *because* `blockedIssueReadiness`
+    // — read on this connection, well before the write — reported no live blockers.
+    // Each one can also carry `blockedByIssueIds`, so a blocker committed between
+    // that read and `syncBlockedByIssueIds` is silently deleted. Re-assert the same
+    // predicate inside the update transaction, where the company graph lock and the
+    // row `FOR UPDATE` make it atomic with the clear.
+    //
+    // Deliberately a superset of `delegateRecoveryPatchInFlight`, and kept separate
+    // from it: that flag additionally pins status and assignee, which are
+    // authorization-snapshot fields specific to the `allow_manager_chain` grant and
+    // must not be imposed on the scoped-recovery or resume arms.
+    //
+    // Semantics-preserving by construction — each disjunct already 409s on unresolved
+    // blockers here, so the write-time re-check can only refuse a request the route
+    // would itself have refused had it read the later snapshot. It admits no new
+    // status transition, which BLO-22909 puts out of scope. The readiness re-check
+    // runs before the sync, so a patch that *adds* blockers is unaffected.
+    const unresolvedBlockerWriteGuardInFlight =
+      delegateRecoveryPatchInFlight ||
+      scopedRecoveryOwnerRestoreNeedsDependencyReadiness ||
+      (resumeRequested === true && isBlocked);
     let interruptedRunId: string | null = null;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
@@ -11003,6 +11024,16 @@ export function issueRoutes(
                       : {}),
                   }
                 : {}),
+              // BLO-22909: and pin the blocker set. Status and assignee are
+              // column equalities the UPDATE's WHERE can re-evaluate; "has no
+              // live blockers" is not, and adding a blocker edge changes
+              // neither of those columns, so a blocker inserted after the
+              // readiness read slips past both guards and gets deleted by the
+              // `blockedByIssueIds` this patch carries. Re-checked inside the
+              // update transaction. Wider than the pins above — see the flag.
+              ...(unresolvedBlockerWriteGuardInFlight
+                ? { expectedNoUnresolvedBlockers: true }
+                : {}),
             },
             tx,
           );
@@ -11041,6 +11072,12 @@ export function issueRoutes(
                   ? { expectedCurrentAssigneeAgentNonInvokable: true }
                   : {}),
               }
+            : {}),
+          // BLO-22909: see the transactional branch above — the blocker set
+          // needs a write-time re-check because it is not a column the
+          // UPDATE's WHERE clause can pin.
+          ...(unresolvedBlockerWriteGuardInFlight
+            ? { expectedNoUnresolvedBlockers: true }
             : {}),
         });
       }

@@ -9467,6 +9467,37 @@ export function issueService(db: Db) {
          */
         expectedCurrentAssigneeAgentId?: string | null;
         /**
+         * BLO-22909: refuse the write if the issue still has unresolved
+         * blockers *at write time*.
+         *
+         * Unlike the two `expectedCurrent*` guards above this is not a column
+         * equality, so it cannot ride along in the UPDATE's WHERE clause — the
+         * predicate lives in `issue_relations` joined to the blockers' own
+         * statuses. It is instead re-evaluated inside `runUpdate`'s transaction
+         * *after* the locks below, which is what makes it atomic with the
+         * `syncBlockedByIssueIds` clear that follows:
+         *
+         *   - `lockIssueParentMutationCompany` is a company-scoped advisory
+         *     xact lock taken on every `blockedByIssueIds` write, so any
+         *     concurrent transaction adding a blocker edge through this same
+         *     service is serialized against us rather than interleaving.
+         *   - `SELECT … FOR UPDATE` then pins the issue row itself.
+         *
+         * Callers that authorized a mutation *because* the row had no live
+         * blockers must pass this. The delegate-recovery unpark
+         * (`blocked` -> `todo` + `blockedByIssueIds: []`) is the motivating
+         * case: its patch shape mandates the empty array and then applies it,
+         * so a blocker inserted after the route's readiness read but before
+         * this write would be silently deleted — the same data-loss class as
+         * BLO-20385, narrowed to an interleaving. Neither `expectedCurrentStatus`
+         * nor `expectedCurrentAssigneeAgentId` catches it, because adding an
+         * edge changes neither status nor assignee.
+         *
+         * Forces the company graph lock on its own, so the guard stays atomic
+         * even for a caller that sets it without `blockedByIssueIds`.
+         */
+        expectedNoUnresolvedBlockers?: boolean;
+        /**
          * BLO-22876 review: the manager-chain reroute grant is conditioned on the
          * current assignee being *non-invokable*. Unlike the guard above, that
          * fact lives in `agents`, not `issues`, so no WHERE clause on the target
@@ -9529,6 +9560,7 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedNoUnresolvedBlockers,
         expectedCurrentAssigneeAgentNonInvokable,
         expectedCurrentCheckoutRunId,
         expectedCurrentExecutionRunId,
@@ -9833,7 +9865,7 @@ export function issueService(db: Db) {
         // Parent and blocker edges share issue rows. Take one company-scoped graph
         // lock before either path starts row-level locks, so combined parent/blocker
         // patches cannot invert against blocker-only patches.
-        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined) {
+        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined || expectedNoUnresolvedBlockers) {
           await lockIssueParentMutationCompany(existing.companyId, tx);
         }
         if (blockedByIssueIds !== undefined) {
@@ -9868,6 +9900,40 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!lockedExisting) return null;
+
+        // BLO-22909: the unresolved-blocker precondition. Deliberately here —
+        // after the company advisory lock and the row `FOR UPDATE` above, and
+        // in the same transaction as the `syncBlockedByIssueIds` clear further
+        // down — so the readiness the caller authorized against and the edges
+        // this write deletes are the same snapshot.
+        //
+        // The route-level pre-check (BLO-20385) reads readiness on its own
+        // connection well before this point and cannot be made atomic there;
+        // it stays as a cheap fast-path that fails the common case early with
+        // the same `reason`. This is the authoritative one. Both emit the
+        // settled `delegate_recovery_unresolved_blockers` shape, so a caller
+        // cannot tell which arm refused and does not need to.
+        //
+        // Terminal blockers stay resolved: `listIssueDependencyReadinessMap`
+        // counts a `done` blocker as resolved (subject to the workspace-finalize
+        // barrier) and a `cancelled` one as unresolved, and clearing genuinely
+        // stale `done` edges is the whole point of the recovery patch, so it
+        // must keep succeeding.
+        if (expectedNoUnresolvedBlockers) {
+          const readinessMap = await listIssueDependencyReadinessMap(tx, lockedExisting.companyId, [id]);
+          const readiness = readinessMap.get(id) ?? createIssueDependencyReadiness(id);
+          if (readiness.unresolvedBlockerCount > 0) {
+            throw conflict(
+              "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+              {
+                issueId: id,
+                reason: "delegate_recovery_unresolved_blockers",
+                unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+              },
+            );
+          }
+        }
 
         // BLO-22876 review: close the invokability time-of-check/time-of-use gap.
         // The caller's authorization rested on the assignee being non-invokable,
