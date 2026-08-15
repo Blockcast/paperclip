@@ -14,6 +14,7 @@ import {
   clampIssueListLimit,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
+  OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS,
   OPEN_ISSUE_STATUSES,
 } from "../services/issues.ts";
 
@@ -256,6 +257,86 @@ describeEmbeddedPostgres("issueService.openAssignmentCensus", () => {
     // The census answers the question the page cannot: is this everything?
     expect(census.complete).toBe(true);
   }, 120_000);
+
+  /**
+   * Pushes the agent grouping past OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS so
+   * the truncation branch is exercised for real. One open issue per agent, so
+   * `openCount` is 1 everywhere and the arithmetic below is unambiguous.
+   */
+  async function seedAgentsPastGroupBound(companyId: string, agentCount: number) {
+    const agentRows: Array<typeof agents.$inferInsert> = [];
+    const issueRows: Array<typeof issues.$inferInsert> = [];
+    for (let i = 0; i < agentCount; i += 1) {
+      const agentId = randomUUID();
+      agentRows.push({ id: agentId, companyId, name: `agent-${i}`, role: "engineer" });
+      issueRows.push({
+        companyId,
+        assigneeAgentId: agentId,
+        title: `open ${i}`,
+        identifier: `BOUND-${i}`,
+        priority: "medium",
+        status: "todo",
+      });
+    }
+    for (let i = 0; i < agentRows.length; i += 500) {
+      await db.insert(agents).values(agentRows.slice(i, i + 500));
+    }
+    for (let i = 0; i < issueRows.length; i += 500) {
+      await db.insert(issues).values(issueRows.slice(i, i + 500));
+    }
+  }
+
+  /**
+   * BLO-22785 review follow-up. The documented reconstruction invariant
+   * (`sum(agents[].openCount) === totals.openAssignedToAgents`) is false on
+   * the endpoint's own advertised truncation path, because `totals` is
+   * company-wide while `agents` is bounded. The contract now scopes that
+   * invariant to `complete: true`; this pins the truncated shape so the
+   * unconditional wording cannot come back.
+   */
+  it("keeps totals company-wide when the agent grouping is truncated, and says so", async () => {
+    const companyId = await seedCompany("Paperclip", "BLO");
+    const agentCount = OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS + 25;
+    await seedAgentsPastGroupBound(companyId, agentCount);
+
+    const census = await svc.openAssignmentCensus(companyId);
+
+    // The completion signal is explicit rather than a silent short array.
+    expect(census.complete).toBe(false);
+    expect(census.truncated).toBe(true);
+
+    // Exactly the bound is returned — never the +1 probe row used to detect
+    // that there was more.
+    expect(census.agents).toHaveLength(OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS);
+    // ...and the true group count is still reported, so a consumer can tell
+    // precisely how many groups it is missing.
+    expect(census.agentGroupCount).toBe(agentCount);
+    expect(census.agentGroupCount - census.agents.length).toBe(25);
+
+    // Totals are company-wide and exact despite truncation.
+    expect(census.totals.openAssignedToAgents).toBe(agentCount);
+    expect(census.totals.open).toBe(agentCount);
+    expect(census.totals.agentsWithOpenWork).toBe(agentCount);
+
+    // The invariant the contract used to claim unconditionally: it does NOT
+    // hold here, and the sum is a strict lower bound. A consumer asserting it
+    // without gating on `complete` would fail against a correct response.
+    const summed = census.agents.reduce((total, row) => total + row.openCount, 0);
+    expect(summed).toBe(OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS);
+    expect(summed).toBeLessThan(census.totals.openAssignedToAgents);
+
+    // The split-total invariant is unconditional — it is computed over the
+    // whole open scope, not the returned groups, so truncation cannot break it.
+    expect(
+      census.totals.openAssignedToAgents
+      + census.totals.openAssignedToUsers
+      + census.totals.openUnassigned,
+    ).toBe(census.totals.open);
+
+    // No duplicate groups in the truncated prefix.
+    expect(new Set(census.agents.map((row) => row.assigneeAgentId)).size)
+      .toBe(census.agents.length);
+  }, 180_000);
 
   it("cannot double-count or drop issues while the collection is mutating", async () => {
     const companyId = await seedCompany("Paperclip", "BLO");

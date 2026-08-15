@@ -805,10 +805,24 @@ export interface OpenAssignmentCensus {
    * `true` when the returned `agents` array is the entire per-agent grouping.
    * The only way this is `false` is the {@link OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS}
    * safety bound; there is no silent row cap.
+   *
+   * Gates the reconstruction invariant: `sum(agents[].openCount)` equals
+   * `totals.openAssignedToAgents` only while this is `true`. When it is
+   * `false` the sum is a strict lower bound — `totals` stays company-wide and
+   * exact, but the tail of the grouping is absent.
    */
   complete: boolean;
   truncated: boolean;
+  /**
+   * The true number of agents with open work, counted before the group bound
+   * is applied — so `agentGroupCount - agents.length` is exactly how many
+   * groups truncation dropped.
+   */
   agentGroupCount: number;
+  /**
+   * Company-wide and exact whatever `complete` says: these are counted over
+   * the whole open population, not over the returned groups.
+   */
   totals: {
     open: number;
     openAssignedToAgents: number;
