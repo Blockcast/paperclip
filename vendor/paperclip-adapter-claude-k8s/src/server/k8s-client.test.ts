@@ -58,6 +58,46 @@ function makePod(image: string, nodeSelectorValue: string) {
   };
 }
 
+/**
+ * Pod whose main container mounts two secret volumes: one projecting a single
+ * key out of a multi-key Secret via `items:`, one projecting the whole Secret.
+ * Mirrors the live paperclip-api spec.
+ */
+function makePodWithSecretVolumes() {
+  return {
+    spec: {
+      containers: [
+        {
+          name: "paperclip",
+          image: "registry/a:v1",
+          env: [],
+          volumeMounts: [
+            { name: "gbrain-authbot-service-key", mountPath: "/var/run/authbot" },
+            { name: "github-merge-token", mountPath: "/paperclip/.secrets/github-merge-token" },
+          ],
+        },
+      ],
+      nodeSelector: {},
+      volumes: [
+        {
+          name: "gbrain-authbot-service-key",
+          secret: {
+            secretName: "authbot-mcp-consumer-service-keys",
+            defaultMode: 292,
+            items: [{ key: "gbrain-plugin-service-key", path: "gbrain-plugin-service-key" }],
+          },
+        },
+        {
+          name: "github-merge-token",
+          secret: { secretName: "paperclip-github-merge-token", defaultMode: 292 },
+        },
+      ],
+      imagePullSecrets: [],
+      tolerations: [],
+    },
+  };
+}
+
 describe("getSelfPodInfo cache keying", () => {
   const KC_A = "/tmp/kubeconfig-cluster-a";
   const KC_B = "/tmp/kubeconfig-cluster-b";
@@ -108,5 +148,55 @@ describe("getSelfPodInfo cache keying", () => {
     podFixtures[KC_A] = makePod("registry/a:v99", "cluster-a");
     const refreshed = await getSelfPodInfo(KC_A);
     expect(refreshed.image).toBe("registry/a:v99");
+  });
+});
+
+describe("getSelfPodInfo secret volume capture", () => {
+  const KC = "/tmp/kubeconfig-secret-volumes";
+
+  beforeEach(async () => {
+    process.env.HOSTNAME = "paperclip-abc123";
+    process.env.PAPERCLIP_NAMESPACE = "paperclip";
+    podFixtures[KC] = makePodWithSecretVolumes();
+    const { resetCache } = await import("./k8s-client.js");
+    resetCache();
+  });
+
+  afterEach(() => {
+    delete process.env.PAPERCLIP_NAMESPACE;
+  });
+
+  it("carries the source volume's items selector through capture", async () => {
+    // Dropping `items` here is what let a one-key projection re-expand into
+    // every key of a multi-key Secret once the volume was replayed onto the
+    // agent Job pod.
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    const scoped = info.secretVolumes.find((v) => v.volumeName === "gbrain-authbot-service-key");
+    expect(scoped?.items).toEqual([
+      { key: "gbrain-plugin-service-key", path: "gbrain-plugin-service-key" },
+    ]);
+  });
+
+  it("leaves items undefined for a volume that projects the whole Secret", async () => {
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    const whole = info.secretVolumes.find((v) => v.volumeName === "github-merge-token");
+    expect(whole).toBeDefined();
+    expect(whole?.items).toBeUndefined();
+  });
+
+  it("copies the items array rather than aliasing the pod spec", async () => {
+    // The captured info is memoized and handed to every later Job build, so a
+    // caller mutating it must not reach back into the cached pod spec.
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    const scoped = info.secretVolumes.find((v) => v.volumeName === "gbrain-authbot-service-key");
+    const source = (podFixtures[KC] as { spec: { volumes: Array<{ name: string; secret?: { items?: unknown[] } }> } })
+      .spec.volumes.find((v) => v.name === "gbrain-authbot-service-key");
+    expect(scoped?.items).not.toBe(source?.secret?.items);
   });
 });

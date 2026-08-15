@@ -697,6 +697,40 @@ describe("buildJobManifest", () => {
       const secretMount = job.spec?.template?.spec?.containers[0]?.volumeMounts?.find((vm) => vm.mountPath === "/secrets/app");
       expect(secretMount?.readOnly).toBe(true);
     });
+
+    it("preserves the source volume's items selector so the Job sees no extra keys", () => {
+      // Mirrors the live paperclip-api spec: the gbrain-authbot-service-key
+      // volume projects exactly ONE key out of a 7-key Secret. Before this was
+      // preserved, agent pods mounted all 7 — more key material than the
+      // container the mount was copied from.
+      selfPod.secretVolumes = [{
+        volumeName: "gbrain-authbot-service-key",
+        secretName: "authbot-mcp-consumer-service-keys",
+        mountPath: "/var/run/authbot",
+        defaultMode: 292,
+        items: [{ key: "gbrain-plugin-service-key", path: "gbrain-plugin-service-key" }],
+      }];
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const vol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "gbrain-authbot-service-key");
+      expect(vol?.secret?.items).toEqual([
+        { key: "gbrain-plugin-service-key", path: "gbrain-plugin-service-key" },
+      ]);
+    });
+
+    it("leaves items unset when the source volume projects the whole Secret", () => {
+      selfPod.secretVolumes = [{
+        volumeName: "github-merge-token",
+        secretName: "paperclip-github-merge-token",
+        mountPath: "/paperclip/.secrets/github-merge-token",
+        defaultMode: 292,
+      }];
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const vol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "github-merge-token");
+      expect(vol?.secret?.items).toBeUndefined();
+      // Still optional, so a Secret absent in the agent namespace cannot
+      // hard-fail the Job.
+      expect(vol?.secret?.optional).toBe(true);
+    });
   });
 
   describe("environment variables", () => {

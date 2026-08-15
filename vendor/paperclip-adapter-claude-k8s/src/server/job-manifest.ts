@@ -1061,7 +1061,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     claimedMountPaths.set(normalized, sv.volumeName);
     volumes.push({
       name: sv.volumeName,
-      secret: { secretName: sv.secretName, defaultMode: sv.defaultMode, optional: true },
+      secret: {
+        secretName: sv.secretName,
+        defaultMode: sv.defaultMode,
+        // Carry the source's key selector through. Without this, a source mount
+        // that projects one key out of a multi-key Secret is re-expanded here
+        // into every key of that Secret, so the agent pod ends up holding more
+        // key material than the container the mount was copied from.
+        ...(sv.items ? { items: sv.items } : {}),
+        // Deliberately always optional, regardless of the source's setting: a
+        // propagated Secret that is absent must not hard-fail the agent Job.
+        optional: true,
+      },
     });
     volumeMounts.push({
       name: sv.volumeName,
