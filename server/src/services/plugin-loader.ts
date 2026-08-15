@@ -50,7 +50,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
-import { resolveDefaultInstallDir } from "../bootstrap/isolated-sdk-plugins.js";
+import { isIsolatedSdkPluginPackage, resolveDefaultInstallDir } from "../bootstrap/isolated-sdk-plugins.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -514,6 +514,14 @@ export async function checkSharedDependencyConsistencyAfterRecheck(
   return check;
 }
 
+/**
+ * Leading text of the torn-store activation refusal below. The startup
+ * isolation migration keys its "safe to un-latch this row" decision off this
+ * exact marker (see `reconcileLegacyIsolatedInstallsAtStartup`), so the two
+ * must stay coupled — hence a shared constant rather than a repeated literal.
+ */
+export const TORN_STORE_ERROR_MARKER = "Torn plugin store detected";
+
 function formatSharedDependencyConsistencyError(check: SharedDependencyConsistencyCheck, installDir: string): string {
   const installedPath = path.join(installDir, "node_modules", ...check.packageName.split("/"));
   if (check.problem === "metadata_invalid") {
@@ -525,7 +533,7 @@ function formatSharedDependencyConsistencyError(check: SharedDependencyConsisten
     );
   }
   return (
-    `Torn plugin store detected: package-lock.json for ${check.packageName} records ` +
+    `${TORN_STORE_ERROR_MARKER}: package-lock.json for ${check.packageName} records ` +
     `'${check.lockfileVersion}' but the installed package at ${installedPath} reports ` +
     `'${check.installedVersion}'. Refusing to activate to avoid a silent worker ` +
     `initialize timeout. Reconcile the shared plugin store (e.g. remove the stale ` +
@@ -1765,6 +1773,112 @@ export function pluginLoader(
   }
 
   /**
+   * Relocate a pre-isolation plugin row into its isolated install dir.
+   *
+   * The `installDir` column was added additively (BLO-20961), so every row that
+   * existed before it — including the two plugins this issue exists to fix —
+   * carries `installDir = NULL` and therefore keeps resolving to the shared
+   * store. That store is torn *by construction* on the worker tier: `index.ts`
+   * re-copies the workspace SDK fork (`1.0.0`) over it on every boot while the
+   * lockfile permanently records the registry version, so those rows fail the
+   * consistency guard 100% of the time and isolation would otherwise only
+   * engage on some later install/upgrade that never comes.
+   *
+   * Pointing the activation fallback at `resolveDefaultInstallDir()` alone is
+   * NOT sufficient: the isolated directory does not exist yet for these rows,
+   * so that would only trade a torn-store failure for a missing-entrypoint one.
+   * This does the real relocation — npm-install into the isolated dir, verify
+   * the reinstalled package is the same plugin, then persist `installDir` —
+   * so activation afterwards resolves somewhere that actually exists.
+   *
+   * No-ops for rows that are already isolated, are local-filesystem installs,
+   * or whose package does not opt into isolation.
+   */
+  async function reconcileLegacyIsolatedInstall(plugin: PluginRecord): Promise<PluginRecord> {
+    if (plugin.installDir || plugin.packagePath || !isIsolatedSdkPluginPackage(plugin.packageName)) {
+      return plugin;
+    }
+
+    const installDir = resolveDefaultInstallDir(plugin.packageName, localPluginDir);
+    const discovered = await fetchAndValidate({
+      packageName: plugin.packageName,
+      version: plugin.version,
+      installDir,
+    });
+
+    // Guard against a package name that now resolves to a different plugin —
+    // persisting installDir for the wrong identity would silently repoint a row.
+    if (!discovered.manifest || discovered.manifest.id !== plugin.pluginKey) {
+      throw new Error(
+        `Isolated reinstall of '${plugin.packageName}' resolved to plugin ` +
+          `'${discovered.manifest?.id ?? "unknown"}', expected '${plugin.pluginKey}'`,
+      );
+    }
+
+    const updated = (await registry.update(plugin.id, {
+      packageName: discovered.packageName,
+      version: discovered.version,
+      manifest: discovered.manifest,
+      installDir: discovered.installDir,
+    })) as PluginRecord | null;
+
+    if (!updated) {
+      throw new Error(`Plugin disappeared during isolated-store migration: ${plugin.id}`);
+    }
+
+    log.info(
+      { pluginId: plugin.id, pluginKey: plugin.pluginKey, installDir: discovered.installDir },
+      "plugin-loader: migrated legacy plugin into isolated install dir",
+    );
+    return updated;
+  }
+
+  /**
+   * Run `reconcileLegacyIsolatedInstall` across installed rows before
+   * `loadAll()` selects by status.
+   *
+   * Also un-latches rows the torn-store guard parked in `error`: `loadAll()`
+   * only selects `status='ready'`, so a row refused once stays invisible to
+   * every later boot even after the underlying cause is fixed. Only rows whose
+   * `lastError` came from that guard are revived, and only when the relocation
+   * actually moved them — an unrelated failure keeps its error and stays out.
+   *
+   * Best-effort per row: one plugin that cannot be reinstalled (npm offline,
+   * yanked version) must not abort boot for every other plugin.
+   */
+  async function reconcileLegacyIsolatedInstallsAtStartup(): Promise<void> {
+    const installed = (await registry.listInstalled()) as PluginRecord[];
+
+    for (const plugin of installed) {
+      const latchedByTornStore =
+        plugin.status === "error" && !!plugin.lastError?.includes(TORN_STORE_ERROR_MARKER);
+      if (plugin.status !== "ready" && !latchedByTornStore) continue;
+
+      try {
+        const migrated = await reconcileLegacyIsolatedInstall(plugin);
+        if (migrated.installDir === plugin.installDir) continue;
+
+        if (latchedByTornStore) {
+          await registry.updateStatus(migrated.id, { status: "ready", lastError: null });
+          log.info(
+            { pluginId: migrated.id, pluginKey: migrated.pluginKey },
+            "plugin-loader: re-enabled plugin latched by the torn shared store",
+          );
+        }
+      } catch (err) {
+        log.warn(
+          {
+            pluginId: plugin.id,
+            packageName: plugin.packageName,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "plugin-loader: legacy isolated-store migration failed; leaving row unchanged",
+        );
+      }
+    }
+  }
+
+  /**
    * Attempt to load and validate a plugin manifest from a resolved path.
    * Returns the manifest on success or throws with a descriptive error.
    */
@@ -2426,6 +2540,11 @@ export function pluginLoader(
 
       log.info("plugin-loader: loading all ready plugins");
 
+      // Relocate pre-isolation rows (installDir IS NULL) into their isolated
+      // dirs and revive any the torn-store guard latched, BEFORE selecting by
+      // status — a revived row must be visible to the query below.
+      await reconcileLegacyIsolatedInstallsAtStartup();
+
       // Fetch all plugins in ready status, ordered by installOrder
       const readyPlugins = (await registry.listByStatus("ready")) as PluginRecord[];
 
@@ -2505,10 +2624,15 @@ export function pluginLoader(
         );
       }
 
-      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      let plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) {
         throw new Error(`Plugin not found: ${pluginId}`);
       }
+
+      // Single-plugin path (operator re-enable, lifecycle load) gets the same
+      // relocation as boot, so re-enabling a legacy row does not just re-run
+      // it against the shared store and fail the guard again.
+      plugin = await reconcileLegacyIsolatedInstall(plugin);
 
       // If the plugin is in 'installed' status, transition it to 'ready' first.
       // lifecycleManager.load() transitions the status AND activates the plugin
