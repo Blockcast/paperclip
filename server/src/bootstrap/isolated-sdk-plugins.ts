@@ -62,3 +62,8 @@ export function resolveDefaultInstallDir(packageName: string | undefined, localP
   }
   return localPluginDir;
 }
+
+/** Whether `packageName` opts into an isolated install dir. */
+export function isIsolatedSdkPluginPackage(packageName: string | null | undefined): boolean {
+  return !!packageName && ISOLATED_SDK_PLUGIN_PACKAGES.includes(packageName);
+}
