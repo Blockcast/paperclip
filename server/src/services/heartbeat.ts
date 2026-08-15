@@ -14382,11 +14382,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *
    * A SIGTERM drain gets seconds and a healthy process; this runs from inside
    * the process crash guard with the process already dying, so it is
-   * deliberately the smallest thing that fixes the attribution problem: per
-   * run, one guarded claim flipping this worker's still-`running`,
-   * non-external-lifecycle run to `interrupted` with
-   * `errorCode: "worker_crashed"`, followed immediately by the same bounded
-   * retry / lock-release cleanup the graceful drain uses.
+   * deliberately the smallest thing that fixes the attribution problem: one
+   * guarded bulk claim flipping this worker's still-`running`,
+   * non-external-lifecycle runs to `interrupted` with
+   * `errorCode: "worker_crashed"`, followed by the same bounded retry /
+   * lock-release cleanup the graceful drain uses.
    *
    * Without this, every run the crash orphaned stayed `running` until a reaper
    * noticed minutes later and reconciled it as `job_missing` — "External
@@ -14394,19 +14394,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * names the symptom (a Job we can no longer see) and hides the cause (this
    * process died). Operators then chase Kubernetes for a fault that was ours.
    *
-   * Claim-then-recover is interleaved per run rather than run as one bulk
-   * UPDATE followed by a serial cleanup loop. The caller races this whole
-   * function against a fixed budget and exits regardless, so a bulk pre-flip
-   * would leave every run the loop never reached `interrupted` with no retry,
-   * no lock release and no agent finalization — and terminal rows are invisible
-   * to the reaper, which only scans `running`. That is a *worse* outcome than
-   * today's zero-pass: unrecoverable rather than merely mis-attributed.
-   * Interleaving keeps the invariant that a run is only terminalized once it
-   * has been recovered, so a run we never reach stays `running` and the
-   * pre-existing reaper genuinely remains its backstop.
+   * Marking is batched into ONE statement ahead of any recovery, rather than
+   * interleaved claim-then-recover per run. The caller races this whole
+   * function against a fixed budget and exits regardless, and a single
+   * provider-release RPC can spend minutes of that budget — so interleaving let
+   * one slow first recovery starve the rest and leave them `running`, i.e. the
+   * `job_missing` misattribution this exists to remove. Attribution is cheap
+   * and must not queue behind cleanup that is not. See the PHASE 1 comment at
+   * the bulk UPDATE for the guard-by-guard argument.
    *
-   * The residual window is one run wide: claimed, budget expires mid-cleanup.
-   * {@link reconcileWorkerCrashedRuns} closes it durably at next startup.
+   * The cost of marking first is that a run the budget never reaches is
+   * terminal with no retry, no lock release and no agent finalization — and
+   * terminal rows are invisible to the reaper, which only scans `running`.
+   * {@link reconcileWorkerCrashedRuns} is what makes that safe rather than
+   * merely faster: it drains terminal `worker_crashed` rows whose
+   * `crash_recovery_completed_at` is still NULL on the next startup. Marking
+   * first is sound only because that reconciler exists.
    *
    * Runs on an external-lifecycle adapter stay `running`: their Kubernetes Job
    * may still be healthy, and the existing reattach / missing-Job reconcilers
