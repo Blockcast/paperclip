@@ -143,7 +143,7 @@ import {
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -215,6 +215,10 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  evaluateAgentIssueApprovalLinkAuthorization,
+  type IssueApprovalLinkAuthorizationIssue,
+} from "./issue-approval-link-authorization.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -3936,6 +3940,136 @@ export function issueRoutes(
     }
     if (actorAgent.role === "ceo" || Boolean(actorAgent.permissions?.canCreateAgents)) return true;
     res.status(403).json({ error: "Missing permission to link approvals" });
+    return false;
+  }
+
+  /**
+   * BLO-24699: the approval-side half of the attach boundary. Deliberately mirrors
+   * `assertApprovalAccessAllowed` in `routes/approvals.ts` — same action, same
+   * resource, same 403 body — because the point of this route's relaxation is that
+   * the two doors to a row in `issue_approvals` decide alike. Any drift here
+   * reopens the asymmetry the relaxation closed, just on the approval side instead
+   * of the issue side.
+   *
+   * Scoped to `issue.companyId` rather than reloading the approval: `link()` calls
+   * `assertIssueAndApprovalSameCompany` and rejects a cross-company pair with 422,
+   * so for every link that could succeed the two companies are the same one.
+   *
+   * Ordinary agents hold `company_scope:read`, so this is a no-op for them and the
+   * BLO-23036 escalation path is untouched. What it excludes is the scoped-key
+   * classes `authorization.ts` denies the action outright while still allowing
+   * `issue:mutate` on their own issue: task-bridge keys, skill-test run tokens, and
+   * low-trust-preset agents — all of which the dropped
+   * `assertCanManageIssueApprovalLinks` gate happened to keep off this route.
+   */
+  async function assertApprovalReadAllowed(req: Request, res: Response, companyId: string) {
+    if (await actorCanReadCompanyScope(req, companyId)) return true;
+    res.status(403).json({ error: "Approvals are outside this actor's authorization boundary" });
+    return false;
+  }
+
+  /**
+   * BLO-24699: the *attach* half of the approval-link boundary, decided through the
+   * same evaluator as `POST /companies/:companyId/approvals` so the two doors to a
+   * row in `issue_approvals` cannot reach different verdicts for the same
+   * (actor, issue) pair.
+   *
+   * ## Why this route no longer runs `assertCanManageIssueApprovalLinks`
+   *
+   * That gate is company-scoped — `role === "ceo" || permissions.canCreateAgents` —
+   * and never looks at the issue. It was not a boundary so much as an accident of
+   * which door an agent picked: the identical end state was always reachable by
+   * filing the approval with an `issueIds` array instead, which is the channel
+   * BLO-23036 requires for `request_board_approval` escalations. Measured against
+   * this company's roster on 2026-08-11, the gate admits 2 of 16 agents (CEO, CTO)
+   * on this route while excluding none of the other 14 from the create route.
+   *
+   * Copying the gate onto create instead (the symmetric fix) was rejected: it would
+   * let those 14 agents file an escalation card but not attach it to the issue it
+   * concerns, which is precisely the context-free escalation BLO-23036 exists to
+   * close.
+   *
+   * The only capability this relaxation adds is attaching a *pre-existing* approval.
+   * For an ordinary agent that discloses nothing new: `GET /approvals/:id` and
+   * `GET /companies/:companyId/approvals` are gated by the same `company_scope:read`
+   * as create, so any agent that can file an approval can already read every
+   * approval in its company.
+   *
+   * That argument covers ordinary agents and *only* ordinary agents. It does not
+   * hold for the scoped-key classes `authorization.ts` denies `company_scope:read`
+   * outright while still allowing `issue:mutate` on their own issue — task-bridge
+   * keys, skill-test run tokens, and low-trust-preset agents. For those, attaching
+   * would have been a genuinely new read: `GET /issues/:id/approvals` returns the
+   * linked approvals to any actor that can read the issue, so a guessed approval id
+   * attached to their own issue would come back readable. The dropped gate happened
+   * to exclude them; `assertApprovalReadAllowed` on the route now excludes them on
+   * purpose, which is also what makes the two doors actually equivalent rather than
+   * equivalent-for-agents. Found in review of PR #1293.
+   *
+   * `DELETE /issues/:id/approvals/:approvalId` deliberately keeps the privileged
+   * gate — see the note there.
+   */
+  async function assertIssueApprovalLinkAllowed(
+    req: Request,
+    res: Response,
+    issue: IssueApprovalLinkAuthorizationIssue,
+  ) {
+    // BLO-23763: this helper receives an already-looked-up issue, so answering a
+    // cross-tenant `issue.companyId` with `assertCompanyAccess`'s 403 would say
+    // "exists in another tenant" where a missing id says 404 — the existence
+    // oracle `hasCompanyAccess` documents in routes/authz.ts. The predecessor
+    // `assertCanManageIssueApprovalLinks` took a bare `companyId: string` and so
+    // never tripped that guard; taking the row itself does, which is a real
+    // widening of what this frame can leak, not just a lint shape.
+    //
+    // The sole caller reaches here through `getAccessibleResource`, which has
+    // already applied both halves, so for that path this is a no-op. It is kept
+    // rather than dropped so the helper closes the oracle on its own terms: the
+    // whole point of BLO-24699 is that two doors decide alike, and a second
+    // caller wiring itself up without the gate must not be able to reintroduce
+    // the leak here.
+    if (!hasCompanyAccess(req, issue.companyId)) {
+      res.status(404).json({ error: "Issue not found" });
+      return false;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    // BLO-24699 review: the evaluator reproduces the watchdog *subtree*
+    // confinement for every door, but not the freshness revalidation, whose
+    // service is plugin-provided and unreachable from `approvalRoutes`. This
+    // route can reach it, so it keeps running the full gate — which also
+    // preserves this door's `deny_task_watchdog_scope` audit row and its 409
+    // staleness contract exactly as they were before the refactor.
+    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, {
+      deniedWriteAction: "issue:mutate",
+    });
+    if (watchdogDecision !== null) return watchdogDecision;
+    const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+    if (verdict.allowed) return true;
+    res.status(verdict.status).json({
+      error: verdict.error,
+      details: {
+        ...verdict.details,
+        reason: verdict.reason,
+        boundary: verdict.boundary,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
+    // BLO-24699 review: dropping `assertAgentIssueMutationAllowed` also dropped
+    // its `recordDeniedIssueWrite` call, so boundary probing through this route
+    // stopped leaving an `issue_write_denied` row. The evaluator itself stays
+    // side-effect-free — the reason it does not record is that an approval-create
+    // body carries `payload`, which for `hire_agent` holds secrets. That argument
+    // is about the *create* route and does not transfer here: this body is
+    // `linkIssueApprovalSchema`-validated to `{approvalId}`, so recording it at
+    // this call site is safe and restores the trail.
+    await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+      // The evaluator's refusal reasons are either an `IssueAccessDecision`
+      // reason passed straight through or one of its own `deny_*` literals, so
+      // this narrows cleanly; `deniedBoundaryReason` carries the safe fallback
+      // for anything that ever fails to.
+      reason: deniedBoundaryReason(verdict.reason as IssueAccessDecision["reason"]),
+      responseStatus: responseStatusForDeniedWrite(res, verdict.status),
+    });
     return false;
   }
 
@@ -9554,9 +9688,30 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
-    if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
+    // BLO-24699: the approval-side half, which create has always run and this route
+    // did not — so the doors were equivalent only for actors holding both halves.
+    // `GET /issues/:id/approvals` returns linked approvals to any actor that can
+    // read the issue, so without this an actor that may mutate its own issue but
+    // may not read approvals could attach an arbitrary approval id and read the row
+    // back. See `assertApprovalReadAllowed` for who that excludes and why ordinary
+    // agents (and so the BLO-23036 escalation path) are unaffected.
+    //
+    // Ordered *after* the run-context check, where create has it before: the two
+    // orderings differ only in which 403 an actor failing both is told about, never
+    // in the allow/deny verdict the equivalence contract is about. The cheap
+    // status-only refusal is the more specific of the two and names the delegation
+    // path an agent needs, and BLO-23036 AC #2 requires that constraint stay visible
+    // rather than being masked by a generic boundary message.
+    if (!(await assertApprovalReadAllowed(req, res, issue.companyId))) return;
+    // BLO-24699: the shared evaluator replaces the former
+    // `assertAgentIssueMutationAllowed` + `assertCanManageIssueApprovalLinks` pair,
+    // so this route and `POST /companies/:companyId/approvals` reach the same
+    // verdict. It is a faithful mirror of the mutation helper's boundary that
+    // additionally honours the productivity-review grant (BLO-23036) and does not
+    // seize the issue's checkout lock merely to annotate it. The 409 conflict
+    // contract for another agent's active checkout is preserved by the evaluator.
+    if (!(await assertIssueApprovalLinkAllowed(req, res, issue))) return;
 
     const actor = getActorInfo(req);
     await issueApprovalsSvc.link(id, req.body.approvalId, {
@@ -9588,6 +9743,14 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
+    // BLO-24699: unlink deliberately keeps the privileged CEO/`canCreateAgents`
+    // gate that the attach route above dropped. The equivalence argument does not
+    // reach here: detaching is not reachable through approval create by any actor,
+    // so there is no second door for the two to agree with. It is also the
+    // destructive direction — removing a board escalation from the issue it
+    // concerns is the context-loss failure BLO-23036 exists to close, and no
+    // escalation path depends on an ordinary agent being able to do it. Curation
+    // stays privileged; attaching does not.
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     await issueApprovalsSvc.unlink(id, approvalId);
