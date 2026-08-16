@@ -4857,6 +4857,40 @@ describe("agent issue mutation checkout ownership", () => {
         expect.objectContaining({ allowExecutionStageParticipantClaim: false }),
       );
     });
+
+    // BLO-27861: the composition of BLO-22666 (this participant claim) and
+    // BLO-22856 (the `issue:mutate` boundary on checkout) was never exercised —
+    // each landed against a base without the other, and the merge queue that
+    // would have caught it was bypassed by a direct-merge batch.
+    //
+    // The claim bypasses ONLY the `tasks:assign` self-appointment door, not the
+    // boundary. That is deliberate and it is what keeps checkout consistent with
+    // `PATCH /issues/:id`: there the participant early return
+    // (`isAgentExecutionStageParticipantDecision`) sits *after* the boundary has
+    // already allowed, so a participant the boundary denies cannot decide the
+    // stage either. Exempting the claim here — the way
+    // `allowSourceScopedRecoveryOwnerCheckout` is exempted — would let it take a
+    // run lock it could then never use, which is precisely the one-way door
+    // BLO-22856 exists to close.
+    it("still applies the issue:mutate boundary to a drifted participant claim", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, { assigneeAgentId: ownerAgentId }),
+      );
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_explicit_grant",
+        explanation:
+          input.action === "issue:mutate" ? "Missing mutation grant." : "Allowed by test boundary default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["in_review"] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.checkout).not.toHaveBeenCalled();
+    });
   });
 
   it("rejects peer-agent status updates that would clear a recovery action they do not own", async () => {
