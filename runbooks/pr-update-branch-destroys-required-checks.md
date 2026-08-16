@@ -46,8 +46,11 @@ one alone is fatal:
    `mergeable_state` describe a *merge*; the queue performs a *rebase*. A
    branch carrying merge commits reads `mergeable_state: clean` while
    `rebaseable: false`, and GitHub fails the rebase at head-of-queue and
-   dequeues it **before creating any `merge_group` build**. See
-   [BLO-27143](/BLO/issues/BLO-27143).
+   dequeues it **before creating any `merge_group` build**. Diagnostic order
+   matters: read `.rebaseable` *first*, because `mergeable_state: clean` masks
+   it — and zero `merge_group` builds across the PR's whole history is a
+   `rebaseable` problem, not queue congestion. See
+   [BLO-22300](/BLO/issues/BLO-22300).
 
 Failure (1) hides failure (2): you cannot even reach the queue to discover the
 branch would have been ejected from it.
@@ -139,8 +142,12 @@ git rev-parse <pr-head>:<file>
 - [`merge-queue-stalled-head.md`](merge-queue-stalled-head.md) — the *other*
   merge-queue failure: an entry that did reach the queue but whose
   `merge_group` check never terminates.
-- [BLO-27143](/BLO/issues/BLO-27143) — the `rebaseable: false` ejection, i.e.
-  failure (2) above, observed on its own.
+- [BLO-22300](/BLO/issues/BLO-22300) — the `rebaseable: false` ejection, i.e.
+  failure (2) above, observed on its own on
+  [`paperclip#1077`](https://github.com/Blockcast/paperclip/pull/1077): three
+  enqueues produced zero `merge_group` builds, one of them dequeuing 15s after
+  reaching head-of-queue with an empty queue; squash-linearizing the branch
+  produced a build in 45 seconds.
 
 ## Verifying signal
 
