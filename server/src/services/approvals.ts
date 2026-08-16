@@ -75,6 +75,14 @@ export function approvalService(db: Db) {
     return conditions;
   }
 
+  // A board note worth protecting from a requester-initiated transition. Blank or
+  // absent is treated as "the board wrote nothing", so an ordinary withdrawal of a
+  // never-decided card keeps recording its reason in the note field as before.
+  function readBoardDecisionNote(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    return value.trim() === "" ? null : value;
+  }
+
   function readSafeLabel(value: unknown) {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
@@ -565,25 +573,48 @@ export function approvalService(db: Db) {
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
-      const existing = await getExistingApproval(id);
-      if (existing.status !== "revision_requested") {
-        throw unprocessable("Only revision requested approvals can be resubmitted");
-      }
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await getExistingApproval(id, txDb);
+        if (existing.status !== "revision_requested") {
+          throw unprocessable("Only revision requested approvals can be resubmitted");
+        }
 
-      const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+        // Clearing the decision fields is right for a card going back to `pending`
+        // -- it is genuinely undecided again, and leaving `decidedAt` populated
+        // would make it read as decided. But the note itself is the board's only
+        // record of *why* revision was asked for, and there is no history on the
+        // column, so archive it as a comment first. Without this the single
+        // operation the workflow tells agents to use is silent, permanent data
+        // loss (BLO-27036, reproduced on approval f946c9b3).
+        const boardDecisionNote = readBoardDecisionNote(existing.decisionNote);
+        if (boardDecisionNote !== null) {
+          await txDb.insert(approvalComments).values({
+            companyId: existing.companyId,
+            approvalId: existing.id,
+            authorAgentId: null,
+            authorUserId: existing.decidedByUserId,
+            body: `Board decision note archived on resubmit (was \`revision_requested\`${
+              existing.decidedAt ? ` at ${existing.decidedAt.toISOString()}` : ""
+            }):\n\n${boardDecisionNote}`,
+          });
+        }
+
+        const now = new Date();
+        return txDb
+          .update(approvals)
+          .set({
+            status: "pending",
+            payload: payload ?? existing.payload,
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: now,
+          })
+          .where(eq(approvals.id, id))
+          .returning()
+          .then((rows) => rows[0]);
+      });
     },
 
     withdraw: async (
@@ -597,13 +628,27 @@ export function approvalService(db: Db) {
       const { updated, publishWithdrawn } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await getExistingApproval(id, txDb);
-        if (existing.status !== "pending") {
-          throw conflict("Only pending approvals can be withdrawn", {
+        // Undecided, not merely `pending`. A `revision_requested` card used to have
+        // exactly one agent-reachable exit -- `resubmit` then `withdraw` -- and
+        // `resubmit` nulls `decisionNote`, so retiring a moot card destroyed the
+        // board's reasoning. Accepting the whole undecided set gives that card a
+        // one-hop terminal exit that touches no decision field (BLO-27036).
+        if (!canResolveStatuses.has(existing.status)) {
+          throw conflict("Only undecided approvals can be withdrawn", {
             approvalId: id,
             status: existing.status,
+            allowedStatuses: resolvableStatuses,
           });
         }
 
+        // The note is the board's, not the withdrawer's. Overwriting it with the
+        // withdrawal reason is unrecoverable -- there is no revision history on
+        // this column -- so a note that already exists is preserved byte-identical,
+        // along with the attribution that makes it readable. The reason is recorded
+        // separately, in the activity log and as an approval comment. Only a card
+        // the board never wrote on takes the reason into the note field, which is
+        // the pre-existing behaviour for an ordinary `pending` withdrawal.
+        const preservesDecision = readBoardDecisionNote(existing.decisionNote) !== null;
         const now = new Date();
         // Status-guarded so a concurrent board decision wins rather than being
         // silently overwritten by a withdrawal racing it.
@@ -611,20 +656,25 @@ export function approvalService(db: Db) {
           .update(approvals)
           .set({
             status: "withdrawn",
-            decisionNote: reason,
-            decidedByUserId: actor.userId ?? null,
-            decidedAt: now,
+            ...(preservesDecision
+              ? {}
+              : {
+                  decisionNote: reason,
+                  decidedByUserId: actor.userId ?? null,
+                  decidedAt: now,
+                }),
             updatedAt: now,
           })
-          .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+          .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
           .returning()
           .then((rows) => rows[0] ?? null);
 
         if (!updated) {
           const latest = await getExistingApproval(id, txDb);
-          throw conflict("Only pending approvals can be withdrawn", {
+          throw conflict("Only undecided approvals can be withdrawn", {
             approvalId: id,
             status: latest.status,
+            allowedStatuses: resolvableStatuses,
           });
         }
 
@@ -636,13 +686,31 @@ export function approvalService(db: Db) {
           if (boundPendingAgent) await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
+        // Where the note was preserved, this comment is the only place the reason
+        // is legible on the card itself. Written inside the transaction so a card
+        // can never end up `withdrawn` with no recorded reason.
+        if (preservesDecision) {
+          await txDb.insert(approvalComments).values({
+            companyId: updated.companyId,
+            approvalId: updated.id,
+            authorAgentId: actor.activity.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            body: `Withdrawn from \`${existing.status}\`: ${reason}\n\nThe board's decision note above is preserved unchanged.`,
+          });
+        }
+
         const publishWithdrawn = await logActivity(txDb, {
           companyId: updated.companyId,
           ...actor.activity,
           action: "approval.withdrawn",
           entityType: "approval",
           entityId: updated.id,
-          details: { type: updated.type, reason },
+          details: {
+            type: updated.type,
+            reason,
+            withdrawnFromStatus: existing.status,
+            decisionNotePreserved: preservesDecision,
+          },
           // This transaction has already terminated the linked agent by the time
           // we get here. If the commit then fails, the default fire-and-forget
           // outbox write would still have told every plugin the approval was

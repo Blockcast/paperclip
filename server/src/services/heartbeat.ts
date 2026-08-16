@@ -1821,6 +1821,11 @@ function mergeAdapterRecoveryMetadata(input: {
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   "approval_approved",
+  // A board decision must not be dropped because a run happened to be in flight,
+  // and that is as true of a refusal as of an approval: `rejected` *looks*
+  // answered, so nothing re-examines a card whose wake was swallowed (BLO-27036).
+  "approval_rejected",
+  "approval_revision_requested",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
 ]);
 const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
@@ -1838,6 +1843,8 @@ const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "execution_approval_requested",
   "execution_changes_requested",
   "approval_approved",
+  "approval_rejected",
+  "approval_revision_requested",
 ]);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
