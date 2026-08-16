@@ -19,7 +19,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { DEP_BLOCKED_RETRY_REASON, heartbeatService } from "../services/heartbeat.js";
+import {
+  DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+  DEP_BLOCKED_RETRY_REASON,
+  heartbeatService,
+} from "../services/heartbeat.js";
 import { getDepBlockedMetric, resetDepBlockedMetrics } from "../services/dep-blocked-metrics.js";
 import {
   composeSweepWakeFramePage,
@@ -1529,6 +1533,13 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .then((rows) => rows[0] ?? null);
     expect(coalescedRequest).not.toBeNull();
     expect(coalescedRequest?.runId).toBe(scheduledRun?.id);
+  });
+
+  it("pins the dependency retry budget used before recovery handoff", () => {
+    // Twelve attempts is the intentional roughly ten-hour dependency wait
+    // horizon; exhaustion must leave the issue for dependency recovery rather
+    // than retrying indefinitely.
+    expect(DEP_BLOCKED_MAX_RETRY_ATTEMPTS).toBe(12);
   });
 
   it("resets dependency-blocked scheduled_retry when the blocker set changes", async () => {

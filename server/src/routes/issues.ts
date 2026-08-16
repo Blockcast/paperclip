@@ -10533,7 +10533,7 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+    let normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
     );
@@ -10810,6 +10810,22 @@ export function issueRoutes(
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
+    const automaticRecoveryHandBack =
+      existing.status === "blocked" &&
+      updateFields.status === "todo" &&
+      req.body.assigneeAgentId === undefined &&
+      req.body.assigneeUserId === undefined &&
+      activeRecoveryActionBeforeUpdate?.ownerAgentId != null &&
+      activeRecoveryActionBeforeUpdate?.ownerAgentId === existing.assigneeAgentId &&
+      Boolean(activeRecoveryActionBeforeUpdate.returnOwnerAgentId);
+    if (automaticRecoveryHandBack) {
+      normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+        existing.companyId,
+        activeRecoveryActionBeforeUpdate!.returnOwnerAgentId,
+      );
+      updateFields.assigneeAgentId = normalizedAssigneeAgentId;
+      updateFields.assigneeUserId = null;
+    }
     const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
     await assertCanManageIssueMonitor(
       access,
@@ -10919,7 +10935,7 @@ export function issueRoutes(
     const isScopedRecoveryOwnerReturnAssignment =
       allowScopedRecoveryOwnerSourceMutation &&
       req.actor.type === "agent" &&
-      req.body.assigneeAgentId !== undefined;
+      (req.body.assigneeAgentId !== undefined || automaticRecoveryHandBack);
     const isCurrentRunMonitorAssigneeRestore =
       req.actor.type === "agent" &&
       isCurrentIssueExecutionRun(req, existing) &&
