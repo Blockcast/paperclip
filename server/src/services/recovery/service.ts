@@ -176,10 +176,9 @@ const SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK = new Set([
 // measured against the run's own most-recent *genuine* activity — the newest of
 // lastUsefulActionAt / lastOutputAt / startedAt, NOT the first non-null of them
 // (see latestRunActivityAt below). That is the same metric the dispatcher's slot
-// gate uses (`nonStaleRunningRuns`, heartbeat.ts:17560-17569) and the reaper's
-// own silence test (`persistedSignalRef`, heartbeat.ts:16672-16682), though both
-// of those still coalesce by priority rather than taking the max — BLO-20775,
-// kept out of this change because it alters reap/dispatch behaviour.
+// gate uses (`nonStaleRunningRuns` in heartbeat.ts) and the reaper's own silence
+// test (`externalLifecycleRecentRefTime` in heartbeat.ts); both of those took the
+// first non-null rather than the max until BLO-20775 fixed them to match this.
 // Deliberately NOT updatedAt:
 // review/recovery churn bumps it every ~minute and would shield a dead run
 // forever (BLO-8827, and the reaper's own note at heartbeat.ts:16444-16448).

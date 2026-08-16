@@ -18216,9 +18216,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
-    const liveProgressRef = runTimestampMs(run.lastUsefulActionAt) || runTimestampMs(run.lastOutputAt);
+    // BLO-20775: take the NEWEST stamp, not the first non-null. This was
+    // `runTimestampMs(lastUsefulActionAt) || runTimestampMs(lastOutputAt)`, which
+    // encodes an invariant nothing enforces: that lastUsefulActionAt is never
+    // older than lastOutputAt. By schema these are independent columns written by
+    // different paths, and on TERMINAL rows they do diverge exactly that way —
+    // classifyAndPersistRunLiveness stamps lastUsefulActionAt to the last concrete
+    // *evidence* time (comment/doc/work-product, often hours old) while leaving
+    // lastOutputAt fresh (run-liveness.ts:314,320).
+    //
+    // On a RUNNING row consumed HERE they cannot diverge today, and no currently
+    // reachable transition makes them: the only writer that touches a live run is
+    // flushOutputProgress, which sets BOTH to the same value in one .set() (see
+    // the coupling guard in heartbeat-process-recovery.test.ts). So the old chain
+    // was not returning wrong answers on this path — for the external-lifecycle
+    // reaper this change is purely future-proofing, not an active-incident fix.
+    //
+    // Specifically NOT a live race here, though an earlier revision of this
+    // comment claimed it was: the unguarded setRunStatus(id, "running") below
+    // (~:17444) can resurrect a terminal row still carrying the terminal-path
+    // stamp, but it sits behind processPidAlive → isTrackedLocalChildProcessAdapter,
+    // i.e. SESSIONED_LOCAL_ADAPTERS (claude_local, codex_local, …). This helper is
+    // only ever called under hasExternalLifecycle → EXTERNAL_LIFECYCLE_ADAPTER_TYPES
+    // (claude_k8s, opencode_k8s). Those two sets are disjoint, so that resurrection
+    // cannot produce a divergent row on the external-lifecycle path. It IS reachable
+    // for the dispatcher slot gate, whose query is adapter-agnostic — see
+    // nonStaleRunningRuns, where that rationale properly lives.
+    //
+    // What this guards instead: a FUTURE deliberate decoupling of the two stamps
+    // (or a future external-lifecycle transition that preserves terminal stamps).
+    // Should either arrive, max() is already correct and the reaper does not
+    // silently regain the power to force-kill a live Job.
+    //
+    // max() is the established idiom for this question in-repo
+    // (silenceStartedAtForRun / latestRunActivityAt in recovery/service.ts,
+    // latestDate in productivity-review.ts), is monotonic toward LESS destructive
+    // reaper behaviour, and keeps the answer correct if the two stamps are ever
+    // decoupled deliberately. runTimestampMs maps null/NaN to 0, so one bad row
+    // cannot win the max or poison the comparison.
+    //
+    // Convergence, deliberately: because streamed output counts as activity, a run
+    // that emits forever never trips isHardStale, so the reaper never kills it.
+    // That is correct for a SILENCE detector — "still talking" is the definition
+    // of not-silent, per the note above — and is unchanged by this commit, since
+    // the stamps are equal on live runs either way. An emitting-but-unproductive
+    // run is the liveness/productivity detectors' problem, not the reaper's; the
+    // reaper has no wall-clock backstop and is not meant to be one.
     return Math.max(
-      liveProgressRef,
+      runTimestampMs(run.lastUsefulActionAt),
+      runTimestampMs(run.lastOutputAt),
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
@@ -20680,21 +20726,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // BLO-12990 Fix #1: stale/silent running runs must not block new high-priority
       // work. Fetch full run rows so we can partition into active vs. stale using
       // the same silence metric the reaper uses (EXTERNAL_LIFECYCLE_STALE_MS). A run
-      // is stale when its most-recent signal (lastUsefulActionAt > lastOutputAt >
-      // startedAt) is older than the threshold. Only non-stale runs count toward the
-      // slot gate — a k8s Job that has been silent for >15 min should not starve
-      // newly-queued high-priority work indefinitely.
+      // is stale when its most-recent signal — the NEWEST of lastUsefulActionAt /
+      // lastOutputAt / startedAt — is older than the threshold. Only non-stale runs
+      // count toward the slot gate — a k8s Job that has been silent for >15 min
+      // should not starve newly-queued high-priority work indefinitely.
       const dispatchNow = new Date();
       const staleFloorMs = dispatchNow.getTime() - EXTERNAL_LIFECYCLE_STALE_MS;
       const runningRunRows = await listRunningRunsForAgent(agentId);
       const nonStaleRunningRuns = runningRunRows.filter((r) => {
-        const signalMs = r.lastUsefulActionAt
-          ? new Date(r.lastUsefulActionAt).getTime()
-          : r.lastOutputAt
-          ? new Date(r.lastOutputAt).getTime()
-          : r.startedAt
-          ? new Date(r.startedAt).getTime()
-          : 0;
+        // BLO-20775: newest stamp, NOT the first non-null. The old chain
+        // (lastUsefulActionAt ? … : lastOutputAt ? …) encodes an invariant nothing
+        // enforces — that lastUsefulActionAt is never older than lastOutputAt. That
+        // is false on TERMINAL rows, where classifyAndPersistRunLiveness stamps
+        // lastUsefulActionAt to an often-hours-old concrete *evidence* time while
+        // lastOutputAt stays fresh.
+        //
+        // Unlike the external-lifecycle reaper helper, that divergent row IS
+        // reachable here. listRunningRunsForAgent filters on agentId + status only,
+        // with no adapter predicate, so it returns sessioned-local rows too — and a
+        // terminal local row can be resurrected to `running` by the unguarded
+        // setRunStatus(id, "running") in reapOrphanedRuns (gated on processPidAlive →
+        // isTrackedLocalChildProcessAdapter), carrying its terminal-path stamp with
+        // it. Such a run genuinely occupies a slot; under the old chain it read as
+        // stale, dropped out of the count, and a second run could dispatch on top of
+        // a live one. runTimestampMs maps null/NaN to 0, so an unparseable stamp is
+        // dropped rather than propagated.
+        const signalMs = Math.max(
+          runTimestampMs(r.lastUsefulActionAt),
+          runTimestampMs(r.lastOutputAt),
+          runTimestampMs(r.startedAt),
+        );
         return signalMs >= staleFloorMs;
       });
       const runningCount = nonStaleRunningRuns.length;
