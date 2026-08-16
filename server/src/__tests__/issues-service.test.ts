@@ -4929,6 +4929,126 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(child.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  // BLO-27706: a reused execution workspace is shared, so patching issue B's
+  // settings must not clear config issue A depends on. The builder used to emit
+  // `null` for every absent key, which defeated mergeExecutionWorkspaceConfig's
+  // leave-unchanged semantics and silently wiped runtime services.
+  it("BLO-27706: a sibling issue update that omits workspaceRuntime leaves shared workspace config intact", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+
+    const workspaceRuntime = {
+      services: [{ name: "portal", command: "pnpm dev", port: 5173 }],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared workspace",
+      status: "active",
+      providerType: "local_fs",
+      metadata: {
+        source: "project_primary",
+        config: {
+          provisionCommand: "bash ./scripts/provision.sh",
+          teardownCommand: "bash ./scripts/teardown.sh",
+          workspaceRuntime,
+        },
+      },
+    });
+
+    // Two issues share the one execution workspace.
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Issue A depends on the runtime services",
+        status: "in_progress",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime },
+      },
+      {
+        id: issueBId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Issue B knows nothing about runtime services",
+        status: "todo",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "shared_workspace" },
+      },
+    ]);
+
+    const readConfig = async () => {
+      const row = await db
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId))
+        .then((rows) => rows[0] ?? null);
+      return (row?.metadata as { config?: Record<string, unknown> } | null)?.config ?? null;
+    };
+
+    expect((await readConfig())?.workspaceRuntime).toEqual(workspaceRuntime);
+
+    // Issue B supplies settings without workspaceRuntime. Absent must mean
+    // "leave unchanged", not "clear".
+    await svc.update(issueBId, {
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+
+    const afterSiblingUpdate = await readConfig();
+    expect(afterSiblingUpdate?.workspaceRuntime).toEqual(workspaceRuntime);
+    expect(afterSiblingUpdate?.provisionCommand).toBe("bash ./scripts/provision.sh");
+    expect(afterSiblingUpdate?.teardownCommand).toBe("bash ./scripts/teardown.sh");
+
+    // Control: an issue that DOES supply workspaceRuntime still writes it through,
+    // so the fix suppresses only the absent-key clear, not the feature.
+    const replacementRuntime = {
+      services: [{ name: "portal", command: "pnpm dev --host", port: 5173 }],
+    };
+    await svc.update(issueAId, {
+      executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime: replacementRuntime },
+    });
+
+    expect((await readConfig())?.workspaceRuntime).toEqual(replacementRuntime);
+  });
 });
 
 describeEmbeddedPostgres("issueService blockers and dependency wake readiness", () => {
@@ -8540,7 +8660,14 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(workspace?.metadata).toEqual({
       config: {
-        environmentId: null,
+        // BLO-27706: issue settings deliberately do not carry environmentId --
+        // parseIssueExecutionWorkspaceSettings is called here without
+        // includeEnvironmentId, so "env-new" above never reaches this patch (see
+        // the "operator overrides env then reassigns" case). This previously
+        // asserted `null`, i.e. every such update silently discarded the
+        // workspace's own environment selection. Absent now means leave
+        // unchanged, so the persisted "env-old" survives.
+        environmentId: "env-old",
         provisionCommand: "bash ./scripts/provision-new.sh",
         teardownCommand: "bash ./scripts/teardown-new.sh",
         cleanupCommand: null,

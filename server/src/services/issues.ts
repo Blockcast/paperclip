@@ -70,6 +70,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+  type ExecutionWorkspaceConfig,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -568,15 +569,30 @@ async function resolveResponsibleUserIdForIssueCreate(
   return input.createdByUserId ?? null;
 }
 
+// BLO-27706: a reused execution workspace is shared by every issue bound to it, so
+// an issue update must patch only the config keys that issue actually supplies.
+// Emitting `null` for an absent key defeated mergeExecutionWorkspaceConfig's
+// leave-unchanged semantics (it keys off `!== undefined`), so updating issue A
+// silently wiped the runtime services issue B depends on. Absent now means "leave
+// unchanged"; deliberate clearing goes through PATCH /execution-workspaces/:id,
+// whose `config` body still honours an explicit null.
 function buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(
   settings: ReturnType<typeof parseIssueExecutionWorkspaceSettings>,
-) {
-  return {
-    environmentId: settings?.environmentId ?? null,
-    provisionCommand: settings?.workspaceStrategy?.provisionCommand ?? null,
-    teardownCommand: settings?.workspaceStrategy?.teardownCommand ?? null,
-    workspaceRuntime: settings?.workspaceRuntime ?? null,
-  };
+): Partial<ExecutionWorkspaceConfig> {
+  const patch: Partial<ExecutionWorkspaceConfig> = {};
+  if (settings?.environmentId !== undefined) {
+    patch.environmentId = settings.environmentId;
+  }
+  if (settings?.workspaceStrategy?.provisionCommand !== undefined) {
+    patch.provisionCommand = settings.workspaceStrategy.provisionCommand;
+  }
+  if (settings?.workspaceStrategy?.teardownCommand !== undefined) {
+    patch.teardownCommand = settings.workspaceStrategy.teardownCommand;
+  }
+  if (settings?.workspaceRuntime !== undefined) {
+    patch.workspaceRuntime = settings.workspaceRuntime;
+  }
+  return patch;
 }
 
 // Accepted-plan children are not realized yet, so carry only unresolved
@@ -10061,30 +10077,37 @@ export function issueService(db: Db) {
           nextExecutionWorkspaceId &&
           nextExecutionWorkspacePreference === "reuse_existing"
         ) {
-          const workspace = await tx
-            .select({
-              id: executionWorkspaces.id,
-              metadata: executionWorkspaces.metadata,
-            })
-            .from(executionWorkspaces)
-            .where(
-              and(
-                eq(executionWorkspaces.id, nextExecutionWorkspaceId),
-                eq(executionWorkspaces.companyId, lockedExisting.companyId),
-              ),
-            )
-            .then((rows: Array<{ id: string; metadata: unknown }>) => rows[0] ?? null);
-          if (workspace) {
-            await tx
-              .update(executionWorkspaces)
-              .set({
-                metadata: mergeExecutionWorkspaceConfig(
-                  (workspace.metadata as Record<string, unknown> | null) ?? null,
-                  buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(nextExecutionWorkspaceSettings),
-                ),
-                updatedAt: new Date(),
+          const configPatch =
+            buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(nextExecutionWorkspaceSettings);
+          // BLO-27706: this issue said nothing about workspace config, and the
+          // workspace is shared. Leave the row untouched rather than rewriting a
+          // normalized copy of config other issues depend on.
+          if (Object.keys(configPatch).length > 0) {
+            const workspace = await tx
+              .select({
+                id: executionWorkspaces.id,
+                metadata: executionWorkspaces.metadata,
               })
-              .where(eq(executionWorkspaces.id, workspace.id));
+              .from(executionWorkspaces)
+              .where(
+                and(
+                  eq(executionWorkspaces.id, nextExecutionWorkspaceId),
+                  eq(executionWorkspaces.companyId, lockedExisting.companyId),
+                ),
+              )
+              .then((rows: Array<{ id: string; metadata: unknown }>) => rows[0] ?? null);
+            if (workspace) {
+              await tx
+                .update(executionWorkspaces)
+                .set({
+                  metadata: mergeExecutionWorkspaceConfig(
+                    (workspace.metadata as Record<string, unknown> | null) ?? null,
+                    configPatch,
+                  ),
+                  updatedAt: new Date(),
+                })
+                .where(eq(executionWorkspaces.id, workspace.id));
+            }
           }
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
