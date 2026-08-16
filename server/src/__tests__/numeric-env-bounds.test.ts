@@ -190,3 +190,41 @@ describe("resolveNumericSetting", () => {
     expect(resolveNumericSetting([], { fallback: 1e309, min: 1, max: 100 })).toBe(100);
   });
 });
+
+describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () => {
+  /**
+   * Automates the manual grep from the BLO-27641 acceptance criteria.
+   *
+   * Without this, the fix is a one-time cleanup of a class that keeps being
+   * re-added: at the time of writing two in-flight PRs each introduce a *new*
+   * reconciler interval using the same idiom (#1375, #1309). A guard turns the
+   * cleanup into an invariant, and points the next author at the helper.
+   */
+  const ALLOWED_ENV_VARS = new Set([
+    // Neither a bound nor a timer delay. An unusable port fails loudly at
+    // listen() rather than silently disabling a guard or starting a hot loop.
+    "PORT",
+  ]);
+
+  it("has no unguarded `Number(process.env.X) ||` outside the allowlist", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(new URL("../config.ts", import.meta.url), "utf8");
+
+    // Strip comments so prose describing the idiom does not trip the guard.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+
+    const offenders = [...code.matchAll(/Number\(process\.env\.([A-Z_][A-Z0-9_]*)\)\s*\|\|/g)]
+      .map((match) => match[1])
+      .filter((envVar) => !ALLOWED_ENV_VARS.has(envVar));
+
+    expect(
+      offenders,
+      `${offenders.join(", ")} use \`Number(process.env.X) || DEFAULT\`, which resolves ` +
+        `to Infinity for "Infinity"/"1e999" and overflows a 32-bit timer for any value ` +
+        `above ${MAX_TIMER_DELAY_MS}ms. Use resolveNumericSetting() with an entry in ` +
+        `NUMERIC_SETTING_BOUNDS instead (and TIMER_SETTING_MS_FACTOR if it is a timer).`,
+    ).toEqual([]);
+  });
+});
