@@ -627,6 +627,31 @@ export function createPluginWorkerHandle(
       : JSONRPC_ERROR_CODES.INTERNAL_ERROR;
   }
 
+  /**
+   * The structured `data` payload for a host-handler failure, or `undefined`.
+   *
+   * Host services raise `HttpError`s carrying a machine-readable discriminator
+   * in `details.code` — `secret_verifier_unsupported`, `binding_ambiguous`, and
+   * so on. Until BLO-20738 none of it crossed this boundary: only `message` and
+   * a numeric JSON-RPC code were sent, and because `HttpError` has `status`
+   * rather than a numeric `code`, every one of them arrived as a bare
+   * `INTERNAL_ERROR`. A plugin could therefore only tell two host failures apart
+   * by substring-matching English prose, which is not a contract — so in
+   * practice plugins could not react to them at all.
+   *
+   * Deliberately a NARROW projection rather than `err.details` verbatim: a
+   * plugin worker is a lower-trust process, and `details` is free-form and
+   * carries whatever a call site happened to attach. Forwarding only a
+   * string `code` keeps this from becoming an accidental exfiltration channel
+   * for host internals the day someone attaches a query or a row to one.
+   */
+  function workerHostErrorData(err: unknown): { code: string } | undefined {
+    const details = (err as { details?: unknown } | null)?.details;
+    if (!details || typeof details !== "object") return undefined;
+    const code = (details as { code?: unknown }).code;
+    return typeof code === "string" && code.length > 0 ? { code } : undefined;
+  }
+
   // -----------------------------------------------------------------------
   // Incoming message handling
   // -----------------------------------------------------------------------
@@ -821,6 +846,7 @@ export function createPluginWorkerHandle(
             request.id,
             errorCodeForWorkerHostError(err),
             errorMessage,
+            workerHostErrorData(err),
           ),
         );
       } catch {

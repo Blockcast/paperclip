@@ -154,12 +154,16 @@ export interface HostServices {
     resolve(params: WorkerToHostMethods["approvals.resolve"][0]): Promise<WorkerToHostMethods["approvals.resolve"][1]>;
   };
 
-  /** Provides `secrets.resolve`, `secrets.list`, `secrets.manage`. */
+  /** Provides `secrets.resolve`, `secrets.verify`, `secrets.list`, `secrets.manage`. */
   secrets: {
     resolve(
       params: WorkerToHostMethods["secrets.resolve"][0],
       context?: WorkerHostCallContext,
     ): Promise<string>;
+    verify(
+      params: WorkerToHostMethods["secrets.verify"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<boolean>;
     list(params: WorkerToHostMethods["secrets.list"][0]): Promise<WorkerToHostMethods["secrets.list"][1]>;
     providers(params: WorkerToHostMethods["secrets.providers"][0]): Promise<WorkerToHostMethods["secrets.providers"][1]>;
     create(params: WorkerToHostMethods["secrets.create"][0]): Promise<WorkerToHostMethods["secrets.create"][1]>;
@@ -442,6 +446,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+  "secrets.verify": "secrets.verify-ref",
   "secrets.list": "secrets.list",
   "secrets.providers": "secrets.list",
   "secrets.create": "secrets.manage",
@@ -833,6 +838,10 @@ export function createHostClientHandlers(
     "secrets.resolve": gated("secrets.resolve", async (params, context) => {
       const companyId = resolveRequiredCompanyId("secrets.resolve", params, context);
       return services.secrets.resolve({ ...params, companyId }, context);
+    }),
+    "secrets.verify": gated("secrets.verify", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("secrets.verify", params, context);
+      return services.secrets.verify({ ...params, companyId }, context);
     }),
     "secrets.list": gated("secrets.list", async (params) => {
       return services.secrets.list(params);

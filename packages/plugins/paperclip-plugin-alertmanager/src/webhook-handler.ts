@@ -27,7 +27,6 @@ import {
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
-import { recordCredentialResolution } from "./credential-health.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -88,6 +87,35 @@ export function verifyBearerToken(
   const expected = `Bearer ${expectedToken}`;
   if (raw.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(raw), Buffer.from(expected));
+}
+
+/**
+ * Largest bearer credential worth sending to the host for verification.
+ *
+ * Mirrors the host's own `MAX_PRESENTED_SECRET_BYTES`
+ * (`server/src/services/plugin-secrets-handler.ts`). Anything larger is
+ * rejected there as `presented_secret_invalid` — an error, not a `false` — so
+ * without this cap an oversized `Authorization` header turns a plainly-wrong
+ * credential into a failed delivery that Alertmanager then retries. No secret
+ * budget is spent either way (the host checks size before any database work),
+ * but the retry volume and error rate are anonymous-triggerable, so reject the
+ * over-long credential here and answer 401 instead.
+ */
+const MAX_BEARER_CREDENTIAL_BYTES = 4_096;
+
+export function readBearerCredential(
+  headers: Record<string, string | string[]>,
+): string | null {
+  const raw =
+    pickHeader(headers, "authorization") ??
+    pickHeader(headers, "Authorization");
+  if (!raw?.startsWith("Bearer ")) return null;
+  const credential = raw.slice("Bearer ".length);
+  if (credential.length === 0) return null;
+  // Byte length, matching how the host measures it — a multi-byte UTF-8
+  // credential inside the character limit can still exceed the byte limit.
+  if (Buffer.byteLength(credential, "utf8") > MAX_BEARER_CREDENTIAL_BYTES) return null;
+  return credential;
 }
 
 function pickHeader(
@@ -734,12 +762,20 @@ async function recoverStateFromIssue(
 }
 
 /**
- * Top-level webhook handler. Pure-ish: takes ctx + config + token + input,
- * returns void. Throws `WebhookUnauthorizedError` when the bearer token
- * fails verification — the worker's onWebhook re-throws this so the host
+ * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
+ * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
+ * verdict is `false` — the worker's onWebhook re-throws this so the host
  * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
  * when any alert in the batch failed to process, so the host records the
  * delivery `failed` and Alertmanager retries it.
+ *
+ * `authenticated` is a verdict, never a credential. `authenticateWebhook`
+ * (config-scope.ts) owns every way a request can authenticate — inline token
+ * and `webhookTokenRef` alike — so this function does no comparison and never
+ * sees a secret. It also records no credential health: given only a verdict it
+ * could not tell "no credential configured" from "wrong bearer presented", and
+ * conflating those is exactly what credential-health.ts exists to prevent
+ * (BLO-20572). `resolveCompanyScope` is the sole recorder.
  *
  * Returning normally is an acknowledgement: it makes the host answer HTTP 200
  * and ends Alertmanager's retries. Only do that when the delivery needs no
@@ -749,7 +785,7 @@ async function recoverStateFromIssue(
 export async function handleWebhook(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
-  resolvedToken: string | null,
+  authenticated: boolean,
   input: PluginWebhookInput,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
@@ -759,12 +795,7 @@ export async function handleWebhook(
     return;
   }
 
-  // Config-resolution outcome, not request-auth outcome: this reflects
-  // whether the company has a usable credential configured at all, not
-  // whether THIS request presented it correctly (BLO-20572).
-  recordCredentialResolution(input.companyId, resolvedToken);
-
-  if (!verifyBearerToken(input.headers, resolvedToken)) {
+  if (!authenticated) {
     ctx.logger.warn(
       "paperclip-plugin-alertmanager: rejecting webhook — bearer token missing or invalid",
     );

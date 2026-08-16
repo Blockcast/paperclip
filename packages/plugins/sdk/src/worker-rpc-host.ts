@@ -612,6 +612,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             configPath: options.configPath,
           });
         },
+        async verify(secretRef, presented, options = {}): Promise<boolean> {
+          return callHost("secrets.verify", {
+            secretRef,
+            presented,
+            companyId: options.companyId,
+            configPath: options.configPath,
+          });
+        },
         async list(companyId: string) {
           return callHost("secrets.list" as any, { companyId });
         },
