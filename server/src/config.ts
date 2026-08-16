@@ -230,6 +230,111 @@ export function readGithubPrReviewerAgentIds(): string[] {
   ];
 }
 
+/**
+ * Largest delay `setTimeout`/`setInterval` accepts before Node coerces it.
+ *
+ * Above this, Node does *not* mean "never" — it emits `TimeoutOverflowWarning`
+ * and sets the duration to **1 ms**, turning a period into a hot loop. This is
+ * why every timer setting below needs an explicit ceiling and not merely a
+ * finiteness check: `2 ** 31 - 1` ms is ~24.8 days, so an ordinary
+ * minutes/milliseconds confusion reaches it with a finite value.
+ */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Ceiling shared by the minute-denominated timer periods (7d, well under the overflow). */
+const TIMER_PERIOD_MINUTES_MAX = 7 * 24 * 60;
+
+type NumericSettingBounds = {
+  /** Used when no candidate is usable. Clamped like any other value. */
+  fallback: number;
+  min: number;
+  max: number;
+};
+
+/**
+ * Bounds for every numeric env override in this file, in one table so the
+ * ceilings are reviewable together and a test can assert them without
+ * restating the numbers.
+ *
+ * BLO-27641. The previous idiom at each of these sites was
+ * `Math.max(FLOOR, Number(process.env.X) || DEFAULT)`, which looks doubly
+ * guarded and is not: `Number("Infinity")` is truthy so `|| DEFAULT` never
+ * fires, and `Math.max(FLOOR, Infinity)` is `Infinity`. The consequence splits
+ * two ways depending on the consumer, and the second is the non-obvious one:
+ *
+ *  - **Comparison bounds** (`recoveryActionTimeoutMs`, `recoveryActionMaxAttempts`,
+ *    the retention/window days) silently stop bounding. `recoveryActionTimeoutMs`
+ *    is worse than "very long": it feeds `new Date(now + timeoutMs)`, and an
+ *    infinite offset yields an *Invalid Date*, whose comparisons are all false —
+ *    so the BLO-19124 bound is not loosened but absent.
+ *  - **Timer periods** degrade to a 1 ms hot loop, not to "never" — see
+ *    `MAX_TIMER_DELAY_MS`. `PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES=Infinity` would
+ *    schedule a database backup every millisecond: a self-inflicted outage
+ *    rather than a disabled feature.
+ */
+export const NUMERIC_SETTING_BOUNDS = {
+  databaseBackupIntervalMinutes: { fallback: 60, min: 1, max: TIMER_PERIOD_MINUTES_MAX },
+  databaseBackupRetentionDays: { fallback: 7, min: 1, max: 3650 },
+  prReconcilerIntervalMinutes: { fallback: 360, min: 1, max: TIMER_PERIOD_MINUTES_MAX },
+  prReconcilerWindowDays: { fallback: 21, min: 1, max: 365 },
+  strandedBlockedIssueReconcilerIntervalMinutes: {
+    fallback: 15,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
+  recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
+  recoveryActionTimeoutMs: {
+    fallback: 6 * 60 * 60_000,
+    min: 60 * 60_000,
+    max: 7 * 24 * 60 * 60_000,
+  },
+} as const satisfies Record<string, NumericSettingBounds>;
+
+/**
+ * The subset of the above consumed as a `setTimeout`/`setInterval` delay, with
+ * the factor converting each to milliseconds. Declared rather than inferred so
+ * the overflow invariant (`value * factor <= MAX_TIMER_DELAY_MS`) is checkable
+ * for the minute-denominated settings, whose ceiling is not in the timer's unit.
+ */
+export const TIMER_SETTING_MS_FACTOR = {
+  databaseBackupIntervalMinutes: 60_000,
+  prReconcilerIntervalMinutes: 60_000,
+  strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  heartbeatSchedulerIntervalMs: 1,
+} as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
+
+/**
+ * Resolve the first usable candidate for a numeric setting, clamped to `[min, max]`.
+ *
+ * A candidate is usable only when it is finite and positive. Unusable
+ * candidates fall through to the next one — matching the old `Number(x) || y`
+ * chain, so a configured file-level fallback still wins over a bad env var —
+ * and non-finite input therefore lands on the documented default rather than
+ * being clamped to the ceiling. That distinction is deliberate: clamping
+ * `Infinity` to `max` would silently read as an operator asking for the maximum,
+ * where falling back keeps the startup banner honest about what is in effect.
+ *
+ * Note this is a small, intentional change for input that was already invalid:
+ * a negative override previously survived `||` and was pulled up to the floor,
+ * and now falls back to the default instead. Every currently-valid input
+ * resolves exactly as before.
+ */
+export function resolveNumericSetting(
+  candidates: readonly unknown[],
+  { fallback, min, max }: NumericSettingBounds,
+): number {
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null || candidate === "") continue;
+    const parsed = Number(candidate);
+    // Rejects NaN (unparseable), ±Infinity (including overflow literals such as
+    // "1e999"), and anything non-positive.
+    if (!Number.isFinite(parsed) || parsed <= 0) continue;
+    return Math.min(max, Math.max(min, parsed));
+  }
+  return Math.min(max, Math.max(min, fallback));
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
@@ -380,17 +485,13 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_DB_BACKUP_ENABLED !== undefined
       ? process.env.PAPERCLIP_DB_BACKUP_ENABLED === "true"
       : (fileDatabaseBackup?.enabled ?? true);
-  const databaseBackupIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES) ||
-      fileDatabaseBackup?.intervalMinutes ||
-      60,
+  const databaseBackupIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES, fileDatabaseBackup?.intervalMinutes],
+    NUMERIC_SETTING_BOUNDS.databaseBackupIntervalMinutes,
   );
-  const databaseBackupRetentionDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS) ||
-      fileDatabaseBackup?.retentionDays ||
-      7,
+  const databaseBackupRetentionDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS, fileDatabaseBackup?.retentionDays],
+    NUMERIC_SETTING_BOUNDS.databaseBackupRetentionDays,
   );
   const databaseBackupDir = resolveHomeAwarePath(
     process.env.PAPERCLIP_DB_BACKUP_DIR ??
@@ -405,13 +506,13 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_PR_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_PR_RECONCILER_ENABLED === "true"
       : true;
-  const prReconcilerIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PR_RECONCILER_INTERVAL_MINUTES) || 360,
+  const prReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.prReconcilerIntervalMinutes,
   );
-  const prReconcilerWindowDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PR_RECONCILER_WINDOW_DAYS) || 21,
+  const prReconcilerWindowDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_RECONCILER_WINDOW_DAYS],
+    NUMERIC_SETTING_BOUNDS.prReconcilerWindowDays,
   );
   const prReconcilerEnrichLoc =
     process.env.PAPERCLIP_PR_RECONCILER_ENRICH_LOC !== undefined
@@ -426,9 +527,9 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_ENABLED === "true"
       : true;
-  const strandedBlockedIssueReconcilerIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES) || 15,
+  const strandedBlockedIssueReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
   );
   const approvalGateReconcilerEnabled =
     process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
@@ -520,18 +621,19 @@ export function loadConfig(): Config {
       paperclipNodeRole === "api"
         ? false
         : process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
-    heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
-    recoveryActionMaxAttempts: Math.max(
-      1,
-      // Preserve the existing wake-owner budget unless an operator explicitly
-      // opts into a new bound through the configurable setting.
-      Number(process.env.RECOVERY_ACTION_MAX_ATTEMPTS) || 5,
+    heartbeatSchedulerIntervalMs: resolveNumericSetting(
+      [process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS],
+      NUMERIC_SETTING_BOUNDS.heartbeatSchedulerIntervalMs,
     ),
-    recoveryActionTimeoutMs: Math.max(
-      60 * 60_000,
-      // Preserve the existing six-hour horizon for deployments that do not
-      // supply an override.
-      Number(process.env.RECOVERY_ACTION_TIMEOUT_MS) || 6 * 60 * 60_000,
+    // Preserve the existing wake-owner budget and six-hour horizon unless an
+    // operator explicitly opts into new bounds through the configurable settings.
+    recoveryActionMaxAttempts: resolveNumericSetting(
+      [process.env.RECOVERY_ACTION_MAX_ATTEMPTS],
+      NUMERIC_SETTING_BOUNDS.recoveryActionMaxAttempts,
+    ),
+    recoveryActionTimeoutMs: resolveNumericSetting(
+      [process.env.RECOVERY_ACTION_TIMEOUT_MS],
+      NUMERIC_SETTING_BOUNDS.recoveryActionTimeoutMs,
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
