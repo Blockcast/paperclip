@@ -165,12 +165,25 @@ export function isRequiredApprovalPair(reviews, headSha) {
  * user IDs — AC1's literal wording in BLO-22916, and the fingerprint of one
  * run submitting its verdict twice rather than two independent passes (two
  * passes produce two different write-ups).
+ *
+ * An empty body is excluded. Two bodiless approvals under two seats compare
+ * equal, but they are not one verdict posted twice — there is no verdict at
+ * all. That is Defect 2 (a counting APPROVED with no review behind it), I2d
+ * already reports it, and its remedy is to post a comment rather than to drop
+ * one of the two submissions.
+ *
+ * @param {object[]} operative reviews ALREADY filtered to the operative set for
+ *   one head, as returned by {@link operativeAllyReviews}. Passing a raw
+ *   `pr.reviews` list would compare dismissed and stale-head reviews and so
+ *   answer a different question than the caller intends.
+ * @returns {boolean} true when the duplicate-submission shape is present
  */
 export function duplicateBodyAcrossIdentities(operative) {
   const reviews = operative ?? [];
   return reviews.some((a, i) =>
     reviews.some(
-      (b, j) => j > i && a?.body === b?.body && a?.user?.id !== b?.user?.id,
+      (b, j) =>
+        j > i && Boolean(a?.body) && a?.body === b?.body && a?.user?.id !== b?.user?.id,
     ),
   );
 }

@@ -384,9 +384,26 @@ describe("duplicateBodyAcrossIdentities", () => {
     assert.equal(duplicateBodyAcrossIdentities(undefined), false);
     assert.equal(duplicateBodyAcrossIdentities([at(1, 290875700, "solo")]), false);
   });
+
+  // Two bodiless approvals compare equal, but "one verdict, posted twice" is
+  // the wrong diagnosis: there is no verdict. I2d reports the missing
+  // attestation, and its remedy (post a comment) differs from this one's.
+  it("does NOT fire on bodiless reviews under two identities", () => {
+    for (const empty of [null, "", undefined]) {
+      assert.equal(
+        duplicateBodyAcrossIdentities([
+          at(1, 290875700, empty),
+          at(2, 296676656, empty),
+        ]),
+        false,
+        `expected no duplicate-submission finding for body ${JSON.stringify(empty)}`,
+      );
+    }
+  });
 });
 
-describe("I1 accepts only the protected-merge approval pair", () => {  it("accepts exactly one independently attested App/User approval pair", () => {
+describe("I1 accepts only the protected-merge approval pair", () => {
+  it("accepts exactly one independently attested App/User approval pair", () => {
     const reviews = requiredApprovalPair();
     const violations = findPrViolations({ number: 1129, headSha: HEAD, reviews });
 
