@@ -1680,6 +1680,141 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
   });
 
+  it("keeps a running external Job whose useful-action stamp is stale but whose output is fresh (BLO-20775)", async () => {
+    // BLO-20775. Scope honestly: this is a CHARACTERIZATION test of the selection
+    // expression in externalLifecycleRecentRefTime, not a reproduction of a
+    // production incident. It manufactures the divergent stamp state directly,
+    // because no production writer produces it on a running row — flushOutputProgress
+    // writes lastOutputAt and lastUsefulActionAt to the same value in a single
+    // .set(), which the coupling guard below pins. An earlier revision of this test
+    // claimed "a live run was killed"; that claim was not substantiated and has
+    // been withdrawn.
+    //
+    // What it is worth: the divergent state is real on TERMINAL rows (the
+    // terminal-path classifyAndPersistRunLiveness stamps lastUsefulActionAt to an
+    // often-hours-old evidence time while lastOutputAt stays fresh). But no
+    // currently reachable transition carries such a row back to `running` on THIS
+    // path. An earlier revision of this comment cited the unguarded
+    // setRunStatus(id, "running") in reapOrphanedRuns; that write sits behind
+    // processPidAlive → isTrackedLocalChildProcessAdapter (SESSIONED_LOCAL_ADAPTERS),
+    // while externalLifecycleRecentRefTime is only reached under hasExternalLifecycle
+    // (claude_k8s / opencode_k8s). The sets are disjoint, so that race cannot
+    // manufacture this row here — it applies to the adapter-agnostic dispatcher slot
+    // gate instead, which is covered separately in
+    // heartbeat-dispatch-priority-sort.test.ts. That claim is withdrawn.
+    //
+    // So this test is deliberately FUTURE-PROOFING, not a reachable-race repro: it
+    // pins that if the two stamps are ever decoupled — or an external-lifecycle
+    // transition that preserves terminal stamps is ever added — such a row is still
+    // NOT force-killed. That outcome is what matters, since isHardStale gates a
+    // destructive Job delete.
+    //
+    // The test above passes under both the old and new code (a fresh
+    // lastUsefulActionAt wins either way); only this direction distinguishes them.
+    const stale = new Date(Date.now() - 46 * 60 * 1000);
+    const freshOutput = new Date(Date.now() - 60 * 1000);
+    const jobName = "agent-opencode-fresh-output-stale-action";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: freshOutput,
+    });
+    // Every lifecycle stamp except lastOutputAt is past the 45-min hard-stale
+    // ceiling, so only taking the max over all of them keeps this run alive.
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: stale, createdAt: stale, lastUsefulActionAt: stale })
+      .where(eq(heartbeatRuns.id, runId));
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({
+      companyId,
+      agentId,
+      runId,
+      jobName,
+      jobUid: "fresh-output-stale-action-uid",
+    });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
+      phase: "active",
+      name: jobName,
+      uid: "fresh-output-stale-action-uid",
+    }]]));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    // REGRESSION GUARD: under the old priority chain this run was reaped with
+    // errorCode "external_lifecycle_stale_killed" and its Job deleted — verified by
+    // reverting the source change with this test in place.
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
+  it("couples lastOutputAt and lastUsefulActionAt on the live output path (BLO-20775 coupling guard)", async () => {
+    // BLO-20775. This is the guard the two characterization tests above depend on,
+    // and it runs through the REAL producer rather than a manufactured row.
+    //
+    // Why it exists: `last_output_at` and `last_useful_action_at` are separate
+    // nullable columns, and their names invite the reading that output advances one
+    // and concrete action advances the other independently. Today that is NOT how a
+    // running run behaves — flushOutputProgress writes BOTH from the same
+    // pendingOutputProgress.at in a single .set(), so on a live row they are always
+    // equal. That coupling is the entire reason a stale-useful/fresh-output row is
+    // unreachable on the normal running path, and until now nothing asserted it.
+    //
+    // If someone later decouples the stamps — a reasonable change, since it is what
+    // the column names already imply, and it would make lastUsefulActionAt mean what
+    // run-liveness.ts computes — this test goes red and points at the two selection
+    // sites (externalLifecycleRecentRefTime and the dispatcher slot gate) that must
+    // stay max-based for that decoupling to be safe. Those sites are already
+    // max-based, so the decoupling is safe to make; this test is the tripwire that
+    // makes the dependency visible instead of implicit.
+    //
+    // Read INSIDE the adapter callback, while the run is still `running`: the
+    // terminal path (classifyAndPersistRunLiveness) rewrites lastUsefulActionAt on
+    // finalize — often to an older evidence timestamp or to null — so reading after
+    // the run settles would observe the terminal write, not the output write.
+    const { runId: coupledRunId } = await seedQueuedIssueRunFixture();
+    let observed: { lastOutputAt: Date | null; lastUsefulActionAt: Date | null } | null = null;
+    mockAdapterExecute.mockImplementationOnce(
+      async (ctx: {
+        runId: string;
+        onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+      }) => {
+        await ctx.onLog("stdout", "streamed adapter output chunk\n");
+        observed = await db
+          .select({
+            lastOutputAt: heartbeatRuns.lastOutputAt,
+            lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, ctx.runId))
+          .then((rows) => rows[0] ?? null);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, coupledRunId, 5_000);
+
+    const flushed = observed as { lastOutputAt: Date | null; lastUsefulActionAt: Date | null } | null;
+    expect(flushed).not.toBeNull();
+    // The flush happened at all (the fixture starts both columns null).
+    expect(flushed?.lastOutputAt).toBeInstanceOf(Date);
+    expect(flushed?.lastUsefulActionAt).toBeInstanceOf(Date);
+    // THE INVARIANT: streamed output advances both stamps to the identical value.
+    expect(flushed?.lastUsefulActionAt?.getTime()).toBe(flushed?.lastOutputAt?.getTime());
+  });
+
   it("does not re-adopt an external Job after its PR gate closes", async () => {
     const jobName = "agent-opencode-closed-pr";
     const jobUid = "closed-pr-uid";

@@ -11,7 +11,8 @@
  *
  * Fix #1 (stale-run exclusion): verifies that a stale/silent running run does
  * not hold a dispatch slot hostage. A run is stale when its most-recent signal
- * (lastUsefulActionAt > lastOutputAt > startedAt) is older than
+ * — the NEWEST of lastUsefulActionAt / lastOutputAt / startedAt (BLO-20775; it
+ * was a first-non-null priority chain before) — is older than
  * EXTERNAL_LIFECYCLE_STALE_MS (15 min). Before the fix, stale runs counted as
  * "running" and blocked all dispatch for external-lifecycle agents via the hard
  * early-return gate — even when the k8s Job was already gone.
@@ -963,6 +964,162 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .where(eq(heartbeatRuns.id, todoRunId))
       .then((rows) => rows[0] ?? null);
     expect(todoRun?.status).not.toBe("queued");
+  });
+
+  it("counts a running run with a stale useful-action stamp but fresh output toward the slot gate (BLO-20775)", async () => {
+    // BLO-20775. Scope honestly: a CHARACTERIZATION test of the slot gate's
+    // selection expression, not a reproduction of a production incident. It
+    // manufactures the divergent stamp state directly, because no production
+    // writer produces it on a running row — flushOutputProgress writes
+    // lastOutputAt and lastUsefulActionAt to the same value in one .set() (pinned
+    // by the coupling guard in heartbeat-process-recovery.test.ts). The old gate
+    // coalesced the stamps by priority (lastUsefulActionAt ? ... : lastOutputAt
+    // ? ...), which assumed an ordering nothing enforces; this takes the newest.
+    //
+    // The state IS real on terminal rows, and — unlike the external-lifecycle
+    // reaper path — it genuinely reaches this gate: listRunningRunsForAgent filters
+    // on agentId + status with no adapter predicate, so it returns sessioned-local
+    // rows, and a terminal local row is resurrected to `running` by the unguarded
+    // setRunStatus(id, "running") in reapOrphanedRuns (gated on processPidAlive →
+    // isTrackedLocalChildProcessAdapter, which is why codex_local below is the
+    // right fixture and not an arbitrary choice). Such a row genuinely occupies a
+    // slot, so it must count — otherwise the agent's only slot looks free and a
+    // second run dispatches on top of a live one.
+    //
+    // This is the exact inverse of the Fix #1 test above: there a genuinely silent
+    // run must NOT hold a slot; here a live one MUST. Both directions are needed —
+    // a max-based gate that simply never excluded anything would pass this test
+    // and fail the one above.
+    //
+    // codex_local for the same reason as above: reapOrphanedRuns is not called
+    // inside startNextQueuedRunForAgent for non-external-lifecycle adapters, so
+    // the running row stays untouched and isolates the slot-gate logic.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const liveIssueId = randomUUID();
+    const queuedIssueId = randomUUID();
+    const issuePrefix = `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "LiveOutputCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "LiveOutputAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: liveIssueId,
+        companyId,
+        title: "Long-running live work",
+        status: "in_progress",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: new Date(),
+      },
+      {
+        id: queuedIssueId,
+        companyId,
+        title: "Queued contender",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+
+    // Useful-action stamp 60 min old (well past EXTERNAL_LIFECYCLE_STALE_MS =
+    // 15 min), output streaming right now. Constructed directly — see the scope
+    // note above for why no production writer emits this on a running row.
+    const lastUsefulActionAt = new Date(Date.now() - 60 * 60 * 1000);
+    const freshOutputAt = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "heartbeat",
+      triggerDetail: "timer",
+      status: "running",
+      contextSnapshot: { issueId: liveIssueId, wakeReason: "heartbeat_timer" },
+      startedAt: lastUsefulActionAt,
+      lastUsefulActionAt,
+      lastOutputAt: freshOutputAt,
+      createdAt: lastUsefulActionAt,
+      updatedAt: freshOutputAt,
+    });
+
+    const queuedWakeId = randomUUID();
+    const queuedRunId = randomUUID();
+    const queuedTime = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: queuedIssueId },
+      status: "queued",
+      runId: queuedRunId,
+      requestedAt: queuedTime,
+      updatedAt: queuedTime,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeId,
+      contextSnapshot: { issueId: queuedIssueId, wakeReason: "issue_assigned" },
+      createdAt: queuedTime,
+      updatedAt: queuedTime,
+    });
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    // REGRESSION GUARD (BLO-20775): the live run holds the agent's single slot,
+    // so nothing must dispatch. Under the old priority chain this asserted the
+    // opposite behaviour — the queued run dispatched onto an occupied slot.
+    expect(dispatchedRunIds).toHaveLength(0);
+
+    const queuedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedRun?.status).toBe("queued");
   });
 
   it("suppresses a queued same-issue retry even when the running row is stale", async () => {
