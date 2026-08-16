@@ -1,4 +1,4 @@
-name: Master health
+name: Master general tests
 
 # BLO-27871: `master`'s head is never tested by anything.
 #
@@ -21,6 +21,17 @@ name: Master health
 # queue so nothing can land outside it — is a repo-admin ruleset change and is
 # tracked separately; the two are complementary, and prevention deliberately
 # removes a manual drain valve the operator may want to keep.
+#
+# SCOPE — read this before assuming a green run means master is healthy.
+# This replicates ONLY pr.yml's `general_tests` matrix, not its full 12-job
+# set. A commit that lands outside the queue and breaks typecheck, the build,
+# the Helm chart, or e2e is still not caught here. That asymmetry is
+# deliberate and cost-driven, not an oversight: 36.5% of landings bypass the
+# queue (66 of 181 over the 7 days to 2026-08-16), so this already adds ~9.4
+# full suite runs per day to a pool with documented eviction pressure
+# (BLO-20369). Widening it to the full job set would multiply that. The name
+# says "general tests" rather than "health" so the promise matches the
+# coverage. Revisit if a future master-red lands outside general_tests.
 
 on:
   push:
@@ -37,7 +48,11 @@ concurrency:
   # the same pool. Only the newest master head is worth testing: it is the one
   # every subsequent PR will be rebased onto, and a failure introduced by an
   # earlier commit in the batch still reproduces on the final head.
-  group: master-health-${{ github.ref }}
+  #
+  # Keyed on event_name too: `github.ref` is `refs/heads/master` for both push
+  # and workflow_dispatch, so without it an operator's "has master recovered?"
+  # dispatch could be cancelled by an unrelated push, or cancel one.
+  group: master-health-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -51,6 +66,10 @@ jobs:
     # arc-light, never arc-merge-queue: this workflow must not contend with
     # merge_group builds for the queue pool, or detection would come at the
     # cost of merge latency — the thing it exists to protect.
+    #
+    # `gh` on arc-light has in-repo precedent: commitperclip-review.yml runs
+    # `gh api` on arc-light with GH_TOKEN: ${{ github.token }} (its job at
+    # `runs-on: arc-light`, querying `repos/.../pulls/<n>`).
     runs-on: arc-light
     timeout-minutes: 5
     outputs:
@@ -105,8 +124,18 @@ jobs:
   general_tests:
     name: Master tests (${{ matrix.group_label }})
     needs: [gate]
+    # `always()` is load-bearing, not decoration. Without a status-check
+    # function the `if:` carries an implicit `success()` on `needs`, so a gate
+    # JOB failure — ARC pod unavailable, the 5-minute timeout firing on a
+    # network stall, any runner-level fault — would SKIP the suite and leave
+    # the commit untested. The in-step fallback below only covers `gh api`
+    # exiting non-zero inside a step that is actually running. With the gate
+    # failed, `needs.gate.outputs.pretested` is empty, `'' != '1'` is true, and
+    # the suite runs — which is the fail-closed behaviour this workflow
+    # promises. Nothing retries a skipped run: the next push supersedes it via
+    # cancel-in-progress.
     # workflow_dispatch is an explicit operator request, so it always runs.
-    if: needs.gate.outputs.pretested != '1' || github.event_name == 'workflow_dispatch'
+    if: always() && (needs.gate.outputs.pretested != '1' || github.event_name == 'workflow_dispatch')
     runs-on: arc-paperclip-general
     timeout-minutes: 90
     strategy:
