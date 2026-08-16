@@ -2994,7 +2994,12 @@ describe("agent issue mutation checkout ownership", () => {
       peerAgentId,
       ["blocked"],
       actor.runId,
-      { allowSourceScopedRecoveryOwner: false, recoveryActionId: null, recoveryActionStatus: null },
+      {
+        allowSourceScopedRecoveryOwner: false,
+        allowExecutionStageParticipantClaim: false,
+        recoveryActionId: null,
+        recoveryActionStatus: null,
+      },
     );
   });
 
@@ -5680,7 +5685,12 @@ describe("agent issue mutation checkout ownership", () => {
         peerAgentId,
         ["blocked"],
         actor.runId,
-        { allowSourceScopedRecoveryOwner: false, recoveryActionId: null, recoveryActionStatus: null },
+        {
+          allowSourceScopedRecoveryOwner: false,
+          allowExecutionStageParticipantClaim: false,
+          recoveryActionId: null,
+          recoveryActionStatus: null,
+        },
       );
     });
 
