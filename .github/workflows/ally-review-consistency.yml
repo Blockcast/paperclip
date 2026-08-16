@@ -2,7 +2,8 @@ name: Ally Review Consistency Guard
 
 # Asserts that every open PR carries at most one operative Ally review at its
 # current head, except for the exact current-head App/User approval pair
-# required by protected merge,
+# required by protected merge — which must carry two *distinct* bodies, since
+# one body under both credentials is a single verdict posted twice (BLO-22916),
 # that no standing APPROVED masks a Critical/Important finding, and that a
 # review's body-attested head matches the commit GitHub recorded it against.
 # See scripts/check-ally-review-consistency.mjs and BLO-19778 for the incident
