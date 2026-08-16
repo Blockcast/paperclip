@@ -196,10 +196,12 @@ const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
   action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
-  // Withdrawal is the only action here an agent is authorized to take, and its
-  // route requires a non-empty reason. Accept a dedicated `reason` so callers do
-  // not have to learn that `decisionNote` is overloaded, but keep reading
-  // `decisionNote` as a fallback for callers that already do.
+  // `withdraw` and `resubmit` are both requester-scoped; only approve/reject/
+  // requestRevision call assertBoard. The withdraw route additionally requires a
+  // non-empty reason, so accept a dedicated `reason` rather than making callers
+  // learn that `decisionNote` is overloaded. `decisionNote` is still read as a
+  // fallback, and on the non-withdraw path `reason` folds back into
+  // `decisionNote` so a note can never be silently dropped either way.
   reason: z.string().optional(),
   payloadJson: z.string().optional(),
 });
@@ -734,7 +736,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, resubmit, or withdraw an approval. `approve`, `reject`, and `requestRevision` are board-only — an agent calling them gets `403 Board access required`. `withdraw` is the action an agent has: the requesting agent may rescind its own ask, so a card that went moot is yours to clear rather than something to ask a human to close. You can only withdraw cards you filed, and only while they are still pending; withdrawing another agent's card is refused (403), as is withdrawing one already decided (409). `withdraw` requires a non-empty `reason` (or `decisionNote`) — the audit trail relies on it to tell a moot request apart from an abandoned one.",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. `approve`, `reject`, and `requestRevision` are board-only — an agent calling them gets `403 Board access required`. `withdraw` and `resubmit` are **both requester-scoped**: the requesting agent may rescind its own ask or resubmit it, so a card that went moot is yours to clear rather than something to ask a human to close, and a card the board sent back as `revision_requested` is yours to resubmit. You can only act on cards you filed, and only while they are still pending; acting on another agent's card is refused (403), as is acting on one already decided (409). `withdraw` requires a non-empty `reason` (or `decisionNote`) — the audit trail relies on it to tell a moot request apart from an abandoned one. Note one destructive side effect: withdrawing a `hire_agent` approval also terminates the pending agent it would have created (it would otherwise be stranded frozen with no approval left to decide it).",
       approvalDecisionSchema,
       async ({ approvalId, action, decisionNote, reason, payloadJson }) => {
         if (action === "withdraw") {
@@ -769,7 +771,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
             ? replacementPayload === undefined
               ? {}
               : { payload: replacementPayload }
-            : { decisionNote };
+            : { decisionNote: decisionNote ?? reason };
 
         return client.requestJson("POST", path, { body });
       },
