@@ -152,6 +152,13 @@ function recoveryActionBoundsAtCreation(now: Date): { maxAttempts: number; timeo
 // reset and is routinely days away; letting that horizon set the lock lifetime
 // took the issue out of service for the whole park, for its own assignee.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+// BLO-22060: sentinel return from the sweep transaction meaning "the lock moved
+// between the pre-transaction scan and the FOR UPDATE revalidation, so this pass
+// declined to clear it". Distinct from `null`, which means "revalidated and the
+// lock is legitimately not stale". Only the former can starve the clear when a
+// renewal keeps landing on the sweep's cadence, so only the former is counted
+// and logged.
+const LOCK_CHANGED_UNDER_SWEEP: unique symbol = Symbol("staleIssueLockSweep.lockChangedUnderSweep");
 export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
 const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
 // Enqueue normally finishes in seconds; an hour-old reservation has lost its owning process.
@@ -9449,6 +9456,15 @@ export function recoveryService(
     const result = {
       cleared: 0,
       issueIds: [] as string[],
+      // BLO-22060: the sweep revalidates every candidate under FOR UPDATE and
+      // bails out silently when the lock moved between the scan and the
+      // transaction. That is correct — but it was also invisible, so a renewal
+      // landing repeatedly on the sweep's own cadence (30s) could starve the
+      // clear indefinitely and look identical to "nothing was stale". Count the
+      // bailouts so the starvation is observable in the sweep result and in the
+      // log line below.
+      skippedByConcurrentLockChange: 0,
+      skippedByConcurrentLockChangeIssueIds: [] as string[],
     };
 
     const candidates = await db
@@ -9663,10 +9679,15 @@ export function recoveryService(
           .then((rows) => rows[0] ?? null);
 
         if (!currentIssue) return null;
-        if (currentIssue.checkoutRunId !== issue.checkoutRunId) return null;
-        if (currentIssue.executionRunId !== issue.executionRunId) return null;
+        // BLO-22060: concurrent-bump bailouts — the lock moved between the
+        // pre-transaction scan and this revalidation. Report them distinctly
+        // from "revalidated and found not stale" (plain null below) so a lock
+        // that keeps being renewed under the sweep is visible rather than
+        // indistinguishable from a quiet pass.
+        if (currentIssue.checkoutRunId !== issue.checkoutRunId) return LOCK_CHANGED_UNDER_SWEEP;
+        if (currentIssue.executionRunId !== issue.executionRunId) return LOCK_CHANGED_UNDER_SWEEP;
         if ((currentIssue.executionLockedAt?.getTime() ?? null) !== (issue.executionLockedAt?.getTime() ?? null)) {
-          return null;
+          return LOCK_CHANGED_UNDER_SWEEP;
         }
 
         const currentReferencedRunIds = [
@@ -9797,7 +9818,26 @@ export function recoveryService(
           })
           .then((rows) => rows[0] ?? null);
 
-        if (!updated) return null;
+        if (!updated) return LOCK_CHANGED_UNDER_SWEEP;
+
+        // BLO-22060: the release must outlive the issue row we just nulled.
+        // The run itself is deliberately left alive (a `scheduled_retry` park
+        // still has to fire at its deadline, and a `queued` run must stay
+        // claimable), and enqueueWakeup's legacy-run fallback would otherwise
+        // re-adopt that same run and re-stamp executionLockedAt, restarting the
+        // 6h clock on every wake. Recording the release on the run is what lets
+        // adoption decline. Counted for whatever status held the lock — the
+        // fallback can select `queued`, `running` and `scheduled_retry` alike,
+        // and a released park that is later promoted reaches it as `queued`.
+        if (currentIssue.executionRunId) {
+          await tx
+            .update(heartbeatRuns)
+            .set({
+              issueLockReleaseCount: sql`${heartbeatRuns.issueLockReleaseCount} + 1`,
+              updatedAt: clearedAt,
+            })
+            .where(eq(heartbeatRuns.id, currentIssue.executionRunId));
+        }
 
         // BLO-21621: clearing a stale pre-claim lock is the only positive
         // evidence that a queued row previously owned, and then lost, this
@@ -10082,6 +10122,21 @@ export function recoveryService(
         }
       });
 
+      if (sweepOutcome === LOCK_CHANGED_UNDER_SWEEP) {
+        result.skippedByConcurrentLockChange += 1;
+        result.skippedByConcurrentLockChangeIssueIds.push(issue.id);
+        logger.warn(
+          {
+            issueId: issue.id,
+            companyId: issue.companyId,
+            executionRunId: issue.executionRunId,
+            checkoutRunId: issue.checkoutRunId,
+            scannedExecutionLockedAt: issue.executionLockedAt?.toISOString() ?? null,
+          },
+          "stale issue lock sweep skipped: lock changed between scan and clear",
+        );
+        continue;
+      }
       if (!sweepOutcome) continue;
       const { updated } = sweepOutcome;
 
