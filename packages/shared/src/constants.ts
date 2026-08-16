@@ -1364,6 +1364,7 @@ export const PLUGIN_CAPABILITIES = [
   "api.routes.register",
   "http.outbound",
   "secrets.read-ref",
+  "secrets.verify-ref",
   "secrets.list",
   "secrets.manage",
   "environment.drivers.register",

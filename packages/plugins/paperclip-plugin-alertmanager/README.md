@@ -54,8 +54,8 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | Key                  | Type    | Required | Notes |
 |----------------------|---------|----------|-------|
 | `defaultCompanyId`   | string  | no       | Company that receives alerts when no routing label is set. Defaults to the delivering company; must match it when set. |
-| `webhookToken`       | string  | for accepted deliveries | Static bearer token. AM sends `Authorization: Bearer <token>`. |
-| `webhookTokenRef`    | secret-ref | no       | Disabled in the worker webhook path until the host can verify secret refs before invoking public plugin code. Configured refs fail closed. |
+| `webhookToken`       | string  | no       | Inline static bearer token for development. AM sends `Authorization: Bearer <token>`. |
+| `webhookTokenRef`    | secret-ref | for production deliveries | Preferred production credential. The host verifies it without returning the value to the worker or consuming secret-resolution quota. Must point at a secret Paperclip wrote itself — see Security below. |
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
@@ -86,7 +86,7 @@ route:
 
 ```yaml
 defaultCompanyId: 11111111-1111-1111-1111-111111111111
-webhookToken: "<same bearer token Alertmanager sends>"
+webhookTokenRef: "<secret reference for the bearer token Alertmanager sends>"
 acceptOnlyLabels:
   paperclip: "true"
 severityToPriority:
@@ -246,21 +246,34 @@ failure than an inherited mute.
 
 ## Security
 
-- **Always set `webhookToken`.** Without a token the
+- **Always set `webhookTokenRef` in production** (or `webhookToken` for local
+  development). Without a token the
   webhook endpoint rejects every request — there is no "open" mode.
-- **Do not configure `webhookTokenRef` on this build.** Secret refs require a
-  host-side verifier so invalid public requests cannot spend shared
-  secret-resolution capacity before authentication. Until that host path exists,
-  configured refs fail closed and deliveries are retried instead of accepted.
+- **`webhookTokenRef` must point at a secret Paperclip wrote itself.**
+  Authentication compares digests host-side, so it needs a digest of the secret
+  VALUE. Paperclip stores one for secrets it created (`local_encrypted`, and
+  provider-managed versions). A secret IMPORTED as an external provider
+  reference — for example an existing AWS Secrets Manager ARN registered by
+  reference — stores a fingerprint of the *reference* instead, and cannot be
+  verified. Configure one of those and every delivery fails permanently:
+  `onHealth()` reports `degraded` naming the company, and the worker logs
+  `points at an external provider reference, which cannot be verified
+  host-side`. Create the token as a Paperclip secret rather than importing it.
+- **Anonymous floods are free, wrong-token floods are cheap.** A request with no
+  `Authorization: Bearer` header is rejected before any host call, and
+  verification is metered on its own budget rather than the secret-resolution
+  budget — so neither can starve genuine deliveries of the resolution quota they
+  need (BLO-20706, BLO-20738).
 - **IP allowlist at ingress** as defense in depth. Alertmanager pods reschedule on
   restart and their pod IP changes; allowlist the namespace's pod CIDR
   rather than per-pod IPs.
 - **mTLS is the V2 upgrade path** for stronger mutual auth (spec §11 Q4).
   Static bearer is V1 because it's the lowest-friction way to get rolling.
-- The bearer token is read from the delivering company's config **per
-  delivery** and is never written to plugin state or logs. A config update takes
-  effect on the next request, and a restart can never leave the worker holding a
-  stale (or absent) token.
+- The bearer credential config is read for the delivering company **per
+  delivery** and is never written to plugin state or logs. Secret-ref values
+  remain in the host process; the worker receives only the comparison result.
+  A config update takes effect on the next request, and a restart can never leave
+  the worker holding a stale (or absent) token.
 
 ### Config is resolved per delivery, per company
 

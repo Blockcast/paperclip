@@ -1394,6 +1394,11 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         return secretsHandler.resolve({ ...params, companyId });
       },
+      async verify(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return secretsHandler.verify({ ...params, companyId });
+      },
       async list(params) {
         const svc = secretService(db);
         return svc.list(params.companyId);

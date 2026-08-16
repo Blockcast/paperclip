@@ -15,6 +15,11 @@ import {
   handleWebhook,
   verifyBearerToken,
 } from "../webhook-handler.js";
+import {
+  CompanyScopeUnavailableError,
+  authenticateWebhook,
+  resolveCompanyScope,
+} from "../config-scope.js";
 import { getCredentialHealth, resetCredentialHealth } from "../credential-health.js";
 import {
   BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
@@ -120,6 +125,8 @@ interface MockClients {
   events: { emit: ReturnType<typeof vi.fn> };
   metrics: { write: ReturnType<typeof vi.fn> };
   activity: { log: ReturnType<typeof vi.fn> };
+  secrets: { resolve: ReturnType<typeof vi.fn>; verify: ReturnType<typeof vi.fn> };
+  config: { get: ReturnType<typeof vi.fn> };
   logger: {
     info: ReturnType<typeof vi.fn>;
     warn: ReturnType<typeof vi.fn>;
@@ -155,6 +162,19 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
     events: { emit: vi.fn(async () => {}) },
     metrics: { write: vi.fn(async () => {}) },
     activity: { log: vi.fn(async () => {}) },
+    secrets: {
+      resolve: vi.fn(async () => TOKEN),
+      verify: vi.fn(async (_ref, presented) => presented === TOKEN),
+    },
+    // Company-scoped config RPC. `resolveCompanyScope` is the only credential
+    // -health recorder now that `handleWebhook` takes a verdict rather than a
+    // credential, so the health tests below drive this rather than the handler.
+    config: {
+      get: vi.fn(async (companyId?: string) => ({
+        ...baseConfig(),
+        defaultCompanyId: companyId ?? "company-1",
+      })),
+    },
     logger: {
       info: vi.fn(),
       warn: vi.fn(),
@@ -210,11 +230,59 @@ describe("verifyBearerToken", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleWebhook — auth", () => {
+  it("uses host verification for secret refs without resolving the secret", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ webhookToken: undefined, webhookTokenRef: "secret-ref" });
+    const input = baseInput();
+
+    const authenticated = await authenticateWebhook(ctx, config, input);
+    await handleWebhook(ctx, config, authenticated, input);
+
+    expect(mocks.secrets.verify).toHaveBeenCalledWith("secret-ref", TOKEN, {
+      companyId: "company-1",
+      configPath: "webhookTokenRef",
+    });
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a missing bearer before calling host verification", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ webhookToken: undefined, webhookTokenRef: "secret-ref" });
+
+    await expect(authenticateWebhook(ctx, config, baseInput({ headers: {} }))).resolves.toBe(false);
+    expect(mocks.secrets.verify).not.toHaveBeenCalled();
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
+  });
+
+  it("prefers a secret ref over a stale inline fallback", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.secrets.verify.mockResolvedValueOnce(false);
+    const config = baseConfig({ webhookToken: TOKEN, webhookTokenRef: "secret-ref" });
+
+    await expect(authenticateWebhook(ctx, config, baseInput())).resolves.toBe(false);
+    expect(mocks.secrets.verify).toHaveBeenCalledTimes(1);
+  });
+
+  // The inline-token branch (config-scope.ts:147) authenticates every tenant
+  // that has not moved to a ref, so it is exercised end to end here rather
+  // than only implied by `verifyBearerToken`'s unit tests above.
+  it("authenticates an inline token without consulting the host", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+
+    await expect(authenticateWebhook(ctx, config, baseInput())).resolves.toBe(true);
+    expect(mocks.secrets.verify).not.toHaveBeenCalled();
+    expect(mocks.secrets.resolve).not.toHaveBeenCalled();
+  });
+
   it("throws WebhookUnauthorizedError when bearer token is missing", async () => {
     const { ctx } = mkCtx();
     const config = baseConfig();
     const input = baseInput({ headers: {} });
-    await expect(handleWebhook(ctx, config, TOKEN, input)).rejects.toBeInstanceOf(
+    const authenticated = await authenticateWebhook(ctx, config, input);
+    expect(authenticated).toBe(false);
+    await expect(handleWebhook(ctx, config, authenticated, input)).rejects.toBeInstanceOf(
       WebhookUnauthorizedError,
     );
   });
@@ -223,7 +291,9 @@ describe("handleWebhook — auth", () => {
     const { ctx } = mkCtx();
     const config = baseConfig();
     const input = baseInput({ headers: { authorization: "Bearer nope" } });
-    await expect(handleWebhook(ctx, config, TOKEN, input)).rejects.toBeInstanceOf(
+    const authenticated = await authenticateWebhook(ctx, config, input);
+    expect(authenticated).toBe(false);
+    await expect(handleWebhook(ctx, config, authenticated, input)).rejects.toBeInstanceOf(
       WebhookUnauthorizedError,
     );
   });
@@ -231,30 +301,41 @@ describe("handleWebhook — auth", () => {
   it("accepts a correct bearer token and processes the payload", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig();
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    const input = baseInput();
+    const authenticated = await authenticateWebhook(ctx, config, input);
+    expect(authenticated).toBe(true);
+    await handleWebhook(ctx, config, authenticated, input);
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
   });
 });
 
 // ---------------------------------------------------------------------------
 // BLO-20572 — credential-resolution health, derived from delivery outcomes
+//
+// Driven through `resolveCompanyScope`, which is the only recorder on the
+// delivery path. `handleWebhook` deliberately records nothing: it is handed an
+// authentication verdict rather than a credential (BLO-20738), so it cannot
+// tell "no credential configured" from "wrong bearer presented" — and letting
+// a wrong bearer mark a tenant degraded is the conflation this surface exists
+// to avoid. The "presented wrong" case below pins exactly that.
 // ---------------------------------------------------------------------------
 
-describe("handleWebhook — credential health (BLO-20572)", () => {
+describe("credential health (BLO-20572)", () => {
+  // A stored config for `companyId` that carries neither credential shape.
+  const configWithoutCredential = (companyId: string) => ({
+    ...baseConfig({ webhookToken: undefined }),
+    defaultCompanyId: companyId,
+  });
+
   it("reports ok when no delivery has happened yet", () => {
     expect(getCredentialHealth()).toEqual({ status: "ok" });
   });
 
   it("reports degraded, naming the company, after a delivery resolves no token", async () => {
-    const { ctx } = mkCtx();
-    const config = baseConfig();
-    const input = baseInput({ companyId: "company-no-token", headers: {} });
+    const { ctx, mocks } = mkCtx();
+    mocks.config.get.mockResolvedValueOnce(configWithoutCredential("company-no-token"));
 
-    // resolvedToken is null: this company's config has no credential at all,
-    // same as what config-scope.ts's resolveWebhookToken() returns.
-    await expect(handleWebhook(ctx, config, null, input)).rejects.toBeInstanceOf(
-      WebhookUnauthorizedError,
-    );
+    await resolveCompanyScope(ctx, "company-no-token");
 
     const health = getCredentialHealth();
     expect(health.status).toBe("degraded");
@@ -262,56 +343,85 @@ describe("handleWebhook — credential health (BLO-20572)", () => {
     expect(health.details).toEqual({ companyIds: ["company-no-token"] });
   });
 
+  it("reports degraded when the company has no stored config at all", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.config.get.mockResolvedValueOnce({});
+
+    await expect(resolveCompanyScope(ctx, "company-unconfigured")).rejects.toBeInstanceOf(
+      CompanyScopeUnavailableError,
+    );
+
+    expect(getCredentialHealth().details).toEqual({ companyIds: ["company-unconfigured"] });
+  });
+
   it("does not flag a company whose token is configured but was presented wrong", async () => {
     const { ctx } = mkCtx();
-    const config = baseConfig();
     const input = baseInput({
       companyId: "company-real-token",
       headers: { authorization: "Bearer wrong-value" },
     });
 
-    // resolvedToken is non-null: the company DOES have a credential
-    // configured. This request just presented the wrong one — an auth
-    // failure, not a misconfiguration, and must not report unhealthy.
-    await expect(handleWebhook(ctx, config, TOKEN, input)).rejects.toBeInstanceOf(
+    const scope = await resolveCompanyScope(ctx, "company-real-token");
+    const authenticated = await authenticateWebhook(ctx, scope!.config, input);
+    expect(authenticated).toBe(false);
+    await expect(handleWebhook(ctx, scope!.config, authenticated, input)).rejects.toBeInstanceOf(
       WebhookUnauthorizedError,
     );
 
+    // The company DOES have a credential configured; this request just
+    // presented the wrong one. That is an auth failure, not a
+    // misconfiguration, and must not report unhealthy.
+    expect(getCredentialHealth()).toEqual({ status: "ok" });
+  });
+
+  it("treats a webhookTokenRef company as credentialed even when the bearer is wrong", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.config.get.mockResolvedValueOnce({
+      ...baseConfig({ webhookToken: undefined, webhookTokenRef: "secret-ref" }),
+      defaultCompanyId: "company-ref",
+    });
+    const input = baseInput({
+      companyId: "company-ref",
+      headers: { authorization: "Bearer wrong-value" },
+    });
+
+    const scope = await resolveCompanyScope(ctx, "company-ref");
+    await expect(authenticateWebhook(ctx, scope!.config, input)).resolves.toBe(false);
+
+    // A ref-configured tenant resolves no inline token by design, so recording
+    // the resolved token would report every such tenant credential-less while
+    // its deliveries authenticate perfectly.
     expect(getCredentialHealth()).toEqual({ status: "ok" });
   });
 
   it("clears once a later delivery for the same company resolves a credential — no restart needed", async () => {
-    const { ctx } = mkCtx();
-    const config = baseConfig();
+    const { ctx, mocks } = mkCtx();
+    mocks.config.get.mockResolvedValueOnce(configWithoutCredential("company-1"));
 
-    await expect(
-      handleWebhook(ctx, config, null, baseInput({ companyId: "company-1", headers: {} })),
-    ).rejects.toBeInstanceOf(WebhookUnauthorizedError);
+    await resolveCompanyScope(ctx, "company-1");
     expect(getCredentialHealth().status).toBe("degraded");
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ companyId: "company-1" }));
+    await resolveCompanyScope(ctx, "company-1");
 
     expect(getCredentialHealth()).toEqual({ status: "ok" });
   });
 
   it("tracks multiple companies independently and never leaks a token value", async () => {
-    const { ctx } = mkCtx();
-    const config = baseConfig();
+    const { ctx, mocks } = mkCtx();
+    mocks.config.get
+      .mockResolvedValueOnce(configWithoutCredential("company-a"))
+      .mockResolvedValueOnce(configWithoutCredential("company-b"));
 
-    await expect(
-      handleWebhook(ctx, config, null, baseInput({ companyId: "company-a", headers: {} })),
-    ).rejects.toBeInstanceOf(WebhookUnauthorizedError);
-    await expect(
-      handleWebhook(ctx, config, null, baseInput({ companyId: "company-b", headers: {} })),
-    ).rejects.toBeInstanceOf(WebhookUnauthorizedError);
-    await handleWebhook(ctx, config, TOKEN, baseInput({ companyId: "company-c" }));
+    await resolveCompanyScope(ctx, "company-a");
+    await resolveCompanyScope(ctx, "company-b");
+    await resolveCompanyScope(ctx, "company-c");
 
     const health = getCredentialHealth();
     expect(health.details).toEqual({ companyIds: ["company-a", "company-b"] });
     expect(JSON.stringify(health)).not.toContain(TOKEN);
 
     // company-a recovers; company-b remains flagged.
-    await handleWebhook(ctx, config, TOKEN, baseInput({ companyId: "company-a" }));
+    await resolveCompanyScope(ctx, "company-a");
     expect(getCredentialHealth().details).toEqual({ companyIds: ["company-b"] });
   });
 });
@@ -321,7 +431,7 @@ describe("handleWebhook — schema validation", () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig();
     const input = baseInput({ parsedBody: { not: "an alertmanager payload" } });
-    await handleWebhook(ctx, config, TOKEN, input);
+    await handleWebhook(ctx, config, true, input);
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.webhook.malformed",
@@ -337,7 +447,7 @@ describe("handleWebhook — schema validation", () => {
       parsedBody: envelope,
       rawBody: JSON.stringify(envelope),
     });
-    await handleWebhook(ctx, config, TOKEN, input);
+    await handleWebhook(ctx, config, true, input);
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.webhook.unsupported_version",
@@ -350,7 +460,7 @@ describe("handleWebhook — schema validation", () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig();
     const input = baseInput({ endpointKey: "something-else" });
-    await handleWebhook(ctx, config, TOKEN, input);
+    await handleWebhook(ctx, config, true, input);
     expect(mocks.issues.create).not.toHaveBeenCalled();
   });
 });
@@ -366,7 +476,7 @@ describe("handleWebhook — firing first time", () => {
       name: "Alice",
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     const createArgs = mocks.issues.create.mock.calls[0][0];
@@ -419,7 +529,7 @@ describe("handleWebhook — firing first time", () => {
   it("creates the issue unassigned when no owner resolves", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
@@ -437,7 +547,7 @@ describe("handleWebhook — firing first time", () => {
       annotations: {},
     });
     const envelope = baseEnvelope({ alerts: [alert] });
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.billingCode).toBe("cost-ctr-7");
   });
@@ -468,7 +578,7 @@ describe("handleWebhook — firing first time", () => {
     });
     const envelope = baseEnvelope({ alerts: [alert] });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.projectId).toBe(BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID);
@@ -515,7 +625,7 @@ describe("handleWebhook — firing first time", () => {
       });
       const envelope = baseEnvelope({ alerts: [alert] });
 
-      await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+      await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
       const createArgs = mocks.issues.create.mock.calls[0][0];
       expect(createArgs.projectId).toBe(BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID);
@@ -535,7 +645,7 @@ describe("handleWebhook — firing first time", () => {
       name: "Alice",
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.projectId).toBeUndefined();
@@ -570,7 +680,7 @@ describe("handleWebhook — firing first time", () => {
     });
     const envelope = baseEnvelope({ alerts: [alert] });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.projectId).toBe("project-override");
@@ -601,7 +711,7 @@ describe("handleWebhook — firing first time", () => {
     });
     const envelope = baseEnvelope({ alerts: [alert] });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.projectId).toBe(BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID);
@@ -630,7 +740,7 @@ describe("handleWebhook — dedup on re-fire", () => {
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "in_progress" });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     // It should bump the description but not change status
@@ -665,7 +775,7 @@ describe("handleWebhook — dedup on re-fire", () => {
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "done" });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
@@ -696,7 +806,7 @@ describe("handleWebhook — dedup on re-fire", () => {
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.metrics.write).not.toHaveBeenCalledWith(
@@ -975,7 +1085,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.listComments).toHaveBeenCalledWith(
       "issue-existing",
@@ -1025,7 +1135,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
     expect(mocks.state.set).toHaveBeenCalledWith(
@@ -1067,7 +1177,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
@@ -1105,7 +1215,7 @@ describe("handleWebhook — resolved", () => {
     });
 
     await expect(
-      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
     ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
     expect(mocks.state.set).not.toHaveBeenCalledWith(
       expect.anything(),
@@ -1142,7 +1252,7 @@ describe("handleWebhook — resolved", () => {
     });
 
     await expect(
-      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
     ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
     expect(mocks.issues.listComments).toHaveBeenCalledWith(
       "issue-existing",
@@ -1181,7 +1291,7 @@ describe("handleWebhook — resolved", () => {
     });
 
     await expect(
-      handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope })),
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
     ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
     expect(mocks.issues.createComment).toHaveBeenCalledWith(
       "issue-existing",
@@ -1227,7 +1337,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
@@ -1259,7 +1369,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.list).toHaveBeenCalledWith({
       companyId: "company-1",
@@ -1314,7 +1424,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.events.emit).not.toHaveBeenCalled();
@@ -1332,7 +1442,7 @@ describe("handleWebhook — resolved", () => {
       alerts: [resolvedAlert],
     });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
@@ -1346,7 +1456,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ acceptOnlyLabels: { paperclip: "true" } });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -1368,7 +1478,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
     });
     const envelope = baseEnvelope({ alerts: [alert] });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
 
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
   });
@@ -1383,7 +1493,7 @@ describe("handleWebhook — severity → priority", () => {
     });
     const envelope = baseEnvelope({ alerts: [alert] });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("high");
   });
@@ -1393,7 +1503,7 @@ describe("handleWebhook — severity → priority", () => {
     const config = baseConfig({
       severityToPriority: { critical: "low" },
     });
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("low");
   });
@@ -1405,7 +1515,7 @@ describe("handleWebhook — severity → priority", () => {
       labels: { alertname: "X", severity: "page" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("medium");
   });
@@ -1428,7 +1538,7 @@ describe("handleWebhook — observability link rendering", () => {
       },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const desc = mocks.issues.create.mock.calls[0][0].description as string;
     expect(desc).toContain("[Dashboard](https://grafana/d/x)");
     expect(desc).toContain("[Tempo trace](https://grafana/t)");
@@ -1458,7 +1568,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     expect(mocks.users.findByEmail).toHaveBeenCalledWith("bob@example.com");
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBe("user-bob");
@@ -1472,7 +1582,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       email: "alice@example.com",
       name: "Alice",
     });
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
     expect(mocks.users.findByEmail).toHaveBeenCalledWith("alice@example.com");
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBe("user-alice");
@@ -1491,7 +1601,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       annotations: { paperclip_assignee_email: "carol@example.com" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBe("user-carol");
   });
@@ -1504,7 +1614,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       annotations: {},
     });
     const envelope = baseEnvelope({ alerts: [alert] });
-    await handleWebhook(ctx, config, TOKEN, baseInput({ parsedBody: envelope }));
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     expect(mocks.users.findByEmail).not.toHaveBeenCalled();
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
@@ -1547,7 +1657,7 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     await handleWebhook(
       ctx,
       baseConfig({ defaultCompanyId: "company-A" }),
-      TOKEN,
+      true,
       baseInput({ companyId: "company-A", parsedBody: envelope }),
     );
 
@@ -1555,7 +1665,7 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     await handleWebhook(
       ctx,
       baseConfig({ defaultCompanyId: "company-B" }),
-      TOKEN,
+      true,
       baseInput({ companyId: "company-B", parsedBody: envelope }),
     );
 
@@ -1583,7 +1693,7 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     await handleWebhook(
       ctx,
       baseConfig({ defaultCompanyId: "company-A" }),
-      TOKEN,
+      true,
       baseInput({ companyId: "company-A", parsedBody: baseEnvelope({ alerts: [alert] }) }),
     );
 
@@ -1602,7 +1712,7 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     await handleWebhook(
       ctx,
       baseConfig({ defaultCompanyId: "company-B", autoCloseOnResolve: true }),
-      TOKEN,
+      true,
       baseInput({ companyId: "company-B", parsedBody: resolvedEnvelope }),
     );
 
@@ -1628,7 +1738,7 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     store.set(`instance/-/alert:${alert.fingerprint}`, legacy);
     mocks.issues.get.mockImplementation(async () => ({ id: "issue-legacy", status: "todo" }));
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     // Treated as a re-fire of the tracked issue, NOT as a brand-new alert.
     // Without the read-through, every alert firing across the upgrade would
@@ -1655,7 +1765,7 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     };
     store.set(`instance/-/alert:${alert.fingerprint}`, legacy);
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     // company-1 files its own issue and never touches company-OTHER's.
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
@@ -1692,7 +1802,7 @@ describe("handleWebhook — delivery acknowledgement", () => {
     );
 
     await expect(
-      handleWebhook(ctx, baseConfig(), TOKEN, baseInput()),
+      handleWebhook(ctx, baseConfig(), true, baseInput()),
     ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
   });
 
@@ -1703,7 +1813,7 @@ describe("handleWebhook — delivery acknowledgement", () => {
     );
 
     await expect(
-      handleWebhook(ctx, baseConfig(), TOKEN, baseInput()),
+      handleWebhook(ctx, baseConfig(), true, baseInput()),
     ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
   });
 
@@ -1724,7 +1834,7 @@ describe("handleWebhook — delivery acknowledgement", () => {
     const err = await handleWebhook(
       ctx,
       baseConfig(),
-      TOKEN,
+      true,
       baseInput({ parsedBody: twoAlertEnvelope() }),
     ).catch((e: unknown) => e);
 
@@ -1737,14 +1847,14 @@ describe("handleWebhook — delivery acknowledgement", () => {
   it("acknowledges (returns) when every alert succeeds", async () => {
     const { ctx } = mkCtx();
     await expect(
-      handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: twoAlertEnvelope() })),
+      handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: twoAlertEnvelope() })),
     ).resolves.toBeUndefined();
   });
 
   it("still acknowledges a malformed payload — permanent, so retrying is pointless", async () => {
     const { ctx } = mkCtx();
     await expect(
-      handleWebhook(ctx, baseConfig(), TOKEN, baseInput({ parsedBody: { nope: true } })),
+      handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: { nope: true } })),
     ).resolves.toBeUndefined();
   });
 
@@ -1756,7 +1866,7 @@ describe("handleWebhook — delivery acknowledgement", () => {
     const err = await handleWebhook(
       ctx,
       baseConfig(),
-      TOKEN,
+      true,
       baseInput({ parsedBody: twoAlertEnvelope() }),
     ).catch((e: unknown) => e);
 
@@ -1810,7 +1920,7 @@ describe("BLO-20467 — firing retries are idempotent across create/state-write"
     mocks.issues.create.mockResolvedValue({ id: "issue-from-attempt-1" });
 
     // Attempt 1: the issue commits, then its state write fails.
-    await expect(handleWebhook(ctx, baseConfig(), TOKEN, input)).rejects.toBeInstanceOf(
+    await expect(handleWebhook(ctx, baseConfig(), true, input)).rejects.toBeInstanceOf(
       AlertDeliveryIncompleteError,
     );
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
@@ -1820,7 +1930,7 @@ describe("BLO-20467 — firing retries are idempotent across create/state-write"
     // way to avoid a duplicate is to reconcile against the existing issue.
     fail.on = false;
     mocks.issues.list.mockResolvedValue(liveIssue);
-    await handleWebhook(ctx, baseConfig(), TOKEN, input);
+    await handleWebhook(ctx, baseConfig(), true, input);
 
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     // The retry must also leave durable state behind, or every later delivery
@@ -1841,10 +1951,10 @@ describe("BLO-20467 — firing retries are idempotent across create/state-write"
     const input = baseInput({ parsedBody: baseEnvelope({ alerts: [baseAlert()] }) });
     mocks.issues.create.mockResolvedValue({ id: "issue-from-attempt-1" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, input).catch(() => {});
+    await handleWebhook(ctx, baseConfig(), true, input).catch(() => {});
     fail.on = false;
     mocks.issues.list.mockResolvedValue(liveIssue);
-    await handleWebhook(ctx, baseConfig(), TOKEN, input);
+    await handleWebhook(ctx, baseConfig(), true, input);
 
     const persisted = mocks.state.set.mock.calls.at(-1)?.[1] as {
       nextEscalationAt: string | null;

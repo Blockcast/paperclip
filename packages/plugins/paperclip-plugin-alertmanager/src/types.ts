@@ -64,16 +64,14 @@ export interface AlertmanagerPluginConfig {
   /** Company that receives alerts when no company-routing label is present. */
   defaultCompanyId: string;
   /**
-   * Secret reference to the static bearer token Alertmanager uses when posting
-   * webhooks. The worker intentionally fails closed when this is configured
-   * until the host can verify it before invoking public webhook code.
+    * Secret reference to the static bearer token Alertmanager uses when posting
+    * webhooks. The host compares credentials without returning the secret value
+    * to the worker.
    */
   webhookTokenRef?: string;
   /**
-   * Inline bearer token accepted by the worker-side webhook path. This is the
-   * only enabled token mechanism until `webhookTokenRef` has host-side
-   * verification that does not spend secret-resolution quota on invalid public
-   * requests.
+   * Inline bearer token accepted by the worker-side webhook path. Prefer
+   * `webhookTokenRef` for production deployments.
    */
   webhookToken?: string;
   /**
