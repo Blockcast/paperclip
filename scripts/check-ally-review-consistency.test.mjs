@@ -363,6 +363,20 @@ describe("duplicateBodyAcrossIdentities", () => {
     );
   });
 
+  // One `--body-file` passed to both calls produces byte-identical bodies, but
+  // a stray trailing newline is still one verdict posted twice. Exact equality
+  // would audit these pairs as sound.
+  it("fires when the two bodies differ only in surrounding whitespace", () => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${"a".repeat(40)}`;
+    for (const variant of [`${body}\n`, `${body}  `, `\n${body}`, `\n  ${body}\n\n`]) {
+      assert.equal(
+        duplicateBodyAcrossIdentities([at(1, 290875700, body), at(2, 296676656, variant)]),
+        true,
+        `expected a duplicate-submission finding for variant ${JSON.stringify(variant)}`,
+      );
+    }
+  });
+
   it("does NOT fire when the bodies differ", () => {
     assert.equal(
       duplicateBodyAcrossIdentities([at(1, 290875700, "app"), at(2, 296676656, "user")]),
@@ -388,8 +402,9 @@ describe("duplicateBodyAcrossIdentities", () => {
   // Two bodiless approvals compare equal, but "one verdict, posted twice" is
   // the wrong diagnosis: there is no verdict. I2d reports the missing
   // attestation, and its remedy (post a comment) differs from this one's.
+  // A whitespace-only body is bodiless in substance and must land here too.
   it("does NOT fire on bodiless reviews under two identities", () => {
-    for (const empty of [null, "", undefined]) {
+    for (const empty of [null, "", undefined, "   ", "\n\n", "\t "]) {
       assert.equal(
         duplicateBodyAcrossIdentities([
           at(1, 290875700, empty),

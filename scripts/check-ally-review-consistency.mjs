@@ -161,16 +161,24 @@ export function isRequiredApprovalPair(reviews, headSha) {
 }
 
 /**
- * True when two operative reviews carry byte-identical bodies under different
- * user IDs — AC1's literal wording in BLO-22916, and the fingerprint of one
- * run submitting its verdict twice rather than two independent passes (two
- * passes produce two different write-ups).
+ * True when two operative reviews carry the same body under different user IDs
+ * — AC1's literal wording in BLO-22916, and the fingerprint of one run
+ * submitting its verdict twice rather than two independent passes (two passes
+ * produce two different write-ups).
  *
- * An empty body is excluded. Two bodiless approvals under two seats compare
- * equal, but they are not one verdict posted twice — there is no verdict at
- * all. That is Defect 2 (a counting APPROVED with no review behind it), I2d
- * already reports it, and its remedy is to post a comment rather than to drop
- * one of the two submissions.
+ * Bodies are compared after trimming surrounding whitespace. The named defect
+ * mechanism — passing one `--body-file` to both `gh pr review` calls — produces
+ * byte-identical bodies, but a stray trailing newline is still one verdict
+ * posted twice, and an exact-equality test would audit that pair as sound.
+ * Trimming is deliberately the only normalization: two bodies that differ in
+ * substance are two write-ups, and deciding when overlapping prose counts as
+ * one verdict is a larger question than this predicate should answer.
+ *
+ * A body that is empty or whitespace-only is excluded. Two bodiless approvals
+ * under two seats compare equal, but they are not one verdict posted twice —
+ * there is no verdict at all. That is Defect 2 (a counting APPROVED with no
+ * review behind it), I2d already reports it, and its remedy is to post a
+ * comment rather than to drop one of the two submissions.
  *
  * @param {object[]} operative reviews ALREADY filtered to the operative set for
  *   one head, as returned by {@link operativeAllyReviews}. Passing a raw
@@ -180,10 +188,11 @@ export function isRequiredApprovalPair(reviews, headSha) {
  */
 export function duplicateBodyAcrossIdentities(operative) {
   const reviews = operative ?? [];
+  const bodies = reviews.map((review) => String(review?.body ?? "").trim());
   return reviews.some((a, i) =>
     reviews.some(
       (b, j) =>
-        j > i && Boolean(a?.body) && a?.body === b?.body && a?.user?.id !== b?.user?.id,
+        j > i && bodies[i] !== "" && bodies[i] === bodies[j] && a?.user?.id !== b?.user?.id,
     ),
   );
 }
