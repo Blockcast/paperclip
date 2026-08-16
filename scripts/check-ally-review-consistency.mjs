@@ -125,10 +125,22 @@ function isExpectedApproval(review, { id, login }, headSha) {
  * required App identity and one from the required User seat. This deliberately
  * inspects the full operative set instead of deduplicating it; a retry, an
  * unexpected identity, or a missing/stale attestation makes the shape fail.
+ *
+ * The two bodies must also differ. This exemption exists for the case where a
+ * gate genuinely needs both seats — an App-authored PR, or a CODEOWNERS/team
+ * approver a GitHub App cannot be — and there the User seat contributes a
+ * short, distinct approval linking to the App's review. Two *byte-identical*
+ * bodies are not that case: they are one verdict submitted twice under two
+ * credentials, which is BLO-22916's defect and the mechanism that held this
+ * guard red from 2026-08-02 to 2026-08-16. Ally's instructions now forbid
+ * passing the same `--body-file` to both calls; this is where that is enforced,
+ * so a future run cannot re-derive "submit under both to be safe" and have the
+ * audit call it sound.
  */
 export function isRequiredApprovalPair(reviews, headSha) {
   const operative = operativeAllyReviews(reviews, headSha);
   if (operative.length !== 2) return false;
+  if (operative[0].body === operative[1].body) return false;
 
   return (
     operative.some((review) =>
@@ -149,6 +161,21 @@ export function isRequiredApprovalPair(reviews, headSha) {
 }
 
 /**
+ * True when two operative reviews carry byte-identical bodies under different
+ * user IDs — AC1's literal wording in BLO-22916, and the fingerprint of one
+ * run submitting its verdict twice rather than two independent passes (two
+ * passes produce two different write-ups).
+ */
+export function duplicateBodyAcrossIdentities(operative) {
+  const reviews = operative ?? [];
+  return reviews.some((a, i) =>
+    reviews.some(
+      (b, j) => j > i && a?.body === b?.body && a?.user?.id !== b?.user?.id,
+    ),
+  );
+}
+
+/**
  * @param {{number: number, headSha: string, reviews: object[]}} pr
  * @returns {string[]} human-readable violations; empty when the PR is sound
  */
@@ -160,8 +187,14 @@ export function findPrViolations(pr) {
 
   if (operative.length > 1 && !isRequiredApprovalPair(pr.reviews, head)) {
     const detail = operative.map((r) => `${r.state}/${r.id}`).join(", ");
+    // Name the duplicate-submission shape explicitly. Left as a bare count, an
+    // operator reading the hourly audit cannot tell "one verdict posted twice"
+    // from "two genuinely different reviews", and those have opposite remedies.
+    const reason = duplicateBodyAcrossIdentities(operative)
+      ? "the same body submitted under two credentials — one verdict, posted twice (BLO-22916)"
+      : "expected at most 1 or the exact App/User APPROVED pair";
     violations.push(
-      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — expected at most 1 or the exact App/User APPROVED pair`,
+      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — ${reason}`,
     );
   }
 
