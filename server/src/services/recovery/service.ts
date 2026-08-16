@@ -449,6 +449,14 @@ type StrandedRecoveryCause =
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
+const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
+  "job_failed",
+  "k8s_pod_schedule_failed",
+  "adapter_failed",
+  "external_lifecycle_stale_killed",
+  "k8s_concurrency_guard_unreachable",
+]);
+
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
   correctiveRunId: string;
@@ -4177,7 +4185,9 @@ export function recoveryService(
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
     const routeToOriginal = input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
-      input.recoveryCause === "codex_output_inactivity_monitor";
+      input.recoveryCause === "codex_output_inactivity_monitor" ||
+      input.recoveryCause === "stranded_assigned_issue" &&
+        ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(input.latestRun?.errorCode ?? "");
     if (input.recoveryCause === "provider_quota") {
       const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
       if (!retryAgentId) {
@@ -6351,15 +6361,6 @@ export function recoveryService(
         continue;
       }
 
-      const agent = await getAgent(agentId);
-      const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
-        : false;
-      if (issue.status !== "in_review" && !agentInvokable) {
-        result.skipped += 1;
-        continue;
-      }
-
       if (await hasActiveExecutionPath(
         issue.companyId,
         issue.id,
@@ -6430,6 +6431,81 @@ export function recoveryService(
         // issue whose only crime was being adopted once.
         adoptionHandoverLostSuccessor = !adoptingRun;
         latestRun = adoptingRun;
+      }
+      const agent = await getAgent(agentId);
+      const agentInvokable = agent && agent.companyId === issue.companyId
+        ? await isAgentInvokable(agent)
+        : false;
+      if (
+        latestRun?.errorCode === "issue_dependencies_blocked" &&
+        (issue.status === "in_review" || !agentInvokable)
+      ) {
+        const readiness = await issuesSvc.getDependencyReadiness(issue.id);
+        const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
+        // A dependency-ready issue has no blocker wake backstop unless this
+        // reconciliation persists one. Do not manufacture a blocked state for
+        // that case: the blocked-only reconciler would immediately flip it to
+        // todo and this sweep could put it back into blocked on every pass.
+        let nextStatus: "blocked" | "todo" | null = readiness.unresolvedBlockerCount > 0
+          ? "blocked"
+          : null;
+        if (readiness.unresolvedBlockerCount === 0 && resolvedBlockerIssueId && issue.assigneeAgentId) {
+          // `enqueueWakeup` signals "woke nobody" two different ways, and only one of
+          // them is a null return. The benign deferrals (wake-on-demand disabled,
+          // cooldown, concurrency gating) return null, but a wholly non-invokable
+          // assignee — paused, terminated, invalid org chain — or an exhausted budget
+          // THROWS a 409 instead (`heartbeat.ts` invokability and budget guards).
+          //
+          // That throw is the *expected* shape here, not an anomaly: one of the two
+          // ways to reach this branch at all is `!agentInvokable`. Letting it escape
+          // would abort the entire sweep mid-loop, so a single paused assignee would
+          // strand every issue queued behind it. Treat it exactly like a declined wake:
+          // leave `nextStatus` null so the issue keeps the status it already has, and
+          // let the blockers-resolved sweep pick it up once the assignee is invokable.
+          try {
+            const wake = await deps.enqueueWakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              payload: {
+                issueId: issue.id,
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+                backstop: "stranded_recovery_reconciliation",
+              },
+              idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({
+                dependentIssueId: issue.id,
+                resolvedBlockerIssueId,
+              }),
+              requestedByActorType: "system",
+              requestedByActorId: "stranded_recovery_reconciliation",
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                source: "recovery.reconcile_stranded_assigned_issue",
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+              },
+            });
+            if (wake) nextStatus = "todo";
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id, agentId: issue.assigneeAgentId, resolvedBlockerIssueId },
+              "failed to enqueue dependency wake during stranded recovery reconciliation; leaving issue status unchanged",
+            );
+          }
+        }
+        const updated = nextStatus === null || issue.status === nextStatus
+          ? issue
+          : await issuesSvc.update(issue.id, { status: nextStatus });
+        if (updated) result.issueIds.push(issue.id);
+        result.skipped += 1;
+        continue;
+      }
+      if (issue.status !== "in_review" && !agentInvokable) {
+        result.skipped += 1;
+        continue;
       }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
