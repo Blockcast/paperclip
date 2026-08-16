@@ -99,42 +99,58 @@ import {
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./zero-token-startup-failure.js";
+import {
+  decideRecoveryAction,
+  planRecoverySweep,
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  DEFAULT_RECOVERY_ACTION_TIMEOUT_MS,
+  type PlannedRecoveryAction,
+  type RecoveryActionBoundsConfig,
+} from "./recovery-action-bounds.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
+
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 
-type RecoveryActionBoundsConfig = {
-  maxAttempts: number;
-  timeoutMs: number;
-};
+/** Reads the reaper bounds from config (BLO-19124). */
+function recoveryActionBoundsConfig(): RecoveryActionBoundsConfig {
+  const cfg = loadConfig();
+  return {
+    retryBaseMs: cfg.recoveryActionRetryBaseMs,
+    retryMaxMs: cfg.recoveryActionRetryMaxMs,
+    maxAttempts: cfg.recoveryActionMaxAttempts,
+    timeoutMs: cfg.recoveryActionTimeoutMs,
+    perOwnerPerTick: cfg.recoveryActionReapPerOwnerPerTick,
+    perTick: cfg.recoveryActionReapPerTick,
+  };
+}
 
 /**
- * Read bounds when creating an action so deployments can tune newly-created
- * recovery work without changing actions that are already in flight.
+ * Bounds stamped onto a wake_owner recovery action at first escalation.
+ *
+ * Read from the same `recoveryActionBoundsConfig()` the reaper uses, so a row's
+ * stamped bounds and the bounds the reaper would fall back to for a legacy NULL
+ * row are always the same policy. An earlier revision stamped the older
+ * `STRANDED_RECOVERY_*` constants here instead, which made
+ * `RECOVERY_ACTION_MAX_ATTEMPTS` / `RECOVERY_ACTION_TIMEOUT_MS` inert for every
+ * newly created action — the operator knob moved only legacy rows, and new rows
+ * silently kept the fixed 6h horizon the reaper's 72h default contradicts.
  */
-function recoveryActionBoundsConfig(): RecoveryActionBoundsConfig {
-  const config = loadConfig();
+function recoveryActionBoundsAtCreation(
+  now: Date,
+  config: RecoveryActionBoundsConfig = recoveryActionBoundsConfig(),
+): { maxAttempts: number; timeoutAt: Date } {
   return {
-    maxAttempts: config.recoveryActionMaxAttempts,
-    timeoutMs: config.recoveryActionTimeoutMs,
+    maxAttempts: config.maxAttempts,
+    timeoutAt: new Date(now.getTime() + config.timeoutMs),
   };
 }
-
-/** Bounds persisted on the first wake_owner escalation for an action. */
-function recoveryActionBoundsAtCreation(now: Date): { maxAttempts: number; timeoutAt: Date } {
-  const bounds = recoveryActionBoundsConfig();
-  return {
-    maxAttempts: bounds.maxAttempts,
-    timeoutAt: new Date(now.getTime() + bounds.timeoutMs),
-  };
-}
-
 // BLO-18995: how long an issue execution lock may be held by a run that has
 // not yet been claimed (status still `queued`/`scheduled_retry`, startedAt
 // null) before sweepStaleIssueLocks treats it as stale and clears it.
@@ -330,7 +346,8 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
  */
 export const STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS = Math.max(
   2,
-  Number(process.env.STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS) || 5,
+  Number(process.env.STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS)
+    || DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
 );
 
 /**
@@ -354,7 +371,8 @@ export const STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS = Math.max(
  */
 export const STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS = Math.max(
   60_000,
-  Number(process.env.STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS) || 6 * 60 * 60 * 1000,
+  Number(process.env.STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS)
+    || DEFAULT_RECOVERY_ACTION_TIMEOUT_MS,
 );
 
 /**
@@ -1571,6 +1589,16 @@ export function recoveryService(
         executionRunId: string | null;
         executionLockedAt: Date | null;
       },
+    ) => Promise<void> | void;
+    /**
+     * Fires in the reaper's lost-update window: after the source-issue restore
+     * has run and before the recovery action is terminated. The window is real
+     * in production (the restore does an issue UPDATE plus a comment insert)
+     * but too narrow to hit reliably from a test, so the terminate-time CAS
+     * needs a deterministic seam to prove it holds.
+     */
+    beforeRecoveryActionTerminateForTest?: (
+      action: { id: string; sourceIssueId: string; attemptCount: number },
     ) => Promise<void> | void;
   },
 ) {
@@ -4582,6 +4610,17 @@ export function recoveryService(
     const hasNewActivitySinceLastAttempt = !previousAttemptAt
       || input.issue.lastActivityAt > previousAttemptAt;
 
+    // Computed once and reused for both the stored policy and the bounds
+    // decision below, so the two cannot drift apart.
+    const wakePolicy: { type: string; reason: string; ownerAgentId?: string | null } =
+      recoveryCause === "provider_quota" && !ownerAgentId
+        ? { type: "monitor_only", reason: recoveryCause }
+        : recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
+        ? { type: "manual_repair_required", reason: recoveryCause, ownerAgentId }
+        : ownerAgentId
+        ? { type: "wake_owner", reason: "source_scoped_recovery_action", ownerAgentId }
+        : { type: "board_escalation", reason: "no_invokable_recovery_owner" };
+
     const action = await actionSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -4625,27 +4664,7 @@ export function recoveryService(
         : recoveryCause === "execution_review_participant_recovery"
           ? "Repair the failed review participant path, restore the source issue to in_review with a live reviewer, or record an intentional manual resolution."
         : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-      wakePolicy: recoveryCause === "provider_quota" && !ownerAgentId
-        ? {
-          type: "monitor_only",
-          reason: recoveryCause,
-        }
-        : recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
-        ? {
-          type: "manual_repair_required",
-          reason: recoveryCause,
-          ownerAgentId,
-        }
-        : ownerAgentId
-        ? {
-          type: "wake_owner",
-          reason: "source_scoped_recovery_action",
-          ownerAgentId,
-        }
-        : {
-          type: "board_escalation",
-          reason: "no_invokable_recovery_owner",
-        },
+      wakePolicy,
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
@@ -10257,6 +10276,322 @@ export function recoveryService(
     return { escalated: true, ownerAgentId, ownerType: ownerAgentId ? "agent" : "board" };
   }
 
+  /**
+   * Re-arms or expires unresolved source-scoped recovery actions (BLO-19124).
+   *
+   * Why this exists: `escalateStrandedAssignedIssue` creates the action, fires
+   * one `wake_owner`, and sets the source issue to `blocked`. The only sweep
+   * that could re-attempt it, `reconcileStrandedAssignedIssues`, selects
+   * todo/in_progress/in_review — so escalation removes its own issue from the
+   * one retry path. A dropped wake therefore stranded the issue permanently.
+   *
+   * Rather than bolt a second wake mechanism alongside the first, the re-arm
+   * here restores the issue to `todo`, which puts it back into the existing,
+   * well-tested reconcile sweep. That sweep re-dispatches if the underlying
+   * infrastructure failure cleared, or re-escalates (incrementing attemptCount)
+   * if it did not. This is also what makes the burst case safe: returning N
+   * issues to `todo` wakes nobody directly, so recovery no longer depends on an
+   * owner absorbing N simultaneous wakes — the normal dispatcher picks them up
+   * within its own maxConcurrentRuns.
+   */
+  async function reapRecoveryActions(opts?: { now?: Date }) {
+    const now = opts?.now ?? new Date();
+    const bounds = recoveryActionBoundsConfig();
+    const result = {
+      scanned: 0,
+      rearmed: 0,
+      expired: 0,
+      waiting: 0,
+      settled: 0,
+      parked: 0,
+      skipped: 0,
+      actionIds: [] as string[],
+    };
+
+    // Oversample the candidate pool relative to perTick: many of the oldest
+    // rows will be in backoff, and we still want a full tick of real work
+    // behind them. listActiveCandidatesForReap already filters to wake_owner in
+    // SQL so manual/monitor actions cannot occupy the LIMIT.
+    const candidates = await recoveryActionsSvc.listActiveCandidatesForReap(bounds.perTick * 20);
+    result.scanned = candidates.length;
+
+    const planned: PlannedRecoveryAction<(typeof candidates)[number]>[] = [];
+    for (const action of candidates) {
+      const decision = decideRecoveryAction(action, now, bounds);
+      if (decision.type === "wait") {
+        result.waiting += 1;
+        continue;
+      }
+      planned.push({ action, decision });
+    }
+
+    const swept = planRecoverySweep(planned, bounds);
+    result.skipped = planned.length - swept.length;
+
+    for (const { action, decision } of swept) {
+      try {
+        if (decision.type === "expire") {
+          const expired = await expireRecoveryAction({ action, reason: decision.reason });
+          if (expired === "expired") {
+            result.expired += 1;
+            result.actionIds.push(action.id);
+          } else if (expired === "settled") {
+            result.settled += 1;
+            result.actionIds.push(action.id);
+          }
+          continue;
+        }
+        const rearmed = await rearmRecoveryAction({ action, now });
+        if (rearmed === "rearmed") {
+          result.rearmed += 1;
+          result.actionIds.push(action.id);
+        } else if (rearmed === "settled") {
+          result.settled += 1;
+          result.actionIds.push(action.id);
+        } else {
+          result.parked += 1;
+        }
+      } catch (error) {
+        logger.error(
+          { err: error, recoveryActionId: action.id, sourceIssueId: action.sourceIssueId },
+          "recovery action reap failed",
+        );
+      }
+    }
+
+    // Two distinct silences worth breaking. The first is a fully starved tick:
+    // candidates existed but nothing moved at all. The second is the mixed tick
+    // — other owners progressed, but some rows were planned, consumed a
+    // per-owner slot, and stayed active. Reporting only the first would hide a
+    // slot leak behind unrelated progress.
+    const noProgress =
+      result.scanned > 0 && result.rearmed + result.expired + result.settled + result.waiting === 0;
+    if (noProgress || result.parked > 0) {
+      logger.warn(
+        {
+          scanned: result.scanned,
+          planned: planned.length,
+          rearmed: result.rearmed,
+          expired: result.expired,
+          settled: result.settled,
+          parked: result.parked,
+          waiting: result.waiting,
+          skipped: result.skipped,
+        },
+        noProgress
+          ? "recovery action reap scanned candidates but made no progress"
+          : "recovery action reap left candidates parked without progressing them",
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * Returns a stranded issue to a live status so it is visible to the normal
+   * reconcile sweep again. Returns the status it left the issue in, or null if
+   * it deliberately made no change.
+   */
+  async function restoreStrandedIssueToLiveStatus(input: {
+    sourceIssueId: string;
+    returnOwnerAgentId?: string | null;
+    note: string;
+  }): Promise<"restored" | "missing" | "terminal" | "not_blocked" | "has_blockers" | "update_failed"> {
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, input.sourceIssueId))
+      .limit(1);
+    if (!issue) return "missing";
+    // Terminal issues need no live wake path.
+    if (issue.status === "done" || issue.status === "cancelled") return "terminal";
+    // Only `blocked` is the stranding status we created; anything else already
+    // has a path and must not be stomped.
+    if (issue.status !== "blocked") return "not_blocked";
+
+    const { blockerIssueIds } = await unresolvedBlockerHumanDecisionEscalationState(
+      issue.companyId,
+      issue.id,
+    );
+    // Blocked on a real blocker is a legitimate state with a live wake path
+    // (issue_blockers_resolved). Leave it; only the zero-blocker case is the
+    // parked-and-forgotten one this ticket is about.
+    if (blockerIssueIds.length > 0) return "has_blockers";
+
+    const updated = await issuesSvc.update(issue.id, {
+      status: "todo",
+      assigneeAgentId: input.returnOwnerAgentId ?? issue.assigneeAgentId,
+    });
+    if (!updated) return "update_failed";
+    await issuesSvc.addComment(issue.id, input.note, {}, { authorType: "system" });
+    return "restored";
+  }
+
+  /**
+   * Outcome of one re-arm attempt, from the reaper's accounting point of view.
+   *
+   * `parked` is the one that costs something: the row stays active, so it keeps
+   * consuming a per-owner slot on later ticks. Anything that can never become
+   * re-armable is terminated instead (`settled`) so it leaves the candidate set
+   * for good rather than being re-planned until its wall-clock timeout.
+   */
+  type RearmOutcome = "rearmed" | "settled" | "parked";
+  type ExpireOutcome = "expired" | "settled" | "noop";
+
+  async function rearmRecoveryAction(input: {
+    action: Awaited<ReturnType<typeof recoveryActionsSvc.listActiveCandidatesForReap>>[number];
+    now: Date;
+  }): Promise<RearmOutcome> {
+    const nextAttemptCount = input.action.attemptCount + 1;
+    // Every termination below is compare-and-set on the attempt count this
+    // reaper listed. A null return means the row moved underneath us — either a
+    // concurrent reaper already terminated it, or `upsertSourceScopedUnlocked`
+    // refreshed it into a new episode with a new owner. We do not distinguish
+    // them (that would cost a read on a rare path) and report `parked` for
+    // both: it is exactly right for the refresh case, and for the already-
+    // terminated case it only over-reports one row in the sweep's warn log.
+    // What matters is that we never claim to have settled a row we did not.
+    const settleBy = async (
+      status: "resolved" | "cancelled",
+      outcome: Parameters<typeof recoveryActionsSvc.terminateById>[0]["outcome"],
+      resolutionNote: string,
+    ): Promise<RearmOutcome> => {
+      await deps.beforeRecoveryActionTerminateForTest?.(input.action);
+      const terminated = await recoveryActionsSvc.terminateById({
+        actionId: input.action.id,
+        expectedAttemptCount: input.action.attemptCount,
+        status,
+        outcome,
+        resolutionNote,
+      });
+      return terminated ? "settled" : "parked";
+    };
+    const restored = await restoreStrandedIssueToLiveStatus({
+      sourceIssueId: input.action.sourceIssueId,
+      returnOwnerAgentId: input.action.returnOwnerAgentId,
+      note: `Recovery re-arm ${nextAttemptCount}/${input.action.maxAttempts ?? "∞"}: returning this issue to \`todo\` so it is picked up by the normal dispatch sweep. It was parked in \`blocked\` with no unresolved blockers and no live wake path.`,
+    });
+    if (restored === "terminal") {
+      return settleBy(
+        "resolved",
+        "restored",
+        "Source issue is already terminal; no re-arm is needed.",
+      );
+    }
+    // A real blocker is not stranding: the issue already has a live wake path
+    // via the blockers-resolved sweep, so there is nothing for recovery to
+    // re-arm. Resolving here (rather than parking) is what keeps an ordinarily
+    // blocked issue from occupying a per-owner slot every tick until its
+    // wall-clock bound. If it strands again later, escalation creates a fresh
+    // action.
+    if (restored === "has_blockers") {
+      return settleBy(
+        "resolved",
+        "blocked",
+        "Source issue is blocked on unresolved blockers, which is a live wake path (issue_blockers_resolved). Recovery re-arm is not needed.",
+      );
+    }
+    // The source issue is gone; no future tick can restore it.
+    if (restored === "missing") {
+      return settleBy(
+        "cancelled",
+        "false_positive",
+        "Source issue no longer exists; nothing to recover.",
+      );
+    }
+    // A live source issue is the successful post-rearm state: normal dispatch
+    // can see it again. Leave the row terminal so it cannot occupy an owner
+    // re-arm slot until the wall-clock bound expires.
+    if (restored === "not_blocked") {
+      return settleBy(
+        "resolved",
+        "restored",
+        "Source issue is already on a live status; recovery re-arm is complete.",
+      );
+    }
+    // `update_failed` is transient: the update lost a race. Advance the clock
+    // without burning an attempt so the row leaves the oldest-candidate window,
+    // and let the next backoff interval retry.
+    if (restored !== "restored") {
+      await recoveryActionsSvc.recordReapNoop(
+        input.action.id,
+        input.action.attemptCount,
+        input.now,
+      );
+      return "parked";
+    }
+
+    const recorded = await recoveryActionsSvc.recordReapAttempt(
+      input.action.id,
+      input.action.attemptCount,
+      input.now,
+    );
+    // Lost the race to a concurrent resolve/fold — correct outcome, nothing to do.
+    if (!recorded) return "settled";
+    return "rearmed";
+  }
+
+  async function expireRecoveryAction(input: {
+    action: Awaited<ReturnType<typeof recoveryActionsSvc.listActiveCandidatesForReap>>[number];
+    reason: "max_attempts" | "timeout";
+  }): Promise<ExpireOutcome> {
+    const note = input.reason === "max_attempts"
+      ? `Recovery action expired after ${input.action.attemptCount} attempts without resolution.`
+      : `Recovery action expired on its wall-clock bound without resolution.`;
+    const restored = await restoreStrandedIssueToLiveStatus({
+      sourceIssueId: input.action.sourceIssueId,
+      returnOwnerAgentId: input.action.returnOwnerAgentId,
+      note: `${note} Automatic recovery has stopped retrying; returning this issue to \`todo\` so it keeps a live wake path rather than sitting in \`blocked\` with no blockers. If this issue is genuinely dead, cancel it explicitly.`,
+    });
+    await deps.beforeRecoveryActionTerminateForTest?.(input.action);
+    if (restored === "not_blocked" || restored === "terminal") {
+      const terminated = await recoveryActionsSvc.terminateById({
+        actionId: input.action.id,
+        expectedAttemptCount: input.action.attemptCount,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: restored === "terminal"
+          ? "Source issue is already terminal; no expiration is needed."
+          : "Source issue already has a live status; recovery re-arm completed before expiration.",
+      });
+      return terminated ? "settled" : "noop";
+    }
+    if (restored === "has_blockers") {
+      const terminated = await recoveryActionsSvc.terminateById({
+        actionId: input.action.id,
+        expectedAttemptCount: input.action.attemptCount,
+        status: "resolved",
+        outcome: "blocked",
+        resolutionNote:
+          "Source issue is blocked on unresolved blockers, which is a live wake path (issue_blockers_resolved). Recovery expiration is not needed.",
+      });
+      return terminated ? "settled" : "noop";
+    }
+    if (restored === "missing") {
+      const terminated = await recoveryActionsSvc.terminateById({
+        actionId: input.action.id,
+        expectedAttemptCount: input.action.attemptCount,
+        status: "cancelled",
+        outcome: "false_positive",
+        resolutionNote: "Source issue no longer exists; nothing to expire.",
+      });
+      return terminated ? "settled" : "noop";
+    }
+    // The widest window in the reaper: `restored === "restored"` means the
+    // issue UPDATE and comment insert above both ran, so a re-escalation had
+    // ample room to refresh this row into a new episode. Expiring it on the
+    // attempt count we listed is what keeps that new episode alive — a `noop`
+    // here is the correct, self-healing outcome, not a lost expiration.
+    const terminated = await recoveryActionsSvc.terminateById({
+      actionId: input.action.id,
+      expectedAttemptCount: input.action.attemptCount,
+      status: "cancelled",
+      outcome: "expired",
+      resolutionNote: note,
+    });
+    return terminated ? "expired" : "noop";
+  }
+
   return {
     escalateStalledSelfReviewPr,
     buildRunOutputSilence,
@@ -10268,6 +10603,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     dismissStaleEvaluationOnRunTerminated,
     reconcileStrandedAssignedIssues,
+    reapRecoveryActions,
     sweepStaleIssueLocks,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,

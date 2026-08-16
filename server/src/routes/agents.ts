@@ -30,6 +30,8 @@ import {
   updateAgentSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
+  ISSUE_RECOVERY_ACTION_STATUSES,
+  type IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
 import {
   EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
@@ -54,12 +56,13 @@ import {
   ISSUE_LIST_DEFAULT_LIMIT,
   issueApprovalService,
   issueRecoveryActionService,
+  ACTIVE_RECOVERY_ACTION_STATUSES,
   issueService,
   logActivity,
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -119,6 +122,32 @@ import {
   changeConsentGateService,
   touchesAgentProfileChangeConsentFields,
 } from "../services/change-consent-gate.js";
+
+function parseOptionalPositiveIntegerQuery(
+  value: unknown,
+  name: string,
+  fallback: number,
+  max?: number,
+): number {
+  if (value === undefined) return fallback;
+  if (Array.isArray(value)) throw badRequest(`${name} must be a single integer`);
+  const raw = typeof value === "string" ? value.trim() : String(value);
+  if (!/^\d+$/.test(raw)) throw badRequest(`${name} must be a positive integer`);
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) throw badRequest(`${name} is too large`);
+  if (parsed === 0) throw badRequest(`${name} must be a positive integer`);
+  return max != null ? Math.min(parsed, max) : parsed;
+}
+
+function parseOptionalNonNegativeIntegerQuery(value: unknown, name: string, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (Array.isArray(value)) throw badRequest(`${name} must be a single integer`);
+  const raw = typeof value === "string" ? value.trim() : String(value);
+  if (!/^\d+$/.test(raw)) throw badRequest(`${name} must be a non-negative integer`);
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) throw badRequest(`${name} is too large`);
+  return parsed;
+}
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
@@ -2402,6 +2431,52 @@ export function agentRoutes(
     await assertCanReadConfigurations(req, companyId);
     const rows = await svc.list(companyId);
     res.json(rows.map((row) => redactAgentConfiguration(row)));
+  });
+
+  /**
+   * Owner-facing recovery backlog (BLO-19124). Before this, an owner could only
+   * discover their own stranded recoveries by scanning their whole inbox and
+   * reading `activeRecoveryAction` off each issue — which is how a 131-item
+   * backlog went unnoticed for seven weeks. Defaults to live actions; pass
+   * ?status=... to include terminal ones.
+   */
+  router.get("/agents/me/recovery-actions", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+    const agent = await svc.getById(req.actor.agentId);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    const rawStatuses = Array.isArray(req.query.status)
+      ? req.query.status
+      : typeof req.query.status === "string"
+      ? req.query.status.split(",")
+      : [];
+    const requested = rawStatuses
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter((entry): entry is IssueRecoveryActionStatus =>
+        (ISSUE_RECOVERY_ACTION_STATUSES as readonly string[]).includes(entry),
+      );
+    const statuses = requested.length > 0
+      ? [...new Set(requested)]
+      : [...ACTIVE_RECOVERY_ACTION_STATUSES];
+    const limit = parseOptionalPositiveIntegerQuery(req.query.limit, "limit", 50, 200);
+    const offset = parseOptionalNonNegativeIntegerQuery(req.query.offset, "offset", 0);
+
+    const filters = {
+      companyId: agent.companyId,
+      ownerAgentId: agent.id,
+      statuses,
+    };
+    const recoveryActions = issueRecoveryActionService(db);
+    const [actions, total] = await Promise.all([
+      recoveryActions.listForCompany({ ...filters, limit, offset }),
+      recoveryActions.countForCompany(filters),
+    ]);
+    res.json({ actions, total, limit, offset });
   });
 
   router.get("/agents/me", async (req, res) => {

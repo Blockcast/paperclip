@@ -249,6 +249,50 @@ describe("issueRecoveryActionService", () => {
     expect(updates.at(-1)).toMatchObject({ timeoutAt: originalHorizon });
   });
 
+  it("increments attemptCount in SQL when updating an active row", async () => {
+    const existingRow = makeRecoveryActionRow({ id: "existing-action", attemptCount: 41 });
+    const updatedRow = makeRecoveryActionRow({ id: "existing-action", attemptCount: 42 });
+    const set = vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(async () => [updatedRow]),
+      })),
+    }));
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() {
+          return this;
+        },
+        where() {
+          return this;
+        },
+        orderBy() {
+          return this;
+        },
+        limit() {
+          return Promise.resolve([existingRow]);
+        },
+      })),
+      update: vi.fn(() => ({ set })),
+      insert: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: "agent-1",
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:fingerprint",
+      nextAction: "Choose a valid issue disposition.",
+    });
+
+    expect(result.attemptCount).toBe(42);
+    expect(fakeDb.insert).not.toHaveBeenCalled();
+    const setPayload = set.mock.calls[0]?.[0] as { attemptCount?: unknown };
+    expect(typeof setPayload.attemptCount).not.toBe("number");
+  });
+
   // BLO-20263. The handoff comment grant's TTL is measured from this anchor, so if
   // ordinary sweep churn refreshed it the grant would never expire — which is the
   // failure mode the ticket exists to close, not a cosmetic detail.

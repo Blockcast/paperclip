@@ -48,6 +48,8 @@ function issuePrefix(id: string) {
   return `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres plugin orchestration API tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
@@ -108,6 +110,34 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       permissions: {},
     });
     return { companyId, agentId };
+  }
+
+  async function waitForQueuedPluginEvents(
+    expectedEventTypes: readonly string[],
+    timeoutMs = 3_000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    let observedEventTypes: string[] = [];
+
+    while (Date.now() < deadline) {
+      const rows = await db.select({ eventType: pluginEventOutbox.eventType }).from(pluginEventOutbox);
+      observedEventTypes = rows.map((row) => row.eventType);
+
+      const remaining = [...expectedEventTypes];
+      for (const eventType of observedEventTypes) {
+        const index = remaining.indexOf(eventType);
+        if (index >= 0) remaining.splice(index, 1);
+      }
+      if (remaining.length === 0) return;
+
+      await sleep(25);
+    }
+
+    throw new Error(
+      `Timed out waiting for queued plugin events ${expectedEventTypes.join(", ")}; observed ${observedEventTypes.join(
+        ", ",
+      )}`,
+    );
   }
 
   async function makeLocalRoot() {
@@ -349,6 +379,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         status: "pending",
       },
     });
+
+    await waitForQueuedPluginEvents(["issue.created", "issue.updated", "approval.created"]);
 
     while ((await drainPluginEventOutbox(db, fakeBus)) > 0) {
       /* drain all enqueued events through the fake bus */

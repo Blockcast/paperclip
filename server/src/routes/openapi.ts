@@ -521,6 +521,58 @@ const jsonBody = (schema: z.ZodTypeAny) => ({
 
 const r = responses;
 
+const recoveryActionListQuerySchema = z.object({
+  status: z.string().optional(),
+  kind: z.string().optional(),
+  outcome: z.string().optional(),
+  ownerAgentId: z.string().optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+});
+
+const agentRecoveryActionListQuerySchema = z.object({
+  status: z.string().optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+});
+
+const recoveryActionListResponseSchema: JsonSchema = {
+  type: "object",
+  properties: {
+    actions: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: true,
+        properties: {
+          id: { type: "string", format: "uuid" },
+          companyId: { type: "string", format: "uuid" },
+          sourceIssueId: { type: "string", format: "uuid" },
+          kind: { type: "string" },
+          status: { type: "string" },
+          ownerType: { type: "string" },
+          ownerAgentId: { type: "string", format: "uuid", nullable: true },
+          attemptCount: { type: "integer", minimum: 0 },
+          maxAttempts: { type: "integer", minimum: 1, nullable: true },
+          timeoutAt: { type: "string", format: "date-time", nullable: true },
+          outcome: { type: "string", nullable: true },
+          createdAt: { type: "string", format: "date-time" },
+          updatedAt: { type: "string", format: "date-time" },
+        },
+      },
+    },
+    total: { type: "integer", minimum: 0 },
+    limit: { type: "integer", minimum: 1 },
+    offset: { type: "integer", minimum: 0 },
+  },
+  required: ["actions", "total", "limit", "offset"],
+};
+
+const recoveryActionListResponse = {
+  description: "Success",
+  content: { "application/json": { schema: recoveryActionListResponseSchema } },
+};
+
 const externalObjectSummariesBodySchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
@@ -1526,6 +1578,15 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Get the current agent",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/recovery-actions",
+  tags: ["agents"],
+  summary: "List current agent recovery actions",
+  request: { query: agentRecoveryActionListQuerySchema },
+  responses: { 200: recoveryActionListResponse, 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3195,6 +3256,18 @@ registry.registerPath({
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["dashboard"],
+  summary: "List company recovery actions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: recoveryActionListQuerySchema,
+  },
+  responses: { 200: recoveryActionListResponse, 400: r.badRequest, 401: r.unauthorized },
 });
 
 // ─── Sidebar ─────────────────────────────────────────────────────────────────

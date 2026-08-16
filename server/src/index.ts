@@ -1471,6 +1471,23 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
+              // Re-arm or expire recovery actions whose owner never acted on
+              // the single wake escalation fired (BLO-19124). Runs after the
+              // reconcile sweep so an issue restored to `todo` here is picked
+              // up by the next tick rather than being re-escalated inside this
+              // one. Contained in its own try/catch: this step sits upstream of
+              // every remaining sweep in the chain, and a throw here must not
+              // take them down with it.
+              try {
+                const reaped = await heartbeat.reapRecoveryActions();
+                if (reaped.rearmed > 0 || reaped.expired > 0 || reaped.settled > 0) {
+                  logger.warn({ ...reaped }, "recovery action reaper re-armed or expired stranded recoveries");
+                }
+              } catch (error) {
+                logger.error({ err: error }, "recovery action reaper failed");
+              }
+            })
+            .then(async () => {
               const reconciled = await heartbeat.reconcileIssueGraphLiveness();
               if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
                 logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
