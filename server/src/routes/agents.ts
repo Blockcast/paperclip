@@ -118,7 +118,6 @@ import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
-  AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
@@ -3661,11 +3660,16 @@ export function agentRoutes(
         },
       );
     }
+    // Fail CLOSED on mixing: any patch that *touches* a consent-gated profile
+    // field takes the protected branch, regardless of which other keys ride
+    // along.  The previous `profileOnlyChange` form required *every* key to be
+    // a profile field, so `{role, <any non-profile key>}` fell through to
+    // `assertCanUpdateAgent`, which reaches `allow_self` for a self-PATCH and
+    // let an agent write its own `role`/`name`/`title`/`capabilities` with no
+    // change grant and no consent (BLO-27751).  This mirrors the
+    // coordination-metadata path, which also fails closed on mixing.
     const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
-    if (profileOnlyChange) {
+    if (touchesProfileFields) {
       await assertCanApplyAgentProfileChange(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
