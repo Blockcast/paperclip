@@ -2971,7 +2971,8 @@ registry.registerPath({
   method: "post",
   path: "/api/approvals/{id}/withdraw",
   tags: ["approvals"],
-  summary: "Withdraw an approval request (requesting agent or board)",
+  summary:
+    "Withdraw an undecided approval request (requesting agent or board). Accepts `pending` and `revision_requested`; a decision note already written by the board is preserved and the withdrawal reason is recorded as an approval comment.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(withdrawApprovalSchema),
