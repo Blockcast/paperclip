@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_TIMER_DELAY_MS,
   NUMERIC_SETTING_BOUNDS,
   TIMER_SETTING_MS_FACTOR,
   loadConfig,
+  resetNumericSettingWarnings,
   resolveNumericSetting,
 } from "../config.js";
 
@@ -72,10 +73,17 @@ describe("numeric env override bounds (BLO-27641)", () => {
     process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
     process.env.PAPERCLIP_DEPLOYMENT_EXPOSURE = "private";
     process.env.PAPERCLIP_AUTH_BASE_URL_MODE = "explicit";
+    // Feeding hostile input is the point of this suite, so the resulting
+    // reject/clamp warnings are expected. Silence them here — they are asserted
+    // on their own terms in "resolveNumericSetting reports adjustments" below.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    resetNumericSettingWarnings();
   });
 
   afterEach(() => {
     process.env = { ...originalEnv };
+    vi.restoreAllMocks();
+    resetNumericSettingWarnings();
   });
 
   describe.each(SETTING_KEYS)("%s", (key) => {
@@ -191,6 +199,67 @@ describe("resolveNumericSetting", () => {
   });
 });
 
+/**
+ * A clamp of a *finite* override is the one adjustment that produces no signal
+ * on its own: the startup banner prints the post-clamp number, so
+ * `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=7300` and `=3650` are indistinguishable
+ * once resolved — and the first of those silently shortens retention. The
+ * warning is what makes the adjustment visible to the operator who caused it.
+ */
+describe("resolveNumericSetting reports adjustments (BLO-27641)", () => {
+  const bounds = { fallback: 60, min: 10, max: 100 };
+
+  /** Fresh spy + fresh dedupe state, so each case counts only its own output. */
+  function captureWarnings() {
+    resetNumericSettingWarnings();
+    return vi.spyOn(console, "warn").mockImplementation(() => {});
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetNumericSettingWarnings();
+  });
+
+  it("warns when a finite override is clamped, naming both values", () => {
+    const warn = captureWarnings();
+    expect(resolveNumericSetting(["730"], bounds, "prReconcilerWindowDays")).toBe(100);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain("prReconcilerWindowDays");
+    expect(message).toContain("730");
+    expect(message).toContain("100");
+  });
+
+  it("warns when an override is rejected as unusable", () => {
+    const warn = captureWarnings();
+    expect(resolveNumericSetting(["Infinity"], bounds, "recoveryActionTimeoutMs")).toBe(60);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("Infinity");
+  });
+
+  it("stays silent when the override is honoured verbatim, or absent", () => {
+    const warn = captureWarnings();
+    expect(resolveNumericSetting(["50"], bounds, "heartbeatSchedulerIntervalMs")).toBe(50);
+    // No candidate supplied is the default case, not operator error.
+    expect(resolveNumericSetting([undefined, ""], bounds, "heartbeatSchedulerIntervalMs")).toBe(60);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns once per setting, not once per loadConfig() call", () => {
+    const warn = captureWarnings();
+    for (let i = 0; i < 5; i++) {
+      resolveNumericSetting(["730"], bounds, "prReconcilerWindowDays");
+    }
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays silent when no setting name is supplied", () => {
+    const warn = captureWarnings();
+    expect(resolveNumericSetting(["730"], bounds)).toBe(100);
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
 describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () => {
   /**
    * Automates the manual grep from the BLO-27641 acceptance criteria.
@@ -203,10 +272,14 @@ describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () 
   const ALLOWED_ENV_VARS = new Set([
     // Neither a bound nor a timer delay. An unusable port fails loudly at
     // listen() rather than silently disabling a guard or starting a hot loop.
+    // PORT is read twice — at the `port` field and again to interpolate
+    // `linearOAuthRedirectUri` — but the second site is covered by the first:
+    // `PORT=Infinity` builds a nonsense redirect URI and then still dies at
+    // bind, so the failure stays loud rather than becoming a silent misconfig.
     "PORT",
   ]);
 
-  it("has no unguarded `Number(process.env.X) ||` outside the allowlist", async () => {
+  it("has no unguarded numeric-env idiom outside the allowlist", async () => {
     const { readFile } = await import("node:fs/promises");
     const source = await readFile(new URL("../config.ts", import.meta.url), "utf8");
 
@@ -215,16 +288,26 @@ describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () 
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/^\s*\/\/.*$/gm, "");
 
-    const offenders = [...code.matchAll(/Number\(process\.env\.([A-Z_][A-Z0-9_]*)\)\s*\|\|/g)]
-      .map((match) => match[1])
-      .filter((envVar) => !ALLOWED_ENV_VARS.has(envVar));
+    // Deliberately wider than the literal `Number(process.env.X) ||` form the
+    // acceptance criteria grep for. Near-identical spellings have the same hole
+    // — `parseInt(process.env.X, 10) ||`, `Number(process.env["X"]) ?? …` — and
+    // with two in-flight PRs re-adding the idiom the next one is as likely to
+    // arrive in a variant as in the original spelling.
+    const offenders = [
+      ...code.matchAll(
+        /(?:Number|parseInt|parseFloat)\(\s*process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[\s*["'`]([A-Z_][A-Z0-9_]*)["'`]\s*\])[^)]*\)\s*(?:\|\||\?\?)/g,
+      ),
+    ]
+      .map((match) => match[1] ?? match[2])
+      .filter((envVar): envVar is string => envVar !== undefined && !ALLOWED_ENV_VARS.has(envVar));
 
     expect(
       offenders,
-      `${offenders.join(", ")} use \`Number(process.env.X) || DEFAULT\`, which resolves ` +
-        `to Infinity for "Infinity"/"1e999" and overflows a 32-bit timer for any value ` +
-        `above ${MAX_TIMER_DELAY_MS}ms. Use resolveNumericSetting() with an entry in ` +
-        `NUMERIC_SETTING_BOUNDS instead (and TIMER_SETTING_MS_FACTOR if it is a timer).`,
+      `${offenders.join(", ")} use a bare \`Number(process.env.X) || DEFAULT\`-style ` +
+        `fallback, which resolves to Infinity for "Infinity"/"1e999" and overflows a ` +
+        `32-bit timer for any value above ${MAX_TIMER_DELAY_MS}ms. Use ` +
+        `resolveNumericSetting() with an entry in NUMERIC_SETTING_BOUNDS instead ` +
+        `(and TIMER_SETTING_MS_FACTOR if it is a timer).`,
     ).toEqual([]);
   });
 });

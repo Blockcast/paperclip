@@ -317,6 +317,34 @@ export const TIMER_SETTING_MS_FACTOR = {
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
 /**
+ * What the call sites actually supply: env vars (`string | undefined`) and
+ * file-config numbers. Narrower than `unknown` on purpose — `Number(true)` is
+ * `1` and `Number([5])` is `5`, so a boolean or single-element array in a
+ * config file would otherwise resolve to a plausible-looking interval instead
+ * of falling through to the documented default.
+ */
+export type NumericSettingCandidate = string | number | null | undefined;
+
+const numericSettingWarnings = new Set<string>();
+
+/**
+ * Test seam. The dedupe is deliberately process-global: an operator needs each
+ * adjustment reported once at startup, not once per `loadConfig()` call (which
+ * is un-memoized and re-invoked freely).
+ */
+export function resetNumericSettingWarnings(): void {
+  numericSettingWarnings.clear();
+}
+
+function warnNumericSettingAdjustment(name: string | undefined, message: string): void {
+  if (name === undefined) return;
+  const key = `${name}:${message}`;
+  if (numericSettingWarnings.has(key)) return;
+  numericSettingWarnings.add(key);
+  console.warn(`[config] ${name}: ${message}`);
+}
+
+/**
  * Resolve the first usable candidate for a numeric setting, clamped to `[min, max]`.
  *
  * A candidate is usable only when it is finite and positive. Unusable
@@ -327,22 +355,47 @@ export const TIMER_SETTING_MS_FACTOR = {
  * `Infinity` to `max` would silently read as an operator asking for the maximum,
  * where falling back keeps the startup banner honest about what is in effect.
  *
- * Note this is a small, intentional change for input that was already invalid:
- * a negative override previously survived `||` and was pulled up to the floor,
- * and now falls back to the default instead. Every currently-valid input
- * resolves exactly as before.
+ * Two intentional behaviour changes, both of which an operator should audit on
+ * upgrade — the second one affects input that was previously honoured verbatim:
+ *
+ *  1. A negative override used to survive `||` and get pulled up to the floor;
+ *     it now falls back to the default instead.
+ *  2. A *finite* override above the new ceiling is now clamped down to it. The
+ *     clamps plausibly reachable in an existing deployment are:
+ *       - `HEARTBEAT_SCHEDULER_INTERVAL_MS=172800000` (48h) → `86400000` (24h)
+ *       - `PAPERCLIP_PR_RECONCILER_WINDOW_DAYS=730` → `365`
+ *       - `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=7300` → `3650`, which *shortens*
+ *         retention, so the next prune deletes backups the operator asked to keep.
+ *
+ * Both are reported through `warnNumericSettingAdjustment` when `name` is
+ * supplied, because the startup banner prints only the post-clamp number and so
+ * cannot distinguish "operator asked for 365" from "operator asked for 730".
  */
 export function resolveNumericSetting(
-  candidates: readonly unknown[],
+  candidates: readonly NumericSettingCandidate[],
   { fallback, min, max }: NumericSettingBounds,
+  name?: string,
 ): number {
   for (const candidate of candidates) {
     if (candidate === undefined || candidate === null || candidate === "") continue;
     const parsed = Number(candidate);
     // Rejects NaN (unparseable), ±Infinity (including overflow literals such as
     // "1e999"), and anything non-positive.
-    if (!Number.isFinite(parsed) || parsed <= 0) continue;
-    return Math.min(max, Math.max(min, parsed));
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      warnNumericSettingAdjustment(
+        name,
+        `ignoring override ${JSON.stringify(candidate)} — not a finite positive number`,
+      );
+      continue;
+    }
+    const resolved = Math.min(max, Math.max(min, parsed));
+    if (resolved !== parsed) {
+      warnNumericSettingAdjustment(
+        name,
+        `override ${parsed} is outside [${min}, ${max}] and was clamped to ${resolved}`,
+      );
+    }
+    return resolved;
   }
   return Math.min(max, Math.max(min, fallback));
 }
@@ -500,10 +553,12 @@ export function loadConfig(): Config {
   const databaseBackupIntervalMinutes = resolveNumericSetting(
     [process.env.PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES, fileDatabaseBackup?.intervalMinutes],
     NUMERIC_SETTING_BOUNDS.databaseBackupIntervalMinutes,
+    "databaseBackupIntervalMinutes",
   );
   const databaseBackupRetentionDays = resolveNumericSetting(
     [process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS, fileDatabaseBackup?.retentionDays],
     NUMERIC_SETTING_BOUNDS.databaseBackupRetentionDays,
+    "databaseBackupRetentionDays",
   );
   const databaseBackupDir = resolveHomeAwarePath(
     process.env.PAPERCLIP_DB_BACKUP_DIR ??
@@ -521,10 +576,12 @@ export function loadConfig(): Config {
   const prReconcilerIntervalMinutes = resolveNumericSetting(
     [process.env.PAPERCLIP_PR_RECONCILER_INTERVAL_MINUTES],
     NUMERIC_SETTING_BOUNDS.prReconcilerIntervalMinutes,
+    "prReconcilerIntervalMinutes",
   );
   const prReconcilerWindowDays = resolveNumericSetting(
     [process.env.PAPERCLIP_PR_RECONCILER_WINDOW_DAYS],
     NUMERIC_SETTING_BOUNDS.prReconcilerWindowDays,
+    "prReconcilerWindowDays",
   );
   const prReconcilerEnrichLoc =
     process.env.PAPERCLIP_PR_RECONCILER_ENRICH_LOC !== undefined
@@ -542,6 +599,7 @@ export function loadConfig(): Config {
   const strandedBlockedIssueReconcilerIntervalMinutes = resolveNumericSetting(
     [process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES],
     NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
+    "strandedBlockedIssueReconcilerIntervalMinutes",
   );
   const approvalGateReconcilerEnabled =
     process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
@@ -690,16 +748,19 @@ export function loadConfig(): Config {
     heartbeatSchedulerIntervalMs: resolveNumericSetting(
       [process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS],
       NUMERIC_SETTING_BOUNDS.heartbeatSchedulerIntervalMs,
+      "heartbeatSchedulerIntervalMs",
     ),
     // Preserve the existing wake-owner budget and six-hour horizon unless an
     // operator explicitly opts into new bounds through the configurable settings.
     recoveryActionMaxAttempts: resolveNumericSetting(
       [process.env.RECOVERY_ACTION_MAX_ATTEMPTS],
       NUMERIC_SETTING_BOUNDS.recoveryActionMaxAttempts,
+      "recoveryActionMaxAttempts",
     ),
     recoveryActionTimeoutMs: resolveNumericSetting(
       [process.env.RECOVERY_ACTION_TIMEOUT_MS],
       NUMERIC_SETTING_BOUNDS.recoveryActionTimeoutMs,
+      "recoveryActionTimeoutMs",
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
