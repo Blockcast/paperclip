@@ -454,6 +454,46 @@ describe("I1 accepts only the protected-merge approval pair", () => {
     );
   });
 
+  // The whitespace case has to be asserted HERE, through findPrViolations, and
+  // not only against duplicateBodyAcrossIdentities. That predicate does not
+  // gate anything — it picks the wording after I1 has already fired, and I1
+  // fires only when isRequiredApprovalPair returns false. A first attempt at
+  // this fix trimmed inside the predicate alone; every variant below still
+  // audited as SOUND because the deciding branch compared raw bodies and
+  // exempted the pair before the predicate was consulted. The whole suite
+  // stayed green throughout, which is exactly why the end-to-end assertion is
+  // the one that matters.
+  it("rejects a body that differs only in surrounding whitespace under both credentials", () => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)\n`;
+
+    for (const variant of [`${body}\n`, `${body}  `, `\n${body}`, `\n  ${body}\n\n`]) {
+      const reviews = requiredApprovalPair({ body }, { body: variant });
+      const context = `variant ${JSON.stringify(variant)}`;
+
+      assert.notEqual(reviews[0].body, reviews[1].body, `${context} must not be byte-identical`);
+      assert.equal(isRequiredApprovalPair(reviews, HEAD), false, context);
+      assert.match(
+        findPrViolations({ number: 1176, headSha: HEAD, reviews }).find((v) =>
+          v.startsWith("I1"),
+        ) ?? "",
+        /one verdict, posted twice/,
+        context,
+      );
+    }
+  });
+
+  // The counterweight: trimming must not collapse two genuinely distinct
+  // write-ups into a "duplicate", or the two-seat exemption stops working.
+  it("still accepts a pair whose bodies differ in substance, not just whitespace", () => {
+    const reviews = requiredApprovalPair(
+      { body: `Reviewed head: ${HEAD}\n\nApp reviewed the implementation.  ` },
+      { body: `\nReviewed head: ${HEAD}\n\nUser seat approval; see the App review above.\n` },
+    );
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
+    assert.deepEqual(findPrViolations({ number: 1177, headSha: HEAD, reviews }), []);
+  });
+
   it("names the duplicate shape rather than reporting a bare count", () => {
     const body = `Reviewed head: ${HEAD}\n\nSame text, two seats.`;
     const identical = requiredApprovalPair({ body }, { body });
