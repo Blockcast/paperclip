@@ -585,8 +585,48 @@ describe("paperclip MCP tools", () => {
     expect(JSON.parse(String(init.body))).toEqual({ reason: "Question answered itself." });
   });
 
-  it("refuses a withdraw with a blank reason instead of dropping it", async () => {
-    const fetchMock = vi.fn();
+  it("prefers reason over decisionNote when a withdraw supplies both", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "Superseded by PR #1190.",
+      decisionNote: "stale note from an earlier draft",
+    });
+
+    // `reason` is the withdraw-specific field, so it wins; `decisionNote` is only
+    // a fallback. Pinning this keeps the precedence from silently inverting.
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Superseded by PR #1190." });
+  });
+
+  it("folds reason into decisionNote on non-withdraw actions so it is never dropped", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ id: "approval-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "approve",
+      reason: "Looks good.",
+    });
+
+    // `reason` is advertised on the shared schema, so a board caller can reach for
+    // it on any action. Without the fold-back the note is silently elided by
+    // JSON.stringify and the server receives {}.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/approve",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({ decisionNote: "Looks good." });
+  });
+
+  it("refuses a withdraw with a blank reason instead of dropping it", async () => {    const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
     const tool = getTool("paperclipApprovalDecision");
