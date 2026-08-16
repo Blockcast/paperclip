@@ -403,6 +403,7 @@ import {
   recordProcessLostLivenessNull,
   recordGithubReviewRequestDelivery,
   recordGithubReviewRequestSuppressed,
+  recordGithubReviewCompletion,
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
   GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
   setGithubReviewRequestDeadLetterUnresolved,
@@ -21044,6 +21045,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reviewEvidence.status === "missing" || reviewEvidence.status === "auth_expired"
           ? reviewEvidence
           : null;
+      // BLO-27608: record the FINAL verdict — after the GitHub re-verification
+      // above, which can turn a locally-`missing` run into a proven
+      // `posted_review` (and the reverse for an unverifiable claim). Recording
+      // before it would disagree with what the run is actually credited with.
+      recordGithubReviewCompletion(reviewEvidence.status);
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
         reviewEvidence.status === "already_reviewed" ||
         reviewEvidence.status === "archived_repo_skipped" ||
@@ -28431,6 +28437,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
       }
+      // BLO-27608: record the FINAL verdict — after the GitHub re-verification
+      // above, for the same reason as the missing-Job recovery path: a run whose
+      // local evidence read `missing` but which GitHub proves did post must be
+      // counted as `posted_review`, matching how it is credited. This is the
+      // run-side companion to the webhook-observed
+      // paperclip_github_review_posted_total; a run that dies at the model call
+      // reaches no verdict at all, which is what makes a drought silence on both.
+      recordGithubReviewCompletion(prReviewCompletionEvidence.status);
       const prReviewIncompleteOverride =
         prReviewCompletionEvidence.status === "missing" ||
         prReviewCompletionEvidence.status === "auth_expired"
