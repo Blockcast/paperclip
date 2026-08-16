@@ -151,12 +151,43 @@ git rev-parse <pr-head>:<file>
 
 ## Verifying signal
 
-- `gh run list --repo Blockcast/paperclip --commit <head>` returns a `PR` run
-  for every open PR head, and `gh pr merge` is never answered with
-  `Required status check "verify" is expected.` on an approved PR.
-- No commit on `master` has `web-flow` as committer with the
-  `Merge branch 'master' into ...` subject shape:
+Check **open PR heads**, not `master`. The damage lives on the PR branch and is
+erased by the time anything lands.
+
+- Every open PR head has a `PR` run. This is the direct signal — a head with
+  zero runs is the failure itself, not a proxy for it:
 
   ```bash
-  git log origin/master --format='%H %cn %s' | grep "Merge branch 'master' into"
+  gh pr list --repo Blockcast/paperclip --state open \
+    --json number,headRefOid --jq '.[]|"\(.number) \(.headRefOid)"' |
+  while read -r n sha; do
+    c=$(gh run list --repo Blockcast/paperclip --commit "$sha" \
+          --json databaseId --jq 'length')
+    [ "$c" = "0" ] && echo "PR #$n head $sha has NO workflow runs"
+  done
   ```
+
+- No open PR branch carries a `web-flow` merge commit — i.e. catch the
+  `update-branch` call while its result is still reachable:
+
+  ```bash
+  gh pr list --repo Blockcast/paperclip --state open --json number \
+    --jq '.[].number' |
+  while read -r n; do
+    gh api "repos/Blockcast/paperclip/pulls/$n/commits" \
+      --jq ".[]|select((.parents|length)>1)|\"PR #$n merge commit \(.sha[0:8]) \(.commit.message|split(\"\n\")[0])\""
+  done
+  ```
+
+- `gh pr merge` is never answered with `Required status check "verify" is
+  expected.` on an approved PR.
+
+> **Do not grep `master` for `Merge branch 'master' into ...`.** That check was
+> in the first version of this runbook and it is unsound here: `master`'s queue
+> merges by **rebase**, so an `update-branch` merge commit never reaches
+> `master` under that subject. Verified against this runbook's own canonical
+> incident — #1111's bad head `9f87c108` (*"Merge branch 'master' into
+> codex/reopen-pr-910"*, committer `GitHub`) is **not an ancestor of
+> `master`**; #1111 landed as single-parent `8446c101`. The 15 historical hits
+> on `master` all predate the merge queue (newest `2026-08-02`), so that grep
+> now reads clean whether or not anyone is calling `update-branch`.
