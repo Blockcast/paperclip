@@ -69,7 +69,9 @@ import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.
 import { recoveryService } from "../services/recovery/service.js";
 import {
   recordGithubReviewRequestDelivery,
+  recordGithubReviewPosted,
   recordGithubWorkflowRunConclusion,
+  type GithubReviewSurface,
 } from "../services/metrics.js";
 import {
   recordMergedPullRequest,
@@ -398,6 +400,82 @@ function isActionablePrReviewComment(
 ): boolean {
   if (!hasActionablePrReviewFeedback(body)) return false;
   return isConfiguredPrReviewerAuthor(authorLogin, configuredReviewerLogin) || hasAllyConsolidatedReviewHeader(body);
+}
+
+/**
+ * Detect that this delivery IS a review the reviewer identity just published
+ * (BLO-27608), for {@link recordGithubReviewPosted}.
+ *
+ * Deliberately independent of `resolveEventContext`. That resolver answers "does
+ * this event need a wake", and its answer is `null` for most of what we need to
+ * count here: a CLEAN comment-shaped review is neither a review REQUEST nor
+ * actionable FEEDBACK (`isActionablePrReviewComment` requires findings), so it
+ * falls out as no context at all, and the reviewer's own formal review is
+ * dropped downstream as a self-echo (BLO-15799). Both of those are correct wake
+ * decisions and both would silently zero this counter — the reviewer's own
+ * output is precisely the artifact whose absence we are trying to alert on. So
+ * this reads the signed payload directly and shares no control flow with the
+ * wake path.
+ *
+ * Returns `null` for anything that is not a freshly-published reviewer review.
+ */
+function resolvePostedReviewObservation(
+  eventName: string,
+  payload: Record<string, unknown>,
+  configuredReviewerLogin: string | null | undefined,
+): { repoFullName: string | null; prNumber: number | null; surface: GithubReviewSurface } | null {
+  const repository = payload.repository as Record<string, unknown> | undefined;
+  const repoFullName = readStringField(repository, "full_name");
+  const action = payload.action as string | undefined;
+
+  if (eventName === "pull_request_review") {
+    // Only `submitted` publishes a review; `edited`/`dismissed` mutate one that
+    // was already counted when it landed.
+    if (action !== "submitted") return null;
+    const review = payload.review as Record<string, unknown> | undefined;
+    const reviewUser = review?.user as Record<string, unknown> | undefined;
+    if (!isConfiguredPrReviewerAuthor(readStringField(reviewUser, "login"), configuredReviewerLogin)) {
+      return null;
+    }
+    const pr = payload.pull_request as Record<string, unknown> | undefined;
+    const prNumberRaw = pr?.number;
+    return {
+      repoFullName,
+      prNumber: typeof prNumberRaw === "number" ? prNumberRaw : null,
+      surface: "formal",
+    };
+  }
+
+  if (eventName === "issue_comment") {
+    if (action !== "created") return null;
+    const issue = payload.issue as Record<string, unknown> | undefined;
+    // `issue_comment` fires for plain issues too; only a PR carries this key.
+    if (!issue?.pull_request) return null;
+    const comment = payload.comment as Record<string, unknown> | undefined;
+    const commentUser = comment?.user as Record<string, unknown> | undefined;
+    if (!isConfiguredPrReviewerAuthor(readStringField(commentUser, "login"), configuredReviewerLogin)) {
+      return null;
+    }
+    const commentBody = readStringField(comment, "body");
+    // The heading is what separates a published review from the reviewer
+    // identity's other PR comments — the control plane's own back-link comment
+    // (githubPostIssueComment) and an agent's review REQUEST are both authored
+    // under this same login and must not be counted as review output.
+    if (!hasAllyConsolidatedReviewHeading(commentBody)) return null;
+    // BLO-21618: a marker-prefixed agent request may legitimately quote a
+    // heading-shaped line while asking for a fresh pass. The marker is anchored
+    // to literal byte 0 and Ally's own output opens with the heading, so marker
+    // presence cleanly excludes the request case without touching real reviews.
+    if (hasPrReviewerAgentRequestMarker(commentBody)) return null;
+    const prNumberRaw = issue.number;
+    return {
+      repoFullName,
+      prNumber: typeof prNumberRaw === "number" ? prNumberRaw : null,
+      surface: "comment",
+    };
+  }
+
+  return null;
 }
 
 function timingSafeStringEq(a: string, b: string): boolean {
@@ -3379,6 +3457,37 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // BLO-27608: the review-OUTPUT counter. Every other GitHub review metric is
+    // request-side and read healthy right through the ~8.6h fleet-wide review
+    // blackout on 2026-08-12 (BLO-27123), because the runs really were enqueued
+    // and dispatched — they died at the model call and produced no artifact.
+    // This is the only signal that separates "a review came out" from "a run
+    // started". Recorded off the signed payload, before and independent of every
+    // wake decision below: the reviewer's own review is dropped as a self-echo
+    // and a clean comment-shaped review resolves to no context at all, so
+    // anything downstream of those would zero exactly the series we need.
+    const postedReview = resolvePostedReviewObservation(
+      eventName,
+      payload,
+      config.prReviewerBotLogin,
+    );
+    if (postedReview) {
+      recordGithubReviewPosted({
+        repo: postedReview.repoFullName,
+        surface: postedReview.surface,
+      });
+      logger.info(
+        {
+          event: eventName,
+          deliveryId,
+          repoFullName: postedReview.repoFullName,
+          prNumber: postedReview.prNumber,
+          surface: postedReview.surface,
+        },
+        "github webhook observed a published reviewer review",
+      );
+    }
+
     // A consolidated review can arrive as a plain issue comment, which GitHub
     // does not reflect in reviewDecision. Run the opt-in status gate directly
     // from the signed payload, independent of Paperclip issue matching and the
@@ -4425,6 +4534,7 @@ export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
 export const __test_isReviewerSelfEchoReview = isReviewerSelfEchoReview;
+export const __test_resolvePostedReviewObservation = resolvePostedReviewObservation;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;
