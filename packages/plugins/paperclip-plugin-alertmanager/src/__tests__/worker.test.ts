@@ -851,7 +851,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     mocks.state.get.mockResolvedValueOnce(suppressedState());
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -877,7 +877,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -898,7 +898,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
@@ -932,7 +932,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
     expect(written.nextEscalationAt).not.toBe("2026-04-29T09:00:00Z");
@@ -947,7 +947,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, config, TOKEN, baseInput());
+    await handleWebhook(ctx, config, true, baseInput());
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -964,7 +964,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "in_progress" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     // Body refresh, no status change — the ordinary re-fire path.
     const updatePatch = mocks.issues.update.mock.calls[0][1];
@@ -982,7 +982,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
     expect(Date.parse(written.operatorSuppressedAt as string)).toBeGreaterThan(0);
@@ -993,7 +993,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     mocks.state.get.mockResolvedValueOnce(suppressedState());
     mocks.issues.get.mockResolvedValueOnce(null);
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.issue_missing",
@@ -1008,7 +1008,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     mocks.state.get.mockResolvedValueOnce(suppressedState());
     mocks.issues.get.mockRejectedValueOnce(new Error("issues.get exploded"));
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     // Persisting an anchor off a call that never landed would start the
     // suppression clock on a status nobody actually observed.
@@ -1034,7 +1034,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "todo" });
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
     expect(written.escalationComplete).toBe(false);
@@ -1050,7 +1050,7 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
     );
     mocks.issues.get.mockResolvedValueOnce(null);
 
-    await handleWebhook(ctx, baseConfig(), TOKEN, baseInput());
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
 
     // Dropping it would restart the window on the next readable re-fire,
     // extending the mute past what the operator's close bought.
