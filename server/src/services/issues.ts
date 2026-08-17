@@ -6900,6 +6900,106 @@ export function issueService(db: Db) {
     return clearTerminalIssueRunLocks(issueId, "both");
   }
 
+   * Diagnostic detail for a 409 raised after the reap ladder above has already
+   * declined to release the lock (BLO-28219).
+   *
+   * Before this existed, the conflict body carried only the two run ids, which
+   * cannot distinguish the two cases that reach it — and they need opposite
+   * responses:
+   *
+   *   - the holder is LIVE, i.e. a concurrent sibling run of the same agent
+   *     (`maxConcurrentRuns > 1`). The fence is working as designed; the caller
+   *     must yield, not retry, and must not re-file a platform bug.
+   *   - the holder is not live but the row still could not be adopted (a
+   *     genuinely wedged lock), which is the only case worth escalating.
+   *
+   * BLO-28219 was filed as the second case and was in fact the first: the
+   * reporting run read `409` + a run id it knew had hit provider quota, and
+   * concluded the lock outlived a dead run. The holder was a *different*, still
+   * `running` sibling that only went terminal six minutes later, at which point
+   * the lock released on its own within 200ms. Reporting liveness here is what
+   * makes those two indistinguishable-by-run-id cases self-diagnosing.
+   */
+  async function describeIssueLockConflict(input: {
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+    actorAgentId: string;
+    actorRunId: string | null;
+  }) {
+    const ownerRunIds = [...new Set([
+      input.checkoutRunId,
+      input.executionRunId,
+    ].filter((runId): runId is string => Boolean(runId)))].sort();
+    if (ownerRunIds.length === 0) {
+      return {
+        lockHolders: [],
+        holderLiveness: "no_holder" as const,
+        concurrentSiblingRun: false,
+        remediation: "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
+      };
+    }
+
+    let ownerRuns;
+    try {
+      ownerRuns = await db
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, ownerRunIds))
+        .orderBy(asc(heartbeatRuns.id));
+    } catch {
+      return {
+        lockHolders: ownerRunIds.map((runId) => ({
+          runId,
+          agentId: null,
+          status: null,
+          live: null,
+          sameAgentAsActor: false,
+        })),
+        holderLiveness: "unknown" as const,
+        concurrentSiblingRun: false,
+        remediation: "The lock-holder status could not be read; retry once, then re-read the issue before escalating.",
+      };
+    }
+    const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+
+    const holders = ownerRunIds.map((runId) => {
+      const run = ownerRunById.get(runId) ?? null;
+      return {
+        runId,
+        agentId: run?.agentId ?? null,
+        status: run?.status ?? null,
+        // "Live" is the exact complement of reapable: a terminal run, or a
+        // never-started queued/scheduled_retry one, holds no real claim.
+        live: run != null && !isReapableHeartbeatRunRow(run),
+        sameAgentAsActor: run?.agentId === input.actorAgentId,
+      };
+    });
+
+    const liveHolders = holders.filter((holder) => holder.live);
+    const liveSiblings = liveHolders.filter((holder) => holder.sameAgentAsActor);
+
+    return {
+      lockHolders: holders,
+      // The single field a caller should branch on before deciding whether this
+      // 409 is a bug at all.
+      holderLiveness: liveHolders.length > 0 ? ("live" as const) : ("not_live" as const),
+      concurrentSiblingRun: liveSiblings.length > 0,
+      // `remediation` specifically: the error handler hoists a string under this
+      // key to the top level of the response body, so the fix path is visible
+      // without the caller having to dig into `details`.
+      remediation: liveHolders.length === 0
+        ? "The lock holder was not live in this snapshot. Retry once so a terminal or queued holder can be reaped; escalate only if the conflict persists."
+        : liveSiblings.length > 0
+          ? `Expected: a concurrent run of your own agent (${liveSiblings.map((holder) => holder.runId).join(", ")}) is live and holds this issue. Do NOT retry or re-file a platform bug — yield this issue to the sibling run, or wait for it to finish and the lock releases automatically.`
+          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`,
+    };
+  }
+
   type StaleExecutionLockInput = {
     issueId: string;
     companyId: string;
@@ -11403,6 +11503,12 @@ export function issueService(db: Db) {
           executionRunId: resolvedLatest.latest.executionRunId,
           actorAgentId,
           actorRunId,
+          ...(await describeIssueLockConflict({
+            checkoutRunId: resolvedLatest.latest.checkoutRunId,
+            executionRunId: resolvedLatest.latest.executionRunId,
+            actorAgentId,
+            actorRunId,
+          })),
         });
       }
 
@@ -11506,6 +11612,12 @@ export function issueService(db: Db) {
         executionRunId: latest.executionRunId,
         actorAgentId,
         actorRunId,
+        ...(await describeIssueLockConflict({
+          checkoutRunId: latest.checkoutRunId,
+          executionRunId: latest.executionRunId,
+          actorAgentId,
+          actorRunId,
+        })),
       });
     }),
 
@@ -11574,6 +11686,12 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
         reason: "pending_review_stage_locked_by_another_run",
+        ...(await describeIssueLockConflict({
+          checkoutRunId: current.checkoutRunId,
+          executionRunId: current.executionRunId,
+          actorAgentId,
+          actorRunId,
+        })),
       });
     },
 
