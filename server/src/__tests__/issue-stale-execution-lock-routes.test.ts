@@ -644,6 +644,55 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(res.body.error).toBe("Issue run ownership conflict");
   });
 
+  // BLO-28219: the conflict body used to carry only the two run ids, which cannot
+  // distinguish "a live sibling run of my own agent holds this" (working as
+  // designed — yield) from "the lock outlived a dead run" (a wedge worth
+  // escalating). BLO-28219 was filed as the second and was in fact the first.
+  it("reports live-sibling liveness and an unblock path on an ownership conflict", async () => {
+    const { companyId, agentId, failedRunId: liveHolderRunId, currentRunId } =
+      await seedCompanyAgentAndRuns({ staleRunStatus: "running" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live sibling conflict diagnostics",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: liveHolderRunId,
+      executionRunId: liveHolderRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue run ownership conflict");
+
+    // The holder is `running` and belongs to the actor's own agent, so this is
+    // the concurrency fence, not a stale lock.
+    expect(res.body.details?.holderLiveness, JSON.stringify(res.body)).toBe("live");
+    expect(res.body.details?.concurrentSiblingRun).toBe(true);
+    // `remediation` is hoisted to the top level by the error handler, so the fix
+    // path is visible without digging into `details`.
+    expect(res.body.remediation, JSON.stringify(res.body)).toContain(
+      "concurrent run of your own agent",
+    );
+    // Must steer the caller away from the two responses that wasted runs.
+    expect(res.body.remediation).toContain("Do NOT retry or re-file");
+
+    const holder = (res.body.details?.lockHolders ?? []).find(
+      (entry: { runId: string }) => entry.runId === liveHolderRunId,
+    );
+    expect(holder, JSON.stringify(res.body)).toBeTruthy();
+    expect(holder.live).toBe(true);
+    expect(holder.status).toBe("running");
+    expect(holder.sameAgentAsActor).toBe(true);
+  });
+
   it("allows the rightful assignee to release after the owning run failed", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
