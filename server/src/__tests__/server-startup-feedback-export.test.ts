@@ -45,6 +45,7 @@ const {
     resumeRunningExternalRuntimeRuns: vi.fn(async () => 0),
     stopDispatch: vi.fn(),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
+    reconcileWorkerCrashedRuns: vi.fn(async () => ({ reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
@@ -192,6 +193,10 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   getPostgresDataDirectory: vi.fn(),
   inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
   applyPendingMigrations: vi.fn(),
+  // BLO-21526 wired this into every startup migration pass (server/src/index.ts).
+  // Returns the deferred indexes it had to build; an empty array is the
+  // steady-state "nothing pending" answer and keeps the caller's loop a no-op.
+  ensurePendingConcurrentIndexes: vi.fn(async () => []),
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
@@ -534,12 +539,188 @@ describe("startServer feedback export wiring", () => {
       );
 
       intervalCallback?.();
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
-      expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalledTimes(1);
+      // `vi.waitFor` rather than a fixed number of `await Promise.resolve()`
+      // hops: the sweep is reached after several awaits inside the tick, and
+      // counting microtasks makes this fail whenever a reconciler is added
+      // ahead of it (BLO-20822 did exactly that). The property under test is
+      // that both passes still run despite an unrelated recovery rejection —
+      // not how many microtasks it takes to get there.
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+        expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalledTimes(1);
+      });
     } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-20822: a startup-only pass misses a lease left by a recoverer that
+  // died mid-cleanup on this replica's own previous life — a replica that
+  // restarts immediately runs its startup pass before that lease expires and
+  // skips the row, and nothing revisits it short of another full restart.
+  // Pre-fix, `reconcileWorkerCrashedRuns` was called only once, from the
+  // startup recovery sequence; this pins that it also runs on the recurring
+  // scheduler tick.
+  it("runs worker-crash reconciliation on the periodic scheduler tick, not just at startup", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-20822: the interval callback checks `heartbeatSchedulerStopped` before
+  // awaiting `resolveSchedulingSuppression`, but the callback itself is handed
+  // to `setInterval` and is NOT registered with `trackHeartbeatSchedulerWork`.
+  // So while it is suspended in that await, shutdown can set the flag, clear
+  // the interval, and find the in-flight set already empty — the drain barrier
+  // reports idle and shutdown proceeds. Pre-fix, when the await then resolved
+  // the callback took the single-flight latch and started crash reconciliation
+  // *after* that barrier, mutating runs and issue locks during shutdown.
+  it("does not start crash reconciliation when shutdown begins while the tick awaits suppression", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    // `startServer` installs a `process.once("SIGTERM")` handler. Isolate this
+    // test's handler from any left by earlier tests in the file, and restore
+    // the originals afterwards.
+    const priorSigterm = process.listeners("SIGTERM");
+    process.removeAllListeners("SIGTERM");
+
+    try {
+      await startServer();
+      // Both also run once from the startup recovery sequence (index.ts:1257);
+      // clear so the assertions below only see post-shutdown activity.
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+
+      // Park the SECOND suppression resolve — the one gating the reconcile /
+      // sweep pair. The first (timer tick) resolves normally so the tick gets
+      // all the way to the reconcile gate, which is where the finding is.
+      let releaseSuppression: (() => void) | null = null;
+      resolveHeartbeatSchedulingSuppressionMock
+        .mockImplementationOnce(() => ({ suppressed: false, reason: null }))
+        .mockImplementationOnce(
+          () => new Promise((resolve) => {
+            releaseSuppression = () => resolve({ suppressed: false, reason: null });
+          }),
+        );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseSuppression).not.toBeNull());
+
+      // Shutdown begins while the tick is parked. `fakeServer.close` never
+      // invokes its callback, so the handler stops there — well after the
+      // scheduler flag is set, the interval cleared and the idle barrier passed.
+      process.emit("SIGTERM" as NodeJS.Signals);
+      await vi.waitFor(() => expect(fakeServer.close).toHaveBeenCalled());
+
+      releaseSuppression?.();
+      // Give the resumed tick more than enough turns to reach the latch.
+      for (let i = 0; i < 25; i += 1) await Promise.resolve();
+
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+      process.removeAllListeners("SIGTERM");
+      for (const listener of priorSigterm) {
+        process.on("SIGTERM", listener as (...args: unknown[]) => void);
+      }
+    }
+  });
+
+  // BLO-20822: the reconciliation → stale-lock-sweep pair must stay ordered
+  // ACROSS ticks, not just within one. `setInterval` starts the next callback
+  // on schedule whether or not the previous settled, and a reconciliation batch
+  // can outlive the interval — so an in-tick `await` alone still lets tick N+1's
+  // sweeper race tick N's reconciliation, which is the exact window (lock
+  // cleared between terminalizing the crashed run and handing it to the retry)
+  // that the ordering exists to close. The test above proves the pair runs
+  // periodically but cannot tell a latched implementation from an unlatched one;
+  // this discriminates by parking the first reconciliation and firing a second
+  // tick underneath it.
+  it("does not start a second reconciliation or sweep while the first is still in flight", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    let releaseReconciliation: (() => void) | null = null;
+    try {
+      await startServer();
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockClear();
+      heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+
+      // Park the first reconciliation so the pair is still in flight when the
+      // next tick fires.
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseReconciliation = () =>
+              resolve({ reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] });
+          }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1),
+      );
+
+      // Second tick, first still parked. Pre-latch this started a concurrent
+      // reconciliation; the sweep must not run either, since it is what would
+      // clear the lock out from under the parked reconciliation's hand-over.
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalled(),
+      );
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
+
+      // Once it drains, the pair completes and a later tick can run it again.
+      releaseReconciliation?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1));
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).toHaveBeenCalledTimes(2),
+      );
+    } finally {
+      releaseReconciliation?.();
       setIntervalSpy.mockRestore();
     }
   });
