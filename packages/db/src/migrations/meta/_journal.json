@@ -1520,6 +1520,27 @@
       "when": 1787356573975,
       "tag": "0224_heartbeat_runs_overdue_scheduled_retry_index",
       "breakpoints": true
+    },
+    {
+      "idx": 225,
+      "version": "7",
+      "when": 1787356574975,
+      "tag": "0225_heartbeat_runs_crash_recovery_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 226,
+      "version": "7",
+      "when": 1787356575975,
+      "tag": "0226_heartbeat_runs_crash_recovery_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 227,
+      "version": "7",
+      "when": 1787356576975,
+      "tag": "0227_heartbeat_runs_crash_recovery_validate",
+      "breakpoints": true
     }
   ]
 }

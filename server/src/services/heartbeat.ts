@@ -5,6 +5,99 @@ import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+
+/**
+ * Either the pool or an open transaction. BLO-19722 needs a handful of writes
+ * to run on the same transaction that took a per-run advisory lock, so the
+ * helpers they go through accept an executor rather than always closing over
+ * the pool.
+ */
+type HeartbeatTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type HeartbeatDbExecutor = Db | HeartbeatTx;
+
+/**
+ * Outcome of `enqueueProcessLossRetry` (BLO-19722).
+ *
+ * Replaces a `run | null` return that conflated an intentional no-work result
+ * ("the agent is not invokable, so there is deliberately no retry") with a
+ * failure. Worker-crash recovery must stamp its completion marker for the
+ * former and replay for the latter, so the difference has to survive the
+ * return.
+ */
+type ProcessLossRetryResult =
+  /**
+   * A new retry run was queued by this call.
+   *
+   * `issueLockOwnedByRetry` reports whether the retry actually ends up holding
+   * the issue's execution lock. For a freshly `created` retry that is always
+   * `false`, and not by accident: master's "bind issue locks only for running
+   * runs" rule (8446c1011) means enqueue RELEASES the original's lock rather
+   * than handing it to the queued retry, and lazy locking stamps
+   * `issues.execution_run_id` at CLAIM time instead. An `adopted` retry may own
+   * one, because it may already have been claimed, so that arm reads the row.
+   * Callers must not infer ownership from `kind`.
+   *
+   * `retryContinuesContextIssue` is the *decision* callers actually need, and
+   * it is deliberately NOT the same question (BLO-21623, Ally round 9). Lock
+   * ownership is the wrong predicate for "will this retry carry the issue
+   * forward", because the lazy-locking model only stamps
+   * `issues.execution_run_id` at CLAIM time — see `reconcileDetachedQueuedRuns`
+   * (BLO-21621). A `queued` run that owns no lock is therefore the NORMAL
+   * shape, not a dead one: the dispatcher still picks it up and stamps the lock
+   * when it claims. So gating promotion on ownership promotes a deferred wake
+   * *beside* a still-runnable adopted retry — two continuations for one failed
+   * execution, which is the race the round-7 gate exists to prevent.
+   *
+   * The predicate is instead "this retry is a live continuation *of the context
+   * issue*": the run is non-terminal AND the original had a context issue for
+   * it to inherit. Both halves matter. Dropping the status half is the round-8
+   * bug (a terminal retry continues nothing, so the wake must promote or the
+   * issue strands — BLO-21309). Dropping the context-issue half would suppress
+   * promotion for issue-less runs, whose retry carries no `issueId` and so
+   * cannot continue the sibling issue a deferred wake is parked behind.
+   */
+  | {
+      kind: "created";
+      run: typeof heartbeatRuns.$inferSelect;
+      issueLockOwnedByRetry: boolean;
+      retryContinuesContextIssue: boolean;
+    }
+  /** A retry already existed (or was created concurrently); we adopted it. */
+  | {
+      kind: "adopted";
+      run: typeof heartbeatRuns.$inferSelect;
+      issueLockOwnedByRetry: boolean;
+      retryContinuesContextIssue: boolean;
+    }
+  /** No retry, on purpose: no actor could run it. Recovery is still complete. */
+  | { kind: "suppressed"; reason: string };
+
+/**
+ * Outcome of a single worker-crash recovery step (BLO-19722).
+ *
+ * `incomplete` is the only value that blocks the completion marker. Everything
+ * else — including deliberate no-work and best-effort audit failures — leaves
+ * the run stampable, because replaying it would never produce a different
+ * result and would instead pin the run at the head of the oldest-first
+ * candidate batch forever.
+ */
+type CrashRecoveryStepOutcome =
+  | { kind: "done" }
+  | { kind: "skipped"; detail: string }
+  | { kind: "incomplete"; detail: string };
+
+/**
+ * Outcome of `finalizeAgentStatus` when called with ownership enforcement
+ * (BLO-19722).
+ *
+ * `superseded` means a newer run owns the agent's derived state and this
+ * (stale) replay correctly declined to overwrite it — a success for recovery
+ * purposes, not a failure to retry.
+ */
+type AgentFinalizationResult =
+  | { kind: "applied" }
+  | { kind: "superseded"; reason: string }
+  | { kind: "failed"; reason: string };
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
@@ -1574,6 +1667,124 @@ const EXTERNAL_LIFECYCLE_ADAPTERS = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_T
 // threshold. Issue/worktree ownership stays more conservative: a running row
 // holds its issue until it reaches a terminal/missing lifecycle state.
 const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
+// BLO-19722: bounded so a pathological backlog cannot stall startup recovery
+// ahead of the reattach and reaper passes; the next start picks up the rest.
+const WORKER_CRASH_RECONCILE_MAX_RUNS = 200;
+// The batch cap above bounds ROWS, not TIME, and only time is what starves the
+// startup passes that queue behind this one. Each row can sit in a provider
+// release for `ENVIRONMENT_LEASE_RELEASE_TIMEOUT_MS`, so during a provider
+// outage a full 200-row batch is hours of serial waiting while external
+// reattachment, orphan reaping and queued-run resumption wait their turn. Two
+// minutes is comfortably more than a healthy full batch needs (releases resolve
+// in milliseconds when the provider is up) and short enough that a sick
+// provider costs one tick rather than a startup.
+const WORKER_CRASH_RECONCILE_BUDGET_MS = 2 * 60 * 1000;
+// Poison-row backoff. Candidates are drained oldest-first, so a run whose
+// *required* cleanup permanently fails would otherwise sit at the head of that
+// order and freeze recovery of every newer run. Backing a failing row off
+// (exponentially, capped) drops it out of the candidate window without ever
+// marking it complete, so newer runs make progress while the failure stays
+// visible and eventually retried.
+const WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS = 5 * 60 * 1000;
+const WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
+// Hard timeout on a per-run recovery claim. The claim is what makes exactly one
+// replica recover a given run; the timeout is what stops a recoverer that dies
+// mid-cleanup from wedging the row forever. Comfortably longer than a recovery
+// (a handful of queries plus one provider release), short enough that a crashed
+// holder's work is picked up on a later start rather than left indefinitely.
+const WORKER_CRASH_RECOVERY_CLAIM_TTL_MS = 10 * 60 * 1000;
+// The claim lease above is only honest if the work it covers cannot outlast it.
+// Every other recovery step is a pooled query with its own statement timeout;
+// the environment-lease release is the one call that reaches a provider and has
+// no inherent bound. Capping it at half the lease keeps the whole recovery
+// inside its claim by construction, so the compare-and-set on the terminal
+// writes is a backstop for the pathological case rather than the only thing
+// standing between two live recoverers. Renewing the lease from a timer was the
+// alternative; it was rejected because it adds a second liveness mechanism (and
+// a background timer per in-flight recovery) to protect a call we can simply
+// bound, and a stalled renewal query would fail in exactly the cases a stalled
+// provider call does.
+const WORKER_CRASH_RECOVERY_PROVIDER_RELEASE_TIMEOUT_MS = WORKER_CRASH_RECOVERY_CLAIM_TTL_MS / 2;
+// Keep the durable diagnostic small; it is a breadcrumb, not a log sink.
+const WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS = 500;
+
+/**
+ * Race `work` against `timeoutMs`, converting a timeout into the same shape a
+ * failed call would produce (via `onTimeout`) rather than throwing. Used for
+ * the single provider call inside crash recovery, so the recovery cannot run
+ * past the claim lease it took. The abandoned promise is left to settle on its
+ * own — there is no cancellation contract on the provider side.
+ */
+async function withRecoveryProviderTimeout<T>(
+  label: string,
+  work: Promise<T>,
+  onTimeout: (detail: string) => T,
+  timeoutMs: number = WORKER_CRASH_RECOVERY_PROVIDER_RELEASE_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(
+      () => resolve(onTimeout(`${label} exceeded ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    // Never hold the event loop open on behalf of a recovery timeout.
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function workerCrashRecoveryBackoffMs(attempts: number): number {
+  // Cap the exponent, not the resulting scale: 2**31 * five minutes already
+  // exceeds the six-hour ceiling by orders of magnitude, so the exponent bound
+  // exists purely to keep the intermediate finite. Clamping the scale against a
+  // *millisecond* ceiling — as an earlier version did — compared a unitless
+  // multiplier to a duration; it happened to clamp correctly but only by
+  // accident of the constants.
+  const exponent = Math.min(Math.max(0, attempts - 1), 31);
+  return Math.min(WORKER_CRASH_RECOVERY_BACKOFF_BASE_MS * 2 ** exponent, WORKER_CRASH_RECOVERY_BACKOFF_MAX_MS);
+}
+
+/**
+ * Normalize an injected `now` into a clock that is read at each point of use.
+ *
+ * Crash-recovery batches are serial and a single row can sit for minutes inside
+ * a provider RPC, so one batch-start timestamp is not a safe basis for anything
+ * carrying a deadline. A lease derived from it is already partly — or entirely —
+ * spent by the time a later row is claimed, which hands that row to any peer
+ * replica as immediately reclaimable and defeats the single-owner guarantee the
+ * claim exists for; a backoff derived from it is short by the batch's elapsed
+ * time, and its claim guard is correspondingly stale.
+ *
+ * Tests that inject a fixed `Date` still observe exactly that instant at every
+ * call, so assertions pinned to an injected clock keep holding. Tests that need
+ * time to advance mid-batch inject a function instead.
+ */
+function resolveCrashRecoveryClock(now: Date | (() => Date) | undefined): () => Date {
+  if (typeof now === "function") return now;
+  if (now) return () => now;
+  return () => new Date();
+}
+
+function describeRecoveryError(error: unknown): string {
+  const text = error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : typeof error === "string"
+      ? error
+      : (() => {
+        try {
+          return JSON.stringify(error) ?? String(error);
+        } catch {
+          return String(error);
+        }
+      })();
+  return text.length > WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS
+    ? `${text.slice(0, WORKER_CRASH_RECOVERY_ERROR_MAX_CHARS - 1)}…`
+    : text;
+}
 // External-lifecycle adapters create a DB run before the adapter.invoke event
 // is appended. Startup and periodic reapers can overlap that setup window;
 // give slow pre-run hooks and kube Job creation time to reach adapter.invoke.
@@ -10029,6 +10240,51 @@ export interface HeartbeatServiceOptions {
   beforeQueuedDispatchRefusalStatusReadForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only failure injection: fired at the start of `enqueueProcessLossRetry`,
+   * before any DB work. Throwing here simulates the enqueue itself failing —
+   * otherwise not reachable from the public test surface — so
+   * `recoverCrashInterruptedRun`'s "retry_enqueue incomplete, so issue_release
+   * must not run" gate (BLO-20822) can be exercised deterministically.
+   */
+  beforeProcessLossRetryEnqueueForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /**
+   * Test-only override for the crash-recovery provider-release timeout, whose
+   * production value is half the ten-minute claim lease. Lets a test prove the
+   * bound exists without waiting five minutes for it.
+   */
+  workerCrashRecoveryProviderTimeoutMsForTest?: number;
+  /**
+   * Test-only failure injection: fired inside `appendRunEventAtomicSeq`'s
+   * transaction, after the event row has been inserted but before commit.
+   * Throwing here rolls the insert back, which is the only case that can
+   * distinguish publishing inside the transaction from publishing after it
+   * (BLO-20822).
+   */
+  afterRunEventAppendedInTransactionForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /**
+   * Test-only failure injection for the crash-recovery agent load. A transient
+   * `getAgent` failure must be distinguishable from a genuinely missing agent
+   * row: the first still owes the run a retry and so must keep the issue
+   * execution lock, the second never will and must release it (BLO-20822).
+   */
+  beforeCrashRecoveryAgentLoadForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
+  /**
+   * Test-only failure injection fired immediately before the terminal
+   * completion/backoff write in `recoverCrashInterruptedRun`. Throwing here is
+   * the only way to reach the "every step ran but the bookkeeping write itself
+   * failed" branch, which must report the run unresolved rather than
+   * reconciled (BLO-20822).
+   */
+  beforeCrashRecoveryTerminalWriteForTest?: (
+    run: typeof heartbeatRuns.$inferSelect,
+  ) => Promise<void> | void;
   /** Test-only hook after a queued run commits and before dispatch can claim it. */
   beforeQueuedRunDispatchForTest?: (
     run: typeof heartbeatRuns.$inferSelect,
@@ -10568,13 +10824,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return completedRun;
   }
 
+  /**
+   * Releases this run's environment leases and reports whether every lease
+   * actually reached a released state.
+   *
+   * BLO-19722: the return value matters to worker-crash recovery, which must
+   * distinguish "cleanup finished" from "cleanup failed". A lease left `active`
+   * is a *required* step failure — the run's environment stays reserved, so the
+   * recovery may not be marked complete and has to be replayed. Errors are
+   * still logged and swallowed rather than thrown, so the pre-existing callers
+   * that ignore this value keep their previous behaviour exactly.
+   */
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
     companyId: string;
     agentId: string;
     status: string | null | undefined;
     failureReason?: string | null;
-  }) {
+  }): Promise<{ fullyReleased: boolean; failureReason: string | null }> {
+    let threw: unknown = null;
     const releaseResult = await envOrchestrator.releaseForRun({
       heartbeatRunId: input.runId,
       companyId: input.companyId,
@@ -10583,6 +10851,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       failureReason: input.failureReason ?? undefined,
     }).catch((err) => {
       logger.warn({ err, runId: input.runId }, "failed to release environment leases for heartbeat run");
+      threw = err;
       return null;
     });
     for (const releaseError of releaseResult?.errors ?? []) {
@@ -10591,7 +10860,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "failed to release environment lease for heartbeat run",
       );
     }
+    if (threw) {
+      return { fullyReleased: false, failureReason: `environment lease release threw: ${describeRecoveryError(threw)}` };
+    }
+    const failedLeases = releaseResult?.errors ?? [];
+    if (failedLeases.length > 0) {
+      return {
+        fullyReleased: false,
+        failureReason: `${failedLeases.length} environment lease(s) left unreleased`,
+      };
+    }
+    return { fullyReleased: true, failureReason: null };
   }
+
 
   async function hasUnsafeTextProjectionDatabase() {
     if (!unsafeTextProjectionPromise) {
@@ -13998,7 +14279,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message?: string;
       payload?: Record<string, unknown>;
     },
-  ) {
+    // BLO-19722: lets `appendRunEventAtomicSeq` perform the insert on the same
+    // transaction that allocated `seq`, so allocation and append share one
+    // owner. Defaults to the pool, which is every pre-existing caller.
+    executor: HeartbeatDbExecutor = db,
+  ): Promise<{ publish: () => void }> {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
@@ -14019,7 +14304,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       at: eventAt,
     });
 
-    await db.insert(heartbeatRunEvents).values({
+    await executor.insert(heartbeatRunEvents).values({
       companyId: run.companyId,
       runId: run.id,
       agentId: run.agentId,
@@ -14032,40 +14317,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: sanitizedPayload,
     });
 
-    publishLiveEvent({
-      companyId: run.companyId,
-      type: "heartbeat.run.event",
-      payload: {
-        runId: run.id,
-        agentId: run.agentId,
-        issueId,
-        seq,
-        eventType: event.eventType,
-        stream: event.stream ?? null,
-        level: event.level ?? null,
-        color: event.color ?? null,
-        message: sanitizedMessage ?? null,
-        currentToolName: progress?.currentToolName ?? null,
-        lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
-        lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
-        payload: sanitizedPayload ?? null,
-      },
-    });
-    if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
-      const status = setHeartbeatRunRuntimeStatus({
+    const publish = () => {
+      publishLiveEvent({
         companyId: run.companyId,
-        issueId,
-        agentId: run.agentId,
-        runId: run.id,
-        phase: progress.phase,
-        message: progress.message,
-        updatedAt: eventAt,
-        currentToolName: progress.currentToolName,
-        lastAssistantSnippet: progress.lastAssistantSnippet,
-        lastEventAt: progress.lastEventAt,
+        type: "heartbeat.run.event",
+        payload: {
+          runId: run.id,
+          agentId: run.agentId,
+          issueId,
+          seq,
+          eventType: event.eventType,
+          stream: event.stream ?? null,
+          level: event.level ?? null,
+          color: event.color ?? null,
+          message: sanitizedMessage ?? null,
+          currentToolName: progress?.currentToolName ?? null,
+          lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
+          lastEventAt: (progress?.lastEventAt ?? eventAt).toISOString(),
+          payload: sanitizedPayload ?? null,
+        },
       });
-      if (status) publishHeartbeatRunRuntimeProgress(status);
+      if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
+        const status = setHeartbeatRunRuntimeStatus({
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          runId: run.id,
+          phase: progress.phase,
+          message: progress.message,
+          updatedAt: eventAt,
+          currentToolName: progress.currentToolName,
+          lastAssistantSnippet: progress.lastAssistantSnippet,
+          lastEventAt: progress.lastEventAt,
+        });
+        if (status) publishHeartbeatRunRuntimeProgress(status);
+      }
+    };
+
+    // BLO-19722: a caller that passes an explicit executor is writing inside
+    // its own transaction (see `appendRunEventAtomicSeq` below) and owns when
+    // to publish. Publishing here, before that transaction commits, would let
+    // a rollback leave subscribers holding a phantom event for a row that was
+    // never durably written. The default pooled executor autocommits the
+    // insert above before this line runs, so every pre-existing caller (which
+    // never passes an executor) keeps publishing immediately.
+    if (executor === db) {
+      publish();
     }
+    return { publish };
   }
 
   async function nextRunEventSeq(runId: string) {
@@ -14074,6 +14373,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runId));
     return Number(row?.maxSeq ?? 0) + 1;
+  }
+
+  /**
+   * Allocate the next event sequence and append the event under one owner
+   * (BLO-19722).
+   *
+   * `nextRunEventSeq` followed by `appendRunEvent` is a read-then-write race:
+   * two writers appending to the same run both read the same `max(seq)` and
+   * both insert it. There is no unique constraint on `(run_id, seq)` to turn
+   * that into a retryable error — `heartbeat_run_events_run_seq_idx` is a plain
+   * index — so the duplicate is silent, and the run's event stream ends up with
+   * two events claiming the same position.
+   *
+   * That race is reachable in normal operation on the crash-recovery path:
+   * startup reconciliation runs on every replica, so several processes can be
+   * appending lifecycle events to the same crash-marked run at once.
+   *
+   * A transaction-scoped advisory lock keyed on the run makes allocation and
+   * insert atomic without a migration, and — unlike a claim column — it is
+   * released automatically if the holder dies. The lock is held only across two
+   * cheap statements: never across provider RPC, and never around the retry
+   * enqueue (which takes a *different* key of its own; see
+   * `enqueueProcessLossRetry`), so the two cannot deadlock against each other.
+   */
+  async function appendRunEventAtomicSeq(
+    run: typeof heartbeatRuns.$inferSelect,
+    event: {
+      eventType: string;
+      stream?: "system" | "stdout" | "stderr";
+      level?: "info" | "warn" | "error";
+      color?: string;
+      message?: string;
+      payload?: Record<string, unknown>;
+    },
+  ) {
+    // BLO-19722: publish is deferred out of the transaction and invoked here,
+    // after `db.transaction` has committed — see the comment on
+    // `appendRunEvent`'s `publish` closure for why publishing inside the
+    // still-open transaction would risk a phantom event on rollback.
+    const { publish } = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-run-event-seq:${run.id}`}, 0))`,
+      );
+      const [row] = await tx
+        .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, run.id));
+      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
+      // Test-only: the append has succeeded but the transaction has not
+      // committed. Throwing here is the only way to reach the rollback-after-
+      // successful-insert case, which is precisely the one where publishing
+      // early would leak a phantom event.
+      await options.afterRunEventAppendedInTransactionForTest?.(run);
+      return appended;
+    });
+    publish();
   }
 
   async function persistRunProcessMetadata(
@@ -14446,26 +14801,103 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
+  /**
+   * Queue the replacement run for a run whose process was lost.
+   *
+   * BLO-19722: returns a *typed* outcome rather than `run | null`. The null
+   * conflated two cases that worker-crash recovery has to treat oppositely —
+   * "no retry was created because the agent is not invokable", which is a
+   * finished, intentional no-work result, and "no retry exists because
+   * something failed", which must be replayed. Callers now branch on `kind`.
+   *
+   * `suppressed` deliberately does *not* release the issue execution lock here
+   * any more. It used to, while every caller also released on a falsy return —
+   * so the release ran twice on this path. Ownership of that decision now sits
+   * with the caller, which is the only place that knows whether some other
+   * retry already owns the issue.
+   */
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
-  ) {
+  ): Promise<ProcessLossRetryResult> {
+    await options.beforeProcessLossRetryEnqueueForTest?.(run);
+
+    // A stage exit wins over process-loss recovery.  Keep this fast-path
+    // outside the enqueue transaction as well as the guarded check below: the
+    // terminal transition can race this call, so both sides need to report the
+    // same typed suppression outcome.
     if (isPersistedPipelineStageExitRun(run)) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
         message: "Process-loss retry suppressed because pipeline stage exit already cancelled this run",
+        payload: { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE },
+      });
+      return { kind: "suppressed", reason: "pipeline_stage_exited" };
+    }
+
+    // Hoisted above the dedupe fast path: every run-bearing return below has to
+    // report issue-lock ownership, including the one that returns before the
+    // retry is built. Parsing the snapshot is pure, so moving it costs nothing.
+    const issueIdForLock = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+
+    // The retry owns the issue only if the issue's execution lock actually
+    // points at it *now*. Read it rather than assuming the hand-over landed —
+    // see `ProcessLossRetryResult`. A run with no issue has no lock to own.
+    const issueLockOwnedBy = async (retryRunId: string) => {
+      if (!issueIdForLock) return false;
+      const rows = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.id, issueIdForLock),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, retryRunId),
+        ));
+      return rows.length > 0;
+    };
+
+    // Whether a retry run will carry the CONTEXT ISSUE forward, which is what
+    // decides deferred-wake promotion. See `ProcessLossRetryResult` for why
+    // this is not `issueLockOwnedByRetry`: a `queued` retry owning no lock is
+    // the normal shape under lazy locking (BLO-21621), and treating it as dead
+    // promotes a second runnable path beside it (BLO-21623).
+    const continuesContextIssue = (retry: typeof heartbeatRuns.$inferSelect) =>
+      Boolean(issueIdForLock) &&
+      readNonEmptyString(parseObject(retry.contextSnapshot).issueId) === issueIdForLock &&
+      !HEARTBEAT_RUN_TERMINAL_STATUSES.some((status) => status === retry.status);
+    const pickExistingRetry = (retries: Array<typeof heartbeatRuns.$inferSelect>) =>
+      retries.find(continuesContextIssue) ?? retries[0] ?? null;
+
+    const existingRetries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+    const existingRetry = pickExistingRetry(existingRetries);
+    if (existingRetry) {
+      await appendRunEventAtomicSeq(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
         payload: {
-          errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE,
+          retryRunId: existingRetry.id,
+          retryRunStatus: existingRetry.status,
         },
       });
-      return null;
+      return {
+        kind: "adopted",
+        run: existingRetry,
+        issueLockOwnedByRetry: await issueLockOwnedBy(existingRetry.id),
+        retryContinuesContextIssue: continuesContextIssue(existingRetry),
+      };
     }
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
@@ -14476,29 +14908,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...invokability.details,
         },
       });
-      await releaseIssueExecutionAndPromote(run);
-      return null;
+      return { kind: "suppressed", reason: invokability.reason ?? "agent_not_invokable" };
     }
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: "Process-loss retry suppressed because the run has no open issue",
-      });
-      return null;
-    }
-    if (!UUID_PATTERN.test(issueId)) {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+    if (issueId && !UUID_PATTERN.test(issueId)) {
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
         message: "Process-loss retry suppressed because the run issue id is malformed",
       });
-      return null;
+      return { kind: "suppressed", reason: "malformed_issue_id" };
     }
     const retryReason = readNonEmptyString(contextSnapshot.wakeReason) === "issue_monitor_due"
       ? "issue_continuation_needed"
@@ -14513,50 +14935,84 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
-    const claim = await db.transaction(async (tx) => {
-      // Keep the issue-before-run locking order used by the dispatcher. Once
-      // both ownership rows are locked, stage exit cannot race a retry claim.
-      const issue = await tx
-        .select({
-          id: issues.id,
-          status: issues.status,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
-        .limit(1)
-        .for("update")
-        .then((rows) => rows[0] ?? null);
+    const queued = await db.transaction(async (tx) => {
+      // BLO-19722: the pre-flight dedupe select above is a fast path, not a
+      // guarantee — between it and this insert another process can queue the
+      // same retry. That race became reachable in normal operation once startup
+      // crash reconciliation began running on every replica, so two API pods
+      // and the worker can all recover the same crash-marked run concurrently.
+      // Two retries means two wakeup requests and two agent invocations for one
+      // failed execution.
+      //
+      // A unique constraint on `retry_of_run_id` would be the tighter fix, but
+      // it is not available: several recovery paths legitimately point more than
+      // one child at the same parent run (recovery/service.ts threads
+      // `latestRun.id` into repeated recovery mints), so the column is not
+      // unique today and cannot be made so without changing those semantics. An
+      // advisory lock keyed on the parent run gives the same atomicity for just
+      // this decision, and — unlike a claim column — it is released
+      // automatically if the holder's process dies, so a crashed recoverer can
+      // never wedge the row for the next one.
+      //
+      // This lock is taken *inside* this transaction on this transaction's
+      // connection. No caller may wrap this function in an outer transaction
+      // that takes the same key: the inner acquisition would run on a different
+      // pooled connection and block on the outer holder forever, hanging
+      // startup on every replica. That is why worker-crash recovery runs its
+      // steps sequentially without an enclosing transaction.
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`heartbeat-process-loss-retry:${run.id}`}, 0))`,
+      );
+      const racedRetries = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const racedRetry = pickExistingRetry(racedRetries);
+      if (racedRetry) {
+        return {
+          retryRun: racedRetry,
+          created: false as const,
+          issueLockUnavailable: false as const,
+          suppressionReason: undefined,
+        };
+      }
+
+      // Transactions touching both ownership rows always lock issue before run.
+      // `for update` on issues both takes that lock and returns the row the
+      // ownership test below reads, so the test can never observe a value from
+      // before the lock was held.
+      const issueLock = issueId
+        ? await tx
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null)
+        : null;
       const sourceRun = await tx
         .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
         .limit(1)
-        .for("update")
-        .then((rows) => rows[0] ?? null);
-      if (!sourceRun || isPersistedPipelineStageExitRun(sourceRun)) {
-        return { kind: "pipeline_stage_exited" as const };
-      }
-      if (
-        !issue ||
-        TERMINAL_ISSUE_STATUSES.has(issue.status) ||
-        issue.executionRunId !== sourceRun.id
-      ) {
+        .for("update");
+      const lockedSourceRun = sourceRun[0] ?? null;
+      if (!lockedSourceRun || isPersistedPipelineStageExitRun(lockedSourceRun)) {
         return {
-          kind: "issue_not_open" as const,
-          issueStatus: issue?.status ?? null,
-          executionRunId: issue?.executionRunId ?? null,
+          retryRun: null,
+          created: false as const,
+          issueLockUnavailable: true as const,
+          suppressionReason: "pipeline_stage_exited" as const,
         };
       }
-
-      const existingRetry = await tx
-        .select()
-        .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, sourceRun.id)))
-        .orderBy(asc(heartbeatRuns.createdAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (existingRetry) return { kind: "existing" as const, retryRun: existingRetry };
+      if (issueId && issueLock?.executionRunId !== lockedSourceRun.id) {
+        return {
+          retryRun: null,
+          created: false as const,
+          issueLockUnavailable: true as const,
+          suppressionReason: "issue_lock_not_owned" as const,
+        };
+      }
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -14590,8 +15046,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: retryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: sessionBefore,
-          retryOfRunId: sourceRun.id,
-          processLossRetryCount: (sourceRun.processLossRetryCount ?? 0) + 1,
+          retryOfRunId: lockedSourceRun.id,
+          processLossRetryCount: (lockedSourceRun.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
         })
         .returning()
@@ -14608,84 +15064,94 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx
         .update(heartbeatRuns)
         .set({
-          processLossRetryCount: (sourceRun.processLossRetryCount ?? 0) + 1,
+          processLossRetryCount: (lockedSourceRun.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
         })
-        .where(eq(heartbeatRuns.id, sourceRun.id));
+        .where(eq(heartbeatRuns.id, lockedSourceRun.id));
 
-      // Queued retries do not own the execution lock; the dispatcher claims it
-      // when the retry actually starts. This also releases the exiting run's
-      // ownership without letting it be repointed after the stage-exit check.
-      await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: now,
-        })
-        .where(and(
-          eq(issues.id, issueId),
-          eq(issues.companyId, run.companyId),
-          eq(issues.executionRunId, sourceRun.id),
-        ));
+      // Master's "bind issue locks only for running runs" rule (8446c1011):
+      // the retry is `queued`, so enqueue RELEASES the original's lock instead
+      // of handing it over. The dispatcher stamps `execution_run_id` when it
+      // claims the retry — lazy locking, `reconcileDetachedQueuedRuns`
+      // (BLO-21621). Still guarded on `execution_run_id = run.id`, so it is a
+      // no-op once the lock has moved on — most likely cleared by
+      // `sweepStaleIssueLocks`, which sees the crash-marked original as
+      // terminal and therefore cleanable for the whole of recovery.
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, lockedSourceRun.id)));
+      }
 
-      return { kind: "queued" as const, retryRun };
+      return {
+        retryRun,
+        created: true as const,
+        issueLockUnavailable: false as const,
+        suppressionReason: undefined,
+      };
     });
 
-    if (claim.kind === "pipeline_stage_exited") {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+    if (queued.issueLockUnavailable) {
+      const reason = queued.suppressionReason ?? "issue_lock_not_owned";
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "Process-loss retry suppressed because pipeline stage exit won the terminal transition",
-        payload: { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE },
-      });
-      return null;
-    }
-    if (claim.kind === "issue_not_open") {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: "Process-loss retry suppressed because the source issue is no longer open and owned by this run",
+        message: reason === "pipeline_stage_exited"
+          ? "Process-loss retry suppressed because pipeline stage exit won the terminal transition"
+          : "Process-loss retry suppressed because the source issue is no longer open and owned by this run",
         payload: {
-          issueId,
-          issueStatus: claim.issueStatus,
-          executionRunId: claim.executionRunId,
+          ...(reason === "pipeline_stage_exited" ? { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE } : {}),
+          ...(reason !== "pipeline_stage_exited" && issueId ? { issueId } : {}),
         },
       });
-      return null;
+      return { kind: "suppressed", reason };
     }
-    if (claim.kind === "existing") {
-      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+
+    // The loser of the advisory-lock race adopts the winner's retry and skips
+    // every side effect that belongs to *creating* one — no second live event,
+    // no second "queued automatic retry" lifecycle line on a run it did not
+    // queue. Callers still get the retry back, so their own bookkeeping (the
+    // "a retry exists, leave the issue lock alone" branch) stays correct.
+    if (!queued.created) {
+      await appendRunEventAtomicSeq(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        message: "Process-loss retry was queued concurrently by another worker; adopting it",
         payload: {
-          retryRunId: claim.retryRun.id,
-          retryRunStatus: claim.retryRun.status,
+          retryRunId: queued.retryRun.id,
+          retryRunStatus: queued.retryRun.status,
         },
       });
-      return claim.retryRun;
+      return {
+        kind: "adopted",
+        run: queued.retryRun,
+        issueLockOwnedByRetry: await issueLockOwnedBy(queued.retryRun.id),
+        retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
+      };
     }
-    const queued = claim.retryRun;
 
     publishLiveEvent({
-      companyId: queued.companyId,
+      companyId: queued.retryRun.companyId,
       type: "heartbeat.run.queued",
       payload: {
-        runId: queued.id,
-        agentId: queued.agentId,
-        invocationSource: queued.invocationSource,
-        triggerDetail: queued.triggerDetail,
-        wakeupRequestId: queued.wakeupRequestId,
+        runId: queued.retryRun.id,
+        agentId: queued.retryRun.agentId,
+        invocationSource: queued.retryRun.invocationSource,
+        triggerDetail: queued.retryRun.triggerDetail,
+        wakeupRequestId: queued.retryRun.wakeupRequestId,
       },
     });
 
-    await appendRunEvent(queued, 1, {
+    await appendRunEvent(queued.retryRun, 1, {
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
@@ -14695,7 +15161,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    return queued;
+    return {
+      kind: "created",
+      run: queued.retryRun,
+      // Always false, and not a shortcut: the transaction above RELEASED the
+      // context lock rather than handing it to this `queued` retry, because
+      // issue locks bind only to running runs (8446c1011). The dispatcher
+      // stamps it at claim time. Reporting the release outcome here would
+      // invert the meaning — a successful release is precisely the case where
+      // the retry owns nothing.
+      issueLockOwnedByRetry: false,
+      retryContinuesContextIssue: continuesContextIssue(queued.retryRun),
+    };
   }
 
   function toHotRestartIntentRun(input: {
@@ -14979,6 +15456,846 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  /**
+   * Crash-time counterpart to {@link drainRunningRunsForShutdown} (BLO-19722).
+   *
+   * A SIGTERM drain gets seconds and a healthy process; this runs from inside
+   * the process crash guard with the process already dying, so it is
+   * deliberately the smallest thing that fixes the attribution problem: one
+   * guarded bulk claim flipping this worker's still-`running`,
+   * non-external-lifecycle runs to `interrupted` with
+   * `errorCode: "worker_crashed"`, followed by the same bounded retry /
+   * lock-release cleanup the graceful drain uses.
+   *
+   * Without this, every run the crash orphaned stayed `running` until a reaper
+   * noticed minutes later and reconciled it as `job_missing` — "External
+   * lifecycle Job is missing while heartbeat run is still running" — which
+   * names the symptom (a Job we can no longer see) and hides the cause (this
+   * process died). Operators then chase Kubernetes for a fault that was ours.
+   *
+   * Marking is batched into ONE statement ahead of any recovery, rather than
+   * interleaved claim-then-recover per run. The caller races this whole
+   * function against a fixed budget and exits regardless, and a single
+   * provider-release RPC can spend minutes of that budget — so interleaving let
+   * one slow first recovery starve the rest and leave them `running`, i.e. the
+   * `job_missing` misattribution this exists to remove. Attribution is cheap
+   * and must not queue behind cleanup that is not. See the PHASE 1 comment at
+   * the bulk UPDATE for the guard-by-guard argument.
+   *
+   * The cost of marking first is that a run the budget never reaches is
+   * terminal with no retry, no lock release and no agent finalization — and
+   * terminal rows are invisible to the reaper, which only scans `running`.
+   * {@link reconcileWorkerCrashedRuns} is what makes that safe rather than
+   * merely faster: it drains terminal `worker_crashed` rows whose
+   * `crash_recovery_completed_at` is still NULL on the next startup. Marking
+   * first is sound only because that reconciler exists.
+   *
+   * Runs on an external-lifecycle adapter stay `running`: their Kubernetes Job
+   * may still be healthy, and the existing reattach / missing-Job reconcilers
+   * are the only paths that can preserve or correctly classify that work.
+   */
+  async function markRunsInterruptedByWorkerCrash(input: {
+    reason: string;
+    now?: Date;
+  }): Promise<{ markedRunIds: string[] }> {
+    const clock = resolveCrashRecoveryClock(input.now);
+    // One instant for the marking writes: every run in this batch is being
+    // terminalized because the *same* process death took them, so they share a
+    // `finished_at`. The recovery that follows each mark is what needs a live
+    // clock, and gets one.
+    const now = input.now ?? new Date();
+    // Union of both live-execution registries — the same pair `liveRunExecutions`
+    // consults, but enumerated rather than probed.
+    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
+    if (runIds.length === 0) return { markedRunIds: [] };
+
+    // Decide "is this run's lifecycle ours to end?" from the run, never from
+    // `external_run_id`. A null id does NOT mean local: `executeRun` adds a run
+    // to `activeRunExecutions` before it has even loaded the agent, while the
+    // backing Job name is stamped later and best-effort, only once a reap cycle
+    // observes the Job. A claude_k8s / opencode_k8s run therefore spends a real
+    // window owned-but-unstamped, and terminalizing it there would queue a
+    // replacement against a Job that is still healthy — duplicate execution of
+    // the same run, which is strictly worse than the orphaned row this guard
+    // exists to prevent.
+    //
+    // The agent's `adapterType` is likewise not sufficient on its own: it is
+    // mutable and read here long after dispatch, while `executeRun` made its
+    // lifecycle decision from the agent record it loaded at launch. Reconfigure
+    // a busy K8s agent to a local adapter and this query would classify its
+    // live, unstamped Job as local. So we also consult the run-scoped
+    // external-runtime reservation, which is immutable with respect to agent
+    // config and always exists before `executeRun` proceeds. A run is treated
+    // as ours to end only when *both* signals say local; either one saying
+    // external is enough to leave it alone.
+    //
+    // The inverse transition (local agent reconfigured to K8s while a local
+    // child is live) is left deliberately: it fails toward "leave it running",
+    // which is the pre-existing reaper's job to classify. Same fail-safe
+    // direction as a run whose agent row is missing, which drops out of this
+    // join entirely. We only terminalize work we can positively prove we own.
+    const ownedRuns = await db
+      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(inArray(heartbeatRuns.id, runIds));
+    const localByAdapter = ownedRuns
+      .filter((row) => !hasExternalLifecycle(row.adapterType))
+      .map((row) => row.runId);
+    if (localByAdapter.length === 0) return { markedRunIds: [] };
+
+    // One batched lookup, not one per run: this runs inside a dying process
+    // racing a fixed budget, and every round trip is time not spent recovering.
+    let reservedRunIds: Set<string>;
+    try {
+      const reserved = await db
+        .select({ runId: externalRuntimeReservations.runId })
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, localByAdapter),
+          isNull(externalRuntimeReservations.releasedAt),
+        ));
+      reservedRunIds = new Set(reserved.map((row) => row.runId));
+    } catch (error) {
+      // Fail closed: without this signal we cannot prove any of these runs is
+      // local, so leave the whole batch for the reaper rather than risk
+      // terminalizing a live Job.
+      logger.warn({ err: error }, "failed to read external runtime reservations during crash marking");
+      return { markedRunIds: [] };
+    }
+    const localRunIds = localByAdapter.filter((runId) => !reservedRunIds.has(runId));
+    if (localRunIds.length === 0) return { markedRunIds: [] };
+
+    const message = `Interrupted by worker process crash (${input.reason})`;
+
+    // PHASE 1 — mark every owned run, in ONE statement, before recovering any of
+    // them. The ordering is the whole point of this function and is not a
+    // stylistic choice: the crash guard races a fixed exit budget, and
+    // `recoverCrashInterruptedRun` can spend minutes of it in a single provider
+    // release RPC. Interleaving mark-then-recover per run therefore let one slow
+    // first recovery consume the budget and leave every later run still
+    // `running` — which is precisely the `job_missing` misattribution this whole
+    // change exists to eliminate (BLO-19722 AC 2). Attribution is cheap and must
+    // never queue behind cleanup that is not.
+    //
+    // Batching is also strictly safer than the per-run loop it replaces: the
+    // guards are unchanged and now evaluated atomically. `status='running'`
+    // still prevents overwriting a run that reached a terminal state on its way
+    // out, and the `external_run_id` guard is still the second line of defence
+    // behind the adapter-type filter above (a local-adapter run somehow carrying
+    // an external id is not ours to terminalize).
+    //
+    // Anything left unrecovered below is not lost: `reconcileWorkerCrashedRuns`
+    // exists specifically to drain terminal `worker_crashed` rows on the next
+    // startup, and it is the reason marking-first is safe rather than merely
+    // faster.
+    const claimedRuns = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: now,
+        error: message,
+        errorCode: "worker_crashed",
+        updatedAt: now,
+      })
+      .where(and(
+        inArray(heartbeatRuns.id, localRunIds),
+        eq(heartbeatRuns.status, "running"),
+        isNull(heartbeatRuns.externalRunId),
+      ))
+      .returning();
+
+    const markedRunIds = claimedRuns.map((run) => run.id);
+    const retryRunIds: string[] = [];
+
+    if (markedRunIds.length > 0) {
+      // Emit attribution as soon as it is durable, not after recovery. If the
+      // budget expires mid-phase-2 the operator still has the crash-named
+      // reason and the full marked set in the log.
+      logger.warn(
+        { markedRunIds, reason: input.reason },
+        "marked local heartbeat runs interrupted by worker crash",
+      );
+    }
+
+    // PHASE 2 — best-effort recovery with whatever budget is left. A throw here
+    // must not lose the marks already made, nor stop the remaining runs from
+    // being attempted, so each row is guarded individually.
+    for (const claimed of claimedRuns) {
+      try {
+        const { retryRunId } = await recoverCrashInterruptedRun(claimed, {
+          reason: input.reason,
+          message,
+          clock,
+        });
+        if (retryRunId) retryRunIds.push(retryRunId);
+      } catch (error) {
+        logger.warn(
+          { err: error, runId: claimed.id },
+          "crash-time recovery failed for marked run; left for startup reconciliation",
+        );
+      }
+    }
+
+    if (retryRunIds.length > 0) {
+      logger.warn(
+        { markedRunIds, retryRunIds },
+        "enqueued process-loss retries for worker-crashed runs",
+      );
+    }
+
+    return { markedRunIds };
+  }
+
+  /**
+   * The retry / lock-release / finalize half of worker-crash recovery for a
+   * single already-claimed run (BLO-19722).
+   *
+   * NO TRANSACTION WRAPS THIS FUNCTION, AND NONE MAY.
+   * `enqueueProcessLossRetry` opens its own transaction and takes a per-run
+   * advisory lock inside it. An enclosing transaction holding that same key
+   * would be blocked by its own inner acquisition on a different pooled
+   * connection — a self-deadlock. This pass is awaited before the reattach and
+   * reap passes at startup, so that deadlock would hang startup on every
+   * replica. Steps therefore run sequentially and are individually guarded.
+   * (For the same reason, no DB transaction is ever held across the provider
+   * RPC in `releaseEnvironmentLeasesForRun`.)
+   *
+   * Each step returns a typed outcome, and only an `incomplete` one blocks the
+   * completion marker. That distinction is the whole point: making the marker
+   * contingent on blanket step success inverts the sign of the fix. Candidates
+   * are drained oldest-first in a capped batch, so rows that can never succeed
+   * — a deleted agent, a permanently unreachable environment provider — would
+   * sit at the head of that order and freeze recovery of every newer run
+   * forever. Intentional no-work outcomes (no agent row, retry suppressed,
+   * retry adopted, stale-but-correctly-declined finalization) are *finished*,
+   * and a best-effort audit append that fails is not worth replaying a whole
+   * recovery for.
+   *
+   * A genuinely failing required step is neither stamped nor retried
+   * immediately: it records an attempt count, the failure, and a backoff
+   * deadline, so it leaves the candidate window without ever being marked
+   * complete. "Required cleanup unresolved" stays distinct from "done".
+   */
+  async function recoverCrashInterruptedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    context: { reason: string; message: string; clock: () => Date },
+  ): Promise<{ retryRunId: string | null; claimed: boolean; completed: boolean; incompleteSteps: string[] }> {
+    const { reason, message, clock } = context;
+    // Claim time, read here rather than taken from the caller's batch scan.
+    // Callers drive this serially over a batch and each row can spend minutes in
+    // a provider RPC, so a batch-start timestamp would date this row's lease,
+    // claim guard and backoff to a moment already long past. See
+    // {@link resolveCrashRecoveryClock}.
+    const now = clock();
+
+    // Durable per-run recovery claim. One atomic UPDATE ... RETURNING decides
+    // ownership: the winner gets the row back, every loser gets zero rows and
+    // returns without touching anything. Startup reconciliation runs on every
+    // replica, so without this two pods run the whole cleanup for the same run
+    // — duplicate lifecycle events, duplicate agent finalization, duplicate
+    // issue promotion. (The retry itself was already unique, guarded by an
+    // advisory lock inside `enqueueProcessLossRetry`; this makes the cheap half
+    // single-owner too.)
+    //
+    // `crashRecoveryNextAttemptAt` doubles as the claim's lease, which is why
+    // the claim also serves as the poison-row backoff: a claim expires after
+    // `WORKER_CRASH_RECOVERY_CLAIM_TTL_MS`, so a recoverer that dies mid-cleanup
+    // cannot wedge the row, and a *failed* recovery simply pushes the same
+    // field further out. A durable claim is used rather than holding an
+    // advisory lock across the whole recovery precisely because the recovery
+    // makes a provider RPC — no lock and no transaction may span that.
+    //
+    // `crashRecoveryAttempts` is incremented here, at claim time, so an attempt
+    // is counted even if the process dies before recording an outcome. It is
+    // incremented FROM THE ROW (`coalesce(..., 0) + 1`) rather than from
+    // `run.crashRecoveryAttempts`, and the post-increment value is read back out
+    // of `RETURNING`. Computing an absolute value from the candidate snapshot
+    // was a lost update: candidates are drained serially oldest-first, so this
+    // row can sit behind slow earlier rows while a peer replica claims it,
+    // fails, and advances the durable counter. Writing the stale absolute value
+    // then rolls that counter *backwards*, and since the value feeds
+    // `workerCrashRecoveryBackoffMs`, the effect is to weaken or reset the
+    // exponential backoff protecting a row that is already failing repeatedly.
+    //
+    // `claimLeaseUntil` is also the CAS token the two terminal writes below
+    // check against. The claim UPDATE above is itself a compare-and-set on
+    // `id`, but the two writes that follow it were, before BLO-20822's
+    // follow-up, unconditional `where(eq(id, run.id))` — safe only if this
+    // call is guaranteed to finish inside its own lease. It is not: the
+    // cleanup below makes a provider RPC with no bound on it. If that RPC
+    // outlives `WORKER_CRASH_RECOVERY_CLAIM_TTL_MS`, a fresher claim can win
+    // the row out from under this call, and an unconditional terminal write
+    // would then clobber that fresher attempt's bookkeeping with this stale
+    // one's.
+    const claimLeaseUntil = new Date(now.getTime() + WORKER_CRASH_RECOVERY_CLAIM_TTL_MS);
+    const claimed = await db
+      .update(heartbeatRuns)
+      .set({
+        crashRecoveryAttempts: sql`coalesce(${heartbeatRuns.crashRecoveryAttempts}, 0) + 1`,
+        crashRecoveryNextAttemptAt: claimLeaseUntil,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        isNull(heartbeatRuns.crashRecoveryCompletedAt),
+        or(
+          isNull(heartbeatRuns.crashRecoveryNextAttemptAt),
+          lte(heartbeatRuns.crashRecoveryNextAttemptAt, now),
+        ),
+      ))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!claimed) {
+      return { retryRunId: null, claimed: false, completed: false, incompleteSteps: [] };
+    }
+    // Authoritative post-increment count. Every backoff and log below reads this,
+    // never the pre-claim snapshot.
+    const attempts = claimed.crashRecoveryAttempts ?? 1;
+
+    const steps: Array<{ name: string; outcome: CrashRecoveryStepOutcome }> = [];
+    const record = (name: string, outcome: CrashRecoveryStepOutcome) => {
+      steps.push({ name, outcome });
+      return outcome;
+    };
+
+    // Both steps below are REQUIRED *and* must happen before a retry exists —
+    // each one retires a claim the dead run still holds on a resource the
+    // retry is about to take over. Recording them `incomplete` withholds the
+    // completion marker, but that alone does not undo a retry already created
+    // further down: backing off the marker replays the recovery, it does not
+    // retract the replacement run. So a failure here has to *stop* the enqueue,
+    // not merely be noted alongside it.
+    let preRetryCleanupIncomplete = false;
+
+    // REQUIRED. A wakeup left `queued` can be picked up again for a run that no
+    // longer exists — and if a retry has meanwhile been queued, that stale wake
+    // dispatches a second live run beside it.
+    try {
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: null });
+      record("wakeup_cancel", { kind: "done" });
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to cancel wakeup for crash-interrupted run");
+      preRetryCleanupIncomplete = true;
+      record("wakeup_cancel", { kind: "incomplete", detail: describeRecoveryError(error) });
+    }
+
+    // REQUIRED. A lease left `active` keeps the run's environment reserved.
+    //
+    // Bounded, because this is the only step that leaves the database: an
+    // unbounded provider call could outlive the claim lease taken above and
+    // leave two replicas recovering the same run. On timeout the step is
+    // `incomplete` like any other failure, so the run is backed off and
+    // replayed rather than stamped. The abandoned call may still land — that
+    // is the pre-existing at-least-once provider-release contract tracked by
+    // BLO-20795, not something this timeout introduces.
+    const leaseRelease = await withRecoveryProviderTimeout(
+      "environment lease release",
+      releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      }),
+      (detail) => ({ fullyReleased: false as const, failureReason: detail }),
+      options.workerCrashRecoveryProviderTimeoutMsForTest,
+    );
+    record(
+      "environment_leases",
+      leaseRelease.fullyReleased
+        ? { kind: "done" }
+        : { kind: "incomplete", detail: leaseRelease.failureReason ?? "lease left active" },
+    );
+    if (!leaseRelease.fullyReleased) preRetryCleanupIncomplete = true;
+
+    // A missing agent row and a *failure to read* the agents table are opposite
+    // outcomes that `getAgent`'s `run | null` return conflates. No row means no
+    // actor can ever retry this run, so recovery is finished. A thrown read is
+    // transient and must be replayed — otherwise a blip during startup would
+    // permanently strand the run with no retry.
+    let agent: typeof agents.$inferSelect | null = null;
+    let agentLoadFailed = false;
+    try {
+      await options.beforeCrashRecoveryAgentLoadForTest?.(run);
+      agent = await getAgent(run.agentId);
+      record(
+        "agent_load",
+        agent
+          ? { kind: "done" }
+          : { kind: "skipped", detail: "agent row missing; no actor can retry this run" },
+      );
+    } catch (error) {
+      agentLoadFailed = true;
+      logger.warn({ err: error, agentId: run.agentId, runId: run.id }, "failed to load crash-interrupted run agent");
+      record("agent_load", { kind: "incomplete", detail: describeRecoveryError(error) });
+    }
+
+    // REQUIRED when it throws; `suppressed` is a finished, intentional no-work
+    // result and must not be replayed — the agent is not invokable, and
+    // replaying would both pin this row at the head of the batch and hand it a
+    // retry the original recovery deliberately withheld once the agent became
+    // invokable again.
+    let retry: typeof heartbeatRuns.$inferSelect | null = null;
+    let retryOwnsIssueLock = false;
+    let retryContinuesContextIssue = false;
+    let retryEnqueueIncomplete = false;
+    if (preRetryCleanupIncomplete) {
+      // Deliberately not attempted. The old wake is still runnable and/or the
+      // old environment is still reserved; queueing the replacement now would
+      // race a second dispatch against it or hand it an environment the dead
+      // run has not let go of. The blocking step is already `incomplete`, so
+      // the row is backed off and the whole recovery — this enqueue included —
+      // replays once the cleanup succeeds.
+      record("retry_enqueue", {
+        kind: "skipped",
+        detail: "deferred: required pre-retry cleanup incomplete",
+      });
+    } else if (agent && !agentLoadFailed) {
+      try {
+        const result = await enqueueProcessLossRetry(run, agent, now);
+        if (result.kind === "suppressed") {
+          record("retry_enqueue", { kind: "skipped", detail: `suppressed: ${result.reason}` });
+        } else {
+          retry = result.run;
+          retryOwnsIssueLock = result.issueLockOwnedByRetry;
+          retryContinuesContextIssue = result.retryContinuesContextIssue;
+          record("retry_enqueue", { kind: "done" });
+        }
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "failed to enqueue crash-interrupted run retry");
+        retryEnqueueIncomplete = true;
+        record("retry_enqueue", { kind: "incomplete", detail: describeRecoveryError(error) });
+      }
+    }
+
+    // Single call site. `enqueueProcessLossRetry` used to release the issue
+    // itself on the non-invokable path while every caller *also* released on a
+    // falsy return, so this ran twice. Releasing is required only when no retry
+    // owns the issue — a retry already re-points the execution lock at itself.
+    //
+    // A failed `retry_enqueue` above is *also* a falsy `retry`, but it must
+    // not take this branch: releasing now would let a fresh checkout claim
+    // the issue before the retry that is meant to own it exists, and this
+    // whole recovery is already incomplete and will be replayed in full
+    // (including this release) once a later attempt succeeds at enqueueing
+    // the retry.
+    //
+    // A *transient* agent-load failure is the same situation reached one step
+    // earlier: `agent` is null so the enqueue block never ran, leaving `retry`
+    // null and `retryEnqueueIncomplete` false. Keying the release on `!retry`
+    // alone would drop the lock here too, even though a retry is still owed
+    // and the replay will create one. Note this is deliberately NOT the
+    // `agent === null` case: a genuinely missing agent row means no actor can
+    // ever retry, so releasing is the correct terminal outcome there.
+    // A deferred enqueue (required pre-retry cleanup incomplete) is the same
+    // situation again: no retry exists yet, but one is still owed, so the lock
+    // must stay put until the replay creates it.
+    if (retryEnqueueIncomplete || agentLoadFailed || preRetryCleanupIncomplete) {
+      record("issue_release", {
+        kind: "skipped",
+        detail: preRetryCleanupIncomplete
+          ? "pre-retry cleanup incomplete; lock left until a retry exists"
+          : agentLoadFailed
+            ? "agent_load incomplete; lock left until a retry exists"
+            : "retry_enqueue incomplete; lock left until a retry exists",
+      });
+    } else {
+      // Release unconditionally — including when the retry does own the context
+      // issue's lock (BLO-20822, Ally round 6).
+      //
+      // A single run can hold execution locks on MORE than one issue: the
+      // context issue from `svc.checkout`, plus any issue stamped by
+      // `enqueueWakeup`'s legacy-run fallback. `enqueueProcessLossRetry` only
+      // ever hands over the *context* issue, so `retryOwnsIssueLock` is a fact
+      // about one issue and says nothing about the others. Skipping the release
+      // on the strength of it left every sibling issue pointing at a terminal
+      // run — the precise "subsequent checkouts fail with 409 and the issue
+      // stays blocked forever" failure `releaseIssueExecutionAndPromote` was
+      // itself fixed to prevent, reintroduced one layer up.
+      //
+      // Calling it after a successful hand-over is safe, and deliberately so:
+      // its lock-clearing UPDATE is keyed on `execution_run_id = <this run>`,
+      // which a transferred lock no longer matches, and its promotion path
+      // bails at `issue.executionRunId !== run.id` on the pre-update snapshot.
+      // So the retry keeps what it was given and only orphaned siblings are
+      // cleared. That is why this needs no separate transferred-lock ledger.
+      try {
+        // A retry that will carry the context issue forward IS the continuation,
+        // so the deferred wake must not also be promoted. Keyed on the retry
+        // being a live continuation rather than on its holding the issue lock
+        // (BLO-21623): an ADOPTED `queued` retry legitimately owns no lock under
+        // lazy locking, and gating on ownership promoted a wake beside it. If no
+        // retry exists — the zero-row hand-over, where enqueue is suppressed —
+        // the deferred wake is the single continuation and must promote.
+        await releaseIssueExecutionAndPromote(run, { suppressPromotion: retryContinuesContextIssue });
+        record("issue_release", { kind: "done" });
+      } catch (error) {
+        logger.warn({ err: error, runId: run.id }, "failed to release crash-interrupted issue execution lock");
+        record("issue_release", { kind: "incomplete", detail: describeRecoveryError(error) });
+      }
+    }
+
+    // Best-effort audit. A missing lifecycle line is not worth replaying an
+    // entire recovery — and would keep this row at the head of the batch.
+    try {
+      await appendRunEventAtomicSeq(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message,
+        payload: {
+          reason,
+          ...(retry
+            ? {
+                retryRunId: retry.id,
+                issueLockOwnedByRetry: retryOwnsIssueLock,
+                retryContinuesContextIssue,
+              }
+            : {}),
+        },
+      });
+      record("lifecycle_event", { kind: "done" });
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "failed to append crash-interrupted run event");
+      record("lifecycle_event", { kind: "skipped", detail: `audit append failed: ${describeRecoveryError(error)}` });
+    }
+
+    // `superseded` means a newer run owns the agent's derived status and this
+    // replay correctly declined to overwrite it — finished, not failed. Only a
+    // genuine write failure is replayable.
+    try {
+      const finalization = await finalizeAgentStatus(run.agentId, "interrupted", message, {
+        errorCode: "worker_crashed",
+        runId: run.id,
+        requireOwnership: run,
+      });
+      record(
+        "agent_finalize",
+        finalization.kind === "failed"
+          ? { kind: "incomplete", detail: finalization.reason }
+          : finalization.kind === "superseded"
+            ? { kind: "skipped", detail: `superseded: ${finalization.reason}` }
+            : { kind: "done" },
+      );
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id, agentId: run.agentId }, "failed to finalize agent after worker crash");
+      record("agent_finalize", { kind: "incomplete", detail: describeRecoveryError(error) });
+    }
+
+    const incompleteSteps = steps
+      .filter((step) => step.outcome.kind === "incomplete")
+      .map((step) => `${step.name}: ${step.outcome.kind === "incomplete" ? step.outcome.detail : ""}`);
+
+    // Both terminal writes below are guarded by `claimLeaseUntil`, not just
+    // `id`: if this call outlived its lease (see the comment at the claim
+    // above), a fresher claim already rewrote `crashRecoveryNextAttemptAt`
+    // for its own attempt, and the CAS fails with zero rows rather than
+    // clobbering it. `supersededStamp` records that so the returned
+    // `completed` doesn't claim a durable stamp that didn't happen.
+    let supersededStamp = false;
+    let terminalWriteFailed = false;
+    try {
+      await options.beforeCrashRecoveryTerminalWriteForTest?.(run);
+      // Re-read the clock: everything between the claim and here — notably the
+      // bounded provider release — can have consumed a large fraction of the
+      // lease. Dating the completion stamp, and especially the backoff, to claim
+      // time would make the backoff short by exactly that elapsed time, so a row
+      // that just burned minutes failing becomes re-eligible sooner than its
+      // attempt count intends. The CAS token below stays `claimLeaseUntil`; only
+      // the values being written move forward.
+      const terminalNow = clock();
+      if (incompleteSteps.length === 0) {
+        // Last write, deliberately: the durable "every required step ran"
+        // marker {@link reconcileWorkerCrashedRuns} selects on. Stamping any
+        // earlier would let a crash mid-cleanup hide an unfinished run from the
+        // only pass that can find it. Best-effort — if this write is the one
+        // that dies, the run stays a candidate and the (idempotent) cleanup is
+        // simply replayed next startup.
+        const stamped = await db
+          .update(heartbeatRuns)
+          .set({
+            crashRecoveryCompletedAt: terminalNow,
+            crashRecoveryNextAttemptAt: null,
+            crashRecoveryLastError: null,
+            updatedAt: terminalNow,
+          })
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.crashRecoveryNextAttemptAt, claimLeaseUntil),
+          ))
+          .returning({ id: heartbeatRuns.id });
+        if (stamped.length === 0) {
+          supersededStamp = true;
+          logger.warn(
+            { runId: run.id, attempts },
+            "worker-crash recovery completion superseded by a newer claim; leaving the newer attempt's bookkeeping in place",
+          );
+        }
+      } else {
+        // Explicitly NOT stamped. The row stays unresolved and visible, but its
+        // claim lease is extended into a backoff so it stops occupying a slot
+        // in the oldest-first batch.
+        const backedOff = await db
+          .update(heartbeatRuns)
+          .set({
+            crashRecoveryNextAttemptAt: new Date(terminalNow.getTime() + workerCrashRecoveryBackoffMs(attempts)),
+            crashRecoveryLastError: describeRecoveryError(incompleteSteps.join("; ")),
+            updatedAt: terminalNow,
+          })
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.crashRecoveryNextAttemptAt, claimLeaseUntil),
+          ))
+          .returning({ id: heartbeatRuns.id });
+        if (backedOff.length === 0) {
+          supersededStamp = true;
+          logger.warn(
+            { runId: run.id, attempts, incompleteSteps },
+            "worker-crash recovery backoff superseded by a newer claim; leaving the newer attempt's bookkeeping in place",
+          );
+        } else {
+          logger.warn(
+            { runId: run.id, attempts, incompleteSteps },
+            "worker-crash recovery left required cleanup unresolved; backing off",
+          );
+        }
+      }
+    } catch (error) {
+      // The write itself failed (connection dropped, statement timeout). The
+      // row therefore carries neither the completion stamp nor the backoff we
+      // intended, so this recovery is NOT durable however well its steps ran:
+      // reporting `completed` here would tell the caller a run was reconciled
+      // while `crash_recovery_completed_at` is still null, and the cleanup
+      // silently replays later against a row nobody is tracking.
+      terminalWriteFailed = true;
+      logger.warn({ err: error, runId: run.id }, "failed to persist crash recovery progress");
+    }
+
+    return {
+      retryRunId: retry?.id ?? null,
+      claimed: true,
+      completed: incompleteSteps.length === 0 && !supersededStamp && !terminalWriteFailed,
+      incompleteSteps,
+    };
+  }
+
+  /**
+   * One warning per absence episode, not one per 30s tick. Re-armed the moment
+   * the index is seen present again, so a later drop or invalid rebuild is
+   * reported instead of being silenced by the earlier episode's warning.
+   */
+  let crashRecoveryCandidateIndexWarned = false;
+
+  /**
+   * Is the partial index backing the oldest-first crash-recovery candidate scan
+   * present AND usable?
+   *
+   * `indisvalid`/`indisready` are checked, not just existence: a
+   * `CREATE INDEX CONCURRENTLY` that fails partway leaves an invalid index
+   * behind that the planner will not use, which would otherwise read here as
+   * "indexed" and re-enable the very scan this gate exists to prevent.
+   *
+   * The result is NOT cached (BLO-20822, Ally round 7). An earlier version
+   * latched `true` forever on the reasoning that "an index cannot become
+   * invalid again without an operator dropping it, and that path takes a
+   * restart anyway". That is simply wrong about Postgres: `DROP INDEX
+   * CONCURRENTLY` needs no restart, and a failed online rebuild can leave the
+   * index absent or invalid — so a latched worker would silently resume the
+   * sequential scan and top-N sort this gate exists to prevent, with no further
+   * catalog check ever. Revalidating on every periodic pass is Ally's own first
+   * remedy and needs no tunable: this is one indexed catalog lookup per
+   * scheduler tick per replica, which is noise next to the scan it guards
+   * against, and it makes the gate recover in BOTH directions.
+   *
+   * A probe FAILURE means we do not know, so it skips this one periodic tick
+   * (startup recovery is ungated) and the next tick asks again.
+   */
+  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+    try {
+      const rows = await db.execute(sql`
+        select 1
+        from pg_class c
+        join pg_index i on i.indexrelid = c.oid
+        join pg_namespace n on n.oid = c.relnamespace
+        where c.relname = 'heartbeat_runs_crash_recovery_pending_idx'
+          and n.nspname = current_schema()
+          and c.relkind = 'i'
+          and i.indisvalid
+          and i.indisready
+        limit 1
+      `);
+      const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      if (present) {
+        // Re-arm the warning so a later disappearance is reported again rather
+        // than being silenced by a warning issued before the index existed.
+        crashRecoveryCandidateIndexWarned = false;
+      } else if (!crashRecoveryCandidateIndexWarned) {
+        crashRecoveryCandidateIndexWarned = true;
+        // logger.warn, not the migration's RAISE NOTICE: the production client
+        // swallows notices, which is why this went unnoticed at all.
+        logger.warn(
+          {
+            index: "heartbeat_runs_crash_recovery_pending_idx",
+            remediation:
+              "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
+          },
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+        );
+      }
+      return present;
+    } catch (err) {
+      // Never let a catalog probe failure take out the caller, and never cache
+      // it: "we could not tell" is not evidence either way. Skips this periodic
+      // tick only; startup recovery is ungated.
+      logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
+      return false;
+    }
+  }
+
+  /**
+   * Startup reconciliation for runs that {@link markRunsInterruptedByWorkerCrash}
+   * claimed but could not finish recovering before the crash budget expired
+   * (BLO-19722).
+   *
+   * Such a run is `interrupted` / `worker_crashed` with its recovery
+   * incomplete, and possibly still holding its issue execution lock. Being
+   * terminal, it is invisible to the orphan reaper, so without this pass it
+   * would never be recovered by anything.
+   *
+   * Completion is read from the explicit `crashRecoveryCompletedAt` marker,
+   * never inferred from the presence of a retry child. A retry is neither
+   * necessary nor sufficient evidence: recovery deliberately completes without
+   * one when the agent is not invokable, while conversely the retry is
+   * committed *before* the lifecycle-event and agent-finalization steps, so a
+   * crash in between would have made a genuinely unfinished row disappear from
+   * this candidate set.
+   *
+   * Deliberately NOT bounded by a `finishedAt` cutoff. These rows are already
+   * terminal, so an age window would not defer the work, it would abandon it:
+   * an outage longer than the window would age the row out permanently while
+   * its issue lock still points at a dead run. Bounding is by batch size and by
+   * a wall-clock BUDGET instead, oldest-first, so repeated passes make
+   * monotonic progress — with the backoff filter ensuring "oldest-first" cannot
+   * be captured by rows that will never succeed.
+   *
+   * The budget is what bounds latency; the batch size does not. Each row can
+   * spend up to `ENVIRONMENT_LEASE_RELEASE_TIMEOUT_MS` in a provider release, so
+   * a full batch of 200 during a provider outage is hours of serial waiting.
+   * The startup caller runs this ahead of external reattachment, orphan
+   * reaping and queued-run resumption, so an unbounded drain here starves all
+   * of them. On budget exhaustion the pass stops cleanly and returns what it
+   * did; the untouched candidates keep their claim state and are picked up by
+   * the periodic pass or the next start. Stopping early is always safe —
+   * nothing here is all-or-nothing, and every row is individually claimed.
+   */
+  async function reconcileWorkerCrashedRuns(options: {
+    maxRuns?: number;
+    now?: Date | (() => Date);
+    budgetMs?: number;
+    requireCandidateIndex?: boolean;
+  } = {}): Promise<{
+    reconciledRunIds: string[];
+    retryRunIds: string[];
+    unresolvedRunIds: string[];
+    budgetExhausted: boolean;
+    skippedReason?: "candidate_index_missing";
+  }> {
+    // BLO-20822 / BLO-21526: migration 0225 deliberately declines to build the
+    // candidate index inline on a populated table — a non-concurrent build
+    // there would take an ACCESS EXCLUSIVE lock on `heartbeat_runs` for the
+    // whole build. It raises a NOTICE instead, and the production client sets
+    // `onnotice: () => {}` (`packages/db/src/client.ts`), so the migration
+    // records as complete and the index is silently absent until the online
+    // `CREATE INDEX CONCURRENTLY` deploy step runs.
+    //
+    // Without the index the scan below is a sequential scan plus a top-N sort
+    // over a table that grows with every run — acceptable once per process at
+    // startup, but not every 30s on every scheduler replica. So the PERIODIC
+    // caller passes `requireCandidateIndex` and is skipped until the index
+    // exists; startup recovery is never gated, because that is the primary
+    // recovery path and its cost is bounded and one-off.
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+      return {
+        reconciledRunIds: [],
+        retryRunIds: [],
+        unresolvedRunIds: [],
+        budgetExhausted: false,
+        skippedReason: "candidate_index_missing",
+      };
+    }
+
+    const clock = resolveCrashRecoveryClock(options.now);
+    const now = clock();
+    const maxRuns = options.maxRuns ?? WORKER_CRASH_RECONCILE_MAX_RUNS;
+    const budgetMs = options.budgetMs ?? WORKER_CRASH_RECONCILE_BUDGET_MS;
+    const deadline = now.getTime() + budgetMs;
+
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "worker_crashed"),
+        isNull(heartbeatRuns.crashRecoveryCompletedAt),
+        // Poison-row backoff. Without this filter a run whose required cleanup
+        // can never succeed sits at the head of `asc(finished_at)` and consumes
+        // a batch slot on every pass forever; enough of them (the batch is
+        // capped) and no newer run is ever reached again.
+        or(
+          isNull(heartbeatRuns.crashRecoveryNextAttemptAt),
+          lte(heartbeatRuns.crashRecoveryNextAttemptAt, now),
+        ),
+      ))
+      .orderBy(asc(heartbeatRuns.finishedAt), asc(heartbeatRuns.id))
+      .limit(maxRuns);
+
+    const reconciledRunIds: string[] = [];
+    const retryRunIds: string[] = [];
+    const unresolvedRunIds: string[] = [];
+    let budgetExhausted = false;
+
+    for (const run of candidates) {
+      // Budget is checked BEFORE each row, not after: a row already started is
+      // allowed to finish (abandoning it mid-recovery would leave exactly the
+      // partial state this pass exists to resolve), but no new provider wait is
+      // entered once the budget is gone.
+      if (clock().getTime() >= deadline) {
+        budgetExhausted = true;
+        break;
+      }
+      // Ownership is decided by the atomic claim inside
+      // `recoverCrashInterruptedRun`, not by a re-read here: a peer replica can
+      // finish (or claim) this run at any point between the candidate scan and
+      // the claim, and only a compare-and-set closes that window.
+      const { retryRunId, claimed, completed } = await recoverCrashInterruptedRun(run, {
+        reason: "worker crash recovery incomplete at previous exit",
+        message: run.error ?? "Interrupted by worker process crash",
+        clock,
+      });
+      if (!claimed) continue;
+      if (completed) reconciledRunIds.push(run.id);
+      else unresolvedRunIds.push(run.id);
+      if (retryRunId) retryRunIds.push(retryRunId);
+    }
+
+    if (budgetExhausted) {
+      logger.warn(
+        { budgetMs, candidates: candidates.length, processed: reconciledRunIds.length + unresolvedRunIds.length },
+        "worker-crash reconciliation stopped on wall-clock budget; remaining candidates deferred to the next pass",
+      );
+    }
+
+    if (reconciledRunIds.length > 0 || unresolvedRunIds.length > 0) {
+      logger.warn(
+        { reconciledRunIds, retryRunIds, unresolvedRunIds },
+        "completed interrupted worker-crash recovery for runs left unrecovered by a previous crash",
+      );
+    }
+
+    return { reconciledRunIds, retryRunIds, unresolvedRunIds, budgetExhausted };
+  }
+
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
     const activeRuns = await db
       .select({
@@ -15044,12 +16361,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = terminalDecision.pipelineStageExited
-        ? null
-        : await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
+      const retryResult = await enqueueProcessLossRetry(interrupted, agent, now);
+      const retry = retryResult.kind === "suppressed" ? null : retryResult.run;
+      const retryContinuesContextIssue =
+        retryResult.kind === "suppressed" ? false : retryResult.retryContinuesContextIssue;
+      // Release regardless of whether a retry exists (BLO-20822, Ally round 6).
+      // The retry only ever takes over the *context* issue, so gating on its
+      // existence left every other issue this run had locked pointing at a
+      // terminal run. Safe post-hand-over: the clearing UPDATE is keyed on
+      // `execution_run_id = <this run>`, which the transferred lock no longer
+      // matches, and promotion bails when the context issue is owned by the retry.
+      await releaseIssueExecutionAndPromote(interrupted, { suppressPromotion: retryContinuesContextIssue });
+      if (retry) {
         retryRunIds.push(retry.id);
       }
 
@@ -18283,6 +19606,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return parts.join("; ");
   }
 
+  /**
+   * Derive and persist the agent's status after a run reached a terminal state.
+   *
+   * BLO-19722 added `options.requireOwnership` and a typed return. Without it
+   * this function is a read-then-write: it counts the agent's running runs,
+   * awaits, then writes an unguarded `update agents ... where id = ?`. Two
+   * things go wrong when the caller is a *replayed* recovery of an old run.
+   *
+   * First, the count is stale by the time the write lands, so a run that
+   * started in between is invisible to it. Second, and worse, a startup replay
+   * of a day-old crash-marked run has no business deriving the agent's status
+   * at all once newer runs have come and gone — their finalizations are the
+   * current truth, and this one would overwrite them with a stale outcome.
+   *
+   * With `requireOwnership` set to the run being finalized, both are closed by
+   * one guard evaluated inside the UPDATE itself. Zero rows updated means a
+   * newer run owns the derived state; that is reported as `superseded`, which
+   * callers treat as a completed step rather than something to retry.
+   *
+   * Callers that do not pass `requireOwnership` keep the previous behaviour
+   * byte for byte.
+   */
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -18293,13 +19638,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryNotBefore?: Date | null;
       /** Run that drove this transition, so a fallback reason can point at it. */
       runId?: string | null;
+      /**
+       * The run whose terminal transition this call derives the agent status
+       * from. When set, the write is refused if a *newer* run already owns that
+       * derived state. See the doc comment.
+       */
+      requireOwnership?: typeof heartbeatRuns.$inferSelect;
     },
-  ) {
+  ): Promise<AgentFinalizationResult> {
     const existing = await getAgent(agentId);
-    if (!existing) return;
+    if (!existing) return { kind: "superseded", reason: "agent_missing" };
 
     if (existing.status === "paused" || existing.status === "terminated") {
-      return;
+      return { kind: "superseded", reason: `agent_${existing.status}` };
     }
 
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
@@ -18330,6 +19681,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "idle"
           : "error";
 
+    // BLO-19722 compare-and-set: refuse the write when some *other* run for
+    // this agent currently owns the derived agent state — either because it is
+    // still running, or because it finished after the owner run did. Evaluated
+    // inside the UPDATE, so the compare and the set are atomic and there is no
+    // read-then-write window.
+    //
+    // The two alternatives are deliberately independent of `created_at`.
+    // Requiring `created_at > owner.created_at` (as this first did) misses the
+    // overlapping-run case: a run started BEFORE the crashed owner but which
+    // outlived it — still running, or finished later — is the current state of
+    // the agent, yet an older-created run fails a `created_at >` test and the
+    // stale replay overwrites it. Ordering by *finish* is what matters here,
+    // because that is what `finalizeAgentStatus` derives status from.
+    //
+    // The retry this very recovery just queued does not match — it is `queued`,
+    // not running, and has no `finishedAt`.
+    const ownerRun = options?.requireOwnership;
+    // Dates must reach a raw `sql` fragment as ISO text with an explicit cast:
+    // inside a raw fragment there is no column mapper to serialize them, and
+    // postgres.js rejects a bare Date parameter.
+    const ownerFinishedAt = ownerRun
+      ? new Date(ownerRun.finishedAt ?? ownerRun.createdAt).toISOString()
+      : null;
+    const ownershipGuard = ownerRun
+      ? sql`not exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.agentId} = ${agentId}
+            and ${heartbeatRuns.id} <> ${ownerRun.id}
+            and (
+              ${heartbeatRuns.status} = 'running'
+              or ${heartbeatRuns.finishedAt} > ${ownerFinishedAt}::timestamptz
+            )
+        )`
+      : undefined;
+
     const updated = await db
       .update(agents)
       .set({
@@ -18354,9 +19740,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(ownershipGuard ? and(eq(agents.id, agentId), ownershipGuard) : eq(agents.id, agentId))
       .returning()
       .then((rows) => rows[0] ?? null);
+
+    if (!updated && ownershipGuard) {
+      // A newer run owns the agent's derived status. Its own finalization is
+      // the current truth; replaying this stale transition could only clobber it.
+      logger.info(
+        { agentId, outcome, runId: options?.runId ?? null },
+        "finalizeAgentStatus: declined stale agent status write; a newer run owns the derived state (BLO-19722)",
+      );
+      return { kind: "superseded", reason: "newer_run_owns_agent_state" };
+    }
 
     if (isFirstHeartbeat && updated) {
       const tc = getTelemetryClient();
@@ -18410,6 +19806,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       });
     }
+
+    return { kind: "applied" };
   }
 
   function mergeRunStopMetadataForAgent(
@@ -20493,20 +21891,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      let retryContinuesContextIssue = false;
       let promotedRunDispatched = false;
       const retryAgent = await getAgent(run.agentId);
       if (!terminalDecision.pipelineStageExited && shouldRetry) {
         if (retryAgent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          const retryResult = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          // `suppressed` keeps the pre-BLO-19722 behaviour of this call site:
+          // no retry run, so the issue lock is released below exactly as it was
+          // when this function returned null. The difference is only that the
+          // release now happens once, here, instead of also inside the callee.
+          retriedRun = retryResult.kind === "suppressed" ? null : retryResult.run;
+          retryContinuesContextIssue =
+            retryResult.kind === "suppressed" ? false : retryResult.retryContinuesContextIssue;
         }
       } else if (!terminalDecision.pipelineStageExited && retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
+        retryContinuesContextIssue = Boolean(
+          retriedRun && readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
+        );
       }
 
-      if (!retriedRun) {
-        promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun);
-      }
+      // Release regardless of whether a retry exists (BLO-20822, Ally round 6):
+      // the retry takes over only the context issue, so gating on its existence
+      // stranded every sibling issue this run had locked. Promotion, however,
+      // stays gated on there being a live retry for the context issue. An
+      // adopted queued retry can legitimately own no lock until dispatch claims
+      // it, but is still the single continuation (BLO-21623). If fresh enqueue
+      // is suppressed because the original lock disappeared, the deferred wake
+      // is promoted instead. When promotion is suppressed,
+      // `promotedRunDispatched` remains false, which is the same value this call
+      // site saw before, so the `startNextQueuedRunForAgent` fallback below is
+      // unchanged.
+      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+        suppressPromotion: retryContinuesContextIssue,
+      });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
         await startNextQueuedRunForAgent(run.agentId);
       }
@@ -27231,6 +28651,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     options: {
       suppressImmediateRecovery?: boolean;
       deferPrimaryCheckoutRestoration?: boolean;
+      /**
+       * Clear this run's issue locks but do NOT promote a deferred wake.
+       *
+       * Set when a process-loss retry demonstrably owns the context issue lock:
+       * that retry is the single intended continuation, so promoting here
+       * would create a second runnable path for the same issue (BLO-20822).
+       */
+      suppressPromotion?: boolean;
     } = {},
   ): Promise<boolean> {
     // A pipeline-stage exit made this run obsolete, not failed. Release its
@@ -27340,6 +28768,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
         );
+
+      // Lock clearing is done; promotion is a separate decision (BLO-20822,
+      // Ally round 7). When a process-loss retry exists it IS the single
+      // intended continuation, so promoting a `deferred_issue_execution` wake
+      // here would queue a SECOND runnable path for the same issue.
+      //
+      // This is not hypothetical: `enqueueProcessLossRetry` commits the retry
+      // even when its guarded context-lock transfer matches zero rows (the
+      // stale-lock sweeper can clear the terminal original's lock first), and
+      // it reports that honestly as `issueLockOwnedByRetry: false`. The
+      // ownership check below is `issue.executionRunId && ... !== run.id`, so a
+      // lock the sweeper cleared to NULL is FALSY and sails straight through
+      // it — the retry ends up racing a promoted run. Callers that queued a
+      // retry pass `suppressPromotion` and this returns before that check.
+      if (options.suppressPromotion) return null;
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the
@@ -32252,6 +33695,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
+    // BLO-19722 AC 2/3. Wired at the process entrypoint as the crash guard's
+    // `onCrash` callback — `index.ts` registers a marker closure over this
+    // function when it builds the service, and `installProcessCrashGuard`
+    // invokes it (raced against a timeout) before exiting non-zero.
+    //
+    // Crash-time marking is best-effort by construction: the guard's budget can
+    // expire and the DB is frequently the very thing that just died.
+    // `reconcileWorkerCrashedRuns` is the durable half — it closes at the next
+    // startup, and on the periodic tick, whatever a crash could not finish.
+    markRunsInterruptedByWorkerCrash,
+    reconcileWorkerCrashedRuns,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
