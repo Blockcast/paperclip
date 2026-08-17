@@ -1675,6 +1675,27 @@ export interface RecordAgentZeroTokenCompletedRunStreakInput {
   knownAgentIds: ReadonlySet<string>;
 }
 
+/**
+ * Last `adapter` label written per `agent_id` for
+ * {@link AGENT_NO_USAGE_STREAK_METRIC} (BLO-21415).
+ *
+ * This gauge is written per-agent from that agent's own heartbeat finalization,
+ * so there is no fleet-wide snapshot pass that could reset-then-set it the way
+ * {@link setQueuedRunOldestAgeMetrics} does. That makes `adapter` a latching
+ * label: `Gauge.set()` mints one child per (agent_id, adapter) pair and never
+ * retires one, so an agent moved between adapters keeps exporting its OLD
+ * adapter's child frozen at whatever value it last held. Frozen at or above the
+ * alert threshold, that orphan fires `PaperclipAgentZeroTokenRunStreak` forever
+ * while the agent's live series reads healthy -- and because the streak
+ * saturates at the `listRecentTerminalRunsForZeroTokenStreak` LIMIT, the orphan
+ * is pinned at exactly the value a maximally-wedged agent reports, so the alert
+ * cannot be told apart from a real incident by its value either.
+ *
+ * Bounded by the same roster that bounds the label itself: at most one entry per
+ * active agent id plus {@link UNKNOWN_AGENT_ID}.
+ */
+const zeroTokenStreakAdapterByAgentId = new Map<string, string>();
+
 export function recordAgentZeroTokenCompletedRunStreak(
   input: RecordAgentZeroTokenCompletedRunStreakInput,
 ): { agent_id: string; adapter: string; streak: number } {
@@ -1683,7 +1704,15 @@ export function recordAgentZeroTokenCompletedRunStreak(
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
   };
   const streak = Number.isFinite(input.streak) ? Math.max(0, Math.floor(input.streak)) : 0;
-  ensureRegistry().zeroTokenCompletedRunStreakGauge.set(labels, streak);
+  const gauge = ensureRegistry().zeroTokenCompletedRunStreakGauge;
+  // Retire the previous adapter's child before minting the new one, so an agent
+  // that changed adapterType stops exporting a frozen series under the old label.
+  const previousAdapter = zeroTokenStreakAdapterByAgentId.get(labels.agent_id);
+  if (previousAdapter !== undefined && previousAdapter !== labels.adapter) {
+    gauge.remove({ agent_id: labels.agent_id, adapter: previousAdapter });
+  }
+  zeroTokenStreakAdapterByAgentId.set(labels.agent_id, labels.adapter);
+  gauge.set(labels, streak);
   return { ...labels, streak };
 }
 
@@ -2150,6 +2179,7 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   agentZeroTokenCompletedRunStreak = null;
+  zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;

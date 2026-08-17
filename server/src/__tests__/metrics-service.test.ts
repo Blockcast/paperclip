@@ -461,6 +461,100 @@ describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
     );
     expect(body).not.toContain("ghost");
   });
+
+  // BLO-21415: `adapter` used to latch. This gauge is written per-agent from
+  // that agent's own heartbeat finalization, so nothing ever retired the child
+  // minted under a previous adapterType -- it stayed frozen at its last value
+  // for the process lifetime and kept firing PaperclipAgentZeroTokenRunStreak
+  // while the agent's live series read healthy.
+  it("retires the previous adapter's series when an agent changes adapter", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 10,
+      knownAgentIds,
+    });
+
+    const before = await renderMetrics();
+    expect(before.body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 10`,
+    );
+
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "claude_k8s",
+      streak: 0,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="claude_k8s"} 0`,
+    );
+    // The orphaned series is gone entirely, not merely zeroed -- a lingering
+    // `opencode_k8s` child at 10 is exactly what fired the alert forever.
+    expect(body).not.toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`,
+    );
+  });
+
+  it("keeps other agents' series when one agent changes adapter", async () => {
+    const knownAgentIds = new Set(["agent-a", "agent-b"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-b",
+      adapter: "opencode_k8s",
+      streak: 7,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 4,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "claude_k8s",
+      streak: 1,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-b",adapter="opencode_k8s"} 7`,
+    );
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="claude_k8s"} 1`,
+    );
+    expect(body).not.toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`,
+    );
+  });
+
+  it("re-recording the same adapter keeps a single series at the newest value", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 2,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 5,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 5`,
+    );
+    expect(
+      body.split("\n").filter((line) => line.startsWith(`${AGENT_NO_USAGE_STREAK_METRIC}{`)),
+    ).toHaveLength(1);
+  });
 });
 
 describe("dep-blocked metrics counters", () => {

@@ -5436,6 +5436,24 @@ export function countConsecutiveZeroTokenCompletedRuns(
   return count;
 }
 
+/**
+ * Ceiling on the zero-token streak reported by
+ * `paperclip_agent_zero_token_completed_run_streak` (BLO-21415).
+ *
+ * `countConsecutiveZeroTokenCompletedRuns` counts a prefix of this result, so
+ * this LIMIT is also the gauge's saturation point -- the streak can never read
+ * higher than the number of rows fetched here. At the previous value of 10,
+ * against an alert that fires at >= 6, a brief self-healing burst and an agent
+ * wedged for hundreds of runs were numerically identical, which removed exactly
+ * the severity signal the alert exists to carry (BLO-10866 class). 50 keeps the
+ * per-finalization read bounded and indexed while leaving ~8x headroom above the
+ * firing threshold, so "barely tripped" and "badly wedged" stay distinguishable.
+ *
+ * Raising this cannot change WHEN the alert fires (the threshold is unchanged),
+ * only how high a genuine streak is allowed to read.
+ */
+export const ZERO_TOKEN_STREAK_SCAN_LIMIT = 50;
+
 export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: string) {
   return db
     .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
@@ -5452,7 +5470,7 @@ export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: 
       inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
     ))
     .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
-    .limit(10);
+    .limit(ZERO_TOKEN_STREAK_SCAN_LIMIT);
 }
 
 // Counts the run-list prefix (runs ordered newest-first) that are each a
