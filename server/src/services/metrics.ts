@@ -1374,6 +1374,8 @@ function ensureRegistry(): {
     || !githubReviewRequestDelivery
     || !githubReviewRequestSuppression
     || !githubReviewRequestDeadLetterUnresolved
+    || !githubReviewPosted
+    || !githubReviewCompletion
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
