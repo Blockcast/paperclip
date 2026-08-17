@@ -33,6 +33,7 @@ import {
   touchLocalServiceRegistryRecord,
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
+import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import {
   authorizeOwnedGitWorktreeCleanup,
@@ -3727,6 +3728,19 @@ export async function realizeExecutionWorkspace(input: {
         recorder: input.recorder ?? null,
       });
     }
+    // BLO-27858: this path hands back the base checkout verbatim, so every
+    // concurrent run of this agent that lands here shares one working tree.
+    // Nothing below guards a filesystem write, so tell the run now -- these
+    // warnings reach context.paperclipWorkspace before the agent starts.
+    const occupancyWarning = await describeSharedCheckoutOccupancy({
+      db: input.db ?? null,
+      agentId: input.agent.id,
+      companyId: input.agent.companyId,
+      heartbeatRunId: input.heartbeatRunId ?? null,
+      cwd: input.base.baseCwd,
+      strategyType,
+    });
+    if (occupancyWarning) warnings = [...warnings, occupancyWarning];
     return {
       ...input.base,
       strategy: "project_primary",
