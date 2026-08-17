@@ -182,6 +182,9 @@ jobs:
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
 
+      - name: Test Playwright install-deps retry/backoff
+        run: node --test ./scripts/__tests__/playwright-install-deps-retry.test.mjs
+
       - name: Test PR server-shard folding
         run: node --test ./scripts/__tests__/pr-ci-shard-folding.test.mjs
 
@@ -908,8 +911,29 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
 
+      # BLO-27699 (BLO-22675 residue): apt's upstream mirrors (e.g.
+      # security.ubuntu.com) fail with a transient "Mirror sync in progress?"
+      # size mismatch often enough to take out a merge_group run on their own —
+      # run 31107120860 died here and forced PR #1038 to be admin-merged.
+      # Retry with backoff before failing the job.
       - name: Install Playwright system dependencies
-        run: pnpm exec playwright install-deps chromium
+        run: |
+          attempts=3
+          delay="${PLAYWRIGHT_INSTALL_DEPS_RETRY_DELAY_SECONDS:-15}"
+          attempt=1
+          while [ "$attempt" -le "$attempts" ]; do
+            if pnpm exec playwright install-deps chromium; then
+              exit 0
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              echo "Playwright system dependency install failed (attempt $attempt/$attempts); retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+            attempt=$((attempt + 1))
+          done
+          echo "Playwright system dependency install failed after $attempts attempts" >&2
+          exit 1
 
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'
