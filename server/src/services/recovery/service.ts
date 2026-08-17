@@ -7851,15 +7851,59 @@ export function recoveryService(
     }) ?? null;
   }
 
-  async function findRecentCompletedLivenessRecoveryIssue(
+  /**
+   * Should we suppress re-raising an escalation we have already delivered once?
+   *
+   * Two suppressors (BLO-27676):
+   *
+   *   1. `cooldown` -- a `done` escalation for this incident inside `cooldownMs`.
+   *      Debounces the detector against its own sweep cadence. Unchanged.
+   *
+   *   2. `unchanged_target` -- a `done` escalation for this incident whose leaf
+   *      target has had no activity since it resolved. This is the termination
+   *      path the class lacked. The old rule was purely time-based: it consulted
+   *      only elapsed time, never the target, so it always expired and an
+   *      unchanged leaf re-escalated forever. Measured on one leaf: four
+   *      byte-identical `originFingerprint` rows over five days at ~75 min
+   *      inter-arrival, which is exactly this 60 min cooldown plus the next
+   *      sweep. We have already reported this leaf in this state to an owner who
+   *      resolved the report; re-delivering an unchanged fact on a timer is
+   *      noise, not liveness.
+   *
+   * Note this is a suppressor on RE-escalation only. Suppression while an
+   * escalation is still open is a separate, deliberate mechanism -- the open row
+   * contributes a waiting path for its leaf, so the finding does not re-fire.
+   * That behaviour is intentional and is pinned by "treats open recovery issues
+   * as active waiting paths for non-assigned-backlog states" and by "creates one
+   * bounded escalation for an assigned backlog blocker leaf"; do not remove it in
+   * an attempt to fix the loop. The loop lives here, in the re-arm.
+   *
+   * What still re-arms, so this cannot degrade into "stop escalating":
+   *   - any activity on the leaf after the resolution
+   *   - a different invariant state (the fingerprint carries `state`)
+   *   - a `cancelled` rather than `done` prior escalation
+   *   - a leaf we cannot read (fails open)
+   *
+   * Trade-off, deliberately accepted and called out for review: an escalation
+   * resolved `done` WITHOUT actually giving the leaf an action path will not
+   * re-raise under the same fingerprint until the leaf is touched. That is the
+   * intended reading of "closing a row must not, by itself, regenerate it"; the
+   * alternative is the unbounded loop this replaces, and cancelling rather than
+   * closing remains the escape hatch. Resolving an escalation does not itself
+   * write to the leaf (`removeRecoveryBlockerFromSource` touches the SOURCE), so
+   * the comparison is stable rather than self-clearing.
+   */
+  async function findSuppressingResolvedLivenessRecoveryIssue(
     finding: IssueLivenessFinding,
     now: Date,
     cooldownMs: number,
   ) {
-    if (cooldownMs <= 0) return null;
-    const cutoff = new Date(now.getTime() - cooldownMs);
-    return db
-      .select({ id: issues.id })
+    const mostRecentDone = await db
+      .select({
+        id: issues.id,
+        completedAt: issues.completedAt,
+        updatedAt: issues.updatedAt,
+      })
       .from(issues)
       .where(
         and(
@@ -7870,13 +7914,43 @@ export function recoveryService(
             eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
           ),
           visibleIssueCondition(),
+          // `done` only, deliberately. A `cancelled` escalation means the report
+          // was wrong or was consolidated away -- not that the leaf was given an
+          // action path -- so that shape must re-escalate immediately. Pinned by
+          // "re-escalates immediately after a matching escalation is cancelled".
           eq(issues.status, "done"),
-          gte(issues.updatedAt, cutoff),
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+    if (!mostRecentDone) return null;
+
+    const resolvedAtMs = (mostRecentDone.completedAt ?? mostRecentDone.updatedAt)?.getTime();
+    if (resolvedAtMs === undefined || !Number.isFinite(resolvedAtMs)) return null;
+
+    if (cooldownMs > 0 && resolvedAtMs >= now.getTime() - cooldownMs) {
+      return { id: mostRecentDone.id, reason: "cooldown" as const };
+    }
+
+    const leaf = await db
+      .select({ lastActivityAt: issues.lastActivityAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, finding.companyId),
+          eq(issues.id, livenessRecoveryLeafIssueId(finding)),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    // Leaf unreadable -> fall through and let the escalation be raised. Failing
+    // open keeps a genuinely abandoned row escalating, which this must not regress.
+    const leafActivityMs = leaf?.lastActivityAt?.getTime();
+    if (leafActivityMs === undefined || !Number.isFinite(leafActivityMs)) return null;
+    if (leafActivityMs > resolvedAtMs) return null;
+
+    return { id: mostRecentDone.id, reason: "unchanged_target" as const };
   }
 
   async function removeRecoveryBlockerFromSource(recovery: typeof issues.$inferSelect) {
@@ -8337,12 +8411,13 @@ export function recoveryService(
       });
       return { kind: "existing" as const, escalationIssueId: existing.id };
     }
-    if (await findRecentCompletedLivenessRecoveryIssue(
+    const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
       input.finding,
       input.now,
       input.reescalationCooldownMs,
-    )) {
-      return { kind: "cooldown" as const };
+    );
+    if (suppressed) {
+      return { kind: "cooldown" as const, reason: suppressed.reason };
     }
 
     const ownerSelection = await resolveEscalationOwnerAgentId(input.finding, recoveryIssue);
@@ -9208,6 +9283,7 @@ export function recoveryService(
       skippedAutoRecoveryDisabled: 0,
       skippedOutsideLookback: 0,
       skippedReescalationCooldown: 0,
+      skippedUnchangedTarget: 0,
       obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
       obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
       obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
@@ -9310,6 +9386,7 @@ export function recoveryService(
         result.escalationIssueIds.push(escalation.escalationIssueId);
       } else if (escalation.kind === "cooldown") {
         result.skippedReescalationCooldown += 1;
+        if (escalation.reason === "unchanged_target") result.skippedUnchangedTarget += 1;
         result.skipped += 1;
       } else {
         result.skipped += 1;

@@ -1320,7 +1320,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     );
   });
 
-  it("holds a recently closed matching escalation, then re-escalates after the cooldown", async () => {
+  it("holds a recently closed matching escalation, and keeps holding past the cooldown while the target is unchanged", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
@@ -1354,16 +1354,22 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     expect(held.escalationsCreated).toBe(0);
     expect(held.skippedReescalationCooldown).toBe(1);
+    expect(held.skippedUnchangedTarget).toBe(0);
 
-    const result = await heartbeat.reconcileIssueGraphLiveness({
+    // BLO-27676: past the cooldown this used to re-raise unconditionally, which
+    // is what made the class non-terminating -- an unchanged target regenerated
+    // the same leaf fingerprint every ~75 min indefinitely. The leaf here has not
+    // been touched since the escalation resolved, so the report has already been
+    // delivered and nothing about it has changed. Stay silent.
+    const stillHeld = await heartbeat.reconcileIssueGraphLiveness({
       now: new Date(now.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 1),
     });
 
-    expect(result.escalationsCreated).toBe(1);
-    expect(result.existingEscalations).toBe(0);
+    expect(stillHeld.escalationsCreated).toBe(0);
+    expect(stillHeld.skippedUnchangedTarget).toBe(1);
 
-    const openEscalations = await db
-      .select()
+    const escalations = await db
+      .select({ id: issues.id })
       .from(issues)
       .where(
         and(
@@ -1372,20 +1378,83 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
           eq(issues.originId, incidentKey),
         ),
       );
-    expect(openEscalations).toHaveLength(2);
-    const freshEscalation = openEscalations.find((issue) => issue.status !== "done");
-    expect(freshEscalation).toMatchObject({
-      parentId: blockerIssueId,
+    expect(escalations.map((row) => row.id)).toEqual([closedEscalationId]);
+  });
+
+  it("re-escalates once the leaf target has been touched since the escalation resolved", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatSvc;
+    const now = new Date();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+
+    // Timeline matters here, and it is easy to get wrong: the escalation gate
+    // ALSO requires the leaf to have been quiet for the staleness threshold, so
+    // "touch the leaf" cannot mean "touch it just now" -- that suppresses the
+    // finding outright via a different gate and the test proves nothing.
+    // Resolve 50h ago, touch the leaf 30h ago: after the resolution (so this
+    // suppressor re-arms) but still >24h quiet (so the finding fires at all).
+    const resolvedAt = new Date(now.getTime() - 50 * 60 * 60 * 1000);
+    const touchedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Closed escalation",
+      status: "done",
+      priority: "high",
+      parentId: blockedIssueId,
       assigneeAgentId: managerId,
-      status: expect.stringMatching(/^(todo|in_progress|done)$/),
+      issueNumber: 3,
+      identifier: "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: new Date(resolvedAt.getTime() - 30 * 60 * 1000),
+      updatedAt: resolvedAt,
+      completedAt: resolvedAt,
     });
 
-    const blockers = await db
-      .select({ blockerIssueId: issueRelations.issueId })
-      .from(issueRelations)
-      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.some((row) => row.blockerIssueId === closedEscalationId)).toBe(false);
-    expect(blockers.some((row) => row.blockerIssueId === freshEscalation?.id)).toBe(true);
+    await db
+      .update(issues)
+      .set({ lastActivityAt: touchedAt, updatedAt: touchedAt })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("still escalates an unowned backlog blocker that has never been reported", async () => {
+    // Rejection test for the suppressor above: it must not degrade into "stop
+    // escalating". A leaf with no owner, no disposition and no prior resolved
+    // escalation is exactly the shape the detector exists to catch.
+    await enableAutoRecovery();
+    const { companyId, blockerIssueId } = await seedBlockedChain({ blockerStatus: "backlog" });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+
+    const [escalation] = await db
+      .select({ parentId: issues.parentId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "harness_liveness_escalation"),
+        ),
+      );
+    expect(escalation?.parentId).toBe(blockerIssueId);
   });
 
   it("re-escalates immediately after a matching escalation is cancelled", async () => {
