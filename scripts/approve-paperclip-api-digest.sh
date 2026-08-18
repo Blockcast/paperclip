@@ -123,6 +123,21 @@ if [[ -n "$ABANDON_IN_FLIGHT" && -z "$ABANDON_IN_FLIGHT_OWNER" ]] \
   echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER must be set together" >&2
   exit 2
 fi
+# Admissibility-probe pacing. Validated here, with the other operator-facing
+# env, so a typo fails before the ring is touched rather than mid-probe with an
+# in-flight lock held. The exhaustion message at the end of this script actively
+# directs operators to raise the attempt count, so these are turned by hand
+# under pressure and must fail legibly.
+PROBE_ATTEMPTS="${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-40}"
+PROBE_MAX_SLEEP_SECONDS="${PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS:-8}"
+if [[ ! "$PROBE_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PAPERCLIP_APPROVAL_PROBE_ATTEMPTS='${PROBE_ATTEMPTS}' is not a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$PROBE_MAX_SLEEP_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS='${PROBE_MAX_SLEEP_SECONDS}' is not a positive integer" >&2
+  exit 2
+fi
 if [[ -z "${PAPERCLIP_DEPLOY_KUBECONFIG:-}" \
       || ! -f "$PAPERCLIP_DEPLOY_KUBECONFIG" ]]; then
   echo "PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential used for the admission probe" >&2
@@ -381,6 +396,7 @@ MAX_ROTATE_ATTEMPTS="${PAPERCLIP_APPROVAL_ROTATE_ATTEMPTS:-5}"
 replace_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-err.XXXXXX")"
 nonce_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-nonce.XXXXXX")"
 server_plan_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-server-plan.XXXXXX")"
+probe_attempts_log="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-probe-log.XXXXXX")"
 lock_cleanup_armed=""
 lock_preserve_on_failure=""
 
@@ -402,7 +418,7 @@ cleanup_on_exit() {
       echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER value." >&2
     fi
   fi
-  rm -f "$replace_err" "$nonce_err" "$server_plan_err"
+  rm -f "$replace_err" "$nonce_err" "$server_plan_err" "$probe_attempts_log"
   exit "$status"
 }
 trap cleanup_on_exit EXIT
@@ -656,9 +672,53 @@ fi
 # Helm's managed-field ownership. Create semantics are used only on NotFound.
 # The returned object is also the server-normalized plan whose hash completion
 # later requires on the live rollout.
+#
+# The wait is for an informer to converge, not for a kubectl round trip, so the
+# cadence has to be sized in wall-clock minutes rather than attempts. The
+# original flat 1s/2s over 30 attempts capped the sleep budget at ~56s; three
+# consecutive production deploys (2026-08-14, -16, -17) burned the entire window
+# and failed at this step, and an otherwise-identical rerun on 08-18 passed with
+# no code change — the signature of a race, not a rejected manifest. Back off
+# geometrically to a ceiling: still ~1s for the common case where the parameter
+# is already visible, but a tail measured in minutes when it is not.
+# PROBE_ATTEMPTS and PROBE_MAX_SLEEP_SECONDS are resolved and range-checked in
+# the operator-env block near the top, before the in-flight lock is taken.
+#
+# 1,1,2,2,4,4,8,8,... capped. 40 attempts ≈ 286s of sleep. The exponent is
+# clamped before shifting: bash arithmetic is signed 64-bit, so `1 << 63` is
+# INT64_MIN and a raised PAPERCLIP_APPROVAL_PROBE_ATTEMPTS — which the
+# exhaustion message below tells operators to do — would otherwise hand `sleep`
+# a negative delay and abort the run with the lock still held.
+probe_backoff_seconds() {
+  local attempt="$1"
+  local exponent=$(( (attempt - 1) / 2 ))
+  local delay="$PROBE_MAX_SLEEP_SECONDS"
+  if (( exponent < 31 )); then
+    delay=$(( 1 << exponent ))
+    if (( delay > PROBE_MAX_SLEEP_SECONDS )); then
+      delay="$PROBE_MAX_SLEEP_SECONDS"
+    fi
+  fi
+  printf '%s' "$delay"
+}
+
+# Only the final attempt's stderr used to be reported. When the ring became
+# visible partway through, the tail of the window could be dominated by an
+# unrelated policy, so an informer-lag timeout was indistinguishable from a
+# genuine manifest rejection — which is exactly how this failure was first
+# misdiagnosed as Helm-chart drift. Keep every attempt so the summary can show
+# what actually denied, and how often.
+record_probe_attempt() {
+  printf 'attempt %s: %s\n' \
+    "$1" \
+    "$(tr '\n' ' ' <"$server_plan_err" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')" \
+    >>"$probe_attempts_log"
+}
+
+probe_started_at="$(date +%s)"
 server_plan_ready=""
 server_plan_json=""
-for attempt in $(seq 1 "${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-30}"); do
+for attempt in $(seq 1 "$PROBE_ATTEMPTS"); do
   server_plan_candidate="$planned_json"
   server_plan_verb=create
   if live_server_plan_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
@@ -667,7 +727,8 @@ for attempt in $(seq 1 "${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-30}"); do
         '.metadata.resourceVersion | select(type == "string" and length > 0)' \
         <<<"$live_server_plan_json")"; then
       echo "live Deployment/${DEPLOYMENT} has no resourceVersion" >"$server_plan_err"
-      sleep "$(( attempt < 5 ? 1 : 2 ))"
+      record_probe_attempt "$attempt"
+      sleep "$(probe_backoff_seconds "$attempt")"
       continue
     fi
     server_plan_candidate="$(jq -n \
@@ -699,7 +760,8 @@ for attempt in $(seq 1 "${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-30}"); do
       ')"
     server_plan_verb=replace
   elif ! grep -qiE 'not[[:space:]]+found|notfound' "$server_plan_err"; then
-    sleep "$(( attempt < 5 ? 1 : 2 ))"
+    record_probe_attempt "$attempt"
+    sleep "$(probe_backoff_seconds "$attempt")"
     continue
   fi
 
@@ -707,13 +769,32 @@ for attempt in $(seq 1 "${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-30}"); do
       | "${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" "$server_plan_verb" \
           --dry-run=server -o json -f - 2>"$server_plan_err")"; then
     server_plan_ready=yes
+    # Always report, not just on a slow convergence: this race was invisible for
+    # three deploys precisely because a win left no trace. A run that habitually
+    # lands near PROBE_ATTEMPTS is one informer hiccup from failing, and only
+    # the success-path number shows that before it does.
+    echo "Plan became admissible on probe ${attempt}/${PROBE_ATTEMPTS} after $(( $(date +%s) - probe_started_at ))s."
     break
   fi
-  sleep "$(( attempt < 5 ? 1 : 2 ))"
+  record_probe_attempt "$attempt"
+  sleep "$(probe_backoff_seconds "$attempt")"
 done
 if [[ -z "$server_plan_ready" ]]; then
-  echo "planned Deployment never became admissible for ${DIGEST}:" >&2
-  cat "$server_plan_err" >&2
+  probe_elapsed_seconds=$(( $(date +%s) - probe_started_at ))
+  {
+    echo "planned Deployment never became admissible for ${DIGEST}"
+    echo "  gave up after ${PROBE_ATTEMPTS} probes spanning ${probe_elapsed_seconds}s"
+    echo "  denials observed across the window (most frequent first):"
+    if ! grep -oE "ValidatingAdmissionPolicy '[^']+'" "$probe_attempts_log" \
+        | sort | uniq -c | sort -rn | sed 's/^/    /'; then
+      echo "    (no admission-policy denial matched; see the last attempt below)"
+    fi
+    echo "  last attempt:"
+    sed 's/^/    /' "$server_plan_err"
+    echo "  If the denials above are dominated by paperclip-api-image-approval,"
+    echo "  this is admission-parameter informer lag, not a rejected manifest;"
+    echo "  raise PAPERCLIP_APPROVAL_PROBE_ATTEMPTS and retry."
+  } >&2
   exit 1
 fi
 CANONICAL_SERVER_PLAN="$(jq -cS "$CANONICAL_DEPLOYMENT_JQ" <<<"$server_plan_json")"

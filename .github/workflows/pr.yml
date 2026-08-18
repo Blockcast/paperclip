@@ -82,6 +82,9 @@ jobs:
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
 
+      - name: Test approval admissibility-probe backoff (BLO-28471)
+        run: node --test ./scripts/approve-paperclip-api-digest.test.js
+
       - name: Test CI cache and Docker runner routing
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
 
