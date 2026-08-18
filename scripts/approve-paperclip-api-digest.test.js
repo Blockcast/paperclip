@@ -86,20 +86,48 @@ test("backoff follows the documented 1,1,2,2,4,4,8,8 ramp and holds at the ceili
   assert.deepEqual(delaysFor(range(1, 12)), [1, 1, 2, 2, 4, 4, 8, 8, 8, 8, 8, 8]);
 });
 
-test("the default window spends the sleep budget the script's own comment claims", () => {
-  // Derived from the script's defaults, and cross-checked against the arithmetic
-  // the comment beside probe_backoff_seconds states. If someone changes either
-  // default, this fails loudly instead of agreeing with itself.
+// The budget prose wraps across several `#` lines, so assertions about it match
+// a normalised form rather than a brittle single-line regex.
+const commentText = script
+  .split("\n")
+  .filter((line) => line.trimStart().startsWith("#"))
+  .map((line) => line.trimStart().replace(/^#\s?/, ""))
+  .join(" ")
+  .replace(/\s+/g, " ");
+
+test("the script documents BOTH sleep quantities, and both match the arithmetic", () => {
+  // Two different numbers live here and conflating them is the exact defect this
+  // guards: probe_backoff_seconds summed over every attempt, versus what the
+  // loop actually sleeps — the final attempt does not sleep, so the loop spends
+  // one whole ceiling less. The prior version of this test asserted only the
+  // former while the comment claimed it was the latter, so the suite actively
+  // defended a figure that was wrong by exactly PROBE_MAX_SLEEP_SECONDS.
   assert.equal(DEFAULT_ATTEMPTS, 40, "default attempt count moved; update the script comment too");
   assert.equal(DEFAULT_MAX_SLEEP, 8, "default ceiling moved; update the script comment too");
-  const total = delaysFor(range(1, DEFAULT_ATTEMPTS)).reduce((sum, delay) => sum + delay, 0);
-  assert.equal(total, 286);
-  // Tolerates both "≈" and "~=": the onprem-k8s copy of this script uses ASCII
-  // there. Everything else about the assertion is exact.
+
+  const sum = (delays) => delays.reduce((total, delay) => total + delay, 0);
+  const functionTotal = sum(delaysFor(range(1, DEFAULT_ATTEMPTS)));
+  const loopSleeps = sum(delaysFor(range(1, DEFAULT_ATTEMPTS - 1)));
+
+  assert.equal(functionTotal, 286);
+  assert.equal(loopSleeps, 278);
+  assert.equal(
+    functionTotal - loopSleeps,
+    DEFAULT_MAX_SLEEP,
+    "the skipped final sleep should be exactly one ceiling",
+  );
+
+  // Expected prose is built FROM the computed values, so the comment cannot
+  // drift away from the arithmetic in either direction.
   assert.match(
-    script,
-    /40 attempts (?:≈|~=) 286s/,
-    "the in-script budget comment no longer matches the defaults",
+    commentText,
+    new RegExp(`over ${DEFAULT_ATTEMPTS} attempts totals ${functionTotal}s`),
+    `the script comment no longer states the function's ${functionTotal}s total`,
+  );
+  assert.match(
+    commentText,
+    new RegExp(`exhausted window spends ${loopSleeps}s sleeping`),
+    `the script comment no longer states the loop's real ${loopSleeps}s budget`,
   );
 });
 
@@ -186,13 +214,22 @@ test("an empty probe knob falls through to the default rather than failing", () 
 // PAPERCLIP_APPROVAL_PROBE_ATTEMPTS=4000 is one stray zero on the default 40 and
 // buys ~8.9h of probing while the in-flight approval lock is held. Only CI has a
 // deadline; the hand-invoked path documented in the runbook has none.
+//
+// The two 20-digit cases are the reason the guard checks digit WIDTH before
+// magnitude. `(( ))` is signed 64-bit: 2^64 + 40 wraps to exactly 40, so a bare
+// `(( value > limit ))` returns false and passes it through to
+// `seq 1 "$PROBE_ATTEMPTS"`, which iterates on the unwrapped literal
+// essentially forever with the lock held. 99999999999999999999 was caught
+// before only by luck — it wraps to 7766279631452241919, still above the limit.
 test("an out-of-range probe knob is rejected before the approval ring is touched", () => {
   const cases = [
     ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", String(ATTEMPTS_LIMIT + 1)],
     ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "4000"],
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "18446744073709551656"],
     ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "99999999999999999999"],
     ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", String(MAX_SLEEP_LIMIT + 1)],
     ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", "86400"],
+    ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", "18446744073709555200"],
   ];
   for (const [knob, value] of cases) {
     const result = runWithKnobs({ [knob]: value });
