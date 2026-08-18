@@ -1409,7 +1409,149 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       title: "Closed escalation",
       status: "done",
       priority: "high",
-      parentId: blockedIssueId,
+      // Production parents these under the LEAF blocker, asserted by "creates one
+      // manager escalation, preserves blockers, and records owner selection".
+      // `parentId` is not in the suppressor's lookup predicate, so this does not
+      // change what the test proves -- it keeps the fixture the same shape as the
+      // rows the code under test actually produces.
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 3,
+      identifier: "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: new Date(resolvedAt.getTime() - 30 * 60 * 1000),
+      updatedAt: resolvedAt,
+      completedAt: resolvedAt,
+    });
+
+    // Backdate `createdAt` with the activity, so the leaf does not end up with
+    // `updatedAt` earlier than `createdAt` -- an ordering no real row can have,
+    // and one that `issueCreatedAtGte` (always injected via heartbeat.ts) could
+    // start tripping over for reasons unrelated to this behaviour.
+    await db
+      .update(issues)
+      .set({
+        lastActivityAt: touchedAt,
+        updatedAt: touchedAt,
+        createdAt: new Date(touchedAt.getTime() - 60 * 60 * 1000),
+      })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("picks the most recently resolved escalation even when an older row was edited after it closed", async () => {
+    // Regression for the sort-key/value-key mismatch (BLO-27676 review): the
+    // query ordered by `updatedAt` but compared `completedAt ?? updatedAt`, so a
+    // post-close edit to an OLDER escalation made it win the sort while
+    // contributing its older resolution timestamp. That fails OPEN -- the leaf
+    // touch then reads as "after the resolution" and the class re-escalates every
+    // sweep, reinstating exactly the loop this suppressor removes.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+
+    // Two resolutions straddling one leaf touch. The leaf is quiet for 50h, so
+    // the finding still fires (>=24h staleness); the newer resolution is 30h old,
+    // so it is outside the 60m cooldown and inside the 7d ceiling.
+    const olderResolvedAt = new Date(now.getTime() - 100 * 60 * 60 * 1000);
+    const leafTouchedAt = new Date(now.getTime() - 50 * 60 * 60 * 1000);
+    const newerResolvedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Closed escalation (older, edited after close)",
+        status: "done",
+        priority: "high",
+        parentId: blockerIssueId,
+        assigneeAgentId: managerId,
+        issueNumber: 3,
+        identifier: "CLOSED-3",
+        originKind: "harness_liveness_escalation",
+        originId: incidentKey,
+        createdAt: new Date(olderResolvedAt.getTime() - 30 * 60 * 1000),
+        completedAt: olderResolvedAt,
+        // The post-close edit: a retitle/label/assignee change bumps `updatedAt`
+        // long after `completedAt`. This is what used to win the ORDER BY.
+        updatedAt: new Date(now.getTime() - 60 * 1000),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Closed escalation (most recently resolved)",
+        status: "done",
+        priority: "high",
+        parentId: blockerIssueId,
+        assigneeAgentId: managerId,
+        issueNumber: 4,
+        identifier: "CLOSED-4",
+        originKind: "harness_liveness_escalation",
+        originId: incidentKey,
+        createdAt: new Date(newerResolvedAt.getTime() - 30 * 60 * 1000),
+        completedAt: newerResolvedAt,
+        updatedAt: newerResolvedAt,
+      },
+    ]);
+
+    await db
+      .update(issues)
+      .set({
+        lastActivityAt: leafTouchedAt,
+        updatedAt: leafTouchedAt,
+        createdAt: new Date(leafTouchedAt.getTime() - 60 * 60 * 1000),
+      })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    // The leaf touch predates the LATEST resolution, so the report is already
+    // delivered and nothing has changed since: stay silent.
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.skippedUnchangedTarget).toBe(1);
+  });
+
+  it("re-escalates an untouched leaf once the suppression ceiling has elapsed", async () => {
+    // The target-state gate is what lets this class terminate, but unbounded it
+    // is permanent: the leaf is quiet by construction, so an escalation closed
+    // `done` without giving the leaf an action path would never be re-reported --
+    // a silent hole in a liveness detector. The ceiling bounds it to weekly.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+
+    // Resolved 8d ago, past the 7d ceiling, and the leaf has NOT been touched
+    // since (9d quiet). Without the ceiling this is suppressed forever.
+    const resolvedAt = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 9 * 24 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Closed escalation",
+      status: "done",
+      priority: "high",
+      parentId: blockerIssueId,
       assigneeAgentId: managerId,
       issueNumber: 3,
       identifier: "CLOSED-3",
@@ -1422,14 +1564,67 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     await db
       .update(issues)
-      .set({ lastActivityAt: touchedAt, updatedAt: touchedAt })
+      .set({
+        lastActivityAt: leafQuietSince,
+        updatedAt: leafQuietSince,
+        createdAt: new Date(leafQuietSince.getTime() - 60 * 60 * 1000),
+      })
       .where(eq(issues.id, blockerIssueId));
 
-    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
 
     expect(result.escalationsCreated).toBe(1);
     expect(result.skippedUnchangedTarget).toBe(0);
     expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("holds an untouched leaf inside the suppression ceiling", async () => {
+    // Companion to the test above: the ceiling must not be so eager that it
+    // re-opens the ~75 min loop. Same fixture, resolved 30h ago instead of 8d.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+
+    const resolvedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 40 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Closed escalation",
+      status: "done",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 3,
+      identifier: "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: new Date(resolvedAt.getTime() - 30 * 60 * 1000),
+      updatedAt: resolvedAt,
+      completedAt: resolvedAt,
+    });
+
+    await db
+      .update(issues)
+      .set({
+        lastActivityAt: leafQuietSince,
+        updatedAt: leafQuietSince,
+        createdAt: new Date(leafQuietSince.getTime() - 60 * 60 * 1000),
+      })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.skippedUnchangedTarget).toBe(1);
   });
 
   it("still escalates an unowned backlog blocker that has never been reported", async () => {
