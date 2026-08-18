@@ -13,10 +13,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
-const repoRoot = path.resolve(new URL("..", import.meta.url).pathname);
+// fileURLToPath, not URL.pathname: pathname does not percent-decode, so a
+// checkout path containing a space or non-ASCII character would resolve wrong.
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const scriptPath = path.join(repoRoot, "scripts/approve-paperclip-api-digest.sh");
 const script = readFileSync(scriptPath, "utf8");
 
@@ -31,11 +34,36 @@ function extractShellFunction(name) {
   return lines.slice(start, end + 1).join("\n");
 }
 
+// The defaults are READ OUT OF THE SCRIPT, not hard-coded. The whole point of
+// extracting the function is that a rename fails here rather than silently
+// testing a stale copy — but that guarantee was hollow while the two numbers the
+// budget assertion depends on were literals. Changing the script's ceiling to 4
+// would have left `total === 286` passing green while the real budget became
+// 158s and the script's own "40 attempts ~= 286s" comment became false: a silent
+// divergence in the exact quantity this fix exists to control.
+function shellDefault(knob) {
+  const m = script.match(new RegExp(`\\$\\{PAPERCLIP_APPROVAL_${knob}:-(\\d+)\\}`));
+  assert.ok(m, `could not read the PAPERCLIP_APPROVAL_${knob} default out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+// Likewise the upper bounds, so the rejection tests cannot drift from the script.
+function shellLimit(name) {
+  const m = script.match(new RegExp(`^${name}=(\\d+)$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+const DEFAULT_ATTEMPTS = shellDefault("PROBE_ATTEMPTS");
+const DEFAULT_MAX_SLEEP = shellDefault("PROBE_MAX_SLEEP_SECONDS");
+const ATTEMPTS_LIMIT = shellLimit("PROBE_ATTEMPTS_LIMIT");
+const MAX_SLEEP_LIMIT = shellLimit("PROBE_MAX_SLEEP_SECONDS_LIMIT");
+
 const backoffSource = extractShellFunction(FUNCTION_NAME);
 
 // Returns the delay the shipping function yields for each attempt, under the
 // given ceiling. One bash invocation per call, not per attempt.
-function delaysFor(attempts, maxSleepSeconds = 8) {
+function delaysFor(attempts, maxSleepSeconds = DEFAULT_MAX_SLEEP) {
   const harness = [
     "set -euo pipefail",
     `PROBE_MAX_SLEEP_SECONDS=${maxSleepSeconds}`,
@@ -58,9 +86,21 @@ test("backoff follows the documented 1,1,2,2,4,4,8,8 ramp and holds at the ceili
   assert.deepEqual(delaysFor(range(1, 12)), [1, 1, 2, 2, 4, 4, 8, 8, 8, 8, 8, 8]);
 });
 
-test("the default 40-attempt window spends the sleep budget the comment claims", () => {
-  const total = delaysFor(range(1, 40)).reduce((sum, delay) => sum + delay, 0);
+test("the default window spends the sleep budget the script's own comment claims", () => {
+  // Derived from the script's defaults, and cross-checked against the arithmetic
+  // the comment beside probe_backoff_seconds states. If someone changes either
+  // default, this fails loudly instead of agreeing with itself.
+  assert.equal(DEFAULT_ATTEMPTS, 40, "default attempt count moved; update the script comment too");
+  assert.equal(DEFAULT_MAX_SLEEP, 8, "default ceiling moved; update the script comment too");
+  const total = delaysFor(range(1, DEFAULT_ATTEMPTS)).reduce((sum, delay) => sum + delay, 0);
   assert.equal(total, 286);
+  // Tolerates both "≈" and "~=": the onprem-k8s copy of this script uses ASCII
+  // there. Everything else about the assertion is exact.
+  assert.match(
+    script,
+    /40 attempts (?:≈|~=) 286s/,
+    "the in-script budget comment no longer matches the defaults",
+  );
 });
 
 test("a raised ceiling is honoured and never exceeded", () => {
@@ -140,6 +180,41 @@ test("an empty probe knob falls through to the default rather than failing", () 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /is not a positive integer/);
+});
+
+// Shape validation alone left the same class of hazard the clamp closed:
+// PAPERCLIP_APPROVAL_PROBE_ATTEMPTS=4000 is one stray zero on the default 40 and
+// buys ~8.9h of probing while the in-flight approval lock is held. Only CI has a
+// deadline; the hand-invoked path documented in the runbook has none.
+test("an out-of-range probe knob is rejected before the approval ring is touched", () => {
+  const cases = [
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", String(ATTEMPTS_LIMIT + 1)],
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "4000"],
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "99999999999999999999"],
+    ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", String(MAX_SLEEP_LIMIT + 1)],
+    ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", "86400"],
+  ];
+  for (const [knob, value] of cases) {
+    const result = runWithKnobs({ [knob]: value });
+    assert.equal(result.status, 2, `${knob}='${value}' should exit 2, got ${result.status}`);
+    assert.match(
+      result.stderr,
+      new RegExp(`${knob}=.*exceeds the \\d+ maximum`),
+      `${knob}='${value}' should name the knob and its bound, got: ${result.stderr}`,
+    );
+  }
+});
+
+// The bound is a fat-finger guard, not a policy: a deliberate widening well past
+// the default must still be accepted, right up to the limit.
+test("a deliberately widened knob at the limit is still accepted", () => {
+  const result = runWithKnobs({
+    PAPERCLIP_APPROVAL_PROBE_ATTEMPTS: String(ATTEMPTS_LIMIT),
+    PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS: String(MAX_SLEEP_LIMIT),
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
+  assert.doesNotMatch(result.stderr, /is not a positive integer|exceeds the/);
 });
 
 test("valid knobs pass validation and the script proceeds to the deploy credential", () => {
