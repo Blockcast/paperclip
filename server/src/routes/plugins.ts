@@ -235,6 +235,12 @@ const UUID_REGEX =
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
 const PLUGIN_ACTION_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
 const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
+/**
+ * `Retry-After` advertised when webhook ingestion rejects a delivery because the
+ * plugin is not ready. Long enough that a stuck plugin is not hot-looped by its
+ * senders, short enough that a normal restart re-delivers promptly.
+ */
+const WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS = 30;
 const MEMORY_PLUGIN_KEYWORDS = ["gbrain", "hindsight", "memory", "plugin-secrets"] as const;
 
 type RagHealthBucketCacheEntry = {
@@ -3143,8 +3149,16 @@ export function pluginRoutes(
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
-   * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 400 if the manifest is missing or lacks the webhooks.receive capability
+   * - 503 (with `Retry-After`) if the plugin is not in ready state
    * - 502 if the worker is unavailable or the RPC call fails
+   *
+   * Readiness is a *transient, server-side* condition, so it answers 503 and
+   * not 4xx: a conforming sender treats 4xx as permanent and discards the
+   * payload outright. Alertmanager did exactly that during the 2026-08-18
+   * outage ("notify retry canceled due to unrecoverable error ... status code
+   * 400"), destroying every alert that fired across a 5.8h window. Keep this
+   * retryable; delayed alerts are recoverable, dropped ones are not.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -3161,9 +3175,13 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 2: Validate the plugin is in 'ready' state
+    // Step 2: Validate the plugin is in 'ready' state.
+    //
+    // 503 + Retry-After, not 400: the request is well-formed and the fault is
+    // ours. Matching the sibling guard at the plugin-scoped API route above.
     if (plugin.status !== "ready") {
-      res.status(400).json({
+      res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
+      res.status(503).json({
         error: `Plugin is not ready (current status: ${plugin.status})`,
       });
       return;
