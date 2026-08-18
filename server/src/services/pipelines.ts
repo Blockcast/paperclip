@@ -50,7 +50,6 @@ import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
-import { logger } from "../middleware/logger.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
