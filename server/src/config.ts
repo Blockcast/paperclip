@@ -333,6 +333,22 @@ function warnNumericSettingAdjustment(name: string | undefined, message: string)
 }
 
 /**
+ * Render a rejected candidate for the operator.
+ *
+ * `JSON.stringify` maps every non-finite number to the string `null`, which
+ * would make the reject warning unable to name the one input class it exists to
+ * report: a config file carrying an overflowing literal parses to the *number*
+ * `Infinity` (JSON has no `Infinity` token, but `JSON.parse("1e999")` yields
+ * one), and the warning would then read `ignoring override null` and send the
+ * operator looking for a literal `null` that is not in their file. Numbers are
+ * therefore rendered with `String`; everything else keeps `JSON.stringify` so
+ * the quoting still distinguishes the string `"abc"` from a bare number.
+ */
+function describeNumericCandidate(candidate: NumericSettingCandidate): string {
+  return typeof candidate === "number" ? String(candidate) : JSON.stringify(candidate);
+}
+
+/**
  * Resolve the first usable candidate for a numeric setting, clamped to `[min, max]`.
  *
  * A candidate is usable only when it is finite and positive. Unusable
@@ -372,7 +388,7 @@ export function resolveNumericSetting(
     if (!Number.isFinite(parsed) || parsed <= 0) {
       warnNumericSettingAdjustment(
         name,
-        `ignoring override ${JSON.stringify(candidate)} — not a finite positive number`,
+        `ignoring override ${describeNumericCandidate(candidate)} — not a finite positive number`,
       );
       continue;
     }
