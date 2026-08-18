@@ -128,14 +128,38 @@ fi
 # in-flight lock held. The exhaustion message at the end of this script actively
 # directs operators to raise the attempt count, so these are turned by hand
 # under pressure and must fail legibly.
+#
+# An explicitly-empty value falls through to the default on purpose: a CI `env:`
+# expression that resolves to "" must not fail a deploy.
+#
+# Both shape AND magnitude are checked. A bare digits pattern would accept 4000
+# — one stray zero on the default 40 — which is ~8.9h of probing while holding
+# the in-flight approval lock, and 99999999999999999999 would pass too. That is
+# the same hazard class the exponent clamp closes. The exhaustion message points
+# an operator at this exact knob while a release is wedged, and only CI has a
+# deadline to catch an overshoot (bash does run the EXIT trap on SIGTERM, so the
+# CI kill at least retires the lock); the hand-invoked path has none. The
+# ceilings below are fat-finger guards, not policy: a deliberate widening well
+# past the default still fits.
 PROBE_ATTEMPTS="${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-40}"
 PROBE_MAX_SLEEP_SECONDS="${PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS:-8}"
+PROBE_ATTEMPTS_LIMIT=1000
+PROBE_MAX_SLEEP_SECONDS_LIMIT=3600
 if [[ ! "$PROBE_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
   echo "PAPERCLIP_APPROVAL_PROBE_ATTEMPTS='${PROBE_ATTEMPTS}' is not a positive integer" >&2
   exit 2
 fi
+if (( PROBE_ATTEMPTS > PROBE_ATTEMPTS_LIMIT )); then
+  echo "PAPERCLIP_APPROVAL_PROBE_ATTEMPTS='${PROBE_ATTEMPTS}' exceeds the ${PROBE_ATTEMPTS_LIMIT} maximum" >&2
+  echo "that many probes would hold the in-flight approval lock for hours; widen deliberately, not by typo" >&2
+  exit 2
+fi
 if [[ ! "$PROBE_MAX_SLEEP_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS='${PROBE_MAX_SLEEP_SECONDS}' is not a positive integer" >&2
+  exit 2
+fi
+if (( PROBE_MAX_SLEEP_SECONDS > PROBE_MAX_SLEEP_SECONDS_LIMIT )); then
+  echo "PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS='${PROBE_MAX_SLEEP_SECONDS}' exceeds the ${PROBE_MAX_SLEEP_SECONDS_LIMIT} maximum" >&2
   exit 2
 fi
 if [[ -z "${PAPERCLIP_DEPLOY_KUBECONFIG:-}" \
@@ -777,7 +801,17 @@ for attempt in $(seq 1 "$PROBE_ATTEMPTS"); do
     break
   fi
   record_probe_attempt "$attempt"
-  sleep "$(probe_backoff_seconds "$attempt")"
+  # No sleep after the final attempt: the loop is about to end, so it buys
+  # nothing and would inflate the elapsed figure reported below by one whole
+  # ceiling — overstating the window in the very message an operator reads to
+  # decide whether to widen it. Spelled as an `if` rather than
+  # `(( … )) && sleep`: a false `(( … ))` yields a non-zero status, and this is
+  # the last command in the loop body, so the safe reading depends on a `set -e`
+  # exemption. An abort here would strand the in-flight lock; not worth the
+  # subtlety to save two lines.
+  if (( attempt < PROBE_ATTEMPTS )); then
+    sleep "$(probe_backoff_seconds "$attempt")"
+  fi
 done
 if [[ -z "$server_plan_ready" ]]; then
   probe_elapsed_seconds=$(( $(date +%s) - probe_started_at ))
