@@ -775,21 +775,6 @@ export function parseStatusFilter(input: string | readonly string[] | undefined)
     .filter(Boolean);
 }
 
-// BLO-24495: `GET /companies/:companyId/issues` only ever implemented
-// limit/offset pagination. `page`/`perPage` were silently dropped (never read
-// from req.query), so every page number replayed the same limit/offset-default
-// window with no error — a confident, wrong result set. Detect their presence
-// so the route can reject explicitly instead.
-export function parseUnsupportedPaginationParams(query: {
-  page?: unknown;
-  perPage?: unknown;
-}): string[] {
-  return [
-    ...(query.page !== undefined ? ["page"] : []),
-    ...(query.perPage !== undefined ? ["perPage"] : []),
-  ];
-}
-
 export interface IssueFilters {
   attention?: "blocked";
   status?: string | readonly string[];

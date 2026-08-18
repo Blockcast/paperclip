@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
-import { parseUnsupportedPaginationParams } from "../services/issues.ts";
+import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.ts";
 
 /**
  * Regression test for BLO-24495.
