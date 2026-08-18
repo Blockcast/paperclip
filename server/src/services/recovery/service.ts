@@ -9117,6 +9117,36 @@ export function recoveryService(
         { healed: result.healed, issueIds: result.issueIds },
         "stranded recovery wake backstop redelivered undelivered recovery-action wakes",
       );
+    } else if (result.checked > 0) {
+      // The all-skipped sweep is the one that matters and it used to be the one that said
+      // nothing: the healed>0 branch above was the only log here, and both callers in
+      // index.ts log `reconcileIssueGraphLiveness` only when `escalationsCreated` or
+      // `dependencyWakesHealed` moved. So a sweep that examined a full page of candidates
+      // and redelivered none emitted no record at all, and the per-gate counters below were
+      // computed and dropped on the floor. That is why BLO-19124 could measure the symptom
+      // (actions reaching their 6h horizon at attemptCount 0-1 of a 5-attempt budget) but
+      // not the cause: nothing said which gate consumed the ~11 unused redelivery slots.
+      // `info` rather than `warn` because this fires on the 30s scheduler tick and an
+      // idle-but-healthy fleet legitimately skips every candidate (live path, cooldown).
+      // The value is the time series, not any single line.
+      logger.info(
+        {
+          checked: result.checked,
+          noOwnerSkipped: result.noOwnerSkipped,
+          causeSkipped: result.causeSkipped,
+          exhaustedSkipped: result.exhaustedSkipped,
+          cooldownSkipped: result.cooldownSkipped,
+          livePathSkipped: result.livePathSkipped,
+          interactionSkipped: result.interactionSkipped,
+          pauseHoldSkipped: result.pauseHoldSkipped,
+          claimLost: result.claimLost,
+          candidateLimitSkipped: result.candidateLimitSkipped,
+          deferredOrFailed: result.deferredOrFailed,
+          enqueueFailed: result.enqueueFailed,
+          backlogParkedResolved: result.backlogParkedResolved,
+        },
+        "stranded recovery wake backstop redelivered nothing this sweep",
+      );
     }
 
     return result;
