@@ -20242,6 +20242,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     lookbackHours?: number;
     now?: Date;
     reescalationCooldownMs?: number;
+    // Both re-escalation suppressors must be settable from here: this wrapper is
+    // the only way into the detector (`index.ts` boot paths, the operator route
+    // at `routes/instance-settings.ts`, and the tests all call it rather than
+    // `recovery.reconcileIssueGraphLiveness`). An option the service accepts but
+    // this literal type omits is an excess-property error for every caller under
+    // `src/`, i.e. unreachable from typechecked code rather than merely
+    // inconvenient -- which would leave the documented rollback for a
+    // liveness-detector behaviour change as "edit a constant and redeploy".
+    // Note this is NOT enforced for the test suite: `server/tsconfig.json`
+    // excludes `src/__tests__`, so a test can pass the field either way and
+    // cannot pin this. The production callers above are what keep it honest.
+    unchangedTargetSuppressionMs?: number;
   }) {
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
