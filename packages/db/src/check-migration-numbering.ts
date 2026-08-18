@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { basename } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const journalPath = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
@@ -235,7 +236,15 @@ async function main() {
   analyzeMigrationNumbering(await readMigrationNumberingInput());
 }
 
-const isDirectRun = process.argv[1] === fileURLToPath(import.meta.url);
+const isDirectRun =
+  Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+
 if (isDirectRun) {
-  await main();
+  try {
+    await main();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`${basename(process.argv[1])}: ${detail}`);
+    process.exitCode = 1;
+  }
 }
