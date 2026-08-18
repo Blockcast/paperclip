@@ -1,12 +1,14 @@
 import { Router, type Request } from "express";
-import { eq } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  listApprovalsQuerySchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import {
@@ -17,25 +19,49 @@ import {
   secretService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactApprovalPayloadByType } from "../redaction.js";
+import { redactApprovalPayloadForDisplay } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
 
-function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(approval: T): T {
+function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
+  approval: T,
+): T & { redactedFields: string[] } {
+  const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
   return {
     ...approval,
-    payload: redactApprovalPayloadByType(approval.type, approval.payload),
+    payload,
+    redactedFields,
   };
 }
 
 function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
-): T & { applied: boolean } {
+): T & { redactedFields: string[]; applied: boolean } {
   return {
     ...redactApprovalPayload(approval),
     applied,
   };
+}
+
+// A status-only recovery run is barred from approval work because approvals carry expensive or
+// destructive side effects once resolved. Filing a board escalation is the one exception: the card
+// is inert until a human resolves it, and it is the only channel that reaches a human at all.
+//
+// A manager delivering the productivity-review verdict "block with an unblock owner" has to be able
+// to execute that verdict in the same run that reaches it. Without this escape the review can state
+// a gate it cannot escalate, and the natural failure mode — believing the escalation implied by the
+// verdict exists — silently reproduces the stall the review was created to catch. See BLO-23036.
+//
+// Deliberately create-only: resubmit/withdraw/comment never pass a requested type, so they stay
+// barred regardless of the target approval's type.
+const BOARD_ESCALATION_APPROVAL_TYPE = "request_board_approval";
+
+function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+  const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
+  return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
 }
 
 function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
@@ -46,6 +72,15 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.allowDeliverableWork === false &&
     context.allowDocumentUpdates === false &&
     context.resumeRequiresNormalModel === true;
+}
+
+function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  return context.recoveryIntent === "planning_only" &&
+    context.allowDeliverableWork === false &&
+    context.allowDocumentUpdates === true &&
+    context.resumeRequiresNormalModel === false;
 }
 
 export function approvalRoutes(
@@ -79,7 +114,12 @@ export function approvalRoutes(
     return false;
   }
 
-  async function assertApprovalMutationAllowedByRunContext(req: Request, res: any, companyId: string) {
+  async function assertApprovalMutationAllowedByRunContext(
+    req: Request,
+    res: any,
+    companyId: string,
+    options: { requestedType?: unknown; requestedIssueIds?: unknown } = {},
+  ) {
     if (req.actor.type !== "agent") return true;
     const runId = req.actor.runId?.trim();
     if (!runId || !req.actor.agentId) return true;
@@ -95,27 +135,162 @@ export function approvalRoutes(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return true;
 
-    res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
-      details: {
-        companyId,
-        runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
+    const refuse = (error: string, extra: Record<string, unknown> = {}) => {
+      res.status(403).json({
+        error,
+        details: {
+          companyId,
+          runId: run.id,
+          ...(statusOnly ? {
+            modelProfile: "cheap",
+            allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          } : {}),
+          recoveryIntent: planningOnly ? "planning_only" : "status_only",
+          resumeRequiresNormalModel: statusOnly,
+          ...extra,
+        },
+      });
+      return false;
+    };
+
+    if (planningOnly) {
+      return refuse("Planning-only recovery runs cannot create or modify approvals");
+    }
+
+    if (options.requestedType !== BOARD_ESCALATION_APPROVAL_TYPE) {
+      return refuse(
+        "Cheap status-only recovery runs can only create `request_board_approval` approvals; " +
+        "every other approval create/modify action requires a normal-model run",
+      );
+    }
+
+    const sourceIssueId = statusOnlyEscalationSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      return refuse(
+        "This status-only run cannot file a board escalation: its run context has no source issue",
+      );
+    }
+
+    const requestedIssueIds = Array.isArray(options.requestedIssueIds)
+      ? Array.from(new Set(options.requestedIssueIds.filter((value): value is string => typeof value === "string")))
+      : [];
+    if (!requestedIssueIds.includes(sourceIssueId)) {
+      return refuse(
+        "A status-only run must link its board escalation to the source issue from its run context",
+        { sourceIssueId },
+      );
+    }
+
+    const unrelatedIssueIds = requestedIssueIds.filter((issueId) => issueId !== sourceIssueId);
+    if (unrelatedIssueIds.length > 0) {
+      return refuse(
+        "A status-only run may only link a board escalation to its source issue",
+        { sourceIssueId, unrelatedIssueIds },
+      );
+    }
+
+    // Do not authorize from an ID alone: authorization decisions depend on the source issue's
+    // current assignee, origin, and scope. Passing a partial resource would make an assigned source
+    // look unassigned and could trigger the generic company-agent allow path. The source is looked
+    // up and authorized before the approval is created or linked.
+    const sourceIssue = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        projectId: issues.projectId,
+        parentId: issues.parentId,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        createdByAgentId: issues.createdByAgentId,
+        status: issues.status,
+        originKind: issues.originKind,
+        originId: issues.originId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, sourceIssueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceIssue) {
+      return refuse(
+        "This status-only run cannot file a board escalation: its source issue is unavailable in this company",
+        { sourceIssueId },
+      );
+    }
+
+    const sourceAuthorization = await access.decide({
+      actor: req.actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: sourceIssue.companyId,
+        issueId: sourceIssue.id,
+        projectId: sourceIssue.projectId,
+        parentIssueId: sourceIssue.parentId,
+        assigneeAgentId: sourceIssue.assigneeAgentId,
+        assigneeUserId: sourceIssue.assigneeUserId,
+        createdByAgentId: sourceIssue.createdByAgentId ?? null,
+        status: sourceIssue.status,
+        originKind: sourceIssue.originKind,
+        originId: sourceIssue.originId ?? null,
+      },
+      scope: {
+        issueId: sourceIssue.id,
+        projectId: sourceIssue.projectId,
+        parentIssueId: sourceIssue.parentId,
+        assigneeAgentId: sourceIssue.assigneeAgentId,
+        assigneeUserId: sourceIssue.assigneeUserId,
+        originKind: sourceIssue.originKind ?? null,
+        originId: sourceIssue.originId ?? null,
       },
     });
-    return false;
+    if (!sourceAuthorization.allowed) {
+      return refuse(
+        "This status-only run is not authorized to escalate its source issue",
+        { sourceIssueId, authorizationReason: sourceAuthorization.reason },
+      );
+    }
+
+    return true;
   }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
-    const status = req.query.status as string | undefined;
-    const result = await svc.list(companyId, status);
+
+    const parsed = listApprovalsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid query", details: parsed.error.flatten() });
+      return;
+    }
+    const { view, status, type, issueId, requestedByAgentId, idempotencyKey } = parsed.data;
+
+    // `count` and `summary` exist so that checking whether an ask is already filed is
+    // cheaper than filing it again. The default `full` view is unchanged.
+    const filters = {
+      status,
+      type,
+      issueId,
+      requestedByAgentId,
+      idempotencyKey,
+    };
+    if (view === "count") {
+      const count = await svc.countBy(companyId, filters);
+      res.json({ count });
+      return;
+    }
+
+    if (view === "summary") {
+      const rows = await svc.listSummary(companyId, filters);
+      res.json(rows);
+      return;
+    }
+
+    const result = await svc.list(companyId, filters);
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
 
@@ -131,12 +306,15 @@ export function approvalRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
+      requestedType: req.body.type,
+      requestedIssueIds: uniqueIssueIds,
+    }))) return;
     const { issueIds: _issueIds, ...approvalInput } = req.body;
     const normalizedPayload =
       approvalInput.type === "hire_agent"
@@ -146,41 +324,19 @@ export function approvalRoutes(
             { strictMode: strictSecretsMode },
           )
         : approvalInput.payload;
-
-    const actor = getActorInfo(req);
-    const approval = await svc.create(companyId, {
-      ...approvalInput,
-      payload: normalizedPayload,
-      requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-      // An agent actor cannot nominate a different requester. The body field stays honoured for
-      // user actors (a human filing on an agent's behalf), but letting an agent set it would make
-      // `requestedByAgentId` unusable as an attribution signal — anything downstream that reasons
-      // about who asked for an approval could be pointed at an innocent agent.
-      requestedByAgentId:
-        actor.actorType === "agent"
-          ? actor.actorId
-          : (approvalInput.requestedByAgentId ?? null),
-      status: "pending",
-      decisionNote: null,
-      decidedByUserId: null,
-      decidedAt: null,
-      updatedAt: new Date(),
-    });
-
-    if (uniqueIssueIds.length > 0) {
-      await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
+    if (
+      approvalInput.type === "hire_agent" &&
+      Object.prototype.hasOwnProperty.call(normalizedPayload, "agentId")
+    ) {
+      res.status(422).json({
+        error: "Generic hire approvals cannot bind an existing agent; use the agent hire endpoint",
       });
+      return;
     }
 
-    // Surface the approval's human-facing title/description in the activity
-    // details so the plugin domain event (built from `details` in logActivity)
-    // carries them to notifiers. Without this the Slack approval card renders
-    // only `Type` — every board approval looks identical (every card is just
-    // `request_board_approval`). `payload` is free-form (z.record), so accept
-    // either `description` or the common `note` alias. The Slack formatter reads
-    // `approvalId`, `title`, `description`.
+    const actor = getActorInfo(req);
+    const requestedByAgentId = actor.actorType === "agent" ? actor.actorId : null;
+    const requestedByUserId = actor.actorType === "user" ? actor.actorId : null;
     const payloadObj =
       typeof normalizedPayload === "object" && normalizedPayload !== null
         ? (normalizedPayload as Record<string, unknown>)
@@ -194,24 +350,84 @@ export function approvalRoutes(
           ? payloadObj.note
           : undefined;
 
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.created",
-      entityType: "approval",
-      entityId: approval.id,
-      details: {
-        type: approval.type,
-        approvalId: approval.id,
-        issueIds: uniqueIssueIds,
-        ...(approvalTitle !== undefined ? { title: approvalTitle } : {}),
-        ...(approvalDescription !== undefined
-          ? { description: approvalDescription }
-          : {}),
+    const publishCreatedActivityRef: { current: (() => void) | null } = { current: null };
+    const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
+      ...approvalInput,
+      payload: normalizedPayload,
+      // Requester identity is derived only from the authenticated actor, and exactly one
+      // requester column is populated. Letting a user also nominate `requestedByAgentId`
+      // makes the idempotency key ambiguous because both requester-scoped unique indexes
+      // would apply to the same row.
+      requestedByAgentId,
+      requestedByUserId,
+      status: "pending",
+      decisionNote: null,
+      decidedByUserId: null,
+      decidedAt: null,
+      updatedAt: new Date(),
+    }, {
+      afterCreate: async (txDb, createdApproval) => {
+        if (uniqueIssueIds.length > 0) {
+          await issueApprovalService(txDb).linkManyForApproval(createdApproval.id, uniqueIssueIds, {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          });
+        }
+
+        publishCreatedActivityRef.current = await logActivity(txDb, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          action: "approval.created",
+          entityType: "approval",
+          entityId: createdApproval.id,
+          details: {
+            type: createdApproval.type,
+            approvalId: createdApproval.id,
+            issueIds: uniqueIssueIds,
+            ...(approvalTitle !== undefined ? { title: approvalTitle } : {}),
+            ...(approvalDescription !== undefined
+              ? { description: approvalDescription }
+              : {}),
+          },
+        }, { deferPublish: true });
       },
     });
+
+    // Issue links are applied on both paths. The insert is onConflictDoNothing, so
+    // re-linking the same issues is a no-op, and a retry that names a new issue still
+    // gets it attached rather than silently losing it. New filings link inside the
+    // create transaction above, with the human-facing activity log; replays must not
+    // emit another activity card.
+    if (deduplicated && uniqueIssueIds.length > 0) {
+      await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+    }
+
+    publishCreatedActivityRef.current?.();
+
+    // A replay is not a new filing. Answer with the original plus a readback so the
+    // requester learns it is still pending without having to file again to find out —
+    // silence is otherwise indistinguishable from "not yet decided", which is what
+    // makes retrying the only way to get information, and the queue flood downstream.
+    if (deduplicated) {
+      const pendingForMs = Date.now() - new Date(approval.createdAt).getTime();
+      res.status(200).json({
+        ...redactApprovalPayload(approval),
+        deduplicated: true,
+        deduplicationReason: "idempotency_key",
+        pendingSince: approval.createdAt,
+        pendingForMs,
+        statusReadback:
+          `Approval ${approval.id} (${approval.type}) is still ${approval.status}, filed ` +
+          `${new Date(approval.createdAt).toISOString()} (${Math.floor(pendingForMs / 60000)} min ago). ` +
+          `No duplicate was created.`,
+      });
+      return;
+    }
 
     res.status(201).json(redactApprovalPayload(approval));
   });
@@ -312,7 +528,7 @@ export function approvalRoutes(
       return;
     }
 
-    const normalizedPayload = req.body.payload
+    let normalizedPayload = req.body.payload
       ? existing.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
             existing.companyId,
@@ -321,6 +537,19 @@ export function approvalRoutes(
           )
         : req.body.payload
       : undefined;
+    if (existing.type === "hire_agent" && normalizedPayload) {
+      const submittedAgentId = normalizedPayload.agentId;
+      if (
+        (existing.linkedAgentId && submittedAgentId !== undefined && submittedAgentId !== existing.linkedAgentId) ||
+        (!existing.linkedAgentId && Object.prototype.hasOwnProperty.call(normalizedPayload, "agentId"))
+      ) {
+        res.status(422).json({ error: "Hire approval agent binding cannot be changed" });
+        return;
+      }
+      if (existing.linkedAgentId) {
+        normalizedPayload = { ...normalizedPayload, agentId: existing.linkedAgentId };
+      }
+    }
     const approval = await svc.resubmit(id, normalizedPayload);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -333,6 +562,33 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
+    res.json(redactApprovalPayload(approval));
+  });
+
+  router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!existing) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+
+    // Scoped exactly like resubmit: a requester may rescind its own ask, but
+    // never another agent's. Board actors retain full reach.
+    if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
+      res.status(403).json({ error: "Only requesting agent can withdraw this approval" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const reason = req.body.reason as string;
+    const approval = await svc.withdraw(id, reason, {
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      activity: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+      },
+    });
+
     res.json(redactApprovalPayload(approval));
   });
 

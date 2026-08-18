@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  approvals,
   companies,
   companySkills,
   createDb,
@@ -16,6 +17,7 @@ import {
   issueExecutionDecisions,
   issueReadStates,
   issues,
+  pluginEventOutbox,
   routines,
 } from "@paperclipai/db";
 import {
@@ -23,6 +25,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
+import { approvalService } from "../services/approvals.js";
 import { companyService } from "../services/companies.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -46,6 +49,12 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
+    // Withdrawal enqueues its plugin event through the caller's transaction, so
+    // these fixtures now leave real outbox rows behind. This teardown deletes
+    // tables directly rather than going through companyService.remove, which
+    // does purge the outbox (companies.ts) -- so it has to purge it too, or the
+    // company delete below trips the outbox FK.
+    await db.delete(pluginEventOutbox);
     await db.delete(issueReadStates);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
@@ -55,6 +64,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(routines);
+    await db.delete(approvals);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -153,6 +163,139 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("clears approval agent bindings before deleting the referenced agent", async () => {
+    const { agentId, companyId } = await seedFixture();
+    const approvalId = randomUUID();
+
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      linkedAgentId: agentId,
+      requestedByAgentId: agentId,
+      requestedByUserId: null,
+      status: "approved",
+      payload: { agentId, name: "CodexCoder" },
+    });
+
+    const removed = await agentService(db).remove(agentId);
+
+    expect(removed?.id).toBe(agentId);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+
+    const [approval] = await db
+      .select({
+        linkedAgentId: approvals.linkedAgentId,
+        requestedByAgentId: approvals.requestedByAgentId,
+      })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId));
+    expect(approval).toEqual({ linkedAgentId: null, requestedByAgentId: null });
+  });
+
+  it("leaves an open hire approval withdrawable after its pending agent is deleted", async () => {
+    // Nulling `linked_agent_id` alone strands the caller-supplied
+    // `payload.agentId`, and the strict binding check then refuses the
+    // withdrawal with a 409 that no retry can satisfy -- the approval would be
+    // stuck open forever with no agent left to decide it against.
+    const { agentId, companyId } = await seedFixture();
+    const approvalId = randomUUID();
+
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      linkedAgentId: agentId,
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId, name: "CodexCoder" },
+    });
+
+    await agentService(db).remove(agentId);
+
+    const [neutralised] = await db
+      .select({ linkedAgentId: approvals.linkedAgentId, payload: approvals.payload })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId));
+    expect(neutralised.linkedAgentId).toBeNull();
+    expect(neutralised.payload).not.toHaveProperty("agentId");
+    // The rest of the payload is preserved -- only the dangling id is dropped.
+    expect(neutralised.payload).toMatchObject({ name: "CodexCoder" });
+
+    const withdrawn = await approvalService(db).withdraw(approvalId, "hire agent was deleted", {
+      userId: "user-1",
+      activity: { actorType: "user", actorId: "user-1", agentId: null },
+    });
+    expect(withdrawn.status).toBe("withdrawn");
+  });
+
+  it("does not touch a foreign company's approval that names the removed agent in its payload", async () => {
+    // `payload.agentId` is caller-controlled free-form JSON. Without a company
+    // predicate on the neutralisation update, company B could plant company A's
+    // agent id in its own approval payload and have that row rewritten when A
+    // deletes the agent -- a tenant-isolation break, and an existence oracle:
+    // B learns when a foreign agent it cannot otherwise observe was deleted.
+    const { agentId, companyId } = await seedFixture();
+    const foreign = await seedFixture();
+    const sameCompanyApprovalId = randomUUID();
+    const foreignApprovalId = randomUUID();
+
+    await db.insert(approvals).values({
+      id: sameCompanyApprovalId,
+      companyId,
+      type: "hire_agent",
+      linkedAgentId: agentId,
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId, name: "CodexCoder" },
+    });
+
+    // Same shape, different tenant, and deliberately NOT linked -- the only
+    // thing tying it to the removed agent is the untrusted payload id.
+    await db.insert(approvals).values({
+      id: foreignApprovalId,
+      companyId: foreign.companyId,
+      type: "hire_agent",
+      linkedAgentId: null,
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { agentId, name: "PlantedByOtherTenant" },
+    });
+
+    const [foreignBefore] = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, foreignApprovalId));
+
+    await agentService(db).remove(agentId);
+
+    const [foreignAfter] = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, foreignApprovalId));
+    // Byte-for-byte: payload keeps the planted id, and no column moved
+    // (including `updated_at`, which would itself leak that a write occurred).
+    expect(foreignAfter).toEqual(foreignBefore);
+    expect(foreignAfter.payload).toMatchObject({ agentId, name: "PlantedByOtherTenant" });
+
+    // ...while the removed agent's own company is still cleaned up and withdrawable.
+    const [neutralised] = await db
+      .select({ linkedAgentId: approvals.linkedAgentId, payload: approvals.payload })
+      .from(approvals)
+      .where(eq(approvals.id, sameCompanyApprovalId));
+    expect(neutralised.linkedAgentId).toBeNull();
+    expect(neutralised.payload).not.toHaveProperty("agentId");
+
+    const withdrawn = await approvalService(db).withdraw(sameCompanyApprovalId, "hire agent was deleted", {
+      userId: "user-1",
+      activity: { actorType: "user", actorId: "user-1", agentId: null },
+    });
+    expect(withdrawn.status).toBe("withdrawn");
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {

@@ -1,10 +1,94 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { envBindingSecretRefSchema, envBindingUserSecretRefSchema } from "@paperclipai/shared";
 
-const SECRET_FIELD_NAME_PATTERN =
-  String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|base[-_]?url)[A-Za-z0-9_-]*`;
+/**
+ * Tier 1: key-name stems with no ambiguous benign reading (BLO-20810 / CEO
+ * design constraint on #943). Any key matching one of these is redacted
+ * unconditionally — no value gate, inherited by every descendant of the
+ * matched value (object and array alike). A `credential`- or `password`-named
+ * field is never prose; the tradeoff this accepts is that a field that merely
+ * *contains* one of these words (e.g. `decision_3_traffic_ops_credential`)
+ * keeps redacting even when the ask itself isn't secret material — the filer
+ * is told which fields were scrubbed at create time (`redactedFields`) and
+ * restates them in a comment instead.
+ */
+const SECRET_TIER1_STEMS =
+  String.raw`api[-_]?key|access[-_]?token|auth(?:entication|orization|[-_]?token)|bearer|token|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring`;
 
-const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
+/**
+ * Tier 2: substrings that collide with ordinary words — bare `auth` catches
+ * `author`/`authored`, bare `secret` catches sentence-shaped names like
+ * `no_secrets_in_payload`, and `base_url` is a benign config field that
+ * happens to contain `url`-adjacent text. These get a narrow positive
+ * credential test (`looksLikeCredentialValue`) rather than unconditional
+ * redaction, so `ask_2_author_identity` survives but `ask_2_author_identity:
+ * "ghp_..."` still redacts.
+ */
+const SECRET_TIER2_STEMS = String.raw`auth|secret|base[-_]?url`;
+
+const SECRET_FIELD_NAME_PATTERN =
+  String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER1_STEMS}|${SECRET_TIER2_STEMS})[A-Za-z0-9_-]*`;
+
+const SECRET_TIER1_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER1_STEMS})[A-Za-z0-9_-]*`, "i");
+const SECRET_TIER2_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER2_STEMS})[A-Za-z0-9_-]*`, "i");
+
+/**
+ * `auth`/`secret` are Tier 2 because they collide with ordinary words
+ * (`author`, `no_secrets_in_payload`), but as a *whole token* in a key
+ * that otherwise reads as an identifier — not a sentence — they're never
+ * that collision: `secret`, `client_secret`, `webhook_secret`,
+ * `stripe_webhook_secret`, `auth` are ordinary credential field names, not
+ * prose. Promote those to Tier 1 so a short value under them
+ * (`{ secret: "hunter2" }`) doesn't fall through `looksLikeCredentialValue`'s
+ * length/shape gate (BLO-20810 residual finding, #943 review).
+ *
+ * A flat token-count cap (originally <=2) under-promoted real three-token
+ * field names like `stripe_webhook_secret` and `database_client_secret`
+ * (#943 review, still-present finding). The count alone can't tell
+ * `stripe_webhook_secret` (an identifier) from `secret_fields_must_stay_
+ * redacted` (a sentence that happens to contain the word "secret") — but
+ * *position* can: every sentence-shaped collision in this codebase's own
+ * census (`secret_fields_must_stay_redacted`, `no_secret_values_in_this_
+ * report`, `ask_2_author_identity`) has the trigger word somewhere in the
+ * middle, never as the trailing token, because English sentences end on a
+ * verb/object/adjective, not the subject noun. Real credential field names
+ * follow the opposite convention (`*_secret`, `*_auth`). So: promote when
+ * the trigger word is the *last* token regardless of total length, in
+ * addition to the original short-key case (<=2 tokens, any position) so
+ * `auth`/`secret` alone still promote. `author`/`authors` keep Tier 2
+ * because "auth" isn't a whole token in them; `base_url` is excluded on
+ * purpose — it is two tokens but never itself a credential value.
+ */
+const AMBIGUOUS_PROMOTABLE_TOKENS = new Set(["auth", "secret"]);
+
+function keyTokens(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[_\-\s]+/)
+    .filter(Boolean)
+    .map((token) => token.toLowerCase());
+}
+
+function promotesTier2ToTier1(key: string): boolean {
+  const tokens = keyTokens(key);
+  if (tokens.length === 0) return false;
+  if (tokens.length <= 2) return tokens.some((token) => AMBIGUOUS_PROMOTABLE_TOKENS.has(token));
+  return AMBIGUOUS_PROMOTABLE_TOKENS.has(tokens[tokens.length - 1]);
+}
+
+/**
+ * Single source of truth for a key's tier, used both for the top-level scan
+ * in `sanitizeRecord` and to re-evaluate object children in
+ * `sanitizeSecretMatchedValue` — a Tier-2 parent must not suppress a child
+ * key that independently classifies as Tier 1 (BLO-20810 / #943 review
+ * Critical: `{ authorInfo: { password: "hunter2" } }` used to inherit
+ * `authorInfo`'s Tier 2 all the way down and never re-test `password`).
+ */
+function classifyKeyTier(key: string): 1 | 2 | null {
+  if (SECRET_TIER1_KEY_RE.test(key)) return 1;
+  if (SECRET_TIER2_KEY_RE.test(key)) return promotesTier2ToTier1(key) ? 1 : 2;
+  return null;
+}
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -184,6 +268,204 @@ function sanitizeCommandArgs(args: unknown[], options?: SanitizeOptions): unknow
   });
 }
 
+const OPAQUE_VALUE_SCHEME_PREFIX_RE = /^(?:bearer|basic|token)\s+/i;
+const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]+-----/;
+const URL_USERINFO_RE = /:\/\/[^/\s@]+:[^/\s@]+@/;
+const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|passwd|password|credential|x-amz-signature)=/i;
+const KNOWN_SECRET_PREFIX_RE = /^(?:sk-|sk_live_|pk_live_|ghp_|gho_|ghu_|ghs_|ghr_|xox[baprs]-|AKIA|glpat-|gsk_)/i;
+const JWT_LIKE_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const MIN_OPAQUE_TOKEN_LENGTH = 20;
+
+/**
+ * A URL's total length trivially exceeds any opaque-token threshold, so a
+ * whole-string length backstop is useless for URLs — nearly every real URL
+ * would trip it (CTO finding, #943 review). Gate per path segment instead:
+ * an ordinary URL's segments (`pull`, `1898`, `Blockcast`) are short, while a
+ * capability/webhook URL that embeds its credential directly in the path
+ * (no `user:pass@`, no `?token=`) puts the whole secret in a single segment,
+ * e.g. `https://hooks.slack.test/services/T000/B000/<opaque-secret>`.
+ *
+ * Length alone over-redacts: a 40-char commit SHA or a canonical UUID is a
+ * benign evidence identifier, not a capability, and length-only gating
+ * blanks it right back (Important finding, #943 review — the exact
+ * over-redaction this issue exists to remove, just relocated into the URL
+ * branch). Exempt the two identifier shapes that are common, unambiguous,
+ * and never themselves a bearer credential: bare hex (git SHAs, hex object
+ * ids) and canonical UUIDs. Also exempt a segment that reads as a
+ * human-authored slug — several short hyphen/underscore-joined words rather
+ * than one unbroken blob.
+ *
+ * "Chunked into short parts" is NOT on its own evidence of readability
+ * (Important finding, #1136 review, head b78bb2e9): a delimiter-chunked
+ * opaque token such as `a1b2c3d4-e5f6g7h8-i9j0k1l2` is three parts of <=12
+ * chars and passed a pure arity/length test, so the generic backstop that is
+ * supposed to fail closed on unrecognized long values let it through. Judge
+ * the parts *lexically* instead: a slug's parts are whole words
+ * (`pending`, `merge`) or bare numbers (`20810`, an issue id), whereas the
+ * signature of an opaque chunk is letters and digits interleaved *within*
+ * one part. Require at least two word-shaped parts as well, so an all-numeric
+ * chunking (`12345678-87654321-11223344`) stays fail-closed too.
+ *
+ * Residual, deliberately accepted: a secret chunked into purely alphabetic
+ * parts (`abcdefgh-ijklmnop-qrstuvwx`) is still exempted. Separating that
+ * from a real word list needs a dictionary; the alternative — dropping the
+ * exemption — re-blanks the status slugs and evidence links this issue
+ * exists to stop over-redacting, which is the more common and more costly
+ * failure. Tier-1 keys never reach this test, so a value under a genuinely
+ * secret-named field is redacted regardless of shape.
+ */
+const HEX_IDENTIFIER_RE = /^[0-9a-f]{20,64}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SLUG_WORD_PART_RE = /^[A-Za-z]+$/;
+const SLUG_NUMERIC_PART_RE = /^[0-9]+$/;
+const MAX_SLUG_PART_LENGTH = 12;
+
+function looksLikeReadableSlug(segment: string): boolean {
+  const parts = segment.split(/[-_]/).filter(Boolean);
+  if (parts.length < 3) return false;
+  let wordParts = 0;
+  for (const part of parts) {
+    if (part.length > MAX_SLUG_PART_LENGTH) return false;
+    if (SLUG_WORD_PART_RE.test(part)) {
+      wordParts += 1;
+      continue;
+    }
+    // Bare numbers (issue ids, years, counts) are ordinary slug components.
+    // Anything else — notably letters and digits mixed inside a single
+    // part — is an opaque chunk, so fail closed.
+    if (!SLUG_NUMERIC_PART_RE.test(part)) return false;
+  }
+  return wordParts >= 2;
+}
+
+function hasOpaqueUrlPathSegment(pathname: string): boolean {
+  return pathname.split("/").some((rawSegment) => {
+    if (!rawSegment) return false;
+    let segment = rawSegment;
+    try {
+      segment = decodeURIComponent(rawSegment);
+    } catch {
+      // Malformed percent-encoding: judge the raw segment as-is.
+    }
+    if (/\s/.test(segment) || segment.length < MIN_OPAQUE_TOKEN_LENGTH) return false;
+    if (HEX_IDENTIFIER_RE.test(segment) || UUID_RE.test(segment)) return false;
+    if (looksLikeReadableSlug(segment)) return false;
+    return true;
+  });
+}
+
+/**
+ * Tier 2's value gate (BLO-20810 / CEO design constraint on #943 review). This
+ * is a *positive* credential test, not a benign-shape allowlist — the earlier
+ * version of this function ("does it look like prose?") let real credentials
+ * through whenever they happened to contain whitespace (a spaced passphrase)
+ * or a scheme (a presigned/webhook URL, a Postgres DSN), because those are
+ * properties real credentials can have too. Classify the *value* as
+ * credential-shaped by matching known secret prefixes, JWT shape, PEM
+ * blocks, URL userinfo/credential query params, a path-embedded opaque
+ * segment, or (as a backstop for unrecognized formats) a long single opaque
+ * token — rather than inferring "not a credential" from the absence of those
+ * properties.
+ *
+ * A short single word ("octocat", "alice") is common under ambiguous
+ * tier-2 keys like `author`/`authors` and is deliberately NOT treated as
+ * credential-shaped (BLO-20810 Important finding) — real secrets this
+ * function must catch either carry a recognizable prefix/shape or are long
+ * enough that `MIN_OPAQUE_TOKEN_LENGTH` catches them.
+ */
+function looksLikeCredentialValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return false;
+  if (PEM_BLOCK_RE.test(trimmed)) return true;
+  if (URL_LIKE_VALUE_RE.test(trimmed)) {
+    if (URL_USERINFO_RE.test(trimmed) || URL_CREDENTIAL_QUERY_RE.test(trimmed)) return true;
+    try {
+      const url = new URL(trimmed);
+      // `url.search` is covered by the `trimmed` test above via
+      // URL_CREDENTIAL_QUERY_RE, but a fragment (`#access_token=...`, the
+      // OAuth2 implicit-flow shape) is not: its param never has a leading
+      // `?`/`&` to match on, since it starts right after `#` (Critical
+      // finding, #943 review). Re-run the same credential-param test against
+      // the fragment with a synthesized `?` so the fragment's first param
+      // matches the same way a query string's first param does.
+      if (url.hash.length > 1 && URL_CREDENTIAL_QUERY_RE.test(`?${url.hash.slice(1)}`)) return true;
+      return hasOpaqueUrlPathSegment(url.pathname);
+    } catch {
+      return false;
+    }
+  }
+  if (OPAQUE_VALUE_SCHEME_PREFIX_RE.test(trimmed)) return true;
+  const withoutScheme = trimmed.replace(OPAQUE_VALUE_SCHEME_PREFIX_RE, "");
+  if (withoutScheme.length === 0) return false;
+  if (KNOWN_SECRET_PREFIX_RE.test(withoutScheme)) return true;
+  if (JWT_LIKE_VALUE_RE.test(withoutScheme)) return true;
+  if (/\s/.test(withoutScheme)) return false;
+  if (withoutScheme.length < MIN_OPAQUE_TOKEN_LENGTH) return false;
+  // Same over-redaction as the URL path-segment case, one level up: a
+  // whitespace-free length-20+ *status slug* (`pending_human_merge_review`)
+  // is exactly as common under a Tier-2 collision key as a real opaque
+  // token, and the length backstop alone can't tell them apart. Confirmed
+  // live on a currently-pending card, not hypothetical: an
+  // `authoritative_state` field (Tier 2 — "auth" is a substring of
+  // "authoritative", the same collision class as "author") got blanked by
+  // this exact branch post-#943-merge. Reuse the same
+  // dictionary-word-shaped-parts exemption already applied to URL path
+  // segments.
+  return !looksLikeReadableSlug(withoutScheme);
+}
+
+/**
+ * Applies key-based redaction to a value already known to sit under a
+ * secret-ish-named key, without assuming the value is a bare string —
+ * recurses into arrays *and* objects so a name collision on the parent key
+ * (e.g. `ask_2_author_identity`, `links.PR_1898_app_authored`) doesn't
+ * destroy structured or non-opaque content nested beneath it, and so a
+ * genuinely secret parent (e.g. `authorization: { value, current }`) keeps
+ * every descendant leaf covered by *at least* the parent's tier — a neutral
+ * child key doesn't downgrade it — while a child key that independently
+ * classifies as a *stronger* tier than the parent (e.g. `password` under the
+ * ambiguous `authorInfo`) is redacted unconditionally rather than inheriting
+ * the parent's weaker narrow-value-test tier (BLO-20810 / #943 review
+ * Critical 2 — the object branch used to delegate to `sanitizeRecord`, which
+ * re-tested each child key from scratch and silently dropped the parent's
+ * sensitivity in the other direction; the array branch never had that bug,
+ * so array and object must take the same path here).
+ *
+ * `tier === 1` mirrors the unconditional Tier-1 key match: every string leaf
+ * is redacted regardless of shape. `tier === 2` applies the narrow
+ * credential test (`looksLikeCredentialValue`) at every leaf, unless a child
+ * key itself resolves to Tier 1.
+ */
+function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | undefined, tier: 1 | 2): unknown {
+  if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
+    return sanitizeValue(value, options);
+  }
+  if (isPlainBinding(value)) {
+    return { type: "plain", value: REDACTED_EVENT_VALUE };
+  }
+  if (typeof value === "string") {
+    if (tier === 1) return REDACTED_EVENT_VALUE;
+    return looksLikeCredentialValue(value) ? REDACTED_EVENT_VALUE : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeSecretMatchedValue(entry, options, tier));
+  }
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      // A child key's own classification only ever strengthens the
+      // inherited tier (min(1, 2) = 1), never weakens it — a neutral child
+      // (`value`, `current`) keeps the parent's tier, exactly as before.
+      const childTier = classifyKeyTier(k);
+      const effectiveTier = childTier !== null && childTier < tier ? childTier : tier;
+      out[k] = sanitizeSecretMatchedValue(v, options, effectiveTier);
+    }
+    return out;
+  }
+  return value;
+}
+
 export function sanitizeRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
@@ -199,20 +481,9 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
       redacted[key] = redactSensitiveText(value);
       continue;
     }
-    if (SECRET_PAYLOAD_KEY_RE.test(key)) {
-      if (isSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value, options);
-        continue;
-      }
-      if (isUserSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value, options);
-        continue;
-      }
-      if (isPlainBinding(value)) {
-        redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
-        continue;
-      }
-      redacted[key] = REDACTED_EVENT_VALUE;
+    const keyTier = classifyKeyTier(key);
+    if (keyTier !== null) {
+      redacted[key] = sanitizeSecretMatchedValue(value, options, keyTier);
       continue;
     }
     if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
@@ -260,6 +531,57 @@ export function redactApprovalPayloadByType(type: unknown, payload: unknown): Re
   if (!payload || !isPlainObject(payload)) return {};
   if (type === "hire_agent") return redactAgentConfigPayload(payload) ?? {};
   return redactEventPayload(payload) ?? {};
+}
+
+/**
+ * Approval payloads are a human-facing escalation channel (BLO-20810), so a
+ * field the scanner actually blanked must read differently from one the
+ * filer simply left empty — a bare `***REDACTED***` is ambiguous on its own.
+ * This walks the already-redacted output next to the untouched original —
+ * never round-tripped back into approval decisions, see `services/approvals.ts`
+ * `approve()`, which reads the raw DB row rather than this display payload —
+ * and swaps each genuinely-scrubbed leaf for a message naming the field,
+ * while also returning the list of paths so the filer can restate them in a
+ * comment (comment bodies aren't scanned).
+ *
+ * Scoped to the generic, key-name-triggered redaction path only. `hire_agent`
+ * goes through `redactAgentConfigPayload`'s unconditional structural rules
+ * (BLO-18969: every `env` value and `plain` binding is credential material by
+ * construction, not a name-collision false positive) and keeps the bare
+ * sentinel — other code treats that exact string as a contract, e.g. the
+ * `agents-pending-approval-config` test suite and the persistence guard in
+ * `secrets.ts`.
+ */
+export function redactApprovalPayloadForDisplay(
+  type: unknown,
+  payload: unknown,
+): { payload: Record<string, unknown>; redactedFields: string[] } {
+  const redacted = redactApprovalPayloadByType(type, payload);
+  if (type === "hire_agent") return { payload: redacted, redactedFields: [] };
+
+  const redactedFields: string[] = [];
+  const original = isPlainObject(payload) ? payload : {};
+
+  function annotate(originalValue: unknown, redactedValue: unknown, path: string): unknown {
+    if (redactedValue === REDACTED_EVENT_VALUE && originalValue !== REDACTED_EVENT_VALUE) {
+      redactedFields.push(path);
+      return `[redacted by secret scanner: ${path}]`;
+    }
+    if (Array.isArray(redactedValue) && Array.isArray(originalValue)) {
+      return redactedValue.map((entry, i) => annotate(originalValue[i], entry, `${path}[${i}]`));
+    }
+    if (isPlainObject(redactedValue) && isPlainObject(originalValue)) {
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(redactedValue)) {
+        out[k] = annotate(originalValue[k], redactedValue[k], path ? `${path}.${k}` : k);
+      }
+      return out;
+    }
+    return redactedValue;
+  }
+
+  const displayPayload = annotate(original, redacted, "") as Record<string, unknown>;
+  return { payload: displayPayload, redactedFields };
 }
 
 export function redactSensitiveText(input: string): string {

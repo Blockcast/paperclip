@@ -38,6 +38,7 @@ import {
 import { routineService } from "../services/routines.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3077,5 +3078,140 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(freshChild!.terminalChildCount).toBe(1);
     expect(freshGrandchild!.terminalKind).toBe("cancelled");
     expect(freshGrandchild!.retiredReason).toBe("automation_retry");
+  });
+
+  // BLO-21605: `updateStageAutomationEnv` used to fire `logActivity` from
+  // inside its `db.transaction` callback, so a consumer could receive
+  // `activity.logged` before the routine-revision bump committed, and a
+  // rolled-back transaction still emitted an event for a revision that never
+  // existed.
+  describe("updateStageAutomationEnv activity publication", () => {
+    async function routineRevisionNumber(routineId: string) {
+      return db
+        .select({ latestRevisionNumber: routines.latestRevisionNumber })
+        .from(routines)
+        .where(eq(routines.id, routineId))
+        .then((rows) => rows[0]?.latestRevisionNumber ?? null);
+    }
+
+    // Subscribes to `activity.logged` for the given action and, at the moment
+    // each event fires, kicks off a `snapshot()` read on a connection outside
+    // the transaction that logged it. Whether that read observes the
+    // committed effect is what distinguishes "published after commit" from
+    // "published from inside the transaction".
+    function captureActivityEvents<T>(companyId: string, action: string, snapshot: () => Promise<T>) {
+      const seen: { valueAtPublish: Promise<T> }[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+        if (event.type !== "activity.logged") return;
+        const payload = event.payload as Record<string, unknown>;
+        if (payload.action !== action) return;
+        seen.push({ valueAtPublish: snapshot() });
+      });
+      return { seen, stop: unsubscribe };
+    }
+
+    async function seedAutomatedStage() {
+      const { company, pipeline, byKey } = await seedPipeline();
+      const routineSeed = await seedRoutine(company.id, "Env publish seed");
+      const stageId = byKey.get("in_progress")!.id;
+      const savedStage = await svc.updateStage({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        stageId,
+        patch: {
+          config: {
+            automation: {
+              assigneeAgentId: routineSeed.assigneeAgentId,
+              instructionsBody: "Env publication probe.",
+            },
+          },
+        },
+        actor: userActor,
+      });
+      const routineId = (savedStage.config as { onEnter?: { routineId?: string } }).onEnter!.routineId!;
+      return { company, pipeline, stageId, routineId };
+    }
+
+    it("emits no activity.logged event when the env update transaction fails to commit", async () => {
+      const { company, pipeline, stageId, routineId } = await seedAutomatedStage();
+      const revisionBefore = await routineRevisionNumber(routineId);
+
+      // Runs the real transaction — routine revision bump, pipeline_stages
+      // update, and the activity_log insert all succeed — then aborts it,
+      // standing in for a commit-time failure.
+      const rollbackDb = new Proxy(db, {
+        get(target, property, receiver) {
+          if (property === "transaction") {
+            return (callback: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+              (target.transaction as unknown as (
+                cb: (tx: unknown) => Promise<unknown>,
+                ...args: unknown[]
+              ) => Promise<unknown>)(async (tx) => {
+                await callback(tx);
+                throw new Error("simulated commit failure after insert");
+              }, ...rest);
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      }) as typeof db;
+      const rollbackSvc = pipelineService(rollbackDb, { heartbeat: noopHeartbeat });
+
+      const events = captureActivityEvents(
+        company.id,
+        "pipeline.stage_automation_env_updated",
+        () => routineRevisionNumber(routineId),
+      );
+      try {
+        await expect(rollbackSvc.updateStageAutomationEnv({
+          companyId: company.id,
+          pipelineId: pipeline.id,
+          stageId,
+          env: null,
+          actor: userActor,
+        })).rejects.toBeDefined();
+      } finally {
+        events.stop();
+      }
+
+      expect(
+        events.seen,
+        "a rolled-back env update must not publish a phantom activity event",
+      ).toHaveLength(0);
+      await expect(routineRevisionNumber(routineId)).resolves.toBe(revisionBefore);
+    });
+
+    it("publishes pipeline.stage_automation_env_updated only once the revision bump is visible", async () => {
+      const { company, pipeline, stageId, routineId } = await seedAutomatedStage();
+
+      const events = captureActivityEvents(
+        company.id,
+        "pipeline.stage_automation_env_updated",
+        () => routineRevisionNumber(routineId),
+      );
+      let result: Awaited<ReturnType<typeof svc.updateStageAutomationEnv>>;
+      try {
+        result = await svc.updateStageAutomationEnv({
+          companyId: company.id,
+          pipelineId: pipeline.id,
+          stageId,
+          env: null,
+          actor: userActor,
+        });
+      } finally {
+        events.stop();
+      }
+
+      expect(events.seen).toHaveLength(1);
+      const revisionAfter = await routineRevisionNumber(routineId);
+      expect(result).toBeDefined();
+      // Read taken from inside the event listener, on a connection outside
+      // the updating transaction: the bumped revision is only visible there
+      // after commit, so a pre-commit publication would observe the stale
+      // (pre-update) revision number instead.
+      await expect(
+        events.seen[0]!.valueAtPublish,
+        "the bumped revision must already be visible to other connections when the event fires",
+      ).resolves.toBe(revisionAfter);
+    });
   });
 });

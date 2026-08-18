@@ -189,7 +189,7 @@ describe("paperclip MCP tools", () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(init.body))).toEqual({
       agentId: "22222222-2222-2222-2222-222222222222",
-      expectedStatuses: ["todo", "backlog", "blocked"],
+      expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
     });
   });
 
@@ -218,6 +218,14 @@ describe("paperclip MCP tools", () => {
       requestDepth: 0,
       allowDuplicate: false,
     });
+  });
+
+  it("documents duplicate candidates as advisory and independent of allowDuplicate", () => {
+    const tool = getTool("paperclipCreateIssue");
+
+    expect(tool.description).toContain("advisory `duplicateCandidates`");
+    expect(tool.description).toContain("never refuse the create");
+    expect(tool.description).toContain("independent of `allowDuplicate`");
   });
 
   it("defaults issue document format to markdown", async () => {
@@ -485,7 +493,7 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipCreateApproval");
     await tool.execute({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
 
@@ -497,9 +505,165 @@ describe("paperclip MCP tools", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
       type: "hire_agent",
-      payload: { branch: "pap-1167" },
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
+  });
+
+  it("publishes payload.title as required for approval creation", () => {
+    const tool = getTool("paperclipCreateApproval");
+    const payloadSchema = tool.schema.shape.payload;
+
+    expect(Object.keys(payloadSchema.shape)).toContain("title");
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { branch: "pap-1167" },
+    }).success).toBe(false);
+    expect(tool.schema.safeParse({
+      type: "hire_agent",
+      payload: { title: "Approve agent hire", branch: "pap-1167" },
+    }).success).toBe(true);
+  });
+
+  it("omits approval resubmit payload when no replacement payloadJson is supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "resubmit",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/resubmit",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({});
+  });
+
+  it("routes approval withdraw to the requester-scoped withdraw endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "Superseded by PR #1190.",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/withdraw",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Superseded by PR #1190." });
+  });
+
+  it("falls back to decisionNote as the withdraw reason", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      decisionNote: "Question answered itself.",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Question answered itself." });
+  });
+
+  it("prefers reason over decisionNote when a withdraw supplies both", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "Superseded by PR #1190.",
+      decisionNote: "stale note from an earlier draft",
+    });
+
+    // `reason` is the withdraw-specific field, so it wins; `decisionNote` is only
+    // a fallback. Pinning this keeps the precedence from silently inverting.
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ reason: "Superseded by PR #1190." });
+  });
+
+  it("folds reason into decisionNote on non-withdraw actions so it is never dropped", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ id: "approval-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "approve",
+      reason: "Looks good.",
+    });
+
+    // `reason` is advertised on the shared schema, so a board caller can reach for
+    // it on any action. Without the fold-back the note is silently elided by
+    // JSON.stringify and the server receives {}.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/55555555-5555-5555-5555-555555555555/approve",
+    );
+    expect(JSON.parse(String(init.body))).toEqual({ decisionNote: "Looks good." });
+  });
+
+  it("refuses a withdraw with a blank reason instead of dropping it", async () => {    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    const response = await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "   ",
+    });
+
+    // Fails loudly and locally: the audit trail relies on the reason to tell a
+    // moot request from an abandoned one, so this must never reach the server
+    // as a withdrawal with no note.
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain("withdraw requires a non-empty reason");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves requester and pending scoping to the server for withdraw", async () => {
+    // The route rejects withdrawing another agent's card (403) and the service
+    // rejects withdrawing an already-decided one (409). Pin that the tool sends
+    // no actor or status override that could widen either check.
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ error: "Only requesting agent can withdraw this approval" }, 403),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    const response = await tool.execute({
+      approvalId: "55555555-5555-5555-5555-555555555555",
+      action: "withdraw",
+      reason: "Not mine to withdraw.",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(Object.keys(JSON.parse(String(init.body)))).toEqual(["reason"]);
+    expect(response.isError).toBe(true);
+    expect(response.content[0]?.text).toContain("Only requesting agent can withdraw this approval");
   });
 
   it("rejects invalid generic request paths", async () => {
@@ -724,5 +888,75 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("No accessible company with prefix");
     // Only the company-list call happened; no cross-company request was attempted.
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // BLO-18466: a CEO PATCH denied with 403 came back success-shaped, so the
+  // caller read `priority` off the result, got nothing, and reported the
+  // priority as raised when the field had not moved. The denial must reach the
+  // agent as a failure, not as an object that merely lacks the field.
+  it("surfaces a denied paperclipUpdateIssue as an MCP error rather than a success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ error: "deny_missing_grant", boundary: "grant" }, 403),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateIssue");
+    const response = await tool.execute({
+      issueId: "75901b6e-8c97-40e1-8576-514de1f3f972",
+      priority: "critical",
+    });
+
+    expect(response.isError).toBe(true);
+
+    const payload = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(payload.status).toBe(403);
+    expect(payload.body).toMatchObject({ error: "deny_missing_grant" });
+    // The precise failure mode: no `priority` key to misread as "unchanged".
+    expect(payload).not.toHaveProperty("priority");
+  });
+
+  it("does not mark a successful paperclipUpdateIssue as an error", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "75901b6e-8c97-40e1-8576-514de1f3f972", priority: "critical" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await getTool("paperclipUpdateIssue").execute({
+      issueId: "75901b6e-8c97-40e1-8576-514de1f3f972",
+      priority: "critical",
+    });
+
+    expect(response.isError).toBeUndefined();
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ priority: "critical" });
+  });
+
+  it("queries parked agents with an optional reason filter", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ parkedCount: 1, agents: [{ agentName: "PlatformSREEngineer" }] }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await getTool("paperclipListParkedAgents").execute({
+      reason: "ccrotate_capacity",
+      limit: 50,
+    });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toContain("/companies/11111111-1111-1111-1111-111111111111/parked-agents");
+    expect(String(url)).toContain("reason=ccrotate_capacity");
+    expect(String(url)).toContain("limit=50");
+    expect(response.isError).toBeUndefined();
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ parkedCount: 1 });
+  });
+
+  it("omits the parked-agents query string when no filters are given", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ parkedCount: 0, agents: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getTool("paperclipListParkedAgents").execute({});
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toContain("/parked-agents");
+    expect(String(url)).not.toContain("?");
   });
 });

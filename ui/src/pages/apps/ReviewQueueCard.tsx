@@ -44,7 +44,7 @@ export function ReviewQueueCard({
     refetchOnMount: false,
     refetchInterval: (state) => {
       const visibleItems = filterActionRequests(state.state.data?.actionRequests, connectionId);
-      return emptyState !== "hidden" && visibleItems.length === 0
+      return emptyState !== "hidden" && state.state.status === "success" && visibleItems.length === 0
         ? VISIBLE_EMPTY_QUEUE_REFRESH_MS
         : 20_000;
     },
@@ -60,15 +60,6 @@ export function ReviewQueueCard({
     didRefetchOnMountForCompany.current = selectedCompanyId;
     void query.refetch();
   }, [query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
-
-  useEffect(() => {
-    if (!selectedCompanyId || items.length > 0) return;
-    if (query.dataUpdatedAt === 0 || query.fetchStatus === "fetching") return;
-    const timeout = window.setTimeout(() => {
-      void query.refetch();
-    }, VISIBLE_EMPTY_QUEUE_REFRESH_MS);
-    return () => window.clearTimeout(timeout);
-  }, [items.length, query.dataUpdatedAt, query.fetchStatus, query.refetch, selectedCompanyId]);
 
   if (!selectedCompanyId) return null;
   if (query.isLoading) return null;

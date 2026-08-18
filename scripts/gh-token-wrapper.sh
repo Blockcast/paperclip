@@ -14,33 +14,133 @@
 # existing.
 #
 # A second, volume-free delivery path exists for credentials bound per-agent
-# rather than mounted fleet-wide: see PAPERCLIP_GITHUB_TOKEN_VALUE below.
+# rather than mounted fleet-wide: see GH_SEAT_TOKEN_VALUE below.
 set -eu
 
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
+GH_SELF="${GH_TOKEN_WRAPPER_SELF:-/usr/bin/gh}"
+# Absolute, not `git` via PATH: some pods reorder PATH ahead of this image's
+# own bin dirs (this is precisely the class of drift BLO-25702 is about), and
+# a shadowing `git` could behave arbitrarily differently underneath us here.
+GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 
-# PAPERCLIP_GITHUB_TOKEN_VALUE carries a token *value* rather than a path, for
-# credentials delivered by the scoped secret-binding path (per-agent /
-# per-project env bindings) instead of by a mounted secret volume. It exists so
-# a credential can be given to specific agents without mounting it into every
-# agent pod: the k8s adapters propagate every main-container secret volume into
-# every Job pod with no agent or tenant filter (BLO-18927, BLO-18970), so a
-# volume-delivered secret is necessarily fleet-wide.
+# `gh auth setup-git` asks the running `gh` binary to report its own on-disk
+# path (via /proc/self/exe, not argv[0]) and writes that path into git's
+# credential.*.helper. Because this wrapper delegates by `exec`, the running
+# binary *is* REAL_GH by the time that happens — so a plain exec here
+# reproduces BLO-25702 verbatim. Two callers can trigger the write:
+# `gh auth setup-git` directly, and `gh auth login`, which runs the identical
+# setup-git logic internally when it prompts (or is told, e.g. via
+# `--git-protocol https`) to authenticate git — by the time that internal
+# call happens, `gh auth login` has *already* been exec'd into REAL_GH, so it
+# hits the bug the same way a direct `setup-git` call would. Route both
+# subcommands through a non-exec call so the helper that was just written can
+# be rewritten back to this wrapper afterward, instead of either reproducing
+# the regression or silently skipping a command the caller explicitly asked
+# for.
+exec_real_gh() {
+  case "${1:-} ${2:-}" in
+    "auth setup-git" | "auth login")
+      status=0
+      "${REAL_GH}" "$@" || status=$?
+      fix_setup_git_credential_helper
+      exit "${status}"
+      ;;
+  esac
+  exec "${REAL_GH}" "$@"
+}
+
+# Best-effort repair of whatever `gh auth setup-git` (directly, or via `gh
+# auth login`'s internal call to the same logic) just wrote with `--global`.
+# gh has no notion of this wrapper's split HOME-per-workspace layout, so it
+# always ends up in whichever file `git config --global` itself resolves for
+# the current environment: normally "${HOME}/.gitconfig", but
+# "$XDG_CONFIG_HOME/git/config" instead when that file already exists (see
+# the FILES section of git-config(1)). Repairing through `git config` rather
+# than sed on a path we guess means git resolves that file for us, so both
+# locations are covered without this script needing to know which one
+# applies (BLO-25702 review S2 on PR #1311 — the sed version only ever
+# checked "${HOME}/.gitconfig").
+#
+# `--fixed-value` treats both the search pattern and (implicitly, since we
+# only ever pass the literal value we just searched for) the value we match
+# on as exact strings, not regexes — REAL_GH/GH_SELF come from
+# GH_TOKEN_WRAPPER_REAL_GH/GH_TOKEN_WRAPPER_SELF, caller-controlled env vars,
+# and the prior sed-based version only escaped "." in them, so a path
+# containing "#", "&", "\", or another sed/regex metacharacter could corrupt
+# the gitconfig instead of failing loudly (BLO-25702 review, same PR).
+# Scoped to the exact value gh's own setup-git logic writes — a shell-out
+# credential helper pointing at REAL_GH — so it never touches an unrelated
+# helper a caller configured on purpose.
+fix_setup_git_credential_helper() {
+  [ -n "${HOME:-}" ] || return 0
+
+  broken_value="!${REAL_GH} auth git-credential"
+  fixed_value="!${GH_SELF} auth git-credential"
+
+  matches=$("${GIT_BIN}" config --global --fixed-value --get-regexp '^credential\..*\.helper$' "${broken_value}" 2>/dev/null) || return 0
+
+  echo "${matches}" | while IFS=' ' read -r key value; do
+    [ -n "${key}" ] || continue
+    "${GIT_BIN}" config --global --fixed-value --replace-all "${key}" "${fixed_value}" "${broken_value}" 2>/dev/null || true
+  done
+
+  echo "gh-token-wrapper: gh auth setup-git (directly or via gh auth login) wrote a credential helper pointing at ${REAL_GH} (its own on-disk path, per BLO-25702); rewrote the global git config to route through ${GH_SELF} instead" >&2
+}
+
+# GH_SEAT_TOKEN_VALUE carries a token *value* rather than a path, for
+# credentials delivered by the scoped secret-binding path (agent-scoped env
+# bindings only) instead of by a mounted secret volume. Project, environment and
+# routine scope are NOT delivery routes for this key: AGENT_SCOPE_ONLY_ENV_KEYS
+# (server/src/services/heartbeat.ts) strips it from all three, so that a
+# lower-trust writer cannot select the identity every `gh` call runs as.
+# It exists so a credential can be given to specific agents without mounting it
+# into every agent pod: the k8s adapters propagate every main-container secret
+# volume into every Job pod with no agent or tenant filter (BLO-18927,
+# BLO-18970), so a volume-delivered secret is necessarily fleet-wide.
+#
+# The name deliberately does NOT start with `PAPERCLIP_`. Do not "fix" it for
+# consistency with the FILE variable below — the prefix is load-bearing in the
+# opposite direction. `isPaperclipRuntimeEnvKey` (server/src/services/
+# heartbeat.ts) strips every `PAPERCLIP_*` key out of adapter, environment,
+# project and routine env, and agent-scope binding resolution reads that
+# already-stripped config. A `PAPERCLIP_`-prefixed name is therefore
+# unreachable from the very binding path this branch exists to serve: it would
+# be silently deleted server-side and fall through to the file branch with no
+# error anywhere. That guard is correct and must stay — it stops user config
+# overriding paperclip's own runtime env — so the credential moves out of its
+# namespace instead. See BLO-18927 step 2.
+#
+# The FILE variable keeps its `PAPERCLIP_` prefix on purpose, for the same
+# reason inverted: it selects a path on disk, and being strippable is what
+# stops project/environment config from redirecting the file branch.
 #
 # Precedence: value > file. Both are *explicit caller selections* of an identity
 # for one invocation — the same trust model the FILE variable already had, since
-# a caller could always point that at a file it wrote. This is deliberately NOT
-# GH_TOKEN: the override below must keep clobbering GH_TOKEN unconditionally
-# (BLO-13241), so GH_TOKEN cannot double as an input without reopening that bug.
-if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
+# a caller could always point that at a file it wrote.
+#
+# Dropping the `PAPERCLIP_` prefix would otherwise have widened who can set this
+# key: environment/project/routine env are overlaid *after* agent-scope
+# resolution, so the lowest-trust writer would win and could swap the identity
+# `gh` runs as, or park whitespace here and fail every invocation with exit 64.
+# The prefix used to prevent that for free. It is now prevented explicitly
+# instead: AGENT_SCOPE_ONLY_ENV_KEYS in server/src/services/heartbeat.ts strips
+# this key from environment, project and routine env, so only an agent-scoped
+# secret binding can set it. Keep those two in sync — renaming here without
+# renaming there silently reopens the hole.
+#
+# This is deliberately NOT GH_TOKEN: the override below must keep clobbering
+# GH_TOKEN unconditionally (BLO-13241), so GH_TOKEN cannot double as an input
+# without reopening that bug.
+if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   # Trim surrounding whitespace only — a secret that arrives via a templated
   # env binding routinely picks up a trailing newline, and tabs/spaces are just
   # as likely as CR/LF from a YAML block scalar. Deliberately a trim rather than
   # a delete: `tr -d` would silently splice "ghu_aaa\nbbb" into the single
   # plausible-looking token "ghu_aaabbb" and authenticate as nobody-in-
   # particular, which is the failure mode this whole branch exists to avoid.
-  TOKEN="${PAPERCLIP_GITHUB_TOKEN_VALUE}"
+  TOKEN="${GH_SEAT_TOKEN_VALUE}"
   while :; do
     case "${TOKEN}" in
       [[:space:]]*) TOKEN="${TOKEN#?}" ;;
@@ -54,7 +154,7 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
   # continuing would run `gh` under whatever ambient GH_TOKEN/GITHUB_TOKEN the
   # caller happened to inherit — an unintended identity, silently.
   if [ -z "${TOKEN}" ]; then
-    echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
     exit 64
   fi
   case "${TOKEN}" in
@@ -62,14 +162,14 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_VALUE+x}" = x ]; then
       # No GitHub token format contains whitespace, so this is either a
       # concatenation of two values or a corrupted binding. Refuse rather than
       # guess which half was meant. The value itself is never echoed.
-      echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+      echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
       exit 64
       ;;
   esac
 
   export GH_TOKEN="${TOKEN}"
   export GITHUB_TOKEN="${TOKEN}"
-  exec "${REAL_GH}" "$@"
+  exec_real_gh "$@"
 fi
 
 if [ -r "${TOKEN_FILE}" ]; then
@@ -97,4 +197,4 @@ elif [ -e "${TOKEN_FILE}" ]; then
   echo "gh-token-wrapper: ${TOKEN_FILE} exists but is not readable; falling back to unwrapped auth" >&2
 fi
 
-exec "${REAL_GH}" "$@"
+exec_real_gh "$@"

@@ -20,7 +20,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { authorizationService } from "../services/authorization.js";
+import {
+  authorizationService,
+  commentAuthorCanGrantIssueMention,
+} from "../services/authorization.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -165,6 +168,30 @@ async function grantUserPermission(
     grantedByUserId: "owner",
   });
 }
+
+describe("comment mention grant predicate", () => {
+  it("matches wake eligibility to the author identities that can grant issue access", () => {
+    const base = {
+      mentionedAgentId: "mentioned-agent",
+      issueAssigneeAgentId: "assignee-agent",
+      authorUserIsActiveMember: false,
+    };
+
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "unrelated-agent",
+    })).toBe(false);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: "assignee-agent",
+    })).toBe(true);
+    expect(commentAuthorCanGrantIssueMention({
+      ...base,
+      authorAgentId: null,
+      authorUserIsActiveMember: true,
+    })).toBe(true);
+  });
+});
 
 describeEmbeddedPostgres("authorization service", () => {
   let db!: ReturnType<typeof createDb>;
@@ -1324,6 +1351,233 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
+  it("expires the recovery handoff comment grant once the TTL elapses, even while the action stays active", async () => {
+    const company = await createCompany(db, "RecoveryHandoffTtl");
+    const project = await createProject(db, company.id, "RecoveryHandoffTtlTarget");
+    const previousOwner = await createAgent(db, company.id, { role: "engineer" });
+    const recoveryOwner = await createAgent(db, company.id, { role: "cto" });
+    const unrelatedAgent = await createAgent(db, company.id, { role: "qa" });
+    const issue = await createIssue(db, company.id, {
+      title: "Recovery-transferred handoff target with an aged grant",
+      projectId: project.id,
+      assigneeAgentId: recoveryOwner.id,
+    });
+
+    const authorization = authorizationService(db);
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: recoveryOwner.id,
+      status: "blocked",
+    } as const;
+    const actorFor = (agentId: string) =>
+      ({ type: "agent", agentId, companyId: company.id, source: "agent_key" }) as const;
+    const commentDecision = (agentId: string) =>
+      authorization.decide({ actor: actorFor(agentId), action: "issue:comment", resource });
+    const mutateDecision = (agentId: string) =>
+      authorization.decide({ actor: actorFor(agentId), action: "issue:mutate", resource });
+
+    // The clock is controlled through the anchor the TTL is measured from rather
+    // than by faking timers, so this exercises the same read path production uses.
+    const anchorAgo = (ms: number) =>
+      ({ recoveryHandoffGrantAnchorAt: new Date(Date.now() - ms).toISOString() });
+    const HOUR = 60 * 60 * 1000;
+
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId: company.id,
+      sourceIssueId: issue.id,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwner.id,
+      previousOwnerAgentId: previousOwner.id,
+      returnOwnerAgentId: previousOwner.id,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Hand the diagnosis to the recovery owner.",
+      evidence: anchorAgo(23 * HOUR),
+    }).returning();
+    expect(action?.id).toBeTruthy();
+
+    // (a) just inside the TTL, behaviour is unchanged from #827.
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+    // (c) and it is still comment-only inside the window.
+    await expect(mutateDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // (d) an unrelated agent gets nothing inside the window.
+    await expect(commentDecision(unrelatedAgent.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Age the transfer past the TTL. The action is deliberately left `active` —
+    // that is the whole point: 0 of 119 rows measured had ever been resolved, so
+    // the pre-existing state bound never fires (BLO-20263).
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: anchorAgo(25 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    // (b) the grant has lapsed on time alone.
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // (c) mutate is still denied outside the window.
+    await expect(mutateDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // (d) as is the unrelated agent.
+    await expect(commentDecision(unrelatedAgent.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // The action really is still active, so this is a time bound and not the
+    // pre-existing resolve/cancel bound firing under another name.
+    const [stillActive] = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id));
+    expect(stillActive?.status).toBe("active");
+
+    // The recovery owner is unaffected throughout — it holds the issue.
+    await expect(mutateDecision(recoveryOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_self" });
+
+    // Sweep churn must not renew an expired grant. `upsertSourceScoped` rewrites
+    // `lastAttemptAt` on every pass of an unresolved action, so anchoring the TTL
+    // there would have made it unexpirable — a TTL that reads as bounded and is not.
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(), updatedAt: new Date(), attemptCount: 42 })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Rows written before the anchor key existed fall back to `createdAt`, which is
+    // how the 117 aged grants this ticket was filed about lapse at deploy.
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: {}, createdAt: new Date(Date.now() - 9 * 24 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // ...and a legacy row created inside the window still works.
+    await db
+      .update(issueRecoveryActions)
+      .set({ evidence: {}, createdAt: new Date(Date.now() - 1 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+  });
+
+  it("fails the recovery handoff grant closed on invalid temporal evidence", async () => {
+    // BLO-22127 defect 1. The TTL added by BLO-20263 was one-sided and treated a
+    // present-but-unreadable anchor as if the row had never claimed one. Both states are
+    // fail-OPEN in an authorization path: they degrade the bound back to the unbounded
+    // grant BLO-20263 was filed to remove.
+    const company = await createCompany(db, "RecoveryHandoffTtlEvidence");
+    const project = await createProject(db, company.id, "RecoveryHandoffTtlEvidenceTarget");
+    const previousOwner = await createAgent(db, company.id, { role: "engineer" });
+    const recoveryOwner = await createAgent(db, company.id, { role: "cto" });
+    const issue = await createIssue(db, company.id, {
+      title: "Recovery-transferred handoff target with unusable temporal evidence",
+      projectId: project.id,
+      assigneeAgentId: recoveryOwner.id,
+    });
+
+    const authorization = authorizationService(db);
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: recoveryOwner.id,
+      status: "blocked",
+    } as const;
+    const commentDecision = (agentId: string) =>
+      authorization.decide({
+        actor: { type: "agent", agentId, companyId: company.id, source: "agent_key" },
+        action: "issue:comment",
+        resource,
+      });
+    const HOUR = 60 * 60 * 1000;
+
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId: company.id,
+      sourceIssueId: issue.id,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwner.id,
+      previousOwnerAgentId: previousOwner.id,
+      returnOwnerAgentId: previousOwner.id,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Hand the diagnosis to the recovery owner.",
+      evidence: { recoveryHandoffGrantAnchorAt: new Date(Date.now() - 1 * HOUR).toISOString() },
+    }).returning();
+    const setEvidence = async (evidence: Record<string, unknown>) => {
+      await db
+        .update(issueRecoveryActions)
+        .set({ evidence })
+        .where(eq(issueRecoveryActions.id, action!.id));
+    };
+
+    // Baseline: a readable, recent anchor still grants, so every denial below is
+    // attributable to the evidence under test and not to the surrounding fixture.
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+
+    // (a) A future-dated anchor yields a NEGATIVE age, and negative trivially satisfies
+    // `<= TTL`. Unfixed, the grant holds until wall-clock catches up — here, for a year.
+    await setEvidence({
+      recoveryHandoffGrantAnchorAt: new Date(Date.now() + 365 * 24 * HOUR).toISOString(),
+    });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Even one hour into the future: the bound is two-sided, not merely sanity-checked.
+    await setEvidence({ recoveryHandoffGrantAnchorAt: new Date(Date.now() + 1 * HOUR).toISOString() });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // (b) A present-but-unparseable anchor must NOT silently rebase onto `createdAt`.
+    // `createdAt` here is moments ago, so the unfixed `??` fallback returns a grant the
+    // row never claimed. The row is denied because its own stated anchor is unreadable.
+    await setEvidence({ recoveryHandoffGrantAnchorAt: "not-a-date" });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // A JSON null is *present*, not absent, so it is unreadable evidence too.
+    await setEvidence({ recoveryHandoffGrantAnchorAt: null });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // ...and the fallback is genuinely suppressed rather than coincidentally expired:
+    // pinning `createdAt` well inside the TTL still does not rescue the row.
+    await db
+      .update(issueRecoveryActions)
+      .set({ createdAt: new Date(Date.now() - 1 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await setEvidence({ recoveryHandoffGrantAnchorAt: "not-a-date" });
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // (c) An ABSENT key is the legacy shape and still falls back to `createdAt`. This is
+    // the line between the two: absent means "this row predates the anchor", present-
+    // but-unreadable means "this row claims an anchor we cannot verify".
+    await setEvidence({});
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_recovery_handoff_grant" });
+
+    // The legacy fallback keeps its own upper bound.
+    await db
+      .update(issueRecoveryActions)
+      .set({ createdAt: new Date(Date.now() - 25 * HOUR) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+    await expect(commentDecision(previousOwner.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
   it("does not open a recovery handoff channel when the escalation kept the previous owner assigned", async () => {
     const company = await createCompany(db, "RecoveryHandoffBoardOwned");
     const project = await createProject(db, company.id, "RecoveryHandoffBoardTarget");
@@ -2009,7 +2263,7 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows active board-user comments to create mention-scoped issue grants", async () => {
+  it("requires an active board-user membership for mention-scoped issue grants", async () => {
     const company = await createCompany(db, "MentionCommentBoardGrant");
     const allowedProject = await createProject(db, company.id, "MentionBoardAllowed");
     const targetProject = await createProject(db, company.id, "MentionBoardTarget");
@@ -2033,13 +2287,6 @@ describeEmbeddedPostgres("authorization service", () => {
       assigneeAgentId: ownerAgent.id,
     });
     const boardUserId = `user-${randomUUID()}`;
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "user",
-      principalId: boardUserId,
-      status: "active",
-      membershipRole: "member",
-    });
     await db.insert(issueComments).values({
       companyId: company.id,
       issueId: issue.id,
@@ -2057,7 +2304,22 @@ describeEmbeddedPostgres("authorization service", () => {
       status: issue.status,
     } as const;
 
-    await expect(authorizationService(db).decide({
+    const authorization = authorizationService(db);
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false });
+
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+
+    await expect(authorization.decide({
       actor,
       action: "issue:comment",
       resource,
@@ -2274,6 +2536,61 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.allowed, decision.explanation).toBe(true);
   });
 
+  // BLO-19951: the recovery-guard carve-out in the issue PATCH handler skips
+  // assertRecoveryActionAuthority whenever a coordination-metadata decision is
+  // in hand. That is only safe because the two authorities are currently the
+  // same predicate: issue:coordination_metadata allows solely via
+  // isManagerOf(actor, assignee), and tasks:manage_active_checkouts allows on
+  // that same relation — which assertRecoveryActionAuthority consults, and
+  // returns true on, before it can 403. So today the carve-out cannot change
+  // any outcome; it fires only where the guard would already have passed.
+  //
+  // Pinned here against the real service rather than in the route tests,
+  // because those stub access.decide and a stub can express
+  // coordination_metadata=allow together with manage_active_checkouts=deny —
+  // a pair this service cannot emit. If coordination metadata is ever
+  // decoupled from the manager-chain requirement, this fails, and the
+  // carve-out has to be re-reviewed as a live bypass of the recovery-owner
+  // check instead of being inherited silently.
+  it("couples coordination-metadata authority to active-checkout management", async () => {
+    const company = await createCompany(db, "CoordCheckoutCoupling");
+    // Deliberately not a ceo/cto-tier role: canCreateAgentsLegacy would allow
+    // tasks:manage_active_checkouts on its own and mask the coupling.
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const peerAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+    await grantAgentPermission(db, company.id, peerAgent.id, "tasks:assign");
+
+    const decideFor = (agentId: string, action: "issue:coordination_metadata" | "tasks:manage_active_checkouts") =>
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId, companyId: company.id, source: "agent_jwt" },
+        action,
+        resource: { type: "issue", companyId: company.id, assigneeAgentId: reportAgent.id },
+      });
+
+    // Half 1 — the allow set for coordination metadata is confined to managers
+    // of the assignee. Without this, the implication below is vacuous: widening
+    // coordination metadata to grant-only would admit actors that hold no
+    // checkout-management authority, and a manager-only assertion would not
+    // notice.
+    const peerCoordination = await decideFor(peerAgent.id, "issue:coordination_metadata");
+    expect(peerCoordination.allowed, peerCoordination.explanation).toBe(false);
+
+    // Half 2 — every actor in that set also clears the recovery guard, via
+    // allow_manager_chain specifically. That is the shared isManagerOf branch
+    // which makes the carve-out redundant; a different allow reason here would
+    // mean the coupling no longer holds for the reason documented above.
+    const managerCoordination = await decideFor(managerAgent.id, "issue:coordination_metadata");
+    const managerCheckouts = await decideFor(managerAgent.id, "tasks:manage_active_checkouts");
+
+    expect(managerCoordination.allowed, managerCoordination.explanation).toBe(true);
+    expect(managerCheckouts, managerCheckouts.explanation).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
   it("denies coordination metadata to a tasks:assign holder who does not manage the assignee", async () => {
     const company = await createCompany(db, "CoordPeer");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
@@ -2387,6 +2704,127 @@ describeEmbeddedPostgres("authorization service", () => {
     });
 
     expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  // BLO-21947: stranded-execution recovery authority. Both actions exist to
+  // give a *non-assignee* manager a repair lever, because this failure class
+  // breaks the assignee's own wake path — and because
+  // `issue-execution-policy.ts` refuses a convergence-stalled re-arm by the
+  // assignee outright, mandating a non-assignee actor the permission layer
+  // never provisioned below board. Same manager-chain + `tasks:assign` shape as
+  // coordination-metadata above, for the same stated reason: the grant is held
+  // unscoped by nearly every agent, so the manager-chain is the real gate.
+  it("allows a managing tasks:assign holder to recover a report's stranded run", async () => {
+    const company = await createCompany(db, "StrandedManager");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: reportAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  it("denies stranded-run recovery to a tasks:assign holder who does not manage the run's agent", async () => {
+    const company = await createCompany(db, "StrandedPeer");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const peerAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: peerAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
+  it("denies stranded-run recovery to a manager without a tasks:assign grant", async () => {
+    const company = await createCompany(db, "StrandedNoGrant");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: reportAgent.id },
+    });
+
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("denies stranded-run recovery targeting the actor's own run", async () => {
+    // Self-recovery needs no widening; this action exists only for the
+    // cross-agent case the broken wake path cannot serve.
+    const company = await createCompany(db, "StrandedSelf");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: actorAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
+  it("allows a company-root actor to recover an indirect report's stranded run", async () => {
+    const company = await createCompany(db, "StrandedIndirect");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    const engineerAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: ctoAgent.id });
+    await grantAgentPermission(db, company.id, ceoAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: engineerAgent.id },
+    });
+
+    expect(decision.allowed, decision.explanation).toBe(true);
+  });
+
+  // Same trap as the coordination-metadata case above: a heartbeat run carries
+  // onBehalfOfUserId, so every real recovery call goes through the
+  // responsible-user intersection. `run:recover_stranded` has no board
+  // permission mapping, so without an entry in
+  // activeResponsibleUserCanAuthorizeIssueAction the intersection denies it as
+  // unsupported and the agent-side allow is never reached — the feature would
+  // pass its unit tests and fail in production.
+  it("does not let the responsible-user intersection deny recovery actions as unsupported", async () => {
+    const company = await createCompany(db, "RecoveryResponsibleUser");
+    const managerAgent = await createAgent(db, company.id, { role: "ceo" });
+    const reportAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const responsibleUserId = await createUser(db);
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
+    const actor = {
+      type: "agent" as const,
+      agentId: managerAgent.id,
+      companyId: company.id,
+      onBehalfOfUserId: responsibleUserId,
+      source: "agent_jwt" as const,
+    };
+    const svc = authorizationService(db);
+
+    const runDecision = await svc.decide({
+      actor,
+      action: "run:recover_stranded",
+      resource: { type: "agent", companyId: company.id, agentId: reportAgent.id },
+    });
+    expect(runDecision.allowed, runDecision.explanation).toBe(true);
   });
 
   it("denies execution-stage override for an unrelated peer agent", async () => {
@@ -2602,6 +3040,80 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision).toMatchObject({
       allowed: false,
       reason: "deny_missing_grant",
+    });
+  });
+
+  it("does not grant a parent issue's assignee access to its descendant (BLO-19170)", async () => {
+    const company = await createCompany(db, "DescendantDoesNotInheritGrant");
+    const parentAssignee = await createAgent(db, company.id, { role: "engineer" });
+    const childAssignee = await createAgent(db, company.id, { role: "engineer" });
+    const parentIssue = await createIssue(db, company.id, {
+      title: "Parent assigned to the actor",
+      assigneeAgentId: parentAssignee.id,
+      createdByAgentId: parentAssignee.id,
+    });
+    const childIssue = await createIssue(db, company.id, {
+      title: "Child assigned to an unrelated agent",
+      parentId: parentIssue.id,
+      assigneeAgentId: childAssignee.id,
+      createdByAgentId: childAssignee.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: parentAssignee.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: childIssue.id,
+        parentIssueId: parentIssue.id,
+        assigneeAgentId: childAssignee.id,
+        createdByAgentId: childIssue.createdByAgentId,
+        status: childIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("allows an actor to comment on its assigned sibling issue regardless of ancestry (BLO-19036)", async () => {
+    const company = await createCompany(db, "SiblingUsesTargetAssigneeGrant");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const wakeTargetAssignee = await createAgent(db, company.id, { role: "engineer" });
+    const parentIssue = await createIssue(db, company.id, { title: "Shared parent" });
+    await createIssue(db, company.id, {
+      title: "Wake target sibling",
+      parentId: parentIssue.id,
+      assigneeAgentId: wakeTargetAssignee.id,
+      createdByAgentId: wakeTargetAssignee.id,
+    });
+    const assignedSibling = await createIssue(db, company.id, {
+      title: "Sibling assigned to the actor",
+      parentId: parentIssue.id,
+      assigneeAgentId: actorAgent.id,
+      createdByAgentId: wakeTargetAssignee.id,
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: assignedSibling.id,
+        parentIssueId: parentIssue.id,
+        assigneeAgentId: actorAgent.id,
+        createdByAgentId: assignedSibling.createdByAgentId,
+        status: assignedSibling.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_self",
     });
   });
 

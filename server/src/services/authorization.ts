@@ -28,7 +28,7 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
-import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { logger } from "../middleware/logger.js";
 
@@ -72,6 +72,7 @@ export type AuthorizationAction =
   | "issue:mutate"
   | "issue:read"
   | "project:read"
+  | "run:recover_stranded"
   | "runtime:manage"
   | "secrets:read";
 
@@ -175,6 +176,15 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   // the dedicated branch also requires the actor to manage the issue assignee.
   // Mapping it here would silently drop that second half of the check.
   if (action === "issue:coordination_metadata") return null;
+  // BLO-21947: stranded-run recovery is unmapped for the same reason as
+  // coordination-metadata above. It requires the actor to manage the stalled
+  // agent *in addition to* holding `tasks:assign`, and is further gated by an
+  // auditable precondition enforced at the route (the run never dispatched).
+  // Mapping it here would let the generic `permissionKey` fallback satisfy it
+  // on the grant alone, silently dropping the manager-chain half and — because
+  // the route only consults the precondition after the decision allows —
+  // leaving the widening far broader than intended.
+  if (action === "run:recover_stranded") return null;
   return action;
 }
 
@@ -538,9 +548,17 @@ function activeResponsibleUserCanAuthorizeIssueAction(
     // action and the agent-side decision would never be reached. It is a
     // strict subset of issue:mutate, so it cannot be gated more loosely by
     // sharing that action's active-non-viewer bar.
+    // BLO-21947: stranded-run recovery joins for the same reason. It has no
+    // board permission mapping, so without this the responsible-user
+    // intersection returns `deny_unsupported_action` and the agent-side
+    // decision — which is where the manager-chain check lives — is never
+    // consulted. It is strictly narrower than `issue:mutate` (it cancels a run
+    // that never started), so sharing that action's active-non-viewer bar
+    // cannot gate it more loosely.
     (action === "issue:comment"
       || action === "issue:mutate"
-      || action === "issue:coordination_metadata")
+      || action === "issue:coordination_metadata"
+      || action === "run:recover_stranded")
   );
 }
 
@@ -574,6 +592,39 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
     reason: decision.reason,
     boundary: authorizationBoundaryLabel(decision.reason),
   };
+}
+
+export function commentAuthorCanGrantIssueMention(input: {
+  mentionedAgentId: string;
+  issueAssigneeAgentId: string | null;
+  authorAgentId: string | null;
+  authorUserIsActiveMember: boolean;
+}) {
+  if (input.authorAgentId) {
+    if (input.authorAgentId === input.mentionedAgentId) return false;
+    return input.issueAssigneeAgentId === input.authorAgentId;
+  }
+  return input.authorUserIsActiveMember;
+}
+
+export function getActiveCompanyMembership(
+  db: Db,
+  companyId: string,
+  principalType: PrincipalType,
+  principalId: string,
+) {
+  return db
+    .select()
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, principalType),
+        eq(companyMemberships.principalId, principalId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
 }
 
 // BLO-18152: a bare "outside this actor's authorization boundary" message
@@ -641,18 +692,7 @@ export function authorizationService(db: Db) {
     principalType: PrincipalType,
     principalId: string,
   ) {
-    return db
-      .select()
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, principalType),
-          eq(companyMemberships.principalId, principalId),
-          eq(companyMemberships.status, "active"),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
+    return getActiveCompanyMembership(db, companyId, principalType, principalId);
   }
 
   async function loadResponsibleUserSnapshot(companyId: string, userId: string): Promise<ResponsibleUserSnapshot> {
@@ -1338,23 +1378,6 @@ export function authorizationService(db: Db) {
     return isAgentInSubtree(db, companyId, managerAgentId, assigneeAgentId);
   }
 
-  function commentAuthorCanGrantIssueMention(input: {
-    mentionedAgentId: string;
-    issueAssigneeAgentId: string | null;
-    authorAgentId: string | null;
-    authorUserId: string | null;
-    activeAuthorUserIds: Set<string>;
-  }) {
-    if (input.authorAgentId) {
-      if (input.authorAgentId === input.mentionedAgentId) return false;
-      return input.issueAssigneeAgentId === input.authorAgentId;
-    }
-    if (input.authorUserId) {
-      return input.activeAuthorUserIds.has(input.authorUserId);
-    }
-    return false;
-  }
-
   async function agentHasMentionGrantOnIssue(input: {
     action: AuthorizationAction;
     companyId: string;
@@ -1399,8 +1422,9 @@ export function authorizationService(db: Db) {
         mentionedAgentId: input.actorAgentId,
         issueAssigneeAgentId: input.issueAssigneeAgentId,
         authorAgentId: row.authorAgentId,
-        authorUserId: row.authorUserId,
-        activeAuthorUserIds,
+        authorUserIsActiveMember: Boolean(
+          row.authorUserId && activeAuthorUserIds.has(row.authorUserId),
+        ),
       });
       if (authorCanGrant) {
         logger.info({
@@ -1442,6 +1466,13 @@ export function authorizationService(db: Db) {
   //   * state-bounded — only while the recovery action is active/escalated.
   //     Resolving or cancelling it lapses the grant, and a resolved row can
   //     never be revived (`upsertSourceScoped` only ever updates an active row).
+  //     Do not rely on this alone: measured across the live population, 0 of 119
+  //     active recovery actions had ever been resolved, so in practice this bound
+  //     never fires (BLO-19124 tracks the undrained queue).
+  //   * time-bounded  — and therefore the bound that actually binds. The grant
+  //     lapses `RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS` after the transfer that
+  //     opened it, independently of whether the action is ever resolved
+  //     (BLO-20263).
   //   * owner-bound   — the row's `ownerAgentId` must still be the issue's
   //     `assigneeAgentId`. A second reassignment away from the recovery owner
   //     lapses the grant too, so the channel only ever exists between the agent
@@ -1468,6 +1499,8 @@ export function authorizationService(db: Db) {
         kind: issueRecoveryActions.kind,
         cause: issueRecoveryActions.cause,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
+        evidence: issueRecoveryActions.evidence,
+        createdAt: issueRecoveryActions.createdAt,
         assigneeAgentId: issues.assigneeAgentId,
       })
       .from(issueRecoveryActions)
@@ -1500,6 +1533,26 @@ export function authorizationService(db: Db) {
     // both shapes; keep it so the invariant survives a query rewrite.
     if (!row.ownerAgentId || row.ownerAgentId === input.actorAgentId) return false;
     if (row.assigneeAgentId !== row.ownerAgentId) return false;
+    // BLO-20263: time-bound the channel. #827 called this grant "state-bounded"
+    // because resolving or cancelling the action lapses it — but 0 of 119 active
+    // recovery actions had ever been resolved, so the bound never fired and the
+    // grant ran to a median of 9 days (max 51) across 117 issues. The TTL runs from
+    // the transfer and expires on its own, whether or not anything ever drains the
+    // recovery queue (BLO-19124).
+    if (!recoveryHandoffGrantIsWithinTtl({ evidence: row.evidence, createdAt: row.createdAt })) {
+      logger.info({
+        actorAgentId: input.actorAgentId,
+        issueId: input.issueId,
+        companyId: input.companyId,
+        recoveryActionId: row.id,
+        recoveryActionKind: row.kind,
+        recoveryOwnerAgentId: row.ownerAgentId,
+        requestedAction: input.action,
+        grant: "recovery_handoff_comment",
+        ttlMs: RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS,
+      }, "recovery handoff comment grant expired");
+      return false;
+    }
     logger.info({
       actorAgentId: input.actorAgentId,
       issueId: input.issueId,
@@ -2228,6 +2281,47 @@ export function authorizationService(db: Db) {
     //
     // Callers must still enforce the FIELD allowlist; this decides only
     // "may this actor touch coordination metadata on this issue at all".
+    // BLO-21947: recovery authority over a run belonging to an agent this
+    // actor manages. Deliberately mirrors `issue:coordination_metadata`
+    // below — manager-chain AND an explicit `tasks:assign` grant — for the
+    // same reason: the grant is held unscoped by nearly every agent, so the
+    // grant alone would let any agent cancel any other agent's runs.
+    //
+    // This decides only "may this actor recover executions owned by that
+    // agent at all". The *precondition* that makes the cancel non-destructive
+    // (the run never dispatched: `startedAt === null`, so no process, no
+    // tokens, no side effects) is enforced by the route, exactly as the field
+    // allowlist is for coordination-metadata. A `running` run stays board-only.
+    if (input.action === "run:recover_stranded") {
+      const resource = input.resource.type === "agent" ? input.resource : null;
+      const targetAgentId = resource?.agentId ?? null;
+      if (!targetAgentId) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Stranded-run recovery requires the run's owning agent as the resource.",
+        });
+      }
+      if (targetAgentId === actorAgentId) {
+        // An agent recovering its own run needs no widening: it is the
+        // assignee, and this action exists purely for the cross-agent case
+        // that the assignee's own broken wake path cannot serve.
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Stranded-run recovery authority applies only to runs owned by another agent.",
+        });
+      }
+      if (!(await isManagerOf(companyId, actorAgentId, targetAgentId))) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Actor does not manage the run's owning agent in the reporting chain.",
+        });
+      }
+      return decideWithTaskAssignmentGrants("agent", actorAgentId);
+    }
+
     if (input.action === "issue:coordination_metadata") {
       const resource = input.resource.type === "issue" ? input.resource : null;
       const assigneeAgentId = resource?.assigneeAgentId ?? null;

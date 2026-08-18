@@ -176,6 +176,60 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).toContain("Do NOT close the PR or self-approve");
   });
 
+  // BLO-19522: `prRole: "author"` is set for EVERY github_pr_* wake, and on a
+  // review-REQUEST wake reviewState/reviewBody/reviewAuthorLogin are all null
+  // (isActionableReviewFeedbackContext is false for review_requested). The
+  // author branch therefore fell through to the null-state feedback directive
+  // and told the author a reviewer had posted findings, on a PR with no review
+  // at all — then instructed them to push a follow-up commit addressing them.
+  // Observed three times across three repos; the action it steers toward is
+  // re-requesting the review, which re-posts the marker and re-fires this wake.
+  it("does not claim findings exist when the author wake is a review REQUEST", () => {
+    const authorMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 604,
+        repoFullName: "Blockcast/Network-Operator-Portal",
+        event: "issue_comment",
+        prRole: "author",
+        requestCommentAuthorLogin: "allyblockcast[bot]",
+        requestCommentBody: "<!-- paperclip:review-request -->\n@ally please review at head `66a0f30`",
+      },
+    });
+    // The false assertions the old branch produced must be gone.
+    expect(authorMarkdown).not.toContain("just posted findings on YOUR pull request");
+    expect(authorMarkdown).not.toContain("If the findings are correct");
+    expect(authorMarkdown).not.toContain("push a follow-up commit");
+    expect(authorMarkdown).not.toContain("GitHub PR review feedback directive:");
+    // ...and it must say the true thing, including the anti-loop instruction.
+    expect(authorMarkdown).toContain("GitHub PR review request directive:");
+    expect(authorMarkdown).toContain(
+      "allyblockcast[bot] requested a review on YOUR pull request.",
+    );
+    expect(authorMarkdown).toContain("no findings to act on");
+    expect(authorMarkdown).toContain("you do NOT need to request the review again");
+    expect(authorMarkdown).toContain("The request comment:");
+  });
+
+  // Guards the branch boundary: a real submitted review with no state/body must
+  // still get the feedback directive, so the fix above cannot silence genuine
+  // review feedback.
+  it("still gives the feedback directive for a submitted review with no state or body", () => {
+    const authorMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 605,
+        repoFullName: "Blockcast/Network-Operator-Portal",
+        event: "pull_request_review",
+        prRole: "author",
+      },
+    });
+    expect(authorMarkdown).toContain("A reviewer just posted findings on YOUR pull request.");
+    expect(authorMarkdown).not.toContain("GitHub PR review request directive:");
+  });
+
   it("falls back to a generic author-facing directive when reviewer login / state / body are missing", () => {
     const authorMarkdown = buildPaperclipTaskMarkdown({
       issue: null,
@@ -189,6 +243,204 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
     expect(authorMarkdown).toContain("A reviewer just posted findings on YOUR pull request.");
     expect(authorMarkdown).not.toContain("Latest review body:");
+  });
+
+  // BLO-20886: github_pr_review_requested fires on a bare `@ally review` ASK
+  // -- no review has been posted -- and the author-role wake loop also
+  // covers plain PR lifecycle events with no review data at all. Both used
+  // to render the review-feedback directive unconditionally, telling the
+  // woken agent "a reviewer just posted findings on YOUR pull request" and
+  // to push a follow-up commit against a PR with zero recorded reviews
+  // (observed live: Blockcast/paperclip#953).
+  //
+  // review_requested is claimed by the more specific BLO-19522 branch above,
+  // which says the same true thing in more useful words (it names the
+  // requester and carries the anti-loop instruction). What BLO-20886 adds is
+  // the allowlist that catches every OTHER reasonless wakeReason -- the
+  // lifecycle events asserted below, and any reason added later.
+  it("does not instruct a push when no review has actually been submitted", () => {
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+      },
+    });
+    expect(requestedMarkdown).not.toContain("just posted findings on YOUR pull request");
+    expect(requestedMarkdown).not.toContain("push a follow-up commit");
+    expect(requestedMarkdown).not.toContain("GitHub PR review feedback directive:");
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+
+    // A lifecycle event carries no review either, and no branch above claims
+    // it -- so it must land on the generic directive rather than fall through
+    // to the feedback one.
+    for (const wakeReason of [
+      "github_pr_opened",
+      "github_pr_reopened",
+      "github_pr_synchronize",
+      "github_pr_ready_for_review",
+    ]) {
+      const lifecycleMarkdown = buildPaperclipTaskMarkdown({
+        issue: null,
+        prReview: {
+          wakeReason,
+          prNumber: 35,
+          repoFullName: "Blockcast/paperclip",
+          event: "pull_request",
+          prRole: "author",
+        },
+      });
+      expect(lifecycleMarkdown).not.toContain("YOUR pull request");
+      expect(lifecycleMarkdown).not.toContain("push a follow-up commit");
+      expect(lifecycleMarkdown).not.toContain("GitHub PR review feedback directive:");
+      expect(lifecycleMarkdown).toContain("GitHub PR event directive:");
+      expect(lifecycleMarkdown).toContain(`"${wakeReason}"`);
+      expect(lifecycleMarkdown).toContain("No review findings are recorded for this PR yet");
+    }
+
+    // The allowlist is what makes this hold for a wakeReason nobody has
+    // written yet: unrecognized must fail into "no findings", not into a
+    // false claim that findings exist.
+    const unknownMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_some_future_reason",
+        prNumber: 36,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+      },
+    });
+    expect(unknownMarkdown).toContain("GitHub PR event directive:");
+    expect(unknownMarkdown).not.toContain("GitHub PR review feedback directive:");
+  });
+
+  // Real review content must still get the author-shaped directive -- this
+  // fix narrows WHEN "YOUR pull request" fires, it doesn't remove it.
+  it("still asserts 'YOUR pull request' for an actionable review-feedback comment wake", () => {
+    const feedbackMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_feedback",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewAuthorLogin: "ally",
+      },
+    });
+    expect(feedbackMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(feedbackMarkdown).toContain("YOUR pull request");
+  });
+
+  // BLO-20886 AC3. Owning-issue routing fixed WHICH issue is woken, but the
+  // recipient still isn't necessarily the PR's author: `kkroo/blo-19132-*`
+  // resolves to BLO-19132 via the branch tier, so BLO-19132's assignee is woken
+  // about a branch a human owns. That is the original paperclip#953 damage path
+  // -- #953 existed precisely to have a non-bot author, so a bot commit there
+  // destroys the independence it was opened to establish.
+  it("drops the possessive and the push instruction when the PR was authored by a third party", () => {
+    const thirdPartyMarkdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "BLO-19132",
+        title: "Approval dedupe",
+        workMode: null,
+        description: null,
+      },
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        prUrl: "https://github.com/Blockcast/paperclip/pull/953",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        // The signed webhook's pull_request.user.login -- a human, not the fleet bot.
+        prAuthorLogin: "kkroo",
+      },
+    });
+
+    // The two things AC3 forbids asserting about a PR we did not write.
+    expect(thirdPartyMarkdown).not.toContain("YOUR pull request");
+    expect(thirdPartyMarkdown).not.toContain("push a follow-up commit");
+    // It still delivers the findings -- the review is real, only the ownership
+    // claim was false -- and names who actually owns the branch.
+    expect(thirdPartyMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(thirdPartyMarkdown).toContain("pull request #953");
+    expect(thirdPartyMarkdown).toContain('authored by "kkroo", NOT by you');
+    expect(thirdPartyMarkdown).toContain("Do NOT push commits to it");
+    expect(thirdPartyMarkdown).toContain("Critical: missing null check.");
+  });
+
+  it("keeps the possessive when the PR was authored by the configured bot identity", () => {
+    // Control for the test above: the gate must fire on a positive mismatch
+    // only, never blanket-strip the possessive from PRs the fleet did write.
+    const botAuthoredMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 1367,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        prAuthorLogin: "allyblockcast[bot]",
+      },
+    });
+    expect(botAuthoredMarkdown).toContain("YOUR pull request");
+    expect(botAuthoredMarkdown).toContain("push a follow-up commit");
+    expect(botAuthoredMarkdown).not.toContain("NOT by you");
+  });
+
+  it("fails open and keeps the possessive when the PR author is unknown", () => {
+    // An absent author login is not PROOF of third-party authorship, and the
+    // bot-authored case is the common one, so an unknown author must not
+    // silently strip the directive the author actually needs.
+    const unknownAuthorMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 1367,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        prAuthorLogin: null,
+      },
+    });
+    expect(unknownAuthorMarkdown).toContain("YOUR pull request");
+  });
+
+  it("drops the possessive on a review REQUEST for a third-party-authored PR", () => {
+    // The review_requested branch carries no push instruction already, but it
+    // still asserted ownership -- paperclip#953's wake was exactly this shape.
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        requestCommentAuthorLogin: "kkroo",
+        prAuthorLogin: "kkroo",
+      },
+    });
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+    expect(requestedMarkdown).not.toContain("YOUR pull request");
+    expect(requestedMarkdown).toContain("pull request #953");
+    expect(requestedMarkdown).toContain("NOT by you");
   });
 
   it("adds accepted-plan continuation guidance for standard-work issues when the wake is flagged as a plan continuation", () => {
@@ -1089,6 +1341,195 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.githubHeadSha).toBe("8555702b54179d291f3283a449eaead3c4b08bc9");
     expect(merged.githubPrReviewBody).toBe("Nit: rename the helper.");
     expect(merged.githubPrReviewAuthorLogin).toBe("ally");
+  });
+
+  // BLO-22229. Reproduces the incident verbatim: a formal `kkroo` APPROVED
+  // review is still the active run's context when Ally posts a *comment*-
+  // shaped consolidated review carrying Critical findings on the SAME PR.
+  // github-webhook.ts's issue_comment branch never sets a `reviewState` (only
+  // a formal `pull_request_review` submission can), so the incoming wake
+  // supplies a new `githubPrReviewAuthorLogin` (the comment author) but no
+  // `githubPrReviewState` of its own. Before the fix, the naive `{...existing,
+  // ...incoming}` spread kept the OLD APPROVED state paired with the NEW
+  // comment author — composing a directive from two different GitHub events
+  // that together describe a review that never happened, and telling the
+  // author to merge a PR carrying unresolved Critical findings.
+  it("does not weld a stale reviewState onto a same-PR comment-shaped review (BLO-22229)", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_feedback",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "1 Critical + 2 Important findings.",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        githubReviewFeedbackActionable: true,
+        prRole: "author",
+      },
+    );
+
+    // The incoming comment review's own fields win outright.
+    expect(merged.githubPrReviewBody).toBe("1 Critical + 2 Important findings.");
+    expect(merged.githubPrReviewAuthorLogin).toBe("allyblockcast[bot]");
+    // The prior formal review's state must NOT survive paired with this
+    // comment's author — it is cleared, not inherited, so the directive
+    // falls back to neutral "posted findings" wording instead of a false
+    // "state: APPROVED ... proceed to merge".
+    expect(merged.githubPrReviewState).toBeUndefined();
+  });
+
+  it("retires superseded review-feedback comments on same-PR review replacement (BLO-22229)", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_feedback",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "1 Critical + 2 Important findings.",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        githubReviewFeedbackActionable: true,
+        githubReviewFeedbackCommentId: "pr-feedback-comment-1053",
+        commentId: "pr-feedback-comment-1053",
+        wakeCommentId: "pr-feedback-comment-1053",
+        wakeCommentIds: ["human-comment-1", "pr-feedback-comment-1053"],
+        paperclipWake: {
+          comments: [
+            { id: "human-comment-1", body: "Can someone check this part?" },
+            {
+              id: "pr-feedback-comment-1053",
+              body: "1 Critical + 2 Important findings.",
+              metadata: {
+                kind: "github_pr_review_feedback",
+                repoFullName: "Blockcast/paperclip",
+                prNumber: 1053,
+              },
+            },
+          ],
+        },
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrReviewBody).toBe("LGTM.");
+    expect(merged.githubPrReviewState).toBe("approved");
+    expect(merged.githubPrReviewAuthorLogin).toBe("kkroo");
+    expect(merged.githubReviewFeedbackActionable).toBeUndefined();
+    expect(merged.githubReviewFeedbackCommentId).toBeUndefined();
+    expect(merged.commentId).toBe("human-comment-1");
+    expect(merged.wakeCommentId).toBe("human-comment-1");
+    expect(merged.wakeCommentIds).toEqual(["human-comment-1"]);
+    expect(merged.paperclipWake).toBeUndefined();
+  });
+
+  it("clears stale review-feedback comment routing when none survives same-PR review replacement", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_feedback",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "1 Critical + 2 Important findings.",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        githubReviewFeedbackActionable: true,
+        githubReviewFeedbackCommentId: "pr-feedback-comment-1053",
+        commentId: "pr-feedback-comment-1053",
+        wakeCommentId: "pr-feedback-comment-1053",
+        wakeCommentIds: ["pr-feedback-comment-1053"],
+        paperclipWake: {
+          comments: [
+            {
+              id: "pr-feedback-comment-1053",
+              body: "1 Critical + 2 Important findings.",
+              metadata: {
+                kind: "github_pr_review_feedback",
+                repoFullName: "Blockcast/paperclip",
+                prNumber: 1053,
+              },
+            },
+          ],
+        },
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubHeadSha: "82f168065",
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrReviewBody).toBe("LGTM.");
+    expect(merged.githubPrReviewState).toBe("approved");
+    expect(merged.githubPrReviewAuthorLogin).toBe("kkroo");
+    expect(merged.githubReviewFeedbackActionable).toBeUndefined();
+    expect(merged.githubReviewFeedbackCommentId).toBeUndefined();
+    expect(merged.commentId).toBeUndefined();
+    expect(merged.wakeCommentId).toBeUndefined();
+    expect(merged.wakeCommentIds).toBeUndefined();
+    expect(merged.paperclipWake).toBeUndefined();
+  });
+
+  // Companion: a genuine second formal review (APPROVED -> CHANGES_REQUESTED
+  // on the same PR) must fully replace the prior review's state, not merge
+  // fields across the two submissions either.
+  it("a new formal review submission fully replaces the prior one's state (BLO-22229)", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubPrReviewBody: "LGTM.",
+        githubPrReviewState: "approved",
+        githubPrReviewAuthorLogin: "kkroo",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1053",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1053,
+        githubPrReviewState: "changes_requested",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrReviewState).toBe("changes_requested");
+    expect(merged.githubPrReviewAuthorLogin).toBe("allyblockcast[bot]");
+    // The new review carried no body — the old review's body must not survive
+    // paired with the new state/author.
+    expect(merged.githubPrReviewBody).toBeUndefined();
   });
 
   // Same PR number, different repository — the identity key is (repo, number),

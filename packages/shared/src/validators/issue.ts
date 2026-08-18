@@ -49,6 +49,7 @@ export const issueBlockedInboxReasonSchema = z.enum([
   "blocked_by_assigned_backlog_issue",
   "blocked_by_uninvokable_assignee",
   "blocked_by_cancelled_issue",
+  "blocked_without_blockers",
   "blocked_chain_stalled",
   "invalid_review_participant",
   "in_review_without_action_path",
@@ -114,6 +115,9 @@ const executionWorkspaceStrategySchema = z
     worktreeParentDir: z.string().optional().nullable(),
     provisionCommand: z.string().optional().nullable(),
     teardownCommand: z.string().optional().nullable(),
+    // BLO-19063: opt into a per-run working tree. Omitted => "per_issue", the
+    // historical behaviour.
+    runScope: z.enum(["per_issue", "per_run"]).optional().nullable(),
   })
   .strict();
 

@@ -84,6 +84,7 @@ import { BUNDLED_PLUGIN_PACKAGES } from "./bootstrap/bundled-plugin-packages.js"
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { githubReviewerAppSlug } from "./services/github-app-auth.js";
+import { reconcileContendedPrReviewerWakes } from "./routes/github-webhook.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
@@ -771,12 +772,21 @@ export async function startServer(): Promise<StartedServer> {
   // Overwrite only the SDK JS files that contain our fork extensions.
   // We must NOT delete the whole SDK dir or its package.json — the npm-installed
   // SDK has proper dependency resolution for @paperclipai/shared that we need.
-  function copyWorkspaceSdkFiles() {
+  async function pathExists(target: string): Promise<boolean> {
+    try {
+      await fs.promises.access(target);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function copyWorkspaceSdkFiles() {
     try {
       const pluginsSdkDist = path.join(os.homedir(), ".paperclip", "plugins", "node_modules", "@paperclipai", "plugin-sdk", "dist");
       const thisDir = path.dirname(new URL(import.meta.url).pathname);
       const workspaceSdkDist = path.resolve(thisDir, "../../packages/plugins/sdk/dist");
-      if (!fs.existsSync(workspaceSdkDist) || !fs.existsSync(pluginsSdkDist)) return;
+      if (!(await pathExists(workspaceSdkDist)) || !(await pathExists(pluginsSdkDist))) return;
 
       // Only overwrite the specific files we changed (fork extensions)
       const filesToCopy = [
@@ -805,8 +815,8 @@ export async function startServer(): Promise<StartedServer> {
       for (const file of filesToCopy) {
         const src = path.join(workspaceSdkDist, file);
         const dest = path.join(pluginsSdkDist, file);
-        if (fs.existsSync(src)) {
-          fs.cpSync(src, dest, { force: true });
+        if (await pathExists(src)) {
+          await fs.promises.cp(src, dest, { force: true });
           copied++;
         }
       }
@@ -817,7 +827,37 @@ export async function startServer(): Promise<StartedServer> {
       logger.warn({ err }, "Failed to patch workspace SDK files (non-fatal)");
     }
   }
-  copyWorkspaceSdkFiles();
+
+  async function copyWorkspacePluginSdk() {
+    try {
+      const pluginsSdkDir = path.join(
+        os.homedir(),
+        ".paperclip",
+        "plugins",
+        "node_modules",
+        "@paperclipai",
+        "plugin-sdk",
+      );
+      const thisDir = path.dirname(new URL(import.meta.url).pathname);
+      const workspaceSdkDist = path.resolve(thisDir, "../../packages/plugins/sdk/dist");
+      const workspaceSdkPkg = path.resolve(thisDir, "../../packages/plugins/sdk/package.json");
+      if (!(await pathExists(workspaceSdkDist)) || !(await pathExists(pluginsSdkDir))) return;
+
+      if ((await fs.promises.lstat(pluginsSdkDir)).isSymbolicLink()) {
+        await fs.promises.unlink(pluginsSdkDir);
+        await fs.promises.mkdir(pluginsSdkDir, { recursive: true });
+      }
+      await fs.promises.cp(workspaceSdkDist, path.join(pluginsSdkDir, "dist"), {
+        recursive: true,
+      });
+      if (await pathExists(workspaceSdkPkg)) {
+        await fs.promises.cp(workspaceSdkPkg, path.join(pluginsSdkDir, "package.json"));
+      }
+      logger.info("Copied workspace plugin SDK dist to local plugins directory");
+    } catch (err) {
+      logger.warn({ err }, "Failed to copy workspace SDK (non-fatal)");
+    }
+  }
 
   // The npm-installed @paperclipai/shared on the plugins side can lag the
   // workspace fork (its registry publish is date-versioned and is not
@@ -831,23 +871,31 @@ export async function startServer(): Promise<StartedServer> {
   // `exports` map points at ./src/*.ts (raw TS), whereas the registry copy's
   // `exports` already points at ./dist/*.js. Overwriting it would swap the
   // missing-export crash for ERR_MODULE_NOT_FOUND on the same plugins.
-  function copyWorkspaceSharedDist() {
+  async function copyWorkspaceSharedDist() {
     try {
       const pluginsSharedDir = path.join(os.homedir(), ".paperclip", "plugins", "node_modules", "@paperclipai", "shared");
       const thisDir = path.dirname(new URL(import.meta.url).pathname);
       const workspaceSharedDist = path.resolve(thisDir, "../../packages/shared/dist");
       // Only act when both the workspace source and the installed target exist;
       // never create the package from nothing (mirrors the SDK copy guard).
-      if (!fs.existsSync(workspaceSharedDist) || !fs.existsSync(pluginsSharedDir)) return;
-      if (fs.lstatSync(pluginsSharedDir).isSymbolicLink()) {
-        fs.unlinkSync(pluginsSharedDir);
-        fs.mkdirSync(pluginsSharedDir, { recursive: true });
+      if (!(await pathExists(workspaceSharedDist)) || !(await pathExists(pluginsSharedDir))) return;
+      if ((await fs.promises.lstat(pluginsSharedDir)).isSymbolicLink()) {
+        await fs.promises.unlink(pluginsSharedDir);
+        await fs.promises.mkdir(pluginsSharedDir, { recursive: true });
       }
-      fs.cpSync(workspaceSharedDist, path.join(pluginsSharedDir, "dist"), { recursive: true });
+      await fs.promises.cp(workspaceSharedDist, path.join(pluginsSharedDir, "dist"), { recursive: true });
       logger.info("Copied workspace @paperclipai/shared dist to local plugins directory");
     } catch (err) {
       logger.warn({ err }, "Failed to copy workspace shared dist (non-fatal)");
     }
+  }
+
+  // API pods use a stub plugin manager and never load plugin workers. Avoid
+  // touching their shared CephFS package tree entirely; worker-tier patching
+  // completes before createApp can start plugin loading.
+  if (config.paperclipNodeRole !== "api") {
+    await copyWorkspacePluginSdk();
+    await copyWorkspaceSharedDist();
   }
 
   const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
@@ -1220,6 +1268,18 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
+        // BLO-21621: terminalize queued runs whose issue lock has already
+        // moved on or gone empty, so a detached run cannot sit invisible to
+        // every other recovery sweep indefinitely.
+        try {
+          const detached = await heartbeat.reconcileDetachedQueuedRuns();
+          if (detached.terminalized > 0) {
+            logger.warn({ ...detached }, "startup detached-queued-run sweeper terminalized stale runs");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup detached-queued-run sweeper failed");
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1371,6 +1431,20 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic stale-lock sweeper failed");
             }));
 
+          // BLO-21621: same cadence as the stale-lock sweeper above — a
+          // detached queued run is only reachable once its lock has already
+          // gone stale, so the two run back to back.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileDetachedQueuedRuns()
+            .then((detached) => {
+              if (detached.terminalized > 0) {
+                logger.warn({ ...detached }, "periodic detached-queued-run sweeper terminalized stale runs");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic detached-queued-run sweeper failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
@@ -1432,6 +1506,28 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { ...failedWakeDispatches },
                   "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
+                );
+              }
+            })
+            .then(async () => {
+              // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
+              // advisory lock at webhook time. GitHub never redelivers a 200,
+              // so this pass is the only path back for a sanctioned review
+              // request that lost that race.
+              const contendedReviewerWakes = await reconcileContendedPrReviewerWakes(db as any, {
+                webhookSecret: config.githubWebhookSecret || null,
+                pluginWorkerManager,
+                heartbeatOptions: { paperclipNodeRole: config.paperclipNodeRole },
+                prReviewerAgentIds: config.githubPrReviewerAgentIds,
+                prReviewerBotLogin: config.prReviewerBotLogin || null,
+              });
+              if (
+                contendedReviewerWakes.recovered > 0 ||
+                contendedReviewerWakes.exhausted > 0
+              ) {
+                logger.warn(
+                  { ...contendedReviewerWakes },
+                  "periodic contended PR-reviewer wake reconciliation replayed lock-contended review requests (BLO-21995)",
                 );
               }
             })
@@ -1497,6 +1593,26 @@ export async function startServer(): Promise<StartedServer> {
       runReconcilerSweepTick();
       setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
     }
+  }
+
+  // Stranded-blocked-issue reconciler (BLO-21523 phase 1). Worker-tier
+  // singleton, same rationale as the merged-PR reconciler above: drains
+  // issues left `status = 'blocked'` after their last blocker cleared, which
+  // are otherwise permanently unreachable (no dispatch, no wake path). Kicks
+  // off once on startup, then on interval; each pass re-checks its own
+  // predicate at UPDATE time, so it's safe to run from every worker replica.
+  if (config.strandedBlockedIssueReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startStrandedBlockedIssueReconciler } = await import(
+      "./services/stranded-blocked-issue-reconciler.js"
+    );
+    logger.info(
+      { intervalMinutes: config.strandedBlockedIssueReconcilerIntervalMinutes },
+      "Stranded-blocked-issue reconciler enabled (BLO-21523)",
+    );
+    startStrandedBlockedIssueReconciler(
+      db,
+      config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
+    );
   }
 
   // Wait for external adapters to finish loading before accepting requests.
@@ -1578,41 +1694,15 @@ export async function startServer(): Promise<StartedServer> {
     });
   });
 
-  // Ensure plugins directory uses the workspace SDK (with fork extensions).
-  // Copy the built dist + package.json from the workspace SDK into the plugins
-  // node_modules so workers use our fork's SDK (with labels/projects extensions).
-  try {
-    const pluginsSdkDir = path.join(os.homedir(), ".paperclip", "plugins", "node_modules", "@paperclipai", "plugin-sdk");
-    const thisDir = path.dirname(new URL(import.meta.url).pathname);
-    const workspaceSdkDist = path.resolve(thisDir, "../../packages/plugins/sdk/dist");
-    const workspaceSdkPkg = path.resolve(thisDir, "../../packages/plugins/sdk/package.json");
-    if (fs.existsSync(workspaceSdkDist) && fs.existsSync(pluginsSdkDir)) {
-      // Remove symlink if left over from a previous approach
-      if (fs.lstatSync(pluginsSdkDir).isSymbolicLink()) {
-        fs.unlinkSync(pluginsSdkDir);
-        fs.mkdirSync(pluginsSdkDir, { recursive: true });
-      }
-      fs.cpSync(workspaceSdkDist, path.join(pluginsSdkDir, "dist"), { recursive: true });
-      if (fs.existsSync(workspaceSdkPkg)) {
-        fs.cpSync(workspaceSdkPkg, path.join(pluginsSdkDir, "package.json"));
-      }
-      logger.info("Copied workspace plugin SDK dist to local plugins directory");
-    }
-  } catch (err) {
-    logger.warn({ err }, "Failed to copy workspace SDK (non-fatal)");
-  }
-  // Keep shared in lockstep with the vendored fork SDK (see note above).
-  copyWorkspaceSharedDist();
-
   // Auto-install bundled plugins (idempotent — skips if already installed).
   // Skipped on the API tier: /api/plugins/install hits pluginWorkerManager
   // which is stubbed; the workers tier owns plugin installs.
   if (config.paperclipNodeRole !== "api") {
-    void autoInstallBundledPlugins(db as any, internalBootstrapToken).then(() => {
+    void autoInstallBundledPlugins(db as any, internalBootstrapToken).then(async () => {
       // Re-patch workspace SDK after plugin installs — npm install pulls the upstream SDK.
-      copyWorkspaceSdkFiles();
+      await copyWorkspaceSdkFiles();
       // …and the upstream shared it dragged in, so the matched fork pair survives.
-      copyWorkspaceSharedDist();
+      await copyWorkspaceSharedDist();
     }).catch((err) => {
       logger.warn({ err }, "auto-install of bundled plugins failed (non-fatal)");
     });

@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,12 +55,17 @@ function installStubs(ids: { uid: number; gid: number; nodeUid?: number; nodeGid
   for (const cmd of ["usermod", "groupmod", "chown", "mkdir", "ln"]) {
     writeStub(cmd, `echo "${cmd} $*" >> "${logFile}"`);
   }
+  writeStub("google-chrome", "exit 0");
   writeStub("gosu", `echo "gosu $*" >> "${logFile}"\nshift\nexec "$@"`);
 }
 
 async function runEntrypoint(env: Record<string, string> = {}) {
   const result = await execFileAsync("sh", [ENTRYPOINT, "echo", "ENTRYPOINT-CMD-RAN"], {
-    env: { PATH: `${stubDir}:${process.env.PATH}`, ...env },
+    env: {
+      PATH: `${stubDir}:${process.env.PATH}`,
+      CHROME_BIN: join(stubDir, "google-chrome"),
+      ...env,
+    },
   });
   const calls = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
   return { stdout: result.stdout, stderr: result.stderr, calls };
@@ -98,7 +112,8 @@ describe("docker-entrypoint.sh", () => {
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toBe("");
-    expect(calls).toBe("");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
+    expect(calls).toContain(`ln -sfn ${join(stubDir, "google-chrome")} /paperclip/bin/google-chrome`);
   });
 
   it("execs directly with a warning for an arbitrary non-root UID (OpenShift-style)", async () => {
@@ -108,7 +123,7 @@ describe("docker-entrypoint.sh", () => {
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("running unprivileged as 1234:1234; cannot remap to requested 1000:1000");
-    expect(calls).toBe("");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
   });
 
   it("execs directly with a warning on a non-root GID mismatch", async () => {
@@ -118,6 +133,38 @@ describe("docker-entrypoint.sh", () => {
 
     expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
     expect(stderr).toContain("running unprivileged as 1000:1001; cannot remap to requested 1000:1000");
-    expect(calls).toBe("");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
+  });
+
+  it("does not abort an arbitrary-UID command when the PVC is not writable", async () => {
+    installStubs({ uid: 1234, gid: 1234 });
+    writeStub("mkdir", `echo "mkdir $*" >> "${logFile}"\nexit 1`);
+
+    const { stdout, stderr, calls } = await runEntrypoint();
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(stderr).toContain("/paperclip/bin is not writable; browser link not installed");
+    expect(calls).toContain("mkdir -p /paperclip/bin");
+    expect(calls).not.toContain("ln -sfn");
+  });
+
+  it("replaces a browser leaf symlink without following it", async () => {
+    installStubs({ uid: 1000, gid: 1000 });
+    const paperclipHome = join(stubDir, "paperclip-home");
+    const browserBin = join(paperclipHome, "bin");
+    const browserLink = join(browserBin, "google-chrome");
+    const staleBrowserDirectory = join(stubDir, "stale-browser");
+    mkdirSync(browserBin, { recursive: true });
+    mkdirSync(staleBrowserDirectory);
+    symlinkSync(staleBrowserDirectory, browserLink);
+    writeStub("mkdir", `echo "mkdir $*" >> "${logFile}"\nexec /bin/mkdir "$@"`);
+    writeStub("ln", `echo "ln $*" >> "${logFile}"\nexec /bin/ln "$@"`);
+
+    const { stdout, calls } = await runEntrypoint({ PAPERCLIP_HOME: paperclipHome });
+
+    expect(stdout).toContain("ENTRYPOINT-CMD-RAN");
+    expect(calls).toContain(`ln -sfn ${join(stubDir, "google-chrome")} ${browserLink}`);
+    expect(calls).not.toContain("ln -sf ");
+    expect(readlinkSync(browserLink)).toBe(join(stubDir, "google-chrome"));
   });
 });

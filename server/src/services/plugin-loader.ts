@@ -50,6 +50,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import { isIsolatedSdkPluginPackage, resolveDefaultInstallDir } from "../bootstrap/isolated-sdk-plugins.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -119,6 +120,113 @@ function isSdkInstallRaceError(err: unknown): boolean {
     msg.includes(SDK_INSTALL_RACE_ERR_MARKER) &&
     msg.includes(SDK_INSTALL_RACE_PACKAGE_MARKER)
   );
+}
+
+/**
+ * Transient worker-startup failures (BLO-20410).
+ *
+ * `startWorker()` runs the `initialize` RPC under INITIALIZE_TIMEOUT_MS (60s,
+ * plugin-worker-manager.ts) and throws `Worker initialize failed for "<id>":
+ * RPC call "initialize" timed out after 60000ms` when the budget is blown. That
+ * failure used to latch the plugin at `status='error'` on the first attempt,
+ * where nothing ever retried it — four of eleven plugins (including
+ * `lucitra.plugin-secrets`) sat dead for 9+ hours and all four recovered from a
+ * single manual `/enable` with no other change.
+ *
+ * The timeout is a symptom of boot contention, not of a broken plugin, so it is
+ * retried rather than latched.
+ *
+ * A message-substring classifier used to live here (BLO-22095). It could not
+ * work: `startWorker()` applies the `Worker initialize failed for "<id>"`
+ * prefix to *every* initialize failure, so matching that prefix also matched a
+ * plugin that threw — bad credentials, missing config, any explicit RPC
+ * rejection — and retried it three times while this comment claimed the
+ * opposite. It also listed a `Worker exited during startup` marker that no
+ * production site has ever thrown. It was superseded by the typed classifier
+ * below, left behind with no call sites, and is now removed rather than left
+ * to mislead the next reader.
+ */
+const INITIALIZE_TIMEOUT_ERR_MARKER = 'RPC call "initialize" timed out after';
+
+function isWorkerStartupError(
+  err: unknown,
+): err is { name: string; transient: boolean } {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "WorkerStartupError" &&
+    typeof (err as { transient?: unknown }).transient === "boolean"
+  );
+}
+
+/**
+ * Classify only failures that should consume the expensive activation retry
+ * budget. Typed `WorkerStartupError` provenance is authoritative; the narrow
+ * string fallback is solely for an untyped initialize-timeout rejection.
+ */
+export function isTransientActivationRetryError(err: unknown): boolean {
+  if (isWorkerStartupError(err)) return err.transient;
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes(INITIALIZE_TIMEOUT_ERR_MARKER);
+}
+
+/**
+ * Each attempt can burn the full 60s initialize budget, so this schedule is
+ * deliberately short: two extra attempts, ~10s of added delay. Bounded boot
+ * concurrency (PLUGIN_ACTIVATION_CONCURRENCY) removes most of the contention
+ * that causes these timeouts; this is the safety net for what slips through.
+ */
+export const TRANSIENT_ACTIVATION_RETRY_DELAYS_MS = [2_000, 8_000];
+
+/**
+ * Boot-time activation was an unbounded `Promise.allSettled` over every ready
+ * plugin, so all eleven raced for the same 60s initialize window and the losers
+ * latched `error`. Enabling them one at a time afterwards succeeded every time,
+ * which is what identifies this as contention rather than per-plugin slowness.
+ *
+ * `loadAll()` is fire-and-forget at boot (app.ts) so serializing does not delay
+ * readiness.
+ */
+const DEFAULT_PLUGIN_ACTIVATION_CONCURRENCY = 4;
+
+export function resolveActivationConcurrency(): number {
+  const raw = process.env.PAPERCLIP_PLUGIN_ACTIVATION_CONCURRENCY;
+  if (!raw) return DEFAULT_PLUGIN_ACTIVATION_CONCURRENCY;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_PLUGIN_ACTIVATION_CONCURRENCY;
+  }
+  return parsed;
+}
+
+/**
+ * Run `task` over `items` with at most `limit` in flight, preserving input
+ * order in the result. Never rejects: like `Promise.allSettled`, each slot
+ * captures its own failure so one bad plugin cannot abort the rest.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      try {
+        results[index] = { status: "fulfilled", value: await task(items[index]!, index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+
+  const slots = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: slots }, () => worker()));
+  return results;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -393,6 +501,14 @@ export async function checkSharedDependencyConsistencyAfterRecheck(
   return check;
 }
 
+/**
+ * Leading text of the torn-store activation refusal below. The startup
+ * isolation migration keys its "safe to un-latch this row" decision off this
+ * exact marker (see `reconcileLegacyIsolatedInstallsAtStartup`), so the two
+ * must stay coupled — hence a shared constant rather than a repeated literal.
+ */
+export const TORN_STORE_ERROR_MARKER = "Torn plugin store detected";
+
 function formatSharedDependencyConsistencyError(check: SharedDependencyConsistencyCheck, installDir: string): string {
   const installedPath = path.join(installDir, "node_modules", ...check.packageName.split("/"));
   if (check.problem === "metadata_invalid") {
@@ -404,7 +520,7 @@ function formatSharedDependencyConsistencyError(check: SharedDependencyConsisten
     );
   }
   return (
-    `Torn plugin store detected: package-lock.json for ${check.packageName} records ` +
+    `${TORN_STORE_ERROR_MARKER}: package-lock.json for ${check.packageName} records ` +
     `'${check.lockfileVersion}' but the installed package at ${installedPath} reports ` +
     `'${check.installedVersion}'. Refusing to activate to avoid a silent worker ` +
     `initialize timeout. Reconcile the shared plugin store (e.g. remove the stale ` +
@@ -507,6 +623,12 @@ export interface DiscoveredPlugin {
   source: PluginSource;
   /** The parsed and validated manifest if available, null if discovery-only. */
   manifest: PaperclipPluginManifestV1 | null;
+  /**
+   * npm install prefix this package was (or would be) installed into.
+   * Equal to the shared `localPluginDir` unless the package is isolated
+   * (see BLO-20961 / `resolveDefaultInstallDir`).
+   */
+  installDir: string;
 }
 
 /**
@@ -1494,7 +1616,12 @@ export function pluginLoader(
       throw new Error("Either packageName or localPath must be provided");
     }
 
-    const targetInstallDir = installDir ?? localPluginDir;
+    // Third-party packages that declare their own real `@paperclipai/plugin-sdk`
+    // dependency default into an isolated install dir instead of the shared
+    // store, so the workspace-SDK-fork vendoring in index.ts can never tear
+    // their install (BLO-20961). Callers can still force a specific
+    // `installDir` (e.g. upgradePlugin reusing a plugin's existing dir).
+    const targetInstallDir = installDir ?? resolveDefaultInstallDir(packageName, localPluginDir);
 
     // Step 1 & 2: Resolve and install package
     let resolvedPackagePath: string;
@@ -1628,7 +1755,114 @@ export function pluginLoader(
       version: resolvedVersion,
       source: localPath ? "local-filesystem" : "npm",
       manifest,
+      installDir: targetInstallDir,
     };
+  }
+
+  /**
+   * Relocate a pre-isolation plugin row into its isolated install dir.
+   *
+   * The `installDir` column was added additively (BLO-20961), so every row that
+   * existed before it — including the two plugins this issue exists to fix —
+   * carries `installDir = NULL` and therefore keeps resolving to the shared
+   * store. That store is torn *by construction* on the worker tier: `index.ts`
+   * re-copies the workspace SDK fork (`1.0.0`) over it on every boot while the
+   * lockfile permanently records the registry version, so those rows fail the
+   * consistency guard 100% of the time and isolation would otherwise only
+   * engage on some later install/upgrade that never comes.
+   *
+   * Pointing the activation fallback at `resolveDefaultInstallDir()` alone is
+   * NOT sufficient: the isolated directory does not exist yet for these rows,
+   * so that would only trade a torn-store failure for a missing-entrypoint one.
+   * This does the real relocation — npm-install into the isolated dir, verify
+   * the reinstalled package is the same plugin, then persist `installDir` —
+   * so activation afterwards resolves somewhere that actually exists.
+   *
+   * No-ops for rows that are already isolated, are local-filesystem installs,
+   * or whose package does not opt into isolation.
+   */
+  async function reconcileLegacyIsolatedInstall(plugin: PluginRecord): Promise<PluginRecord> {
+    if (plugin.installDir || plugin.packagePath || !isIsolatedSdkPluginPackage(plugin.packageName)) {
+      return plugin;
+    }
+
+    const installDir = resolveDefaultInstallDir(plugin.packageName, localPluginDir);
+    const discovered = await fetchAndValidate({
+      packageName: plugin.packageName,
+      version: plugin.version,
+      installDir,
+    });
+
+    // Guard against a package name that now resolves to a different plugin —
+    // persisting installDir for the wrong identity would silently repoint a row.
+    if (!discovered.manifest || discovered.manifest.id !== plugin.pluginKey) {
+      throw new Error(
+        `Isolated reinstall of '${plugin.packageName}' resolved to plugin ` +
+          `'${discovered.manifest?.id ?? "unknown"}', expected '${plugin.pluginKey}'`,
+      );
+    }
+
+    const updated = (await registry.update(plugin.id, {
+      packageName: discovered.packageName,
+      version: discovered.version,
+      manifest: discovered.manifest,
+      installDir: discovered.installDir,
+    })) as PluginRecord | null;
+
+    if (!updated) {
+      throw new Error(`Plugin disappeared during isolated-store migration: ${plugin.id}`);
+    }
+
+    log.info(
+      { pluginId: plugin.id, pluginKey: plugin.pluginKey, installDir: discovered.installDir },
+      "plugin-loader: migrated legacy plugin into isolated install dir",
+    );
+    return updated;
+  }
+
+  /**
+   * Run `reconcileLegacyIsolatedInstall` across installed rows before
+   * `loadAll()` selects by status.
+   *
+   * Also un-latches rows the torn-store guard parked in `error`: `loadAll()`
+   * only selects `status='ready'`, so a row refused once stays invisible to
+   * every later boot even after the underlying cause is fixed. Only rows whose
+   * `lastError` came from that guard are revived, and only when the relocation
+   * actually moved them — an unrelated failure keeps its error and stays out.
+   *
+   * Best-effort per row: one plugin that cannot be reinstalled (npm offline,
+   * yanked version) must not abort boot for every other plugin.
+   */
+  async function reconcileLegacyIsolatedInstallsAtStartup(): Promise<void> {
+    const installed = (await registry.listInstalled()) as PluginRecord[];
+
+    for (const plugin of installed) {
+      const latchedByTornStore =
+        plugin.status === "error" && !!plugin.lastError?.includes(TORN_STORE_ERROR_MARKER);
+      if (plugin.status !== "ready" && !latchedByTornStore) continue;
+
+      try {
+        const migrated = await reconcileLegacyIsolatedInstall(plugin);
+        if (migrated.installDir === plugin.installDir) continue;
+
+        if (latchedByTornStore) {
+          await registry.updateStatus(migrated.id, { status: "ready", lastError: null });
+          log.info(
+            { pluginId: migrated.id, pluginKey: migrated.pluginKey },
+            "plugin-loader: re-enabled plugin latched by the torn shared store",
+          );
+        }
+      } catch (err) {
+        log.warn(
+          {
+            pluginId: plugin.id,
+            packageName: plugin.packageName,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "plugin-loader: legacy isolated-store migration failed; leaving row unchanged",
+        );
+      }
+    }
   }
 
   /**
@@ -1745,6 +1979,7 @@ export function pluginLoader(
         version,
         source,
         manifest: null,
+        installDir: localPluginDir,
       };
     }
 
@@ -1756,6 +1991,7 @@ export function pluginLoader(
         version,
         source,
         manifest,
+        installDir: localPluginDir,
       };
     } catch (err) {
       // Rethrow with context — callers catch and route to the errors array
@@ -2038,6 +2274,9 @@ export function pluginLoader(
           {
             packageName: discovered.packageName,
             packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+            // Null (not omitted) when the resolved dir is the shared store, so a
+            // force-repoint away from isolation is explicit rather than a no-op.
+            installDir: discovered.installDir === localPluginDir ? null : discovered.installDir,
           },
           manifest,
           { force: installOptions.force === true },
@@ -2099,6 +2338,7 @@ export function pluginLoader(
         id: string;
         packageName: string;
         packagePath: string | null;
+        installDir: string | null;
         manifestJson: PaperclipPluginManifestV1;
       } | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
@@ -2114,8 +2354,16 @@ export function pluginLoader(
         force = false,
       } = upgradeOptions;
 
+      // Reuse the plugin's existing install directory rather than always
+      // reinstalling into the shared store. A plugin already isolated from
+      // the shared store (BLO-20961) must stay isolated across upgrades, and
+      // a not-yet-isolated plugin whose packageName is now in
+      // ISOLATED_SDK_PLUGIN_PACKAGES should isolate on its next upgrade
+      // rather than waiting for an uninstall/reinstall cycle.
+      const targetInstallDir = plugin.installDir ?? resolveDefaultInstallDir(packageName, localPluginDir);
+
       log.info(
-        { pluginId, packageName, version, localPath },
+        { pluginId, packageName, version, localPath, installDir: targetInstallDir },
         "plugin-loader: upgrading plugin",
       );
 
@@ -2124,7 +2372,7 @@ export function pluginLoader(
         packageName,
         localPath,
         version,
-        installDir: localPluginDir,
+        installDir: targetInstallDir,
       });
 
       const newManifest = discovered.manifest!;
@@ -2164,6 +2412,7 @@ export function pluginLoader(
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        installDir: discovered.installDir === localPluginDir ? null : discovered.installDir,
       });
 
       return {
@@ -2186,25 +2435,37 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async cleanupInstallArtifacts(plugin: PluginRecord): Promise<void> {
+      // Isolated plugins (BLO-20961) were npm-installed into their own dir,
+      // not the shared store — uninstall/rm must target the same dir they
+      // actually live in, or this silently no-ops (wrong `npm uninstall`
+      // --prefix) and orphans the isolated install on disk forever.
+      const pluginInstallDir = plugin.installDir ?? localPluginDir;
       const managedTargets = new Set<string>();
-      const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
-      const directManagedDir = path.join(localPluginDir, plugin.packageName);
+      const managedNodeModulesDir = resolveManagedInstallPackageDir(pluginInstallDir, plugin.packageName);
+      const directManagedDir = path.join(pluginInstallDir, plugin.packageName);
 
       managedTargets.add(managedNodeModulesDir);
-      if (isPathInsideDir(directManagedDir, localPluginDir)) {
+      if (isPathInsideDir(directManagedDir, pluginInstallDir)) {
         managedTargets.add(directManagedDir);
       }
-      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
+      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, pluginInstallDir)) {
         managedTargets.add(path.resolve(plugin.packagePath));
       }
 
-      const packageJsonPath = path.join(localPluginDir, "package.json");
+      // An isolated plugin gets its own dedicated install dir (see
+      // `isolatedPluginsRoot`), so it's safe to remove the whole dir rather
+      // than just the package subtree within it.
+      if (plugin.installDir && plugin.installDir !== localPluginDir) {
+        managedTargets.add(pluginInstallDir);
+      }
+
+      const packageJsonPath = path.join(pluginInstallDir, "package.json");
       if (existsSync(packageJsonPath)) {
         try {
           const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
           await execFileAsync(
             "npm",
-            ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts", "--cache", npmCacheDir],
+            ["uninstall", plugin.packageName, "--prefix", pluginInstallDir, "--ignore-scripts", "--cache", npmCacheDir],
             { timeout: 120_000 },
           );
         } catch (err) {
@@ -2266,6 +2527,11 @@ export function pluginLoader(
 
       log.info("plugin-loader: loading all ready plugins");
 
+      // Relocate pre-isolation rows (installDir IS NULL) into their isolated
+      // dirs and revive any the torn-store guard latched, BEFORE selecting by
+      // status — a revived row must be visible to the query below.
+      await reconcileLegacyIsolatedInstallsAtStartup();
+
       // Fetch all plugins in ready status, ordered by installOrder
       const readyPlugins = (await registry.listByStatus("ready")) as PluginRecord[];
 
@@ -2279,9 +2545,18 @@ export function pluginLoader(
         "plugin-loader: found ready plugins to load",
       );
 
-      // Load plugins in parallel
-      const results = await Promise.allSettled(
-        readyPlugins.map((plugin) => activatePlugin(plugin))
+      // Activate with bounded concurrency. An unbounded fan-out here put every
+      // ready plugin into the same 60s `initialize` window and the losers
+      // latched status='error' permanently (BLO-20410).
+      const concurrency = resolveActivationConcurrency();
+      log.info(
+        { count: readyPlugins.length, concurrency },
+        "plugin-loader: activating plugins with bounded concurrency",
+      );
+      const results = await mapWithConcurrency(
+        readyPlugins,
+        concurrency,
+        (plugin) => activatePlugin(plugin),
       );
 
       const loadResults = results.map((r, i) => {
@@ -2336,10 +2611,15 @@ export function pluginLoader(
         );
       }
 
-      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      let plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) {
         throw new Error(`Plugin not found: ${pluginId}`);
       }
+
+      // Single-plugin path (operator re-enable, lifecycle load) gets the same
+      // relocation as boot, so re-enabling a legacy row does not just re-run
+      // it against the shared store and fail the guard again.
+      plugin = await reconcileLegacyIsolatedInstall(plugin);
 
       // If the plugin is in 'installed' status, transition it to 'ready' first.
       // lifecycleManager.load() transitions the status AND activates the plugin
@@ -2481,6 +2761,16 @@ export function pluginLoader(
       tools: 0,
     };
 
+    // Retry counters live at function scope so the failure handler can record
+    // how the plugin got here. The activation log line is written once, at
+    // activation time, and had already scrolled out of retention by the time
+    // BLO-20410 was investigated 9 hours later — `lastError` was the only
+    // surviving evidence, and a bare timeout string cannot distinguish boot
+    // contention (retries exhausted) from a real fault (failed closed
+    // immediately).
+    let sdkRaceAttempt = 0;
+    let transientAttempt = 0;
+
     // Guard: runtime services must exist (callers already checked)
     if (!runtimeServices) {
       return {
@@ -2511,10 +2801,16 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
-      const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      // Isolated plugins (BLO-20961) live in their own install dir, entirely
+      // outside the shared store's node_modules — resolve everything below
+      // against that dir instead of the shared `localPluginDir` so the
+      // consistency check and entrypoint lookup see the tree that's actually
+      // theirs.
+      const pluginInstallDir = activePlugin.installDir ?? localPluginDir;
+      const packageRoot = resolvePluginPackageRoot(activePlugin, pluginInstallDir);
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
-      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
+      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, pluginInstallDir);
 
       // ------------------------------------------------------------------
       // 1b. Fail closed on a torn shared package store (BLO-18384)
@@ -2530,9 +2826,9 @@ export function pluginLoader(
       // plugin errored, while a persistent mismatch still fails well before
       // the worker initialize timeout.
       // ------------------------------------------------------------------
-      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(localPluginDir);
+      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(pluginInstallDir);
       if (!sdkConsistency.consistent) {
-        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, localPluginDir));
+        throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, pluginInstallDir));
       }
 
       // ------------------------------------------------------------------
@@ -2608,38 +2904,92 @@ export function pluginLoader(
         };
       }
 
-      for (let attempt = 0; ; attempt++) {
+      // Two independent retry budgets share this loop: the SDK install race
+      // (module not found, cheap to retry) and a transient startup failure such
+      // as the 60s `initialize` timeout (BLO-20410, expensive to retry). They
+      // are counted separately so exhausting one does not consume the other.
+      for (;;) {
         try {
           if (workerManager.getWorker(pluginId)) {
             await workerManager.stopWorker(pluginId);
           }
           await workerManager.startWorker(pluginId, workerOptions);
-          if (attempt > 0) {
+          if (sdkRaceAttempt > 0 || transientAttempt > 0) {
             log.info(
-              { pluginId, pluginKey, attempt },
-              "plugin-loader: worker started after SDK install race retry",
+              { pluginId, pluginKey, sdkRaceAttempt, transientAttempt },
+              "plugin-loader: worker started after activation retry",
             );
           }
           break;
         } catch (err) {
+          // Drop the failed handle before sleeping. A worker that crashed during
+          // startup can own a restart timer; leaving it registered across the
+          // retry delay lets it start itself inside the next retry window.
+          const releaseFailedWorker = async (): Promise<void> => {
+            if (!workerManager.getWorker(pluginId)) return;
+            try {
+              await workerManager.stopWorker(pluginId);
+            } catch (stopErr) {
+              log.warn(
+                {
+                  pluginId,
+                  pluginKey,
+                  err: stopErr instanceof Error ? stopErr.message : String(stopErr),
+                },
+                "plugin-loader: failed to stop worker before activation retry",
+              );
+            }
+          };
+
           if (
-            !isSdkInstallRaceError(err) ||
-            attempt >= SDK_INSTALL_RACE_RETRY_DELAYS_MS.length
+            isSdkInstallRaceError(err) &&
+            sdkRaceAttempt < SDK_INSTALL_RACE_RETRY_DELAYS_MS.length
           ) {
-            throw err;
+            const delay = SDK_INSTALL_RACE_RETRY_DELAYS_MS[sdkRaceAttempt]!;
+            sdkRaceAttempt += 1;
+            log.warn(
+              {
+                pluginId,
+                pluginKey,
+                attempt: sdkRaceAttempt,
+                delayMs: delay,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "plugin-loader: SDK install race detected, retrying worker spawn",
+            );
+            await releaseFailedWorker();
+            await sleep(delay);
+            continue;
           }
-          const delay = SDK_INSTALL_RACE_RETRY_DELAYS_MS[attempt]!;
-          log.warn(
-            {
-              pluginId,
-              pluginKey,
-              attempt: attempt + 1,
-              delayMs: delay,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "plugin-loader: SDK install race detected, retrying worker spawn",
-          );
-          await sleep(delay);
+
+          // An SDK install race that has exhausted its own budget must not fall
+          // through and borrow the transient budget as well — a crashed-at-import
+          // worker matches both classifiers, and chaining them would silently
+          // give the SDK race 7 attempts instead of 5.
+          if (
+            !isSdkInstallRaceError(err) &&
+            isTransientActivationRetryError(err) &&
+            transientAttempt < TRANSIENT_ACTIVATION_RETRY_DELAYS_MS.length
+          ) {
+            const delay = TRANSIENT_ACTIVATION_RETRY_DELAYS_MS[transientAttempt]!;
+            transientAttempt += 1;
+            log.warn(
+              {
+                pluginId,
+                pluginKey,
+                attempt: transientAttempt,
+                maxAttempts: TRANSIENT_ACTIVATION_RETRY_DELAYS_MS.length,
+                delayMs: delay,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "plugin-loader: transient worker startup failure, retrying before marking plugin errored",
+            );
+            await releaseFailedWorker();
+            await sleep(delay);
+            continue;
+          }
+
+          throw err;
         }
       }
       registered.worker = true;
@@ -2770,14 +3120,28 @@ export function pluginLoader(
       }
 
       log.error(
-        { pluginId, pluginKey, err: errorMessage },
+        { pluginId, pluginKey, err: errorMessage, sdkRaceAttempt, transientAttempt },
         "plugin-loader: failed to activate plugin",
       );
 
-      // Mark the plugin as errored in the database so it is not retried
-      // automatically on next startup without operator intervention.
+      // Record how the plugin reached this state alongside the error itself.
+      // `lastError` outlives log retention, so it carries the one fact the logs
+      // cannot: whether retries were spent (contention) or the failure was
+      // terminal on the first attempt (a real fault). See BLO-20410.
+      const retrySuffix =
+        sdkRaceAttempt > 0 || transientAttempt > 0
+          ? ` (after ${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries)`
+          : " (failed closed on first attempt; not classified as transient)";
+
+      // Mark the plugin as errored in the database. Transient failures are
+      // retried above before reaching this point (BLO-20410); anything that
+      // lands here has either exhausted its retry budget or is a fault we
+      // deliberately do not retry, so it still requires operator intervention.
       try {
-        await lifecycleManager.markError(pluginId, `Activation failed: ${errorMessage}`);
+        await lifecycleManager.markError(
+          pluginId,
+          `Activation failed: ${errorMessage}${retrySuffix}`,
+        );
       } catch (markErr) {
         log.error(
           {

@@ -493,16 +493,51 @@ function parseMonitorDate(value: string | null | undefined) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function exhaustedMonitorClearReason(input: {
-  monitor: IssueExecutionMonitorPolicy;
+/**
+ * Ceiling used by scheduler dispatch for a monitor armed without an explicit
+ * `maxAttempts` (BLO-23061).
+ *
+ * `recoveryPolicy` and the whole `max_attempts_exhausted` → owner-recovery path
+ * are already implemented and tested, but they hang off `exhaustedMonitorClearReason`,
+ * which only fires when `maxAttempts` is non-null. Agents routinely arm monitors
+ * with a `recoveryPolicy` and no `maxAttempts`, which made that escalation
+ * unreachable: the monitor re-armed forever and no human was ever notified.
+ * Observed on BLO-22305 — 19 agent runs across 31 hours, every one reporting an
+ * unchanged signature and re-arming.
+ *
+ * 24 is deliberately generous: at the ~hourly cadence those live monitors used,
+ * it is roughly a day of self-service polling before a human is pulled in. An
+ * explicit `maxAttempts` on the policy still wins, so callers that genuinely
+ * need a longer leash can set one. This is intentionally a scheduler default,
+ * not an API re-arm default: an explicit re-arm without `maxAttempts` remains
+ * unbounded as it was before this ceiling existed.
+ */
+export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
+
+/**
+ * Single source of truth for "has this monitor run out of road?" — shared by the
+ * policy transition path and the heartbeat scheduler (BLO-23061).
+ *
+ * `attemptCount` is the number of attempts ALREADY made, not the one about to be
+ * consumed. The scheduler previously kept a private copy of this rule phrased as
+ * `nextAttemptCount > maxAttempts`, where `nextAttemptCount = attemptCount + 1`;
+ * that is algebraically identical to `attemptCount >= maxAttempts`, so collapsing
+ * the two is behaviour-preserving. Keep this parameterization — passing the
+ * post-increment count here would move the ceiling by one. Only the scheduler
+ * supplies `defaultMaxAttempts`; explicit policy transitions omit it so a
+ * monitor with no configured limit remains unbounded.
+ */
+export function exhaustedMonitorClearReason(input: {
+  monitor: Pick<IssueExecutionMonitorPolicy, "timeoutAt" | "maxAttempts"> | null;
   attemptCount: number;
   now: Date;
+  defaultMaxAttempts?: number | null;
 }): IssueExecutionMonitorClearReason | null {
-  const timeoutAt = parseMonitorDate(input.monitor.timeoutAt ?? null);
+  const timeoutAt = parseMonitorDate(input.monitor?.timeoutAt ?? null);
   if (timeoutAt && input.now.getTime() >= timeoutAt.getTime()) {
     return "timeout_exceeded";
   }
-  const maxAttempts = input.monitor.maxAttempts ?? null;
+  const maxAttempts = input.monitor?.maxAttempts ?? input.defaultMaxAttempts ?? null;
   if (maxAttempts !== null && input.attemptCount >= maxAttempts) {
     return "max_attempts_exhausted";
   }
@@ -552,6 +587,28 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
       scheduledBy,
     },
   };
+}
+
+/**
+ * Merge a requested monitor into an existing policy rather than replacing the
+ * policy outright.
+ *
+ * `PATCH /issues/:id` writes `executionPolicy` wholesale, which is correct for
+ * an actor who already holds general mutation authority over the issue. It is
+ * wrong for the narrow manager-chain monitor re-arm (BLO-22860): that actor is
+ * *not* the assignee and holds no general mutation grant, so restoring a lapsed
+ * timer must not also drop the report's `stages`, `reviewPreset`,
+ * `authorizationPolicy` or `mode` as a side effect.
+ */
+export function mergeIssueExecutionPolicyMonitor(
+  previous: IssueExecutionPolicy | null,
+  monitor: IssueExecutionMonitorPolicy | null,
+): IssueExecutionPolicy | null {
+  if (!monitor) return previous;
+  if (!previous) {
+    return { mode: "normal", commentRequired: true, stages: [], monitor };
+  }
+  return { ...previous, monitor };
 }
 
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
@@ -1327,6 +1384,44 @@ export function buildIssueMonitorTriggeredPatch(input: {
     monitorWakeRequestedAt: null,
     monitorLastTriggeredAt: input.triggeredAt,
     monitorAttemptCount: nextMonitorState.attemptCount,
+    monitorNotes: nextMonitorState.notes,
+    monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
+export function buildIssueMonitorDispatchRearmPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  /**
+   * Attempt count to persist. Defaults to restoring the attempt the undelivered
+   * wake consumed — the tick-detected lapse path, where the wake never ran and
+   * so must not count against maxAttempts.
+   *
+   * The watchdog *dispatch* path passes the already-incremented count instead:
+   * that fire did real work (it re-dispatched the stuck run), so it consumes an
+   * attempt and the retry loop stays bounded by maxAttempts rather than
+   * re-arming forever against a run that never moves (BLO-22860).
+   */
+  attemptCount?: number;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const restoredAttemptCount = input.attemptCount ?? Math.max(0, (currentMonitorState?.attemptCount ?? 1) - 1);
+  const previousMonitorState = currentMonitorState
+    ? { ...currentMonitorState, attemptCount: restoredAttemptCount }
+    : null;
+  const nextMonitorState = buildScheduledMonitorState(previousMonitorState, input.policy.monitor!);
+
+  return {
+    executionPolicy: input.policy as unknown as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: new Date(input.policy.monitor!.nextCheckAt),
+    monitorWakeRequestedAt: null,
+    monitorAttemptCount: restoredAttemptCount,
     monitorNotes: nextMonitorState.notes,
     monitorScheduledBy: nextMonitorState.scheduledBy,
   };

@@ -45,10 +45,10 @@ describe("PR-review dispatch fairness", () => {
     const selected = selectAgedPrReviewRunForFairDispatch(
       [
         queuedRun("newer-review", 11 * 60 * 1000, {
-          taskKey: "pr_review:Blockcast/paperclip:2",
+          taskKey: "pr_review:blockcast/paperclip:2",
         }),
         queuedRun("oldest-review", 20 * 60 * 1000, {
-          taskKey: "pr_review:Blockcast/paperclip:1",
+          taskKey: "pr_review:blockcast/paperclip:1",
         }),
         queuedRun("issue", 30 * 60 * 1000, { issueId: randomUUID() }),
       ],
@@ -66,7 +66,7 @@ describe("PR-review dispatch fairness", () => {
           reviewKind: "pr_review",
         }),
       ],
-      { contextSnapshot: { taskKey: "pr_review:Blockcast/paperclip:previous" } },
+      { contextSnapshot: { taskKey: "pr_review:blockcast/paperclip:previous" } },
       now,
     );
 
@@ -77,7 +77,7 @@ describe("PR-review dispatch fairness", () => {
     const selected = selectAgedPrReviewRunForFairDispatch(
       [
         queuedRun("review", PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS - 1, {
-          taskKey: "pr_review:Blockcast/paperclip:1",
+          taskKey: "pr_review:blockcast/paperclip:1",
         }),
       ],
       { contextSnapshot: { issueId: randomUUID() } },
@@ -293,7 +293,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
   it("coalesces concurrent same-task deliveries into one queued run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
-    const taskKey = "pr_review:Blockcast/penstock-vault-node:189";
+    const taskKey = "pr_review:blockcast/penstock-vault-node:189";
 
     await db.insert(companies).values({
       id: companyId,
@@ -366,7 +366,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runningRunId = randomUUID();
-    const taskKey = "pr_review:Blockcast/penstock-llm-proxy-core:691";
+    const taskKey = "pr_review:blockcast/penstock-llm-proxy-core:691";
 
     await db.insert(companies).values({
       id: companyId,
@@ -492,7 +492,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runningRunId = randomUUID();
-    const taskKey = "pr_review:Blockcast/pim-multicast-gateway:1888";
+    const taskKey = "pr_review:blockcast/pim-multicast-gateway:1888";
 
     await db.insert(companies).values({
       id: companyId,
@@ -619,7 +619,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const scheduledRunId = randomUUID();
-    const taskKey = "pr_review:Blockcast/penstock-vault-node:191";
+    const taskKey = "pr_review:blockcast/penstock-vault-node:191";
 
     await db.insert(companies).values({
       id: companyId,
@@ -725,7 +725,7 @@ describeEmbeddedPostgres("PR-review wake enqueue concurrency", () => {
     const wakeupId = randomUUID();
     const runId = randomUUID();
     const scheduledRunId = randomUUID();
-    const taskKey = "pr_review:Blockcast/penstock-vault-node:190";
+    const taskKey = "pr_review:blockcast/penstock-vault-node:190";
 
     await db.insert(companies).values({
       id: companyId,

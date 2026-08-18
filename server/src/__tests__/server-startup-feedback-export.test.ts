@@ -64,6 +64,13 @@ const {
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    reconcileDetachedQueuedRuns: vi.fn(async () => ({
+      scanned: 0,
+      terminalized: 0,
+      recovered: 0,
+      skipped: 0,
+      failed: 0,
+    })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     reconcileResolvedBlockerDependents: vi.fn(async () => ({ woken: 0, failed: 0 })),
     reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
@@ -170,7 +177,16 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
+// Spread the real module rather than enumerating exports: `@paperclipai/db`'s
+// entry point is pure re-exports (no connection is opened until `createDb` is
+// called), while its table objects are dereferenced at module-evaluation time
+// by services in `startServer`'s import graph (e.g. `issueDocumentSelect` in
+// `services/documents.ts`). An allowlist mock therefore fails at import with
+// `No "<table>" export is defined` the first time that graph grows — which is
+// what BLO-21995 hit by importing `routes/github-webhook.js` here. Only the
+// side-effecting functions below need to stay stubbed.
+vi.mock("@paperclipai/db", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@paperclipai/db")>()),
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
@@ -179,10 +195,6 @@ vi.mock("@paperclipai/db", () => ({
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
-  authUsers: {},
-  companies: {},
-  companyMemberships: {},
-  instanceUserRoles: {},
 }));
 
 vi.mock("../app.js", () => ({
@@ -461,6 +473,21 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
   });
 
+  it("continues startup recovery when the detached-queued-run sweep fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileDetachedQueuedRuns.mockRejectedValueOnce(
+      new Error("detached-queued-run sweep failure"),
+    );
+
+    await startServer();
+
+    expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+  });
+
   it("starts listening while queued-run recovery continues in the background", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
@@ -501,6 +528,7 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
       heartbeatServiceMock.sweepStaleIssueLocks.mockClear();
+      heartbeatServiceMock.reconcileDetachedQueuedRuns.mockClear();
       heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
         new Error("unrelated recovery failure"),
       );
@@ -510,6 +538,7 @@ describe("startServer feedback export wiring", () => {
       await Promise.resolve();
 
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }

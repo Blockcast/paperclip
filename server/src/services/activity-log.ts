@@ -23,6 +23,12 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
+  // A withdrawal is a terminal transition out of `pending` exactly like the three
+  // above, so plugin mirrors must see it or they keep showing the approval as
+  // open forever. There is no dedicated `approval.withdrawn` plugin event; adding
+  // one would break existing subscribers that already treat `approval.decided` as
+  // "this approval left the queue", so it maps onto that.
+  approval_withdrawn: "approval.decided",
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",
@@ -85,6 +91,32 @@ export function publishPluginDomainEvent(event: PluginEvent): void {
     );
 }
 
+/**
+ * Enqueue through the caller's own db handle -- typically an open transaction --
+ * and await it, so the outbox row commits or rolls back with the state change
+ * that produced it.
+ *
+ * `publishPluginDomainEvent` above writes through the module-global `_outboxDb`,
+ * a different connection from any caller transaction. That is fine for the
+ * common non-transactional caller, but inside a transaction it means the event
+ * commits independently: if the transaction then fails, the state change is
+ * undone while plugins have already been told it happened. For a terminal
+ * approval transition that phantom is durable and drives every plugin mirror.
+ *
+ * The tradeoff is deliberate: unlike the fire-and-forget path, a failed insert
+ * here fails the caller's transaction rather than being swallowed. That is the
+ * point -- we would rather refuse the withdrawal than report one that did not
+ * happen.
+ */
+async function enqueuePluginDomainEventAtomically(db: Db, event: PluginEvent): Promise<void> {
+  await db.insert(pluginEventOutbox).values({
+    eventId: event.eventId,
+    companyId: event.companyId,
+    eventType: event.eventType,
+    payload: event as unknown as Record<string, unknown>,
+  });
+}
+
 export interface LogActivityInput {
   companyId: string;
   actorType: "agent" | "user" | "system" | "plugin";
@@ -106,6 +138,16 @@ export interface LogActivityInput {
    * applied; the key-based secret scrubber is not (see logActivity for why).
    */
   pluginEventPayloadExtra?: Record<string, unknown> | null;
+  /**
+   * Enqueue the plugin domain event through the `db` handle passed to
+   * logActivity instead of the module-global outbox connection, and await it.
+   *
+   * Set this when calling logActivity inside a transaction whose rollback must
+   * also retract the plugin event -- otherwise the event commits independently
+   * and survives the rollback. See enqueuePluginDomainEventAtomically for the
+   * failure-semantics tradeoff this accepts.
+   */
+  atomicPluginEvent?: boolean;
 }
 
 function readNonEmptyString(value: unknown) {
@@ -215,6 +257,46 @@ export async function logActivity(
     details: redactedDetails,
   });
 
+  const pluginEventType = eventTypeForActivityAction(input.action);
+  let pluginEvent: PluginEvent | null = null;
+  if (pluginEventType) {
+    // Event-only payload extras: merged into the emitted plugin event but never
+    // written to the activity_log row above. We apply the current-user / PII
+    // redactor but deliberately NOT the key-based secret scrubber
+    // (sanitizeRecord): it false-positives on legitimate field names such as
+    // "authorName" (the "auth" secret-key pattern) and would mangle the faithful
+    // comment body the Linear bridge exists to mirror. Comment-body secret
+    // scrubbing is not applied anywhere else in comment sync, so doing it only
+    // here would be both inconsistent and lossy.
+    const redactedEventExtra = input.pluginEventPayloadExtra
+      ? (redactCurrentUserValue(
+          input.pluginEventPayloadExtra,
+          currentUserRedactionOptions,
+        ) as Record<string, unknown>)
+      : null;
+    pluginEvent = {
+      eventId: randomUUID(),
+      eventType: pluginEventType,
+      occurredAt: new Date().toISOString(),
+      actorId: input.actorId,
+      actorType: input.actorType,
+      entityId: input.entityId,
+      entityType: input.entityType,
+      companyId: input.companyId,
+      payload: {
+        ...redactedDetails,
+        ...(redactedEventExtra ?? {}),
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+        responsibleUserId,
+      },
+    };
+  }
+
+  if (pluginEvent && input.atomicPluginEvent) {
+    await enqueuePluginDomainEventAtomically(db, pluginEvent);
+  }
+
   const publish: ActivityPublish = () => {
     publishLiveEvent({
       companyId: input.companyId,
@@ -232,40 +314,8 @@ export async function logActivity(
       },
     });
 
-    const pluginEventType = eventTypeForActivityAction(input.action);
-    if (pluginEventType) {
-      // Event-only payload extras: merged into the emitted plugin event but never
-      // written to the activity_log row above. We apply the current-user / PII
-      // redactor but deliberately NOT the key-based secret scrubber
-      // (sanitizeRecord): it false-positives on legitimate field names such as
-      // "authorName" (the "auth" secret-key pattern) and would mangle the faithful
-      // comment body the Linear bridge exists to mirror. Comment-body secret
-      // scrubbing is not applied anywhere else in comment sync, so doing it only
-      // here would be both inconsistent and lossy.
-      const redactedEventExtra = input.pluginEventPayloadExtra
-        ? (redactCurrentUserValue(
-            input.pluginEventPayloadExtra,
-            currentUserRedactionOptions,
-          ) as Record<string, unknown>)
-        : null;
-      const event: PluginEvent = {
-        eventId: randomUUID(),
-        eventType: pluginEventType,
-        occurredAt: new Date().toISOString(),
-        actorId: input.actorId,
-        actorType: input.actorType,
-        entityId: input.entityId,
-        entityType: input.entityType,
-        companyId: input.companyId,
-        payload: {
-          ...redactedDetails,
-          ...(redactedEventExtra ?? {}),
-          agentId: input.agentId ?? null,
-          runId: input.runId ?? null,
-          responsibleUserId,
-        },
-      };
-      publishPluginDomainEvent(event);
+    if (pluginEvent && !input.atomicPluginEvent) {
+      publishPluginDomainEvent(pluginEvent);
     }
   };
 

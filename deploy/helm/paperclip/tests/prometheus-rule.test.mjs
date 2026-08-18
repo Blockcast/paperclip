@@ -306,3 +306,251 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     "terminal-failed alert must link the runbook from its annotation",
   );
 });
+
+test("PaperclipQueuedRunStranded is agent-keyed, freshness-gated, and fires before 30m (BLO-21116)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipQueuedRunStranded/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "queued-run-stranded alert must render an expr");
+
+  // Must threshold the per-agent age gauge, not a summed queued-run count
+  // under a long `for:` -- same reasoning as the terminal-failed alert above:
+  // a `for:` clause measures how long the EXPRESSION has stayed true, and a
+  // summed count across agents lets one agent's strand clearing exactly as
+  // another's appears keep the expression permanently true while any one row
+  // is young.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_queued_run_oldest_age_seconds and on\(instance\) \(paperclip_queued_run_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "queued-run-stranded alert must gate each replica's age before taking the per-agent max",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh
+  // (see setQueuedRunOldestAgeMetrics), so a strictly positive threshold is
+  // the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // `for:` is scrape-flap tolerance only -- the ageing lives in the threshold
+  // above. It must stay short so it does not stack on top of the age
+  // threshold and delay the page well past the AC's ~30m intent.
+  assert.ok(forWindow, "queued-run-stranded alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
+  );
+
+  // BLO-21116's own AC is "firing before the age exceeds ~30m" -- the FIRST
+  // real-clock moment the alert can fire, which is threshold + for, not the
+  // threshold in isolation. Checking each independently is exactly the gap
+  // Ally's review caught here: a bare threshold of 1800s (30m) with this
+  // same 5m `for:` does not fire until 2100s (35m) of real age, past the AC,
+  // even though 1800 alone looks compliant and 5m alone looks short.
+  assert.ok(
+    Number(ageThreshold) + forMinutes * 60 <= 1800,
+    `age threshold ${ageThreshold}s plus for-window ${forWindow} stacks to `
+      + `${Number(ageThreshold) + forMinutes * 60}s, past the 1800s (30m) BLO-21116 AC`,
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunStranded[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
+    "queued-run-stranded alert must link the runbook from its annotation",
+  );
+});
+
+test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_queued_run_age_metrics_refresh_success == 0\n/,
+    "a failed queued-run-age refresh must have its own alert",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
+    "the freshness failure alert must route responders to the queued-run runbook",
+  );
+});
+
+test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
+  // BLO-23413: this alert was verified structurally unable to fire on the
+  // live cluster (kube-state-metrics only ever emits ONE post-failure
+  // sample per ac-* Job before the object is deleted, so rate()/increase()
+  // -- which need >=2 samples -- can never compute a value). It must stay
+  // deleted; a permanently-inert rule is worse than none because its
+  // presence implies coverage that does not exist.
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+  assert.doesNotMatch(
+    rendered,
+    /alert: PaperclipAgentJobBackoffLimitExceeded/,
+    "PaperclipAgentJobBackoffLimitExceeded must not be re-added without a fresh live-series proof (BLO-23413)",
+  );
+});
+
+test("PaperclipAgentHeartbeatStale is an outcome-side per-agent-interval alert (BLO-23413)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(rendered, /alert: PaperclipAgentHeartbeatStale/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipAgentHeartbeatStale[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "heartbeat-stale alert must render an expr");
+
+  // Must threshold as a MULTIPLE of the agent's OWN configured interval via
+  // an `on (agent_id)` join, not one fleet-wide constant -- a fleet runs
+  // agents with different heartbeat.intervalSec, and a constant threshold
+  // would be wrong for every agent not on the modal interval.
+  //
+  // BLO-23413 review fix: the multiplier must sit INSIDE the parenthesised
+  // right-hand operand, and both sides must be pre-aggregated with
+  // `max by (agent_id)`. The original form
+  //   age > N * on (agent_id) interval
+  // bound the matching modifier to the `*` (scalar left operand) and failed
+  // to parse; and even with the parens fixed, the un-aggregated form is a
+  // many-to-many match because every control-plane pod exports its own copy
+  // of these gauges. Both were reproduced against live Prometheus (HTTP 400
+  // and HTTP 422 respectively). See the template comment for the full proof.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_agent_heartbeat_age_seconds\) > on \(agent_id\) \(\d+ \* max by \(agent_id\) \(paperclip_agent_heartbeat_interval_seconds\)\)$/,
+    "heartbeat-stale alert must threshold max-by-agent age against max-by-agent interval*multiplier, joined 1:1 on agent_id",
+  );
+
+  const [, multiplier] = expr.match(/\((\d+) \* max by/) ?? [];
+  assert.ok(
+    Number(multiplier) >= 3,
+    `heartbeat-stale multiplier ${multiplier} must be at least 3x per the BLO-23413 AC`,
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipAgentHeartbeatStale[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(forWindow, "heartbeat-stale alert must render a for window");
+});
+
+// BLO-23413. The bug this guards against shipped once and the existing
+// per-alert test did not catch it -- worse, that test pinned the broken string
+// as if it were correct, so the regex was actively enforcing the defect.
+//
+// PromQL permits a vector-matching modifier (`on (...)` / `ignoring (...)`)
+// only BETWEEN TWO INSTANT VECTORS. Writing `age > 3 * on (agent_id) interval`
+// binds the modifier to the `*`, whose left operand is the scalar `3`, and the
+// whole rule then fails to parse -- Prometheus returns a query error and the
+// alert can never fire. That is the same silently-inert-rule class this file
+// deleted PaperclipAgentJobBackoffLimitExceeded for, so re-introducing one
+// would be a straight regression of the issue's own premise.
+//
+// SCOPE, stated honestly: this is a targeted structural guard for that one
+// defect class, NOT a PromQL parser. Full parse+evaluation validation needs
+// `promtool check rules` / `promtool test rules`, which requires a promtool
+// binary this job does not install, and which belongs with the copies that
+// actually render live (Blockcast/onprem-k8s) rather than with this chart copy
+// -- the file header notes prometheusRule.enabled=false for Blockcast values,
+// so nothing here reaches a live Prometheus. This guard is cheap, hermetic and
+// catches the specific mistake that was made; it is not a substitute for
+// promtool, and should not be described as one.
+test("no rendered alert applies a vector-matching modifier to a scalar operand (BLO-23413)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const exprs = [...rendered.matchAll(/^\s+expr:\s*(.+?)\s*$/gm)].map(
+    ([, expr]) => expr,
+  );
+  assert.ok(
+    exprs.length > 0,
+    "expected the PrometheusRule to render at least one expr to check",
+  );
+
+  // Match `<operand> <binop> on|ignoring (`; flag it when <operand> is a bare
+  // numeric literal. `metric > on (...)` and `) > on (...)` are both fine.
+  const modifierJoin =
+    /([A-Za-z_:][A-Za-z0-9_:]*|\d+(?:\.\d+)?|\))\s*(\*|\/|%|\^|\+|-|==|!=|>=|<=|>|<)\s*(on|ignoring)\s*\(/g;
+
+  const offenders = [];
+  for (const expr of exprs) {
+    for (const [, lhs, op, mod] of expr.matchAll(modifierJoin)) {
+      if (/^\d/.test(lhs)) {
+        offenders.push(`${expr}\n    (scalar '${lhs}' ${op} ${mod} (...))`);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `vector-matching modifier applied to a scalar operand -- this rule cannot ` +
+      `parse and will never fire. Put the scalar inside the parenthesised ` +
+      `vector operand instead, e.g. 'a > on (l) (3 * b)' not ` +
+      `'a > 3 * on (l) b':\n  ${offenders.join("\n  ")}`,
+  );
+});
+
+// BLO-23413. Second defect found in review of the same alert: fixing the parse
+// error alone is NOT sufficient. These agent gauges are published from the
+// reconcileFailedWakeDispatches pass, and EVERY control-plane pod running that
+// pass exports its own copy -- measured live, the sibling metric from the same
+// pass (paperclip_agent_wakeup_terminal_failed_unresolved) is present on 3 pods
+// x 16 agents = 48 series. With 3 series per agent_id on each side, a bare
+// `on (agent_id)` join is many-to-many and errors at RUNTIME with HTTP 422
+// "found duplicate series for the match group" -- reproduced directly against
+// that metric. Pre-aggregating each side with `max by (agent_id)` collapses it
+// to a 1:1 join, yields exactly one alert per dark agent instead of one per
+// replica, and keeps alert identity stable across pod restarts.
+test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-23413)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const exprs = [...rendered.matchAll(/^\s+expr:\s*(.+?)\s*$/gm)].map(
+    ([, expr]) => expr,
+  );
+
+  const unaggregated = exprs.filter((expr) => {
+    if (!/\bon\s*\(\s*agent_id\s*\)/.test(expr)) return false;
+    // Every bare selector of a per-agent control-plane gauge must be wrapped in
+    // an aggregation that collapses the instance/pod dimension.
+    const bareSelectors = [
+      ...expr.matchAll(/(^|[^)\w])(paperclip_agent_[a-z0-9_]+)/g),
+    ].map(([, , name]) => name);
+    return bareSelectors.some(
+      (name) =>
+        !new RegExp(
+          `(max|min|avg|sum|count)\\s+by\\s*\\(\\s*agent_id\\s*\\)\\s*\\(\\s*${name}\\s*\\)`,
+        ).test(expr),
+    );
+  });
+
+  assert.deepEqual(
+    unaggregated,
+    [],
+    `an alert joins on agent_id without collapsing the per-pod dimension. ` +
+      `Every control-plane replica exports its own copy of these gauges, so a ` +
+      `bare 'on (agent_id)' join is many-to-many and fails at evaluation time ` +
+      `with "found duplicate series for the match group". Wrap each side in ` +
+      `'max by (agent_id) (...)':\n  ${unaggregated.join("\n  ")}`,
+  );
+});
+

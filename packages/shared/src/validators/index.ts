@@ -552,14 +552,18 @@ export {
 
 export {
   createApprovalSchema,
+  listApprovalsQuerySchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
+  type ListApprovalsQuery,
   type ResolveApproval,
   type RequestApprovalRevision,
   type ResubmitApproval,
+  type WithdrawApproval,
   type AddApprovalComment,
 } from "./approval.js";
 

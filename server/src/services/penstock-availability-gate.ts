@@ -26,9 +26,16 @@ export interface PenstockAvailabilityGateAllowResult {
   allow: true;
 }
 
+/**
+ * Penstock-side provider identity. Distinct from the ccrotate target
+ * ("claude" | "codex", see `ccrotate-target.ts`) because penstock names the
+ * Anthropic pool `anthropic` while ccrotate names it `claude`.
+ */
+export type PenstockProvider = "anthropic" | "codex";
+
 export interface PenstockAvailabilityGateDenyResult {
   allow: false;
-  provider: "anthropic";
+  provider: PenstockProvider;
   reason: "penstock.model_capacity_unavailable" | "penstock.model_temporarily_unavailable";
   model: string;
   resumeAt: Date | null;
@@ -49,9 +56,15 @@ interface CacheEntry {
   result: PenstockAvailabilityGateResult;
 }
 
-interface ResolvedPenstockAnthropicCheck {
+interface ResolvedPenstockCheck {
   capacityUrl: URL;
-  messagesUrl: URL;
+  /**
+   * Secondary probe URL, used only when the capacity readback is
+   * inconclusive. Anthropic-shaped (`/v1/messages`); `null` for providers
+   * with no probe implementation, which then fail open exactly as they did
+   * before this gate covered them.
+   */
+  messagesUrl: URL | null;
   token: string;
   model: string;
 }
@@ -75,20 +88,22 @@ export function createPenstockAvailabilityGate(
 
   return {
     async checkAdapter(input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult> {
-      if (input.adapterType !== "claude_k8s") return { allow: true };
+      const provider = mapAdapterToPenstockProvider(input.adapterType);
+      if (!provider) return { allow: true };
 
-      const resolved = resolvePenstockAnthropicCheck(input);
+      const resolved = resolvePenstockCheck(input, provider);
       if (!resolved) return { allow: true };
 
       const nowMs = input.now.getTime();
-      const key = `${resolved.capacityUrl.origin}${resolved.capacityUrl.pathname}::anthropic::${resolved.model}`;
+      const key = `${resolved.capacityUrl.origin}${resolved.capacityUrl.pathname}::${provider}::${resolved.model}`;
       const cached = cache.get(key);
       if (cached && nowMs - cached.fetchedAt < cacheTtlMs) {
         return cached.result;
       }
 
-      const readback = await readPenstockAnthropicCapacity({
+      const readback = await readPenstockCapacity({
         fetchImpl,
+        provider,
         url: resolved.capacityUrl,
         token: resolved.token,
         model: resolved.model,
@@ -100,17 +115,21 @@ export function createPenstockAvailabilityGate(
       });
       const result =
         readback ??
-        (await probePenstockAnthropicModel({
-          fetchImpl,
-          url: resolved.messagesUrl,
-          token: resolved.token,
-          model: resolved.model,
-          agentId: input.agentId,
-          timeoutMs,
-          defaultRetryDelayMs,
-          now: nowFn,
-          log: opts.log,
-        }));
+        (resolved.messagesUrl
+          ? await probePenstockAnthropicModel({
+              fetchImpl,
+              url: resolved.messagesUrl,
+              token: resolved.token,
+              model: resolved.model,
+              agentId: input.agentId,
+              timeoutMs,
+              defaultRetryDelayMs,
+              now: nowFn,
+              log: opts.log,
+            })
+          : // No secondary probe for this provider: fail open, which is the
+            // pre-existing behaviour for any adapter this gate did not cover.
+            ({ allow: true } as PenstockAvailabilityGateResult));
       cache.set(key, { fetchedAt: nowMs, result });
       return result;
     },
@@ -120,22 +139,51 @@ export function createPenstockAvailabilityGate(
   };
 }
 
-function resolvePenstockAnthropicCheck(
+/**
+ * Adapter → penstock provider. Only the k8s adapters are mapped: this gate
+ * exists to defer k8s *dispatch*, and the `*_local` adapters do not dispatch
+ * through it. Returning `null` means "not covered by this gate" and results
+ * in an unconditional allow.
+ */
+export function mapAdapterToPenstockProvider(adapterType: string): PenstockProvider | null {
+  if (adapterType === "claude_k8s") return "anthropic";
+  if (adapterType === "opencode_k8s") return "codex";
+  return null;
+}
+
+/**
+ * Env var names per provider. Both are read from the agent's `adapterConfig.env`
+ * first and `process.env` second, exactly as before.
+ */
+const PROVIDER_ENV: Record<PenstockProvider, { baseUrl: string; tokens: readonly string[] }> = {
+  anthropic: {
+    baseUrl: "ANTHROPIC_BASE_URL",
+    tokens: ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+  },
+  codex: {
+    baseUrl: "OPENAI_BASE_URL",
+    tokens: ["OPENAI_AUTH_TOKEN", "OPENAI_API_KEY"],
+  },
+};
+
+function resolvePenstockCheck(
   input: PenstockAvailabilityGateCheckInput,
-): ResolvedPenstockAnthropicCheck | null {
+  provider: PenstockProvider,
+): ResolvedPenstockCheck | null {
   const adapterConfig = asRecord(input.adapterConfig);
   const envConfig = asRecord(adapterConfig?.env);
   const env = input.env ?? process.env;
+  const names = PROVIDER_ENV[provider];
+
   const baseUrl =
-    readConfigEnvString(envConfig, "ANTHROPIC_BASE_URL") ??
-    readProcessEnvString(env, "ANTHROPIC_BASE_URL");
+    readConfigEnvString(envConfig, names.baseUrl) ?? readProcessEnvString(env, names.baseUrl);
   if (!baseUrl || !isPenstockBaseUrl(baseUrl)) return null;
 
-  const token =
-    readConfigEnvString(envConfig, "ANTHROPIC_AUTH_TOKEN") ??
-    readConfigEnvString(envConfig, "ANTHROPIC_API_KEY") ??
-    readProcessEnvString(env, "ANTHROPIC_AUTH_TOKEN") ??
-    readProcessEnvString(env, "ANTHROPIC_API_KEY");
+  let token: string | null = null;
+  for (const name of names.tokens) {
+    token = readConfigEnvString(envConfig, name) ?? readProcessEnvString(env, name);
+    if (token) break;
+  }
   if (!token || token === "[redacted]") return null;
 
   const model = readNonEmptyString(adapterConfig?.model);
@@ -143,8 +191,10 @@ function resolvePenstockAnthropicCheck(
 
   try {
     return {
-      capacityUrl: buildCapacityUrl(baseUrl, model),
-      messagesUrl: buildMessagesUrl(baseUrl),
+      capacityUrl: buildCapacityUrl(baseUrl, model, provider),
+      // The secondary probe is an Anthropic Messages call; there is no codex
+      // equivalent implemented, so codex relies on the capacity readback alone.
+      messagesUrl: provider === "anthropic" ? buildMessagesUrl(baseUrl) : null,
       token,
       model,
     };
@@ -168,18 +218,19 @@ function buildMessagesUrl(baseUrl: string): URL {
   return new URL(`${trimmed}/v1/messages`);
 }
 
-function buildCapacityUrl(baseUrl: string, model: string): URL {
+function buildCapacityUrl(baseUrl: string, model: string, provider: PenstockProvider): URL {
   const url = new URL(baseUrl);
   url.pathname = "/v1/pools/default/capacity";
   url.search = "";
-  url.searchParams.set("provider", "anthropic");
+  url.searchParams.set("provider", provider);
   url.searchParams.set("model", model);
   url.hash = "";
   return url;
 }
 
-async function readPenstockAnthropicCapacity(input: {
+async function readPenstockCapacity(input: {
   fetchImpl: typeof fetch;
+  provider: PenstockProvider;
   url: URL;
   token: string;
   model: string;
@@ -237,7 +288,7 @@ async function readPenstockAnthropicCapacity(input: {
     const retry = capacityRetryFromBody(body, input.defaultRetryDelayMs, now);
     const result: PenstockAvailabilityGateDenyResult = {
       allow: false,
-      provider: "anthropic",
+      provider: input.provider,
       reason: "penstock.model_capacity_unavailable",
       model: input.model,
       resumeAt: retry.resumeAt,
@@ -273,6 +324,7 @@ async function readPenstockAnthropicCapacity(input: {
 
 function capacityEndpointUnavailable(
   input: {
+    provider: PenstockProvider;
     model: string;
     defaultRetryDelayMs: number;
     now: () => Date;
@@ -287,7 +339,7 @@ function capacityEndpointUnavailable(
   const retry = defaultCapacityRetry(input.defaultRetryDelayMs, input.now());
   const result: PenstockAvailabilityGateDenyResult = {
     allow: false,
-    provider: "anthropic",
+    provider: input.provider,
     reason:
       status === 429
         ? "penstock.model_capacity_unavailable"
@@ -312,6 +364,12 @@ function capacityEndpointUnavailable(
   return result;
 }
 
+/**
+ * Anthropic-only secondary probe (Messages API shape, `anthropic-version`
+ * header). Reachable only when `ResolvedPenstockCheck.messagesUrl` is non-null,
+ * which `resolvePenstockCheck` sets for `anthropic` alone — hence the
+ * hardcoded provider in its deny result.
+ */
 async function probePenstockAnthropicModel(input: {
   fetchImpl: typeof fetch;
   url: URL;

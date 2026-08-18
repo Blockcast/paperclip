@@ -2,11 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lt, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
   agents,
+  createDbFromPostgresClient,
   documents,
   executionWorkspaces,
   heartbeatRuns,
@@ -50,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -62,6 +64,7 @@ import {
   updateIssueSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
+  isAgentStatusInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompactIssue,
@@ -90,6 +93,10 @@ import {
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
 } from "@paperclipai/shared";
+import {
+  findIssueDuplicateCandidates,
+  type IssueDuplicateDocument,
+} from "@paperclipai/shared/issue-duplicate-matcher";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
@@ -110,6 +117,7 @@ import {
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
+  OPEN_ISSUE_STATUSES,
   issueReferenceService,
   issueService,
   type IssueFilters,
@@ -123,7 +131,10 @@ import {
   workProductService,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
-import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
+import {
+  hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
+} from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -164,7 +175,12 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
 } from "../services/issues.js";
-import { authorizationBoundaryLabel, authorizationDeniedDetails } from "../services/authorization.js";
+import {
+  authorizationBoundaryLabel,
+  authorizationDeniedDetails,
+  commentAuthorCanGrantIssueMention,
+  getActiveCompanyMembership,
+} from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -174,12 +190,13 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  type IssueMonitorConvergence,
 } from "../services/issue-execution-policy.js";
-import type { IssueMonitorConvergence } from "../services/issue-execution-policy.js";
 import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
 import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -197,6 +214,268 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP = 1_000;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS = 500;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS = 1_000;
+export const ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS = 1_000;
+
+type CreateIssueDuplicateCandidate = {
+  identifier: string;
+  title: string;
+  score: number;
+};
+
+type CreateIssueDuplicateCandidateRow = IssueDuplicateDocument & {
+  companyId: string;
+  projectId: string | null;
+  parentId: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  createdByAgentId: string | null;
+  status: string;
+  originKind: string | null;
+  originId: string | null;
+  createdAt: Date;
+};
+
+type CreateIssueDuplicateCandidateCorpusFilter = (
+  rows: CreateIssueDuplicateCandidateRow[],
+  signal?: AbortSignal,
+  scopedDb?: Db,
+) => Promise<CreateIssueDuplicateCandidateRow[]>;
+
+type CreateIssueDuplicateCandidatePage = {
+  corpus: Array<CreateIssueDuplicateCandidateRow & { createdAtMicros: string }>;
+  readable: CreateIssueDuplicateCandidateRow[];
+};
+
+export function raceCreateIssueDuplicateCandidateLookup<T>(
+  promise: Promise<T>,
+  timeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
+  onTimeout?: () => void,
+  operation = "issue duplicate candidate lookup",
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(
+      () => {
+        onTimeout?.();
+        reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+      },
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+export async function findCreateIssueDuplicateCandidates(
+  db: Db,
+  companyId: string,
+  subject: IssueDuplicateDocument,
+  filterCorpus?: CreateIssueDuplicateCandidateCorpusFilter,
+  signal?: AbortSignal,
+  statementTimeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
+): Promise<CreateIssueDuplicateCandidate[]> {
+  const cutoff = new Date(
+    Date.now() - ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS * 24 * 60 * 60 * 1_000,
+  );
+  const visibleCorpus: CreateIssueDuplicateCandidateRow[] = [];
+  let scannedRows = 0;
+  let cursor: { createdAtMicros: string; id: string } | null = null;
+  const createdAtMicros = sql<string>`(
+    extract(epoch from ${issueRows.createdAt}) * 1000000
+  )::numeric(20, 0)`;
+  do {
+    signal?.throwIfAborted();
+    const cursorCondition: SQL | undefined = cursor
+      ? or(
+          lt(createdAtMicros, cursor.createdAtMicros),
+          and(eq(createdAtMicros, cursor.createdAtMicros), lt(issueRows.id, cursor.id)),
+        )
+      : undefined;
+    const page: CreateIssueDuplicateCandidatePage = await db.transaction(async (tx) => {
+      await tx.execute(sql`select set_config('statement_timeout', ${String(statementTimeoutMs)}, true)`);
+      const corpus: CreateIssueDuplicateCandidatePage["corpus"] = await tx
+        .select({
+          id: issueRows.id,
+          identifier: issueRows.identifier,
+          title: issueRows.title,
+          description: issueRows.description,
+          companyId: issueRows.companyId,
+          projectId: issueRows.projectId,
+          parentId: issueRows.parentId,
+          assigneeAgentId: issueRows.assigneeAgentId,
+          assigneeUserId: issueRows.assigneeUserId,
+          createdByAgentId: issueRows.createdByAgentId,
+          status: issueRows.status,
+          originKind: issueRows.originKind,
+          originId: issueRows.originId,
+          createdAt: issueRows.createdAt,
+          createdAtMicros,
+        })
+        .from(issueRows)
+        .where(and(
+          eq(issueRows.companyId, companyId),
+          isNull(issueRows.hiddenAt),
+          gte(issueRows.createdAt, cutoff),
+          notInArray(issueRows.id, [subject.id]),
+          cursorCondition,
+        ))
+        .orderBy(desc(issueRows.createdAt), desc(issueRows.id))
+        .limit(Math.min(
+          ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
+          ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP - scannedRows,
+        ));
+      signal?.throwIfAborted();
+      const readable = filterCorpus
+        ? await filterCorpus(corpus, signal, tx as unknown as Db)
+        : corpus;
+      return { corpus, readable };
+    });
+    signal?.throwIfAborted();
+    visibleCorpus.push(...page.readable);
+    scannedRows += page.corpus.length;
+    const lastRow = page.corpus.at(-1);
+    cursor = lastRow ? { createdAtMicros: lastRow.createdAtMicros, id: lastRow.id } : null;
+    if (!filterCorpus || page.corpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP) break;
+  } while (
+    visibleCorpus.length < ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP
+    && scannedRows < ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP
+  );
+
+  return findIssueDuplicateCandidates(
+    subject,
+    visibleCorpus.slice(0, ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP),
+  ).candidates.map((candidate) => ({
+    identifier: candidate.identifier ?? candidate.id,
+    title: candidate.title,
+    score: candidate.score,
+  }));
+}
+
+type ReservedPostgresSql = {
+  begin?: (fn: (sql: ReservedPostgresSql) => unknown) => Promise<unknown>;
+  release: () => void;
+  options?: unknown;
+  unsafe: (query: string) => PromiseLike<unknown>;
+};
+
+type ReservablePostgresClient = {
+  options: unknown;
+  reserve: () => Promise<ReservedPostgresSql>;
+};
+
+function getReservablePostgresClient(db: Db): ReservablePostgresClient | null {
+  const client = (db as Db & { $client?: Partial<ReservablePostgresClient> }).$client;
+  return typeof client?.reserve === "function" ? client as ReservablePostgresClient : null;
+}
+
+async function withReservedCreateIssueAdvisoryDb<T>(
+  db: Db,
+  timeoutMs: number,
+  operation: string,
+  fn: (db: Db) => Promise<T>,
+): Promise<T> {
+  const client = getReservablePostgresClient(db);
+  if (!client) return db.transaction((tx) => fn(tx as unknown as Db));
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const reservePromise = client.reserve();
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const reserved = await Promise.race([reservePromise, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+
+  if (!reserved) {
+    void reservePromise
+      .then((lateReserved) => lateReserved.release())
+      .catch((err) => {
+        logger.warn({ err }, `${operation} database connection reservation failed after timeout`);
+      });
+    throw new Error(`${operation} skipped because no database connection was available within ${timeoutMs}ms`);
+  }
+
+  try {
+    // postgres.js reserve() omits runtime options and begin() despite ReservedSql extending Sql.
+    reserved.options = client.options;
+    reserved.begin = async (transaction) => transaction(reserved);
+    const reservedDb = createDbFromPostgresClient(
+      reserved as unknown as Parameters<typeof createDbFromPostgresClient>[0],
+    );
+    await reserved.unsafe("BEGIN");
+    try {
+      const result = await fn(reservedDb);
+      await reserved.unsafe("COMMIT");
+      return result;
+    } catch (err) {
+      await reserved.unsafe("ROLLBACK");
+      throw err;
+    }
+  } finally {
+    reserved.release();
+  }
+}
+
+function scheduleDuplicateCandidateShownActivity(input: {
+  db: Db;
+  res: Response;
+  opts: {
+    createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateActivityTimeoutMs?: number;
+  };
+  companyId: string;
+  issue: { id: string; identifier: string | null };
+  actor: ReturnType<typeof getActorInfo>;
+  duplicateCandidates: CreateIssueDuplicateCandidate[];
+}) {
+  if (input.duplicateCandidates.length === 0) return;
+
+  input.res.once("finish", () => {
+    if (input.res.statusCode < 200 || input.res.statusCode >= 300) return;
+    const timeoutMs = input.opts.createIssueDuplicateCandidateActivityTimeoutMs
+      ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS;
+    void raceCreateIssueDuplicateCandidateLookup(
+      withReservedCreateIssueAdvisoryDb(
+        input.db,
+        timeoutMs,
+        "issue duplicate candidate consumption event",
+        async (advisoryDb) => {
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(timeoutMs)}, true)`);
+          await (input.opts.createIssueDuplicateCandidateActivityWriter ?? logActivity)(advisoryDb, {
+            companyId: input.companyId,
+            actorType: input.actor.actorType,
+            actorId: input.actor.actorId,
+            agentId: input.actor.agentId,
+            runId: input.actor.runId,
+            agentApiKeyId: input.actor.agentApiKeyId,
+            action: "issue.duplicate_candidates_shown",
+            entityType: "company",
+            entityId: input.companyId,
+            details: {
+              identifier: input.issue.identifier,
+              duplicateCandidates: input.duplicateCandidates.map(({ identifier, score }) => ({ identifier, score })),
+            },
+          });
+        },
+      ),
+      timeoutMs,
+      undefined,
+      "issue duplicate candidate consumption event",
+    ).catch((err) => {
+      logger.warn(
+        { err, companyId: input.companyId, issueId: input.issue.id, issueIdentifier: input.issue.identifier },
+        "issue duplicate candidate consumption event failed; continuing successful create",
+      );
+    });
+  });
+}
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -784,7 +1063,7 @@ async function listSuccessfulRunHandoffStates(
   db: Db,
   companyId: string,
   issueIds: string[],
-  options?: { hydrateLiveness?: boolean },
+  options?: { hydrateLiveness?: boolean; foldTerminal?: boolean },
 ): Promise<Map<string, SuccessfulRunHandoffState>> {
   if (issueIds.length === 0) return new Map();
   const rows = await db
@@ -810,6 +1089,13 @@ async function listSuccessfulRunHandoffStates(
     if (states.has(row.entityId)) continue;
     const state = successfulRunHandoffStateFromActivity(row);
     if (state) states.set(row.entityId, state);
+  }
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Callers that use this map to
+  // decide whether to WRITE the resolution activity row must opt out — folding
+  // first would make the pending handoff invisible and swallow the audit event.
+  if (options?.foldTerminal !== false) {
+    await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
   }
   return options?.hydrateLiveness === false
     ? states
@@ -1725,6 +2011,13 @@ async function assertCanManageIssueMonitor(
     executionRunId?: string | null;
   },
   monitorChanged: boolean,
+  options: {
+    // Set only by `PATCH /issues/:id`, and only once
+    // `assertAgentIssueMutationAllowed` has already allowed this mutation via
+    // `allow_productivity_review_grant` (BLO-19723). See the call site.
+    productivityReviewOwnerAuthorized?: boolean;
+    managerMonitorRearmAuthorized?: boolean;
+  } = {},
 ) {
   if (!monitorChanged) return;
   if (req.actor.type === "board") return;
@@ -1738,7 +2031,47 @@ async function assertCanManageIssueMonitor(
   }
   if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === issue.assigneeAgentId) return;
   if (req.actor.type === "agent" && req.actor.agentId && isCurrentIssueExecutionRun(req, issue)) return;
-  throw forbidden("Only the assignee agent or a board user can manage issue monitors");
+  // BLO-19723: this guard is a *second* gate, independent of the authorization
+  // boundary. #853 (BLO-19094) taught `authorization.ts` that an open
+  // productivity review grants its owner `issue:mutate` on the source issue,
+  // but this check never consults grants — it tests the assignee relation
+  // directly. So a reviewer cleared the boundary and then bounced off here,
+  // and re-arming a wedged monitor is the single remedy that actually resumes
+  // stalled work. Observed live on 2026-08-01 (BLO-20426): after #853 shipped,
+  // the denial changed from `deny_missing_grant` to this guard's message,
+  // which is what localized the residual gap to this function.
+  //
+  // Deliberately narrow, mirroring #853:
+  //   * opt-in per route — only `PATCH /issues/:id` passes the flag, so
+  //     monitor writes folded into issue *creation*
+  //     (`POST /companies/:companyId/issues`, `POST /issues/:id/children`,
+  //     `POST /issues/:id/accepted-plan-decompositions`) and the forced wake
+  //     `POST /issues/:id/monitor/check-now` stay closed to a reviewer.
+  //   * derived, not re-queried — the caller may only set this after
+  //     `assertAgentIssueMutationAllowed` returned `allow_productivity_review_grant`,
+  //     so the grant predicate (open review, agent-scoped, relation-scoped,
+  //     server-stamped `originId`) stays in exactly one place.
+  //   * still behind `runtime:manage` above — the review grant substitutes for
+  //     the assignee *relation*, not for the runtime capability.
+  if (options.productivityReviewOwnerAuthorized) return;
+  if (options.managerMonitorRearmAuthorized) return;
+  throw forbidden(
+    "Only the assignee agent or a board user can manage issue monitors",
+    {
+      issueAssigneeAgentId: issue.assigneeAgentId ?? null,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+      // AC #2 (BLO-19723): say which relations satisfy this gate rather than
+      // returning a bare 403, so a reviewer that lands here knows the review
+      // grant is honoured on `PATCH /issues/:id` and nowhere else.
+      allowedRelations: [
+        "board user",
+        "the issue's assignee agent",
+        "the agent holding the issue's current execution run",
+        "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
+        "a manager in the assignee's reporting chain re-arming a triggered monitor (PATCH /issues/:id only)",
+      ],
+    },
+  );
 }
 
 function isCurrentIssueExecutionRun(
@@ -1748,7 +2081,47 @@ function isCurrentIssueExecutionRun(
   if (req.actor.type !== "agent") return false;
   const runId = req.actor.runId;
   if (!runId) return false;
-  return issue.checkoutRunId === runId || issue.executionRunId === runId;
+  const ownsCheckout = issue.checkoutRunId === runId;
+  const ownsExecution = issue.executionRunId === runId;
+  return (
+    (ownsCheckout || ownsExecution) &&
+    (issue.checkoutRunId == null || ownsCheckout) &&
+    (issue.executionRunId == null || ownsExecution)
+  );
+}
+
+// BLO-22666 / BLO-18858: a pending `in_review` stage that is live-locked belongs
+// to exactly one run. Reports the *second run of the issue's own assignee* — the
+// only actor that both (a) clears every ordinary authorization boundary and (b)
+// has no business mutating or deciding the stage the lock holder is sitting on.
+//
+// Deliberately narrow, and the narrowness is the point: by the time callers reach
+// this, the actor may legitimately be a mention-granted peer reviewer, a
+// manager-chain actor, a recovery owner, a human, or a `currentParticipant` that
+// has drifted off `assigneeAgentId`. None of those hold the checkout and all of
+// them are supposed to be able to approve, so the `assigneeAgentId === actor`
+// term must stay. Widening past it re-breaks the approval-by-comment path this
+// issue exists to protect.
+function isForeignRunOfLockedPendingReview(
+  req: Request,
+  issue: {
+    status: string;
+    assigneeAgentId?: string | null;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+    executionState?: unknown;
+  },
+) {
+  if (req.actor.type !== "agent") return false;
+  const actorAgentId = req.actor.agentId;
+  if (!actorAgentId) return false;
+  if (issue.status !== "in_review") return false;
+  if (issue.assigneeAgentId !== actorAgentId) return false;
+  // An unlocked row is exactly what BLO-22666's checkout half made claimable;
+  // fencing it here would re-close the door #1117 opened.
+  if (issue.checkoutRunId == null && issue.executionRunId == null) return false;
+  if (parseIssueExecutionState(issue.executionState)?.status !== "pending") return false;
+  return !isCurrentIssueExecutionRun(req, issue);
 }
 
 function summarizeIssueMonitor(
@@ -2487,6 +2860,10 @@ function setIssueListResponseCacheEntry(key: string, entry: IssueListCacheEntry)
   trimIssueListResponseCache();
 }
 
+export function __setIssueListResponseCacheEntryForTests(key: string, entry: IssueListCacheEntry) {
+  setIssueListResponseCacheEntry(key, entry);
+}
+
 function decrementIssueListActorClientInflight(actorClientKey: string) {
   const next = (issueListActorClientInflight.get(actorClientKey) ?? 1) - 1;
   if (next <= 0) issueListActorClientInflight.delete(actorClientKey);
@@ -2659,6 +3036,17 @@ export function issueRoutes(
       actionRequestId: string;
       actor: { agentId?: string | null; userId?: string | null };
     }) => Promise<unknown>;
+    createIssueDuplicateCandidateLookup?: typeof findCreateIssueDuplicateCandidates;
+    createIssueDuplicateCandidateTimeoutMs?: number;
+    createIssueDuplicateCandidateCompanyScopeReader?: (
+      scopedDb: Db,
+      req: Request,
+      companyId: string,
+    ) => Promise<boolean>;
+    createIssueDuplicateCandidateActivityWriter?: typeof logActivity;
+    createIssueDuplicateCandidateActivityTimeoutMs?: number;
+    createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
+    createIssueBeforeResponseHook?: () => Promise<void>;
   } = {},
 ) {
   const router = Router();
@@ -3213,6 +3601,16 @@ export function issueRoutes(
 
     if (issue.assigneeUserId && issue.status !== "done" && issue.status !== "cancelled") {
       return "Recovery action became stale because the source issue now has a human owner.";
+    }
+
+    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
+    // deliberately not dispatchable, so an action left active there names an owner wake that
+    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
+    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
+    // backstop sweep folds rows that were parked before this branch existed, or parked by a
+    // path that never reaches this classifier.
+    if (issue.status === "backlog") {
+      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
     }
 
     if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
@@ -4562,13 +4960,53 @@ export function issueRoutes(
     return action.ownerAgentId === issue.assigneeAgentId;
   }
 
-  async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
-    const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
-    return rows.filter((_, index) => decisions[index]?.allowed);
+  async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(
+    req: Request,
+    rows: T[],
+    signal?: AbortSignal,
+    scopedDb?: Db,
+  ) {
+    if (!signal && !scopedDb) {
+      const decisions = await Promise.all(rows.map((issue) => decideIssueAccess(req, issue, "issue:read")));
+      return rows.filter((_, index) => decisions[index]?.allowed);
+    }
+    const scopedAccess = scopedDb ? accessService(scopedDb) : access;
+    const readable: T[] = [];
+    for (const issue of rows) {
+      signal?.throwIfAborted();
+      const decision = await scopedAccess.decide({
+        actor: req.actor,
+        action: "issue:read",
+        resource: {
+          type: "issue",
+          companyId: issue.companyId,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          createdByAgentId: issue.createdByAgentId ?? null,
+          status: issue.status,
+          originKind: issue.originKind,
+          originId: issue.originId ?? null,
+        },
+        scope: {
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          originKind: issue.originKind ?? null,
+          originId: issue.originId ?? null,
+        },
+      });
+      if (decision.allowed) readable.push(issue);
+    }
+    return readable;
   }
 
-  async function actorCanReadCompanyScope(req: Request, companyId: string) {
-    const decision = await access.decide({
+  async function actorCanReadCompanyScope(req: Request, companyId: string, scopedDb?: Db) {
+    const decision = await (scopedDb ? accessService(scopedDb) : access).decide({
       actor: req.actor,
       action: "company_scope:read",
       resource: { type: "company", companyId },
@@ -4676,32 +5114,19 @@ export function issueRoutes(
     );
   }
 
-  // A stage decision is a status advance, optionally carrying the reviewer's
-  // rationale. Deliberately mirrors isBlockedCorrectionPatchBody: anything else
-  // in the body (assignee moves, executionPolicy edits, title/description,
-  // relations) is not a stage decision and must stay on the ownership path.
-  // `in_review` is excluded because it does not advance a pending stage —
-  // hasExecutionStageOverrideAuthorization rejects it for the same reason.
   function isExecutionStageDecisionPatchBody(body: unknown) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return false;
     const patch = body as Record<string, unknown>;
-    const allowedKeys = new Set(["status", "comment"]);
-    if (!Object.keys(patch).every((key) => allowedKeys.has(key))) return false;
-    return typeof patch.status === "string" && patch.status !== "in_review";
+    const presentKeys = Object.entries(patch)
+      .filter(([, value]) => value !== undefined)
+      .map(([key]) => key);
+    if (presentKeys.length === 0) return false;
+    const allowedKeys = new Set(["status", "comment", "reviewRequest"]);
+    if (!presentKeys.every((key) => allowedKeys.has(key))) return false;
+    return patch.status === "done" || patch.status === "in_progress";
   }
 
-  // BLO-19081: the stage's currentParticipant and the issue's assigneeAgentId
-  // can diverge (a reassignment while a review stage is pending), which left the
-  // pinned reviewer unable to decide their own stage — a hard 403 with no actor
-  // able to clear it. This grants the participant exactly that decision and
-  // nothing else. Double-narrowed like isAgentBlockedCorrectionForActiveExecutionStage:
-  // callers must opt in via options.allowExecutionStageDecision (only the
-  // PATCH /issues/:id route does), *and* the body must be a stage decision.
-  // Without both, this grant would reach all 25 assertAgentIssueMutationAllowed
-  // routes — including DELETE /issues/:id and the document/work-product writes
-  // that back the done-gate evidence, letting one actor author closure evidence
-  // and then approve the close.
-  function isAgentCurrentExecutionStageParticipant(
+  function isAgentExecutionStageParticipantDecision(
     req: Request,
     issue: { status: string; executionState?: unknown },
   ) {
@@ -4710,10 +5135,8 @@ export function issueRoutes(
     if (issue.status !== "in_review") return false;
     const executionState = parseIssueExecutionState(issue.executionState);
     if (executionState?.status !== "pending") return false;
-    return actorMatchesExecutionParticipant(
-      { actorType: "agent", actorId: req.actor.agentId },
-      executionState.currentParticipant,
-    );
+    const actor = { type: "agent" as const, agentId: req.actor.agentId, userId: null };
+    return executionPrincipalsEqual(executionState.currentParticipant, actor);
   }
 
   // BLO-18289: returns the coordination-metadata field names in this PATCH
@@ -4740,10 +5163,43 @@ export function issueRoutes(
     return present;
   }
 
+  type CoordinationMetadataDecision = Awaited<ReturnType<typeof access.decide>>;
+
+  // BLO-19912: the outcome of the coordination-metadata gate.
+  //
+  // `null` (returned by `decideCoordinationMetadataPatch`) means the path never
+  // applied — wrong actor kind, wrong company, or the actor already holds
+  // ordinary mutation authority over this issue. Nothing was attempted, so
+  // there is nothing to record. A `refused` outcome means a coordinator did
+  // reach the gate and was turned away, which is the operator-visible signal
+  // that was previously missing.
+  type CoordinationMetadataOutcome =
+    | { kind: "allowed"; decision: CoordinationMetadataDecision }
+    | {
+      kind: "refused";
+      refusalReason: "execution_lock";
+      blockedFields: string[];
+      executionRunId: string;
+    }
+    | {
+      kind: "refused";
+      refusalReason: "authorization_denied";
+      // Ally review of cd1ecd253: named `boundaryReason`, never
+      // `authorizationReason`. `logActivity` runs details through
+      // `sanitizeRecord`, whose secret-key matcher treats any key containing
+      // "authorization" as credential material (`server/src/redaction.ts`), so
+      // the persisted value came back `***REDACTED***` — the audit row silently
+      // lost the one field that says *why* the refusal happened. The
+      // `issue_write_denied` details use `boundaryReason` for the same enum,
+      // which is the precedent this now follows.
+      boundaryReason: CoordinationMetadataDecision["reason"];
+    };
+
   // BLO-18289: decide whether this agent may take the coordination-metadata
   // path on this issue. Returns the authorization decision when the path is
-  // available, or null when it is not (caller then falls through to the
-  // ordinary, unchanged mutation boundary).
+  // available, a refusal when the actor reached the gate and was turned away,
+  // or null when the path never applied. In both non-`allowed` cases the caller
+  // falls through to the ordinary, unchanged mutation boundary.
   async function decideCoordinationMetadataPatch(
     req: Request,
     issue: {
@@ -4755,10 +5211,17 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
       blockedByIssueIds: string[] | null;
-      executionRunId?: string | null;
+      // BLO-19912: required, deliberately not `executionRunId?: string | null`.
+      // This is the field the execution-sensitive branch below keys on, and an
+      // optional declaration lets a future caller pass an object without it,
+      // have the gate read "no lock", and permit a parentId / projectId /
+      // projectWorkspaceId rebind on a *running* issue. That fails open, where
+      // the BLO-18289 blocker bug failed closed. `blockedByIssueIds` was
+      // tightened to required in b3a240ec for exactly this reason.
+      executionRunId: string | null;
     },
     fields: string[],
-  ) {
+  ): Promise<CoordinationMetadataOutcome | null> {
     if (req.actor.type !== "agent" || !req.actor.agentId) return null;
     if (req.actor.companyId !== issue.companyId) return null;
     // Self-owned and unassigned issues already have ordinary mutation
@@ -4767,9 +5230,12 @@ export function issueRoutes(
     // Rebinding execution context or adding blockers under a live execution
     // lock can silently strand another agent's run; refuse the coordination
     // path so the request falls through to the standard mutation boundary.
-    if (
-      issue.executionRunId &&
-      fields.some((field) => {
+    //
+    // `filter` rather than `some` only so the refusal record can name the
+    // offending fields; a non-empty filter is the same predicate as `some`, so
+    // which requests are refused is unchanged.
+    const executionBlockedFields = issue.executionRunId
+      ? fields.filter((field) => {
         if (field === "blockedByIssueIds") {
           return !coordinationBlockerPatchOnlyRemoves(
             issue.blockedByIssueIds,
@@ -4778,8 +5244,14 @@ export function issueRoutes(
         }
         return COORDINATION_METADATA_EXECUTION_SENSITIVE_FIELDS.has(field);
       })
-    ) {
-      return null;
+      : [];
+    if (issue.executionRunId && executionBlockedFields.length > 0) {
+      return {
+        kind: "refused",
+        refusalReason: "execution_lock",
+        blockedFields: executionBlockedFields,
+        executionRunId: issue.executionRunId,
+      };
     }
     const decision = await access.decide({
       actor: req.actor,
@@ -4802,7 +5274,271 @@ export function issueRoutes(
         assigneeUserId: issue.assigneeUserId,
       },
     });
-    return decision.allowed ? decision : null;
+    return decision.allowed
+      ? { kind: "allowed", decision }
+      : { kind: "refused", refusalReason: "authorization_denied", boundaryReason: decision.reason };
+  }
+
+  const COORDINATION_METADATA_REFUSAL_ACTION = "issue.coordination_metadata_refused";
+  const COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS = 5 * 60_000;
+  const COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS = 5;
+
+  // Ally review of be5cd310d finding 2, extended by its reviews of 5d985942b
+  // and cd1ecd253. Keying the dedupe on (reason, fields) alone collapsed
+  // refusals that are materially different evidence: a lock refusal against a
+  // *different* holding run, a denial whose boundary reason changed, or an
+  // otherwise identical denial after the issue was reassigned — all vanished as
+  // "duplicates" inside the window, losing exactly the transition an operator is
+  // watching for.
+  //
+  // The epoch — (assignee, holding run) — is split out because it does double
+  // duty: it discriminates the signature, and it scopes the aggregate cap below
+  // so a burst of denials in one epoch cannot starve the next one.
+  function coordinationMetadataRefusalEpoch(issue: {
+    assigneeAgentId: string | null;
+    executionRunId: string | null;
+  }) {
+    return `assignee=${issue.assigneeAgentId ?? "none"}|lock=${issue.executionRunId ?? "none"}`;
+  }
+
+  function coordinationMetadataRefusalSignature(input: {
+    runId: string | null;
+    agentApiKeyId: string | null;
+    refusalEpoch: string;
+    fieldsKey: string;
+    outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>;
+  }) {
+    const base =
+      `${input.outcome.refusalReason}|run=${input.runId ?? "none"}|key=${input.agentApiKeyId ?? "none"}` +
+      `|${input.refusalEpoch}|fields=${input.fieldsKey}`;
+    return input.outcome.refusalReason === "execution_lock"
+      ? `${base}|blocked=${[...input.outcome.blockedFields].sort().join(",")}`
+      : `${base}|authz=${input.outcome.boundaryReason}`;
+  }
+
+  async function hasRecentCoordinationMetadataRefusal(input: {
+    executor: Pick<typeof db, "select">;
+    companyId: string;
+    actorId: string;
+    issueId: string;
+    refusalSignature: string;
+  }) {
+    const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
+    const [existing] = await input.executor
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, COORDINATION_METADATA_REFUSAL_ACTION),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        gte(activityLog.createdAt, windowStart),
+        sql`${activityLog.details} ->> 'refusalSignature' = ${input.refusalSignature}`,
+      ))
+      .limit(1);
+    return Boolean(existing);
+  }
+
+  // Ally review of cd1ecd253, finding 1. A single actor/issue bucket let five
+  // authorization denials exhaust the budget and then swallow the very
+  // transitions this record exists to capture — the first refusal after a
+  // reassignment, or after an execution lock appeared. The bucket is therefore
+  // scoped to the epoch (assignee, holding run): churn inside one epoch still
+  // caps at five, and a genuinely new epoch opens a fresh budget so its
+  // transition is always recorded.
+  //
+  // The bound this buys is path-scoped, and only that. Neither
+  // `assigneeAgentId` nor `status` is in COORDINATION_METADATA_FIELDS, so no
+  // patch reaching *this* function can reassign the issue or take/release its
+  // execution lock: within one epoch the cap genuinely holds at five.
+  //
+  // It does NOT hold as a blanket property, because other routes move the
+  // epoch. `POST /issues/:id/checkout` reassigns `assigneeAgentId` behind
+  // `assertCanAssignTasks` alone, and `tasks:assign` resolves in simple mode
+  // via `allow_simple_company_member` with no manager-chain check — whereas
+  // `issue:coordination_metadata` additionally requires
+  // `isManagerOf(companyId, actor, assignee)`. So an actor `deny_scope`'d here
+  // for not managing the assignee can still self-checkout the same issue and
+  // mint a fresh `(assignee, lock)` epoch, and by churning checkout/handoff
+  // cycles can open new five-record budgets over time.
+  //
+  // That is accepted rather than fixed here, on two grounds: each reset is
+  // itself an audited `issue.checked_out` event, so the churn is visible in
+  // the same log a reader of these records is already in; and once the actor
+  // holds the issue this path returns `null` for it outright (see the
+  // self-assignee guard in `decideCoordinationMetadataPatch`), so it cannot
+  // farm refusals against its own assignment. Closing it properly would need a
+  // per-issue ceiling independent of epoch — which would reintroduce the exact
+  // swallowing of transitions that the epoch scoping above exists to fix, so it
+  // is not a drop-in tightening. Contrast `runId`, which the actor *can* churn
+  // directly — see the note on the aggregate cap in the recorder below.
+  async function countRecentCoordinationMetadataRefusals(input: {
+    executor: Pick<typeof db, "select">;
+    companyId: string;
+    actorId: string;
+    issueId: string;
+    refusalEpoch: string;
+  }) {
+    const windowStart = new Date(Date.now() - COORDINATION_METADATA_REFUSAL_DEDUPE_WINDOW_MS);
+    const rows = await input.executor
+      .select({ refusalId: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, input.actorId),
+        eq(activityLog.action, COORDINATION_METADATA_REFUSAL_ACTION),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        gte(activityLog.createdAt, windowStart),
+        sql`${activityLog.details} ->> 'refusalEpoch' = ${input.refusalEpoch}`,
+      ))
+      .limit(COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS);
+    return rows.length;
+  }
+
+  // BLO-19912: the refusal counterpart to the `issue.coordination_metadata_updated`
+  // audit below. A coordinator that reached the gate and was turned away left no
+  // trace at all: the request fell through to the ordinary boundary, and an
+  // attempted workspace rebind or blocker addition against a live run — the
+  // thing an operator reviewing this authority most wants to see — was invisible.
+  // Same channel as the success path so both sides of the gate are queryable
+  // together.
+  //
+  // This records the *coordination path's* decision, not the request's final
+  // outcome: a refused actor can still be authorized further down by an
+  // unrelated path (checkout-management override, recovery-action owner), and
+  // the record stands either way.
+  //
+  // Ally review of be5cd310d, finding 1. Admission was an unlocked
+  // check-then-insert, which bounds nothing: concurrent refusals all miss the
+  // probe and all insert. The first revision of this comment claimed a bound it
+  // did not deliver and argued the record could therefore fail *open* on a
+  // probe failure. Both halves are withdrawn. Admission and insertion now run in
+  // one transaction serialized on an advisory lock keyed to
+  // (company, actor, issue) — the same shape `recordDeniedIssueWrite` uses, and
+  // for the same reason — and it fails *closed*, because a throw in here means
+  // the database is unhealthy and an unbounded insert path is worst precisely
+  // then. The lock is per-actor-per-issue, so it never serializes unrelated
+  // traffic.
+  //
+  // Ally review of 5d985942b, finding 1. An earlier revision argued no aggregate
+  // cap was needed because every signature component is server-derived from a
+  // closed set. That is wrong, and the counterexample is `runId`: under
+  // agent-API-key auth `resolveRunAttribution` constrains the
+  // `X-Paperclip-Run-Id` header only to a run belonging to that agent
+  // (`server/src/middleware/auth.ts`) — no recency or liveness check — so an
+  // actor can cycle its own historical run ids and mint a fresh signature per
+  // request. The advisory lock bounds concurrent duplicates; it bounds nothing
+  // sequential. So the cap goes in, alongside — not instead of — the
+  // exact-signature dedupe, which still collapses genuinely repeated evidence,
+  // and scoped per epoch so churn in one epoch cannot swallow the next one's
+  // first record (see countRecentCoordinationMetadataRefusals).
+  //
+  // Best-effort end to end: this is observability on an authorization decision
+  // that has already been made, so nothing here may change the outcome of the
+  // request.
+  async function recordRefusedCoordinationMetadataPatch(
+    req: Request,
+    issue: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      assigneeAgentId: string | null;
+      executionRunId: string | null;
+    },
+    fields: string[],
+    outcome: Extract<CoordinationMetadataOutcome, { kind: "refused" }>,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return;
+    const fieldsKey = [...fields].sort().join(",");
+    try {
+      const actor = getActorInfo(req);
+      const refusalEpoch = coordinationMetadataRefusalEpoch(issue);
+      const refusalSignature = coordinationMetadataRefusalSignature({
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        refusalEpoch,
+        fieldsKey,
+        outcome,
+      });
+      const lockKey =
+        `paperclip:coordination-metadata-refused:${issue.companyId}:${actor.actorId}:${issue.id}`;
+      // The transaction hands the publisher back rather than firing it:
+      // `activity.logged` and the plugin outbox both escape the transaction, so
+      // emitting inline lets a consumer read the event before the row is
+      // visible, and turns a rolled-back transaction into an event for a record
+      // that does not exist.
+      const publishRecorded = await db.transaction(async (tx): Promise<ActivityPublish | null> => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        if (await hasRecentCoordinationMetadataRefusal({
+          executor: tx,
+          companyId: issue.companyId,
+          actorId: actor.actorId,
+          issueId: issue.id,
+          refusalSignature,
+        })) return null;
+        // Checked after the exact-signature dedupe so a repeated attempt
+        // collapses onto its existing row instead of consuming budget: a burst
+        // of one refusal must not evict the capacity that distinct evidence
+        // needs.
+        if (await countRecentCoordinationMetadataRefusals({
+          executor: tx,
+          companyId: issue.companyId,
+          actorId: actor.actorId,
+          issueId: issue.id,
+          refusalEpoch,
+        }) >= COORDINATION_METADATA_REFUSAL_AGGREGATE_MAX_RECORDS) return null;
+        // A drizzle transaction is structurally a `Db` minus `$client`, which
+        // `logActivity` never touches. Same cast, and same reasoning, as
+        // `recordDeniedIssueWrite`.
+        return await logActivity(tx as unknown as typeof db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: COORDINATION_METADATA_REFUSAL_ACTION,
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            identifier: issue.identifier ?? null,
+            path: "coordination_metadata_allowlist",
+            outcome: "refused",
+            refusalReason: outcome.refusalReason,
+            fields,
+            fieldsKey,
+            refusalSignature,
+            refusalEpoch,
+            assigneeAgentId: issue.assigneeAgentId,
+            issueExecutionRunId: issue.executionRunId,
+            ...(outcome.refusalReason === "execution_lock"
+              ? { blockedFields: outcome.blockedFields, executionRunId: outcome.executionRunId }
+              : { boundaryReason: outcome.boundaryReason }),
+          },
+        }, { deferPublish: true });
+      });
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        publishRecorded?.();
+      } catch (err) {
+        // Distinct from the catch below: the record itself is committed and
+        // recoverable, only its notification failed.
+        logger.warn(
+          { err, issueId: issue.id, refusalReason: outcome.refusalReason },
+          "BLO-19912: recorded a refused coordination-metadata patch but failed to publish its activity event",
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, refusalReason: outcome.refusalReason },
+        "BLO-19912: failed to record refused coordination-metadata patch",
+      );
+    }
   }
 
   function isCreatorOrManagerChainRecoveryPatch(
@@ -4819,6 +5555,88 @@ export function issueRoutes(
       Array.isArray(body.blockedByIssueIds) &&
       body.blockedByIssueIds.length === 0
     );
+  }
+
+  function isManagerChainNonInvokableAssigneeReroutePatch(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const patch = body as Record<string, unknown>;
+    const keys = Object.keys(patch);
+    if (keys.length !== 1) return false;
+    return keys[0] === "assigneeAgentId" || (keys[0] === "status" && patch.status === "cancelled");
+  }
+
+  async function decideManagerChainNonInvokableAssigneeReroute(
+    req: Request,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return null;
+    if (req.actor.companyId !== issue.companyId || !issue.assigneeAgentId) return null;
+    if (!isManagerChainNonInvokableAssigneeReroutePatch(req.body)) return null;
+
+    const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (commentDecision.reason !== "allow_manager_chain") return null;
+
+    const assignee = await agentsSvc.getById(issue.assigneeAgentId);
+    if (!assignee || assignee.companyId !== issue.companyId || isAgentStatusInvokable(assignee.status)) return null;
+    return commentDecision;
+  }
+
+  function isLapsedMonitorRearmPatch(
+    issue: {
+      status: string;
+      executionState?: unknown;
+      monitorNextCheckAt?: Date | null;
+    },
+    body: Record<string, unknown>,
+  ) {
+    if (!["in_progress", "in_review"].includes(issue.status) || issue.monitorNextCheckAt) return false;
+    if (Object.keys(body).length !== 1 || body.executionPolicy == null) return false;
+    const currentMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+    // Two monitor shapes leave an issue with no scheduled wake, and both are
+    // recoverable only by someone other than the assignee:
+    //
+    //  - `triggered` — the monitor fired and nobody re-armed it (BLO-24149).
+    //  - `cleared` / `convergence_stalled` — the BLO-18294 guard refused the
+    //    re-arm after N consecutive re-checks failed to narrow the gate set.
+    //
+    // The second shape is what BLO-21947 records as unrecoverable. The service
+    // layer already implements its recovery: `resetConvergenceAfterStalledClear`
+    // grants a fresh convergence budget, and `sameAssigneeResetAfterPriorStall`
+    // throws so the *assignee* still cannot grant itself one — preserving the
+    // guard's stated intent that "a non-assignee actor must make that re-arm
+    // decision". Until now no non-assignee could reach that code, so the
+    // guard's documented escape hatch had no executor at all.
+    //
+    // Note the guard force-sets the issue to `blocked` when it trips, and a
+    // monitor cannot be armed on a `blocked` issue (`issueAllowsMonitor` — the
+    // service throws MONITOR_INVALID_MESSAGE on an explicit update). Admitting
+    // `blocked` here would therefore be unreachable code, so recovery stays a
+    // deliberate two-step: return the issue to active work, then have a
+    // non-assignee re-arm it.
+    const isRecoverableLapsedMonitor =
+      currentMonitor?.status === "triggered" ||
+      (currentMonitor?.status === "cleared" && currentMonitor.clearReason === "convergence_stalled");
+    if (!isRecoverableLapsedMonitor) return false;
+    // The capability this unlocks is a monitor re-arm and nothing else. A body
+    // carrying only `executionPolicy` is NOT sufficient to establish that:
+    // `executionPolicy` is a whole-policy replace, so a policy that merely
+    // *contains* a monitor alongside `stages` or `authorizationPolicy` would let
+    // a manager rewrite a report's workflow and authorization configuration
+    // through a path that deliberately skips the ordinary mutation boundary.
+    //
+    // Checked on the *normalized* policy rather than the request's key set:
+    // `validate(updateIssueRouteSchema)` has already replaced req.body with the
+    // parsed result, and unlike the top-level `.partial()` object the nested
+    // policy schema does fire its defaults — a monitor-only policy arrives here
+    // as `{mode, commentRequired, stages, monitor}`. So key presence proves
+    // nothing and only the values do. `mode`/`commentRequired` are not checked
+    // because the merge at the write site keeps the report's own values and
+    // discards everything the request carried except the monitor.
+    const requestedPolicy = normalizeIssueExecutionPolicy(body.executionPolicy);
+    if (!requestedPolicy?.monitor) return false;
+    if (requestedPolicy.stages.length > 0) return false;
+    if (requestedPolicy.reviewPreset || requestedPolicy.authorizationPolicy) return false;
+    return true;
   }
 
   async function assertAgentIssueMutationAllowed(
@@ -4839,7 +5657,6 @@ export function issueRoutes(
     },
     options: {
       allowBlockedCorrection?: boolean;
-      allowExecutionStageDecision?: boolean;
       allowScopedRecoveryOwnerSourceMutation?: boolean;
       allowRecoveryActionOwner?: boolean;
       allowProductivityReviewOwner?: boolean;
@@ -4848,7 +5665,21 @@ export function issueRoutes(
         previousAssigneeAgentId: string | null;
         issueStatus: string;
       }) => void;
+      onCheckoutOwnershipValidated?: (input: {
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      }) => void;
       allowCoordinationMetadata?: boolean;
+      allowManagerChainNonInvokableReroute?: boolean;
+      onManagerChainNonInvokableRerouteAllowed?: () => void;
+      allowManagerMonitorRearm?: boolean;
+      /**
+       * PATCH /issues/:id only: when an execution-stage currentParticipant and
+       * issue assignee diverge, the participant must still be able to submit a
+       * decision-shaped stage patch. Keep this opt-in and shape-gated because
+       * this helper also protects delete/document/work-product routes.
+       */
+      allowExecutionStageParticipantDecision?: boolean;
       /**
        * BLO-18797: opt in to the allow_issue_creator / allow_manager_chain
        * ownership bypass below. Off by default and deliberately so — this
@@ -4886,6 +5717,9 @@ export function issueRoutes(
     if (options.allowCoordinationMetadata) {
       return true;
     }
+    if (options.allowManagerMonitorRearm) {
+      return true;
+    }
     if (isCurrentIssueExecutionRun(req, issue)) {
       return true;
     }
@@ -4895,12 +5729,56 @@ export function issueRoutes(
       return activeRecoveryAction?.ownerAgentId === actorAgentId;
     };
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+    // BLO-24191: recording the reviewer relation is deliberately separated from
+    // *returning* on it. The return below still happens only where PR #853 put
+    // it (inside the another-agent's-issue branch, after the run-ownership
+    // checks); this only notes that the boundary said the actor holds an open
+    // productivity review of this issue.
+    //
+    // The two were fused, and that made the relation unobservable for the
+    // reviewer it matters most for. `hasActiveCheckoutManagementOverride` is
+    // the check immediately preceding that override in the same branch, and it
+    // returns true for any actor holding `tasks:manage_active_checkouts` over
+    // the assignee — which every manager does via `allow_manager_chain`, and
+    // every legacy agent-creator (the CTO) does unconditionally. Productivity
+    // reviews are routed up the reporting chain, so the reviewer is nearly
+    // always exactly that actor: the PATCH was allowed by the checkout
+    // override, the callback never ran, and `assertCanManageIssueMonitor` then
+    // refused the monitor write while its own `allowedRelations` advertised the
+    // relation the caller held (BLO-23544, live 2026-08-10 against deployed
+    // e307f937b).
+    //
+    // No widening: the boundary reason is `allow_productivity_review_grant`
+    // only when authorization.ts matched the full predicate (open, non-hidden,
+    // agent-scoped review whose server-stamped `originId` is this issue), and
+    // the monitor gate still requires `runtime:manage` on top. Routes that do
+    // not opt in (`DELETE /issues/:id` and friends) pass neither the flag nor
+    // the callback and are untouched.
+    let productivityReviewOwnerRecorded = false;
+    const recordProductivityReviewOwnerAuthorization = () => {
+      if (productivityReviewOwnerRecorded) return;
+      if (!options.allowProductivityReviewOwner) return;
+      if (!boundaryDecision.allowed || boundaryDecision.reason !== "allow_productivity_review_grant") return;
+      productivityReviewOwnerRecorded = true;
+      options.onProductivityReviewOwnerMutationAllowed?.({
+        reviewerAgentId: actorAgentId,
+        previousAssigneeAgentId: issue.assigneeAgentId,
+        issueStatus: issue.status,
+      });
+    };
     let creatorOrManagerChainDecision =
       boundaryDecision.allowed && isCreatorOrManagerChainDecision(boundaryDecision)
         ? boundaryDecision
         : null;
     if (!boundaryDecision.allowed) {
       if (await isActiveRecoveryActionOwner()) return true;
+      if (options.allowManagerChainNonInvokableReroute) {
+        const rerouteDecision = await decideManagerChainNonInvokableAssigneeReroute(req, issue);
+        if (rerouteDecision) {
+          options.onManagerChainNonInvokableRerouteAllowed?.();
+          return true;
+        }
+      }
       if (
         options.allowCreatorOrManagerChainOwnership &&
         isCreatorOrManagerChainRecoveryPatch(issue, req.body as Record<string, unknown>)
@@ -4927,6 +5805,12 @@ export function issueRoutes(
         return false;
       }
     }
+    // The boundary has spoken and it allowed (or was rescued into an allow).
+    // Record the reviewer relation here, before any of the early returns below
+    // can mask it. Recording is not authorizing: nothing downstream reads this
+    // except the monitor gate on `PATCH /issues/:id` and the source-mutation
+    // activity entry, and both only run once this helper has returned true.
+    recordProductivityReviewOwnerAuthorization();
     if (await isActiveRecoveryActionOwner()) return true;
     // BLO-18113 / BLO-18797: creator / manager-chain grants are comment-only
     // in authorization.ts. The one mutation they may carry is a tightly-shaped
@@ -4960,10 +5844,26 @@ export function issueRoutes(
     if (issue.assigneeAgentId === null) {
       return true;
     }
+    // BLO-22666 AC2: fence the same agent's *other* run off a live-locked pending
+    // `in_review` stage. Placed here on purpose — deliberately AFTER the recovery
+    // -action owner (:isActiveRecoveryActionOwner), creator/manager-chain recovery
+    // and unassigned early-returns above, so none of those rescue paths can be
+    // fenced; and deliberately BEFORE the blocked-correction and
+    // execution-stage-participant early returns below, which are exactly the two
+    // ways run B would otherwise decide run A's stage without ever reaching the
+    // `in_progress`-only checkout assertion at the bottom of this function.
+    if (isForeignRunOfLockedPendingReview(req, issue)) {
+      const reviewRunId = requireAgentRunId(req, res);
+      if (!reviewRunId) return false;
+      await svc.assertPendingReviewRunOwnership(issue.id, actorAgentId, reviewRunId);
+    }
     if (options.allowBlockedCorrection && isAgentBlockedCorrectionForActiveExecutionStage(req, issue)) {
       return true;
     }
-    if (options.allowExecutionStageDecision && isAgentCurrentExecutionStageParticipant(req, issue)) {
+    if (
+      options.allowExecutionStageParticipantDecision &&
+      isAgentExecutionStageParticipantDecision(req, issue)
+    ) {
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
@@ -4992,15 +5892,16 @@ export function issueRoutes(
       // anyway. This is checked before the creator/manager-chain deny below;
       // the two are mutually exclusive by reason, so the order is for clarity
       // rather than correctness.
+      //
+      // BLO-24191: the recorder is idempotent and has normally already run
+      // above, so reaching this branch does not double-log. It is still called
+      // here so this override keeps working if the earlier call site ever
+      // moves.
       if (
         options.allowProductivityReviewOwner &&
         boundaryDecision.reason === "allow_productivity_review_grant"
       ) {
-        options.onProductivityReviewOwnerMutationAllowed?.({
-          reviewerAgentId: actorAgentId,
-          previousAssigneeAgentId: issue.assigneeAgentId,
-          issueStatus: issue.status,
-        });
+        recordProductivityReviewOwnerAuthorization();
         return true;
       }
       if (creatorOrManagerChainDecision) {
@@ -5055,6 +5956,12 @@ export function issueRoutes(
     const runId = requireAgentRunId(req, res);
     if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
+    if ("checkoutRunId" in ownership || "executionRunId" in ownership) {
+      options.onCheckoutOwnershipValidated?.({
+        checkoutRunId: ownership.checkoutRunId ?? null,
+        executionRunId: ownership.executionRunId ?? null,
+      });
+    }
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -5492,6 +6399,15 @@ export function issueRoutes(
       context.resumeRequiresNormalModel === true;
   }
 
+  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+    const context = contextSnapshot as Record<string, unknown>;
+    return context.recoveryIntent === "planning_only" &&
+      context.allowDeliverableWork === false &&
+      context.allowDocumentUpdates === true &&
+      context.resumeRequiresNormalModel === false;
+  }
+
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;
     return !!overrides &&
@@ -5536,6 +6452,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
+        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
       },
     });
     if (issue.id) {
@@ -5547,23 +6464,55 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * Gate deliverable-shaped writes on the actor's recovery run class.
+   *
+   * `documentKey` is consulted ONLY for `mutationKind: "document"`, and only to
+   * carve out the status-adjudication key for status-only runs (BLO-25868).
+   * Callers that cannot name a key pass nothing and get the strict behaviour, so
+   * omitting it can never widen the gate.
+   */
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string },
+    mutationKind: "document" | "deliverable" | "annotation" = "deliverable",
+    documentKey?: string,
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    // A status-only run may record its verdict, and only its verdict. Without
+    // this the done gate's 422 (`no_execution_run_and_no_pr_evidence`) and this
+    // 403 were both reachable for the same actor on the same issue, demanding a
+    // durable artifact while forbidding the only call that produces one — a
+    // deadlock no re-wake could clear. Narrow by construction: one exact key, on
+    // the upsert route alone, so plans, other document keys, annotations and
+    // work products stay barred.
+    const writesStatusAdjudication = mutationKind === "document" &&
+      documentKey === ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY;
+    if (statusOnly && writesStatusAdjudication) return true;
+    if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+      error: planningOnly
+        ? "Planning-only recovery runs can update issue documents but cannot create or modify annotations or deliverable artifacts"
+        : "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts. " +
+          `To record a status conclusion and close, PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} ` +
+          "with the verdict and the evidence it rests on; producing the deliverable itself needs a normal-model run.",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
+        ...(statusOnly
+          ? {
+            modelProfile: "cheap",
+            allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          }
+          : {}),
+        recoveryIntent: planningOnly ? "planning_only" : "status_only",
+        resumeRequiresNormalModel: statusOnly,
       },
     });
     return false;
@@ -5576,16 +6525,28 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error:
+        planningOnly
+          ? "Planning-only recovery runs cannot link or unlink approvals"
+          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
+        ...(statusOnly
+          ? {
+            modelProfile: "cheap",
+            allowedApprovalType: "request_board_approval",
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          }
+          : {}),
+        recoveryIntent: planningOnly ? "planning_only" : "status_only",
+        resumeRequiresNormalModel: statusOnly,
       },
     });
     return false;
@@ -6616,6 +7577,88 @@ export function issueRoutes(
     res.json({ count });
   });
 
+  /**
+   * Authoritative open-assignment census.
+   *
+   * `GET /companies/:id/issues` silently clamps `limit` to ISSUE_LIST_MAX_LIMIT
+   * and returns a bare array with no total and no cursor, so a caller cannot
+   * tell a complete page from a truncated one, and offset paging over a
+   * mutating collection double-counts and drops rows. Consumers that need
+   * exact per-agent open counts (the agent-health sweep) must read them here
+   * instead of reconstructing them from that population.
+   */
+  router.get("/companies/:companyId/issues/open-assignment-census", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (isTaskBridgeKeyActor(req)) {
+      res.status(403).json({ error: "Task bridge keys cannot use company-wide issue census APIs" });
+      return;
+    }
+    if (req.query.limit !== undefined || req.query.offset !== undefined) {
+      res.status(400).json({
+        error: "open-assignment-census is not paginated and does not accept limit or offset",
+      });
+      return;
+    }
+
+    const rawStatus = req.query.status;
+    let status: string[] | undefined;
+    if (rawStatus !== undefined) {
+      const candidates = (Array.isArray(rawStatus) ? rawStatus : [rawStatus])
+        .flatMap((value) => String(value).split(","))
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const invalid = candidates.filter((value) => !OPEN_ISSUE_STATUSES.includes(
+        value as typeof OPEN_ISSUE_STATUSES[number],
+      ));
+      if (candidates.length === 0 || invalid.length > 0) {
+        res.status(400).json({
+          error: `status must be a subset of ${OPEN_ISSUE_STATUSES.join(",")}`,
+        });
+        return;
+      }
+      status = [...new Set(candidates)];
+    }
+
+    const censusFilters = {
+      status,
+      includeRoutineExecutions:
+        req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
+      includePluginOperations:
+        req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
+    };
+
+    // The census is a company-wide aggregate: it cannot be assembled from a
+    // per-actor visibility filter without losing the single-snapshot property
+    // that makes it authoritative. Actors without company-scope read get an
+    // explicit refusal rather than a silently narrowed census that would look
+    // exact and be wrong.
+    if (!(await actorCanReadCompanyScope(req, companyId))) {
+      const trustResolution = req.actor.type === "agent"
+        ? await resolveAgentTrustForIssue({
+            agentId: req.actor.agentId,
+            runId: req.actor.runId,
+          }, companyId, null)
+        : null;
+      if (trustResolution?.kind === "denied") {
+        throw forbidden(trustResolution.detail);
+      }
+      if (trustResolution?.kind === "low_trust_review") {
+        res.json(await svc.openAssignmentCensus(companyId, {
+          ...censusFilters,
+          lowTrustBoundary: trustResolution.boundary,
+        }));
+        return;
+      }
+      res.status(403).json({
+        error: "open-assignment-census requires company-scope read access",
+      });
+      return;
+    }
+
+    res.json(await svc.openAssignmentCensus(companyId, censusFilters));
+  });
+
   router.get("/companies/:companyId/labels", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -7501,6 +8544,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "annotation"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -7575,6 +8619,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "annotation"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -7630,6 +8675,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "annotation"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -7672,12 +8718,14 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+    // Key must be parsed BEFORE the run-class gate: it decides whether a
+    // status-only run is writing the one document key it is allowed (BLO-25868).
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
       return;
     }
+    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document", keyParsed.data))) return;
 
     const actor = getActorInfo(req);
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
@@ -7901,7 +8949,7 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+      if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue, "document"))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
         res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -8302,7 +9350,17 @@ export function issueRoutes(
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
     const product = await workProductsSvc.update(id, {
       ...patch,
-      ...(sourceTrust ? { sourceTrust } : {}),
+      // BLO-19566: an actor edit never *inherits* provenance -- it restamps it
+      // with the actor's own resolution, which is null at standard trust.
+      //
+      // Webhook-written PR rows carry system source-trust, and productivity
+      // review treats exactly those rows as progress-eligible evidence keyed on
+      // `updatedAt`. Conditionally spreading `sourceTrust` left the system stamp
+      // in place on an actor write while `update()` refreshed `updatedAt`, so an
+      // assignee could PATCH a stale webhook row and manufacture fresh, trusted
+      // evidence about their own issue. Clearing it demotes the row to an
+      // ordinary actor-authored work product, which the review ignores.
+      sourceTrust: sourceTrust ?? null,
     });
     if (!product) {
       res.status(404).json({ error: "Work product not found" });
@@ -8749,6 +9807,7 @@ export function issueRoutes(
         ...issue,
         deduplicated: true,
         deduplicationReason,
+        duplicateCandidates: [],
         relatedWork: referenceSummary,
         referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       });
@@ -8851,9 +9910,55 @@ export function issueRoutes(
       requestedByActorId: actor.actorId,
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
+    await opts.createIssueBeforeResponseHook?.();
+
+    let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
+    try {
+      const lookupAbortController = new AbortController();
+      const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
+        ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
+      duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
+        withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
+          await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);
+          const canReadCompanyScope = await (opts.createIssueDuplicateCandidateCompanyScopeReader
+            ?? ((scopedDb, scopedReq, scopedCompanyId) => (
+              actorCanReadCompanyScope(scopedReq, scopedCompanyId, scopedDb)
+            )))(advisoryDb, req, companyId);
+          return (opts.createIssueDuplicateCandidateLookup ?? findCreateIssueDuplicateCandidates)(advisoryDb, companyId, {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+          }, opts.createIssueDuplicateCandidateCorpusFilter
+            ?? (canReadCompanyScope
+              ? undefined
+              : (rows, signal, scopedDb) => filterIssuesForActor(req, rows, signal, scopedDb)),
+          lookupAbortController.signal,
+          lookupTimeoutMs);
+        }),
+        lookupTimeoutMs,
+        () => lookupAbortController.abort(),
+      );
+    } catch (err) {
+      logger.warn(
+        { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
+        "issue duplicate candidate lookup failed; continuing create without advisories",
+      );
+    }
+
+    scheduleDuplicateCandidateShownActivity({
+      db,
+      res,
+      opts,
+      companyId,
+      issue,
+      actor,
+      duplicateCandidates,
+    });
 
     res.status(201).json({
       ...issue,
+      duplicateCandidates,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });
@@ -9327,6 +10432,16 @@ export function issueRoutes(
         issueStatus: string;
       } | null;
     } = { current: null };
+    let currentRunMutationOwnershipSnapshot: {
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    } | null = req.actor.type === "agent" && isCurrentIssueExecutionRun(req, existing)
+      ? {
+          checkoutRunId: existing.checkoutRunId ?? null,
+          executionRunId: existing.executionRunId ?? null,
+        }
+      : null;
+    let managerChainNonInvokableRerouteAllowed = false;
     // BLO-18289: coordination-metadata allowlist. Evaluated before the boundary
     // check so a manager holding tasks:assign can curate the dependency graph
     // on a report's issue; null whenever the body is not exclusively
@@ -9336,7 +10451,7 @@ export function issueRoutes(
     if (coordinationMetadataFields?.includes("blockedByIssueIds")) {
       existingRelations = await svc.getRelationSummaries(existing.id);
     }
-    const coordinationMetadataDecision = coordinationMetadataFields
+    const coordinationMetadataOutcome = coordinationMetadataFields
       ? await decideCoordinationMetadataPatch(
         req,
         {
@@ -9346,19 +10461,50 @@ export function issueRoutes(
         coordinationMetadataFields,
       )
       : null;
+    const managerMonitorRearmDecision =
+      req.actor.type === "agent" &&
+      isLapsedMonitorRearmPatch(existing, req.body as Record<string, unknown>)
+        ? await decideIssueAccess(req, existing, "issue:comment")
+        : null;
+    const managerMonitorRearmAuthorized = Boolean(
+      managerMonitorRearmDecision &&
+      managerMonitorRearmDecision.reason === "allow_manager_chain",
+    );
+    const coordinationMetadataDecision = coordinationMetadataOutcome?.kind === "allowed"
+      ? coordinationMetadataOutcome.decision
+      : null;
+    // BLO-19912: record the refusal before the boundary check, which returns
+    // early on denial. The record is the trace of the coordination attempt
+    // itself and must survive whichever way the fall-through resolves.
+    if (coordinationMetadataOutcome?.kind === "refused" && coordinationMetadataFields) {
+      await recordRefusedCoordinationMetadataPatch(
+        req,
+        existing,
+        coordinationMetadataFields,
+        coordinationMetadataOutcome,
+      );
+    }
     if (!(await assertAgentIssueMutationAllowed(
       req,
       res,
       existing,
       {
         allowBlockedCorrection: true,
-        allowExecutionStageDecision: true,
         allowScopedRecoveryOwnerSourceMutation,
         allowProductivityReviewOwner: true,
         onProductivityReviewOwnerMutationAllowed: (audit) => {
           productivityReviewSourceMutationAudit.current = audit;
         },
+        onCheckoutOwnershipValidated: (ownership) => {
+          currentRunMutationOwnershipSnapshot = ownership;
+        },
         allowCoordinationMetadata: coordinationMetadataDecision !== null,
+        allowExecutionStageParticipantDecision: true,
+        allowManagerChainNonInvokableReroute: true,
+        onManagerChainNonInvokableRerouteAllowed: () => {
+          managerChainNonInvokableRerouteAllowed = true;
+        },
+        allowManagerMonitorRearm: managerMonitorRearmAuthorized,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -9380,6 +10526,8 @@ export function issueRoutes(
       !!existing.assigneeAgentId &&
       existing.assigneeAgentId !== req.actor.agentId &&
       isCreatorOrManagerChainRecoveryPatch(existing, req.body as Record<string, unknown>);
+    const authorizationPinnedAssignee =
+      delegateRecoveryPatchInFlight || managerChainNonInvokableRerouteAllowed;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -9444,8 +10592,36 @@ export function issueRoutes(
         ? activeRecoveryActionForPatch
         : await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
       : null;
+    // BLO-19951: the coordination-metadata allowlist (BLO-18289) is decided
+    // above but was never consulted here, so an allowlist-confined patch still
+    // 403'd whenever the issue carried a recovery action owned outside the
+    // actor's chain. Stranded-recovery issues are exactly the population the
+    // gate exists to curate (BLO-19119), so that subset was unreachable.
+    //
+    // Reusing the already-computed decision rather than recomputing keeps the
+    // two paths from drifting. The carve-out is narrow by construction: a
+    // non-null decision means the body contained *only* allowlisted fields, and
+    // `status` / `assigneeAgentId` / `executionPolicy` / `reopen` / `resume` are
+    // all outside the allowlist, so the only trigger that can reach this line
+    // with a decision in hand is `blockedByIssueIds` — the BLO-18163 use case.
+    // Any non-allowlisted field nulls the decision and restores the guard.
+    //
+    // Follow-up finding (BLO-19951, after merge): this term is currently
+    // REDUNDANT, and deliberately kept as defence in depth rather than reverted.
+    // `issue:coordination_metadata` allows solely via isManagerOf(actor,
+    // assignee), and `tasks:manage_active_checkouts` allows on that same
+    // relation — which `assertRecoveryActionAuthority` consults, and returns
+    // true on, before it can 403. So a non-null decision implies the guard
+    // would already have passed, and no 403 this term suppresses can actually
+    // occur. It matters only if those two authorities are ever decoupled, at
+    // which point it silently becomes a live bypass of the recovery-owner
+    // check — so the coupling is pinned by a real-service test
+    // ("couples coordination-metadata authority to active-checkout
+    // management", authorization-service.test.ts). If that test fails, revisit
+    // this line before relaxing it further.
     if (
       recoveryRelevantSourceMutationRequested &&
+      !coordinationMetadataDecision &&
       !(await assertRecoveryActionAuthority(
         req,
         res,
@@ -9526,6 +10702,27 @@ export function issueRoutes(
       });
       return;
     }
+    // BLO-22909: every arm above refuses this patch *because* `blockedIssueReadiness`
+    // — read on this connection, well before the write — reported no live blockers.
+    // Each one can also carry `blockedByIssueIds`, so a blocker committed between
+    // that read and `syncBlockedByIssueIds` is silently deleted. Re-assert the same
+    // predicate inside the update transaction, where the company graph lock and the
+    // row `FOR UPDATE` make it atomic with the clear.
+    //
+    // Deliberately a superset of `delegateRecoveryPatchInFlight`, and kept separate
+    // from it: that flag additionally pins status and assignee, which are
+    // authorization-snapshot fields specific to the `allow_manager_chain` grant and
+    // must not be imposed on the scoped-recovery or resume arms.
+    //
+    // Semantics-preserving by construction — each disjunct already 409s on unresolved
+    // blockers here, so the write-time re-check can only refuse a request the route
+    // would itself have refused had it read the later snapshot. It admits no new
+    // status transition, which BLO-22909 puts out of scope. The readiness re-check
+    // runs before the sync, so a patch that *adds* blockers is unaffected.
+    const unresolvedBlockerWriteGuardInFlight =
+      delegateRecoveryPatchInFlight ||
+      scopedRecoveryOwnerRestoreNeedsDependencyReadiness ||
+      (resumeRequested === true && isBlocked);
     let interruptedRunId: string | null = null;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
@@ -9610,10 +10807,21 @@ export function issueRoutes(
       });
     }
     if (req.body.executionPolicy !== undefined) {
-      updateFields.executionPolicy = applyActorMonitorScheduledBy(
+      const requestedExecutionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
       );
+      // A manager-chain re-arm is authorized to restore a *timer*, not to
+      // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
+      // request carrying anything but a monitor; merging rather than replacing
+      // closes the other half — the write itself must not silently drop stages,
+      // reviewPreset, authorizationPolicy or mode that the assignee set.
+      updateFields.executionPolicy = managerMonitorRearmAuthorized
+        ? mergeIssueExecutionPolicyMonitor(
+          normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+          requestedExecutionPolicy?.monitor ?? null,
+        )
+        : requestedExecutionPolicy;
     }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =
@@ -9630,6 +10838,17 @@ export function issueRoutes(
       existing.companyId,
       existing,
       req.body.executionPolicy !== undefined && monitorChanged,
+      {
+        // BLO-19723. Set from the audit record rather than re-running the grant
+        // predicate: `productivityReviewSourceMutationAudit.current` is written
+        // by `assertAgentIssueMutationAllowed` above (line ~8852) and is
+        // non-null only when this PATCH was authorized by
+        // `allow_productivity_review_grant`. If some other allow-path matched,
+        // the reason differs, the audit stays null, and this guard keeps its
+        // pre-existing behaviour — fail-closed.
+        productivityReviewOwnerAuthorized: productivityReviewSourceMutationAudit.current !== null,
+        managerMonitorRearmAuthorized,
+      },
     );
 
     const requestedExecutionStageStatus = typeof updateFields.status === "string" ? updateFields.status : undefined;
@@ -9754,6 +10973,27 @@ export function issueRoutes(
       }
     }
 
+    const executionSnapshotPreconditions = updateFields.executionState === undefined
+      ? {}
+      : {
+          expectedCurrentStatus: existing.status,
+          expectedCurrentExecutionState:
+            existing.executionState && typeof existing.executionState === "object"
+              ? existing.executionState
+              : null,
+          expectedCurrentExecutionPolicy:
+            existing.executionPolicy && typeof existing.executionPolicy === "object"
+              ? existing.executionPolicy
+              : null,
+        };
+    const currentRunMutationPreconditions =
+      req.actor.type === "agent" && currentRunMutationOwnershipSnapshot
+        ? {
+            expectedCurrentCheckoutRunId: currentRunMutationOwnershipSnapshot.checkoutRunId,
+            expectedCurrentExecutionRunId: currentRunMutationOwnershipSnapshot.executionRunId,
+          }
+        : {};
+
     let issue;
     try {
       if (transition.decision && decisionId) {
@@ -9765,15 +11005,34 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
-              ...(delegateRecoveryPatchInFlight
+              ...executionSnapshotPreconditions,
+              ...currentRunMutationPreconditions,
+              ...(authorizationPinnedAssignee
                 ? {
-                    expectedCurrentStatus: "blocked",
+                    ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
                     // BLO-18797: allow_manager_chain was granted because this
                     // assignee is a report of the actor. Pin it too, or a
                     // reassignment to an unrelated agent that keeps the row
                     // blocked would still satisfy an id+status predicate.
                     expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                    // BLO-22876 review: the reroute grant additionally rests on
+                    // that assignee being non-invokable, which lives in `agents`
+                    // and so cannot be pinned by an `issues` WHERE clause. Pin
+                    // it as a locked write-time re-read instead.
+                    ...(managerChainNonInvokableRerouteAllowed
+                      ? { expectedCurrentAssigneeAgentNonInvokable: true }
+                      : {}),
                   }
+                : {}),
+              // BLO-22909: and pin the blocker set. Status and assignee are
+              // column equalities the UPDATE's WHERE can re-evaluate; "has no
+              // live blockers" is not, and adding a blocker edge changes
+              // neither of those columns, so a blocker inserted after the
+              // readiness read slips past both guards and gets deleted by the
+              // `blockedByIssueIds` this patch carries. Re-checked inside the
+              // update transaction. Wider than the pins above — see the flag.
+              ...(unresolvedBlockerWriteGuardInFlight
+                ? { expectedNoUnresolvedBlockers: true }
                 : {}),
             },
             tx,
@@ -9800,13 +11059,25 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          ...(delegateRecoveryPatchInFlight
+          ...executionSnapshotPreconditions,
+          ...currentRunMutationPreconditions,
+          ...(authorizationPinnedAssignee
             ? {
-                expectedCurrentStatus: "blocked",
+                ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
                 // See the transactional branch above: the assignee is an
-                // authorization-relevant snapshot field for allow_manager_chain.
+                // authorization-relevant snapshot field for allow_manager_chain,
+                // and its invokability is one for the BLO-22876 reroute grant.
                 expectedCurrentAssigneeAgentId: existing.assigneeAgentId,
+                ...(managerChainNonInvokableRerouteAllowed
+                  ? { expectedCurrentAssigneeAgentNonInvokable: true }
+                  : {}),
               }
+            : {}),
+          // BLO-22909: see the transactional branch above — the blocker set
+          // needs a write-time re-check because it is not a column the
+          // UPDATE's WHERE clause can pin.
+          ...(unresolvedBlockerWriteGuardInFlight
+            ? { expectedNoUnresolvedBlockers: true }
             : {}),
         });
       }
@@ -9861,7 +11132,15 @@ export function issueRoutes(
           path: "coordination_metadata_allowlist",
           fields: coordinationMetadataFields,
           assigneeAgentId: existing.assigneeAgentId,
-          authorizationReason: coordinationMetadataDecision.reason,
+          // BLO-19912: renamed from `authorizationReason`, which BLO-18289
+          // shipped and which has been persisting as `***REDACTED***` ever
+          // since — `sanitizeRecord`'s secret-key matcher treats any key
+          // containing "authorization" as credential material. Ally caught this
+          // on the new refusal record; the bug is identical here, one line
+          // away, so it is fixed rather than left to be rediscovered. This does
+          // change a persisted key on an existing audit record, but the old key
+          // only ever held a redaction placeholder, so no consumer loses data.
+          boundaryReason: coordinationMetadataDecision.reason,
         },
       });
     }
@@ -10104,7 +11383,14 @@ export function issueRoutes(
     const explicitlyRecordedSuccessfulRunDisposition =
       actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";
     if (explicitlyRecordedSuccessfulRunDisposition) {
-      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
+      // foldTerminal:false — this read decides whether to WRITE the durable
+      // resolution row, and `issue` is already terminal by the time we get here.
+      // Letting the terminal fold run would report the handoff as resolved and
+      // skip the write, losing sourceRunId/correctiveRunId/resolvedByStatus.
+      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], {
+        hydrateLiveness: false,
+        foldTerminal: false,
+      })
         .then(async (handoffStates) => {
           const handoff = handoffStates.get(issue.id);
           if (handoff?.state !== "required" && handoff?.state !== "escalated") return;
@@ -10580,8 +11866,24 @@ export function issueRoutes(
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
 
+        let authorUserIsActiveMember = false;
+        if (mentionedIds.length > 0 && actor.actorType === "user") {
+          try {
+            authorUserIsActiveMember = Boolean(
+              await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+            );
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+          }
+        }
+
         for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+          if (!commentAuthorCanGrantIssueMention({
+            mentionedAgentId: mentionedId,
+            issueAssigneeAgentId: issue.assigneeAgentId,
+            authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+            authorUserIsActiveMember,
+          })) continue;
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -10768,7 +12070,33 @@ export function issueRoutes(
       (activeRecoveryActionForCheckout.status === "active" || activeRecoveryActionForCheckout.status === "escalated") &&
       activeRecoveryActionForCheckout.ownerAgentId === req.body.agentId;
 
-    if (issue.assigneeAgentId !== req.body.agentId && !allowSourceScopedRecoveryOwnerCheckout) {
+    // BLO-22666 AC3: the pending stage is pinned to this agent as its
+    // `currentParticipant`, but the issue belongs to somebody else. The stage
+    // decision is already authorized for this actor on `PATCH /issues/:id`; this
+    // lets it take the lock first so that decision is atomic instead of racing.
+    //
+    // It bypasses the `tasks:assign` self-appointment door below because it is
+    // NOT a self-appointment: the service-side claim writes only the lock
+    // columns and leaves `assigneeAgentId` untouched, so nothing here can widen
+    // into general issue ownership. The pin is re-asserted inside the claiming
+    // UPDATE, so this read is a fast path, not the authorization.
+    const allowExecutionStageParticipantClaim =
+      req.actor.type === "agent" &&
+      req.actor.agentId === req.body.agentId &&
+      issue.status === "in_review" &&
+      issue.assigneeAgentId !== req.body.agentId &&
+      (() => {
+        const state = parseIssueExecutionState(issue.executionState);
+        if (state?.status !== "pending") return false;
+        const participant = state.currentParticipant;
+        return participant?.type === "agent" && participant.agentId === req.body.agentId;
+      })();
+
+    if (
+      issue.assigneeAgentId !== req.body.agentId &&
+      !allowSourceScopedRecoveryOwnerCheckout &&
+      !allowExecutionStageParticipantClaim
+    ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
           issueId: issue.id,
@@ -10804,6 +12132,65 @@ export function issueRoutes(
       }
     }
 
+    // BLO-22856: until this check, checkout was the only issue-mutating route
+    // that never consulted the `issue:mutate` boundary. It gated solely on
+    // `tasks:assign` above — and only in the cross-assignee case, so a
+    // self-assigned checkout was authorized by nothing but company access.
+    // `tasks:assign` and `issue:mutate` admit different actor sets, so an actor
+    // could clear checkout, move the row `blocked`/`todo` -> `in_progress` and
+    // take the run lock, and then be denied by every endpoint that could undo
+    // it: upsert-document, PATCH, and release all run the boundary this skipped.
+    // That is a one-way door — the row strands `in_progress` until an
+    // out-of-band `stranded_assigned_issue` recovery action clears it, because
+    // the actor cannot even release its own checkout.
+    //
+    // The watchdog gate is the half that leaks without any race. Its own
+    // comment on `assertTaskWatchdogScopedIssueMutationAllowed` states the
+    // invariant — resolve the scope "before any current-run bypass so stale or
+    // forged watchdog context cannot inherit broader execution-lock authority" —
+    // and checkout violated it by never resolving the scope at all. A watchdog
+    // run could therefore check out an issue outside the watched subtree and
+    // then be refused by release, which does run the gate (403 out-of-subtree,
+    // 409 stale fingerprint). Run it unconditionally here, exactly as release
+    // does, including for the recovery owner: release grants that actor no
+    // watchdog exemption either, so exempting it here would reopen the gap.
+    //
+    // A non-null result IS the verdict, mirroring
+    // `assertAgentIssueMutationAllowed`'s `if (watchdogDecision !== null)
+    // return watchdogDecision`. A valid in-subtree watchdog scope deliberately
+    // widens past the ordinary boundary, so stacking the boundary check on top
+    // of an allow would deny mutations release permits — the opposite of the
+    // symmetry this change exists to establish.
+    let watchdogScopeAuthorized = false;
+    if (req.actor.type === "agent") {
+      const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, {
+        deniedWriteAction: "issue:mutate",
+      });
+      if (watchdogDecision === false) return;
+      watchdogScopeAuthorized = watchdogDecision === true;
+    }
+
+    // Deliberately placed AFTER the `tasks:assign` gate so every denial that
+    // fires today keeps its current status and message; this only closes states
+    // that currently succeed. The recovery owner is exempt for the same reason
+    // `POST /issues/:id/release` exempts it via `allowRecoveryActionOwner`: that
+    // actor is authorized BY the active recovery action rather than by the
+    // ordinary boundary (which denies, since the row is assigned to someone
+    // else), and `svc.checkout` re-validates the action atomically in the
+    // UPDATE's WHERE clause.
+    if (req.actor.type === "agent" && !allowSourceScopedRecoveryOwnerCheckout && !watchdogScopeAuthorized) {
+      const checkoutBoundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
+      if (!checkoutBoundaryDecision.allowed) {
+        await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+          reason: deniedBoundaryReason(checkoutBoundaryDecision.reason),
+          boundaryReason: checkoutBoundaryDecision.reason,
+          responseStatus: 403,
+        });
+        respondIssueBoundaryDenied(res, checkoutBoundaryDecision);
+        return;
+      }
+    }
+
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
@@ -10814,6 +12201,7 @@ export function issueRoutes(
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
       allowSourceScopedRecoveryOwner: allowSourceScopedRecoveryOwnerCheckout,
+      allowExecutionStageParticipantClaim,
       recoveryActionId: activeRecoveryActionForCheckout?.id ?? null,
       recoveryActionStatus: activeRecoveryActionForCheckout?.status ?? null,
     });
@@ -11457,8 +12845,34 @@ export function issueRoutes(
         // after another agent has taken over the issue.
         const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
         if (!boundaryDecision.allowed) {
-          respondIssueBoundaryDenied(res, boundaryDecision);
-          return;
+          // BLO-22670: that boundary is keyed to the issue's *current* trust
+          // posture (assignee, grants) — which the interaction's creator can
+          // lose the moment the issue changes hands, defeating the stale-card
+          // cleanup the comment above promises: the card becomes unwithdrawable
+          // by anyone (creator fails this boundary, the new assignee fails
+          // createdByAgentId below). The service's own createdByAgentId check
+          // is race-safe (re-applied in its UPDATE ... WHERE) and sufficient on
+          // its own, so give a genuine creator one more path through it instead
+          // of leaving the card permanently stuck.
+          //
+          // Scoped to deny_missing_grant deliberately. Only that reason means
+          // "this agent lost the issue-level grant", which is the reassignment
+          // case above. Other denials are narrower than the agent and creator
+          // identity cannot stand in for them: a skill_test or task_bridge key
+          // gets deny_scope from decideSkillTestAccess/decideTaskBridgeAccess
+          // for an issue outside the key's boundary, and createdByAgentId is
+          // agent-wide, not key- or run-scoped, so a match there says nothing
+          // about whether *this credential* may touch *this* issue. Treating
+          // every !allowed alike would let a narrowly scoped key withdraw on
+          // an out-of-scope issue purely because its agent authored the card.
+          const createdInteraction =
+            actor.agentId && boundaryDecision.reason === "deny_missing_grant"
+              ? await issueThreadInteractionService(db).getById(interactionId)
+              : null;
+          if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {
+            respondIssueBoundaryDenied(res, boundaryDecision);
+            return;
+          }
         }
         // Without a run id the watchdog scope above resolves to "none" and
         // silently stops confining the caller, so require one exactly as the
@@ -12157,6 +13571,32 @@ export function issueRoutes(
         return;
       }
 
+      // BLO-22666 AC2: an approval-shaped comment is a state transition — it
+      // moves the issue to `done` and inserts an execution decision. When the
+      // stage is live-locked, only the run holding it may make that transition,
+      // so the same agent's second run is refused here.
+      //
+      // Scoped to the auto-approval branch rather than to commenting: run B
+      // posting an ordinary comment (a handoff note, a finding) is legitimate and
+      // is how a losing run leaves its work behind. And because
+      // isForeignRunOfLockedPendingReview requires `assigneeAgentId === actor`,
+      // the mention-granted peer reviewer, the manager-chain actor, the recovery
+      // owner and a drifted `currentParticipant` all still approve by comment
+      // exactly as before — the path this branch exists to serve.
+      if (shouldAutoApproveReviewComment && isForeignRunOfLockedPendingReview(req, currentIssue)) {
+        // isForeignRunOfLockedPendingReview only returns true for an agent actor
+        // carrying an agentId, so this narrowing always holds; it is written as a
+        // guard rather than an assertion so a future change to that predicate
+        // fails closed here instead of throwing on a non-null assertion.
+        if (req.actor.type === "agent" && req.actor.agentId) {
+          await svc.assertPendingReviewRunOwnership(
+            currentIssue.id,
+            req.actor.agentId,
+            req.actor.runId ?? null,
+          );
+        }
+      }
+
       // Persist the comment and the auto-approval state transition atomically when both apply.
       // Without a single transaction, a later status-update error would leave an orphan comment.
       if (shouldAutoApproveReviewComment) {
@@ -12215,7 +13655,18 @@ export function issueRoutes(
               commentOptions,
               tx,
             );
-            const updated = await svc.update(id, updatePatch, tx);
+            const updated = await svc.update(id, {
+              ...updatePatch,
+              expectedCurrentStatus: currentIssue.status,
+              expectedCurrentExecutionState:
+                currentIssue.executionState && typeof currentIssue.executionState === "object"
+                  ? currentIssue.executionState
+                  : null,
+              expectedCurrentExecutionPolicy:
+                currentIssue.executionPolicy && typeof currentIssue.executionPolicy === "object"
+                  ? currentIssue.executionPolicy
+                  : null,
+            }, tx);
             if (!updated) throw new AutoApprovalIssueMissingError();
 
             if (transition.decision && decisionId) {
@@ -12519,8 +13970,24 @@ export function issueRoutes(
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }
 
+      let authorUserIsActiveMember = false;
+      if (mentionedIds.length > 0 && actor.actorType === "user") {
+        try {
+          authorUserIsActiveMember = Boolean(
+            await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
+          );
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+        }
+      }
+
       for (const mentionedId of mentionedIds) {
-        if (actorIsAgent && actor.actorId === mentionedId) continue;
+        if (!commentAuthorCanGrantIssueMention({
+          mentionedAgentId: mentionedId,
+          issueAssigneeAgentId: currentIssue.assigneeAgentId,
+          authorAgentId: actorIsAgent ? actor.actorId : null,
+          authorUserIsActiveMember,
+        })) continue;
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",

@@ -5,6 +5,29 @@ set -e
 PUID=${USER_UID:-1000}
 PGID=${USER_GID:-1000}
 
+# /paperclip is a PVC in agent Jobs, so image-layer links below it are hidden.
+# Replace any ad hoc browser cached there with the image-pinned headless shell.
+# A read-only or unexpectedly shaped PVC must not prevent the requested command
+# from starting, especially under an arbitrary non-root UID.
+install_browser_link() {
+    browser=${CHROME_BIN:-/usr/local/bin/google-chrome}
+    browser_bin=${PAPERCLIP_HOME:-/paperclip}/bin
+    browser_link=$browser_bin/google-chrome
+    [ -x "$browser" ] || return 0
+
+    if [ -L "$browser_bin" ] || { [ -e "$browser_bin" ] && [ ! -d "$browser_bin" ]; }; then
+        echo "docker-entrypoint.sh: refusing unsafe browser link destination $browser_bin" >&2
+        return 0
+    fi
+    if ! mkdir -p "$browser_bin" 2>/dev/null; then
+        echo "docker-entrypoint.sh: $browser_bin is not writable; browser link not installed" >&2
+        return 0
+    fi
+    if ! ln -sfn "$browser" "$browser_link" 2>/dev/null; then
+        echo "docker-entrypoint.sh: could not install browser link in $browser_bin" >&2
+    fi
+}
+
 # Without root we can neither remap the node user (usermod/groupmod/chown)
 # nor switch users (gosu needs CAP_SETUID/CAP_SETGID), so exec directly.
 # This covers Kubernetes restricted PodSecurity (runAsNonRoot + runAsUser)
@@ -15,6 +38,7 @@ if [ "$(id -u)" -ne 0 ]; then
     if [ "$(id -u)" -ne "$PUID" ] || [ "$(id -g)" -ne "$PGID" ]; then
         echo "docker-entrypoint.sh: running unprivileged as $(id -u):$(id -g); cannot remap to requested ${PUID}:${PGID}" >&2
     fi
+    install_browser_link
     exec "$@"
 fi
 
@@ -48,5 +72,6 @@ if [ ! -e /paperclip/.local/bin/claude ]; then
     ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude
 fi
 chown -R node:node /paperclip/.local 2>/dev/null || true
+install_browser_link
 
 exec gosu node "$@"

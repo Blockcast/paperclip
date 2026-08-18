@@ -9,6 +9,7 @@ const TRIGGER_LABELS: Record<string, string> = {
   no_comment_streak: "No-comment streak",
   long_active_duration: "Long active duration",
   high_churn: "High churn",
+  runtime_failure_streak: "Runtime failure streak",
 };
 
 const REVIEW_STATUS_LABELS: Record<string, string> = {

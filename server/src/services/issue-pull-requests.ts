@@ -23,10 +23,15 @@ import { computeAuthoredLoc, type GithubPullFile } from "./authored-loc.js";
 import {
   extractPaperclipIdentifiers,
   resolveLinkSourceForIdentifier,
+  resolveOwningPaperclipIdentifiers,
   type PullRequestLinkSource,
 } from "./paperclip-identifiers.js";
 
 const GITHUB_HOST = "github.com";
+// Describes HOW a link was found, and is used to break ties only after
+// ownership has had its say -- see recordMergedPullRequest. It deliberately
+// ranks the branch first, which is the opposite of the ownership tier order,
+// and that disagreement is why it must not decide ownership on its own.
 const LINK_SOURCE_STRENGTH: Record<PullRequestLinkSource, number> = {
   branch_ref: 4,
   title_ref: 3,
@@ -75,29 +80,71 @@ function githubApiHeaders(token?: string | null): Record<string, string> {
 }
 
 /**
+ * Choose one issue per company: the issue the ownership resolver names wins;
+ * only when it names none does the strongest link source decide, then first
+ * seen. Pure, so the ownership-vs-strength precedence is testable without a DB.
+ *
+ * Deferring to ownership is load-bearing rather than tidy. This module ranks
+ * `branch_ref` above `title_ref`, while resolveOwningPaperclipIdentifiers ranks
+ * the branch LAST and documents the measurement behind it: branches get
+ * repurposed, so over 175 PRs a branch tier disagreed with the curated
+ * title/body answer 8 times and was the wrong issue in every one. Selecting on
+ * link-source strength alone therefore let a stale branch ref outrank the
+ * curated title owner -- for branch `fix/blo-1-stale`, title `Fix BLO-2`, body
+ * `Related: BLO-1`, ownership correctly chooses BLO-2 while strength alone
+ * persisted the PR against BLO-1.
+ *
+ * That was reachable only after resolveLinkSourceForIdentifier began reading the
+ * branch case-insensitively (BLO-20886 round 6): before, a lowercase branch
+ * scored `body_ref` here and lost to the title by accident. Fixing one half of
+ * the module's disagreement about ownership exposed the other half, so the two
+ * orderings are reconciled here instead of being left to coincide.
+ *
+ * `linkSource` still records which field carried the identifier -- that is
+ * descriptive provenance, and it stays accurate for whichever issue is chosen.
+ */
+function selectIssuePerCompany(
+  matchedIssues: RecordMergedPullRequestInput["matchedIssues"],
+  fields: { branch?: string | null; title?: string | null; body?: string | null },
+): Map<string, { issueId: string; identifier: string; linkSource: PullRequestLinkSource; owning: boolean }> {
+  const owning = new Set(resolveOwningPaperclipIdentifiers(fields).owning);
+  const bestPerCompany = new Map<
+    string,
+    { issueId: string; identifier: string; linkSource: PullRequestLinkSource; owning: boolean }
+  >();
+  for (const issue of matchedIssues) {
+    if (!issue.identifier) continue;
+    const linkSource = resolveLinkSourceForIdentifier(issue.identifier, fields) ?? "body_ref";
+    const isOwning = owning.has(issue.identifier);
+    const existing = bestPerCompany.get(issue.companyId);
+    const better =
+      !existing ||
+      (isOwning && !existing.owning) ||
+      (isOwning === existing.owning &&
+        LINK_SOURCE_STRENGTH[linkSource] > LINK_SOURCE_STRENGTH[existing.linkSource]);
+    if (better) {
+      bestPerCompany.set(issue.companyId, {
+        issueId: issue.id,
+        identifier: issue.identifier,
+        linkSource,
+        owning: isOwning,
+      });
+    }
+  }
+  return bestPerCompany;
+}
+
+/**
  * Persist the issue↔PR link for every matched company (one row per
- * (company, repo, PR) — the unique key). Within a company, if several matched
- * issues reference the PR, the strongest link source wins (branch ref first).
+ * (company, repo, PR) — the unique key). See selectIssuePerCompany for how the
+ * single issue per company is chosen.
  */
 export async function recordMergedPullRequest(
   db: Db,
   input: RecordMergedPullRequestInput,
 ): Promise<RecordedPullRequestRow[]> {
   const fields = { branch: input.branch, title: input.title, body: input.body };
-
-  // Choose one issue per company: strongest link source, then first seen.
-  const bestPerCompany = new Map<
-    string,
-    { issueId: string; identifier: string; linkSource: PullRequestLinkSource }
-  >();
-  for (const issue of input.matchedIssues) {
-    if (!issue.identifier) continue;
-    const linkSource = resolveLinkSourceForIdentifier(issue.identifier, fields) ?? "body_ref";
-    const existing = bestPerCompany.get(issue.companyId);
-    if (!existing || LINK_SOURCE_STRENGTH[linkSource] > LINK_SOURCE_STRENGTH[existing.linkSource]) {
-      bestPerCompany.set(issue.companyId, { issueId: issue.id, identifier: issue.identifier, linkSource });
-    }
-  }
+  const bestPerCompany = selectIssuePerCompany(input.matchedIssues, fields);
 
   const recorded: RecordedPullRequestRow[] = [];
   for (const [companyId, choice] of bestPerCompany) {
@@ -382,3 +429,4 @@ export async function reconcileMergedPullRequests(
 
 // Test-only re-exports.
 export const __test_LINK_SOURCE_STRENGTH = LINK_SOURCE_STRENGTH;
+export const __test_selectIssuePerCompany = selectIssuePerCompany;
