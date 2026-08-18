@@ -123,6 +123,21 @@ if [[ -n "$ABANDON_IN_FLIGHT" && -z "$ABANDON_IN_FLIGHT_OWNER" ]] \
   echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER must be set together" >&2
   exit 2
 fi
+# Admissibility-probe pacing. Validated here, with the other operator-facing
+# env, so a typo fails before the ring is touched rather than mid-probe with an
+# in-flight lock held. The exhaustion message at the end of this script actively
+# directs operators to raise the attempt count, so these are turned by hand
+# under pressure and must fail legibly.
+PROBE_ATTEMPTS="${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-40}"
+PROBE_MAX_SLEEP_SECONDS="${PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS:-8}"
+if [[ ! "$PROBE_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PAPERCLIP_APPROVAL_PROBE_ATTEMPTS='${PROBE_ATTEMPTS}' is not a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$PROBE_MAX_SLEEP_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS='${PROBE_MAX_SLEEP_SECONDS}' is not a positive integer" >&2
+  exit 2
+fi
 if [[ -z "${PAPERCLIP_DEPLOY_KUBECONFIG:-}" \
       || ! -f "$PAPERCLIP_DEPLOY_KUBECONFIG" ]]; then
   echo "PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential used for the admission probe" >&2
@@ -666,15 +681,23 @@ fi
 # no code change — the signature of a race, not a rejected manifest. Back off
 # geometrically to a ceiling: still ~1s for the common case where the parameter
 # is already visible, but a tail measured in minutes when it is not.
-PROBE_ATTEMPTS="${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-40}"
-PROBE_MAX_SLEEP_SECONDS="${PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS:-8}"
-
-# 1,1,2,2,4,4,8,8,... capped. 40 attempts ≈ 286s of sleep.
+# PROBE_ATTEMPTS and PROBE_MAX_SLEEP_SECONDS are resolved and range-checked in
+# the operator-env block near the top, before the in-flight lock is taken.
+#
+# 1,1,2,2,4,4,8,8,... capped. 40 attempts ≈ 286s of sleep. The exponent is
+# clamped before shifting: bash arithmetic is signed 64-bit, so `1 << 63` is
+# INT64_MIN and a raised PAPERCLIP_APPROVAL_PROBE_ATTEMPTS — which the
+# exhaustion message below tells operators to do — would otherwise hand `sleep`
+# a negative delay and abort the run with the lock still held.
 probe_backoff_seconds() {
   local attempt="$1"
-  local delay=$(( 1 << ((attempt - 1) / 2) ))
-  if (( delay > PROBE_MAX_SLEEP_SECONDS )); then
-    delay="$PROBE_MAX_SLEEP_SECONDS"
+  local exponent=$(( (attempt - 1) / 2 ))
+  local delay="$PROBE_MAX_SLEEP_SECONDS"
+  if (( exponent < 31 )); then
+    delay=$(( 1 << exponent ))
+    if (( delay > PROBE_MAX_SLEEP_SECONDS )); then
+      delay="$PROBE_MAX_SLEEP_SECONDS"
+    fi
   fi
   printf '%s' "$delay"
 }
@@ -746,6 +769,11 @@ for attempt in $(seq 1 "$PROBE_ATTEMPTS"); do
       | "${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" "$server_plan_verb" \
           --dry-run=server -o json -f - 2>"$server_plan_err")"; then
     server_plan_ready=yes
+    # Always report, not just on a slow convergence: this race was invisible for
+    # three deploys precisely because a win left no trace. A run that habitually
+    # lands near PROBE_ATTEMPTS is one informer hiccup from failing, and only
+    # the success-path number shows that before it does.
+    echo "Plan became admissible on probe ${attempt}/${PROBE_ATTEMPTS} after $(( $(date +%s) - probe_started_at ))s."
     break
   fi
   record_probe_attempt "$attempt"
