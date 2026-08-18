@@ -1340,7 +1340,11 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       title: "Closed escalation",
       status: "done",
       priority: "high",
-      parentId: blockedIssueId,
+      // Production parents these under the LEAF blocker (see the fixture note at
+      // the "picks the most recently resolved escalation" test). `parentId` is
+      // not in the suppressor's predicate, so this does not change what the test
+      // proves -- it keeps every fixture in this file the same shape.
+      parentId: blockerIssueId,
       assigneeAgentId: managerId,
       issueNumber: 3,
       identifier: "CLOSED-3",
@@ -1627,6 +1631,131 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.skippedUnchangedTarget).toBe(1);
   });
 
+  it("falls back to time-only suppression when the target-state gate is disabled", async () => {
+    // Exercises the documented rollback lever: the docblocks on
+    // `findSuppressingResolvedLivenessRecoveryIssue` and
+    // `DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS` both tell a caller to
+    // pass `unchangedTargetSuppressionMs: 0` for pre-BLO-27676 behaviour, and
+    // nothing exercised that path before.
+    //
+    // Scope note, so this is not mistaken for more than it is: this test does
+    // NOT pin the wrapper opts-type fix that made the option reachable. Test
+    // files are not typechecked (`server/tsconfig.json` excludes `src/__tests__`)
+    // and the wrapper spreads `{ ...opts }`, so this passes with or without the
+    // field declared. What pins that is the typechecked production callers under
+    // `src/`. This test pins the BEHAVIOUR of the disable path only.
+    //
+    // Fixture is deliberately the one from "holds an untouched leaf inside the
+    // suppression ceiling" -- resolved 30h ago, leaf quiet 40h, i.e. inside the
+    // 7d ceiling and past the 60m cooldown. That case is held by the target-state
+    // gate and by nothing else, so flipping the gate off flips the outcome.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+
+    const resolvedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 40 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Closed escalation",
+      status: "done",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 3,
+      identifier: "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: new Date(resolvedAt.getTime() - 30 * 60 * 1000),
+      updatedAt: resolvedAt,
+      completedAt: resolvedAt,
+    });
+
+    await db
+      .update(issues)
+      .set({
+        lastActivityAt: leafQuietSince,
+        updatedAt: leafQuietSince,
+        createdAt: new Date(leafQuietSince.getTime() - 60 * 60 * 1000),
+      })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now,
+      unchangedTargetSuppressionMs: 0,
+    });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("suppresses nothing when both re-escalation suppressors are disabled", async () => {
+    // The fully-disabled configuration: `cooldownMs <= 0` AND
+    // `unchangedTargetSuppressionMs <= 0`. Guards the early return that skips the
+    // `mostRecentDone` query in that case -- the assertion is behavioural (a row
+    // resolved 90 seconds ago, well inside the default 60m cooldown, still
+    // re-escalates), so the guard cannot be "optimised" into changing behaviour.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+
+    const resolvedAt = new Date(now.getTime() - 90 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 40 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Closed escalation",
+      status: "done",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 3,
+      identifier: "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: new Date(resolvedAt.getTime() - 30 * 60 * 1000),
+      updatedAt: resolvedAt,
+      completedAt: resolvedAt,
+    });
+
+    await db
+      .update(issues)
+      .set({
+        lastActivityAt: leafQuietSince,
+        updatedAt: leafQuietSince,
+        createdAt: new Date(leafQuietSince.getTime() - 60 * 60 * 1000),
+      })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now,
+      reescalationCooldownMs: 0,
+      unchangedTargetSuppressionMs: 0,
+    });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
   it("still escalates an unowned backlog blocker that has never been reported", async () => {
     // Rejection test for the suppressor above: it must not degrade into "stop
     // escalating". A leaf with no owner, no disposition and no prior resolved
@@ -1671,7 +1800,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       title: "Cancelled escalation",
       status: "cancelled",
       priority: "high",
-      parentId: blockedIssueId,
+      // Leaf-parented, matching production and the rest of this file's fixtures.
+      parentId: blockerIssueId,
       assigneeAgentId: managerId,
       issueNumber: 3,
       identifier: "CANCELLED-3",

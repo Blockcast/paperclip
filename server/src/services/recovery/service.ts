@@ -7929,6 +7929,13 @@ export function recoveryService(
     cooldownMs: number,
     unchangedTargetSuppressionMs: number,
   ) {
+    // With both suppressors off the function can only return null (the cooldown
+    // branch needs `cooldownMs > 0`, the target-state branch needs
+    // `unchangedTargetSuppressionMs > 0`), so skip the query rather than issuing
+    // it once per finding per sweep to discard the row. Keeps "suppression fully
+    // disabled" genuinely free instead of merely inert.
+    if (cooldownMs <= 0 && unchangedTargetSuppressionMs <= 0) return null;
+
     // The ORDER BY must be the same expression that `resolvedAtMs` reads below,
     // or the row selected is not the row whose timestamp is compared. Ordering
     // by `updatedAt` alone was wrong in both directions: any post-close edit to
