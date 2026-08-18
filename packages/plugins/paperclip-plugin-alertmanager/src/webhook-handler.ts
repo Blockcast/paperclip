@@ -22,9 +22,11 @@ import {
   buildIssueDescription,
   buildIssueTitle,
   effectiveAlertStatus,
+  isTerminalSeverity,
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
+import type { IssueRouteResolution } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
@@ -33,6 +35,7 @@ import {
   type AlertmanagerAlert,
   type AlertmanagerPluginConfig,
   type AlertmanagerWebhookPayload,
+  type OwnerResolution,
 } from "./types.js";
 
 export class WebhookUnauthorizedError extends Error {
@@ -321,10 +324,12 @@ export async function handleFiring(
   //
   // This is the same `state ?? recover-from-issue` fallback the resolved path
   // has always used; only the firing path was missing it.
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
+  const terminal = isTerminalSeverity(severity, config.terminalSeverities);
+  const existing =
+    stateRecord ?? (await recoverStateFromIssue(ctx, config, alert, terminal));
 
   if (existing && existing.paperclipIssueId) {
     // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
@@ -343,9 +348,38 @@ export async function handleFiring(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      decision = decideRefire(issue, existing, config, Date.now());
+      // A terminal severity never consults `decideRefire`: that helper reads
+      // any `done`/`cancelled` row as an *operator* close (BLO-24234), which
+      // would mute this fingerprint for the suppression window and then
+      // re-open it as `todo` once the window expired — re-manufacturing
+      // exactly the agent-actionable row BLO-24177 exists to prevent. A
+      // terminal close is the plugin's own doing, not an operator's, so there
+      // is no operator intent to honour and no suppression anchor to bank.
+      decision = terminal
+        ? issue
+          ? { kind: "refresh" }
+          : { kind: "issue_missing" }
+        : decideRefire(issue, existing, config, Date.now());
 
-      if (decision.kind === "reopen") {
+      if (terminal && issue) {
+        // BLO-24177: never agent-actionable, regardless of the row's prior
+        // status — route straight to `done` instead of reopening as `todo`,
+        // so stranded-issue recovery and orphan sweeps never see it as
+        // unowned work. Still touch the row on every re-fire (whether it's
+        // already terminal or not) so `updatedAt` keeps proving the
+        // in-cluster delivery leg accepts POSTs — the row stays live
+        // evidence, it just never becomes work.
+        await ctx.issues.update(
+          existing.paperclipIssueId,
+          {
+            ...(issue.status !== "done" ? { status: "done" as const } : {}),
+            description: newDescription,
+            assigneeAgentId: null,
+            assigneeUserId: null,
+          },
+          existing.paperclipCompanyId,
+        );
+      } else if (decision.kind === "reopen") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "todo", description: newDescription },
@@ -418,6 +452,7 @@ export async function handleFiring(
       ctx.logger.warn(
         `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
       );
+      if (terminal) throw err;
     }
 
     // Ladder restart keeps its original trigger — the alert going
@@ -448,6 +483,8 @@ export async function handleFiring(
 
     const updated: AlertStateRecord = {
       ...existing,
+      assigneeUserId: terminal ? null : existing.assigneeUserId,
+      assigneeAgentId: terminal ? null : existing.assigneeAgentId,
       alertname,
       severity,
       lastFiredAt: nowIso,
@@ -477,8 +514,8 @@ export async function handleFiring(
         labels: alert.labels,
         annotations: alert.annotations,
         paperclipIssueId: existing.paperclipIssueId,
-        assigneeUserId: existing.assigneeUserId,
-        assigneeAgentId: existing.assigneeAgentId ?? null,
+        assigneeUserId: updated.assigneeUserId,
+        assigneeAgentId: updated.assigneeAgentId ?? null,
         reFired: true,
       },
     );
@@ -491,9 +528,22 @@ export async function handleFiring(
 
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
-  const { assigneeUserId, assigneeAgentId, resolution } =
-    await resolveAssigneeUserId(ctx, alert, config.ownerMap);
-  const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
+  let assigneeUserId: string | undefined;
+  let assigneeAgentId: string | undefined;
+  let resolution: OwnerResolution = { email: null, agentId: null, source: "no-match" };
+  let issueRouteResolution: IssueRouteResolution = { route: null, source: null };
+  if (!terminal) {
+    // BLO-24177: a terminal-severity alert (e.g. Watchdog's `severity: none`
+    // heartbeat) is never agent-actionable, so owner-map and issue-route
+    // resolution are skipped entirely rather than resolved and discarded —
+    // no assignee or route should ever apply to it.
+    ({ assigneeUserId, assigneeAgentId, resolution } = await resolveAssigneeUserId(
+      ctx,
+      alert,
+      config.ownerMap,
+    ));
+    issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
+  }
   const issueRoute = issueRouteResolution.route;
   const ownerOverride =
     resolution.source === "label-override" ||
@@ -518,7 +568,10 @@ export async function handleFiring(
         : assigneeUserId;
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
-  const routeStatus = issueRoute?.status;
+  // BLO-24177: terminal severities always create `done` — never left `todo`
+  // where stranded-issue recovery and orphan sweeps would eventually assign
+  // it, resuming exactly the loop this exists to break.
+  const createStatus = terminal ? "done" : issueRoute?.status;
   const resolvedTarget =
     resolution.agentId
       ? `agent:${resolution.agentId}`
@@ -526,7 +579,9 @@ export async function handleFiring(
   const resolvedAssignee =
     createAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
+    terminal
+      ? `Owner resolution for ${alertname}: skipped (terminal severity "${severity}", BLO-24177)`
+      : `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -549,7 +604,7 @@ export async function handleFiring(
     originId: alert.fingerprint,
     ...(routeProjectId ? { projectId: routeProjectId } : {}),
     ...(routeGoalId ? { goalId: routeGoalId } : {}),
-    ...(routeStatus ? { status: routeStatus } : {}),
+    ...(createStatus ? { status: createStatus } : {}),
     ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
     ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
     ...(billingCode ? { billingCode } : {}),
@@ -711,6 +766,7 @@ async function recoverStateFromIssue(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  includeTerminalIssue = false,
 ): Promise<AlertStateRecord | null> {
   const companyId = config.defaultCompanyId;
   if (!companyId) return null;
@@ -731,7 +787,19 @@ async function recoverStateFromIssue(
   // for a paging system is a visible duplicate, not a silent mute. Do not
   // "unify" this branch by returning the terminal issue; that would let a state
   // loss inherit a suppression nobody chose.
-  if (issue.status === "done" || issue.status === "cancelled") return null;
+  //
+  // `includeTerminalIssue` is the one deliberate exception (BLO-24177). For a
+  // terminal severity that ambiguity does not exist: the plugin closes those
+  // rows itself on every delivery and never leaves them open, so a closed row
+  // cannot encode an operator's intent to mute. Filing a duplicate there would
+  // mint a second permanent evidence row per state loss — the failure mode this
+  // caller is passing the flag to avoid — so it adopts instead.
+  if (
+    !includeTerminalIssue &&
+    (issue.status === "done" || issue.status === "cancelled")
+  ) {
+    return null;
+  }
 
   return {
     paperclipIssueId: issue.id,
