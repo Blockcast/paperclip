@@ -167,10 +167,8 @@ import { executionWorkspaceService as executionWorkspaceServiceDirect } from "..
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import {
-  parseUnsupportedPaginationParams,
-  readAcceptedPlanConfirmationTarget,
-} from "../services/issues.js";
+import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.js";
+import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { issueEfficiencyService } from "../services/issue-efficiency.js";
 import {
   ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
