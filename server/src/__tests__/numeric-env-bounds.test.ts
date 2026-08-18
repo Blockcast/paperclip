@@ -279,27 +279,68 @@ describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () 
     "PORT",
   ]);
 
+  /**
+   * Deliberately wider than the literal `Number(process.env.X) ||` form the
+   * acceptance criteria grep for, because the hole is in the *coercion*, not in
+   * one spelling of it. Two shapes both leave it open:
+   *
+   *  - **fallback outside the call** — `Number(process.env.X) || D`,
+   *    `parseInt(process.env.X, 10) ?? D`. `Number("Infinity")` is truthy, so
+   *    the fallback never fires.
+   *  - **fallback inside the call** — `Number(process.env.X ?? "3")`. The
+   *    default only substitutes for an *unset* var; an explicitly hostile value
+   *    is passed straight through to `Number`, so this shape is if anything
+   *    weaker than the first.
+   *
+   * The inside form is not hypothetical: it is the spelling live at three sites
+   * in `services/k8s-job-liveness.ts` today, which makes it the variant the next
+   * author is most likely to reach for.
+   */
+  const BARE_NUMERIC_ENV_IDIOM =
+    /(?:Number|parseInt|parseFloat)\(\s*process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[\s*["'`]([A-Z_][A-Z0-9_]*)["'`]\s*\])(?:\s*(?:\|\||\?\?)|[^)]*\)\s*(?:\|\||\?\?))/g;
+
+  /** Strip comments so prose describing the idiom does not trip the guard. */
+  function findBareNumericEnvIdioms(source: string): string[] {
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    return [...code.matchAll(BARE_NUMERIC_ENV_IDIOM)]
+      .map((match) => match[1] ?? match[2])
+      .filter((envVar): envVar is string => envVar !== undefined && !ALLOWED_ENV_VARS.has(envVar));
+  }
+
+  /**
+   * Without these two tables the guard below is unfalsifiable: it asserts only
+   * that *today's* `config.ts` is clean, which a regex matching nothing would
+   * also satisfy. That is precisely the defect class this ticket exists to kill
+   * — a guard that reports green on a case it never evaluated — so the detector
+   * is pinned against input it must catch and input it must not.
+   */
+  it.each([
+    ["fallback outside, ||", 'Number(process.env.SOME_VAR) || 5'],
+    ["fallback outside, ??", 'Number(process.env.SOME_VAR) ?? 5'],
+    ["parseInt", 'parseInt(process.env.SOME_VAR, 10) || 5'],
+    ["parseFloat", 'parseFloat(process.env.SOME_VAR) || 1.5'],
+    ["bracket access", 'Number(process.env["SOME_VAR"]) || 5'],
+    ["fallback inside, ??", 'Number(process.env.SOME_VAR ?? "3")'],
+    ["fallback inside, ||", 'Number(process.env.SOME_VAR || "3")'],
+    ["bracket + inside ??", 'Number(process.env["SOME_VAR"] ?? "3")'],
+  ])("detects the idiom spelled as %s", (_label, snippet) => {
+    expect(findBareNumericEnvIdioms(snippet)).toEqual(["SOME_VAR"]);
+  });
+
+  it.each([
+    ["the helper", "resolveNumericSetting([process.env.SOME_VAR], NUMERIC_SETTING_BOUNDS.x)"],
+    ["a boolean read", 'process.env.SOME_VAR === "true"'],
+    ["a plain string read", "const raw = process.env.SOME_VAR;"],
+    ["an allowlisted PORT read", "Number(process.env.PORT) || 3100"],
+    ["prose in a comment", "// Number(process.env.SOME_VAR) || 5 is the old idiom"],
+  ])("does not flag %s", (_label, snippet) => {
+    expect(findBareNumericEnvIdioms(snippet)).toEqual([]);
+  });
+
   it("has no unguarded numeric-env idiom outside the allowlist", async () => {
     const { readFile } = await import("node:fs/promises");
     const source = await readFile(new URL("../config.ts", import.meta.url), "utf8");
-
-    // Strip comments so prose describing the idiom does not trip the guard.
-    const code = source
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/^\s*\/\/.*$/gm, "");
-
-    // Deliberately wider than the literal `Number(process.env.X) ||` form the
-    // acceptance criteria grep for. Near-identical spellings have the same hole
-    // — `parseInt(process.env.X, 10) ||`, `Number(process.env["X"]) ?? …` — and
-    // with two in-flight PRs re-adding the idiom the next one is as likely to
-    // arrive in a variant as in the original spelling.
-    const offenders = [
-      ...code.matchAll(
-        /(?:Number|parseInt|parseFloat)\(\s*process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[\s*["'`]([A-Z_][A-Z0-9_]*)["'`]\s*\])[^)]*\)\s*(?:\|\||\?\?)/g,
-      ),
-    ]
-      .map((match) => match[1] ?? match[2])
-      .filter((envVar): envVar is string => envVar !== undefined && !ALLOWED_ENV_VARS.has(envVar));
+    const offenders = findBareNumericEnvIdioms(source);
 
     expect(
       offenders,
