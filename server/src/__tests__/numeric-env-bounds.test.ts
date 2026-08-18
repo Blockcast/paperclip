@@ -139,13 +139,55 @@ describe("timer periods cannot overflow a 32-bit delay (BLO-27641)", () => {
     process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
     process.env.PAPERCLIP_DEPLOYMENT_EXPOSURE = "private";
     process.env.PAPERCLIP_AUTH_BASE_URL_MODE = "explicit";
+    // Same reason as the suite above: this block drives every hostile input
+    // through loadConfig(), so the reject/clamp warnings are expected output
+    // rather than signal. Silence them so a real one stays visible.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    resetNumericSettingWarnings();
   });
 
   afterEach(() => {
     process.env = { ...originalEnv };
+    vi.restoreAllMocks();
+    resetNumericSettingWarnings();
   });
 
   const timerKeys = Object.keys(TIMER_SETTING_MS_FACTOR) as (keyof typeof TIMER_SETTING_MS_FACTOR)[];
+
+  it.each(Object.entries(NUMERIC_SETTING_BOUNDS))(
+    "%s declares min <= fallback <= max",
+    (_key, bounds) => {
+      // The only table error that can change a *resolved value* rather than
+      // just a message: `resolveNumericSetting` clamps the fallback too, so a
+      // mis-declared default does not throw — it silently resolves to a bound.
+      // The "resolves to the documented default" test would catch it, but only
+      // for ENV_ONLY_SETTINGS, which deliberately excludes the two settings a
+      // config file can also supply. This covers all eight.
+      expect(bounds.min).toBeLessThanOrEqual(bounds.fallback);
+      expect(bounds.fallback).toBeLessThanOrEqual(bounds.max);
+    },
+  );
+
+  it("declares a millisecond factor for every setting named like a timer period", () => {
+    // TIMER_SETTING_MS_FACTOR is a Partial<>, and the overflow assertion above
+    // iterates *its* keys — so a new timer setting added to the bounds table and
+    // passed to setInterval, but not added here, is invisible to that invariant
+    // and both guards still report green. Heuristic on the naming convention all
+    // four current timers follow, which is weaker than a type but is the only
+    // thing that can fail when the omission happens.
+    const timerLike = Object.keys(NUMERIC_SETTING_BOUNDS).filter((key) =>
+      /IntervalM(inutes|s)$/.test(key),
+    );
+    expect(timerLike.length).toBeGreaterThan(0);
+    for (const key of timerLike) {
+      expect(
+        Object.hasOwn(TIMER_SETTING_MS_FACTOR, key),
+        `${key} looks like a timer period but has no TIMER_SETTING_MS_FACTOR entry, so the ` +
+          `overflow ceiling is never asserted for it. Add the ms factor (or rename it if it ` +
+          `is not a delay).`,
+      ).toBe(true);
+    }
+  });
 
   it.each(timerKeys)("%s ceiling is itself under the overflow threshold", (key) => {
     // Static check on the declared table: the minute-denominated ceilings are
@@ -237,6 +279,32 @@ describe("resolveNumericSetting reports adjustments (BLO-27641)", () => {
     expect(String(warn.mock.calls[0]?.[0])).toContain("Infinity");
   });
 
+  it("names a non-finite *number* candidate rather than rendering it as null", () => {
+    // The string "Infinity" above is the variant that always worked. This is
+    // the one that did not: `JSON.stringify(Infinity)` is the string `null`, so
+    // the branch that exists to report a non-finite override was the one branch
+    // unable to name it — telling the operator to look for a literal `null`
+    // that is not in their file. Reachable from the config-file source, which
+    // is exactly where the operator has the least other signal about the key.
+    const warn = captureWarnings();
+    const fromConfigFile = JSON.parse("1e999") as number;
+    expect(fromConfigFile).toBe(Infinity);
+    expect(resolveNumericSetting([fromConfigFile], bounds, "databaseBackupIntervalMinutes")).toBe(
+      60,
+    );
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain("Infinity");
+    expect(message).not.toContain("null");
+  });
+
+  it("still quotes a string candidate, so a bad string stays distinct from a number", () => {
+    // The fix must not flatten the two sources together: quoting is the only
+    // thing that says whether the bad value came from an env var or a JSON number.
+    const warn = captureWarnings();
+    expect(resolveNumericSetting(["abc"], bounds, "prReconcilerWindowDays")).toBe(60);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('"abc"');
+  });
+
   it("stays silent when the override is honoured verbatim, or absent", () => {
     const warn = captureWarnings();
     expect(resolveNumericSetting(["50"], bounds, "heartbeatSchedulerIntervalMs")).toBe(50);
@@ -260,7 +328,7 @@ describe("resolveNumericSetting reports adjustments (BLO-27641)", () => {
   });
 });
 
-describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () => {
+describe("the bare idiom cannot be reintroduced (BLO-27641)", () => {
   /**
    * Automates the manual grep from the BLO-27641 acceptance criteria.
    *
@@ -292,9 +360,10 @@ describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () 
    *    is passed straight through to `Number`, so this shape is if anything
    *    weaker than the first.
    *
-   * The inside form is not hypothetical: it is the spelling live at three sites
-   * in `services/k8s-job-liveness.ts` today, which makes it the variant the next
-   * author is most likely to reach for.
+   * The inside form is not hypothetical: it is the spelling live in
+   * `services/k8s-job-liveness.ts` today (see SCANNED_SOURCES below for the
+   * exact set), which makes it the variant the next author is most likely to
+   * reach for.
    */
   const BARE_NUMERIC_ENV_IDIOM =
     /(?:Number|parseInt|parseFloat)\(\s*process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[\s*["'`]([A-Z_][A-Z0-9_]*)["'`]\s*\])(?:\s*(?:\|\||\?\?)|[^)]*\)\s*(?:\|\||\?\?))/g;
@@ -337,18 +406,61 @@ describe("the bare idiom cannot be reintroduced into config.ts (BLO-27641)", () 
     expect(findBareNumericEnvIdioms(snippet)).toEqual([]);
   });
 
-  it("has no unguarded numeric-env idiom outside the allowlist", async () => {
+  /**
+   * The files this guard scans, each with the offenders already live in it.
+   *
+   * `config.ts` is what BLO-27641 cleans, so its list is empty and must stay
+   * empty. `k8s-job-liveness.ts` is deliberately *not* fixed here — that is
+   * BLO-28664 — but it is scanned anyway, because a detector that demonstrably
+   * catches five live instances while pointed only at a file where it catches
+   * zero leaves the class unguarded in the one place we know it is live. Listing
+   * the known offenders instead of skipping the file makes this a ratchet: a
+   * *sixth* instance turns the guard red, and the count is executable rather
+   * than a prose number that silently rots (it already had — this list was
+   * described as "three sites" when the detector matched five).
+   *
+   * Both directions are intentional. Fixing a site under BLO-28664 also turns
+   * this red, which is the prompt to delete it from the list.
+   */
+  const SCANNED_SOURCES: { readonly path: string; readonly knownOffenders: readonly string[] }[] = [
+    { path: "../config.ts", knownOffenders: [] },
+    {
+      // Tracked in BLO-28664. All five are the `Number(process.env.X ?? "D")`
+      // spelling. Consequences at Infinity, which are not uniform:
+      //  - JOB_LIVENESS_TIMEOUT_MS: AbortSignal.timeout() throws RangeError, so
+      //    every k8s API call fails — loud, unlike the rest.
+      //  - STALE_JOB_DELETE_CONFIRM_ATTEMPTS: `attempt < Infinity` never
+      //    terminates, so the "fail closed" delete-confirm budget is absent.
+      //  - STALE_JOB_DELETE_CONFIRM_DELAY_MS: a setTimeout delay, so it takes
+      //    the 1ms overflow coercion — which with the unbounded attempts above
+      //    is a hot loop against the k8s API, not a slow retry.
+      //  - FAILURE_LOG_TAIL_LINES / _MAX_BYTES: `length > Infinity` is always
+      //    false, so the transcript is never truncated.
+      path: "../services/k8s-job-liveness.ts",
+      knownOffenders: [
+        "PAPERCLIP_K8S_JOB_LIVENESS_TIMEOUT_MS",
+        "PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_ATTEMPTS",
+        "PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_DELAY_MS",
+        "PAPERCLIP_K8S_FAILURE_LOG_TAIL_LINES",
+        "PAPERCLIP_K8S_FAILURE_LOG_TAIL_MAX_BYTES",
+      ],
+    },
+  ];
+
+  it.each(SCANNED_SOURCES)("$path has exactly its known numeric-env offenders", async (entry) => {
     const { readFile } = await import("node:fs/promises");
-    const source = await readFile(new URL("../config.ts", import.meta.url), "utf8");
+    const source = await readFile(new URL(entry.path, import.meta.url), "utf8");
     const offenders = findBareNumericEnvIdioms(source);
 
     expect(
-      offenders,
-      `${offenders.join(", ")} use a bare \`Number(process.env.X) || DEFAULT\`-style ` +
-        `fallback, which resolves to Infinity for "Infinity"/"1e999" and overflows a ` +
-        `32-bit timer for any value above ${MAX_TIMER_DELAY_MS}ms. Use ` +
-        `resolveNumericSetting() with an entry in NUMERIC_SETTING_BOUNDS instead ` +
-        `(and TIMER_SETTING_MS_FACTOR if it is a timer).`,
-    ).toEqual([]);
+      [...offenders].sort(),
+      `${entry.path}: expected exactly [${entry.knownOffenders.join(", ")}] but found ` +
+        `[${offenders.join(", ")}]. A NEW name here uses a bare ` +
+        `\`Number(process.env.X) || DEFAULT\`-style fallback, which resolves to Infinity for ` +
+        `"Infinity"/"1e999" and overflows a 32-bit timer for any value above ` +
+        `${MAX_TIMER_DELAY_MS}ms — use resolveNumericSetting() with an entry in ` +
+        `NUMERIC_SETTING_BOUNDS instead (and TIMER_SETTING_MS_FACTOR if it is a timer). ` +
+        `A MISSING name means you fixed one under BLO-28664: delete it from knownOffenders.`,
+    ).toEqual([...entry.knownOffenders].sort());
   });
 });
