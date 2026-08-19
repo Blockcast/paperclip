@@ -706,7 +706,14 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // still terminates at the existing `clearIssueMonitorAndRecover` path that
   // hands the strand to the recovery lane, rather than deferring silently and
   // indefinitely. This is the assertion that separates "survives" from "spins".
-  it("consumes an attempt on each blocker-suppressed deferral so it stays bounded (BLO-22048)", async () => {
+  //
+  // Scope note: this covers the FIRST deferral only, and deletes the park before
+  // asserting. The next test covers the second deferral, where the park is still
+  // present and the coalesce branch runs; the terminal test below covers the
+  // exhaustion boundary itself. Keep the three distinct — an earlier version of
+  // this test was named as though it covered all deferrals and that overclaim is
+  // precisely what hid the coalesce defect.
+  it("consumes an attempt on the first blocker-suppressed deferral (BLO-22048)", async () => {
     const { companyId, issueId } = await seedFixture();
 
     const blockerId = randomUUID();
@@ -745,6 +752,70 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(afterFirst.monitorNextCheckAt).not.toBeNull();
     expect(afterFirst.monitorAttemptCount).toBe(1);
     expect(parseIssueExecutionState(afterFirst.executionState)?.monitor?.status).toBe("scheduled");
+  });
+
+  // BLO-22048 (second deferral): the FIRST dep-blocked fire is the one that
+  // creates the park, so `enqueueWakeup` returns `{ kind: "dep_blocked_scheduled" }`
+  // and sets the sink. Every LATER fire meets an existing park and takes the
+  // coalesce branch instead, returning `{ kind: "coalesced", run }` — a truthy
+  // run — so the sink stays null and the triggered patch destroys the monitor
+  // exactly as it did before the fix. Neither test above reaches this state:
+  // both delete the park before firing again.
+  it("keeps the monitor armed on the SECOND blocker-suppressed deferral (BLO-22048)", async () => {
+    const { companyId, issueId } = await seedFixture();
+
+    const blockerId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:31:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    const afterFirst = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterFirst.monitorNextCheckAt).not.toBeNull();
+    expect(afterFirst.monitorAttemptCount).toBe(1);
+
+    // Fire again at the re-armed instant with the park STILL PRESENT — the state
+    // the real scheduler is actually in on every deferral after the first.
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: afterFirst.monitorNextCheckAt!,
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    const afterSecond = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    // The second wake ran no turn either, so the monitor must still survive.
+    expect(afterSecond.monitorNextCheckAt).not.toBeNull();
+    expect(afterSecond.monitorAttemptCount).toBe(2);
+    expect(normalizeIssueExecutionPolicy(afterSecond.executionPolicy ?? null)?.monitor ?? null).not.toBeNull();
   });
 
   // BLO-22048 (boundary, pre-fix history): before the fix the monitor was
