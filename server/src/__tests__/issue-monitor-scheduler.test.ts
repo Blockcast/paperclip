@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRelations,
   issues,
   workspaceOperations,
   workspaceRuntimeServices,
@@ -122,6 +123,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(workspaceRuntimeServices);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
+    await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -615,6 +617,140 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(heartbeatRuns.agentId, participantAgentId));
     expect(participantRuns).toHaveLength(1);
     expect(participantRuns[0]?.errorCode).not.toBe("issue_assignee_changed");
+  });
+
+  // BLO-22048: when a monitor fires on an issue whose blockers are unresolved,
+  // `enqueueWakeup` converts the wake into a `dependency_blocked` scheduled_retry
+  // park and returns `{ kind: "dep_blocked_scheduled" }` WITHOUT throwing
+  // (heartbeat.ts:28095). `dispatchClaimedIssueMonitor` discards that return value
+  // (heartbeat.ts:11300) and unconditionally applies
+  // `buildIssueMonitorTriggeredPatch`, which nulls `monitorNextCheckAt` AND
+  // strips `executionPolicy.monitor`. The monitor is therefore DESTROYED for a
+  // wake that never ran, and nothing re-arms it once the park exhausts.
+  //
+  // Contrast heartbeat.ts:28768, where a different caller of the same function
+  // *does* branch on `kind === "dep_blocked_scheduled"`.
+  it("keeps the monitor armed when the wake is suppressed by an unresolved blocker (BLO-22048)", async () => {
+    const { companyId, issueId, nextCheckAt } = await seedFixture();
+
+    const blockerId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = createHeartbeat();
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: triggeredAt,
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    // Precondition: the wake really was suppressed into a dep-blocked park,
+    // i.e. no turn ever executed for this monitor fire.
+    const parked = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+
+    // Release the park before asserting: a `scheduled_retry` row counts as an
+    // active run, and the shared teardown helper blocks until none remain. Doing
+    // this up front keeps a failing assertion from cascading into a 5s
+    // teardown timeout that obscures the real diagnostic.
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    expect(parked).toHaveLength(1);
+
+    // The wake never ran, so the monitor must survive to fire again.
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).not.toBeNull();
+
+    // And the issue must not claim a trigger that never happened.
+    expect(activity.map((row) => row.action)).not.toContain("issue.monitor_triggered");
+  });
+
+  // BLO-22048 (bound): the destroyed monitor leaves the issue in state
+  // `triggered` with a null `monitorNextCheckAt`. The ONLY thing that recovers
+  // that shape is `tickExpiredIssueMonitors` (BLO-25865) — and its predicate
+  // requires `timeoutAt is not null`. So a monitor armed WITHOUT a timeoutAt
+  // (the default; `seedFixture`'s monitor and BLO-22048's own live monitor both
+  // have `timeoutAt: null`) has no recovery path at all, while one armed WITH a
+  // timeoutAt does eventually recover. This test pins that boundary, because it
+  // is what separates "permanently dark" from "dark until the timeout".
+  it("recovers a blocker-suppressed monitor only when it was armed with a timeoutAt (BLO-22048)", async () => {
+    const timeoutAt = new Date("2026-04-11T13:00:00.000Z");
+    const { companyId, issueId } = await seedFixture({
+      monitor: { timeoutAt: timeoutAt.toISOString() },
+    });
+
+    const blockerId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:31:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    // Same destruction as the test above, and the monitor is now `triggered`.
+    const afterTrigger = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterTrigger.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(afterTrigger.executionState)?.monitor?.status).toBe("triggered");
+
+    // Past the timeoutAt, the BLO-25865 sweep does pick it back up.
+    const recovered = await heartbeat.__test_tickExpiredIssueMonitors(
+      new Date("2026-04-11T13:30:00.000Z"),
+    );
+    expect(recovered.checked).toBe(1);
+
+    // The recovery enqueues real work; drain it so the shared teardown helper
+    // (which blocks until no run is queued/running/scheduled_retry) can settle.
+    await heartbeat.drainInFlightExecutions(60_000);
+    await db.delete(heartbeatRuns);
   });
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {
