@@ -26,6 +26,10 @@
 // genuine failures (e2e job 96224412919, policy job 96228076444) carried
 // "Process completed with exit code 1." and a non-empty one.
 //
+// One case defeats both signals and is therefore handled as an override ahead
+// of them: a `timeout-minutes` expiry, which GitHub renders in the same shape as
+// a kill. See JOB_TIMEOUT_PATTERNS below.
+//
 // Deliberately NOT in scope: re-running the killed lane. This labels the
 // outcome; it does not change the gate. `verify` still exits non-zero either
 // way — a PR is never merged on the strength of an infrastructure kill.
@@ -37,6 +41,22 @@ const RUNNER_LOSS_PATTERNS = [
   /the self-hosted runner.*lost communication/i,
 ];
 
+// A `timeout-minutes` expiry is NOT a pool kill, and it is invisible to both
+// signals above because it presents in exactly the same shape: GitHub cancels
+// the job, records `conclusion: failure`, emits "The operation was canceled."
+// (matching signal 1) and leaves the in-flight step at a non-`failure`
+// conclusion (matching signal 2). The two signals are independent in general
+// but not here — they agree on the wrong answer.
+//
+// Every lane in pr.yml sets a timeout (general_tests 90m, typecheck 40m,
+// build 20m), so a hung, deadlocked or pathologically slow test introduced by
+// the diff would otherwise be announced as "KILLED MID-JOB by the CI runner
+// pool… not a defect in this PR's diff… Re-run the job" — inverting this
+// script's purpose and turning a real red into an invitation to re-run
+// forever. Not hypothetical here: a degraded npm registry already converted a
+// fast red into a `policy` timeout once (BLO-28813).
+const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
+
 /**
  * Classify a single Actions job as an infrastructure kill or a real failure.
  *
@@ -47,10 +67,22 @@ const RUNNER_LOSS_PATTERNS = [
 export function classifyJobFailure(job, annotations = []) {
   if (job?.conclusion !== "failure") return "reported";
 
-  const runnerLoss = annotations.some(
-    (annotation) =>
-      annotation?.annotation_level === "failure" &&
-      RUNNER_LOSS_PATTERNS.some((pattern) => pattern.test(annotation?.message ?? "")),
+  const failureAnnotations = annotations.filter(
+    (annotation) => annotation?.annotation_level === "failure",
+  );
+
+  // Consulted BEFORE either signal, and deliberately an override rather than a
+  // tie-breaker: signal 2 fires on an empty failing-step set ALONE, so a
+  // timeout would still be excused no matter how the two signals were weighed
+  // against each other. Same asymmetry argument that makes signal 1
+  // independent rather than a tie-breaker.
+  const timedOut = failureAnnotations.some((annotation) =>
+    JOB_TIMEOUT_PATTERNS.some((pattern) => pattern.test(annotation?.message ?? "")),
+  );
+  if (timedOut) return "reported";
+
+  const runnerLoss = failureAnnotations.some((annotation) =>
+    RUNNER_LOSS_PATTERNS.some((pattern) => pattern.test(annotation?.message ?? "")),
   );
   if (runnerLoss) return "infrastructure";
 
@@ -160,7 +192,11 @@ async function main() {
   }
 
   const jobs = [];
-  for (let page = 1; ; page += 1) {
+  // Structurally bounded rather than dependent on the API always returning a
+  // short final page: 20 pages × 100 is far above any plausible run size, and a
+  // pathological response can no longer spin here forever.
+  const MAX_JOB_PAGES = 20;
+  for (let page = 1; page <= MAX_JOB_PAGES; page += 1) {
     const payload = await githubJson(
       `/actions/runs/${runId}/jobs?per_page=100&page=${page}&filter=latest`,
       token,
