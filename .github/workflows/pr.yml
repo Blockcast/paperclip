@@ -75,6 +75,20 @@ jobs:
         with:
           node-version: 24
 
+      - name: Setup actionlint
+        uses: ./.github/actions/setup-actionlint
+
+      - name: Validate workflow files parse (BLO-23511)
+        # Runs before the runner-label check on purpose: that checker scans
+        # these same files line by line, which a structurally broken file
+        # passes happily. An unparseable workflow emits zero jobs, so it
+        # fails nothing and every required check stays green — this is the
+        # step that turns that silence into a red.
+        run: node ./scripts/check-workflows-parse.mjs
+
+      - name: Test workflow-parse gate (BLO-23511)
+        run: node --test ./scripts/check-workflows-parse.test.mjs
+
       - name: Validate ARC runner labels
         run: node ./scripts/check-github-runner-labels.mjs
 
