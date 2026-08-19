@@ -54,6 +54,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueParkedDispositionInput,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -3517,6 +3518,14 @@ const issueListSelect = {
   monitorAttemptCount: issues.monitorAttemptCount,
   monitorNotes: issues.monitorNotes,
   monitorScheduledBy: issues.monitorScheduledBy,
+  // BLO-27912: the deliberate-park disposition, projected alongside the monitor columns it
+  // is modelled on. Listed explicitly because a park has to stay VISIBLE — suppressing the
+  // liveness invariants silently is the failure this disposition exists to avoid, so the
+  // list surface must be able to show that a row is parked, by whom, why, and until when.
+  parkedUntil: issues.parkedUntil,
+  parkedReason: issues.parkedReason,
+  parkedByAgentId: issues.parkedByAgentId,
+  parkedAt: issues.parkedAt,
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,

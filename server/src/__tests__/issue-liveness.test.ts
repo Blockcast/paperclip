@@ -315,7 +315,7 @@ describe("issue graph liveness classifier", () => {
     });
   });
 
-
+  it("does not flag an unassigned blocker that already has an active execution path", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [
         issue(),
