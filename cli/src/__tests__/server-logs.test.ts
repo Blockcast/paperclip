@@ -88,4 +88,54 @@ describe("readServerLogTail", () => {
     expect(report).toContain("short");
     expect(report).not.toContain("last ");
   });
+
+  it("budgets in BYTES, not UTF-16 code units", () => {
+    const dir = path.join(root, "logs");
+    mkdirSync(dir);
+    // The server logs through pino-pretty, whose box glyphs are 3 bytes each.
+    // "◇◇◇◇TAIL" is 8 code units but 16 bytes, so a char-counting
+    // implementation reads a 8-unit budget as "the whole thing fits" and
+    // reports no truncation at all -- while silently admitting 2x the bytes
+    // the caller asked for.
+    writeFileSync(path.join(dir, "server.log"), "◇◇◇◇TAIL");
+
+    const report = readServerLogTail(dir, 8);
+
+    expect(report).toContain("TAIL");
+    expect(report).toContain("last 8 of 16 bytes");
+    // All four glyphs surviving would mean nothing was actually trimmed.
+    expect(report).not.toContain("◇◇◇◇");
+  });
+
+  it("treats a zero budget as a floor, not as unlimited", () => {
+    const dir = path.join(root, "logs");
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, "server.log"), "abcdef");
+
+    // `slice(-0)` is `slice(0)` -- the whole string -- so the natural spelling
+    // turns "give me nothing" into "give me everything", which is how a
+    // failure message ends up carrying an entire log.
+    const report = readServerLogTail(dir, 0);
+
+    expect(report).not.toContain("abcdef");
+    expect(report).toContain("last 1 of 6 bytes");
+  });
+
+  it("reports an unreadable entry without losing the readable ones", () => {
+    const dir = path.join(root, "logs");
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, "a-server.log"), "readable body");
+    // A directory entry, not a permission trick: `chmod 000` is still readable
+    // as root, so it cannot exercise this branch in a container that runs as
+    // uid 0. `readFileSync` on a directory throws EISDIR on every platform and
+    // every uid -- and a rotated-log subdirectory is a plausible real layout.
+    mkdirSync(path.join(dir, "b-rotated"));
+
+    const report = readServerLogTail(dir);
+
+    expect(report).toContain("readable body");
+    expect(report).toContain("b-rotated");
+    expect(report).toContain("unreadable");
+    expect(report).toContain("EISDIR");
+  });
 });

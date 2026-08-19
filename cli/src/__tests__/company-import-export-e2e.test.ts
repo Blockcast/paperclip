@@ -247,7 +247,7 @@ async function runCliJson<T>(
 
 // The server is configured with logging.mode "file" (see writeTestConfig), so
 // its own diagnostics go to serverLogDir -- NOT to the stdout/stderr this test
-// captures from the child process. Before BLO-28813's sibling fix, a failed
+// captures from the child process. Until BLO-28818 (this change), a failed
 // startup probe reported two empty strings and afterAll then deleted the only
 // artifact that could explain the stall.
 async function waitForServer(
@@ -261,9 +261,16 @@ async function waitForServer(
     `stdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}\nserver logs:\n${readServerLogTail(logDir)}`;
 
   while (Date.now() - startedAt < SERVER_STARTUP_TIMEOUT_MS) {
-    if (child.exitCode !== null) {
+    // `exitCode` alone cannot detect a signal kill: Node leaves it null both
+    // while the child is running AND after it dies from a signal, recording the
+    // signal in `signalCode` instead. Checking only exitCode therefore misses
+    // exactly the death this test most needs to catch -- an OOM-kill of a
+    // server sharing a CI shard with embedded Postgres -- and would poll out
+    // the full startup budget before reporting a stall that was really a death.
+    if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(
-        `paperclipai run exited before healthcheck succeeded (code ${child.exitCode} after ${Date.now() - startedAt}ms).\n${diagnostics()}`,
+        `paperclipai run exited before healthcheck succeeded ` +
+          `(exitCode=${child.exitCode} signalCode=${child.signalCode} after ${Date.now() - startedAt}ms).\n${diagnostics()}`,
       );
     }
 
@@ -277,8 +284,13 @@ async function waitForServer(
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
+  // Report the observed pair rather than asserting the process is alive. The
+  // loop above should have caught a death, but a diagnostic that states
+  // liveness as fact is exactly the kind of claim that sent this investigation
+  // down the wrong path once already.
   throw new Error(
-    `Timed out waiting for ${apiBase}/api/health after ${SERVER_STARTUP_TIMEOUT_MS}ms (process still alive).\n${diagnostics()}`,
+    `Timed out waiting for ${apiBase}/api/health after ${SERVER_STARTUP_TIMEOUT_MS}ms ` +
+      `(exitCode=${child.exitCode} signalCode=${child.signalCode}).\n${diagnostics()}`,
   );
 }
 
