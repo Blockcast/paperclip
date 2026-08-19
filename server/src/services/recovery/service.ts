@@ -8245,11 +8245,50 @@ export function recoveryService(
     return lastActivityAt <= staleAt;
   }
 
+  /**
+   * The two re-escalation suppression windows, normalized once (BLO-27676
+   * review). Read by BOTH the preview and the run: they are paired operator
+   * endpoints, so a default that drifts between them makes the preview describe
+   * a run nobody can trigger. Sharing the normalization is what keeps
+   * `recoverableFindings` and `escalationsCreated` answerable from one rule.
+   */
+  function normalizeLivenessSuppressionWindows(opts?: {
+    reescalationCooldownMs?: number;
+    unchangedTargetSuppressionMs?: number;
+  }) {
+    return {
+      reescalationCooldownMs: Math.max(
+        0,
+        Math.floor(
+          asNumber(opts?.reescalationCooldownMs, DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS),
+        ),
+      ),
+      unchangedTargetSuppressionMs: Math.max(
+        0,
+        Math.floor(
+          asNumber(
+            opts?.unchangedTargetSuppressionMs,
+            DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+          ),
+        ),
+      ),
+    };
+  }
+
   async function buildIssueGraphLivenessAutoRecoveryPreview(
-    opts?: { lookbackHours?: number; now?: Date },
+    opts?: {
+      lookbackHours?: number;
+      now?: Date;
+      // Same knobs the run takes, for the same reason: an operator who previews
+      // with the documented rollback lever must see the run that lever produces.
+      reescalationCooldownMs?: number;
+      unchangedTargetSuppressionMs?: number;
+    },
   ): Promise<IssueGraphLivenessAutoRecoveryPreview> {
     const now = opts?.now ?? new Date();
     const lookbackHours = normalizeIssueGraphLivenessAutoRecoveryLookbackHours(opts?.lookbackHours);
+    const { reescalationCooldownMs, unchangedTargetSuppressionMs } =
+      normalizeLivenessSuppressionWindows(opts);
     // `lookbackHours` is now a min-staleness threshold (post-2026-05-06
     // RCA gate inversion). A finding is escalation-eligible when its
     // recoveryIssue hasn't seen meaningful activity since this cutoff.
@@ -8266,11 +8305,39 @@ export function recoveryService(
     const recoveryById = new Map(recoveryRows.map((row) => [row.id, row]));
     const items: IssueGraphLivenessAutoRecoveryPreviewItem[] = [];
     let skippedNotYetStale = 0;
+    let skippedReescalationCooldown = 0;
+    let skippedUnchangedTarget = 0;
 
     for (const finding of findings) {
       const lastActivityAt = recoveryIssueLastActivityForFinding(finding, activityByIssueKey);
       if (!isLivenessFindingStaleEnoughForEscalation(finding, staleAt, activityByIssueKey)) {
         skippedNotYetStale += 1;
+        continue;
+      }
+      // Apply the same re-escalation suppressors the run applies (BLO-27676
+      // review). Without this the preview counts every stale finding while the
+      // run creates only the unsuppressed ones, and the operator surface states
+      // the difference as a promise -- the confirm dialog's button is literally
+      // labelled "Enable and create {recoverableFindings}"
+      // (`ui/src/pages/InstanceExperimentalSettings.tsx`). The divergence
+      // pre-dates BLO-27676 but its magnitude did not: the cooldown alone could
+      // only over-report on findings resolved within the last hour, whereas the
+      // target-state gate spans 7d and selects exactly the population an
+      // operator previews -- leaves already reported once and since quiet. The
+      // steady state was a preview listing n and a run creating zero.
+      //
+      // Cost is one indexed `select` per stale finding, plus a leaf read only
+      // for findings that reach the target-state branch -- the same per-finding
+      // cost the run already pays, on a read-only operator-triggered endpoint.
+      const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
+        finding,
+        now,
+        reescalationCooldownMs,
+        unchangedTargetSuppressionMs,
+      );
+      if (suppressed) {
+        skippedReescalationCooldown += 1;
+        if (suppressed.reason === "unchanged_target") skippedUnchangedTarget += 1;
         continue;
       }
       const recoveryIssue = recoveryById.get(finding.recoveryIssueId);
@@ -8298,6 +8365,15 @@ export function recoveryService(
       findings: findings.length,
       recoverableFindings: items.length,
       skippedOutsideLookback: skippedNotYetStale,
+      // Named to match the run's counters so the two responses compare
+      // field-for-field. Residual divergence, deliberately not covered here: a
+      // finding whose incident already has an OPEN escalation returns `existing`
+      // from the run and creates no row, and the preview still lists it. That
+      // one is rare by construction -- an open escalation contributes a waiting
+      // path for its own leaf, so the finding is usually not collected at all --
+      // and its magnitude is unchanged by BLO-27676, unlike these two.
+      skippedReescalationCooldown,
+      skippedUnchangedTarget,
       items,
     };
   }
@@ -9325,19 +9401,10 @@ export function recoveryService(
     // RCA gate inversion). Escalate when an issue has been silently quiet
     // for at least this long.
     const staleAt = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
-    const reescalationCooldownMs = Math.max(
-      0,
-      Math.floor(asNumber(opts?.reescalationCooldownMs, DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS)),
-    );
-    const unchangedTargetSuppressionMs = Math.max(
-      0,
-      Math.floor(
-        asNumber(
-          opts?.unchangedTargetSuppressionMs,
-          DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
-        ),
-      ),
-    );
+    // Shared with the preview so the paired operator endpoints cannot disagree
+    // about the default windows (BLO-27676 review).
+    const { reescalationCooldownMs, unchangedTargetSuppressionMs } =
+      normalizeLivenessSuppressionWindows(opts);
     const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
     const activityByIssueKey = await loadLivenessRecoveryIssueLastActivityByKey(findings);
     const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();

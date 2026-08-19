@@ -158,5 +158,17 @@ export interface IssueGraphLivenessAutoRecoveryPreview {
   findings: number;
   recoverableFindings: number;
   skippedOutsideLookback: number;
+  // Re-escalation suppression, reported with the same field names the run
+  // returns so preview and run compare directly (BLO-27676 review). Without
+  // these the preview counted stale findings while the run created only the
+  // unsuppressed ones, and `recoverableFindings` -- which the confirm dialog
+  // renders as "Enable and create N" -- overstated the run by up to the 7d
+  // target-state window per leaf.
+  //
+  // Aggregate across BOTH suppressors; the cooldown-only count is the
+  // difference between the two.
+  skippedReescalationCooldown: number;
+  // Subset of the above attributable to the target-state gate.
+  skippedUnchangedTarget: number;
   items: IssueGraphLivenessAutoRecoveryPreviewItem[];
 }

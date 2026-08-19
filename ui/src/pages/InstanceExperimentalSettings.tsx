@@ -146,6 +146,25 @@ function RecoveryPreviewDialog({
           </p>
         ) : null}
 
+        {/*
+          The suppressed count has to be shown, not just subtracted: without it a
+          preview of an already-reported backlog reads as "nothing is wrong"
+          rather than "everything here has already been escalated once and the
+          target has not moved since" (BLO-27676 review).
+        */}
+        {preview && preview.skippedReescalationCooldown > 0 ? (
+          <p className="text-xs text-muted-foreground">
+            {preview.skippedReescalationCooldown} current{" "}
+            {preview.skippedReescalationCooldown === 1 ? "finding has" : "findings have"} already been escalated and
+            resolved, and will not be re-raised.
+            {preview.skippedUnchangedTarget > 0
+              ? ` ${preview.skippedUnchangedTarget} of ${
+                preview.skippedUnchangedTarget === 1 ? "those is" : "those are"
+              } held until the target changes.`
+              : null}
+          </p>
+        ) : null}
+
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isPending}>
             Cancel
