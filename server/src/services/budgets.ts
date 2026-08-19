@@ -343,7 +343,14 @@ async function markApprovalStatus(
       decidedAt: new Date(),
       updatedAt: new Date(),
     })
-    .where(eq(approvals.id, approvalId));
+    // Guarded on `pending` so an already-decided or withdrawn card cannot be
+    // rewritten. `resolveIncident` fetches its incident by id with no status
+    // filter, so a stale client can submit against an incident that was already
+    // closed -- e.g. the soft incident whose card `resolveOpenSoftIncidents`
+    // withdrew when the hard cap was crossed. Without this guard that submission
+    // would overwrite the withdrawn card's decisionNote/decidedAt and report a
+    // decision that never happened.
+    .where(and(eq(approvals.id, approvalId), eq(approvals.status, "pending")));
 }
 
 export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
@@ -488,7 +495,11 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     thresholdType: BudgetThresholdType,
     amountObserved: number,
   ) {
-    const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
+    // One instant for the whole card: the window bounds, the burn measurement and
+    // the projected exhaustion date are all relative to `now`, and taking three
+    // separate `new Date()` readings would let the payload disagree with itself.
+    const now = new Date();
+    const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind, now);
     const existing = await db
       .select()
       .from(budgetIncidents)
@@ -504,7 +515,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     if (existing) return { incident: existing, created: false };
 
     const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
-    const burn = await computeWindowBurn(db, policy, amountObserved);
+    const burn = await computeWindowBurn(db, policy, amountObserved, now);
     const payload = buildApprovalPayload({
       policy,
       scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
@@ -513,6 +524,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       windowStart: start,
       windowEnd: end,
       burn,
+      now,
     });
 
     // Both thresholds file the card. Before BLO-28793 only `hard` did, which put
@@ -587,11 +599,31 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     // The hard card filed moments later says the same thing more urgently, so withdraw
     // the soft one as superseded instead of leaving an undecidable row on the board.
     for (const row of openSoftRows) {
-      await withdrawSupersededApproval(row.approvalId ?? null, row.companyId);
+      await withdrawPendingApproval(
+        row.approvalId ?? null,
+        row.companyId,
+        "Superseded by the hard-cap override request for the same policy.",
+        "superseded_by_hard_threshold",
+      );
     }
   }
 
-  async function withdrawSupersededApproval(approvalId: string | null, companyId: string) {
+  /**
+   * Close out a board card whose incident is being closed without a decision.
+   *
+   * Every path that closes a `budget_incidents` row must settle the card attached
+   * to it. Before BLO-28793 only `hard` incidents carried an `approvalId` and the
+   * one open hard incident was always the one being decided, so this could not
+   * arise; now that a `soft` incident carries one too, any path that resolves
+   * incidents in bulk can strand a `pending` card that no remaining open incident
+   * can ever resolve.
+   */
+  async function withdrawPendingApproval(
+    approvalId: string | null,
+    companyId: string,
+    decisionNote: string,
+    reason: string,
+  ) {
     if (!approvalId) return;
     const now = new Date();
     // Status-guarded so a board decision that landed first wins rather than being
@@ -600,7 +632,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       .update(approvals)
       .set({
         status: "withdrawn",
-        decisionNote: "Superseded by the hard-cap override request for the same policy.",
+        decisionNote,
         decidedAt: now,
         updatedAt: now,
       })
@@ -616,7 +648,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       action: "approval.withdrawn",
       entityType: "approval",
       entityId: approvalId,
-      details: { type: "budget_override_required", reason: "superseded_by_hard_threshold" },
+      details: { type: "budget_override_required", reason },
     });
   }
 
@@ -639,9 +671,26 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       })
       .where(and(eq(budgetIncidents.policyId, policyId), eq(budgetIncidents.status, "open")));
 
-    if (!approvalStatus || !decidedByUserId) return;
+    if (approvalStatus && decidedByUserId) {
+      for (const row of openRows) {
+        await markApprovalStatus(db, row.approvalId ?? null, approvalStatus, "Resolved via budget update", decidedByUserId);
+      }
+      return;
+    }
+
+    // No deciding actor. `upsertPolicy` reaches this branch whenever the caller is
+    // not the board -- see the `actorUserId ? "approved" : null` call sites below
+    // and `server/src/routes/costs.ts`, which passes `null` outright. The incidents
+    // were just closed above, so returning here would leave their cards `pending`
+    // with nothing left to decide them: exactly the leak resolveOpenSoftIncidents
+    // avoids. Withdraw instead of stranding them (BLO-28793).
     for (const row of openRows) {
-      await markApprovalStatus(db, row.approvalId ?? null, approvalStatus, "Resolved via budget update", decidedByUserId);
+      await withdrawPendingApproval(
+        row.approvalId ?? null,
+        row.companyId,
+        "Withdrawn automatically: the budget policy was updated and this incident is no longer open.",
+        "incident_closed_without_decision",
+      );
     }
   }
 
@@ -784,10 +833,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           await resolveOpenIncidentsForPolicy(row.id, actorUserId ? "approved" : null, actorUserId);
         } else {
           const softThreshold = Math.ceil((row.amount * row.warnPercent) / 100);
-          if (row.notifyEnabled && observedAmount >= softThreshold) {
+          const hardStopWillFire = row.hardStopEnabled && observedAmount >= row.amount;
+          // Same gate as evaluateCostEvent: do not file a warn card the hard
+          // branch below is about to withdraw in the same call.
+          if (row.notifyEnabled && observedAmount >= softThreshold && !hardStopWillFire) {
             await createIncidentIfNeeded(row, "soft", observedAmount);
           }
-          if (row.hardStopEnabled && observedAmount >= row.amount) {
+          if (hardStopWillFire) {
             await resolveOpenSoftIncidents(row.id);
             await createIncidentIfNeeded(row, "hard", observedAmount);
             await pauseAndCancelScopeForBudget(row);
@@ -858,8 +910,17 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         if (policy.metric !== "billed_cents" || policy.amount <= 0) continue;
         const observedAmount = await computeObservedAmount(db, policy);
         const softThreshold = Math.ceil((policy.amount * policy.warnPercent) / 100);
+        const hardStopWillFire = policy.hardStopEnabled && observedAmount >= policy.amount;
 
-        if (policy.notifyEnabled && observedAmount >= softThreshold) {
+        // Skip the warn card only when the hard branch below is about to run in
+        // this same evaluation and immediately withdraw it -- a single cost event
+        // can jump from under the warn threshold to over the cap, and filing a
+        // card no board member could ever see just to withdraw it two statements
+        // later puts a decision in the activity log that never happened. The gate
+        // is "the hard path will fire", not "observed >= amount": with
+        // `hardStopEnabled: false` nothing else would ever notify, and the warn
+        // card is the only signal that scope has blown its cap.
+        if (policy.notifyEnabled && observedAmount >= softThreshold && !hardStopWillFire) {
           const softIncident = await createIncidentIfNeeded(policy, "soft", observedAmount);
           if (softIncident?.created) {
             await logActivity(db, {
@@ -1101,6 +1162,16 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         }
 
         await resumeScopeFromBudget(policy);
+        const otherOpenRows = await db
+          .select()
+          .from(budgetIncidents)
+          .where(
+            and(
+              eq(budgetIncidents.policyId, policy.id),
+              eq(budgetIncidents.status, "open"),
+              ne(budgetIncidents.id, incident.id),
+            ),
+          );
         await db
           .update(budgetIncidents)
           .set({
@@ -1111,6 +1182,19 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
 
         await markApprovalStatus(db, incident.approvalId ?? null, "approved", input.decisionNote, actorUserId);
+        // Raising the cap closes *every* open incident for the policy, but only the
+        // one the board acted on gets a decision. A policy can now hold two open
+        // incidents at once -- soft and hard both carry a card since BLO-28793 --
+        // so withdraw the cards belonging to the ones closed as a side effect
+        // rather than leaving them pending against a resolved incident.
+        for (const row of otherOpenRows) {
+          await withdrawPendingApproval(
+            row.approvalId ?? null,
+            row.companyId,
+            "Withdrawn automatically: the budget was raised in response to another incident on this policy.",
+            "incident_closed_without_decision",
+          );
+        }
       } else {
         await db
           .update(budgetIncidents)

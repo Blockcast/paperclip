@@ -341,6 +341,9 @@ describe("budgetService", () => {
         amount: 100,
       }],
       [{ total: 120 }],
+      // resolveIncident() reads the *other* open incidents for the policy so it
+      // can withdraw their cards when the raise closes them (BLO-28793); none here.
+      [],
       [{ id: "approval-1", status: "approved" }],
       [{
         companyId: "company-1",
@@ -700,6 +703,215 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     expect(cardsAfter[0]!.idempotencyKey).toBe(
       `budget:${policy!.id}:soft:${incidentRows[0]!.windowStart.toISOString()}`,
     );
+  });
+
+  it("settles the warn card on every path that closes its incident, and never rewrites a decided card (BLO-28793 review)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+
+    const [policy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 100_000,
+        warnPercent: 80,
+        hardStopEnabled: true,
+        notifyEnabled: true,
+        isActive: true,
+      })
+      .returning();
+
+    const warnEvent = await insertCostEvent({ companyId, agentId, costCents: 85_000 });
+    await service.evaluateCostEvent(warnEvent);
+
+    const softCards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(softCards).toHaveLength(1);
+    expect(softCards[0]).toMatchObject({ status: "pending" });
+
+    // A non-board caller reaches upsertPolicy with actorUserId === null -- the
+    // agent-update route in routes/costs.ts passes it literally. That branch
+    // resolves every open incident for the policy, so before this fix it closed
+    // the incident and returned before touching the card, stranding a `pending`
+    // approval that no remaining open incident could ever resolve.
+    await service.upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 500_000,
+        warnPercent: 80,
+        hardStopEnabled: true,
+        notifyEnabled: true,
+        isActive: true,
+      } as any,
+      null,
+    );
+
+    const afterUpsert = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(afterUpsert).toHaveLength(1);
+    expect(afterUpsert[0]).toMatchObject({ status: "withdrawn" });
+    expect(afterUpsert[0]!.decisionNote).toMatch(/policy was updated/);
+    const [resolvedSoft] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId));
+    expect(resolvedSoft).toMatchObject({ status: "resolved" });
+  });
+
+  it("does not rewrite a withdrawn card when a stale client decides its closed incident (BLO-28793 review)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100_000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    // Warn first, then the hard cap: the soft card is withdrawn as superseded and
+    // the hard card takes its place.
+    const warnEvent = await insertCostEvent({ companyId, agentId, costCents: 85_000 });
+    await service.evaluateCostEvent(warnEvent);
+    const hardEvent = await insertCostEvent({ companyId, agentId, costCents: 30_000 });
+    await service.evaluateCostEvent(hardEvent);
+
+    const allCards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(allCards).toHaveLength(2);
+    const supersededSoft = allCards.find(
+      (row) => (row.payload as Record<string, unknown>).thresholdType === "soft",
+    )!;
+    expect(supersededSoft).toMatchObject({ status: "withdrawn" });
+    expect(supersededSoft.decisionNote).toMatch(/[Ss]uperseded/);
+    const supersededAt = supersededSoft.decidedAt;
+    const hardCard = allCards.find(
+      (row) => (row.payload as Record<string, unknown>).thresholdType === "hard",
+    )!;
+    expect(hardCard).toMatchObject({ status: "pending" });
+
+    const staleSoftIncident = (await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId)))
+      .find((row) => row.thresholdType === "soft")!;
+    expect(staleSoftIncident).toMatchObject({ status: "resolved" });
+
+    // A stale client submits a decision against the already-resolved soft
+    // incident. resolveIncident fetches by id with no status filter, so this
+    // still runs -- but it must not rewrite the withdrawn card as `approved`.
+    await service.resolveIncident(
+      companyId,
+      staleSoftIncident.id,
+      { action: "raise_budget_and_resume", amount: 900_000, decisionNote: "stale submit" } as any,
+      "user-stale",
+    );
+
+    const afterStale = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    const softAfterStale = afterStale.find((row) => row.id === supersededSoft.id)!;
+    expect(softAfterStale.status).toBe("withdrawn");
+    expect(softAfterStale.decisionNote).toMatch(/[Ss]uperseded/);
+    expect(softAfterStale.decisionNote).not.toMatch(/stale submit/);
+    expect(softAfterStale.decidedAt).toEqual(supersededAt);
+
+    // The raise closed the open hard incident as a side effect, so its card is
+    // withdrawn rather than left pending against a resolved incident. No
+    // undecidable card survives on any path.
+    const hardAfterStale = afterStale.find((row) => row.id === hardCard.id)!;
+    expect(hardAfterStale.status).toBe("withdrawn");
+    expect(afterStale.filter((row) => row.status === "pending")).toHaveLength(0);
+  });
+
+  it("files no warn card when one cost event jumps straight past the hard cap (BLO-28793 review)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100_000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    // Zero to over-cap in a single event: the warn threshold is crossed in the
+    // same evaluation that trips the hard stop. Filing a warn card here would
+    // only be withdrawn two statements later, leaving an approvals row and a
+    // pair of activity entries for a card no board member could ever see.
+    const jumpEvent = await insertCostEvent({ companyId, agentId, costCents: 150_000 });
+    await service.evaluateCostEvent(jumpEvent);
+
+    const cards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ type: "budget_override_required", status: "pending" });
+    expect((cards[0]!.payload as Record<string, unknown>).thresholdType).toBe("hard");
+
+    const incidents = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId));
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({ thresholdType: "hard", status: "open" });
+
+    const [agentRow] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    expect(agentRow).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("still files the warn card over cap when the hard stop is disabled (BLO-28793 review)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const service = budgetService(db, { cancelWorkForScope: vi.fn().mockResolvedValue(undefined) });
+
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100_000,
+      warnPercent: 80,
+      hardStopEnabled: false,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    // The skip above is gated on "the hard branch will fire", not on
+    // "observed >= amount". With hardStopEnabled false nothing else notifies,
+    // so the warn card is the only signal that this scope blew its cap.
+    const overCapEvent = await insertCostEvent({ companyId, agentId, costCents: 150_000 });
+    await service.evaluateCostEvent(overCapEvent);
+
+    const cards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ status: "pending" });
+    expect((cards[0]!.payload as Record<string, unknown>).thresholdType).toBe("soft");
+
+    const [agentRow] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    expect(agentRow).toMatchObject({ status: "active", pauseReason: null });
   });
 
   it("hard-stops project work until a valid budget raise resumes it and overview reconciles ledger spend", async () => {
