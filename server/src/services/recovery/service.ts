@@ -1645,7 +1645,7 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
     `- Reason: ${finding.reason}`,
     `- Manager action requested: ${finding.recommendedAction}`,
     "",
-    "This issue now keeps its existing blockers and is also blocked by the escalation issue so dependency wakeups remain explicit.",
+    "This issue's own blockers and status are left untouched: the escalation is tracked separately rather than added as a blocker here, so a fabricated dependency cannot wedge this issue once its real gate clears (BLO-28618).",
   ].join("\n");
 }
 
@@ -8223,6 +8223,18 @@ export function recoveryService(
     return { id: mostRecentDone.id, reason: "unchanged_target" as const };
   }
 
+  /**
+   * Prunes a legacy fabricated blocker edge (recovery issue -> its own source)
+   * left behind by escalations filed before BLO-28618 stopped writing them.
+   *
+   * Clearing the edge alone is not enough, and getting this wrong is how the
+   * re-file loop sustained itself: a source left at `blocked` with an empty
+   * blocker set is *exactly* the `blocked_without_blockers` trigger, so pruning
+   * the edge re-arms the detector against the same source on the next sweep.
+   * Measured on 2026-08-18: closing the recovery row as `done` -- the
+   * disposition its own body prescribes -- left 11 of 11 sources in that state.
+   * So restore the status in the same pass whenever nothing unresolved remains.
+   */
   async function removeRecoveryBlockerFromSource(recovery: typeof issues.$inferSelect) {
     const parsed = parseLivenessIncidentKey(recovery.originId);
     if (!parsed) return false;
@@ -8235,9 +8247,60 @@ export function recoveryService(
 
     const blockerIds = await existingBlockerIssueIds(sourceIssue.companyId, sourceIssue.id);
     if (!blockerIds.includes(recovery.id)) return false;
-    await issuesSvc.update(sourceIssue.id, {
-      blockedByIssueIds: blockerIds.filter((blockerId) => blockerId !== recovery.id),
+    const nextBlockerIds = blockerIds.filter((blockerId) => blockerId !== recovery.id);
+
+    // Compute what survives the prune BEFORE writing, so the edge clear and the
+    // status restore go out as one update. Split across two writes, a crash
+    // between them leaves the source at `blocked` with an empty blocker set --
+    // the trigger state -- and nothing retries, because the second pass sees the
+    // edge already gone and bails at the guard above.
+    const { blockerIssueIds: unresolvedBlockerIds } =
+      await unresolvedBlockerHumanDecisionEscalationState(sourceIssue.companyId, sourceIssue.id);
+    const unresolvedAfterPrune = unresolvedBlockerIds.filter((blockerId) => blockerId !== recovery.id);
+    const shouldRestoreStatus = sourceIssue.status === "blocked" && unresolvedAfterPrune.length === 0;
+
+    let restoredSourceStatus = false;
+    let restoreSkippedReason: string | null = null;
+    try {
+      const updated = await issuesSvc.update(sourceIssue.id, {
+        blockedByIssueIds: nextBlockerIds,
+        ...(shouldRestoreStatus ? { status: "todo" as const } : {}),
+      });
+      restoredSourceStatus = shouldRestoreStatus && updated?.status === "todo";
+    } catch (err) {
+      if (!shouldRestoreStatus) throw err;
+      // Status restore refused (e.g. a concurrent write re-added a blocker).
+      // Still drop the fabricated edge -- leaving it is the wedge -- and let the
+      // next sweep's dead-end finding surface the source honestly.
+      restoreSkippedReason = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        { err, issueId: sourceIssue.id, companyId: sourceIssue.companyId, recoveryIssueId: recovery.id },
+        "pruned liveness recovery blocker but could not restore source issue status",
+      );
+      await issuesSvc.update(sourceIssue.id, { blockedByIssueIds: nextBlockerIds });
+    }
+
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.liveness_recovery_blocker_pruned",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details: {
+        source: "recovery.reconcile_issue_graph_liveness",
+        recoveryIssueId: recovery.id,
+        recoveryIdentifier: recovery.identifier,
+        incidentKey: recovery.originId,
+        previousStatus: sourceIssue.status,
+        remainingUnresolvedBlockerCount: unresolvedAfterPrune.length,
+        restoredSourceStatus,
+        restoreSkippedReason,
+      },
     });
+
     return true;
   }
 
@@ -8320,12 +8383,20 @@ export function recoveryService(
         .from(issues)
         .where(and(eq(issues.companyId, parsed.companyId), eq(issues.id, parsed.issueId)))
         .then((rows) => rows[0] ?? null);
+      // "Obsolete" here means "no finding in this sweep names this incident" --
+      // but an OPEN recovery row suppresses its own finding via
+      // `openRecoveryIssues`/`hasExplicitWaitingPath`, so every live row looks
+      // obsolete on the very next sweep. What kept them alive was the guard
+      // below reading "the source still carries our blocker edge", which was
+      // true for essentially every row this loop reaches -- so the guard
+      // reduced to "a live row whose source is still open is not retired".
+      // BLO-28618 stopped writing that edge, so the intent is now tested
+      // directly against the source's status. Without this the detector files a
+      // row and cancels it one sweep later, which is worse than the wedge it
+      // replaced.
       if (sourceIssue && !["done", "cancelled"].includes(sourceIssue.status)) {
-        const blockerIds = await existingBlockerIssueIds(parsed.companyId, sourceIssue.id);
-        if (blockerIds.includes(recovery.id)) {
-          result.activeSkipped += 1;
-          continue;
-        }
+        result.activeSkipped += 1;
+        continue;
       }
       if (await removeRecoveryBlockerFromSource(recovery)) {
         result.blockerRelationsRemoved += 1;
@@ -8673,84 +8744,22 @@ export function recoveryService(
     return input.recoveryIssue.assigneeAgentId === input.ownerAgentId;
   }
 
-  async function ensureIssueBlockedByEscalation(input: {
-    issue: typeof issues.$inferSelect;
-    escalationIssueId: string;
-    finding: IssueLivenessFinding;
-    runId?: string | null;
-  }) {
-    const blockerIds = await existingBlockerIssueIds(input.issue.companyId, input.issue.id);
-    const nextBlockerIds = [...new Set([...blockerIds, input.escalationIssueId])];
-    const isAlreadyBlockedByEscalation = blockerIds.includes(input.escalationIssueId);
-    const isAlreadyBlocked = input.issue.status === "blocked";
-    if (isAlreadyBlockedByEscalation && isAlreadyBlocked) {
-      return input.issue;
-    }
-
-    const update: Partial<typeof issues.$inferInsert> & { blockedByIssueIds: string[] } = {
-      blockedByIssueIds: nextBlockerIds,
-    };
-    if (!isAlreadyBlocked) {
-      update.status = "blocked";
-    }
-
-    let persistedBlockerIds = nextBlockerIds;
-    let updated: Awaited<ReturnType<typeof issuesSvc.update>> | typeof input.issue;
-    try {
-      updated = await issuesSvc.update(input.issue.id, update);
-    } catch (error) {
-      if (!isBlockingRelationCycleError(error)) throw error;
-      logger.warn(
-        {
-          companyId: input.issue.companyId,
-          issueId: input.issue.id,
-          escalationIssueId: input.escalationIssueId,
-          incidentKey: input.finding.incidentKey,
-        },
-        "skipping cycle-forming liveness escalation blocker relation",
-      );
-      if (blockerIds.length === 0) {
-        // No pre-existing blocker to fall back to. Forcing `blocked` here
-        // would strand the issue with an empty blockedByIssueIds set --
-        // blocked, but with no dependency edge to ever unblock it. Leave
-        // the issue's current status untouched so its existing continuation
-        // path (e.g. the same liveness finding re-triggering next sweep)
-        // keeps working, and persist nothing that didn't actually happen.
-        return input.issue;
-      }
-      persistedBlockerIds = blockerIds;
-      updated = isAlreadyBlocked
-        ? input.issue
-        : await issuesSvc.update(input.issue.id, {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
-        });
-    }
-    if (!updated) return null;
-
-    await logActivity(db, {
-      companyId: input.issue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: null,
-      runId: input.runId ?? null,
-      action: "issue.blockers.updated",
-      entityType: "issue",
-      entityId: input.issue.id,
-      details: {
-        source: "recovery.reconcile_issue_graph_liveness",
-        incidentKey: input.finding.incidentKey,
-        findingState: input.finding.state,
-        blockerIssueIds: persistedBlockerIds,
-        escalationIssueId: input.escalationIssueId,
-        status: update.status ?? input.issue.status,
-        previousStatus: input.issue.status,
-      },
-    });
-
-    return updated;
-  }
-
+  /**
+   * Files the "Unblock liveness incident for X" row for a finding.
+   *
+   * Deliberately does NOT add the escalation to the source's blocker set, and
+   * does NOT flip the source to `blocked` (BLO-28618). Doing either wedged the
+   * very issue the escalation was meant to rescue: the source acquired a
+   * fabricated dependency nobody would ever work, so it could not resolve even
+   * once its real gate cleared -- and when the escalation was later closed or
+   * cancelled the source dropped back into a detector-triggering state, which
+   * made the sweep self-sustaining (240 of 500 sampled rows were re-files).
+   *
+   * Suppression does not need the edge. `openRecoveryIssues` is derived from
+   * `originKind` + the parsed incident key, so an open escalation already
+   * satisfies `hasExplicitWaitingPath` for both the source and the leaf. The
+   * source learns about the escalation through the comment below instead.
+   */
   async function createIssueGraphLivenessEscalation(input: {
     finding: IssueLivenessFinding;
     runId?: string | null;
@@ -8779,12 +8788,6 @@ export function recoveryService(
       await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
       await findOpenLivenessRecoveryIssueForLeaf(input.finding);
     if (existing) {
-      await ensureIssueBlockedByEscalation({
-        issue,
-        escalationIssueId: existing.id,
-        finding: input.finding,
-        runId: input.runId ?? null,
-      });
       return { kind: "existing" as const, escalationIssueId: existing.id };
     }
     const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
@@ -8835,21 +8838,8 @@ export function recoveryService(
         await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
         await findOpenLivenessRecoveryIssueForLeaf(input.finding);
       if (!raced) throw error;
-      await ensureIssueBlockedByEscalation({
-        issue,
-        escalationIssueId: raced.id,
-        finding: input.finding,
-        runId: input.runId ?? null,
-      });
       return { kind: "existing" as const, escalationIssueId: raced.id };
     }
-
-    await ensureIssueBlockedByEscalation({
-      issue,
-      escalationIssueId: escalation.id,
-      finding: input.finding,
-      runId: input.runId ?? null,
-    });
 
     await issuesSvc.addComment(
       issue.id,

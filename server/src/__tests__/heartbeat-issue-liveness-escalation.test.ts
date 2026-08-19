@@ -918,7 +918,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations).toHaveLength(1);
   });
 
-  it("creates one manager escalation, preserves blockers, and records owner selection", async () => {
+  it("creates one manager escalation without blocking its own source, and records owner selection", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
@@ -951,13 +951,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       ].join(":"),
     });
 
+    // BLO-28618: the escalation must NOT appear in its own source's blocker
+    // set. Writing that edge wedged the source behind a fabricated dependency
+    // nobody works, and closing the row later dropped the source into a
+    // detector-triggering state -- the re-file loop. The real blocker is the
+    // only edge that survives.
     const blockers = await db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.map((row) => row.blockerIssueId).sort()).toEqual(
-      [blockerIssueId, escalations[0]!.id].sort(),
-    );
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockedIssueId));
     expect(comments).toHaveLength(1);
@@ -980,10 +983,25 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         projectWorkspaceSourceIssueId: blockerIssueId,
       },
     });
-    expect(events.some((event) => event.action === "issue.blockers.updated")).toBe(true);
+    expect(events.some((event) => event.action === "issue.blockers.updated")).toBe(false);
+
+    // The source keeps its own status too -- it is not force-flipped to
+    // `blocked`, which is what left sources at `blocked` with an empty blocker
+    // set once the recovery row was closed.
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("blocked");
+    const [leafAfter] = await db.select().from(issues).where(eq(issues.id, blockerIssueId));
+    expect(leafAfter?.status).toBe("todo");
   });
 
-  it("rejects a cycle-forming escalation edge and logs the persisted blocker set", async () => {
+  // Pre-BLO-28618 this asserted the *cycle rejection* fallback: the detector
+  // tried to add the escalation as a blocker of its source, hit the cycle
+  // guard, and fell back to persisting the pre-existing blocker set. The
+  // detector no longer writes that edge at all, so there is no cycle to
+  // reject. Kept as the stronger invariant: with an escalation already open
+  // and the reverse edge already present, reconciliation leaves both the
+  // source's blocker set and its status exactly as it found them.
+  it("never writes the escalation into its own source's blocker set", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain({
       blockerStatus: "backlog",
@@ -1039,7 +1057,10 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         eq(activityLog.entityId, blockedIssueId),
       ))
       .then((rows) => rows.at(-1));
-    expect(blockerEvent?.details).toMatchObject({ blockerIssueIds: [blockerIssueId] });
+    expect(blockerEvent).toBeUndefined();
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("blocked");
   });
 
   it("does not strand a zero-pre-existing-blocker source in blocked when the escalation edge would cycle", async () => {
@@ -1404,13 +1425,24 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
     expect(escalations).toHaveLength(1);
 
-    const blockers = await db
+    // One recovery row is shared by both dependents -- and blocks neither of
+    // them (BLO-28618). Both dependents keep only their real leaf blocker.
+    const escalationEdges = await db
       .select({ blockedIssueId: issueRelations.relatedIssueId })
       .from(issueRelations)
       .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.issueId, escalations[0]!.id)));
-    expect(blockers.map((row) => row.blockedIssueId).sort()).toEqual(
-      [blockedIssueId, secondBlockedIssueId].sort(),
-    );
+    expect(escalationEdges).toEqual([]);
+
+    for (const dependentId of [blockedIssueId, secondBlockedIssueId]) {
+      const blockers = await db
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, dependentId),
+        ));
+      expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
+    }
   });
 
   it("holds a recently closed matching escalation, and keeps holding past the cooldown while the target is unchanged", async () => {
@@ -1488,6 +1520,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.escalationsCreated).toBe(1);
     expect(result.skippedUnchangedTarget).toBe(0);
     expect(result.skippedReescalationCooldown).toBe(0);
+
+    // BLO-28618: the re-escalation path creates a fresh row, so it is a second
+    // place the self-blocker edge could be written. The dedicated test above
+    // covers first-time creation; this asserts the same invariant on re-escalation,
+    // where only the pre-existing real blocker may survive.
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
   });
 
   it("picks the most recently resolved escalation even when an older row was edited after it closed", async () => {
@@ -1945,49 +1987,120 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.skippedReescalationCooldown).toBe(0);
   });
 
-  it("removes closed liveness escalations from blocker relations during reconciliation", async () => {
+  // Drain path for the legacy edges filed before BLO-28618 stopped writing
+  // them. The escalation is seeded with the edge by hand because the detector
+  // no longer produces that shape.
+  it("prunes a legacy escalation blocker edge and lifts the source out of blocked", async () => {
     await enableAutoRecovery();
-    const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
+    const legacyEscalationId = randomUUID();
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
 
-    const first = await heartbeat.reconcileIssueGraphLiveness();
-    expect(first.escalationsCreated).toBe(1);
+    await db.insert(issues).values({
+      id: legacyEscalationId,
+      companyId,
+      title: "Unblock liveness incident (legacy)",
+      status: "done",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 9,
+      identifier: "LEGACY-9",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: legacyEscalationId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    // The real leaf is resolved, so once the fabricated edge goes the source has
+    // no unresolved blockers left -- exactly the state that used to be left
+    // behind as `blocked` with an empty blocker set (the `blocked_without_blockers`
+    // trigger, measured at 11 of 11 sources on 2026-08-18).
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
 
-    const escalations = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          eq(issues.originKind, "harness_liveness_escalation"),
-        ),
-      );
-    expect(escalations).toHaveLength(1);
-
-    await db
-      .update(issues)
-      // `blockedByIssueIds` was never a column on the `issues` table — blocker
-      // relationships live in `recoveryBlockerIssues`. Status=done is the
-      // signal `reconcileIssueGraphLiveness` reads to prune the relation.
-      .set({ status: "done" })
-      .where(eq(issues.id, escalations[0]!.id));
-    await db
-      .update(issues)
-      // `blockedByIssueIds` was never a column on the `issues` table — blocker
-      // relationships live in `recoveryBlockerIssues`. Status=done is the
-      // signal `reconcileIssueGraphLiveness` reads to prune the relation.
-      .set({ status: "done" })
-      .where(eq(issues.id, blockerIssueId));
-
-    const second = await heartbeat.reconcileIssueGraphLiveness();
-    expect(second.obsoleteRecoveryBlockerRelationsRemoved).toBe(0);
-    expect(second.doneRecoveryBlockerRelationsRemoved).toBe(1);
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.doneRecoveryBlockerRelationsRemoved).toBe(1);
 
     const blockers = await db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.some((row) => row.blockerIssueId === escalations[0]!.id)).toBe(false);
+    expect(blockers.some((row) => row.blockerIssueId === legacyEscalationId)).toBe(false);
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("todo");
+
+    const pruneEvent = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.liveness_recovery_blocker_pruned"),
+        eq(activityLog.entityId, blockedIssueId),
+      ))
+      .then((rows) => rows.at(-1));
+    expect(pruneEvent?.details).toMatchObject({
+      recoveryIssueId: legacyEscalationId,
+      previousStatus: "blocked",
+      remainingUnresolvedBlockerCount: 0,
+      restoredSourceStatus: true,
+    });
+  });
+
+  // Counterpart: a real remaining blocker must keep the source `blocked`.
+  it("keeps the source blocked when a real blocker survives the legacy prune", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatSvc;
+    const legacyEscalationId = randomUUID();
+
+    await db.insert(issues).values({
+      id: legacyEscalationId,
+      companyId,
+      title: "Unblock liveness incident (legacy)",
+      status: "cancelled",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 9,
+      identifier: "LEGACY-9",
+      originKind: "harness_liveness_escalation",
+      originId: [
+        "harness_liveness",
+        companyId,
+        blockedIssueId,
+        "blocked_by_unassigned_issue",
+        blockerIssueId,
+      ].join(":"),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: legacyEscalationId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.doneRecoveryBlockerRelationsRemoved).toBe(1);
+
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("blocked");
   });
 
   it("handles an armed cutoff when no liveness findings exist", async () => {
