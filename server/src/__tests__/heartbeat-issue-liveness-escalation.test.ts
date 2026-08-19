@@ -1597,6 +1597,59 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.skippedUnchangedTarget).toBe(1);
   });
 
+  it("holds a leaf whose escalation closed with completed_at ahead of updated_at at the horizon edge", async () => {
+    // Regression test for the scan bound, not for the suppressor logic.
+    //
+    // The suppressor ORDERS and COMPARES on `coalesce(completed_at, updated_at)`
+    // but must FILTER on bare `updated_at`, because only the bare column is
+    // servable by `issues_company_updated_idx` and the alternative is an
+    // unbounded scan of the company's entire escalation history. Those two
+    // columns are NOT the same instant: `services/issues.ts` stamps `updatedAt`
+    // when it builds its patch and then `applyStatusSideEffects` sets
+    // `completedAt` from a second, later clock read in the same request. So
+    // `completed_at` LEADS `updated_at` on the primary close path -- the
+    // direction that breaks a naive bound.
+    //
+    // This fixture is that row, positioned so the two columns straddle the
+    // horizon: `completed_at` is 5s INSIDE the 7d ceiling (so the target-state
+    // branch must suppress) while `updated_at` is 5s OUTSIDE it. Bounding at
+    // `now - horizon` filters the row out, the suppressor returns null, and the
+    // escalation re-raises -- the loop BLO-27676 closes, through a narrower
+    // door. `LIVENESS_SUPPRESSION_SCAN_SKEW_MS` absorbs the gap.
+    //
+    // Falsified before being trusted: with the skew term removed from
+    // `horizonCutoff` this fails `expected 1 to be +0`.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    const ceilingMs = 7 * 24 * 60 * 60 * 1000;
+    const completedAt = new Date(now.getTime() - ceilingMs + 5_000);
+    const updatedAt = new Date(now.getTime() - ceilingMs - 5_000);
+    // Quiet well before the resolution, so the leaf-activity check cannot be
+    // what decides this test.
+    const leafQuietSince = new Date(now.getTime() - ceilingMs - 24 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      // `resolvedAt` only backdates `createdAt` here; the two columns the
+      // suppressor and the bound read are both passed explicitly.
+      resolvedAt: completedAt,
+      completedAt,
+      updatedAt,
+      leafQuietSince,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.skippedUnchangedTarget).toBe(1);
+  });
+
   it("falls back to time-only suppression when the target-state gate is disabled", async () => {
     // Exercises the documented rollback lever: the docblocks on
     // `findSuppressingResolvedLivenessRecoveryIssue` and

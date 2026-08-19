@@ -124,6 +124,28 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
  */
 export const DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * Skew allowance on the suppressor's sargable `updated_at` scan bound
+ * (BLO-27676 review).
+ *
+ * `findSuppressingResolvedLivenessRecoveryIssue` orders and compares on
+ * `coalesce(completed_at, updated_at)` but must FILTER on bare `updated_at`,
+ * because only the bare column is servable by `issues_company_updated_idx` and
+ * the alternative is an unbounded scan of the company's whole escalation
+ * history. Those two are not the same instant: `services/issues.ts` stamps
+ * `updatedAt` when it builds the patch and `completedAt` from a second clock
+ * read later in the same request, so `completed_at` can lead `updated_at` by
+ * however long the intervening work takes.
+ *
+ * Without slack, a row resolved within that gap of the horizon boundary is
+ * filtered out, the suppressor returns null, and the escalation re-raises --
+ * the exact loop this issue exists to close, just through a much narrower door.
+ * One minute is several orders of magnitude above the observed intra-request
+ * gap and several orders below the 60m floor of the horizon it widens, so it
+ * closes the hole without meaningfully enlarging the scan.
+ */
+export const LIVENESS_SUPPRESSION_SCAN_SKEW_MS = 60 * 1000;
+
 type RecoveryActionBoundsConfig = {
   maxAttempts: number;
   timeoutMs: number;
@@ -7864,6 +7886,55 @@ export function recoveryService(
     // most recently resolved escalation even when an older row was edited after
     // it closed".
     const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`;
+    // Keep the scan bounded. Neither OR arm is servable for these rows: the
+    // fingerprint arm's only indexes (`issues_active_liveness_recovery_leaf_uq`,
+    // `issues_active_alert_escalation_cover_uq` -- schema/issues.ts) are partial
+    // on `status not in ('done','cancelled')`, mutually exclusive with the
+    // `status = 'done'` filter below, so the planner falls back to the
+    // `(company_id, origin_kind)` prefix of `issues_company_origin_idx` and reads
+    // the company's ENTIRE escalation history -- which only ever grows, since
+    // resolved rows are never pruned. The version this replaced was bounded to
+    // the 60m cooldown by a `gte(updatedAt, cutoff)` servable by
+    // `issues_company_updated_idx`; dropping it was required for the 7d
+    // target-state window, but nothing replaced it, and this runs once per stale
+    // finding per sweep AND synchronously inside the operator preview endpoint.
+    //
+    // Bounding by `max(cooldownMs, unchangedTargetSuppressionMs)` cannot change a
+    // result: every branch below already returns null for rows resolved before
+    // that horizon (the cooldown branch needs `resolvedAtMs >= now - cooldownMs`;
+    // the target branch returns null at `resolvedAtMs <= now -
+    // unchangedTargetSuppressionMs`). Excluding rows can only change WHICH row
+    // the `desc` ORDER BY picks if every candidate is excluded -- and that case
+    // returned null anyway.
+    //
+    // The bound is on `updatedAt` rather than on `resolvedAtExpr` because only
+    // the former is sargable. That makes it a superset ONLY up to skew between
+    // the two columns, and the skew does not run in the convenient direction: on
+    // the primary write path `completed_at` is the LATER of the two.
+    // `services/issues.ts` builds its patch with `updatedAt: new Date()` and only
+    // then calls `applyStatusSideEffects`, which sets `completedAt` from a second
+    // clock read one request-body later -- so `completed_at >= updated_at` there,
+    // by however long the intervening validation and blocker reads take. (The
+    // escalation-close path below and the other four `update(issues)` sites do
+    // write both from one timestamp, and nothing bumps `updated_at` implicitly:
+    // there is no `$onUpdate` on the column, and migration 0076 mirrors
+    // `updated_at` INTO `last_activity_at`, not back.)
+    //
+    // Unskewed, that leaves a real hole: a row with
+    // `updated_at < cutoff <= completed_at` is dropped by the filter, the
+    // suppressor returns null, and the escalation re-raises -- this issue's loop
+    // again, through a much narrower door. It only bites within one
+    // request-duration of the horizon boundary, where the row was about to expire
+    // anyway, but "narrow" is not "closed", and a seconds-wide window on a 7d
+    // horizon is exactly the shape that shows up once in production and never in
+    // a test. `LIVENESS_SUPPRESSION_SCAN_SKEW_MS` restores the superset property
+    // for any gap below it, at the cost of scanning a bounded sliver more. Pinned
+    // by "holds a leaf whose escalation closed with completed_at ahead of
+    // updated_at at the horizon edge". No migration needed.
+    const suppressionHorizonMs = Math.max(cooldownMs, unchangedTargetSuppressionMs);
+    const horizonCutoff = new Date(
+      now.getTime() - suppressionHorizonMs - LIVENESS_SUPPRESSION_SCAN_SKEW_MS,
+    );
     const mostRecentDone = await db
       .select({
         id: issues.id,
@@ -7885,6 +7956,11 @@ export function recoveryService(
           // action path -- so that shape must re-escalate immediately. Pinned by
           // "re-escalates immediately after a matching escalation is cancelled".
           eq(issues.status, "done"),
+          // Sargable superset of the suppression horizon -- see the note above
+          // the query. Restores the bound the 60m cooldown used to provide, and
+          // carries a skew allowance because `completed_at` can lead
+          // `updated_at` on the primary close path.
+          gte(issues.updatedAt, horizonCutoff),
         ),
       )
       .orderBy(desc(resolvedAtExpr), desc(issues.id))
