@@ -20,7 +20,11 @@
  * "Not ready" is a partition, not a negation. `uninstalled` survives soft
  * delete for 30 days and still resolves on this route, so it answers 410 —
  * retrying a removed plugin could never succeed, and telling senders to do so
- * would swap dropped payloads for an unclearable alarm.
+ * would swap dropped payloads for an unclearable alarm. The partition is a
+ * terminal *denylist*, so a status this build does not recognise falls to the
+ * retryable side and is delayed rather than destroyed; that fallback is pinned
+ * explicitly, because a matrix driven off the enum can only ever exercise the
+ * values that are already handled.
  */
 import express from "express";
 import request from "supertest";
@@ -74,6 +78,11 @@ function mockPlugin(overrides: Record<string, unknown>) {
   });
 }
 
+// The production terminal set, read through the same dynamic import the app
+// under test uses so module mocking still applies. Asserting against this
+// rather than against the enum is what makes the drift guard below real.
+const { WEBHOOK_TERMINAL_PLUGIN_STATUSES } = await import("../routes/plugins.js");
+
 async function createApp() {
   const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/plugins.js"),
@@ -121,21 +130,22 @@ describe("webhook ingestion: plugin-not-ready is retryable", () => {
     vi.clearAllMocks();
   });
 
-  // Driven off the real enum, not a hand-written list, so the matrix cannot
-  // drift from the domain: the day someone adds a PluginStatus this fails
-  // loudly and forces a retryable-or-terminal decision instead of silently
-  // inheriting one. ("error" is the status the alertmanager plugin latched
-  // into during the outage, so it is the exact case that caused the data loss.)
+  // Derived from the real enum *and* the real production set, so the matrix
+  // cannot drift from either: add a PluginStatus and it lands in this loop and
+  // is asserted retryable; move a status to terminal and it leaves this loop
+  // and must be covered below. ("error" is the status the alertmanager plugin
+  // latched into during the outage, so it is the exact case that caused the
+  // data loss.)
   const RETRYABLE_STATUSES = PLUGIN_STATUSES.filter(
-    (status) => status !== "ready" && status !== "uninstalled",
+    (status) => status !== "ready" && !WEBHOOK_TERMINAL_PLUGIN_STATUSES.has(status),
   );
 
-  it("covers every non-ready status exactly once", () => {
-    // Guards the two filters above against a status being added and silently
-    // falling outside both this matrix and the terminal test below.
-    expect([...RETRYABLE_STATUSES, "uninstalled", "ready"].sort()).toEqual(
-      [...PLUGIN_STATUSES].sort(),
-    );
+  it("treats uninstalled as the only terminal status", () => {
+    // Pins the production denylist itself, not the enum against itself. Every
+    // status added here converts delayed alerts into destroyed ones, which is
+    // the BLO-28659 regression direction — so widening it has to be a
+    // deliberate edit to this assertion, never a silent one.
+    expect([...WEBHOOK_TERMINAL_PLUGIN_STATUSES]).toEqual(["uninstalled"]);
   });
 
   for (const status of RETRYABLE_STATUSES) {
@@ -164,6 +174,26 @@ describe("webhook ingestion: plugin-not-ready is retryable", () => {
     const res = await postAlert(app);
 
     expect(res.status).toBe(503);
+  }, 20_000);
+
+  it("answers 503, not 410, for a status outside PluginStatus entirely", async () => {
+    // Deliberately off-enum, and that is the contract under test rather than a
+    // pretend domain value: `plugins.status` is `text().$type<PluginStatus>()`
+    // with no PG enum and no CHECK, so the column can hold a string this build
+    // does not know — a rolling deploy where a newer pod writes a status the
+    // older image has never heard of is enough. The parameterized loop above
+    // iterates PLUGIN_STATUSES and so can only ever cover values that are
+    // already handled; this is the one case that pins the *fallback* side of
+    // the partition. It must delay alerts, not destroy them.
+    mockPlugin({ status: "quiescing-from-a-future-release" });
+    const { app, workerManager } = await createApp();
+
+    const res = await postAlert(app);
+
+    expect(res.status).toBe(503);
+    expect(Number(res.headers["retry-after"])).toBeGreaterThan(0);
+    expect(res.body.error).not.toContain("uninstalled");
+    expect(workerManager.call).not.toHaveBeenCalled();
   }, 20_000);
 });
 
