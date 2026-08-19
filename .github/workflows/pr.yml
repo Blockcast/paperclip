@@ -156,6 +156,13 @@ jobs:
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
 
+      # Guards the one property of the BLO-28888 soak workflow that cannot be
+      # re-checked after the fact: that it stays dispatch-only. Adding its
+      # ~50-90 minutes to a per-PR trigger would be invisible until it was
+      # already on every PR's critical path.
+      - name: Test soak workflow stays dispatch-only
+        run: node --test ./.github/scripts/tests/soak-workflow-triggers.test.mjs
+
       - name: Test ffmpeg muxer detection (BLO-23128)
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
 
