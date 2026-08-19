@@ -137,18 +137,13 @@ const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
 // *before* it started still fires on its own unattended time.
 const NO_EXECUTABLE_TURN_DOMINANT_SHARE = 0.5;
 // BLO-26165: `heartbeatRuns.issueCommentStatus` defaults to (and is explicitly
-// re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts)
-// for any run whose wake reason never required a comment in the first place —
-// including a run whose adapter container was never created at all (a
-// pre-adapter setup failure such as `preferred_workspace_unrealizable`; see
-// BLO-23096). That subsystem is authoritative on "was a comment ever
-// expected here" independent of whether `classifyAndPersistRunLiveness`
-// managed to run, which is the axis `isInfraFailureRun` depends on (BLO-22436
-// split `isNeverExecutedRun` into that plus `isDependencyBlockedRun`, whose
-// `errorCode` check needs no liveness classification at all). Runs this
-// excludes are reported separately as `neverInvokedRunCount` rather than
-// folded into `runtimeFailureStreak`, since the two signals can disagree.
-const NEVER_INVOKED_ISSUE_COMMENT_STATUS = "not_applicable";
+// re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts).
+// It is NOT an invocation signal and must never be used as one — see
+// `isNeverInvokedRun` for the predicate that is, and the narrowing note there
+// for why keying the streak on this column produced a fleet-wide false
+// negative. Retained only to report the comment-policy-exempt population as
+// its own accurately-named bucket, which stays IN the streak numerator.
+const COMMENT_POLICY_EXEMPT_ISSUE_COMMENT_STATUS = "not_applicable";
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
@@ -296,14 +291,23 @@ type ProductivityReviewEvidence = {
   // tokens" for a run where usage was never recorded at all.
   runtimeFailureUsageBasis: "measured" | "inferred" | "mixed" | null;
   // BLO-26165: count of terminal runs excluded from the `noCommentStreak` walk
-  // because `issueCommentStatus === "not_applicable"` — the comment-requirement
-  // subsystem (`finalizeIssueCommentPolicy` in heartbeat.ts) already determined
-  // no comment was ever expected from them. Distinct from `runtimeFailureStreak`
-  // (a heuristic over `livenessState`/`usageJson`/`logBytes` that can miss a
-  // pre-adapter setup failure whose liveness classification never ran) so the
-  // evidence block can tell a reviewer "this many runs never had a chance to
-  // comment" apart from "this many runs executed and stayed silent."
+  // because no adapter container was ever created for them (`isNeverInvokedRun`
+  // — `usageJson`, `logStore`, `logRef` all null and `logBytes` null-or-zero).
+  // These runs had nothing capable of writing a comment. Distinct from
+  // `runtimeFailureStreak`, whose `livenessState`/usage heuristic cannot see a
+  // pre-adapter setup failure because classification never ran, so the evidence
+  // block can tell a reviewer "this many runs never had a chance to comment"
+  // apart from "this many runs executed and stayed silent."
   neverInvokedRunCount: number;
+  // BLO-26165 (narrowing): of the runs eligible for the `noCommentStreak` walk,
+  // how many carry `issueCommentStatus: "not_applicable"` —
+  // `finalizeIssueCommentPolicy` exempted them from the comment requirement
+  // (wake reason outside the four-reason whitelist, or a deferred comment wake
+  // was already pending). Reported, NOT excluded: a run that executed and
+  // stayed silent is assignee silence whether or not policy demanded a comment.
+  // Named separately so the evidence block never labels an invoked run "never
+  // invoked".
+  commentExemptExecutedRunCount: number;
   // BLO-22436: runs in the sample window that could not possibly have
   // produced a comment (infra failure or dependency-gate cancellation),
   // reported separately from the streaks so a review body never has to be
@@ -314,14 +318,11 @@ type ProductivityReviewEvidence = {
   // plurality winner would read as a diagnosis.
   nonExecutingDominantErrorCode: { code: string | null; count: number } | null;
   // BLO-22436 (Ally follow-up): how many of `nonExecutingRunCount` are ALSO
-  // in `neverInvokedRunCount` — in production this is every dependency-gate
-  // cancellation, since `cancelQueuedRunForBlockedDependencies` never calls
-  // `finalizeIssueCommentPolicy` and the column defaults to
-  // `issueCommentStatus: "not_applicable"`. The two counts are computed from
-  // independent predicates (errorCode/liveness vs. issueCommentStatus) and are
-  // not defined to be disjoint, so the overlap is measured rather than
-  // assumed. Without this, rendering both counts side by side double-counts
-  // every real cancellation for a reader summing the evidence block.
+  // in `neverInvokedRunCount`. The two counts are computed from independent
+  // predicates (errorCode/liveness vs. run telemetry) and are not defined to be
+  // disjoint, so the overlap is measured rather than assumed. Without this,
+  // rendering both counts side by side double-counts every run that satisfies
+  // both for a reader summing the evidence block.
   nonExecutingAlsoNeverInvokedCount: number;
   totalRunCount: number;
   terminalRunCount: number;
@@ -1217,11 +1218,13 @@ function choosePrimaryTrigger(input: {
   // Runtime failure takes priority: if the sampled window is dominated by
   // runs that never got a model turn, that is the root cause worth surfacing
   // first — an agent that never executed cannot also be judged unproductive
-  // (BLO-21769). `no_comment_streak` only ever counts turn-executing runs
-  // that were actually expected to comment (see `isNeverExecutedRun` and the
-  // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filtering in `collectEvidence`,
-  // BLO-26165), so the two streaks are drawn from disjoint run sets and can
-  // coexist without this ordering being arbitrary.
+  // (BLO-21769). `no_comment_streak` only ever counts runs that got an adapter
+  // and a model turn (see `isNeverExecutedRun` and the `isNeverInvokedRun`
+  // filtering in `collectEvidence`, BLO-26165), so the two streaks are drawn
+  // from disjoint run sets and can coexist without this ordering being
+  // arbitrary. Note it does NOT additionally require that a comment was
+  // *policy-required* — that narrowing was the false negative BLO-26165's
+  // follow-up removed.
   if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
@@ -1430,6 +1433,56 @@ function isNeverExecutedRun(
   run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "logBytes" | "errorCode">,
 ): boolean {
   return isInfraFailureRun(run) || isDependencyBlockedRun(run);
+}
+
+// True when no adapter container was ever created for this run, so nothing
+// capable of writing a comment ever existed (BLO-23096: `preferred_workspace_
+// unrealizable` / `adapter_failed` pre-adapter setup failures, observed at
+// 584ms and 1,097ms lifetimes).
+//
+// This is the *invocation* predicate. It exists because BLO-26165 originally
+// excluded these runs by reading `issueCommentStatus === "not_applicable"`,
+// which was a false-negative regression of considerable scope:
+// `finalizeIssueCommentPolicy` (heartbeat.ts) stamps that same status on runs
+// that provably executed — once when
+// `shouldRequireIssueCommentForWake` returns false, and once when a deferred
+// comment wake already exists. That helper is a four-item whitelist
+// (`issue_assigned`, `execution_review_requested`,
+// `execution_approval_requested`, `execution_changes_requested`), so keying
+// the streak on the column made every `heartbeat_timer`, `issue_monitor_due`,
+// `issue_comment_mentioned`, `issue_continuation_needed`, `process_lost_retry`
+// and recovery-lane run structurally invisible to the silent-agent detector,
+// whether or not it ran a full model turn. An agent could go silent across
+// dozens of wakes and the streak would read zero. Comment *policy* and
+// *invocation* are two different facts sharing one column; only this predicate
+// tests the second one.
+//
+// Deliberately keyed on total absence of run telemetry rather than the
+// `logBytes` ceiling heuristic `isInfraFailureRun` uses. A container that
+// started writes its session boilerplate, so a non-null `logStore`/`logRef`
+// or any non-zero `logBytes` is positive evidence the adapter existed. An
+// explicit zero-token `usageJson` likewise means a session was created and
+// measured (the BLO-21769 shape) — that run was invoked and belongs to
+// `runtimeFailureStreak`, not here. Keeping the two disjoint is what lets the
+// evidence block name which one it is.
+//
+// Independent of `livenessState` being *`failed`*, which is the gap that made
+// the original fix necessary: `classifyAndPersistRunLiveness` never runs for a
+// pre-adapter failure, so `isInfraFailureRun`'s `livenessState !== "failed"`
+// check cannot catch these rows. A *non-null* `livenessState` is still read as
+// positive proof of invocation, though — that column is only ever written by
+// `classifyAndPersistRunLiveness`, which runs after the adapter completes and
+// has adapter output to classify. This direction of the bias is deliberate:
+// wrongly excluding a run recreates the false negative above (a silent agent
+// reads as clean), while wrongly counting one produces a review a manager can
+// read the evidence block and dismiss. Prefer counting.
+function isNeverInvokedRun(
+  run: Pick<HeartbeatRunRow, "usageJson" | "logBytes" | "logStore" | "logRef" | "livenessState">,
+): boolean {
+  if (run.livenessState != null) return false;
+  if (run.usageJson != null) return false;
+  if (run.logStore != null || run.logRef != null) return false;
+  return (run.logBytes ?? 0) === 0;
 }
 
 // The most common `errorCode` among `runs`, but ONLY when it holds a strict
@@ -2946,24 +2999,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             ? "inferred"
             : "measured";
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
-    // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` was
-    // never expected to comment in the first place — either because its
-    // adapter container was never created (BLO-23096: `preferred_workspace_
-    // unrealizable` / `adapter_failed` setup failures, where `usageJson`,
-    // `logBytes`, and `logStore`/`logRef` all stay null) or because
-    // `finalizeIssueCommentPolicy` classified its wake reason as one that
-    // never required a comment. Either way, counting it as a silent run
-    // misattributes an infrastructure or policy fact to the assignee.
-    // Excluded here rather than folded into `isNeverExecutedRun` because the
-    // two signals are independent and can disagree — `issueCommentStatus` is
-    // written by a separate subsystem that does not depend on
-    // `classifyAndPersistRunLiveness` having successfully run.
-    const neverInvokedRunCount = terminalRuns.filter(
-      (run) => run.issueCommentStatus === NEVER_INVOKED_ISSUE_COMMENT_STATUS,
+    // BLO-26165: a run whose adapter container was never created had nothing
+    // capable of writing a comment, so counting it as silence misattributes an
+    // infrastructure fact to the assignee. Excluded here rather than folded
+    // into `isNeverExecutedRun` because that predicate needs
+    // `livenessState === "failed"`, and a pre-adapter setup failure never gets
+    // classified at all.
+    //
+    // Keyed on `isNeverInvokedRun` (absence of run telemetry), NOT on
+    // `issueCommentStatus`. The latter conflates invocation with comment
+    // policy: `finalizeIssueCommentPolicy` stamps `not_applicable` on runs that
+    // executed fine but whose wake reason was outside the four-reason
+    // comment-required whitelist, or that had a deferred comment wake pending.
+    // Excluding on the column therefore blinded the detector to silence on
+    // almost every wake reason — the exact inverse of the false positive this
+    // issue was opened for. See `isNeverInvokedRun`.
+    const neverInvokedRunCount = terminalRuns.filter(isNeverInvokedRun).length;
+    const noCommentEligibleRuns = executedTerminalRuns.filter((run) => !isNeverInvokedRun(run));
+    // Of the runs actually eligible for the streak walk, how many carry the
+    // comment-policy-exempt status. Scoped to the eligible population (not all
+    // terminal runs) so the "DID execute" claim is literally true of every run
+    // counted — an infra-failure run with `livenessState: "failed"` and zero
+    // tokens also carries this status, but it did not execute a turn and is
+    // already excluded via `isNeverExecutedRun`, so folding it in here would
+    // repeat the mislabelling this narrowing exists to fix.
+    //
+    // Reported, NOT excluded: a run that executed and stayed silent is assignee
+    // silence regardless of whether policy demanded a comment. This is also
+    // what keeps the `hasDeferredIssueCommentWake` path from masking a streak —
+    // a chain of deferred-wake runs that never comments stays visible.
+    const commentExemptExecutedRunCount = noCommentEligibleRuns.filter(
+      (run) => run.issueCommentStatus === COMMENT_POLICY_EXEMPT_ISSUE_COMMENT_STATUS,
     ).length;
-    const noCommentEligibleRuns = executedTerminalRuns.filter(
-      (run) => run.issueCommentStatus !== NEVER_INVOKED_ISSUE_COMMENT_STATUS,
-    );
     let noCommentStreak = 0;
     for (const run of noCommentEligibleRuns) {
       if (commentRunIds.has(run.id)) break;
@@ -2976,9 +3043,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const nonExecutingRuns = terminalRuns.filter((run) => isNeverExecutedRun(run));
     const nonExecutingRunCount = nonExecutingRuns.length;
     const nonExecutingDominantErrorCode = dominantErrorCode(nonExecutingRuns);
-    const nonExecutingAlsoNeverInvokedCount = nonExecutingRuns.filter(
-      (run) => run.issueCommentStatus === NEVER_INVOKED_ISSUE_COMMENT_STATUS,
-    ).length;
+    const nonExecutingAlsoNeverInvokedCount = nonExecutingRuns.filter(isNeverInvokedRun).length;
 
     const pullRequestFreshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_PR_FRESH_MS);
     const pullRequestEvidenceSelect = {
@@ -3258,7 +3323,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
     if (noComment) {
       const neverInvokedNote = neverInvokedRunCount > 0
-        ? ` (${neverInvokedRunCount} additional never-invoked run(s) in the sampled window excluded, not counted toward this streak)`
+        ? ` (${neverInvokedRunCount} additional run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak)`
         : "";
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
     }
@@ -3399,6 +3464,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       runtimeFailureStreak,
       runtimeFailureUsageBasis,
       neverInvokedRunCount,
+      commentExemptExecutedRunCount,
       nonExecutingRunCount,
       nonExecutingDominantErrorCode,
       nonExecutingAlsoNeverInvokedCount,
@@ -3527,7 +3593,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
-      `- Never-invoked runs excluded (terminal, \`issueCommentStatus: not_applicable\`, BLO-26165): ${evidence.neverInvokedRunCount}`,
+      `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
+      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, counted toward the streak — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
       ...(evidence.nonExecutingRunCount > 0
         ? [
             // BLO-22436 (Ally suggestion on 37c1bd65): one parenthetical group,
@@ -3645,7 +3712,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
-      `- Never-invoked runs excluded: ${evidence.neverInvokedRunCount}`,
+      `- Never-invoked runs excluded (no adapter created): ${evidence.neverInvokedRunCount}`,
+      `- Comment-policy-exempt runs that DID execute (counted): ${evidence.commentExemptExecutedRunCount}`,
       // BLO-22436 (Ally suggestion on 37c1bd65): the never-invoked count is
       // ambiguous on its own — it says nothing about *why* those runs could not
       // comment. Carry the non-executing count and its overlap here too, so the
