@@ -5,8 +5,8 @@
  * heartbeat.ts) is a text heuristic over the agent's free-text summary; it
  * flags `pr_review_output_missing` whenever the summary lacks a recognized
  * posted-review / skip marker. In practice that misfires on legitimate runs
- * (for example, an idempotency skip or a formal App approval) — the PR *was*
- * reviewed, but the phrasing wasn't matched. This module lets the server check
+ * (an idempotency skip, or a comment-shaped review whose phrasing wasn't
+ * matched) — the PR *was* reviewed. This module lets the server check
  * the authoritative source — GitHub — before keeping that `missing` verdict.
  *
  * The server has no ambient GitHub token, so we mint short-lived **installation
@@ -202,7 +202,7 @@ export async function getInstallationToken(nowMs: number = Date.now()): Promise<
 }
 
 export type ReviewerEvidenceResult =
-  | { found: true; via: "review" }
+  | { found: true; via: "review" | "comment" }
   | { found: false }
   | { error: string };
 
@@ -284,17 +284,63 @@ export async function githubFetchPrHeadSha(input: {
 }
 
 /**
- * Authoritatively check whether the reviewer GitHub App approved THIS PR's
- * required head before a claimed PR-review run can complete.
+ * Extract the head SHA a canonical consolidated Ally review attests to reviewing,
+ * or null when the body is not that canonical shape. Requires the server-owned
+ * heading AND exactly one standalone full-SHA `Reviewed head:` line: a request
+ * comment can quote an arbitrary SHA, so a loose substring match is not durable
+ * evidence that the review side effect actually happened.
+ */
+function consolidatedReviewHead(body: string): string | null {
+  if (!/(?:^|\n)\s*## Ally — Consolidated PR Review\s*(?=\n|$)/.test(body)) {
+    return null;
+  }
+  const attestations = Array.from(
+    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*([0-9a-f]{40})\s*_?\s*(?=\n|$)/gi),
+    (match) => match[1]!.toLowerCase(),
+  );
+  return attestations.length === 1 ? attestations[0]! : null;
+}
+
+/**
+ * Authoritatively check whether the reviewer GitHub App actually REVIEWED this
+ * PR's required head — a *run-output attestation*, not a *merge authorization*.
  *
- * Found only when an APPROVED formal review from the configured App is recorded
- * on the exact wake head, or on the PR's resolved current head when the wake
- * omitted it. The same-slug user seat is a separate team-evidence lane; issue
- * comments and descendant reviews cannot satisfy this App gate.
+ * BLO-28920 — READ THIS BEFORE TIGHTENING THE PREDICATE. These two questions
+ * look alike and are not:
+ *
+ *  - *Merge authorization* ("may this PR merge?") legitimately demands an
+ *    `APPROVED` review. That gate lives elsewhere (`githubGetPullRequestGate`).
+ *  - *Run-output attestation* ("did the reviewer run do its job?") must accept
+ *    `COMMENTED`, because that is Ally's correct output for a review carrying
+ *    findings — and because GitHub bars a PR's author from APPROVE /
+ *    REQUEST_CHANGES on its own PR. Agent PRs are authored by the App itself, so
+ *    requiring `APPROVED` here is structurally unsatisfiable for the dominant
+ *    case: n=1,962 App-authored PRs carry zero App approvals (BLO-24056).
+ *
+ * Applying the merge bar to this attestation is exactly the regression that
+ * 4c7e23d9c shipped by collapsing the App-identity branch into the user-seat
+ * branch: reviewer runs that had posted a valid exact-head `COMMENTED` review
+ * were failed `pr_review_output_missing` and retried in a paid loop (~66 runs /
+ * 3h). Every caller of this function asks the attestation question — completion
+ * verification, the stale-kill double-post probe, and the gate-status outbox —
+ * so state, not approval, is what it must key on.
+ *
+ * Found when the configured App identity left EITHER surface at the exact head,
+ * because Ally posts on either and each surface is individually blind to the
+ * other:
+ *  - a formal review with `commit_id === headSha`, in ANY state; or
+ *  - an issue comment carrying the canonical consolidated-review heading and a
+ *    single `Reviewed head:` attestation equal to that head (comment-mode
+ *    reviews file no review object and so carry no `commit_id`).
+ *
+ * Deliberately NOT accepted, so a genuinely missing review still fails: the
+ * same-slug bare user seat (a distinct principal — see
+ * `githubReviewerIdentityMatches`), and any review at a head other than the
+ * required one.
  *
  * Returns `{error}` on invalid configuration, missing creds/token, or any non-OK
- * or failed reviews fetch. Callers fail completion closed with a retryable
- * verification-unavailable error. An unresolved required head returns
+ * or failed reviews/comments fetch. Callers fail completion closed with a
+ * retryable verification-unavailable error. An unresolved required head returns
  * `{found:false}` and never accepts arbitrary review evidence.
  */
 export async function githubHasReviewerEvidenceForPr(input: {
@@ -316,8 +362,8 @@ export async function githubHasReviewerEvidenceForPr(input: {
     headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
   if (!headSha) return { found: false };
 
-  // Only a formal APPROVED review from the configured App at the required exact
-  // head can satisfy the protected App lane.
+  // 1) Formal reviews — the configured App at this exact head, in any state.
+  // `COMMENTED` counts: see the merge-authorization vs attestation note above.
   try {
     for (let page = 1; page <= 10; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
@@ -334,15 +380,35 @@ export async function githubHasReviewerEvidenceForPr(input: {
       for (const review of batch) {
         const authorLogin = review.user?.login ?? "";
         const commitId = headShaHex(review.commit_id);
-        if (githubReviewerIdentityMatches(authorLogin, botLogin)) {
-          if ((review.state ?? "").toUpperCase() !== "APPROVED") continue;
-          if (commitId === headSha) return { found: true, via: "review" };
-        }
+        if (!githubReviewerIdentityMatches(authorLogin, botLogin)) continue;
+        if (commitId === headSha) return { found: true, via: "review" };
       }
       if (batch.length < 100) break;
     }
   } catch {
     return { error: "reviews_fetch_failed" };
+  }
+
+  // 2) Comment-shaped reviews — the second surface. Ally frequently reviews by
+  // posting a consolidated comment and files no review object at all, so a PR it
+  // demonstrably reviewed can report zero reviews on surface (1).
+  try {
+    for (let page = 1; page <= 10; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
+      const res = await ghFetch(url, { headers });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("comments", res);
+        return { error: classified.reason };
+      }
+      const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string | null }>;
+      for (const comment of batch) {
+        if (!githubReviewerIdentityMatches(comment.user?.login ?? "", botLogin)) continue;
+        if (consolidatedReviewHead(comment.body ?? "") === headSha) return { found: true, via: "comment" };
+      }
+      if (batch.length < 100) break;
+    }
+  } catch {
+    return { error: "comments_fetch_failed" };
   }
 
   return { found: false };
