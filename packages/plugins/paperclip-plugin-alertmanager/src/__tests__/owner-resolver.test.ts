@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveAssigneeUserId,
+  resolveFallbackAgentId,
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
@@ -441,5 +442,80 @@ describe("resolveAssigneeUserId — full chain", () => {
     const result = await resolveAssigneeUserId(ctx, a, ownerMap);
     expect(result.assigneeUserId).toBe("user-7");
     expect(result.assigneeAgentId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveFallbackAgentId (BLO-21310 item 1)
+//
+// Exactly-one-match is the whole contract: anything else must return undefined
+// so the caller fails closed rather than filing an ownerless issue.
+// ---------------------------------------------------------------------------
+
+describe("resolveFallbackAgentId", () => {
+  const mkAgentCtx = (agents: Array<{ id: string; name: string }>) => {
+    const list = vi.fn(async () => agents);
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const ctx = { agents: { list }, logger } as unknown as Parameters<
+      typeof resolveFallbackAgentId
+    >[0];
+    return { ctx, list, logger };
+  };
+
+  it("resolves an exact name to its agent id", async () => {
+    const { ctx } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage" },
+      { id: "agent-2", name: "Release Engineer" },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toBe("agent-1");
+  });
+
+  it("matches case-insensitively after trimming", async () => {
+    const { ctx } = mkAgentCtx([{ id: "agent-1", name: "  Ops Triage " }]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "ops triage"),
+    ).resolves.toBe("agent-1");
+  });
+
+  it("returns undefined without querying when no name is configured", async () => {
+    const { ctx, list } = mkAgentCtx([{ id: "agent-1", name: "Ops Triage" }]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", undefined),
+    ).resolves.toBeUndefined();
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "   "),
+    ).resolves.toBeUndefined();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("returns undefined and warns when the name matches nothing", async () => {
+    const { ctx, logger } = mkAgentCtx([{ id: "agent-1", name: "Ops Triage" }]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Nobody"),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved to 0 agents"),
+    );
+  });
+
+  it("returns undefined and warns when the name is ambiguous", async () => {
+    const { ctx, logger } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage" },
+      { id: "agent-2", name: "ops triage" },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved to 2 agents"),
+    );
+  });
+
+  it("scopes the lookup to the requested company", async () => {
+    const { ctx, list } = mkAgentCtx([{ id: "agent-1", name: "Ops Triage" }]);
+    await resolveFallbackAgentId(ctx, "company-42", "Ops Triage");
+    expect(list).toHaveBeenCalledWith({ companyId: "company-42" });
   });
 });
