@@ -426,13 +426,25 @@ extraVolumes:
   # token (identity app/allyblockcast[bot]) — and it is ALSO the review bot, so a
   # PR authored by the App cannot be formally reviewed by it (GitHub forbids
   # reviewing your own PR; the bot degrades to comment-mode). This separate secret
-  # holds the @allyblockcast USER token (a distinct identity from the [bot] App,
-  # granted write on Blockcast/multicast + the penstock repos). Agents use it to
-  # push the branch + `gh pr create` (so the PR author is the user seat, formally
-  # reviewable by the bot) and for the final `gh pr merge` — see the
-  # github-pr-workflow skill. optional:true so the pod still starts if the secret
-  # is absent. The adapter auto-propagates this main-container secret volume into
-  # agent Job pods (selfPod.secretVolumes).
+  # holds the @allyblockcast USER token (a distinct identity from the [bot] App).
+  #
+  # CORRECTED (BLO-24056): the previous text here claimed agents use this to
+  # "push the branch + `gh pr create` ... and for the final `gh pr merge`". That
+  # was stale and contradicted the github-pr-workflow skill, which documents the
+  # seat as reserved for a dedicated reviewer service and explicitly NOT an
+  # authoring credential. Measurement settled it: across 240 PRs in onprem-k8s,
+  # penstock-llm-proxy-core, paperclip and multicast the seat authored 0 and
+  # pushed 0 — authorship is 100% the App. Anyone auditing intent from the infra
+  # side was being told the opposite of what the deployment does.
+  #
+  # This volume is CONTROL-PLANE ONLY. It is no longer auto-propagated into
+  # agent Job pods: `paperclip-github-merge-token` was removed from
+  # AGENT_SECRET_VOLUME_ALLOWLIST (vendor/paperclip-adapter-claude-k8s). It was
+  # unreachable from an agent anyway — the `gh` wrapper resolves
+  # PAPERCLIP_GITHUB_TOKEN_FILE, pinned above to the App token, and shipped
+  # skills may not name the seat path — while putting a review-clearing
+  # credential on 108 agent Job pods. optional:true so the pod still starts if
+  # the secret is absent.
   - name: github-merge-token
     secret:
       secretName: paperclip-github-merge-token
