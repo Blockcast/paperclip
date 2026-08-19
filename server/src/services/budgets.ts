@@ -1183,10 +1183,17 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
         await markApprovalStatus(db, incident.approvalId ?? null, "approved", input.decisionNote, actorUserId);
         // Raising the cap closes *every* open incident for the policy, but only the
-        // one the board acted on gets a decision. A policy can now hold two open
-        // incidents at once -- soft and hard both carry a card since BLO-28793 --
-        // so withdraw the cards belonging to the ones closed as a side effect
-        // rather than leaving them pending against a resolved incident.
+        // one the board acted on gets a decision, so the rest must have their cards
+        // withdrawn rather than left pending against a resolved incident.
+        //
+        // `otherOpenRows` is non-empty mainly when the *decided* incident is stale --
+        // already resolved or dismissed, so it is not itself in the open set -- while
+        // a later incident on the same policy is still open. That is the case the
+        // tests pin. Note that soft and hard do NOT normally coexist as open rows:
+        // both create sites gate the warn card on `!hardStopWillFire` and call
+        // `resolveOpenSoftIncidents` before filing the hard one. The single exception
+        // is a policy write that clears `hardStopEnabled` while already over cap,
+        // which files a warn card without closing the open hard incident.
         for (const row of otherOpenRows) {
           await withdrawPendingApproval(
             row.approvalId ?? null,
