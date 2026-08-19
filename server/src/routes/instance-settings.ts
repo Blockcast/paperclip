@@ -7,8 +7,13 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { validate } from "../middleware/validate.js";
+import {
+  auditHookCommands,
+  describeHookCommandFinding,
+  LIFECYCLE_HOOK_COMMAND_SETTINGS,
+} from "../services/lifecycle-hook-command-audit.js";
 import {
   companyService,
   heartbeatService,
@@ -27,6 +32,43 @@ function assertCanManageInstanceSettings(req: Request) {
     return;
   }
   throw forbidden("Instance admin access required");
+}
+
+/**
+ * Reject a general-settings PATCH that would store a lifecycle hook command
+ * pointing at an absolute script path which does not exist (BLO-28782).
+ *
+ * Only the keys present in the patch are checked, so an unrelated PATCH is
+ * never blocked by pre-existing drift — that case is the boot audit's job.
+ * API and worker tiers run the same image, so an absolute path resolves
+ * identically wherever the hook is later spawned.
+ */
+function assertHookCommandsResolve(patch: Record<string, unknown>) {
+  const patched = LIFECYCLE_HOOK_COMMAND_SETTINGS.filter((setting) =>
+    Object.prototype.hasOwnProperty.call(patch, setting),
+  );
+  if (patched.length === 0) return;
+
+  const findings = auditHookCommands({
+    preRunCmd: null,
+    postRunCmd: null,
+    quotaExhaustedCmd: null,
+    ...Object.fromEntries(
+      patched.map((setting) => [
+        setting,
+        typeof patch[setting] === "string" ? (patch[setting] as string) : null,
+      ]),
+    ),
+  });
+  if (findings.length === 0) return;
+
+  throw unprocessable(
+    `Lifecycle hook command does not resolve: ${findings.map(describeHookCommandFinding).join("; ")}`,
+    {
+      reason: "lifecycle_hook_command_unresolved",
+      findings,
+    },
+  );
 }
 
 export function instanceSettingsRoutes(db: Db) {
@@ -90,6 +132,7 @@ export function instanceSettingsRoutes(db: Db) {
     validate(patchInstanceGeneralSettingsSchema),
     async (req, res) => {
       assertCanManageInstanceSettings(req);
+      assertHookCommandsResolve(req.body);
       const updated = await svc.updateGeneral(req.body);
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

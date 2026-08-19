@@ -56,6 +56,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
@@ -1692,6 +1693,20 @@ export async function startServer(): Promise<StartedServer> {
 
       resolveListen();
     });
+  });
+
+  // Audit the configured lifecycle hook commands against this image (BLO-28782).
+  // These commands live in instance settings, not code, so a refactor that
+  // deletes the module they point at leaves build + tests green and the hook
+  // silently dead — that is exactly how `quotaExhaustedCmd` spent 44+ days
+  // firing MODULE_NOT_FOUND across 11 agents. Non-fatal and post-listen: a
+  // dead hook must not stop the instance serving, it must stop being silent.
+  void auditConfiguredHookCommandsOnBoot({
+    db: db as any,
+    getGeneral: () => instanceSettingsService(db).getGeneral(),
+    listCompanyIds: () => instanceSettingsService(db).listCompanyIds(),
+  }).catch((err) => {
+    logger.warn({ err }, "lifecycle hook command audit failed (non-fatal)");
   });
 
   // Auto-install bundled plugins (idempotent — skips if already installed).
