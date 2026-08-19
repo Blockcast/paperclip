@@ -795,18 +795,122 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .then((rows) => rows[0]!);
     expect(afterTrigger.monitorNextCheckAt).not.toBeNull();
     expect(parseIssueExecutionState(afterTrigger.executionState)?.monitor?.status).toBe("scheduled");
+    // The bound is carried through the re-arm rather than dropped.
+    expect(parseIssueExecutionState(afterTrigger.executionState)?.monitor?.timeoutAt)
+      .toBe(timeoutAt.toISOString());
 
-    // And the timeout sweep still governs it: past the timeoutAt, BLO-25865
-    // picks it up regardless of the re-arm.
+    // The BLO-25865 sweep now finds NOTHING, and that is the correct outcome:
+    // its predicate targets monitors abandoned in `triggered` state with a null
+    // nextCheckAt, which is exactly the wreckage this fix stops creating.
     const recovered = await heartbeat.__test_tickExpiredIssueMonitors(
       new Date("2026-04-11T13:30:00.000Z"),
     );
-    expect(recovered.checked).toBe(1);
+    expect(recovered.checked).toBe(0);
+
+    // The timeout is enforced on the next dispatch instead: past timeoutAt the
+    // monitor is cleared via exhaustedMonitorClearReason rather than deferring
+    // forever. This is the AC2 bound for a blocker that never resolves.
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T13:30:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+    const afterTimeout = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterTimeout.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(afterTimeout.executionState)?.monitor?.clearReason)
+      .toBe("timeout_exceeded");
 
     // The recovery enqueues real work; drain it so the shared teardown helper
     // (which blocks until no run is queued/running/scheduled_retry) can settle.
     await heartbeat.drainInFlightExecutions(60_000);
     await db.delete(heartbeatRuns);
+  });
+
+  // BLO-22048 (terminal boundary): the re-arm above is bounded, so a blocker
+  // that never resolves eventually exhausts the monitor and hands the strand to
+  // `performIssueMonitorRecovery`. With the default `recoveryPolicy: null` that
+  // path enqueues an `issue_monitor_recovery` wake at the assignee — but that
+  // wake names the SAME still-blocked issue, and it is not an interaction wake
+  // (no comment id), so `isEffectivelyDependencyReadyForDispatch` rejects it and
+  // `enqueueWakeup` parks it as another `dependency_blocked` scheduled_retry.
+  // The return value is discarded there, so `issue.monitor_recovery_wake_queued`
+  // is logged for a wake that was never delivered.
+  //
+  // This test pins that terminal disposition so the residual gap is a recorded,
+  // asserted fact rather than a claim in a comment. It is NOT asserting desired
+  // behaviour — it documents where this fix stops. The remaining gap is reported
+  // on BLO-22048 for the CTO to place, deliberately not filed as its own row
+  // (that issue's triage asked for consolidation over a new row).
+  it("parks — does not deliver — the owner-recovery wake when the blocker is still unresolved (BLO-22048)", async () => {
+    const { companyId, issueId } = await seedFixture({
+      monitor: { maxAttempts: 1 },
+    });
+
+    const blockerId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = createHeartbeat();
+
+    // Attempt 1 of 1: deferred and re-armed, consuming the only attempt.
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:31:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    // Attempt 2 exceeds maxAttempts, so the monitor is cleared and owner
+    // recovery fires.
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:45:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+
+    await heartbeat.drainInFlightExecutions(60_000);
+    await db.delete(heartbeatRuns);
+
+    // The monitor is gone: bounded, as intended.
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(actions).toContain("issue.monitor_exhausted");
+
+    // ...and the recovery wake it handed off to was itself parked behind the
+    // same blocker rather than delivered. Every run produced by this exhaustion
+    // is a dep-blocked park; none is queued or running.
+    expect(runs.length).toBeGreaterThan(0);
+    expect(runs.every((run) => run.scheduledRetryReason === "dependency_blocked")).toBe(true);
+    expect(runs.some((run) => run.status === "queued" || run.status === "running")).toBe(false);
   });
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {
