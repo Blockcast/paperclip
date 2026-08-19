@@ -2875,6 +2875,12 @@ describe("agent issue mutation checkout ownership", () => {
       expect(remediation).toContain(`agent://${ownerAgentId}`);
       // ...and the exact token they must write to do it.
       expect(remediation).toContain(`agent://${peerAgentId}`);
+      // PEN-2394: naming the token is not enough — the parser only accepts the
+      // markdown link form, so the message has to show it. Prescribing "a comment
+      // containing agent://<id>" sent an assignee to post a bare string that
+      // grants nothing, and the retry returned this same text.
+      expect(remediation).toContain(`[@name](agent://${peerAgentId})`);
+      expect(remediation).toMatch(/bare agent:\/\/[^\s]+ in the comment body is not a mention/i);
       // Corrects the specific false inference that caused the loop.
       expect(remediation).toMatch(/does not grant you comment access/i);
       // Names somewhere to respond instead, so the wake is not a dead end.
