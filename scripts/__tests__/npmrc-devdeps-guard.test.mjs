@@ -130,8 +130,18 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
   // install. Validate the pairing positionally rather than pattern-matching a
   // literal, so this guard keeps holding under a future refactor and fails on
   // the misalignment the array form newly makes possible.
-  const laneNames = parseBashArrayElements(verifyBody, "lane_names");
-  const laneResults = parseBashArrayElements(verifyBody, "lane_results");
+  // BLO-28999 added a lane-classification step ahead of the aggregation step,
+  // and it carries its own `lane_names`/`lane_results`/`case` block. Scope the
+  // assertions below to the aggregation step — the one that IS the gate — so
+  // they keep describing the script they were written for rather than
+  // silently retargeting onto whichever step happens to appear first.
+  const aggregationBody = verifyBody.slice(
+    verifyBody.indexOf("- name: Fail if any split verify lane failed"),
+  );
+  assert.ok(aggregationBody, "verify must retain the lane-outcome aggregation step.");
+
+  const laneNames = parseBashArrayElements(aggregationBody, "lane_names");
+  const laneResults = parseBashArrayElements(aggregationBody, "lane_results");
   assert.ok(laneNames !== null, "verify must classify lanes via a lane_names array.");
   assert.ok(laneResults !== null, "verify must classify lanes via a lane_results array.");
   assert.equal(
@@ -160,18 +170,36 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
 
   // The arrays are only paired if the loop reads both at the same index.
   assert.match(
-    verifyBody,
+    aggregationBody,
     /for i in "\$\{!lane_names\[@\]\}";\s*do\s*\n\s*lane="\$\{lane_names\[\$i\]\}"\s*\n\s*case "\$\{lane_results\[\$i\]\}" in/,
     "verify must iterate lane_names and lane_results under a shared index so names and results stay paired.",
   );
+  // BLO-28999 split the default branch: a lane the classifier proved was
+  // killed mid-job by the runner pool goes to `infra_lanes` (different
+  // wording), everything else still goes to `failed_lanes`. The guard's
+  // intent is unchanged and is what matters here — an unrecognized result
+  // must never fall through to silence — so assert BOTH destinations exist
+  // and, crucially, that BOTH of them still gate `exit 1`. A killed lane is
+  // explained differently; it is not excused.
+  const defaultBranch = aggregationBody.match(/\*\)([\s\S]*?);;/)?.[1] ?? "";
   assert.match(
-    verifyBody,
-    /\*\)\s*failed_lanes\+=\("\$lane"\)/,
+    defaultBranch,
+    /failed_lanes\+=\("\$lane"\)/,
     "verify must still treat an unrecognized/failed lane result as a failure, not silently pass.",
   );
   assert.match(
-    verifyBody,
+    defaultBranch,
+    /infra_lanes\+=\("\$lane"\)/,
+    "verify must route a proven runner kill to infra_lanes so it is explained, not misattributed.",
+  );
+  assert.match(
+    aggregationBody,
     /if \[ "\$\{#failed_lanes\[@\]\}" -gt 0 \];\s*then[\s\S]*?exit 1/,
     "verify must exit non-zero when any lane (including worktree_install) is in failed_lanes.",
+  );
+  assert.match(
+    aggregationBody,
+    /if \[ "\$\{#infra_lanes\[@\]\}" -gt 0 \];\s*then[\s\S]*?exit 1/,
+    "verify must exit non-zero for an infrastructure kill too — this changes the explanation, not the gate.",
   );
 });
