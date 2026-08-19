@@ -251,3 +251,75 @@ export function clampTransientRetryHorizon(input: {
   }
   return { dueAt: new Date(ceilingMs), clampedFromIso: input.retryNotBefore.toISOString() };
 }
+
+/**
+ * Decide a retry due time for work owned by a *periodic* routine (BLO-28863).
+ *
+ * {@link clampTransientRetryHorizon} bounds the pathological multi-day park, but
+ * it is period-unaware by design: its ceiling is a flat
+ * MAX_TRANSIENT_RETRY_HORIZON_MS and its own suite asserts that a 23h floor is
+ * "ordinary provider backoff" to be left untouched. That assumption holds for
+ * unbounded work and breaks for a windowed routine. Measured 2026-08-19: the
+ * 6-hourly agent-health routine lost the `00:00Z-06:00Z` window because its
+ * retry was scheduled past the window close, and 70% of `transient_failure`
+ * retries were pinned 3-5h out to the provider's advertised reset — inside the
+ * 24h ceiling, so the existing clamp never fired.
+ *
+ * A retry that can only wake after its window closes is worth *less* than no
+ * retry: it cannot do the window's work, but it still consumes one of the
+ * owning agent's `maxConcurrentRuns` slots and one attempt, delaying every
+ * other queued retry behind it. So the contract here is deliberately
+ * abandon-rather-than-strand: if the due time cannot land inside the owning
+ * period, report `abandon` and let the routine's next scheduled fire own the
+ * work.
+ *
+ * Returns a decision rather than a Date so the caller must handle `abandon`
+ * explicitly; silently substituting a clamped Date is how a stranded retry
+ * would come back as a same-shaped bug.
+ */
+export function resolveRoutineScopedRetry(input: {
+  /** Provider-advertised or backoff-computed due time under consideration. */
+  dueAt: Date;
+  /** Failure instant the period budget is measured from. */
+  failedAt: Date;
+  /** Period of the routine that owns the work, in ms. */
+  routinePeriodMs: number;
+  /**
+   * Hard deadline of the specific window being served, when known. Tighter than
+   * the period whenever the failure happened mid-window, which is the common
+   * case — a failure 5h into a 6h window has 1h of budget, not 6h.
+   */
+  windowClosesAt?: Date | null;
+}):
+  | { decision: "honour"; dueAt: Date; clampedFromIso: null }
+  | { decision: "clamp"; dueAt: Date; clampedFromIso: string }
+  | { decision: "abandon"; dueAt: null; clampedFromIso: string; reason: string } {
+  const periodMs = Math.max(1, input.routinePeriodMs);
+  const periodDeadlineMs = input.failedAt.getTime() + periodMs;
+  const deadlineMs = input.windowClosesAt
+    ? Math.min(periodDeadlineMs, input.windowClosesAt.getTime())
+    : periodDeadlineMs;
+
+  if (input.dueAt.getTime() <= deadlineMs) {
+    return { decision: "honour", dueAt: input.dueAt, clampedFromIso: null };
+  }
+
+  // Past the deadline. Retrying at the deadline itself is pointless — the
+  // window is closed at that instant — so only clamp when there is real margin
+  // left to land in, and abandon otherwise.
+  const marginMs = deadlineMs - input.failedAt.getTime();
+  if (marginMs <= 0) {
+    return {
+      decision: "abandon",
+      dueAt: null,
+      clampedFromIso: input.dueAt.toISOString(),
+      reason: "owning window had already closed at the failure instant",
+    };
+  }
+
+  return {
+    decision: "clamp",
+    dueAt: new Date(deadlineMs),
+    clampedFromIso: input.dueAt.toISOString(),
+  };
+}
