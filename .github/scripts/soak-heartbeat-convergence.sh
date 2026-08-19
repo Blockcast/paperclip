@@ -296,6 +296,22 @@ verdict="$(
           attributed = 1;
           print "LOAD ATTRIBUTION: no synthetic load requested and none observed; this was an idle-regime run.";
         }
+      } else if (dlmean > workers * 1.5) {
+        # The ceiling the floor below implies. A burner is a busy-loop, so N of
+        # them raise the run queue by ~N and the delta should approach `workers`
+        # from EITHER side. Without this branch the pass band is [workers*0.5,
+        # +inf) and every over-attribution is invisible -- which is the failure
+        # direction that can manufacture a false AC2 "regime reached".
+        #
+        # It fires on a RISING runner, where min-of-samples is exactly wrong:
+        # the minimum is the first sample, so the settle window locks in the
+        # pre-rise floor and the delta then measures burners + neighbour. Note
+        # the asymmetry this closes -- with LOAD_WORKERS=off the same neighbour
+        # load is already caught above, so without a ceiling the attribution
+        # check was strictly WEAKER in the normal mode than in the off mode.
+        attributed = 0;
+        printf "LOAD ATTRIBUTION: mean load0 delta (%+.2f) EXCEEDS the %d burner(s) started — load beyond this job'\''s is present (/proc/loadavg is host-wide). The regime reading is not solely ours.\n",
+          dlmean, workers;
       } else if (dlmean >= workers * 0.5) {
         # 0.5: a burner is a busy-loop, so N of them should raise the run queue by
         # ~N and the delta should approach `workers`. Half of that is a deliberately

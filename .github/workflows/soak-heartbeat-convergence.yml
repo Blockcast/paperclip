@@ -26,6 +26,21 @@ on:
         required: false
         default: auto
         type: string
+      load_settle_s:
+        description: >-
+          Seconds to settle before sampling the load baseline, so the install's
+          decaying load is not counted as baseline. 0 takes a single immediate
+          reading — use that for fast smoke dispatches, not for AC2 evidence.
+        required: false
+        default: "90"
+        type: string
+      load_warmup_s:
+        description: >-
+          Seconds to let the synthetic burners reach steady state before
+          iteration 1. 0 starts iterating immediately.
+        required: false
+        default: "240"
+        type: string
 
 permissions:
   contents: read
@@ -77,6 +92,11 @@ jobs:
         env:
           ITERATIONS: ${{ inputs.iterations }}
           LOAD_WORKERS: ${{ inputs.load_workers }}
+          # Both feed `sleep`, and together they are 5.5 minutes of pure waiting
+          # before iteration 1 at the defaults. Plumbed through so a smoke
+          # dispatch can zero them; the script validates both as integers.
+          LOAD_SETTLE_S: ${{ inputs.load_settle_s }}
+          LOAD_WARMUP_S: ${{ inputs.load_warmup_s }}
         run: bash .github/scripts/soak-heartbeat-convergence.sh
 
       - name: Upload soak summary and per-iteration logs
