@@ -7864,6 +7864,35 @@ export function recoveryService(
     // most recently resolved escalation even when an older row was edited after
     // it closed".
     const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`;
+    // Keep the scan bounded. Neither OR arm is servable for these rows: the
+    // fingerprint arm's only index (`issues_active_liveness_recovery_leaf_uq`,
+    // schema/issues.ts) is partial on `status not in ('done','cancelled')`,
+    // which is mutually exclusive with the `status = 'done'` filter below, so
+    // the planner falls back to the `(company_id, origin_kind)` prefix of
+    // `issues_company_origin_idx` and reads the company's ENTIRE escalation
+    // history -- which only ever grows, since resolved rows are never pruned.
+    // The version this replaced was bounded to the 60m cooldown by a
+    // `gte(updatedAt, cutoff)` servable by `issues_company_updated_idx`;
+    // removing it was required for the 7d target-state window, but nothing
+    // replaced it, and this runs once per stale finding per sweep AND
+    // synchronously inside the operator preview endpoint.
+    //
+    // Bounding by `max(cooldownMs, unchangedTargetSuppressionMs)` cannot change
+    // a result: every branch below already returns null for rows resolved
+    // before that horizon (cooldown needs `resolvedAtMs >= now - cooldownMs`;
+    // the target branch returns null at `resolvedAtMs <= now -
+    // unchangedTargetSuppressionMs`). Excluding rows can only change WHICH row
+    // the `desc` ORDER BY picks if every candidate is excluded -- and that case
+    // returned null anyway.
+    //
+    // The bound is on `updatedAt` rather than on `resolvedAtExpr` because only
+    // the former is sargable, and it is a SUPERSET: `completedAt` is always
+    // written as `new Date()` on a write that bumps `updatedAt` to the same
+    // instant, so `completed_at <= updated_at` and therefore
+    // `coalesce(...) >= cutoff` implies `updated_at >= cutoff`. It can never
+    // exclude a row the suppressor would have used. No migration needed.
+    const suppressionHorizonMs = Math.max(cooldownMs, unchangedTargetSuppressionMs);
+    const horizonCutoff = new Date(now.getTime() - suppressionHorizonMs);
     const mostRecentDone = await db
       .select({
         id: issues.id,
@@ -7885,6 +7914,9 @@ export function recoveryService(
           // action path -- so that shape must re-escalate immediately. Pinned by
           // "re-escalates immediately after a matching escalation is cancelled".
           eq(issues.status, "done"),
+          // Sargable superset of the suppression horizon -- see the note above
+          // the query. Restores the bound the 60m cooldown used to provide.
+          gte(issues.updatedAt, horizonCutoff),
         ),
       )
       .orderBy(desc(resolvedAtExpr), desc(issues.id))
