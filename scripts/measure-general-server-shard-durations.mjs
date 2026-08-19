@@ -59,12 +59,40 @@ export function selectTargetFiles({ allFiles, durations, all, shardIndex, shardC
 // Parses a Vitest --reporter=json report into { repoPath: ms }. Vitest test
 // file `name` fields are absolute paths, so they are rebased onto repoRoot to
 // match the manifest's repo-relative keys.
+//
+// An entry only counts as a measurement if the file actually ran tests.
+// Vitest derives a test FILE's status by folding its tests' results, so a file
+// that threw during collection -- import error, bad top-level await -- has no
+// tests to fold: it comes back with an empty `assertionResults` and an
+// endTime - startTime of roughly 0, and (because nothing failed) often a
+// `passed` status. measureFiles deliberately tolerates a non-zero vitest exit
+// so that ordinary test failures still yield real timings, which means without
+// this guard that 0 is indistinguishable from a genuinely fast suite and is
+// written to the manifest as one -- handing what may be the heaviest suite in
+// the lane a near-zero partition weight until the next weekly --all pass.
+//
+// Skipping is the safe direction rather than recording a 0: mergeManifest
+// keeps the suite's previous duration, and a suite that never had one stays
+// absent and keeps the median default, which check-shard-manifest-freshness
+// then reports by name. Note the conditions are written to skip only on
+// positive evidence of a non-run -- an absent `assertionResults` or `status`
+// (reporter shape drift) keeps the entry, because a guard that could silently
+// empty the manifest would be worse than the bug it closes.
 export function parseVitestJsonReport(reportText, repoRoot) {
   const report = JSON.parse(reportText);
   const measured = {};
   for (const testFile of report.testResults ?? []) {
     const repoPath = path.relative(repoRoot, testFile.name).split(path.sep).join("/");
     const durationMs = Math.round(testFile.endTime - testFile.startTime);
+
+    const collectedNothing =
+      Array.isArray(testFile.assertionResults) && testFile.assertionResults.length === 0;
+    const unknownStatus =
+      typeof testFile.status === "string" && !["passed", "failed"].includes(testFile.status);
+    if (collectedNothing || unknownStatus) {
+      continue;
+    }
+
     if (Number.isFinite(durationMs) && durationMs >= 0) {
       measured[repoPath] = durationMs;
     }

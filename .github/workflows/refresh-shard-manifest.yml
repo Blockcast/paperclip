@@ -39,10 +39,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      # Via the wrapper, not pnpm/action-setup directly: it adds the one
+      # jittered retry around the registry fetch that v6's self-update needs
+      # (BLO-28813). No `version:` -- the wrapper resolves the pin from
+      # package.json "packageManager", which is why the checkout above has to
+      # come first.
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v6

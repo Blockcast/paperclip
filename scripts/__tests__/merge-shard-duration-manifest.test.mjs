@@ -75,8 +75,71 @@ test("fresh measurements win over stale entries and un-measured suites keep thei
   assert.equal(next.durations["z.test.ts"], 30, "an un-remeasured suite keeps its prior duration");
 });
 
-test("readShardMeasurements folds every shard artifact together and ignores non-JSON files", () => {
-  const files = { "shard-0.json": { "a.test.ts": 1 }, "shard-1.json": { "b.test.ts": 2 }, "README.md": null };
+// Without a prune the merge is purely additive, so a deleted suite keeps its
+// entry forever and totalCount in the provenance sentence overstates coverage.
+test("a refresh prunes entries for suites no longer on disk", () => {
+  const next = mergeManifest({
+    manifest: manifestFixture(),
+    measured: { "a.test.ts": 12 },
+    runId: "999",
+    date: "2026-08-19",
+    knownSuites: ["a.test.ts"],
+  });
+
+  assert.deepEqual(Object.keys(next.durations), ["a.test.ts"], "z.test.ts was deleted from the repo");
+  assert.ok(next["$comment"].includes("1 total"), "totalCount must reflect the prune");
+});
+
+// The prune is keyed on the suite set ON DISK, never on what this run
+// measured. The measure matrix is fail-fast: false across four shards, so a
+// measured-keyed prune would let one failed shard delete a quarter of the
+// manifest, unattended, on a Monday-morning schedule.
+test("a refresh keeps on-disk suites that this run did not measure", () => {
+  const next = mergeManifest({
+    manifest: manifestFixture(),
+    measured: { "a.test.ts": 12 },
+    runId: "999",
+    date: "2026-08-19",
+    knownSuites: ["a.test.ts", "z.test.ts"],
+  });
+
+  assert.deepEqual(Object.keys(next.durations), ["a.test.ts", "z.test.ts"]);
+  assert.equal(next.durations["z.test.ts"], 30, "an unmeasured but still-present suite keeps its duration");
+});
+
+test("a refresh prunes nothing when the suite set is empty or absent", () => {
+  for (const knownSuites of [undefined, null, []]) {
+    const next = mergeManifest({
+      manifest: manifestFixture(),
+      measured: { "a.test.ts": 12 },
+      runId: "999",
+      date: "2026-08-19",
+      knownSuites,
+    });
+
+    assert.deepEqual(
+      Object.keys(next.durations),
+      ["a.test.ts", "z.test.ts"],
+      `knownSuites=${JSON.stringify(knownSuites)} means a broken checkout, not a mass deletion`,
+    );
+  }
+});
+
+// The prune must not become a way to smuggle a new suite in without a
+// measurement: knownSuites filters, it does not seed.
+test("a refresh does not invent entries for on-disk suites that have no duration", () => {
+  const next = mergeManifest({
+    manifest: manifestFixture(),
+    measured: { "a.test.ts": 12 },
+    runId: "999",
+    date: "2026-08-19",
+    knownSuites: ["a.test.ts", "z.test.ts", "brand-new.test.ts"],
+  });
+
+  assert.deepEqual(Object.keys(next.durations), ["a.test.ts", "z.test.ts"]);
+});
+
+test("readShardMeasurements folds every shard artifact together and ignores non-JSON files", () => {  const files = { "shard-0.json": { "a.test.ts": 1 }, "shard-1.json": { "b.test.ts": 2 }, "README.md": null };
 
   const measured = readShardMeasurements("/tmp/shards", {
     readDir: () => Object.keys(files),

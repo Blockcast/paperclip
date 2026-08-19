@@ -28,6 +28,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { collectGeneralServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
+
 // Manifest keys this merge is allowed to rewrite. Anything else -- `$notes`,
 // `unit`, and whatever a future reader adds -- survives a refresh verbatim.
 export const REWRITTEN_KEYS = ["$comment", "durations"];
@@ -60,11 +62,30 @@ export function formatProvenanceComment({ runId, date, measuredCount, totalCount
 
 // Returns a new manifest object. Key order follows the input manifest so a
 // refresh produces a minimal diff.
-export function mergeManifest({ manifest, measured, runId, date }) {
+//
+// `knownSuites` is the suite set that exists ON DISK, and entries outside it
+// are pruned. Without that the merge is purely additive: a deleted suite keeps
+// its entry forever, and the totalCount in the provenance sentence slowly
+// overstates coverage (the freshness check only looks for *missing* suites, so
+// nothing else notices).
+//
+// It is deliberately the on-disk set and NOT the set measured by this run.
+// The measure matrix is `fail-fast: false` across four shards, so keying the
+// prune on what came back would let one failed shard silently delete a quarter
+// of the manifest -- trading a slow overstatement for a fast, unattended data
+// loss on a Monday-morning schedule nobody is watching. An empty or absent
+// knownSuites prunes nothing, for the same reason.
+export function mergeManifest({ manifest, measured, runId, date, knownSuites = null }) {
   const merged = { ...manifest.durations, ...measured };
+
+  const known = knownSuites instanceof Set ? knownSuites : knownSuites ? new Set(knownSuites) : null;
+  const keep = known && known.size > 0 ? (key) => known.has(key) : () => true;
+
   const durations = {};
   for (const key of Object.keys(merged).sort()) {
-    durations[key] = merged[key];
+    if (keep(key)) {
+      durations[key] = merged[key];
+    }
   }
 
   const next = { ...manifest };
@@ -119,16 +140,42 @@ if (isMainModule()) {
     process.exit(1);
   }
 
+  // The suite set on disk, used to prune entries for deleted suites. An empty
+  // result means the checkout is broken or the cwd is wrong, not that every
+  // suite was deleted -- prune nothing rather than empty the manifest.
+  const knownSuites = collectGeneralServerSuiteFiles(process.cwd());
+  if (knownSuites.length === 0) {
+    console.warn(
+      "[merge-shard-manifest] collected 0 general-server suites from " +
+        `${process.cwd()}; skipping the prune of deleted suites`,
+    );
+  }
+
   const next = mergeManifest({
     manifest,
     measured,
     runId: options.runId ?? process.env.GITHUB_RUN_ID ?? "unknown",
     date: options.date ?? new Date().toISOString().slice(0, 10),
+    knownSuites,
   });
+
+  const pruned = Object.keys(manifest.durations ?? {}).filter(
+    (key) => next.durations[key] === undefined,
+  );
 
   writeFileSync(manifestPath, JSON.stringify(next, null, 2) + "\n");
   console.log(
     `[merge-shard-manifest] merged ${Object.keys(measured).length} measured suite(s) into ` +
       `${Object.keys(next.durations).length} total manifest entries.`,
   );
+  if (pruned.length > 0) {
+    // Named, not just counted: this lands in a PR a human skims, and "why did
+    // 3 entries vanish" should be answerable from the job log alone.
+    console.log(
+      `[merge-shard-manifest] pruned ${pruned.length} entr(ies) for suites no longer on disk:`,
+    );
+    for (const key of pruned) {
+      console.log(`  - ${key}`);
+    }
+  }
 }
