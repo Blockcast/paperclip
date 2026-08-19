@@ -55,6 +55,18 @@ BASELINE_DUR_S="131"
 # matter how many burners are running, which is what made the old 90s default
 # under-report the regime by construction.
 LOAD_WARMUP_S="${LOAD_WARMUP_S:-240}"
+# The workflow runs `pnpm install --frozen-lockfile` immediately before this
+# script, and a monorepo install leaves the 1-minute load average elevated for
+# about a minute after it returns. Reading /proc/loadavg at script start folds
+# that decaying install load into the baseline; the warmup above then lets the
+# install component decay to nothing while the burners ramp up, so every
+# per-iteration dload0 measures `burners - install_load` rather than `burners`
+# and the attribution verdict reports a CFS quota that is not there.
+# Sample the MINIMUM across a settle window rather than a single reading: the
+# install component decays monotonically, so the minimum converges on the
+# settled idle floor, and a neighbour's transient spike cannot inflate it.
+# Set to 0 to take a single immediate reading (fast smoke runs).
+LOAD_SETTLE_S="${LOAD_SETTLE_S:-90}"
 
 mkdir -p "$OUT_DIR"
 SUMMARY="${OUT_DIR}/summary.txt"
@@ -72,6 +84,18 @@ die() {
 
 if ! [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || [ "$ITERATIONS" -lt 1 ]; then
   die "ITERATIONS must be a positive integer, got '$ITERATIONS'"
+fi
+
+# Validated for the same reason ITERATIONS and LOAD_WORKERS are: with no `set -e`,
+# `sleep abc` prints "invalid time interval" and the script CONTINUES, running the
+# whole soak with no warmup (or no settle) while the header still reports the
+# requested value — a silently different experiment reported as the intended one.
+if ! [[ "$LOAD_WARMUP_S" =~ ^[0-9]+$ ]]; then
+  die "LOAD_WARMUP_S must be a non-negative integer, got '$LOAD_WARMUP_S'"
+fi
+
+if ! [[ "$LOAD_SETTLE_S" =~ ^[0-9]+$ ]]; then
+  die "LOAD_SETTLE_S must be a non-negative integer, got '$LOAD_SETTLE_S'"
 fi
 
 if [ ! -f "server/${TEST_FILE}" ]; then
@@ -120,7 +144,29 @@ HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
 if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   die "could not resolve HEAD to a commit sha (got '${HEAD_SHA}')"
 fi
-BASELINE_LOAD="$(awk '{ print $1 }' /proc/loadavg)"
+read_load0() { awk '{ print $1 }' /proc/loadavg; }
+
+# Minimum of a series of samples spaced across LOAD_SETTLE_S — see the comment
+# on LOAD_SETTLE_S for why a single reading at script start is wrong.
+sample_baseline_load() {
+  local remaining="$LOAD_SETTLE_S"
+  local step min cur
+  min="$(read_load0)"
+  while [ "$remaining" -gt 0 ]; do
+    step=15
+    if [ "$remaining" -lt "$step" ]; then step="$remaining"; fi
+    sleep "$step"
+    remaining=$(( remaining - step ))
+    cur="$(read_load0)"
+    min="$(awk -v a="$cur" -v b="$min" 'BEGIN { print (a < b) ? a : b }')"
+  done
+  printf '%s' "$min"
+}
+
+if [ "$LOAD_SETTLE_S" -gt 0 ]; then
+  echo "soak: settling ${LOAD_SETTLE_S}s so the install's decaying load is not counted as baseline"
+fi
+BASELINE_LOAD="$(sample_baseline_load)"
 
 BURNER_PIDS=()
 cleanup() {
@@ -153,8 +199,8 @@ fi
     "$HEAD_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$NPROC" "$CPU_MAX"
   printf 'iterations=%s process_model=one-fresh-vitest-process-per-iteration (not --repeat)\n' \
     "$ITERATIONS"
-  printf 'synthetic_load_workers=%s (mode=%s) warmup=%ss baseline_load0_before_workers=%s\n' \
-    "$WORKERS" "$LOAD_WORKERS" "$LOAD_WARMUP_S" "$BASELINE_LOAD"
+  printf 'synthetic_load_workers=%s (mode=%s) warmup=%ss settle=%ss baseline_load0_before_workers=%s\n' \
+    "$WORKERS" "$LOAD_WORKERS" "$LOAD_WARMUP_S" "$LOAD_SETTLE_S" "$BASELINE_LOAD"
 } >> "$SUMMARY"
 
 FAILURES=0
@@ -167,7 +213,7 @@ for i in $(seq 1 "$ITERATIONS"); do
 
   # Sample load *before* the iteration so the number describes the conditions
   # the run started under, matching how the hand-run series recorded it.
-  load0="$(awk '{ print $1 }' /proc/loadavg)"
+  load0="$(read_load0)"
   # /proc/loadavg is host-wide and not namespaced by container or cgroup, so the
   # absolute figure can be a neighbour's. The delta against the pre-burner
   # baseline is what this job can actually claim.
@@ -251,6 +297,11 @@ verdict="$(
           print "LOAD ATTRIBUTION: no synthetic load requested and none observed; this was an idle-regime run.";
         }
       } else if (dlmean >= workers * 0.5) {
+        # 0.5: a burner is a busy-loop, so N of them should raise the run queue by
+        # ~N and the delta should approach `workers`. Half of that is a deliberately
+        # loose floor -- it tolerates baseline drift and burners descheduled by
+        # vitest, while still catching the case the caveat exists for, where a CFS
+        # quota caps the job far below the burner count it asked for.
         attributed = 1;
         printf "LOAD ATTRIBUTION: mean load0 delta (%+.2f) is consistent with the %d burner(s) this job started.\n",
           dlmean, workers;
