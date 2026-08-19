@@ -1072,14 +1072,12 @@ function readTransientRecoveryContractFromRun(
  * Module-scoped and exported so the exact-head requirement is unit-testable
  * without standing up the whole external-lifecycle finalize path.
  *
- * `githubHasReviewerEvidenceForPr` derives its comment-mode `headPrefix` from
- * the resolved head; when the wake carried no head SHA it falls back to
- * fetching the PR's current head, and if THAT fetch fails there is no prefix,
- * the comment-mode pass is skipped entirely, and the probe can answer
- * `{found: false}` while a comment-mode review exists. That is additive
- * elsewhere, but here a false negative authorizes a retry — so require the
- * wake's exact head and report an unresolved head as unproven (`null`),
- * never as `false`.
+ * `githubHasReviewerEvidenceForPr` keys its comment-mode pass on the resolved
+ * head; when the wake carried no head SHA it falls back to fetching the PR's
+ * current head, and if THAT fetch fails it answers `{found: false}` without
+ * having proven anything. That is additive elsewhere, but here a false negative
+ * authorizes a retry — so require the wake's exact head and report an unresolved
+ * head as unproven (`null`), never as `false`.
  */
 export async function probeStaleKillReviewEvidence(
   run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,

@@ -692,6 +692,30 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
 
     if (!blocker.assigneeAgentId) return null;
 
+    /**
+     * BLO-15200: an assignee's invokability only gates a blocker that is otherwise ready
+     * to be worked.
+     *
+     * A blocker that is itself `blocked` behind its own unresolved edges is waiting on
+     * those edges, not on its owner. The chain walk above has already descended through
+     * them and come back empty, which means every issue further down has a live owner or
+     * an explicit waiting path — so the dependency is progressing and the assignee is
+     * simply not the thing holding it. Escalating here states the wrong fact and, worse,
+     * recommends a remedy that provably cannot work: a freshly-assigned active owner
+     * would be blocked on exactly the same edges the moment it woke.
+     *
+     * This defers the finding rather than discarding it. When the blocker's own edges
+     * clear, `hasUnresolvedBlockerEdge` goes false, the blocker becomes genuinely
+     * dispatchable, and an uninvokable assignee is then the real defect — so the next
+     * sweep escalates it, at the point where "assign it to an active owner" is finally
+     * actionable.
+     *
+     * Deliberately scoped to this rule. `blocked_by_cancelled_issue` names a broken edge
+     * and `blocked_by_assigned_backlog_issue` names a status that never dispatches; both
+     * stay true regardless of what the blocker is waiting on, so both must keep firing.
+     */
+    if (blocker.status === "blocked" && hasUnresolvedBlockerEdge(blocker)) return null;
+
     const blockerAgent = agentsById.get(blocker.assigneeAgentId);
     const blockerEligibility = blockerAgent
       ? getAgentWorkEligibility({ agent: blockerAgent, agents: input.agents })
