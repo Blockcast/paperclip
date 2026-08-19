@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
@@ -191,7 +191,12 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
     expect(error?.details?.ownerExecutionRunId).toBe(ownerRunId);
   });
 
-  it("leaves the victim row untouched, so the failure is not half-applied", async () => {
+  it("leaves the victim row untouched when the conflict lands on unowned adoption", async () => {
+    // Scoped deliberately to this path. The victim is seeded with both lock
+    // columns null, so the conflict lands in `adoptUnownedCheckoutRun`, which is
+    // a single transaction — there is nothing to half-apply. That is NOT a
+    // general property of the guard: see the inline-refresh case below, where a
+    // committed reap precedes the failing write and the row does change.
     const { victimIssueId, agentId, actorRunId } = await seedDuplicateRoutineExecutions();
 
     await svc.assertCheckoutOwner(victimIssueId, agentId, actorRunId).catch(() => null);
@@ -227,8 +232,7 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
     expect(owner?.executionRunId, "the dead run's lock must be released").toBeNull();
   });
 
-  it("adopts normally once the sibling releases the dispatch lock", async () => {
-    const { victimIssueId, ownerIssueId, agentId, actorRunId } =
+  it("adopts normally once the sibling releases the dispatch lock", async () => {    const { victimIssueId, ownerIssueId, agentId, actorRunId } =
       await seedDuplicateRoutineExecutions();
 
     // Releasing the owner's `execution_run_id` drops it out of the partial
@@ -245,5 +249,136 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
     const victim = await readIssueLockState(victimIssueId);
     expect(victim?.checkoutRunId).toBe(actorRunId);
     expect(victim?.executionRunId).toBe(actorRunId);
+  });
+
+  it("records what the inline-refresh path actually leaves behind when it loses the key", async () => {
+    // The other three cases all conflict inside a single transaction. This one
+    // does not, and that is the point: `clearStaleExecutionLock` COMMITS the
+    // reap of the victim's own dead lock, and only then does the separate
+    // refresh write raise 23505. So the victim's row does change even though the
+    // call fails — "not half-applied" is true of the unowned-adoption path and
+    // false here.
+    //
+    // Both rows cannot hold the key at seed time (the partial index forbids it),
+    // so the sibling's acquisition is injected with a trigger that fires exactly
+    // when the reap releases it. That is the real production interleaving, made
+    // deterministic rather than raced.
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const routineId = randomUUID();
+    const fingerprint = "shared-dispatch-fingerprint";
+
+    const deadRunId = await seedRun(companyId, agentId, "failed");
+    await db
+      .update(heartbeatRuns)
+      .set({ finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, deadRunId));
+
+    // The victim holds the key via its OWN dead run, so it is the row the
+    // inline-refresh path reaps.
+    const victimIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: victimIssueId,
+      companyId,
+      identifier: "PEN-VICTIM",
+      title: "CI pipeline health check",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      originKind: "routine_execution",
+      originId: routineId,
+      originFingerprint: fingerprint,
+      checkoutRunId: null,
+      executionRunId: deadRunId,
+      executionLockedAt: new Date(),
+    });
+
+    // The sibling starts with no lock — it takes one the instant the victim's is
+    // released, which is the window the guard has to reason about.
+    const ownerRunId = await seedRun(companyId, agentId, "running");
+    const ownerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: ownerIssueId,
+      companyId,
+      identifier: "PEN-OWNER",
+      title: "CI pipeline health check",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      originKind: "routine_execution",
+      originId: routineId,
+      originFingerprint: fingerprint,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const actorRunId = await seedRun(companyId, agentId, "running");
+
+    // The UUIDs are interpolated as literals, not bound: a plpgsql body cannot
+    // carry bind parameters at CREATE FUNCTION time. They come from
+    // `randomUUID()`, so there is nothing to escape.
+    await db.execute(sql.raw(`
+      create or replace function pen2395_take_lock_on_release() returns trigger as $fn$
+      begin
+        update issues
+           set execution_run_id = '${ownerRunId}'::uuid, execution_locked_at = now()
+         where id = '${ownerIssueId}'::uuid;
+        return null;
+      end;
+      $fn$ language plpgsql;
+    `));
+    await db.execute(sql.raw(`
+      create trigger pen2395_take_lock_on_release
+      after update on issues
+      for each row
+      when (
+        old.execution_run_id is not null
+        and new.execution_run_id is null
+        and new.id = '${victimIssueId}'::uuid
+      )
+      execute function pen2395_take_lock_on_release();
+    `));
+
+    try {
+      const error = await svc
+        .assertCheckoutOwner(victimIssueId, agentId, actorRunId)
+        .then(() => null)
+        .catch((caught: unknown) => caught as {
+          status?: number;
+          message?: string;
+          details?: { ownerIssueId?: string | null };
+        });
+
+      // Still a 409, not the 500 this PR removes — and specifically the
+      // routine-lock 409, so the assertions below cannot be satisfied by some
+      // other conflict path that never reached the inline refresh.
+      expect(error?.status).toBe(409);
+      expect(error?.message).toBe("Routine execution already locked by another open issue");
+      expect(error?.details?.ownerIssueId).toBe(ownerIssueId);
+
+      const victim = await readIssueLockState(victimIssueId);
+      // The committed reap survives the failed refresh. This is the residual
+      // state, asserted rather than assumed: the dead run's lock is gone and the
+      // victim now holds nothing.
+      expect(victim?.executionRunId, "the reap already committed").toBeNull();
+      expect(victim?.checkoutRunId).toBeNull();
+      expect(victim?.status).toBe("in_progress");
+
+      // Benign because the reaped owner was terminal by definition — the run
+      // whose context `cancelStaleIssueContextRuns` would have cancelled is
+      // already dead, so skipping that follow-up strands nothing live.
+      const deadRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, deadRunId))
+        .then((rows) => rows[0] ?? null);
+      expect(deadRun?.status).toBe("failed");
+
+      const owner = await readIssueLockState(ownerIssueId);
+      expect(owner?.executionRunId, "the sibling holds the key it took").toBe(ownerRunId);
+    } finally {
+      await db.execute(sql`drop trigger if exists pen2395_take_lock_on_release on issues`);
+      await db.execute(sql`drop function if exists pen2395_take_lock_on_release()`);
+    }
   });
 });
