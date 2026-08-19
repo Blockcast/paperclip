@@ -66,6 +66,15 @@ const goalIdSchema = z.string().uuid();
 const approvalIdSchema = z.string().uuid();
 const documentKeySchema = z.string().trim().min(1).max(64);
 
+// BLO-27561: `q` is a literal contiguous ILIKE '%…%' over four columns — it is NOT
+// tokenized (server/src/services/issues.ts, `list`). Agent instructions fleet-wide
+// mandate this call as the pre-filing duplicate gate, and its failure direction is the
+// harmful one: a descriptive multi-word query returns `[]`, which is indistinguishable
+// from "no such issue exists". Both tools share this string so the alias cannot drift
+// out of sync with the primary.
+const ISSUE_SEARCH_Q_DESCRIPTION =
+  "Literal contiguous substring match (case-insensitive), NOT tokenized: no AND-of-terms, no stemming, no fuzzy matching. Matched against title, identifier, description, and comment bodies; results are bucketed title > identifier > comment > description, which is a coarse field precedence and not a relevance score.\n\nMULTI-WORD INPUT IS UNRELIABLE — the whole string must appear verbatim and contiguously, so word order and every interior word matter. `dependency-waits provider` does NOT match a title reading `dependency-waits and provider-capacity`; deleting one interior word turns a hit into a miss.\n\nThis matters most when you are using this call as a duplicate check before filing. An empty result for a multi-word phrase is NOT evidence that no such issue exists, and the more precisely you describe your finding the more certain the false clear. Query ONE distinctive token (an error code, a ticket identifier, a rare noun, a symbol name) and read the results yourself; run several single-token queries rather than one descriptive phrase. `%` and `_` are matched literally, not as wildcards.";
+
 const listIssuesSchema = z.object({
   companyId: companyIdOptional,
   status: z.string().optional(),
@@ -100,11 +109,11 @@ const listIssuesSchema = z.object({
     .describe(
       "Hydrate `blockedBy` on every row. Default false, in which case the key is ABSENT (not `[]`) — do not read a missing key as 'no blockers'. `blocks` is never hydrated on list at any setting; use paperclipGetIssue for that.",
     ),
-  q: z.string().optional(),
+  q: z.string().optional().describe(ISSUE_SEARCH_Q_DESCRIPTION),
 });
 
 const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
-  query: z.string().trim().min(1),
+  query: z.string().trim().min(1).describe(ISSUE_SEARCH_Q_DESCRIPTION),
 });
 
 const listCommentsSchema = z.object({
@@ -370,7 +379,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclip_search_issues",
-      "Search Paperclip issues by text. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.",
+      "Find Paperclip issues whose title, identifier, description, or comments CONTAIN a literal substring. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.\n\nDespite the name this is substring matching, not search: the query is not tokenized, so a multi-word phrase must appear verbatim and contiguously. Pass a single distinctive token — see the `query` parameter description before using this as a duplicate check.",
       searchIssuesSchema,
       async ({ query, ...input }) => listIssues(client, { ...input, q: query }),
     ),
