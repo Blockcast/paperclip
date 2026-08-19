@@ -1192,6 +1192,39 @@ export interface WorkerToHostMethods {
     result: void,
   ];
 
+  // Costs / finance
+  /**
+   * Record a settlement-side finance event (`finance_events`), NOT a `cost_events`
+   * row. Adapters already emit `cost_events` for agent traffic; writing there from a
+   * plugin would double-count. This surface exists so an external biller (a proxy, a
+   * provider invoice export) can be reconciled against that self-reported estimate.
+   *
+   * Idempotent on `(companyId, externalInvoiceId)` — a repeat call returns the
+   * existing row with `created: false` instead of inserting a duplicate.
+   */
+  "costs.finance.create": [
+    params: {
+      companyId: string;
+      eventKind: string;
+      biller: string;
+      provider?: string;
+      model?: string;
+      amountCents: number;
+      currency?: string;
+      /** `true` when the amount is derived from an estimate rather than a settled invoice. */
+      estimated?: boolean;
+      quantity?: number;
+      unit?: string;
+      /** Stable external key; the idempotency key for this write. */
+      externalInvoiceId?: string;
+      description?: string;
+      /** ISO 8601. */
+      occurredAt: string;
+      metadata?: Record<string, unknown>;
+    },
+    result: { id: string; created: boolean },
+  ];
+
   // Metrics
   "metrics.write": [
     params: {

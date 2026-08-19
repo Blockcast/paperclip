@@ -183,6 +183,13 @@ export interface HostServices {
     }): Promise<void>;
   };
 
+  /** Provides `costs.write`. */
+  costs: {
+    createFinanceEvent(
+      params: WorkerToHostMethods["costs.finance.create"][0],
+    ): Promise<WorkerToHostMethods["costs.finance.create"][1]>;
+  };
+
   /** Provides `metrics.write`. */
   metrics: {
     write(params: WorkerToHostMethods["metrics.write"][0]): Promise<void>;
@@ -456,6 +463,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Activity
   "activity.log": "activity.log.write",
+
+  // Costs / finance
+  "costs.finance.create": "costs.write",
 
   // Metrics
   "metrics.write": "metrics.write",
@@ -865,6 +875,11 @@ export function createHostClientHandlers(
     // Activity
     "activity.log": gated("activity.log", async (params) => {
       return services.activity.log(params);
+    }),
+
+    // Costs / finance
+    "costs.finance.create": gated("costs.finance.create", async (params) => {
+      return services.costs.createFinanceEvent(params);
     }),
 
     // Metrics
