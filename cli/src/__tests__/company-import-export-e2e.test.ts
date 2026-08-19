@@ -10,6 +10,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { readServerLogTail, serverLogDir } from "./helpers/server-logs.js";
 import { createStoredZipArchive } from "./helpers/zip.js";
 
 const execFileAsync = promisify(execFile);
@@ -66,7 +67,7 @@ function writeTestConfig(configPath: string, tempRoot: string, port: number, con
     },
     logging: {
       mode: "file",
-      logDir: path.join(tempRoot, "logs"),
+      logDir: serverLogDir(tempRoot),
     },
     server: {
       deploymentMode: "local_trusted",
@@ -244,16 +245,25 @@ async function runCliJson<T>(
   return JSON.parse(stdout.slice(jsonStart)) as T;
 }
 
+// The server is configured with logging.mode "file" (see writeTestConfig), so
+// its own diagnostics go to serverLogDir -- NOT to the stdout/stderr this test
+// captures from the child process. Before BLO-28813's sibling fix, a failed
+// startup probe reported two empty strings and afterAll then deleted the only
+// artifact that could explain the stall.
 async function waitForServer(
   apiBase: string,
   child: ServerProcess,
   output: { stdout: string[]; stderr: string[] },
+  logDir: string,
 ) {
   const startedAt = Date.now();
+  const diagnostics = () =>
+    `stdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}\nserver logs:\n${readServerLogTail(logDir)}`;
+
   while (Date.now() - startedAt < SERVER_STARTUP_TIMEOUT_MS) {
     if (child.exitCode !== null) {
       throw new Error(
-        `paperclipai run exited before healthcheck succeeded.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
+        `paperclipai run exited before healthcheck succeeded (code ${child.exitCode} after ${Date.now() - startedAt}ms).\n${diagnostics()}`,
       );
     }
 
@@ -268,7 +278,7 @@ async function waitForServer(
   }
 
   throw new Error(
-    `Timed out waiting for ${apiBase}/api/health.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
+    `Timed out waiting for ${apiBase}/api/health after ${SERVER_STARTUP_TIMEOUT_MS}ms (process still alive).\n${diagnostics()}`,
   );
 }
 
@@ -322,7 +332,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
       output.stderr.push(String(chunk));
     });
 
-    await waitForServer(apiBase, child, output);
+    await waitForServer(apiBase, child, output, serverLogDir(tempRoot));
   }, 180_000);
 
   afterAll(async () => {
