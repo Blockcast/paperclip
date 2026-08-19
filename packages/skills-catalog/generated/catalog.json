@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-08-06T08:32:11.071Z",
+  "generatedAt": "2026-08-16T03:11:14.290Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -67,11 +67,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 4042,
-          "sha256": "df5bdc8bf5e017b7ba5f70a4b5323fad51d0c323278f386580f26cf43ad09160"
+          "sizeBytes": 6351,
+          "sha256": "5fe1df9129ef714a55f7559b86fcaab1189a727e5ea3be21d075939c0f79a997"
         }
       ],
-      "contentHash": "sha256:88dc13560371fb364963782cb4f6eeb4090fcde92ee3774479428ed6b90e11c1"
+      "contentHash": "sha256:f198eec6447fac8275fd9a822dd61b34d644085749a4f566544a8c9e61afc82b"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:reflection-coach",
@@ -409,11 +409,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 26327,
-          "sha256": "b2e78432eb9c3a3d1029845ae4ddc3310b6862f10114d917dd52e7660c98b65c"
+          "sizeBytes": 30124,
+          "sha256": "7636f01ce94e42a9cae00198f13bbadd32d1a7a7581f56c559bf0772ccf69ab2"
         }
       ],
-      "contentHash": "sha256:41acbcd08af8109718ca90d65deac690dd5e1579e44744dfdbbfac0f90f0cc62"
+      "contentHash": "sha256:01ce7a7ba1b6db91549003367bd77784a83a594c79eab8cbfc47c1d1ace091de"
     },
     {
       "id": "paperclipai:optional:browser:agent-browser",

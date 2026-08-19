@@ -270,6 +270,16 @@ export interface PluginJobContext {
   trigger: "schedule" | "manual" | "retry";
   /** ISO 8601 timestamp when the run was scheduled to start. */
   scheduledAt: string;
+  /**
+   * Company this dispatch is scoped to, when the plugin has company-scoped
+   * configuration. The host dispatches a scheduled job once per company that
+   * has configured the plugin (BLO-20957), so a handler whose company-scoped
+   * host calls (`ctx.issues.*`, `ctx.config.get(companyId)`, ...) pass this
+   * value is granted exactly that company's invocation scope. `null`/absent
+   * when the plugin has zero configured companies — such a dispatch has no
+   * company scope and company-scoped host calls will be denied.
+   */
+  companyId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -680,7 +690,8 @@ export interface PluginHttpClient {
 /**
  * `ctx.secrets` — resolve secret references.
  *
- * Requires `secrets.read-ref` capability.
+ * Resolving plaintext requires `secrets.read-ref`; boolean verification requires
+ * `secrets.verify-ref`.
  *
  * Plugins store shared `{ type: "secret_ref", secretId, version? }` bindings in
  * company-scoped config. This client resolves a bound ref through the
@@ -705,6 +716,40 @@ export interface PluginSecretsClient {
     secretRef: string | EnvSecretRefBinding,
     options?: { companyId?: string; configPath?: string },
   ): Promise<string>;
+
+  /**
+   * Compare a presented credential with a bound secret without returning the
+   * secret value to the worker. Verification is metered on its own budget, so
+   * invalid public requests cannot starve trusted resolution.
+   * Requires `secrets.verify-ref`.
+   *
+   * Intended for authenticating a PUBLIC endpoint — a webhook bearer token —
+   * where `resolve` would be wrong twice over: it would put the secret in the
+   * worker, and an anonymous flood would exhaust the resolution budget that
+   * genuine deliveries need.
+   *
+   * NOT SUPPORTED FOR EVERY SECRET. Verification compares digests, so it works
+   * only where Paperclip holds a digest of the VALUE — secrets it wrote itself
+   * (`local_encrypted`, and provider-managed versions). A version IMPORTED as
+   * an external provider reference stores a fingerprint of the reference
+   * instead, and there is no value digest to compare against. Those reject with
+   * `secret_verifier_unsupported` rather than returning `false`, because a
+   * confident `false` would be indistinguishable from a wrong credential and
+   * would silently reject every genuine one.
+   *
+   * Handle that rejection: it is a permanent configuration fault for the
+   * company, not a failed authentication. Read the code from the thrown error's
+   * `data.code` — `error.code` is the numeric JSON-RPC code, and the message is
+   * prose, not a contract.
+   *
+   * @returns `true` when the presented value matches, `false` when it does not
+   * @throws when the bound secret has no value verifier (`secret_verifier_unsupported`)
+   */
+  verify(
+    secretRef: string | EnvSecretRefBinding,
+    presented: string,
+    options?: { companyId?: string; configPath?: string },
+  ): Promise<boolean>;
 
   /** List all secrets for a company. Requires `secrets.list`. */
   list(companyId: string): Promise<CompanySecret[]>;
@@ -2099,7 +2144,7 @@ export interface PluginContext {
   /** Make outbound HTTP requests. Requires `http.outbound`. */
   http: PluginHttpClient;
 
-  /** Resolve secret references. Requires `secrets.read-ref`. */
+  /** Resolve or verify secret references. Requires the corresponding secrets capability. */
   secrets: PluginSecretsClient;
 
   /** Write activity log entries. Requires `activity.log.write`. */

@@ -420,6 +420,7 @@ export type IssueBlockedInboxReason =
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
+  | "blocked_without_blockers"
   | "blocked_chain_stalled"
   | "invalid_review_participant"
   | "in_review_without_action_path"
@@ -531,6 +532,11 @@ export interface SuccessfulRunHandoffState {
   assigneeAgentId: string | null;
   detectedProgressSummary: string | null;
   createdAt: Date | string | null;
+  // Set when the handoff reads `resolved` because its source issue reached a
+  // terminal status rather than because a corrective run discharged it. Absent
+  // on every handoff resolved the ordinary way, so a reader can tell the two
+  // apart instead of inferring a continuation that never ran (BLO-16074).
+  resolvedBySourceIssueStatus?: "done" | "cancelled" | null;
 }
 
 export type IssueScheduledRetryStatus = "scheduled_retry" | "queued" | "running" | "cancelled";

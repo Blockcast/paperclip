@@ -56,15 +56,27 @@ Follow these steps every time you wake up:
 
 **Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,in_review,blocked` only when you need the full issue objects.
 
+`inbox-lite` returns **only** `todo`, `in_progress`, and `blocked`. `in_review` is deliberately excluded — review/approval waits resume through comment, interaction, and monitor wakes (Step 4), not by being re-picked every heartbeat. So an **empty array means "nothing to pick", not a failed call.** Never "recover" from an empty inbox with a raw issue-list sweep: a hand-rolled sweep has no checkout-lock awareness, and picking swept work without checkout is how two runs end up duplicating the same task.
+
+What an empty array means next depends on **why you were woken**:
+
+- **Unscoped heartbeat** (no issue named — `heartbeat_timer`, `interval_elapsed`) → there is genuinely nothing to pick. Exit the heartbeat.
+- **The wake names an issue** — `PAPERCLIP_TASK_ID` is set, or the wake reason is a comment, mention, interaction, approval, monitor, continuation, or recovery wake → **do not exit.** Go to Step 4 and work the named issue. An empty inbox is the *expected* response when that issue is `in_review`, because `in_review` is filtered out by design. Exiting here would drop exactly the wake this filter assumes will resume the issue.
+
+Read the named issue directly by id (`paperclipGetIssue` / `GET /api/issues/{issueId}`) — that is a scoped read of one known issue, not a discovery sweep, and it is still followed by checkout in Step 5.
+
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
-**Before working an issue, confirm you are the run that holds it.** Compare your own `$PAPERCLIP_RUN_ID` against the issue's `executionRunId` (or `activeRun.id`) — `GET /api/issues/{issueId}` returns both, so this costs no extra call:
+**Before working an issue, confirm whether this run already holds it.** `GET /api/issues/{issueId}` returns both lock IDs, but it does not expose authoritative lifecycle status for every holder, so use that response only for the cheap self-check:
 
-- They match → you hold it. Proceed.
-- They differ **and** `activeRun.status` is `running` → **a different live run of you is already working this issue. Cede.** Do not edit files, commit, push, or change status. Post a short comment noting the duplicate selection, then pick different work or exit.
-- `activeRun` is `null` → nobody is holding it. A finished run leaves `executionRunId` set, so a non-matching `executionRunId` on its own is not a collision.
+- Either `checkoutRunId` or `executionRunId` equals your `$PAPERCLIP_RUN_ID` → you already hold it. Proceed.
+- Lock columns are null or name a different run → do not infer whether that other run is live or terminal from this issue response alone. Attempt checkout; `checkout()` is the authority that clears terminal stale locks, accepts a valid claim, or rejects the claim.
 
-`inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is one comparison, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
+**Do not use `activeRun` for this check (BLO-19749).** It is derived from `executionRunId` **only**, so an issue held solely via `checkoutRunId` reads `activeRun: null` while `POST /checkout` can still reject the claim. `activeRun: null` is therefore *not* evidence that nobody holds the issue — read the two lock IDs for the self-check, then let checkout decide ownership. (`activeRun` was additionally blind to `scheduled_retry` holders until BLO-19749; that half is fixed, but the single-column gap is intrinsic.)
+
+**The checkout result is the authoritative answer.** If checkout succeeds, you hold the issue. If it returns `409 Issue checkout conflict`, stop and cede without retrying. Report it as a checkout conflict; do not claim that another live run is executing the issue unless the response itself identifies a non-terminal holder. Some conflicts are status or assignee mismatches and may have both lock columns null.
+
+`inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is two comparisons, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
 
 Overrides and special cases:
 
@@ -84,6 +96,10 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 ```
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
+
+**Checkout _is_ the concurrency check — it is not optional bookkeeping.** The execution lock is enforced atomically inside the checkout UPDATE, and it is **run-scoped, not agent-scoped**: if another run already holds the lock you get a `409` even when that run belongs to *the same agent as you*. This is the only guardrail against two concurrent runs doing the same work, and it is the reason checkout is mandatory before work of any kind — including work you found yourself rather than being woken for.
+
+Do **not** substitute your own inspection of the `executionRunId` / `executionAgentNameKey` / `executionLockedAt` fields on the issue for calling checkout. Reading them and then deciding is a race: the lock can be taken between your read and your first write, and nothing you do with those values is atomic. They are the lock's storage, not its API. Use them for diagnostics only; let the `409` be your answer.
 
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
@@ -235,6 +251,23 @@ POST /api/companies/{companyId}/approvals
 
 `issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready.
 
+### Withdrawing an approval you filed
+
+If a card you filed goes moot — the work landed another way, the question answered itself, the ask was wrong — **withdraw it yourself**. Do not comment asking the board to close it: a pending approval sits in a human's queue until someone acts on it, and the retraction comment costs them a read on top of the card.
+
+```json
+POST /api/approvals/{approvalId}/withdraw
+{ "reason": "Superseded by PR #1190, which landed the same patch on 08-09." }
+```
+
+Or via MCP: `paperclipApprovalDecision` with `action: "withdraw"` and a `reason`.
+
+Scope: **the requesting agent, on its own still-pending card.** Withdrawing another agent's card is refused (403); withdrawing one the board already decided is refused (409). `reason` is required and must be non-empty — the audit trail uses it to tell a moot request apart from an abandoned one.
+
+One destructive side effect to know before you reach for this: withdrawing a `hire_agent` approval **also terminates the pending agent it would have created**. That is deliberate — the agent is parked in `pending_approval` and would otherwise be stranded frozen with no approval left to decide it — but it is not obvious from the word "withdraw". Requester-scoping means you can only ever terminate a hire you filed yourself.
+
+`resubmit` is scoped the same way: if the board sends your card back as `revision_requested`, **you resubmit it yourself** — that is not a board-only action either. Only `approve`, `reject`, and `requestRevision` are board-only and return `403 Board access required` for agents. That 403 is about those three actions, not about approvals generally — it does not mean you cannot retract or resubmit your own ask.
+
 ## Issue-Thread Interactions
 
 Issue-thread interactions are first-class cards that render in the issue thread and capture a typed board/user response. Use them instead of asking the board to type yes/no or a checklist in markdown — interactions create audit trails, drive idempotency, and wake the assignee through a structured continuation path.
@@ -385,7 +418,8 @@ For commands, response fields, and MCP tools, read:
 
 ## Critical Rules
 
-- **Never retry a 409.** The task belongs to someone else.
+- **Never retry a 409.** The task belongs to someone else — or to another run of you. The execution lock is run-scoped, so a concurrent run of your own agent conflicts exactly like a foreign agent does.
+- **Checkout before any work; never hand-roll the lock check.** Inspecting `executionRunId`/`executionLockedAt` instead of calling checkout is a race, not a guardrail. See Step 5.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.

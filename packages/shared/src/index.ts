@@ -1,5 +1,11 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  SENSITIVE_ENV_KEY_RE,
+  isPlausiblySensitiveEnvValue,
+  isSensitiveEnv,
+  isSensitiveEnvKey,
+} from "./sensitive-env.js";
+export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
   isAgentAssignableToWork,
@@ -208,6 +214,7 @@ export {
   ISSUE_TREE_HOLD_RELEASE_POLICY_STRATEGIES,
   ISSUE_TREE_HOLD_STATUSES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   isSystemIssueDocumentKey,
@@ -257,6 +264,7 @@ export {
   PROJECT_COLORS,
   APPROVAL_TYPES,
   APPROVAL_STATUSES,
+  APPROVAL_UNDECIDED_STATUSES,
   SECRET_PROVIDERS,
   SECRET_PROVIDER_CONFIG_STATUSES,
   SECRET_PROVIDER_CONFIG_HEALTH_STATUSES,
@@ -437,6 +445,7 @@ export {
   type PauseReason,
   type ApprovalType,
   type ApprovalStatus,
+  type ApprovalUndecidedStatus,
   type SecretProvider,
   type SecretProviderConfigStatus,
   type SecretProviderConfigHealthStatus,
@@ -695,6 +704,7 @@ export type {
   AdapterEnvironmentTestResult,
   AssetImage,
   Project,
+  PrimaryWorkspaceSource,
   ProjectBudgetSummary,
   ProjectCodebase,
   ProjectCodebaseOrigin,
@@ -1706,6 +1716,7 @@ export {
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./types/milestone.js";
 export {
   createApprovalSchema,
+  listApprovalsQuerySchema,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
@@ -1714,6 +1725,7 @@ export {
   withdrawApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
+  type ListApprovalsQuery,
   type UpsertBudgetPolicy,
   type ResolveBudgetIncident,
   type ResolveApproval,

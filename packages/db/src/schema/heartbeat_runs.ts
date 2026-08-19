@@ -44,6 +44,21 @@ export const heartbeatRuns = pgTable(
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // BLO-22060: how many times sweepStaleIssueLocks has released an issue
+    // execution lock held by this run. The sweep deliberately does not cancel
+    // the run, so the run survives the release — a `scheduled_retry` park still
+    // has to fire at its deadline — and was previously free to be re-adopted as
+    // the issue's executionRunId by enqueueWakeup's legacy-run fallback,
+    // re-stamping executionLockedAt and resetting the 6h staleness clock on
+    // every wake. This counter is what makes that release durable: adoption
+    // declines once it reaches MAX_SWEPT_ISSUE_LOCK_RELEASES, so total lock
+    // time attributable to one run is bounded no matter how many wakes arrive.
+    //
+    // Counted for every holder the sweep releases — `queued` (BLO-18995),
+    // silent-`running` (BLO-19941) and `scheduled_retry` (BLO-21309) — because
+    // the fallback can select all three, and a released park that is later
+    // promoted arrives there as `queued` still carrying this count.
+    issueLockReleaseCount: integer("issue_lock_release_count").notNull().default(0),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
@@ -55,6 +70,16 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
+    // Nullable, no column default (BLO-21116 review follow-up): stamped only
+    // by the specific transitions that put a run back into `queued` after it
+    // was something else (promoteScheduledRetryRun, deferRunForK8sIsolationConflict).
+    // A fresh `queued` insert leaves this null and ages off createdAt via the
+    // coalesce in refreshQueuedRunAgeMetrics -- createdAt IS the queue-entry
+    // time for a brand-new row, so there is nothing to stamp there. Without
+    // this column the age gauge read a promoted retry's full `scheduled_retry`
+    // backoff (hours) as queued-dispatch wait (minutes), manufacturing the
+    // exact false-stranded-run signal BLO-21116 exists to kill.
+    queuedAt: timestamp("queued_at", { withTimezone: true }),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     // Generated stored columns mirroring the hot context_snapshot keys.
     // See migration 0079. Populated automatically by Postgres on insert /
@@ -114,5 +139,8 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    queuedAgeIdx: index("heartbeat_runs_queued_age_idx")
+      .on(table.agentId, sql`coalesce(${table.queuedAt}, ${table.createdAt})`)
+      .where(sql`${table.status} = 'queued'`),
   }),
 );

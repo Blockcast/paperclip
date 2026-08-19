@@ -4,6 +4,7 @@ import {
   AUTH_REQUEST_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
+  ROUTINE_DISPATCH_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
   ISOLATED_RUN_STARTED_METRIC,
   KNOWN_BLOCKED_REASONS,
@@ -33,6 +34,8 @@ import {
   KNOWN_WORKFLOW_RUN_CONCLUSIONS,
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
   UNKNOWN_EXTERNAL_ADAPTER,
   UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
   UNKNOWN_PROCESS_LOST_BUCKET,
@@ -46,7 +49,26 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   setExternalLifecycleRunningRuns,
+  EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC,
+  EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC,
+  KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES,
+  UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS,
+  computeExternalLifecycleSilenceGapSeconds,
+  normalizeExternalLifecycleTerminalStatus,
+  recordExternalLifecycleRunSilenceGap,
+  setQueuedRunOldestAgeMetrics,
+  setQueuedRunAgeMetricsRefreshSuccess,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
+  setAgentLivenessMetrics,
+  AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
+  AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
+  AGENT_ERROR_DURATION_SECONDS_METRIC,
 } from "../services/metrics.js";
+import {
+  incrementRoutineDispatchMetric,
+  resetRoutineDispatchMetrics,
+  snapshotRoutineDispatchMetrics,
+} from "../services/routine-dispatch-metrics.js";
 import {
   getDepBlockedMetric,
   incrementDepBlockedMetric,
@@ -667,6 +689,97 @@ describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
   });
 });
 
+describe("queued-run age metrics (BLO-21116)", () => {
+  it("publishes explicit queue zeros and a separate refresh-success signal", async () => {
+    const agentA = "11111111-1111-1111-1111-111111111111";
+    const agentB = "22222222-2222-2222-2222-222222222222";
+    const known = new Set([agentA, agentB]);
+
+    setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
+    setQueuedRunAgeMetricsRefreshSuccess(true);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+    expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
+
+    // A successful next refresh with no queued rows resolves the age. A
+    // failed refresh is independently visible rather than being mistaken for
+    // a fresh zero.
+    setQueuedRunOldestAgeMetrics([], known);
+    setQueuedRunAgeMetricsRefreshSuccess(false);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
+  });
+});
+
+describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () => {
+  it("publishes heartbeat age + interval only for heartbeat-enabled agents, and error duration for every agent", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-enabled",
+        heartbeatEnabled: true,
+        heartbeatAgeSeconds: 120,
+        heartbeatIntervalSeconds: 1800,
+        errorDurationSeconds: 0,
+      },
+      {
+        agentId: "agent-disabled",
+        heartbeatEnabled: false,
+        heartbeatAgeSeconds: 99999,
+        heartbeatIntervalSeconds: 3600,
+        errorDurationSeconds: 45,
+      },
+    ]);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${AGENT_HEARTBEAT_AGE_SECONDS_METRIC} gauge`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-enabled"} 120`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-enabled"} 1800`);
+    // heartbeat-disabled agent is expected to be dark, so it must not appear
+    // on the age/interval gauges at all -- not even as a 0.
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-disabled"}`);
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-disabled"}`);
+    // error duration is published for every agent regardless of heartbeat.enabled.
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-enabled"} 0`);
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-disabled"} 45`);
+  });
+
+  it("reset-then-sets so an agent dropped from the next snapshot disappears rather than freezing stale", async () => {
+    setAgentLivenessMetrics([
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-b", heartbeatEnabled: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+    ]);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-b"} 20`);
+
+    // Next publish: agent-b is gone (deleted, or heartbeat disabled).
+    setAgentLivenessMetrics([
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+    ]);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-a"} 40`);
+    expect(body).not.toContain('agent_id="agent-b"');
+  });
+
+  it("clamps negative values to 0 and skips non-finite ages", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-c",
+        heartbeatEnabled: true,
+        heartbeatAgeSeconds: Number.NaN,
+        heartbeatIntervalSeconds: -5,
+        errorDurationSeconds: -10,
+      },
+    ]);
+    const { body } = await renderMetrics();
+    // NaN age is skipped entirely (no bogus series), negative interval clamps to 0.
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-c"}`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+  });
+});
+
 describe("recordProcessLostLivenessNull (BLO-16184 denominator #2)", () => {
   it("registers the counter TYPE line and increments per blind cycle", async () => {
     let body = (await renderMetrics()).body;
@@ -675,5 +788,239 @@ describe("recordProcessLostLivenessNull (BLO-16184 denominator #2)", () => {
     recordProcessLostLivenessNull();
     body = (await renderMetrics()).body;
     expect(body).toContain(`${PROCESS_LOST_LIVENESS_NULL_METRIC} 2`);
+  });
+});
+
+describe("computeExternalLifecycleSilenceGapSeconds + recordExternalLifecycleRunSilenceGap (BLO-20815)", () => {
+  const t0 = new Date("2026-08-01T00:00:00.000Z");
+
+  it("registers the histogram so /metrics carries its TYPE line before any event", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC} histogram`);
+  });
+
+  it("uses lastUsefulActionAt when present, ignoring the older lastOutputAt/startedAt", () => {
+    const finalizedAt = new Date(t0.getTime() + 130_000);
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      {
+        lastUsefulActionAt: t0,
+        lastOutputAt: new Date(t0.getTime() - 60_000),
+        startedAt: new Date(t0.getTime() - 3_600_000),
+      },
+      finalizedAt,
+    );
+    expect(gap).toBe(130);
+  });
+
+  it("falls back to lastOutputAt when lastUsefulActionAt is absent", () => {
+    const finalizedAt = new Date(t0.getTime() + 900_000);
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      {
+        lastUsefulActionAt: null,
+        lastOutputAt: t0,
+        startedAt: new Date(t0.getTime() - 3_600_000),
+      },
+      finalizedAt,
+    );
+    expect(gap).toBe(900);
+  });
+
+  it("falls back to startedAt when both lastUsefulActionAt and lastOutputAt are absent", () => {
+    const finalizedAt = new Date(t0.getTime() + 2_700_000);
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      { lastUsefulActionAt: null, lastOutputAt: null, startedAt: t0 },
+      finalizedAt,
+    );
+    expect(gap).toBe(2700);
+  });
+
+  it("returns null when no signal timestamp is available at all (never-started cancelled run)", () => {
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      { lastUsefulActionAt: null, lastOutputAt: null, startedAt: null },
+      new Date(t0.getTime() + 60_000),
+    );
+    expect(gap).toBeNull();
+  });
+
+  it("clamps to 0 rather than going negative under clock skew", () => {
+    const gap = computeExternalLifecycleSilenceGapSeconds(
+      { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      new Date(t0.getTime() - 5_000),
+    );
+    expect(gap).toBe(0);
+  });
+
+  it("keeps every known terminal status and collapses the rest to 'other'", () => {
+    for (const status of KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES) {
+      expect(normalizeExternalLifecycleTerminalStatus(status)).toBe(status);
+    }
+    for (const bad of ["interrupted", "queued", "running", "", null, undefined]) {
+      expect(normalizeExternalLifecycleTerminalStatus(bad as string)).toBe(
+        UNKNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUS,
+      );
+    }
+  });
+
+  it("observes the histogram at the expected labels and value for each precedence branch", async () => {
+    const labels = recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "succeeded",
+      run: { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      finalizedAt: new Date(t0.getTime() + 300_000),
+    });
+    expect(labels).toEqual({ adapter: "claude_k8s", status: "succeeded", silenceGapSeconds: 300 });
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_sum{adapter="claude_k8s",status="succeeded"} 300`,
+    );
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="claude_k8s",status="succeeded"} 1`,
+    );
+    // The 300s observation must fall in the 300 bucket and every larger bucket,
+    // and must NOT be counted in the 60s bucket below it.
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_bucket{le="300",adapter="claude_k8s",status="succeeded"} 1`,
+    );
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_bucket{le="60",adapter="claude_k8s",status="succeeded"} 0`,
+    );
+    // Companion last-value gauge (BLO-20815 review follow-up): the histogram alone
+    // cannot answer "what was the max", so this observation must also land on the
+    // gauge at the same labels/value so max_over_time(...[7d]) can recover it.
+    expect(body).toContain(`# TYPE ${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC} gauge`);
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="succeeded"} 300`,
+    );
+  });
+
+  it("overwrites the last-value gauge with each new observation regardless of direction (last-write, not running max)", async () => {
+    recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "succeeded",
+      run: { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      finalizedAt: new Date(t0.getTime() + 1_800_000),
+    });
+    recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "succeeded",
+      run: { lastUsefulActionAt: t0, lastOutputAt: null, startedAt: null },
+      finalizedAt: new Date(t0.getTime() + 90_000),
+    });
+    const { body } = await renderMetrics();
+    // The gauge itself only ever exposes the most recent value (90s, smaller
+    // than the prior 1800s) — the max is recovered at query time via
+    // max_over_time over Prometheus's already-scraped sample history, not by
+    // this gauge holding a running maximum in-process.
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="succeeded"} 90`,
+    );
+  });
+
+  it("collapses an off-list adapter and status to bounded fallbacks", async () => {
+    recordExternalLifecycleRunSilenceGap({
+      adapter: "codex_local",
+      status: "interrupted",
+      run: { lastUsefulActionAt: null, lastOutputAt: null, startedAt: t0 },
+      finalizedAt: new Date(t0.getTime() + 60_000),
+    });
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="other",status="other"} 1`,
+    );
+  });
+
+  it("records nothing for a run with no signal timestamp at all", async () => {
+    const result = recordExternalLifecycleRunSilenceGap({
+      adapter: "claude_k8s",
+      status: "cancelled",
+      run: { lastUsefulActionAt: null, lastOutputAt: null, startedAt: null },
+      finalizedAt: t0,
+    });
+    expect(result).toBeNull();
+    const { body } = await renderMetrics();
+    expect(body).not.toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_METRIC}_count{adapter="claude_k8s",status="cancelled"}`,
+    );
+    expect(body).not.toContain(
+      `${EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_LAST_METRIC}{adapter="claude_k8s",status="cancelled"}`,
+    );
+  });
+});
+
+describe("routine dispatch metrics counters (BLO-23379)", () => {
+  afterEach(() => {
+    resetRoutineDispatchMetrics();
+  });
+
+  it("renders the parked-execution-issue bypass counter in Prometheus output", async () => {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${ROUTINE_DISPATCH_METRIC} counter`);
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 2`,
+    );
+  });
+
+  // BLO-25692: the stale-run bypass is a sibling label, not a replacement --
+  // both must render, or an operator cannot tell a provider-quota park from an
+  // execution that stalled or overran.
+  it("renders the stale-execution-issue bypass counter alongside the parked one", async () => {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue");
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_stale_execution_issue"} 1`,
+    );
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 1`,
+    );
+  });
+
+  it("starts at zero so a quiet routine is distinguishable from a bypassed one", () => {
+    const snap = snapshotRoutineDispatchMetrics();
+    for (const value of Object.values(snap)) {
+      expect(value).toBe(0);
+    }
+  });
+});
+
+describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
+  it("writes an explicit 0 for a known agent whose queue has drained (drop-to-0 observable)", async () => {
+    const agentA = "11111111-1111-1111-1111-111111111111";
+    const agentB = "22222222-2222-2222-2222-222222222222";
+    const known = new Set([agentA, agentB]);
+
+    setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+
+    // Next refresh: agentA's queue drained. reset-then-set must write 0, not
+    // leave the stale 54000 -- that stale value is what would keep an alert
+    // on this series from ever resolving.
+    setQueuedRunOldestAgeMetrics([], known);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(body).not.toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+  });
+
+  it("takes the oldest of multiple queued runs per agent, and collapses an unknown agent id", async () => {
+    const agentA = "33333333-3333-3333-3333-333333333333";
+    const known = new Set([agentA]);
+
+    setQueuedRunOldestAgeMetrics(
+      [
+        { agentId: agentA, ageSeconds: 120 },
+        { agentId: agentA, ageSeconds: 9000 },
+        { agentId: "not-a-known-agent", ageSeconds: 4500 },
+      ],
+      known,
+    );
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
   });
 });

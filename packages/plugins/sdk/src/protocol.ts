@@ -1123,6 +1123,15 @@ export interface WorkerToHostMethods {
     params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
   ];
+  "secrets.verify": [
+    params: {
+      secretRef: string | EnvSecretRefBinding;
+      presented: string;
+      companyId?: string;
+      configPath?: string;
+    },
+    result: boolean,
+  ];
   "secrets.list": [
     params: { companyId: string },
     result: Array<{

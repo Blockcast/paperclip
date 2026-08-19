@@ -13,7 +13,7 @@ import { envBindingSecretRefSchema, envBindingUserSecretRefSchema } from "@paper
  * restates them in a comment instead.
  */
 const SECRET_TIER1_STEMS =
-  String.raw`api[-_]?key|access[-_]?token|auth(?:orization|[-_]?token)|bearer|token|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring`;
+  String.raw`api[-_]?key|access[-_]?token|auth(?:entication|orization|[-_]?token)|bearer|token|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring`;
 
 /**
  * Tier 2: substrings that collide with ordinary words — bare `auth` catches
@@ -34,14 +34,30 @@ const SECRET_TIER2_KEY_RE = new RegExp(String.raw`[A-Za-z0-9_-]*(?:${SECRET_TIER
 
 /**
  * `auth`/`secret` are Tier 2 because they collide with ordinary words
- * (`author`, `no_secrets_in_payload`), but as a *whole token* in a short key
- * they're never that collision — `secret`, `client_secret`, `webhook_secret`,
- * `auth` are ordinary credential field names, not prose. Promote those to
- * Tier 1 so a short value under them (`{ secret: "hunter2" }`) doesn't fall
- * through `looksLikeCredentialValue`'s length/shape gate (BLO-20810 residual
- * finding, #943 review). `author`/`authors` keep Tier 2 because "auth" isn't
- * a whole token in them; `base_url` is excluded on purpose — it is two
- * tokens but never itself a credential value.
+ * (`author`, `no_secrets_in_payload`), but as a *whole token* in a key
+ * that otherwise reads as an identifier — not a sentence — they're never
+ * that collision: `secret`, `client_secret`, `webhook_secret`,
+ * `stripe_webhook_secret`, `auth` are ordinary credential field names, not
+ * prose. Promote those to Tier 1 so a short value under them
+ * (`{ secret: "hunter2" }`) doesn't fall through `looksLikeCredentialValue`'s
+ * length/shape gate (BLO-20810 residual finding, #943 review).
+ *
+ * A flat token-count cap (originally <=2) under-promoted real three-token
+ * field names like `stripe_webhook_secret` and `database_client_secret`
+ * (#943 review, still-present finding). The count alone can't tell
+ * `stripe_webhook_secret` (an identifier) from `secret_fields_must_stay_
+ * redacted` (a sentence that happens to contain the word "secret") — but
+ * *position* can: every sentence-shaped collision in this codebase's own
+ * census (`secret_fields_must_stay_redacted`, `no_secret_values_in_this_
+ * report`, `ask_2_author_identity`) has the trigger word somewhere in the
+ * middle, never as the trailing token, because English sentences end on a
+ * verb/object/adjective, not the subject noun. Real credential field names
+ * follow the opposite convention (`*_secret`, `*_auth`). So: promote when
+ * the trigger word is the *last* token regardless of total length, in
+ * addition to the original short-key case (<=2 tokens, any position) so
+ * `auth`/`secret` alone still promote. `author`/`authors` keep Tier 2
+ * because "auth" isn't a whole token in them; `base_url` is excluded on
+ * purpose — it is two tokens but never itself a credential value.
  */
 const AMBIGUOUS_PROMOTABLE_TOKENS = new Set(["auth", "secret"]);
 
@@ -55,7 +71,9 @@ function keyTokens(key: string): string[] {
 
 function promotesTier2ToTier1(key: string): boolean {
   const tokens = keyTokens(key);
-  return tokens.length > 0 && tokens.length <= 2 && tokens.some((token) => AMBIGUOUS_PROMOTABLE_TOKENS.has(token));
+  if (tokens.length === 0) return false;
+  if (tokens.length <= 2) return tokens.some((token) => AMBIGUOUS_PROMOTABLE_TOKENS.has(token));
+  return AMBIGUOUS_PROMOTABLE_TOKENS.has(tokens[tokens.length - 1]);
 }
 
 /**
@@ -254,7 +272,7 @@ const OPAQUE_VALUE_SCHEME_PREFIX_RE = /^(?:bearer|basic|token)\s+/i;
 const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]+-----/;
 const URL_USERINFO_RE = /:\/\/[^/\s@]+:[^/\s@]+@/;
-const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|x-amz-signature)=/i;
+const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|passwd|password|credential|x-amz-signature)=/i;
 const KNOWN_SECRET_PREFIX_RE = /^(?:sk-|sk_live_|pk_live_|ghp_|gho_|ghu_|ghs_|ghr_|xox[baprs]-|AKIA|glpat-|gsk_)/i;
 const JWT_LIKE_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const MIN_OPAQUE_TOKEN_LENGTH = 20;
@@ -267,7 +285,60 @@ const MIN_OPAQUE_TOKEN_LENGTH = 20;
  * capability/webhook URL that embeds its credential directly in the path
  * (no `user:pass@`, no `?token=`) puts the whole secret in a single segment,
  * e.g. `https://hooks.slack.test/services/T000/B000/<opaque-secret>`.
+ *
+ * Length alone over-redacts: a 40-char commit SHA or a canonical UUID is a
+ * benign evidence identifier, not a capability, and length-only gating
+ * blanks it right back (Important finding, #943 review — the exact
+ * over-redaction this issue exists to remove, just relocated into the URL
+ * branch). Exempt the two identifier shapes that are common, unambiguous,
+ * and never themselves a bearer credential: bare hex (git SHAs, hex object
+ * ids) and canonical UUIDs. Also exempt a segment that reads as a
+ * human-authored slug — several short hyphen/underscore-joined words rather
+ * than one unbroken blob.
+ *
+ * "Chunked into short parts" is NOT on its own evidence of readability
+ * (Important finding, #1136 review, head b78bb2e9): a delimiter-chunked
+ * opaque token such as `a1b2c3d4-e5f6g7h8-i9j0k1l2` is three parts of <=12
+ * chars and passed a pure arity/length test, so the generic backstop that is
+ * supposed to fail closed on unrecognized long values let it through. Judge
+ * the parts *lexically* instead: a slug's parts are whole words
+ * (`pending`, `merge`) or bare numbers (`20810`, an issue id), whereas the
+ * signature of an opaque chunk is letters and digits interleaved *within*
+ * one part. Require at least two word-shaped parts as well, so an all-numeric
+ * chunking (`12345678-87654321-11223344`) stays fail-closed too.
+ *
+ * Residual, deliberately accepted: a secret chunked into purely alphabetic
+ * parts (`abcdefgh-ijklmnop-qrstuvwx`) is still exempted. Separating that
+ * from a real word list needs a dictionary; the alternative — dropping the
+ * exemption — re-blanks the status slugs and evidence links this issue
+ * exists to stop over-redacting, which is the more common and more costly
+ * failure. Tier-1 keys never reach this test, so a value under a genuinely
+ * secret-named field is redacted regardless of shape.
  */
+const HEX_IDENTIFIER_RE = /^[0-9a-f]{20,64}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SLUG_WORD_PART_RE = /^[A-Za-z]+$/;
+const SLUG_NUMERIC_PART_RE = /^[0-9]+$/;
+const MAX_SLUG_PART_LENGTH = 12;
+
+function looksLikeReadableSlug(segment: string): boolean {
+  const parts = segment.split(/[-_]/).filter(Boolean);
+  if (parts.length < 3) return false;
+  let wordParts = 0;
+  for (const part of parts) {
+    if (part.length > MAX_SLUG_PART_LENGTH) return false;
+    if (SLUG_WORD_PART_RE.test(part)) {
+      wordParts += 1;
+      continue;
+    }
+    // Bare numbers (issue ids, years, counts) are ordinary slug components.
+    // Anything else — notably letters and digits mixed inside a single
+    // part — is an opaque chunk, so fail closed.
+    if (!SLUG_NUMERIC_PART_RE.test(part)) return false;
+  }
+  return wordParts >= 2;
+}
+
 function hasOpaqueUrlPathSegment(pathname: string): boolean {
   return pathname.split("/").some((rawSegment) => {
     if (!rawSegment) return false;
@@ -277,7 +348,10 @@ function hasOpaqueUrlPathSegment(pathname: string): boolean {
     } catch {
       // Malformed percent-encoding: judge the raw segment as-is.
     }
-    return !/\s/.test(segment) && segment.length >= MIN_OPAQUE_TOKEN_LENGTH;
+    if (/\s/.test(segment) || segment.length < MIN_OPAQUE_TOKEN_LENGTH) return false;
+    if (HEX_IDENTIFIER_RE.test(segment) || UUID_RE.test(segment)) return false;
+    if (looksLikeReadableSlug(segment)) return false;
+    return true;
   });
 }
 
@@ -307,7 +381,16 @@ function looksLikeCredentialValue(value: string): boolean {
   if (URL_LIKE_VALUE_RE.test(trimmed)) {
     if (URL_USERINFO_RE.test(trimmed) || URL_CREDENTIAL_QUERY_RE.test(trimmed)) return true;
     try {
-      return hasOpaqueUrlPathSegment(new URL(trimmed).pathname);
+      const url = new URL(trimmed);
+      // `url.search` is covered by the `trimmed` test above via
+      // URL_CREDENTIAL_QUERY_RE, but a fragment (`#access_token=...`, the
+      // OAuth2 implicit-flow shape) is not: its param never has a leading
+      // `?`/`&` to match on, since it starts right after `#` (Critical
+      // finding, #943 review). Re-run the same credential-param test against
+      // the fragment with a synthesized `?` so the fragment's first param
+      // matches the same way a query string's first param does.
+      if (url.hash.length > 1 && URL_CREDENTIAL_QUERY_RE.test(`?${url.hash.slice(1)}`)) return true;
+      return hasOpaqueUrlPathSegment(url.pathname);
     } catch {
       return false;
     }
@@ -318,7 +401,18 @@ function looksLikeCredentialValue(value: string): boolean {
   if (KNOWN_SECRET_PREFIX_RE.test(withoutScheme)) return true;
   if (JWT_LIKE_VALUE_RE.test(withoutScheme)) return true;
   if (/\s/.test(withoutScheme)) return false;
-  return withoutScheme.length >= MIN_OPAQUE_TOKEN_LENGTH;
+  if (withoutScheme.length < MIN_OPAQUE_TOKEN_LENGTH) return false;
+  // Same over-redaction as the URL path-segment case, one level up: a
+  // whitespace-free length-20+ *status slug* (`pending_human_merge_review`)
+  // is exactly as common under a Tier-2 collision key as a real opaque
+  // token, and the length backstop alone can't tell them apart. Confirmed
+  // live on a currently-pending card, not hypothetical: an
+  // `authoritative_state` field (Tier 2 — "auth" is a substring of
+  // "authoritative", the same collision class as "author") got blanked by
+  // this exact branch post-#943-merge. Reuse the same
+  // dictionary-word-shaped-parts exemption already applied to URL path
+  // segments.
+  return !looksLikeReadableSlug(withoutScheme);
 }
 
 /**

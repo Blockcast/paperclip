@@ -2,7 +2,8 @@ export type AgentShellCommandDecision =
   | { action: "allow"; reason: "safe_env_inspection" | "not_environment_dump" }
   | { action: "block"; reason: "full_environment_dump" };
 
-const SAFE_ENV_INSPECTION_RE = /(?:^|[\s;&|()])(?:\.\/scripts\/safe-env-inspect\.mjs|scripts\/safe-env-inspect\.mjs|safe-env-inspect|paperclip-safe-env)(?:\s|$)/;
+const SAFE_ENV_INSPECTION_RE = /(?:^|[\s;&|()])(?:\.\/scripts\/safe-env-inspect\.mjs|scripts\/safe-env-inspect\.mjs|safe-env-inspect|paperclip-safe-env)(?=[\s;&|()]|$)/;
+const BASH_INDIRECT_EXPANSION_RE = /\$\{![^}\r\n]+\}/;
 const SHELL_COMMAND_PREFIX_RE = /^(?:\/bin\/)?(?:ba|z|)?sh\s+-l?c(?:\s+|$)/;
 const FULL_ENV_DUMP_RE = new RegExp([
   String.raw`(?:^|[;&|]\s*)(?:command\s+)?(?:\/usr\/bin\/)?(?:env|printenv)(?:\s*(?:[;&|]|$))`,
@@ -48,6 +49,10 @@ export function classifyAgentShellCommand(command: string): AgentShellCommandDec
   const normalized = unwrapShell(command).trim();
   if (!normalized) return { action: "allow", reason: "not_environment_dump" };
   if (FULL_ENV_DUMP_RE.test(normalized)) return { action: "block", reason: "full_environment_dump" };
-  if (SAFE_ENV_INSPECTION_RE.test(normalized)) return { action: "allow", reason: "safe_env_inspection" };
+  const usesSafeEnvInspection = SAFE_ENV_INSPECTION_RE.test(normalized);
+  if (usesSafeEnvInspection && BASH_INDIRECT_EXPANSION_RE.test(normalized)) {
+    return { action: "block", reason: "full_environment_dump" };
+  }
+  if (usesSafeEnvInspection) return { action: "allow", reason: "safe_env_inspection" };
   return { action: "allow", reason: "not_environment_dump" };
 }

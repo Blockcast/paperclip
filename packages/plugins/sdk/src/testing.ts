@@ -903,6 +903,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
       },
+      async verify(secretRef, presented) {
+        requireCapability(manifest, capabilitySet, "secrets.verify-ref");
+        return presented === `resolved:${secretRef}`;
+      },
       async list(_companyId) {
         requireCapability(manifest, capabilitySet, "secrets.list");
         return [];
@@ -1144,6 +1148,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             },
             workspaces: [],
             primaryWorkspace: null,
+            primaryWorkspaceSource: "none" as const,
             managedByPlugin: {
               id: `managed-${projects.size + 1}`,
               pluginId: manifest.id,

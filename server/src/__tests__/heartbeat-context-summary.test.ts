@@ -245,6 +245,204 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).not.toContain("Latest review body:");
   });
 
+  // BLO-20886: github_pr_review_requested fires on a bare `@ally review` ASK
+  // -- no review has been posted -- and the author-role wake loop also
+  // covers plain PR lifecycle events with no review data at all. Both used
+  // to render the review-feedback directive unconditionally, telling the
+  // woken agent "a reviewer just posted findings on YOUR pull request" and
+  // to push a follow-up commit against a PR with zero recorded reviews
+  // (observed live: Blockcast/paperclip#953).
+  //
+  // review_requested is claimed by the more specific BLO-19522 branch above,
+  // which says the same true thing in more useful words (it names the
+  // requester and carries the anti-loop instruction). What BLO-20886 adds is
+  // the allowlist that catches every OTHER reasonless wakeReason -- the
+  // lifecycle events asserted below, and any reason added later.
+  it("does not instruct a push when no review has actually been submitted", () => {
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+      },
+    });
+    expect(requestedMarkdown).not.toContain("just posted findings on YOUR pull request");
+    expect(requestedMarkdown).not.toContain("push a follow-up commit");
+    expect(requestedMarkdown).not.toContain("GitHub PR review feedback directive:");
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+
+    // A lifecycle event carries no review either, and no branch above claims
+    // it -- so it must land on the generic directive rather than fall through
+    // to the feedback one.
+    for (const wakeReason of [
+      "github_pr_opened",
+      "github_pr_reopened",
+      "github_pr_synchronize",
+      "github_pr_ready_for_review",
+    ]) {
+      const lifecycleMarkdown = buildPaperclipTaskMarkdown({
+        issue: null,
+        prReview: {
+          wakeReason,
+          prNumber: 35,
+          repoFullName: "Blockcast/paperclip",
+          event: "pull_request",
+          prRole: "author",
+        },
+      });
+      expect(lifecycleMarkdown).not.toContain("YOUR pull request");
+      expect(lifecycleMarkdown).not.toContain("push a follow-up commit");
+      expect(lifecycleMarkdown).not.toContain("GitHub PR review feedback directive:");
+      expect(lifecycleMarkdown).toContain("GitHub PR event directive:");
+      expect(lifecycleMarkdown).toContain(`"${wakeReason}"`);
+      expect(lifecycleMarkdown).toContain("No review findings are recorded for this PR yet");
+    }
+
+    // The allowlist is what makes this hold for a wakeReason nobody has
+    // written yet: unrecognized must fail into "no findings", not into a
+    // false claim that findings exist.
+    const unknownMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_some_future_reason",
+        prNumber: 36,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+      },
+    });
+    expect(unknownMarkdown).toContain("GitHub PR event directive:");
+    expect(unknownMarkdown).not.toContain("GitHub PR review feedback directive:");
+  });
+
+  // Real review content must still get the author-shaped directive -- this
+  // fix narrows WHEN "YOUR pull request" fires, it doesn't remove it.
+  it("still asserts 'YOUR pull request' for an actionable review-feedback comment wake", () => {
+    const feedbackMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_feedback",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewAuthorLogin: "ally",
+      },
+    });
+    expect(feedbackMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(feedbackMarkdown).toContain("YOUR pull request");
+  });
+
+  // BLO-20886 AC3. Owning-issue routing fixed WHICH issue is woken, but the
+  // recipient still isn't necessarily the PR's author: `kkroo/blo-19132-*`
+  // resolves to BLO-19132 via the branch tier, so BLO-19132's assignee is woken
+  // about a branch a human owns. That is the original paperclip#953 damage path
+  // -- #953 existed precisely to have a non-bot author, so a bot commit there
+  // destroys the independence it was opened to establish.
+  it("drops the possessive and the push instruction when the PR was authored by a third party", () => {
+    const thirdPartyMarkdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "BLO-19132",
+        title: "Approval dedupe",
+        workMode: null,
+        description: null,
+      },
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        prUrl: "https://github.com/Blockcast/paperclip/pull/953",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        // The signed webhook's pull_request.user.login -- a human, not the fleet bot.
+        prAuthorLogin: "kkroo",
+      },
+    });
+
+    // The two things AC3 forbids asserting about a PR we did not write.
+    expect(thirdPartyMarkdown).not.toContain("YOUR pull request");
+    expect(thirdPartyMarkdown).not.toContain("push a follow-up commit");
+    // It still delivers the findings -- the review is real, only the ownership
+    // claim was false -- and names who actually owns the branch.
+    expect(thirdPartyMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(thirdPartyMarkdown).toContain("pull request #953");
+    expect(thirdPartyMarkdown).toContain('authored by "kkroo", NOT by you');
+    expect(thirdPartyMarkdown).toContain("Do NOT push commits to it");
+    expect(thirdPartyMarkdown).toContain("Critical: missing null check.");
+  });
+
+  it("keeps the possessive when the PR was authored by the configured bot identity", () => {
+    // Control for the test above: the gate must fire on a positive mismatch
+    // only, never blanket-strip the possessive from PRs the fleet did write.
+    const botAuthoredMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 1367,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        prAuthorLogin: "allyblockcast[bot]",
+      },
+    });
+    expect(botAuthoredMarkdown).toContain("YOUR pull request");
+    expect(botAuthoredMarkdown).toContain("push a follow-up commit");
+    expect(botAuthoredMarkdown).not.toContain("NOT by you");
+  });
+
+  it("fails open and keeps the possessive when the PR author is unknown", () => {
+    // An absent author login is not PROOF of third-party authorship, and the
+    // bot-authored case is the common one, so an unknown author must not
+    // silently strip the directive the author actually needs.
+    const unknownAuthorMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 1367,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        prAuthorLogin: null,
+      },
+    });
+    expect(unknownAuthorMarkdown).toContain("YOUR pull request");
+  });
+
+  it("drops the possessive on a review REQUEST for a third-party-authored PR", () => {
+    // The review_requested branch carries no push instruction already, but it
+    // still asserted ownership -- paperclip#953's wake was exactly this shape.
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        requestCommentAuthorLogin: "kkroo",
+        prAuthorLogin: "kkroo",
+      },
+    });
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+    expect(requestedMarkdown).not.toContain("YOUR pull request");
+    expect(requestedMarkdown).toContain("pull request #953");
+    expect(requestedMarkdown).toContain("NOT by you");
+  });
+
   it("adds accepted-plan continuation guidance for standard-work issues when the wake is flagged as a plan continuation", () => {
     const acceptedConfirmation = buildPaperclipTaskMarkdown({
       issue: {

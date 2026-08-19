@@ -20,4 +20,23 @@ describe("heartbeat failure metric finalization input", () => {
       isolationMode: "run",
     });
   });
+
+  it("recovers persisted isolation when an external-lifecycle finalizer has no local descriptor", () => {
+    expect(buildHeartbeatRunFailedMetricInput({
+      agent: { id: "agent-1", adapterType: "claude_k8s" },
+      issueId: "issue-1",
+      run: {
+        errorCode: "oom_killed",
+        contextSnapshot: {
+          wakeReason: "issue_assigned",
+          paperclipK8sIsolation: { isolationMode: "workspace" },
+        },
+      },
+      k8sRunIsolation: null,
+    })).toMatchObject({
+      adapter: "claude_k8s",
+      errorCode: "oom_killed",
+      isolationMode: "workspace",
+    });
+  });
 });

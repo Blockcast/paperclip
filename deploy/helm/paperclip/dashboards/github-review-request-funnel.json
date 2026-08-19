@@ -1,0 +1,304 @@
+{
+  "uid": "paperclip-review-request-funnel",
+  "title": "Paperclip — GitHub review-request delivery funnel",
+  "description": "BLO-20171. Delivery funnel for GitHub review-request reviewer wakes (the @ally path), from webhook receipt to a dispatched run. Backing counters ship with BLO-18859. READ THE FUNNEL PER TIER: paperclip-0 is the promoter and carries service=\"paperclip-workers\"; it emits `queued` without a matching `received`, so a global sum reads queued > received and looks broken. Every funnel panel here pins service=\"paperclip\" (the API tier), where the invariant received == queued + suppressed + deferred + dead_lettered holds exactly. The promoter is charted separately at the bottom.",
+  "tags": ["paperclip", "github", "review-request", "blo-18859", "blo-20171"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Unresolved dead-letters",
+      "description": "Restart-safe gauge, recomputed from committed agent_wakeup_requests rows on every wake-dispatch reconcile pass. Non-zero means at least one @ally review request is sitting in the terminal dispatch_failed_exhausted state and will NEVER be retried — the PR has a posted trigger and no review. Steady state is 0. This is the gauge arm of PaperclipGithubReviewRequestDeadLettered.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum(paperclip_github_review_request_dead_letter_unresolved)",
+          "legendFormat": "unresolved",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Dead-lettered (range)",
+      "description": "Counter arm: review-request wakes that reached the terminal dead_lettered state over the dashboard time range, API tier only. Complements the gauge to the left — the counter is the only arm that sees the dispatch path which fails to persist a durable row at all (that path leaves no row for the gauge to recompute from).",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum(increase(paperclip_github_review_request_delivery_total{service=\"paperclip\",state=\"dead_lettered\"}[$__range]))",
+          "legendFormat": "dead-lettered",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Received (range)",
+      "description": "Review-request webhook events accepted by the API tier over the dashboard time range. This is the funnel denominator — read the panels below against it.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum(increase(paperclip_github_review_request_delivery_total{service=\"paperclip\",state=\"received\"}[$__range]))",
+          "legendFormat": "received",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Funnel imbalance (must be 0)",
+      "description": "received - (queued + suppressed + deferred + dead_lettered) on the API tier. This invariant holds exactly for service=\"paperclip\", so any non-zero value means either a new terminal state was added to the server without being added here, or this panel's selector has drifted onto the promoter tier. It is a self-check on the dashboard, not a fleet alarm.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum(paperclip_github_review_request_delivery_total{service=\"paperclip\",state=\"received\"}) - sum(paperclip_github_review_request_delivery_total{service=\"paperclip\",state=~\"queued|suppressed|deferred|dead_lettered\"})",
+          "legendFormat": "imbalance",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Delivery funnel by state — API tier (service=\"paperclip\")",
+      "description": "The four required delivery states over time: received, queued, retried, dead-lettered. Pinned to service=\"paperclip\" so the promoter pod cannot corrupt the arithmetic. Healthy shape is received and queued tracking each other with retried and dead-lettered flat at zero. A rising `retried` with no dead-letters is dispatch flakiness being absorbed by the retry chain, not loss; any `dead_lettered` at all is a terminal lost review.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "dead_lettered" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineWidth", "value": 3 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "retried" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum by (state) (increase(paperclip_github_review_request_delivery_total{service=\"paperclip\",state=~\"received|queued|retried|dead_lettered\"}[$__rate_interval]))",
+          "legendFormat": "{{state}}",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Terminal suppression by cause",
+      "description": "paperclip_github_review_request_suppression_total broken down by cause. Suppressed is TERMINAL — nothing re-arms a skipped or superseded row — but it is not uniformly a fault. Expected declines (company.inactive, heartbeat.cooldown.active, budget.blocked, ...) are the fleet correctly saying no. The outage-like causes that PaperclipGithubReviewRequestSuppressionOutage pages on are heartbeat.scheduling_suppressed, dispatch_rejected and other; `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES and has not been triaged.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 15 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never"
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum by (cause) (increase(paperclip_github_review_request_suppression_total[$__rate_interval]))",
+          "legendFormat": "{{cause}}",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Promoter tier (service=\"paperclip-workers\") — charted separately, DO NOT add to the funnel",
+      "description": "paperclip-0 is the promoter. It emits `queued` without a matching `received`, so summing it into the panels above makes queued exceed received and the funnel read as broken. It is charted here on its own so the promoter's queue activity stays visible without corrupting the API-tier arithmetic.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 15 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto"
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum by (state) (increase(paperclip_github_review_request_delivery_total{service=\"paperclip-workers\"}[$__rate_interval]))",
+          "legendFormat": "{{state}}",
+          "range": true,
+          "instant": false
+        }
+      ]
+    }
+  ]
+}

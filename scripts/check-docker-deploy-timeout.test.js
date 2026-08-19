@@ -136,7 +136,7 @@ test("production deploy is manual-only and environment-protected", () => {
   assert.ok(conditionMatch, "deploy job must declare an if condition");
   assert.equal(
     conditionMatch[1].replace(/\s+/g, " "),
-    "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success'",
+    "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true'",
   );
   assert.match(deployJob, /environment:\n\s+name: paperclip-production/);
   assert.doesNotMatch(workflow, /^  schedule:/m);

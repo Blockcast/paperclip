@@ -1,0 +1,215 @@
+name: Master general tests
+
+# BLO-27871: `master`'s head is never tested by anything.
+#
+# `pr.yml` triggers on `pull_request` and `merge_group` only. That is complete
+# coverage *while every commit arrives through the merge queue*, because a
+# merge_group build tests `master + PR` before it lands. It leaves a hole
+# exactly when commits land OUTSIDE the queue — a direct merge, an admin
+# bypass, or a force push.
+#
+# On 2026-08-16 a 12-PR direct-merge batch landed between 04:09:52Z and
+# 04:12:53Z. #1353 and #1366 were each green against their own base but
+# semantically conflicting together, so master went red at 04:12Z. Nothing
+# reported it. The only signal was PRs being ejected from the queue one at a
+# time — four of them (#1344, #1169, #1378, #1381), each burning a full
+# ~30-minute merge_group build to rediscover the identical failure against
+# `maximumEntriesToBuild: 1`. Master stayed red ~5.5h and the whole company's
+# merge queue was blocked for ~7h. See BLO-27861 for the incident.
+#
+# This workflow closes the detection half. The prevention half — requiring the
+# queue so nothing can land outside it — is a repo-admin ruleset change and is
+# tracked separately; the two are complementary, and prevention deliberately
+# removes a manual drain valve the operator may want to keep.
+#
+# SCOPE — read this before assuming a green run means master is healthy.
+# This replicates ONLY pr.yml's `general_tests` matrix, not its full 12-job
+# set. A commit that lands outside the queue and breaks typecheck, the build,
+# the Helm chart, or e2e is still not caught here. That asymmetry is
+# deliberate and cost-driven, not an oversight: 36.5% of landings bypass the
+# queue (66 of 181 over the 7 days to 2026-08-16), so this already adds ~9.4
+# full suite runs per day to a pool with documented eviction pressure
+# (BLO-20369). Widening it to the full job set would multiply that. The name
+# says "general tests" rather than "health" so the promise matches the
+# coverage. Revisit if a future master-red lands outside general_tests.
+
+on:
+  push:
+    branches:
+      - master
+  # Lets an operator re-run the suite against the current master head on
+  # demand — after a force push, or to confirm a red master has recovered
+  # without waiting for the next commit.
+  workflow_dispatch:
+
+concurrency:
+  # A bulk direct-merge drain lands many commits in seconds (12 in ~3 minutes
+  # on 2026-08-16). Without cancellation that is 12 full suites competing for
+  # the same pool. Only the newest master head is worth testing: it is the one
+  # every subsequent PR will be rebased onto, and a failure introduced by an
+  # earlier commit in the batch still reproduces on the final head.
+  #
+  # Keyed on event_name too: `github.ref` is `refs/heads/master` for both push
+  # and workflow_dispatch, so without it an operator's "has master recovered?"
+  # dispatch could be cancelled by an unrelated push, or cancel one.
+  group: master-health-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required by the gate below to list this repository's workflow runs.
+  actions: read
+
+jobs:
+  gate:
+    name: Was this commit already proven by the merge queue?
+    # arc-light, never arc-merge-queue: this workflow must not contend with
+    # merge_group builds for the queue pool, or detection would come at the
+    # cost of merge latency — the thing it exists to protect.
+    #
+    # `gh` on arc-light has in-repo precedent: commitperclip-review.yml runs
+    # `gh api` on arc-light with GH_TOKEN: ${{ github.token }} (its job at
+    # `runs-on: arc-light`, querying `repos/.../pulls/<n>`).
+    runs-on: arc-light
+    timeout-minutes: 5
+    outputs:
+      pretested: ${{ steps.check.outputs.pretested }}
+    steps:
+      - name: Look for a successful merge_group build at this exact SHA
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          # A merge_group build's `head_sha` IS the commit that lands on
+          # master. Verified empirically on the 2026-08-16 queue chain, where
+          # each queue branch's base is the previous entry's landed commit:
+          #   pr-1381 head_sha a9b48d9e -> landed as a9b48d9e
+          #   pr-1385 base     a9b48d9e   head_sha 66465314 -> landed
+          #   pr-1123 base     66465314   head_sha d4fb292f -> landed (master)
+          # So a successful merge_group run at this SHA means this exact tree
+          # has already been through the full suite, and re-running it would be
+          # pure duplicated cost.
+          #
+          # Filter on the workflow PATH, not merely on a successful merge_group
+          # run: `commitperclip-review.yml` also fires on merge_group, so
+          # counting any green run here would let a passing review mask a
+          # failing test suite — the guard would fail open in precisely the
+          # case it exists to catch.
+          if ! response="$(gh api \
+            "repos/${REPO}/actions/runs?event=merge_group&head_sha=${HEAD_SHA}&per_page=100" \
+            --jq '[.workflow_runs[]
+                   | select(.path == ".github/workflows/pr.yml"
+                            and .conclusion == "success")]
+                  | length')"; then
+            # Fail closed. An API error must cost us a redundant suite run, not
+            # a silently skipped one — an unnoticed red master is what this
+            # workflow exists to prevent.
+            echo "Could not query merge_group runs; running the suite anyway."
+            echo "pretested=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${response:-0}" -gt 0 ]; then
+            echo "Commit ${HEAD_SHA} has a successful pr.yml merge_group build; skipping."
+            echo "pretested=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "No successful pr.yml merge_group build for ${HEAD_SHA} (landed outside the queue); running the suite."
+            echo "pretested=0" >> "$GITHUB_OUTPUT"
+          fi
+
+  general_tests:
+    name: Master tests (${{ matrix.group_label }})
+    needs: [gate]
+    # The status-check function here is load-bearing, not decoration. Without
+    # one the `if:` carries an implicit `success()` on `needs`, so a gate JOB
+    # failure — ARC pod unavailable, the 5-minute timeout firing on a network
+    # stall, any runner-level fault — would SKIP the suite and leave the commit
+    # untested. The in-step fallback below only covers `gh api` exiting
+    # non-zero inside a step that is actually running. With the gate failed,
+    # `needs.gate.outputs.pretested` is empty, `'' != '1'` is true, and the
+    # suite runs — the fail-closed behaviour this workflow promises. Nothing
+    # retries a skipped run: the next push supersedes it via cancel-in-progress.
+    #
+    # It is `!cancelled()` and NOT `always()`, which is a real distinction here
+    # rather than style. `always()` is true even when the run has been
+    # CANCELLED, and job-level `if:` is evaluated at dispatch time — so during
+    # a bulk drain (12 commits in ~3 minutes on 2026-08-16, against a gate that
+    # takes seconds) nearly every superseded run would still dispatch this
+    # matrix after being cancelled. That is 6 legs at timeout-minutes: 90 each,
+    # per cancelled run, onto the very pool the SCOPE block above budgets
+    # against — and during precisely the event this workflow exists to watch.
+    # `!cancelled()` keeps the fail-closed property (it excludes only
+    # cancellation, not failure) without resurrecting superseded runs.
+    #
+    # The `${{ }}` wrapper is required: a YAML scalar beginning with `!` is a
+    # tag indicator and will not parse as a bare token.
+    #
+    # workflow_dispatch is an explicit operator request, so it always runs.
+    if: ${{ !cancelled() && (needs.gate.outputs.pretested != '1' || github.event_name == 'workflow_dispatch') }}
+    runs-on: arc-paperclip-general
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      # Mirrors pr.yml's general_tests matrix. The 2026-08-16 regression
+      # surfaced in `general-server` shard 1/4's serialized suite.
+      matrix:
+        include:
+          - group: general-server
+            group_label: server 1/4
+            shard_index: 0
+            shard_count: 4
+          - group: general-server
+            group_label: server 2/4
+            shard_index: 1
+            shard_count: 4
+          - group: general-server
+            group_label: server 3/4
+            shard_index: 2
+            shard_count: 4
+          - group: general-server
+            group_label: server 4/4
+            shard_index: 3
+            shard_count: 4
+          - group: general-workspaces-a
+            group_label: workspaces-a
+            shard_index: ''
+            shard_count: ''
+          - group: general-workspaces-b
+            group_label: workspaces-b
+            shard_index: ''
+            shard_count: ''
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run grouped general test suites
+        run: |
+          args=(--group '${{ matrix.group }}')
+          if [ -n '${{ matrix.shard_count }}' ]; then
+            args+=(--shard-index '${{ matrix.shard_index }}' --shard-count '${{ matrix.shard_count }}')
+          fi
+          pnpm test:run:general -- "${args[@]}"
+
+      - name: Run serialized server test shard
+        if: matrix.group == 'general-server'
+        run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}

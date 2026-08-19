@@ -59,7 +59,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -70,6 +70,10 @@ import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { derivePaperclipPrReview } from "../services/heartbeat.js";
+import {
+  evaluateStrandedRunRecovery,
+  STRANDED_RUN_RECOVERY_MIN_AGE_MS,
+} from "../services/stranded-run-recovery.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type {
   AdapterEnvironmentCheck,
@@ -94,7 +98,7 @@ import {
   isTruthyRuntimeEnvValue,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
-import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
@@ -2446,48 +2450,21 @@ export function agentRoutes(
 
     const issuesSvc = issueService(db);
     const recoveryActionsSvc = issueRecoveryActionService(db);
-    const rows = await issuesSvc.list(req.actor.companyId, {
-      assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
-      includeRoutineExecutions: true,
-      limit: ISSUE_LIST_DEFAULT_LIMIT,
-    });
     const worktreeActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
     const isWorktreeRuntime = isTruthyRuntimeEnvValue(process.env.PAPERCLIP_IN_WORKTREE);
-    const eligibleRows = !isWorktreeRuntime
-      ? rows
-      : worktreeActivation.armed
-      ? rows.filter((issue) => new Date(issue.createdAt) >= new Date(worktreeActivation.cutoff))
-      : [];
-    const issueIds = eligibleRows.map((issue) => issue.id);
-    const [dependencyReadiness, recoveryActionByIssue] = await Promise.all([
-      issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds),
-      recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
-    ]);
-
-    // BLO-19001: never offer an issue that a *different* live run already holds.
-    //
-    // Dispatch enforces one-live-run-per-issue only for runs that already carry
-    // an issueId. An autonomous heartbeat run carries none, so it is dispatched
-    // freely and then self-selects here — landing on an issue a sibling run of
-    // this same agent is mid-way through. Under a shared worktree both runs then
-    // edit one tree, and a routine `rm -rf node_modules` in one destroys the
-    // other's state.
-    //
-    // Suppressed rather than flagged: a flag only works if every agent honours
-    // it, and in the observed incident an in-thread warning did not stop the
-    // next run from selecting the same issue 8 minutes later.
     const callerRunId = req.actor.runId ?? null;
-    const nowMs = Date.now();
-    const offeredRows = eligibleRows.filter((issue) => {
-      const held = isIssueHeldByForeignRun({
-        activeRun: issue.activeRun,
-        callerRunId,
-        nowMs,
-      });
-      if (held) {
+    res.json(await loadAgentInboxLite({
+      issuesSvc,
+      recoveryActionsSvc,
+      companyId: req.actor.companyId,
+      agentId: req.actor.agentId,
+      callerRunId,
+      limit: ISSUE_LIST_DEFAULT_LIMIT,
+      isWorktreeRuntime,
+      worktreeActivation,
+      onWithheldForeignRun: (issue) => {
         logger.info(
           {
             agentId: req.actor.agentId,
@@ -2498,28 +2475,8 @@ export function agentRoutes(
           },
           "inbox-lite: withheld issue already held by another live run of this agent",
         );
-      }
-      return !held;
-    });
-
-    res.json(
-      offeredRows.map((issue) => ({
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        status: issue.status,
-        priority: issue.priority,
-        projectId: issue.projectId,
-        goalId: issue.goalId,
-        parentId: issue.parentId,
-        updatedAt: issue.updatedAt,
-        activeRun: issue.activeRun,
-        activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
-        unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
-        unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
-      })),
-    );
+      },
+    }));
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {
@@ -4229,6 +4186,111 @@ export function agentRoutes(
     });
   });
 
+  /**
+   * Which agents cannot run right now, and until when (BLO-24011).
+   *
+   * A `scheduled_retry` park is invisible at fleet level today: the only way to
+   * discover that an agent is parked is to invoke a heartbeat on it and notice
+   * you got an existing run back. During the 2026-08-09 capacity incident that
+   * meant a critical issue sat assigned to a frozen agent, looking owned,
+   * because nothing answered "is this agent actually able to work?".
+   *
+   * Ordered soonest-due first so the tail of the list is the part that needs
+   * attention, and `overdueMs` is computed server-side because a park whose due
+   * time has passed without the sweep promoting it is a different failure from
+   * a park that is simply long.
+   */
+  router.get("/companies/:companyId/parked-agents", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const { reason, limit = 200 } = z.object({
+      reason: z.string().min(1).max(64).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }).parse(req.query);
+
+    const now = new Date();
+    const rows = await db
+      .select({
+        runId: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        agentName: agentsTable.name,
+        agentStatus: agentsTable.status,
+        adapterType: agentsTable.adapterType,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        errorCode: heartbeatRuns.errorCode,
+        createdAt: heartbeatRuns.createdAt,
+        // The park metadata (advertised reset, clamped-from horizon) lives only
+        // in result_json — the generated columns project summary/error, not these.
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(agentsTable.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          ...(reason ? [eq(heartbeatRuns.scheduledRetryReason, reason)] : []),
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt))
+      .limit(limit + 1);
+
+    const truncated = rows.length > limit;
+    // Same per-agent read decision the agents list applies, so an agent caller
+    // sees exactly the agents it is already allowed to see — this endpoint adds
+    // a schedule view, not a new visibility boundary.
+    const visible = await filterAgentsForActor(
+      req,
+      rows.slice(0, limit).map((row) => ({ ...row, id: row.agentId, companyId })),
+      companyId,
+    );
+    const parked = visible.map((row) => {
+      const result = (row.resultJson ?? {}) as Record<string, unknown>;
+      const dueMs = row.scheduledRetryAt?.getTime() ?? null;
+      return {
+        agentId: row.agentId,
+        agentName: row.agentName,
+        agentStatus: row.agentStatus,
+        adapterType: row.adapterType,
+        runId: row.runId,
+        reason: row.scheduledRetryReason,
+        attempt: row.scheduledRetryAttempt,
+        errorCode: row.errorCode,
+        parkedSince: row.createdAt,
+        scheduledRetryAt: row.scheduledRetryAt,
+        retryInMs: dueMs === null ? null : Math.max(0, dueMs - now.getTime()),
+        // A park that is already due but still sitting here means the promotion
+        // sweep is not draining it — the freeze mode this endpoint exists for.
+        overdueMs: dueMs === null ? null : Math.max(0, now.getTime() - dueMs),
+        // What the provider asked for, beside what we actually booked, so the
+        // two can be compared without opening the run.
+        penstockProvider: typeof result.penstockProvider === "string" ? result.penstockProvider : null,
+        penstockModel: typeof result.penstockModel === "string" ? result.penstockModel : null,
+        penstockRetryAfterSeconds:
+          typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
+        penstockAdvertisedResumeAt:
+          typeof result.penstockAdvertisedResumeAt === "string" ? result.penstockAdvertisedResumeAt : null,
+        capacityParkClampedFrom:
+          typeof result.penstockCapacityParkClampedFrom === "string"
+            ? result.penstockCapacityParkClampedFrom
+            : null,
+      };
+    });
+
+    res.json({
+      generatedAt: now,
+      reason: reason ?? null,
+      limit,
+      truncated,
+      parkedCount: parked.length,
+      overdueCount: parked.filter((entry) => (entry.overdueMs ?? 0) > 0).length,
+      agents: parked,
+    });
+  });
+
   router.get("/companies/:companyId/live-runs", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -4329,21 +4391,87 @@ export function agentRoutes(
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type === "none") {
+      throw unauthorized();
+    }
     const runId = req.params.runId as string;
+    // Fetch before authorizing: the recovery path below is scoped by the run's
+    // owning agent, so the decision needs the run. `getAccessibleResource`
+    // still enforces the company boundary for every actor type.
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    const run = await heartbeat.cancelRun(runId);
+
+    // BLO-21947: board keeps unconditional cancel authority. An agent may also
+    // cancel, but only a run (a) owned by an agent it manages and (b) provably
+    // never dispatched. Before this, cancel was `assertBoard` outright, which
+    // combined with `assertCanManageIssueMonitor` to leave a stranded run
+    // repairable *only* by its own assignee — whose wake path is exactly what
+    // is broken in this failure class — or by a human. A manager that detected
+    // the strand, and that the productivity-review generator explicitly routes
+    // these to, could not act on it.
+    let strandedRecovery: ReturnType<typeof evaluateStrandedRunRecovery> | null = null;
+    if (req.actor.type !== "board") {
+      const decision = await access.decide({
+        actor: req.actor,
+        action: "run:recover_stranded",
+        resource: { type: "agent", companyId: existing.companyId, agentId: existing.agentId },
+      });
+      if (!decision.allowed) {
+        throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      }
+      // The relation is authorized; the precondition is what makes the cancel
+      // non-destructive. Keep it here rather than in `authorization.ts`, which
+      // has no run data — mirroring how coordination-metadata authorizes the
+      // relation and leaves the field allowlist to the route.
+      strandedRecovery = evaluateStrandedRunRecovery(existing);
+      if (!strandedRecovery.eligible) {
+        throw forbidden(
+          `Run is not eligible for non-board stranded-run recovery: ${strandedRecovery.reason}`,
+          {
+            runId: existing.id,
+            runStatus: existing.status,
+            runStartedAt: existing.startedAt ?? null,
+            minAgeMs: STRANDED_RUN_RECOVERY_MIN_AGE_MS,
+            allowedRelations: [
+              "board user (any run, any status)",
+              "an agent that manages the run's owning agent (undispatched runs only)",
+            ],
+          },
+        );
+      }
+    }
+
+    const run = await heartbeat.cancelRun(
+      runId,
+      strandedRecovery
+        ? "Cancelled by a managing agent: run was never dispatched (stranded-run recovery)"
+        : undefined,
+    );
 
     if (run) {
+      const actor = getActorInfo(req);
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: actor.actorType,
+        actorId: req.actor.type === "board" ? req.actor.userId ?? "board" : actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
-        details: { agentId: run.agentId },
+        details: {
+          agentId: run.agentId,
+          // Record the precondition that authorized a non-board cancel, so the
+          // grant is auditable after the fact rather than only at decision time.
+          ...(strandedRecovery?.eligible
+            ? {
+                strandedRunRecovery: true,
+                undispatchedForMs: strandedRecovery.queuedForMs,
+                minAgeMs: STRANDED_RUN_RECOVERY_MIN_AGE_MS,
+              }
+            : {}),
+        },
       });
     }
 

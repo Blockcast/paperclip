@@ -33,3 +33,22 @@ platform cannot resolve automatically. Each runbook should be:
   (not failing) and is silently freezing the `master` merge queue. Trigger:
   `master` hasn't advanced in >90 min with the queue non-empty, or the
   position-1 entry's `merge_group` run shows no state change for that long.
+- [`pr-update-branch-destroys-required-checks.md`](pr-update-branch-destroys-required-checks.md)
+  — an approved PR cannot be enqueued because its head has no checks at all,
+  after `update-branch` (or a hand-merged base) replaced the head with a merge
+  commit that Actions never ran. Trigger: `gh pr merge` answers
+  `Required status check "verify" is expected.` while `gh pr checks` shows
+  nothing at the head.
+- [`queued-run-stranded.md`](queued-run-stranded.md) — a `heartbeat_runs` row
+  sitting at `status='queued'` for a long time: the issue it targets looks
+  actively in-progress but nothing is executing, and it manufactures false
+  productivity-review escalations. Also covers the case where the row's age
+  snapshot cannot be refreshed safely. Trigger: alert
+  `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
+  or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
+  — you are adjudicating an open productivity review and the reviewed issue's
+  monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
+  run): the supported one-call repair path, and why the `PATCH {status:
+  "todo"}` bounce is superseded. Trigger: review evidence reads `monitor
+  lapsed at …, never re-armed`.

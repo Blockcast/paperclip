@@ -11,6 +11,8 @@ import { timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
+  DEFAULT_OPERATOR_SUPPRESSION_HOURS,
+  MAX_OPERATOR_SUPPRESSION_HOURS,
   WEBHOOK_KEYS,
   alertStateRef,
   legacyInstanceAlertStateRef,
@@ -25,7 +27,6 @@ import {
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
-import { recordCredentialResolution } from "./credential-health.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -86,6 +87,35 @@ export function verifyBearerToken(
   const expected = `Bearer ${expectedToken}`;
   if (raw.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(raw), Buffer.from(expected));
+}
+
+/**
+ * Largest bearer credential worth sending to the host for verification.
+ *
+ * Mirrors the host's own `MAX_PRESENTED_SECRET_BYTES`
+ * (`server/src/services/plugin-secrets-handler.ts`). Anything larger is
+ * rejected there as `presented_secret_invalid` — an error, not a `false` — so
+ * without this cap an oversized `Authorization` header turns a plainly-wrong
+ * credential into a failed delivery that Alertmanager then retries. No secret
+ * budget is spent either way (the host checks size before any database work),
+ * but the retry volume and error rate are anonymous-triggerable, so reject the
+ * over-long credential here and answer 401 instead.
+ */
+const MAX_BEARER_CREDENTIAL_BYTES = 4_096;
+
+export function readBearerCredential(
+  headers: Record<string, string | string[]>,
+): string | null {
+  const raw =
+    pickHeader(headers, "authorization") ??
+    pickHeader(headers, "Authorization");
+  if (!raw?.startsWith("Bearer ")) return null;
+  const credential = raw.slice("Bearer ".length);
+  if (credential.length === 0) return null;
+  // Byte length, matching how the host measures it — a multi-byte UTF-8
+  // credential inside the character limit can still exceed the byte limit.
+  if (Buffer.byteLength(credential, "utf8") > MAX_BEARER_CREDENTIAL_BYTES) return null;
+  return credential;
 }
 
 function pickHeader(
@@ -164,6 +194,98 @@ async function readAlertState(
 }
 
 /**
+ * Milliseconds an operator-closed issue suppresses re-fires, or `null` for
+ * "suppress indefinitely" (`operatorSuppressionHours: 0`, the pre-BLO-24234
+ * behaviour). A negative or non-finite setting is treated as unset rather than
+ * silently disabling suppression in either direction, and an over-large one is
+ * clamped to `MAX_OPERATOR_SUPPRESSION_HOURS` so the millisecond conversion
+ * cannot overflow to `Infinity` (or to a finite-but-geological window) and
+ * re-create the unbounded mute. The clamped value is what the operator-facing
+ * labels report, so a clamped config shows up as the window it actually got.
+ */
+function operatorSuppressionMs(config: AlertmanagerPluginConfig): number | null {
+  const hours = config.operatorSuppressionHours;
+  const effective =
+    typeof hours === "number" && Number.isFinite(hours) && hours >= 0
+      ? Math.min(hours, MAX_OPERATOR_SUPPRESSION_HOURS)
+      : DEFAULT_OPERATOR_SUPPRESSION_HOURS;
+  return effective === 0 ? null : effective * 60 * 60 * 1000;
+}
+
+/**
+ * Decide what a re-fire should do to an issue that already exists for this
+ * fingerprint. Split out from `handleFiring` so the four decision points the
+ * incident review asked for are enumerable in one place, and testable without
+ * driving a whole webhook delivery.
+ *
+ * `terminal + resolvedAt` means the plugin closed it when the alert cleared, so
+ * a re-fire is a genuine recurrence → re-open. `terminal` with no `resolvedAt`
+ * means a human closed it while the alert was still firing → honour that, but
+ * only until the suppression window expires (BLO-24234).
+ */
+type RefireDecision =
+  | { kind: "refresh" }
+  | { kind: "reopen"; reason: "plugin_resolved" | "suppression_expired" }
+  | { kind: "suppressed"; suppressedAt: string; firstObservation: boolean }
+  | { kind: "issue_missing" };
+
+export function decideRefire(
+  issue: { status: string } | null | undefined,
+  existing: Pick<AlertStateRecord, "resolvedAt" | "operatorSuppressedAt">,
+  config: AlertmanagerPluginConfig,
+  nowMs: number,
+): RefireDecision {
+  if (!issue) return { kind: "issue_missing" };
+
+  const terminal = issue.status === "done" || issue.status === "cancelled";
+  if (!terminal) return { kind: "refresh" };
+  if (existing.resolvedAt) return { kind: "reopen", reason: "plugin_resolved" };
+
+  // Operator-closed. Anchor the window on the first re-fire we see against the
+  // closed issue — not on the close itself, which the plugin never observes.
+  const suppressedAt = existing.operatorSuppressedAt ?? new Date(nowMs).toISOString();
+  const firstObservation = !existing.operatorSuppressedAt;
+  const windowMs = operatorSuppressionMs(config);
+  if (windowMs === null) return { kind: "suppressed", suppressedAt, firstObservation };
+
+  const anchorMs = Date.parse(suppressedAt);
+  // An unparseable anchor (hand-edited or corrupted state row) must not mute the
+  // alert forever — re-anchor to now and keep suppressing for one more window.
+  if (!Number.isFinite(anchorMs)) {
+    return {
+      kind: "suppressed",
+      suppressedAt: new Date(nowMs).toISOString(),
+      firstObservation: true,
+    };
+  }
+  if (nowMs - anchorMs >= windowMs) {
+    return { kind: "reopen", reason: "suppression_expired" };
+  }
+  return { kind: "suppressed", suppressedAt, firstObservation };
+}
+
+/**
+ * Human-readable suppression window for log lines and the re-open comment.
+ */
+function operatorSuppressionHoursLabel(config: AlertmanagerPluginConfig): string {
+  const ms = operatorSuppressionMs(config);
+  if (ms === null) return "indefinite";
+  return `${ms / (60 * 60 * 1000)}h`;
+}
+
+/** When the current suppression window runs out, for operator-facing logs. */
+function suppressionExpiryLabel(
+  suppressedAt: string,
+  config: AlertmanagerPluginConfig,
+): string {
+  const ms = operatorSuppressionMs(config);
+  if (ms === null) return "never (operatorSuppressionHours=0)";
+  const anchorMs = Date.parse(suppressedAt);
+  if (!Number.isFinite(anchorMs)) return "unknown (unparseable suppression anchor)";
+  return new Date(anchorMs + ms).toISOString();
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -206,39 +328,123 @@ export async function handleFiring(
 
   if (existing && existing.paperclipIssueId) {
     // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
-    // re-open if the plugin previously auto-cancelled it on resolve.
+    // re-open if the plugin previously auto-cancelled it on resolve, or if an
+    // operator's close has aged past the suppression window (BLO-24234).
     const newDescription = buildIssueDescription(alert);
+    // Carried out of the try so the state write below records what actually
+    // happened. A decision the RPC then failed to apply must not be persisted
+    // as applied — otherwise a transient issues.update outage would bank the
+    // suppression anchor (or clear it) on the strength of a call that never
+    // landed, and the next re-fire would reason from a fiction.
+    let decision: RefireDecision = { kind: "issue_missing" };
+    let decisionApplied = false;
     try {
       const issue = await ctx.issues.get(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      if (
-        issue &&
-        (issue.status === "done" || issue.status === "cancelled") &&
-        existing.resolvedAt
-      ) {
+      decision = decideRefire(issue, existing, config, Date.now());
+
+      if (decision.kind === "reopen") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "todo", description: newDescription },
           existing.paperclipCompanyId,
         );
+        if (decision.reason === "suppression_expired") {
+          // Say why the close did not stick, on the issue itself — an operator
+          // who closed this yesterday needs to know it re-opened because the
+          // alert never stopped firing, not because something ignored them.
+          try {
+            await ctx.issues.createComment(
+              existing.paperclipIssueId,
+              `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
+              existing.paperclipCompanyId,
+            );
+          } catch (commentErr) {
+            // The re-open is the load-bearing half and has already landed.
+            ctx.logger.warn(
+              `Re-opened issue ${existing.paperclipIssueId} after suppression expiry but could not post the explanatory comment: ${String(commentErr)}`,
+            );
+          }
+          await ctx.metrics.write("alertmanager.firing.suppression_expired", 1, {
+            alertname,
+            severity,
+          });
+        }
         await ctx.metrics.write("alertmanager.firing.reopened", 1, {
           alertname,
           severity,
         });
-      } else if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+      } else if (decision.kind === "refresh") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { description: newDescription },
           existing.paperclipCompanyId,
         );
+      } else if (decision.kind === "suppressed") {
+        // The whole point of BLO-24234: this path used to be entirely silent,
+        // emitting only `firing.deduped` — indistinguishable from a healthy
+        // re-fire against an open issue. A muted fingerprint must be visible
+        // as muted, every time it fires, or nobody can tell that a delivered
+        // page produced no actionable artifact.
+        if (decision.firstObservation) {
+          ctx.logger.warn(
+            `Alert ${alertname} (${alert.fingerprint}) re-fired against operator-closed issue ${existing.paperclipIssueId}; suppressing re-open until ${suppressionExpiryLabel(decision.suppressedAt, config)}`,
+          );
+        } else {
+          ctx.logger.info(
+            `Alert ${alertname} (${alert.fingerprint}) still suppressed by operator close of issue ${existing.paperclipIssueId} (until ${suppressionExpiryLabel(decision.suppressedAt, config)})`,
+          );
+        }
+        await ctx.metrics.write("alertmanager.firing.suppressed", 1, {
+          alertname,
+          severity,
+        });
+      } else {
+        // `issues.get` returned nothing — the issue was hard-deleted out from
+        // under the state row. Previously this fell through both branches in
+        // silence; say so, since the fingerprint is now tracking a ghost.
+        ctx.logger.warn(
+          `Alert ${alertname} (${alert.fingerprint}) re-fired but its tracked issue ${existing.paperclipIssueId} could not be read; leaving state intact`,
+        );
+        await ctx.metrics.write("alertmanager.firing.issue_missing", 1, {
+          alertname,
+          severity,
+        });
       }
+      decisionApplied = true;
     } catch (err) {
       ctx.logger.warn(
         `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
       );
     }
+
+    // Ladder restart keeps its original trigger — the alert going
+    // resolved → firing — which is independent of the issue's status: an
+    // operator may have re-opened the issue by hand, in which case the branch
+    // above is a plain `refresh` but `handleResolved` has still left
+    // `nextEscalationAt` null and `escalationComplete` true. Gating this on the
+    // re-open would silently disarm escalation for exactly that case.
+    //
+    // A suppression-expiry re-open is the one new trigger: the ladder has been
+    // frozen for the whole suppression window, so the now-visible issue needs a
+    // live deadline or it will never page anyone.
+    const suppressionExpiryReopen =
+      decisionApplied &&
+      decision.kind === "reopen" &&
+      decision.reason === "suppression_expired";
+    const ladderRestart = Boolean(existing.resolvedAt) || suppressionExpiryReopen;
+    // Only a decision we actually applied may move the anchor. `issue_missing`
+    // preserves it: the issue was unreadable, so we learned nothing about
+    // whether the operator's close still stands, and dropping the anchor would
+    // restart the whole window on the next readable re-fire.
+    const suppressionAnchor =
+      !decisionApplied || decision.kind === "issue_missing"
+        ? (existing.operatorSuppressedAt ?? null)
+        : decision.kind === "suppressed"
+          ? decision.suppressedAt
+          : null;
 
     const updated: AlertStateRecord = {
       ...existing,
@@ -246,15 +452,16 @@ export async function handleFiring(
       severity,
       lastFiredAt: nowIso,
       resolvedAt: null,
-      nextEscalationAt: existing.resolvedAt
+      operatorSuppressedAt: suppressionAnchor,
+      nextEscalationAt: ladderRestart
         ? (() => {
             const delay = escalationDeadlineMs(alert, config);
             return delay === null ? null : new Date(Date.now() + delay).toISOString();
           })()
         : existing.nextEscalationAt,
-      escalationAttempt: existing.resolvedAt ? 0 : existing.escalationAttempt,
-      escalationComplete: existing.resolvedAt ? false : existing.escalationComplete,
-      escalationIntervalMs: existing.resolvedAt
+      escalationAttempt: ladderRestart ? 0 : existing.escalationAttempt,
+      escalationComplete: ladderRestart ? false : existing.escalationComplete,
+      escalationIntervalMs: ladderRestart
         ? escalationDeadlineMs(alert, config)
         : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
     };
@@ -516,6 +723,14 @@ async function recoverStateFromIssue(
   });
   const issue = matches[0];
   if (!issue) return null;
+  // A terminal issue is deliberately NOT adopted here, which means a lost state
+  // row plus a closed issue files a fresh one rather than reviving the old.
+  // That diverges from the state-present path (which suppresses per
+  // BLO-24234) — on purpose: after a state loss the plugin cannot tell whether
+  // the close was its own resolve or an operator's, and the safe failure mode
+  // for a paging system is a visible duplicate, not a silent mute. Do not
+  // "unify" this branch by returning the terminal issue; that would let a state
+  // loss inherit a suppression nobody chose.
   if (issue.status === "done" || issue.status === "cancelled") return null;
 
   return {
@@ -547,12 +762,20 @@ async function recoverStateFromIssue(
 }
 
 /**
- * Top-level webhook handler. Pure-ish: takes ctx + config + token + input,
- * returns void. Throws `WebhookUnauthorizedError` when the bearer token
- * fails verification — the worker's onWebhook re-throws this so the host
+ * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
+ * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
+ * verdict is `false` — the worker's onWebhook re-throws this so the host
  * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
  * when any alert in the batch failed to process, so the host records the
  * delivery `failed` and Alertmanager retries it.
+ *
+ * `authenticated` is a verdict, never a credential. `authenticateWebhook`
+ * (config-scope.ts) owns every way a request can authenticate — inline token
+ * and `webhookTokenRef` alike — so this function does no comparison and never
+ * sees a secret. It also records no credential health: given only a verdict it
+ * could not tell "no credential configured" from "wrong bearer presented", and
+ * conflating those is exactly what credential-health.ts exists to prevent
+ * (BLO-20572). `resolveCompanyScope` is the sole recorder.
  *
  * Returning normally is an acknowledgement: it makes the host answer HTTP 200
  * and ends Alertmanager's retries. Only do that when the delivery needs no
@@ -562,7 +785,7 @@ async function recoverStateFromIssue(
 export async function handleWebhook(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
-  resolvedToken: string | null,
+  authenticated: boolean,
   input: PluginWebhookInput,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
@@ -572,12 +795,7 @@ export async function handleWebhook(
     return;
   }
 
-  // Config-resolution outcome, not request-auth outcome: this reflects
-  // whether the company has a usable credential configured at all, not
-  // whether THIS request presented it correctly (BLO-20572).
-  recordCredentialResolution(input.companyId, resolvedToken);
-
-  if (!verifyBearerToken(input.headers, resolvedToken)) {
+  if (!authenticated) {
     ctx.logger.warn(
       "paperclip-plugin-alertmanager: rejecting webhook — bearer token missing or invalid",
     );
