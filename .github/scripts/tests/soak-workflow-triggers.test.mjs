@@ -21,6 +21,11 @@ const script = readFileSync(path.join(scriptsDir, SOAK_SCRIPT), 'utf8');
 // something is ABSENT have to run against executable lines only, or the
 // explanation of the rule trips the rule.
 const scriptCode = script
+  // Join shell line-continuations FIRST. The `--repeat` assertion below is
+  // deliberately scoped to a single line (see the comment there), so without
+  // this a split invocation -- `pnpm exec vitest run "$TEST_FILE" \` with
+  // `--repeat "$ITERATIONS"` on the next line -- would slip straight past it.
+  .replace(/\\\n\s*/g, ' ')
   .split('\n')
   .filter((line) => !/^\s*#/.test(line))
   .join('\n');
@@ -117,4 +122,30 @@ test('soak workflow serialises dispatches so load readings stay attributable', (
   assert.match(soak, /^concurrency:$/m);
   assert.match(soak, /^ {2}group: soak-heartbeat-convergence$/m);
   assert.match(soak, /^ {2}cancel-in-progress: false$/m);
+});
+
+test('soak samples its load baseline after a settle window, not at script start', () => {
+  // The workflow installs dependencies immediately before invoking this script,
+  // and a monorepo install leaves the 1-minute load average elevated. A single
+  // reading at script start captures that decaying install load as "baseline",
+  // so every dload0 measures `burners - install_load` and the attribution
+  // verdict blames a CFS quota that is not there. Pin the mechanism: the
+  // baseline must come from the settling sampler, not a bare /proc/loadavg read.
+  assert.match(scriptCode, /BASELINE_LOAD="\$\(sample_baseline_load\)"/);
+  const sampler = scriptCode.slice(
+    scriptCode.indexOf('sample_baseline_load() {'),
+    scriptCode.indexOf('BASELINE_LOAD="$(sample_baseline_load)"'),
+  );
+  assert.ok(sampler.length > 0, 'expected a sample_baseline_load definition');
+  assert.match(sampler, /LOAD_SETTLE_S/);
+
+  // Every tunable that feeds a `sleep` is validated -- with no `set -e`,
+  // `sleep abc` fails and the soak continues as a silently different experiment.
+  for (const knob of ['LOAD_WARMUP_S', 'LOAD_SETTLE_S']) {
+    assert.match(
+      scriptCode,
+      new RegExp(`\\[\\[ "\\$${knob}" =~ \\^\\[0-9\\]\\+\\$ \\]\\]`),
+      `expected ${knob} to be validated as an integer before it reaches sleep`,
+    );
+  }
 });
