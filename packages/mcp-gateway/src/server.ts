@@ -19,6 +19,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { scrubResponseBody } from "./response-scrub.js";
 import {
   CredentialCustodyError,
   applyCustodiedAuthorization,
@@ -576,18 +577,30 @@ function writeResponse(
   result: ForwardResult,
   exposedClientSessionId: string | null,
 ): void {
+  // PEN-2370: every proxied response leaves through here, which makes this the
+  // one place a scrubbing pass covers all of them. Applied unconditionally
+  // rather than per-upstream: an opt-in list is another thing to forget when a
+  // new upstream is added, and the scrub is inert for bodies carrying nothing
+  // it redacts.
+  const body = scrubResponseBody(result.body, result.headers.get("content-type"));
+
   res.statusCode = result.status;
   for (const [k, v] of result.headers.entries()) {
     // Replace upstream's session header with the stable client one.
     if (k.toLowerCase() === MCP_SESSION_HEADER) continue;
     // Skip hop-by-hop headers.
     if (k.toLowerCase() === "transfer-encoding" || k.toLowerCase() === "content-encoding") continue;
+    // Scrubbing changes the body length, so the upstream's content-length no
+    // longer describes what we are about to send. Forwarding it would either
+    // truncate the response or hang the client waiting for bytes that never
+    // arrive; Node recomputes it from the buffer we pass to end().
+    if (k.toLowerCase() === "content-length") continue;
     res.setHeader(k, v);
   }
   if (exposedClientSessionId) {
     res.setHeader(MCP_SESSION_HEADER, exposedClientSessionId);
   }
-  res.end(result.body);
+  res.end(body);
 }
 
 async function handleRequest(
