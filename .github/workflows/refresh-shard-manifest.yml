@@ -94,36 +94,10 @@ jobs:
           node-version: 24
 
       - name: Merge shards into the manifest
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          node - <<'EOF'
-          const { readFileSync, writeFileSync, readdirSync } = require("node:fs");
-          const path = require("node:path");
-
-          const manifestPath = path.join(process.cwd(), "scripts", "general-server-shard-durations.json");
-          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-
-          const shardDir = "/tmp/shard-durations";
-          let measured = {};
-          for (const file of readdirSync(shardDir)) {
-            const shard = JSON.parse(readFileSync(path.join(shardDir, file), "utf8"));
-            measured = { ...measured, ...shard };
-          }
-
-          const merged = { ...manifest.durations, ...measured };
-          const sorted = {};
-          for (const key of Object.keys(merged).sort()) {
-            sorted[key] = merged[key];
-          }
-          manifest.durations = sorted;
-
-          const runId = process.env.GITHUB_RUN_ID;
-          const today = new Date().toISOString().slice(0, 10);
-          manifest["$comment"] =
-            `Per-suite Vitest elapsed durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from the four .github/workflows/refresh-shard-manifest.yml shard jobs in run ${runId} on ${today}. Suites absent from that run use the median fallback; the same workflow re-samples this weekly so it does not need a human to notice drift.`;
-
-          writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-          console.log(`Merged ${Object.keys(measured).length} measured suite(s) into ${Object.keys(manifest.durations).length} total manifest entries.`);
-          EOF
+          node scripts/merge-shard-duration-manifest.mjs --shard-dir /tmp/shard-durations
 
       - name: Create or update pull request
         id: upsert-pr

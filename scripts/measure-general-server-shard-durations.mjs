@@ -2,8 +2,14 @@
 /**
  * measure-general-server-shard-durations.mjs
  *
- * Measures real per-suite Vitest wall-clock durations for the general-server
- * lane and folds them into scripts/general-server-shard-durations.json.
+ * Measures real per-suite Vitest test-execution durations for the
+ * general-server lane and folds them into
+ * scripts/general-server-shard-durations.json.
+ *
+ * These are the JSON reporter's per-file testResults[].startTime->endTime
+ * spans, NOT full wall-clock: they exclude each file's transform/setup/import
+ * cost, which is why a trivial suite can read as single-digit ms. See the
+ * manifest's own "$notes" key for why that does not skew the partition.
  *
  * This is the "one-line fix" scripts/check-shard-manifest-freshness.mjs
  * points at, and the executor .github/workflows/refresh-shard-manifest.yml
@@ -97,10 +103,19 @@ function measureFiles(repoRoot, files) {
     mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
     mkdirSync(env.TMPDIR, { recursive: true });
 
+    // stdout is inherited, not piped, on purpose. The timing data comes from
+    // --outputFile, so nothing here ever reads the child's stdout -- and
+    // piping it would cap it at Node's default 1 MiB maxBuffer. A real
+    // refresh shard runs ~108 server suites for 25-37 min; once their
+    // combined stdout crossed that cap, spawnSync would kill vitest and set
+    // `error` to ENOBUFS, failing the shard and (via `needs: [measure]`)
+    // silently skipping the whole manifest refresh -- exactly the
+    // depends-on-a-human-noticing failure this workflow exists to remove.
+    // Inheriting also puts suite progress in the job log.
     const result = spawnSync(
       "pnpm",
       ["exec", "vitest", "run", "--project", "@paperclipai/server", ...files, ...MEASURE_VITEST_ARGS, "--reporter=json", `--outputFile=${reportPath}`],
-      { cwd: repoRoot, env, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+      { cwd: repoRoot, env, stdio: ["ignore", "inherit", "inherit"] },
     );
     if (result.error) {
       throw result.error;

@@ -9,11 +9,33 @@ import {
 
 test("selectTargetFiles defaults to only the suites missing from the manifest", () => {
   const allFiles = ["a.test.ts", "b.test.ts", "c.test.ts"];
-  const durations = { a: 1 }; // keys deliberately don't match to force "missing"
+  // Mixed fixture on purpose: a.test.ts is already measured, so the default
+  // mode must skip it. Seeding every key as missing would assert the same
+  // result as the --all case below and would still pass with the filter
+  // deleted, proving nothing about the filter.
+  const durations = { "a.test.ts": 10 };
 
   const target = selectTargetFiles({ allFiles, durations, all: false, shardIndex: null, shardCount: null });
 
-  assert.deepEqual(target, ["a.test.ts", "b.test.ts", "c.test.ts"]);
+  assert.deepEqual(target, ["b.test.ts", "c.test.ts"]);
+});
+
+test("selectTargetFiles defaults to an empty list when the manifest already covers every suite", () => {
+  const allFiles = ["a.test.ts", "b.test.ts"];
+  const durations = { "a.test.ts": 10, "b.test.ts": 20 };
+
+  const target = selectTargetFiles({ allFiles, durations, all: false, shardIndex: null, shardCount: null });
+
+  assert.deepEqual(target, [], "a fully covered manifest must leave nothing to measure");
+});
+
+test("selectTargetFiles treats a zero-millisecond entry as measured, not missing", () => {
+  const allFiles = ["a.test.ts", "b.test.ts"];
+  const durations = { "a.test.ts": 0 };
+
+  const target = selectTargetFiles({ allFiles, durations, all: false, shardIndex: null, shardCount: null });
+
+  assert.deepEqual(target, ["b.test.ts"], "0 is a real measurement and must not re-measure");
 });
 
 test("selectTargetFiles --all re-measures every suite regardless of manifest state", () => {

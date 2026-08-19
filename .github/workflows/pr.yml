@@ -201,6 +201,17 @@ jobs:
         continue-on-error: true
         run: node --test ./scripts/check-shard-manifest-freshness.test.mjs
 
+      # BLO-24241: the weekly refresh path. These are required (not
+      # continue-on-error) because a break here only surfaces on a Monday
+      # schedule that nobody is watching -- the merge step used to clobber the
+      # manifest's durable "$notes" prose, and the measurement runner used to
+      # buffer vitest's stdout into an ENOBUFS kill.
+      - name: Test shard duration measurement runner
+        run: node --test ./scripts/__tests__/measure-general-server-shard-durations.test.mjs
+
+      - name: Test shard duration manifest merge
+        run: node --test ./scripts/__tests__/merge-shard-duration-manifest.test.mjs
+
       - name: Test vitest project coverage
         run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
 

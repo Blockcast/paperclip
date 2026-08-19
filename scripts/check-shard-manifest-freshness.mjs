@@ -20,7 +20,7 @@
  *     90%) so ordinary one-or-two-suite drift can no longer cascade. It
  *     always prints formatMissingSuitesDiagnostic() as a warning even when
  *     it doesn't fail.
- *   - scripts/__tests__/check-shard-manifest-freshness.test.mjs asserts
+ *   - scripts/check-shard-manifest-freshness.test.mjs asserts
  *     strict 100% coverage and is wired into .github/workflows/pr.yml with
  *     continue-on-error, so it stays visible (a real red X on its own step,
  *     naming every missing suite and the fix) without failing `policy`.
