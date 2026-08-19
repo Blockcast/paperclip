@@ -677,7 +677,31 @@ jobs:
         vendor_claude_k8s,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 5
+    # BLO-28999: the failure path below adds checkout + Node setup + up to N+1
+    # API round trips, and it runs precisely when the pool is saturated. At the
+    # previous 5 minutes a slow classify step could time `verify` out and lose
+    # the annotation entirely — the one thing this job exists to emit. The
+    # classify step carries its own tighter bound, so this ceiling only has to
+    # cover the setup around it. Same headroom reasoning as `policy` above.
+    timeout-minutes: 10
+    # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
+    # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a
+    # restricted default-permissions preset every scope is `none`, the API calls
+    # 403, and the classifier degrades silently to the pre-existing wording —
+    # indistinguishable from "nothing was killed", which is the exact bug this
+    # job now exists to fix. Declared explicitly, as `master-health.yml` and
+    # `refresh-lockfile.yml` already do for the same reason.
+    permissions:
+      # A job-level block REPLACES the workflow-level one rather than merging
+      # into it (see the same note in `docker.yml`), so `contents: read` is
+      # listed deliberately — without it `actions/checkout` below loses repo
+      # access and the classify step cannot even find the script.
+      contents: read
+      # `/actions/runs/{id}/jobs` — the per-job detail and step conclusions.
+      actions: read
+      # `/check-runs/{id}/annotations` — a DIFFERENT scope from `actions: read`,
+      # and the source of the runner-loss annotation that is signal 1.
+      checks: read
 
     steps:
       # BLO-28999: `needs.<lane>.result` cannot distinguish an ARC mid-job
@@ -710,6 +734,10 @@ jobs:
         # still runs (`if: always()`) and falls back to the pre-existing
         # failure wording.
         continue-on-error: true
+        # Bounded well inside the job ceiling: this step makes N+1 API calls on
+        # a saturated pool, and if it hangs the job timeout would kill `verify`
+        # before the aggregation step could emit any annotation at all.
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
@@ -775,9 +803,17 @@ jobs:
           if [ "${#failed[@]}" -gt 0 ]; then
             # The script degrades to an empty set on any error, so a
             # classification problem can never change the gate — only the
-            # wording the aggregation step picks.
+            # wording the aggregation step picks. That degradation is silent by
+            # design on stdout (which carries the lane list), so surface the
+            # script's stderr as a warning annotation: a 403 from a missing
+            # token scope would otherwise be indistinguishable from a clean
+            # "nothing was killed", and could rot back to silence unnoticed.
+            classify_err="$(mktemp)"
             infra="$(LANE_JOB_NAMES="$(printf '%s\n' "${job_names[@]}")" \
-              node scripts/classify-lane-failures.mjs "${failed[@]}" | tail -n 1)"
+              node scripts/classify-lane-failures.mjs "${failed[@]}" 2>"$classify_err" | tail -n 1)"
+            if [ -s "$classify_err" ]; then
+              echo "::warning title=verify: lane classifier degraded::Runner-kill detection did not produce a verdict, so any killed lane below is reported with the ordinary failure wording. Cause: $(tr '\n' ' ' <"$classify_err")"
+            fi
           fi
           echo "infra_lanes=$infra" >>"$GITHUB_OUTPUT"
 
