@@ -1,0 +1,76 @@
+name: Soak (heartbeat queued-backlog convergence)
+
+# On-demand only. BLO-20885 AC2 needs 20 consecutive green runs of one test
+# file at ONE head; at ~150-270s per iteration that is ~50-90 minutes of
+# self-hosted runner time, so this is deliberately NOT a per-PR gate and must
+# not be added to pr.yml. See BLO-28888 for why the venue moved here at all:
+# an agent pod failed to survive an uninterrupted 50-90 minute process four
+# times across three assignees, while CI runners have no such constraint.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, branch or tag to soak — AC2 is measured at a single head
+        required: true
+        type: string
+      iterations:
+        description: Number of fresh vitest processes to run (AC2 requires 20)
+        required: false
+        default: "20"
+        type: string
+      load_workers:
+        description: >-
+          Synthetic CPU load held for the whole soak. "auto" targets the
+          load/core ratio the series-1 iter-14 failure appeared at (11 on 48
+          cores); "off" runs the runner as-is; an integer pins the worker count.
+        required: false
+        default: auto
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: Soak ${{ inputs.iterations }}x @ ${{ inputs.ref }}
+    runs-on: default
+    # 20 iterations at the observed 150-270s each is 50-90 minutes, and the
+    # synthetic-load mode deliberately slows iterations down. Leave real margin
+    # so runner contention is never reported as a soak failure.
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run soak
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+          LOAD_WORKERS: ${{ inputs.load_workers }}
+        run: bash .github/scripts/soak-heartbeat-convergence.sh
+
+      - name: Upload soak summary and per-iteration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-summary
+          path: |
+            soak-out/summary.txt
+            soak-out/iter-*.log
+          if-no-files-found: error
