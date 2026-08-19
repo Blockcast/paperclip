@@ -170,5 +170,14 @@ export interface IssueGraphLivenessAutoRecoveryPreview {
   skippedReescalationCooldown: number;
   // Subset of the above attributable to the target-state gate.
   skippedUnchangedTarget: number;
+  // The suppression windows this preview actually resolved. Reported so the
+  // operator surface can state the bounds instead of restating them as
+  // constants: both suppressors are time-bounded, and a UI string that says
+  // "will not be re-raised" unqualified describes the unbounded behaviour the
+  // 7d ceiling exists to prevent (BLO-27676 review). Deriving the numbers from
+  // the response keeps the sentence true if either constant is ever tuned, or
+  // if a caller overrides the windows via the documented rollback lever.
+  reescalationCooldownMs: number;
+  unchangedTargetSuppressionMs: number;
   items: IssueGraphLivenessAutoRecoveryPreviewItem[];
 }
