@@ -337,43 +337,60 @@ describe("the bare idiom cannot be reintroduced (BLO-27641)", () => {
    * reconciler interval using the same idiom (#1375, #1309). A guard turns the
    * cleanup into an invariant, and points the next author at the helper.
    */
-  const ALLOWED_ENV_VARS = new Set([
-    // Neither a bound nor a timer delay. An unusable port fails loudly at
-    // listen() rather than silently disabling a guard or starting a hot loop.
-    // PORT is read twice — at the `port` field and again to interpolate
-    // `linearOAuthRedirectUri` — but the second site is covered by the first:
-    // `PORT=Infinity` builds a nonsense redirect URI and then still dies at
-    // bind, so the failure stays loud rather than becoming a silent misconfig.
-    "PORT",
-  ]);
-
   /**
-   * Deliberately wider than the literal `Number(process.env.X) ||` form the
-   * acceptance criteria grep for, because the hole is in the *coercion*, not in
-   * one spelling of it. Two shapes both leave it open:
+   * Matches the *coercion*, not any particular spelling of the fallback around
+   * it, because every shape below resolves `"Infinity"` to `Infinity`:
    *
    *  - **fallback outside the call** — `Number(process.env.X) || D`,
    *    `parseInt(process.env.X, 10) ?? D`. `Number("Infinity")` is truthy, so
    *    the fallback never fires.
    *  - **fallback inside the call** — `Number(process.env.X ?? "3")`. The
    *    default only substitutes for an *unset* var; an explicitly hostile value
-   *    is passed straight through to `Number`, so this shape is if anything
-   *    weaker than the first.
+   *    is passed straight through to `Number`.
+   *  - **no fallback at all** — `Math.max(1, Number(process.env.X))`, or a bare
+   *    `Number(process.env.X)`. `Math.max(1, Number("Infinity"))` is `Infinity`:
+   *    the identical defect, one token *shorter* than the form the acceptance
+   *    criteria grep for. Dropping `|| D` while keeping the floor is a plausible
+   *    edit on any of the eight call sites this ticket just fixed, so requiring
+   *    a fallback operator would leave the guard blind to the likeliest
+   *    regression.
    *
    * The inside form is not hypothetical: it is the spelling live in
    * `services/k8s-job-liveness.ts` today (see SCANNED_SOURCES below for the
    * exact set), which makes it the variant the next author is most likely to
    * reach for.
+   *
+   * The cost of matching the fallback-free shape is that a deliberate
+   * `Number(process.env.X)` one-off now needs an allowlist entry. That is the
+   * right default: there is no safe bare coercion of an env var to a bound or a
+   * delay, so an exemption should have to state its reasoning.
    */
   const BARE_NUMERIC_ENV_IDIOM =
-    /(?:Number|parseInt|parseFloat)\(\s*process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[\s*["'`]([A-Z_][A-Z0-9_]*)["'`]\s*\])(?:\s*(?:\|\||\?\?)|[^)]*\)\s*(?:\|\||\?\?))/g;
+    /(?:Number|parseInt|parseFloat)\(\s*process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[\s*["'`]([A-Z_][A-Z0-9_]*)["'`]\s*\])/g;
 
-  /** Strip comments so prose describing the idiom does not trip the guard. */
-  function findBareNumericEnvIdioms(source: string): string[] {
-    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    return [...code.matchAll(BARE_NUMERIC_ENV_IDIOM)]
+  /**
+   * Strip comments so prose describing the idiom does not trip the guard.
+   *
+   * Trailing comments count. Stripping only *line-leading* `//` (`/^\s*\/\/.*$/gm`)
+   * left `const x = 1; // Number(process.env.X) || 5 is the old idiom` matching,
+   * which turns CI red for prose — a false positive, and a live authoring hazard
+   * in exactly these two files, which discuss the idiom at length.
+   *
+   * The `[^:]` guard keeps `https://…` in a string literal from swallowing the
+   * rest of its line, which would be a false *negative* for any real idiom
+   * sharing that line.
+   */
+  function stripComments(source: string): string {
+    return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  }
+
+  function findBareNumericEnvIdioms(
+    source: string,
+    allowedEnvVars: ReadonlySet<string> = new Set(),
+  ): string[] {
+    return [...stripComments(source).matchAll(BARE_NUMERIC_ENV_IDIOM)]
       .map((match) => match[1] ?? match[2])
-      .filter((envVar): envVar is string => envVar !== undefined && !ALLOWED_ENV_VARS.has(envVar));
+      .filter((envVar): envVar is string => envVar !== undefined && !allowedEnvVars.has(envVar));
   }
 
   /**
@@ -392,6 +409,12 @@ describe("the bare idiom cannot be reintroduced (BLO-27641)", () => {
     ["fallback inside, ??", 'Number(process.env.SOME_VAR ?? "3")'],
     ["fallback inside, ||", 'Number(process.env.SOME_VAR || "3")'],
     ["bracket + inside ??", 'Number(process.env["SOME_VAR"] ?? "3")'],
+    // No fallback operator at all. `Math.max(1, Number("Infinity"))` is
+    // `Infinity`, so the floor alone is not a guard — this is the shape the
+    // eight fixed call sites collapse to if a later edit drops `|| DEFAULT`.
+    ["no fallback, floored", "Math.max(1, Number(process.env.SOME_VAR))"],
+    ["no fallback, bare", "const ms = Number(process.env.SOME_VAR);"],
+    ["no fallback, bracket", 'const ms = Number(process.env["SOME_VAR"]);'],
   ])("detects the idiom spelled as %s", (_label, snippet) => {
     expect(findBareNumericEnvIdioms(snippet)).toEqual(["SOME_VAR"]);
   });
@@ -400,10 +423,33 @@ describe("the bare idiom cannot be reintroduced (BLO-27641)", () => {
     ["the helper", "resolveNumericSetting([process.env.SOME_VAR], NUMERIC_SETTING_BOUNDS.x)"],
     ["a boolean read", 'process.env.SOME_VAR === "true"'],
     ["a plain string read", "const raw = process.env.SOME_VAR;"],
-    ["an allowlisted PORT read", "Number(process.env.PORT) || 3100"],
-    ["prose in a comment", "// Number(process.env.SOME_VAR) || 5 is the old idiom"],
+    ["prose in a line-leading comment", "// Number(process.env.SOME_VAR) || 5 is the old idiom"],
+    // A trailing comment is the form these two files actually use when they
+    // discuss the idiom, and it is the one that used to escape the strip.
+    [
+      "prose in a trailing comment",
+      "const x = 1; // Number(process.env.SOME_VAR) || 5 is the old idiom",
+    ],
+    ["prose in a block comment", "/* Number(process.env.SOME_VAR) || 5 is the old idiom */"],
   ])("does not flag %s", (_label, snippet) => {
     expect(findBareNumericEnvIdioms(snippet)).toEqual([]);
+  });
+
+  it("still flags a real idiom sharing a line with a URL literal", () => {
+    // The `[^:]` guard in stripComments must not let `//` inside a URL swallow
+    // the rest of the line — that would be a false negative, the failure mode
+    // that matters more than the false positive it exists to prevent.
+    expect(
+      findBareNumericEnvIdioms('const u = "https://x.io"; const n = Number(process.env.SOME_VAR);'),
+    ).toEqual(["SOME_VAR"]);
+  });
+
+  it("applies the per-file allowlist rather than a global one", () => {
+    const snippet = "Number(process.env.PORT) || 3100";
+    expect(findBareNumericEnvIdioms(snippet, new Set(["PORT"]))).toEqual([]);
+    // Same read, a file that does not exempt PORT: still an offender. This is
+    // what keeps the exemption attached to the reasoning that justifies it.
+    expect(findBareNumericEnvIdioms(snippet)).toEqual(["PORT"]);
   });
 
   /**
@@ -421,9 +467,33 @@ describe("the bare idiom cannot be reintroduced (BLO-27641)", () => {
    *
    * Both directions are intentional. Fixing a site under BLO-28664 also turns
    * this red, which is the prompt to delete it from the list.
+   *
+   * `allowedEnvVars` is per-file for the same reason `knownOffenders` is: an
+   * exemption is only ever justified by facts about the file it sits in. `PORT`
+   * is exempt in `config.ts` because *that file's* two reads both end at
+   * `listen()`; the same read elsewhere would carry none of that reasoning. A
+   * global allowlist would silently widen as BLO-28664 extends this scan to
+   * `server/src/**`.
    */
-  const SCANNED_SOURCES: { readonly path: string; readonly knownOffenders: readonly string[] }[] = [
-    { path: "../config.ts", knownOffenders: [] },
+  const SCANNED_SOURCES: {
+    readonly path: string;
+    readonly knownOffenders: readonly string[];
+    readonly allowedEnvVars: readonly string[];
+  }[] = [
+    {
+      path: "../config.ts",
+      knownOffenders: [],
+      allowedEnvVars: [
+        // Neither a bound nor a timer delay. An unusable port fails loudly at
+        // listen() rather than silently disabling a guard or starting a hot
+        // loop. PORT is read twice in this file — at the `port` field and again
+        // to interpolate `linearOAuthRedirectUri` — but the second site is
+        // covered by the first: `PORT=Infinity` builds a nonsense redirect URI
+        // and then still dies at bind, so the failure stays loud rather than
+        // becoming a silent misconfig.
+        "PORT",
+      ],
+    },
     {
       // Tracked in BLO-28664. All five are the `Number(process.env.X ?? "D")`
       // spelling. Consequences at Infinity, which are not uniform:
@@ -444,23 +514,27 @@ describe("the bare idiom cannot be reintroduced (BLO-27641)", () => {
         "PAPERCLIP_K8S_FAILURE_LOG_TAIL_LINES",
         "PAPERCLIP_K8S_FAILURE_LOG_TAIL_MAX_BYTES",
       ],
+      // No read in this file has a reason to be exempt.
+      allowedEnvVars: [],
     },
   ];
 
   it.each(SCANNED_SOURCES)("$path has exactly its known numeric-env offenders", async (entry) => {
     const { readFile } = await import("node:fs/promises");
     const source = await readFile(new URL(entry.path, import.meta.url), "utf8");
-    const offenders = findBareNumericEnvIdioms(source);
+    const offenders = findBareNumericEnvIdioms(source, new Set(entry.allowedEnvVars));
 
     expect(
       [...offenders].sort(),
       `${entry.path}: expected exactly [${entry.knownOffenders.join(", ")}] but found ` +
-        `[${offenders.join(", ")}]. A NEW name here uses a bare ` +
-        `\`Number(process.env.X) || DEFAULT\`-style fallback, which resolves to Infinity for ` +
+        `[${offenders.join(", ")}]. A NEW name here coerces an env var with ` +
+        `Number()/parseInt()/parseFloat(), which resolves to Infinity for ` +
         `"Infinity"/"1e999" and overflows a 32-bit timer for any value above ` +
-        `${MAX_TIMER_DELAY_MS}ms — use resolveNumericSetting() with an entry in ` +
-        `NUMERIC_SETTING_BOUNDS instead (and TIMER_SETTING_MS_FACTOR if it is a timer). ` +
-        `A MISSING name means you fixed one under BLO-28664: delete it from knownOffenders.`,
+        `${MAX_TIMER_DELAY_MS}ms. Neither a \`|| DEFAULT\` fallback nor a ` +
+        `\`Math.max(FLOOR, …)\` floor prevents either — use resolveNumericSetting() with an ` +
+        `entry in NUMERIC_SETTING_BOUNDS instead (and TIMER_SETTING_MS_FACTOR if it is a ` +
+        `timer). A MISSING name means you fixed one under BLO-28664: delete it from ` +
+        `knownOffenders.`,
     ).toEqual([...entry.knownOffenders].sort());
   });
 });
