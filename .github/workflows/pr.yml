@@ -25,7 +25,14 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 5
+    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
+    # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
+    # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
+    # into a job timeout, which ejects a merge-queue candidate just the same but
+    # burns a runner for the full budget first. Worst case here is roughly
+    # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
+    # headroom above it.
+    timeout-minutes: 10
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -61,10 +68,7 @@ jobs:
           fi
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-          run_install: false
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -84,6 +88,9 @@ jobs:
 
       - name: Test approval admissibility-probe backoff (BLO-28471)
         run: node --test ./scripts/approve-paperclip-api-digest.test.js
+
+      - name: Test pnpm setup retry wrapper (BLO-28813)
+        run: node --test ./scripts/__tests__/pnpm-setup-retry.test.mjs
 
       - name: Test CI cache and Docker runner routing
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
@@ -292,9 +299,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -348,9 +353,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -471,9 +474,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -557,9 +558,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -781,9 +780,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -821,9 +818,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -880,9 +875,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
