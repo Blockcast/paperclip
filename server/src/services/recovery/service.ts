@@ -8366,12 +8366,32 @@ export function recoveryService(
       recoverableFindings: items.length,
       skippedOutsideLookback: skippedNotYetStale,
       // Named to match the run's counters so the two responses compare
-      // field-for-field. Residual divergence, deliberately not covered here: a
-      // finding whose incident already has an OPEN escalation returns `existing`
-      // from the run and creates no row, and the preview still lists it. That
-      // one is rare by construction -- an open escalation contributes a waiting
-      // path for its own leaf, so the finding is usually not collected at all --
-      // and its magnitude is unchanged by BLO-27676, unlike these two.
+      // field-for-field.
+      //
+      // Residual divergence, deliberately not modelled here. This list is
+      // complete as of this head rather than illustrative -- it is what a reader
+      // deciding "is this preview/run gap known or new?" will trust, so it
+      // enumerates every pre-creation exit in
+      // `createIssueGraphLivenessEscalation` that the preview does not reproduce:
+      //
+      //   1. source issue vanished, or crossed companies since collection
+      //   2. automatic recovery suppressed by a pause hold
+      //   3. recovery issue vanished since collection
+      //   4. an OPEN escalation already exists (returns `existing`)
+      //   5. no resolvable owner agent
+      //
+      // All five are pre-existing and unchanged in magnitude by BLO-27676,
+      // unlike the two suppressors above -- which is why they are recorded here
+      // rather than replicated. (4) is additionally rare by construction: an
+      // open escalation contributes a waiting path for its own leaf, so the
+      // finding is usually not collected at all.
+      //
+      // One attribution nuance, not a count difference: when a finding has BOTH
+      // an open escalation and a resolved `done` one, the run books it to
+      // `existingEscalations` (its `existing` check at the `findOpenLiveness*`
+      // call above precedes its suppressor call) while the preview books it to
+      // `skippedReescalationCooldown`. Neither creates a row, so
+      // `recoverableFindings == escalationsCreated` still holds.
       skippedReescalationCooldown,
       skippedUnchangedTarget,
       // Echo the resolved windows so the operator surface can state the bounds
