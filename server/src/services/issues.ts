@@ -5080,7 +5080,10 @@ function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
 // scoped to open routine-execution rows that hold an `execution_run_id`).
 // Walks the `cause` chain because drizzle wraps the driver error in a
 // `DrizzleQueryError`, so the constraint name is never on the outermost error.
-function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
+// Exported for unit test only: this predicate is what keeps the guard's blast
+// radius to one constraint, so a silent widening here would convert unrelated
+// failures into 409s.
+export function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
   const seen = new Set<unknown>();
   let current = error;
   while (current && typeof current === "object" && !seen.has(current)) {
@@ -6544,27 +6547,45 @@ export function issueService(db: Db) {
         };
 
         let owner = await findLockOwner();
-        if (owner && (await clearExecutionRunIfTerminal(owner.id))) {
+        // Retry once when nothing actually holds the key any more. Two ways to
+        // learn that, and they are the same fact reported differently:
+        //
+        //   - the lookup comes back EMPTY. `findLockOwner` re-queries live state,
+        //     so an empty result means the sibling's run ended and released
+        //     `execution_run_id` in the window between the failed write and this
+        //     select. That is the live moment PEN-2368 recovered on. Treating it
+        //     as a conflict would emit a 409 naming no owner at all — a real
+        //     state reported through the wrong channel, which is the very
+        //     failure mode this guard exists to remove.
+        //   - the lock is held by a TERMINAL run. Nothing owns the work, the row
+        //     is just littered, so reap it and take the key.
+        if (owner === null || (await clearExecutionRunIfTerminal(owner.id))) {
           try {
             return await fn(id, actorAgentId, actorRunId);
           } catch (retryError) {
-            // Only ever retried once, and only after actually reaping a dead
-            // lock. A second conflict means a live sibling took the key in
-            // between, so report that rather than letting a raw 23505 escape
-            // as the 500 this whole guard exists to prevent.
+            // Retried at most once. A second conflict means a live sibling took
+            // the key in between, so report that rather than letting a raw 23505
+            // escape as the 500 this whole guard exists to prevent.
             if (!isOpenRoutineExecutionLockConflict(retryError)) throw retryError;
             owner = await findLockOwner();
           }
         }
 
-        throw conflict("Routine execution already locked by another open issue", {
-          issueId: id,
-          ownerIssueId: owner?.id ?? null,
-          ownerIdentifier: owner?.identifier ?? null,
-          ownerExecutionRunId: owner?.executionRunId ?? null,
-          actorAgentId,
-          actorRunId,
-        });
+        // A null owner that survived the retry is contention, not ownership:
+        // say so rather than asserting an owner the response cannot name.
+        throw conflict(
+          owner
+            ? "Routine execution already locked by another open issue"
+            : "Routine execution dispatch lock is contended; retry the request",
+          {
+            issueId: id,
+            ownerIssueId: owner?.id ?? null,
+            ownerIdentifier: owner?.identifier ?? null,
+            ownerExecutionRunId: owner?.executionRunId ?? null,
+            actorAgentId,
+            actorRunId,
+          },
+        );
       }
     };
   }
