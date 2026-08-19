@@ -25,7 +25,7 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId } from "./owner-resolver.js";
+import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
   ORIGIN_KIND,
@@ -489,6 +489,32 @@ export async function handleFiring(
     return;
   }
 
+  // Creation floor. Deliberately placed *after* the re-fire branch above and
+  // before creation only: an `info` alert that already owns an issue (filed
+  // before this floor existed) keeps being refreshed, and `handleResolved`
+  // still closes it. Gating the whole delivery instead would strand those
+  // legacy issues open forever, which is the resolution behavior this ticket
+  // explicitly excludes from scope.
+  if ((alert.labels.severity ?? "").trim().toLowerCase() === "info") {
+    ctx.logger.info(
+      `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+    } catch (metricErr) {
+      // Best-effort: this drop is permanent policy, already decided. Letting a
+      // metrics outage throw would mark the delivery failed and make
+      // Alertmanager retry an alert we will drop identically every time.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record issue floor metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    return;
+  }
+
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
   const { assigneeUserId, assigneeAgentId, resolution } =
@@ -516,6 +542,35 @@ export async function handleFiring(
       : routeHasAssigneeUserId
         ? routeAssigneeUserId
         : assigneeUserId;
+  // Last rung of the owner chain. Before this, an unresolved owner fell through
+  // to a conditional spread on `issues.create` that simply omitted the field —
+  // so the alert landed as an ownerless issue, which nobody is woken for and
+  // which auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438 all did
+  // exactly this on 2026-08-17). Assigning a configured named agent is what
+  // makes an intake issue actionable.
+  const fallbackAssigneeAgentId =
+    createAssigneeAgentId || createAssigneeUserId
+      ? undefined
+      : await resolveFallbackAgentId(ctx, companyId, config.fallbackAgentName);
+  const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
+  if (!finalAssigneeAgentId && !createAssigneeUserId) {
+    // Fail closed. Throwing (rather than returning) is deliberate: this is a
+    // *configuration* fault, not a property of the alert, so the delivery is
+    // genuinely incomplete. handleWebhook collects the fingerprint and answers
+    // non-2xx, Alertmanager keeps retrying, and the alert survives until an
+    // operator fixes `fallbackAgentName`. Returning here would acknowledge the
+    // delivery and destroy the alert silently — the BLO-20467 loss class.
+    ctx.logger.warn(
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, unmatched, or ambiguous; refusing ownerless issue creation`,
+    );
+    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+      alertname,
+      severity,
+    });
+    throw new Error(
+      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
+    );
+  }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
@@ -524,9 +579,11 @@ export async function handleFiring(
       ? `agent:${resolution.agentId}`
       : resolution.email ?? "(none)";
   const resolvedAssignee =
-    createAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
+    finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
+    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}${
+      fallbackAssigneeAgentId ? " (named fallback)" : ""
+    }`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -551,7 +608,7 @@ export async function handleFiring(
     ...(routeGoalId ? { goalId: routeGoalId } : {}),
     ...(routeStatus ? { status: routeStatus } : {}),
     ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-    ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
+    ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
     ...(billingCode ? { billingCode } : {}),
   });
 
@@ -559,7 +616,7 @@ export async function handleFiring(
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
     assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeAgentId: finalAssigneeAgentId ?? null,
     alertname,
     severity,
     firstSeenAt: alert.startsAt || nowIso,
@@ -583,7 +640,7 @@ export async function handleFiring(
     annotations: alert.annotations,
     paperclipIssueId: issue.id,
     assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeAgentId: finalAssigneeAgentId ?? null,
     reFired: false,
   });
 
@@ -833,7 +890,60 @@ export async function handleWebhook(
     }
 
     const status = effectiveAlertStatus(alert, body);
+    const alertname = alert.labels.alertname ?? "unknown";
     try {
+      // Rule-level opt-out, honored before handleFiring/handleResolved so it
+      // precedes *every* issue and state side effect, at any severity — an
+      // opted-out rule must not create an issue, reopen one, or bank a
+      // suppression anchor. Accepted from either labels or annotations because
+      // Prometheus rules commonly carry policy in annotations.
+      const policyValues = [
+        alert.labels.paperclip_issue,
+        alert.annotations.paperclip_issue,
+      ];
+      if (
+        policyValues.some(
+          (value) => value !== undefined && typeof value !== "string",
+        )
+      ) {
+        // A non-string here means the rule author wrote something structurally
+        // wrong. Refusing to guess is safer than coercing: `paperclip_issue`
+        // decides whether a page becomes an issue at all.
+        ctx.logger.warn(
+          `paperclip-plugin-alertmanager: dropping alert ${alert.fingerprint} because paperclip_issue must be a string when provided`,
+        );
+        try {
+          await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+            alertname,
+          });
+        } catch (metricErr) {
+          ctx.logger.error(
+            `paperclip-plugin-alertmanager: failed to record malformed alert metric for ${alert.fingerprint}: ${String(metricErr)}`,
+          );
+        }
+        continue;
+      }
+      const optedOut = policyValues.some(
+        (value) =>
+          typeof value === "string" && value.trim().toLowerCase() === "false",
+      );
+      if (optedOut) {
+        ctx.logger.info(
+          `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
+        );
+        try {
+          await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+            alertname,
+          });
+        } catch (metricErr) {
+          // Best-effort for the same reason as the creation floor: a permanent
+          // policy drop must stay acknowledged even if telemetry is down.
+          ctx.logger.error(
+            `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
+          );
+        }
+        continue;
+      }
       if (status === "firing") {
         await handleFiring(ctx, config, alert);
       } else if (status === "resolved") {
