@@ -46,9 +46,13 @@ jobs:
           ref: ${{ inputs.ref }}
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        # The retrying wrapper, not pnpm/action-setup directly: v6 always runs a
+        # `self-update` whose engine-identity check resolves against the npm
+        # registry fail-closed, so a registry blip would kill the soak before a
+        # single iteration ran. Passes no `version:` -- the action reads the
+        # packageManager pin from package.json, hence the checkout above. See
+        # BLO-28813.
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
