@@ -1056,4 +1056,85 @@ describe("issue graph liveness classifier", () => {
       expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
     });
   });
+
+  describe("uninvokable assignee on a blocker that is itself blocked (BLO-15200)", () => {
+    const midId = "mid-1";
+    const pausedOwner = agent({ id: "blocker-agent", name: "Paused owner", status: "paused" });
+
+    // source -> blocker (blocked, paused owner) -> mid
+    const chain = [
+      { companyId, blockerIssueId: blockerId, blockedIssueId: blockedId },
+      { companyId, blockerIssueId: midId, blockedIssueId: blockerId },
+    ];
+
+    function blockedBlocker() {
+      return issue({
+        id: blockerId,
+        identifier: "BLO-14424",
+        title: "Operator-gated unblock work",
+        status: "blocked",
+        assigneeAgentId: "blocker-agent",
+      });
+    }
+
+    it("does not escalate while the blocker is still waiting on its own unresolved edge", () => {
+      // The storm shape: 53 of the 58 blockers in the 2026-08-18 census carried their
+      // own unresolved blockedBy edges, so "assign it to an active owner" could not have
+      // helped any of them -- a fresh owner wakes straight back into the same wait.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          blockedBlocker(),
+          issue({ id: midId, identifier: "BLO-14430", title: "Real upstream work", status: "todo" }),
+        ],
+        relations: chain,
+        agents: [agent(), manager, pausedOwner],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("escalates once that edge resolves and the assignee is the thing holding it", () => {
+      // Deferred, not discarded. With the upstream edge done the blocker is genuinely
+      // dispatchable, so the paused assignee is now the real defect and the rule must
+      // fire -- this is what separates the fix from simply muting the invariant.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          blockedBlocker(),
+          issue({ id: midId, identifier: "BLO-14430", title: "Real upstream work", status: "done" }),
+        ],
+        relations: chain,
+        agents: [agent(), manager, pausedOwner],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        issueId: blockedId,
+        state: "blocked_by_uninvokable_assignee",
+        recoveryIssueId: blockerId,
+        incidentKey: `harness_liveness:${companyId}:${blockedId}:blocked_by_uninvokable_assignee:${blockerId}`,
+      });
+    });
+
+    it("still surfaces a real defect further down the chain", () => {
+      // Suppression must not swallow the chain walk: the cancelled edge under the
+      // blocker is a broken dependency that stays broken no matter who owns anything.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          blockedBlocker(),
+          issue({ id: midId, identifier: "BLO-14430", title: "Abandoned upstream", status: "cancelled" }),
+        ],
+        relations: chain,
+        agents: [agent(), manager, pausedOwner],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_cancelled_issue",
+        recoveryIssueId: midId,
+      });
+    });
+  });
 });
