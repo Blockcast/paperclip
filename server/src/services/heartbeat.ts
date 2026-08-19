@@ -17765,6 +17765,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return null;
   }
 
+  // BLO-20482: emitted by every path that declines the delete because there is
+  // no ACTIVE reservation. Kept in one place so the message and payload stay
+  // identical wherever the condition is observed — the signal is asserted on,
+  // and a caller that pre-checks the reservation itself must not silently drop
+  // it.
+  function logNoActiveReservationSkip(runId: string) {
+    logger.debug(
+      { runId, reservationId: null },
+      "skipping external-runtime Job deletion: no active reservation to target",
+    );
+  }
+
   async function deleteExactExternalRuntimeJob(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId">,
   ) {
@@ -17783,10 +17795,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // occurrences per 26 minutes, all with reservationId: null) and buried
     // real failures.
     if (!reservation) {
-      logger.debug(
-        { runId: run.id, reservationId: null },
-        "skipping external-runtime Job deletion: no active reservation to target",
-      );
+      logNoActiveReservationSkip(run.id);
       return "mismatch" as const;
     }
     // A PERSISTED reservation missing its Job name/UID is a genuine anomaly:
@@ -30346,7 +30355,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cleanupExternalRuntime = async (cancelledRun: typeof heartbeatRuns.$inferSelect, strict: boolean) => {
       if (!agent || !hasExternalLifecycle(agent.adapterType)) return true;
       const activeReservation = await getActiveExternalRuntimeReservation(db, cancelledRun.id);
-      if (!activeReservation) return true;
+      // No ACTIVE reservation means there is provably nothing to target (a Job
+      // only ever exists alongside a reservation carrying its name/UID), so the
+      // delete call is skipped rather than made and refused. `strict` callers
+      // read this as already-quiesced: there is no reservation left to release,
+      // and returning false here would stall repairTerminalRelease forever.
+      //
+      // BLO-20482: skipping the call must not also skip the signal, so it is
+      // emitted here instead of inside deleteExactExternalRuntimeJob.
+      if (!activeReservation) {
+        logNoActiveReservationSkip(cancelledRun.id);
+        return true;
+      }
       const deleted = await deleteExactExternalRuntimeJob(cancelledRun);
       let releasedReservation = null;
       if (deleted === "deleted" || deleted === "missing") {
