@@ -5075,6 +5075,31 @@ function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
   return false;
 }
 
+// PEN-2395: matches a 23505 violation of `issues_open_routine_execution_uq`
+// (partial unique index on companyId+originKind+originId+originFingerprint,
+// scoped to open routine-execution rows that hold an `execution_run_id`).
+// Walks the `cause` chain because drizzle wraps the driver error in a
+// `DrizzleQueryError`, so the constraint name is never on the outermost error.
+function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = maybe.constraint ?? maybe.constraint_name;
+    if (maybe.code === "23505" && constraint === "issues_open_routine_execution_uq") {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -6475,6 +6500,73 @@ export function issueService(db: Db) {
     }
 
     return adopted;
+  }
+
+  // PEN-2395: `assertCheckoutOwner` answers an authorization question, but it
+  // answers it by *writing* — it adopts an unowned, stale, or dead-run checkout
+  // so the calling run can proceed. Every one of those adoption writes (three
+  // `adopt*` helpers plus the inline refresh after `clearStaleExecutionLock`)
+  // sets `execution_run_id`, and that column is in the predicate of the
+  // `issues_open_routine_execution_uq` partial index. So when a sibling open
+  // execution of the same routine already holds the dispatch lock, the adoption
+  // write raises 23505 and the caller's mutation dies with a 500 — including a
+  // no-op payload, because this runs in the permission check before the payload
+  // is even looked at, which is what made the row read as permanently
+  // unwritable rather than merely locked.
+  //
+  // Adoption is opportunistic self-healing, so losing it is not a server error.
+  // Two cases, and only one of them is a real conflict:
+  //
+  //   - the sibling's lock is held by a TERMINAL run. Nothing owns the work; the
+  //     row is just littered. The index does not check run liveness, so a dead
+  //     run's lock would otherwise wedge every other execution of that routine
+  //     indefinitely — the "permanently unwritable" reading. Reap it and retry.
+  //   - the sibling's lock is held by a LIVE run. Fail the way the explicit
+  //     checkout path already does: a 409 naming the issue that holds the lock.
+  function withOpenRoutineExecutionLockGuard<Result>(
+    fn: (id: string, actorAgentId: string, actorRunId: string | null) => Promise<Result>,
+  ) {
+    return async (id: string, actorAgentId: string, actorRunId: string | null): Promise<Result> => {
+      try {
+        return await fn(id, actorAgentId, actorRunId);
+      } catch (error) {
+        if (!isOpenRoutineExecutionLockConflict(error)) throw error;
+
+        const findLockOwner = async () => {
+          const target = await db
+            .select({ companyId: issues.companyId })
+            .from(issues)
+            .where(eq(issues.id, id))
+            .then((rows) => rows[0] ?? null);
+          return target
+            ? await findOpenRoutineExecutionLockOwnerForIssue(db, target.companyId, id)
+            : null;
+        };
+
+        let owner = await findLockOwner();
+        if (owner && (await clearExecutionRunIfTerminal(owner.id))) {
+          try {
+            return await fn(id, actorAgentId, actorRunId);
+          } catch (retryError) {
+            // Only ever retried once, and only after actually reaping a dead
+            // lock. A second conflict means a live sibling took the key in
+            // between, so report that rather than letting a raw 23505 escape
+            // as the 500 this whole guard exists to prevent.
+            if (!isOpenRoutineExecutionLockConflict(retryError)) throw retryError;
+            owner = await findLockOwner();
+          }
+        }
+
+        throw conflict("Routine execution already locked by another open issue", {
+          issueId: id,
+          ownerIssueId: owner?.id ?? null,
+          ownerIdentifier: owner?.identifier ?? null,
+          ownerExecutionRunId: owner?.executionRunId ?? null,
+          actorAgentId,
+          actorRunId,
+        });
+      }
+    };
   }
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
@@ -10832,7 +10924,11 @@ export function issueService(db: Db) {
       });
     },
 
-    assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
+    assertCheckoutOwner: withOpenRoutineExecutionLockGuard(async (
+      id: string,
+      actorAgentId: string,
+      actorRunId: string | null,
+    ) => {
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
       const loadCurrent = () =>
@@ -11124,7 +11220,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
       });
-    },
+    }),
 
     // BLO-22666: the `in_review` counterpart of assertCheckoutOwner, kept as a
     // separate entry point rather than widening that one. assertCheckoutOwner is
