@@ -1337,6 +1337,7 @@ export const PLUGIN_CAPABILITIES = [
   "agent.sessions.send",
   "agent.sessions.close",
   "activity.log.write",
+  "costs.write",
   "metrics.write",
   "telemetry.track",
   "database.namespace.migrate",
