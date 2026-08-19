@@ -25,11 +25,22 @@
  * retryable side and is delayed rather than destroyed; that fallback is pinned
  * explicitly, because a matrix driven off the enum can only ever exercise the
  * values that are already handled.
+ *
+ * The final block pins BLO-28803: whichever answer the guard gives, it must
+ * leave a bounded, scrape-visible record of the delivery it turned away.
  */
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PLUGIN_STATUSES } from "@paperclipai/shared";
+import {
+  MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS,
+  OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY,
+  PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
+  __resetMetricsForTest,
+  boundWebhookRejectionPluginKey,
+  renderMetrics,
+} from "../services/metrics.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -123,6 +134,33 @@ function postAlert(app: express.Express, endpointKey = ENDPOINT_KEY) {
   return request(app)
     .post(`/api/plugins/${PLUGIN_ID}/webhooks/${endpointKey}`)
     .send({ alerts: [{ labels: { alertname: "TestAlert" } }] });
+}
+
+/**
+ * Parse the rejection counter out of the *rendered* exposition rather than
+ * reading the registry object.
+ *
+ * The point of BLO-28803 is that an operator can answer "how many did we turn
+ * away" from a Prometheus scrape. A counter that exists in the process but
+ * never reaches `/metrics` would satisfy an in-memory assertion and fail the
+ * actual requirement, so this goes through the same rendering path the scrape
+ * does.
+ */
+async function rejectionSeries(): Promise<
+  { labels: Record<string, string>; value: number }[]
+> {
+  const { body } = await renderMetrics();
+  return body
+    .split("\n")
+    .filter((line) => line.startsWith(`${PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC}{`))
+    .map((line) => {
+      const [, labelBlob, rawValue] = /^[^{]+\{(.*)\}\s+(\S+)$/.exec(line) ?? [];
+      const labels: Record<string, string> = {};
+      for (const [, key, value] of (labelBlob ?? "").matchAll(/(\w+)="([^"]*)"/g)) {
+        labels[key] = value;
+      }
+      return { labels, value: Number(rawValue) };
+    });
 }
 
 describe("webhook ingestion: plugin-not-ready is retryable", () => {
@@ -290,4 +328,133 @@ describe("webhook ingestion: genuine client errors stay 4xx", () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toContain('"companyId" query parameter is required');
   }, 20_000);
+});
+
+/**
+ * A rejected delivery must leave a server-side trace (BLO-28803).
+ *
+ * The readiness guard returns long before the `plugin_webhook_deliveries`
+ * insert, so a bounced delivery used to leave no row, no counter and no log.
+ * When the alertmanager plugin latched into `error` on 2026-08-18 the only
+ * surviving evidence that ~15h of alert batches had been turned away lived in
+ * Alertmanager's logs — Paperclip, the system of record for alerting, could
+ * not answer "how many, and for which plugin?" (BLO-20813).
+ *
+ * Deferral (BLO-28659) makes this sharper, not softer: senders now retry
+ * instead of failing loudly, so a plugin bouncing every batch for hours looks
+ * exactly like one receiving none. Silence is not health.
+ */
+describe("webhook ingestion: rejected deliveries are recorded", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetMetricsForTest();
+  });
+
+  it("records a not-ready rejection as retryable, alongside the 503", async () => {
+    mockPlugin({ status: "error" });
+    const { app } = await createApp();
+
+    const res = await postAlert(app);
+    expect(res.status).toBe(503);
+
+    const series = await rejectionSeries();
+    expect(series).toHaveLength(1);
+    expect(series[0]!.labels).toMatchObject({
+      plugin_key: "paperclip-plugin-alertmanager",
+      response_class: "retryable",
+      plugin_status: "error",
+    });
+    expect(series[0]!.value).toBe(1);
+  }, 20_000);
+
+  it("records an uninstalled rejection as terminal, alongside the 410", async () => {
+    mockPlugin({ status: "uninstalled" });
+    const { app } = await createApp();
+
+    const res = await postAlert(app);
+    expect(res.status).toBe(410);
+
+    const series = await rejectionSeries();
+    expect(series).toHaveLength(1);
+    expect(series[0]!.labels).toMatchObject({
+      response_class: "terminal",
+      plugin_status: "uninstalled",
+    });
+  }, 20_000);
+
+  it("keeps deferred and dropped deliveries on separate series", async () => {
+    // The two mean different things operationally — one says "the payloads are
+    // coming back", the other says "they are gone". Summing them would hide
+    // the only distinction that matters during a reconstruction.
+    mockPlugin({ status: "error" });
+    const { app: retryableApp } = await createApp();
+    await postAlert(retryableApp);
+
+    mockPlugin({ status: "uninstalled" });
+    const { app: terminalApp } = await createApp();
+    await postAlert(terminalApp);
+
+    const byClass = Object.fromEntries(
+      (await rejectionSeries()).map((s) => [s.labels.response_class, s.value]),
+    );
+    expect(byClass).toEqual({ retryable: 1, terminal: 1 });
+  }, 20_000);
+
+  it("counts every bounced delivery, so the volume is recoverable after the fact", async () => {
+    // The question BLO-20813 could not answer from Paperclip: given a window,
+    // how many batches did we turn away for this plugin?
+    mockPlugin({ status: "error" });
+    const { app } = await createApp();
+
+    for (let i = 0; i < 5; i += 1) await postAlert(app);
+
+    const series = await rejectionSeries();
+    expect(series).toHaveLength(1);
+    expect(series[0]!.value).toBe(5);
+  }, 20_000);
+
+  it("mints no series for a plugin that does not exist", async () => {
+    // The abuse bound. `:pluginId` is caller-controlled on a public
+    // unauthenticated route; an unknown one is rejected 404 a step earlier and
+    // must never reach the guard, so hammering nonexistent ids cannot grow the
+    // registry at all.
+    mockRegistry.getById.mockResolvedValue(null);
+    mockRegistry.getByKey.mockResolvedValue(null);
+    const { app } = await createApp();
+
+    for (let i = 0; i < 10; i += 1) {
+      expect((await postAlert(app)).status).toBe(404);
+    }
+
+    expect(await rejectionSeries()).toHaveLength(0);
+  }, 30_000);
+
+  it("labels from the resolved row, not from the URL parameter", async () => {
+    // PLUGIN_ID is a uuid; the label must be the row's pluginKey. If this ever
+    // reads req.params the series count becomes attacker-controlled.
+    mockPlugin({ status: "error", pluginKey: "resolved-key" });
+    const { app } = await createApp();
+
+    await postAlert(app);
+
+    const series = await rejectionSeries();
+    expect(series[0]!.labels.plugin_key).toBe("resolved-key");
+    expect(series[0]!.labels.plugin_key).not.toBe(PLUGIN_ID);
+  }, 20_000);
+
+  it("caps distinct plugin_key values and collapses the overflow", async () => {
+    // Second line of defence behind the resolved-row rule: even if a future
+    // change let an unbounded identifier through, the series count stays flat.
+    for (let i = 0; i < MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS; i += 1) {
+      expect(boundWebhookRejectionPluginKey(`plugin-${i}`)).toBe(`plugin-${i}`);
+    }
+
+    expect(boundWebhookRejectionPluginKey("one-too-many")).toBe(
+      OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY,
+    );
+    // Already-admitted keys keep their slot rather than being evicted.
+    expect(boundWebhookRejectionPluginKey("plugin-0")).toBe("plugin-0");
+    // A missing key is bucketed rather than becoming an empty label value.
+    expect(boundWebhookRejectionPluginKey(null)).toBe(OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY);
+  });
 });
