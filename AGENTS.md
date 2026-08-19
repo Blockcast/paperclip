@@ -201,6 +201,45 @@ running `gh auth setup-git`, which writes a `gh.real` helper that cannot read
 the token file. Widening an installation's repository selection is never the
 right remedy for these symptoms.
 
+### Repos outside the App installation (BLO-22243)
+
+The App installation can only ever cover repos owned by the same account it's
+installed on. A repo owned by a *different* account — e.g.
+`allyblockcast/paperclip-adapter-claude-k8s`, a `User`-owned repo, not an
+`Organization` one — is permanently out of `allyblockcast[bot]`'s reach. That
+shows up as a bare `remote: Permission ... denied to allyblockcast[bot]` /
+`403` on push, which reads like a missing grant but usually isn't one.
+
+A second credential is mounted fleet-wide at
+`/paperclip/.secrets/github-merge-token/token`: a classic PAT for the
+`allyblockcast` **user** account (scopes `repo, write:packages,
+delete:packages, admin:public_key`). It reaches 31 repos — 29 `Blockcast/*`
+plus 2 `allyblockcast/*` — with push access on 11 of them, including repos
+the App installation cannot see at all.
+
+Do not point `gh`/`git` at this token by default. It is broader than the App
+installation and already mounted in every pod, so wiring it in unconditionally
+would silently widen every agent's effective write access with no new grant
+having actually been made. Instead opt in for a single invocation via
+`GH_SEAT_TOKEN_VALUE`, the narrow per-call override both `gh` and `git`
+already honor:
+
+```bash
+# gh
+GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" \
+  gh pr create --repo allyblockcast/paperclip-adapter-claude-k8s --title "..." --body "..."
+
+# git push (same variable — the git credential helper reads it too)
+GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" \
+  git push https://github.com/allyblockcast/paperclip-adapter-claude-k8s.git HEAD:refs/heads/<branch>
+```
+
+Confirm the target repo is actually in this token's reach before relying on
+it — e.g. `GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" gh api /user/repos --paginate --jq '.[].full_name'`
+— rather than assuming every out-of-installation repo is covered. If it
+isn't, that's a real access gap: escalate rather than widening this PAT's
+use further.
+
 ### Commit attribution is write-path dependent, not agent dependent (BLO-21416)
 
 Every agent pod authenticates as the same shared credential — the
