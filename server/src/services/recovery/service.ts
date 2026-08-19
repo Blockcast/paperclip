@@ -8374,6 +8374,15 @@ export function recoveryService(
       // and its magnitude is unchanged by BLO-27676, unlike these two.
       skippedReescalationCooldown,
       skippedUnchangedTarget,
+      // Echo the resolved windows so the operator surface can state the bounds
+      // rather than hardcoding them. Both suppressors expire, and a dialog that
+      // says "will not be re-raised" unqualified asserts the unbounded
+      // behaviour the ceiling was added to remove -- the same
+      // surface-promises-what-the-run-won't-do defect this PR round exists to
+      // close (BLO-27676 review). These are the values this preview used, so
+      // the string stays true under a tuned constant or an overridden knob.
+      reescalationCooldownMs,
+      unchangedTargetSuppressionMs,
       items,
     };
   }

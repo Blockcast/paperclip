@@ -67,7 +67,10 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
-import { DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS } from "../services/recovery/service.ts";
+import {
+  DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS,
+  DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+} from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1809,6 +1812,15 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     expect(withDefaults.recoverableFindings).toBe(0);
     expect(withDefaults.skippedUnchangedTarget).toBe(1);
+    // The confirm dialog states each suppressor's bound from these fields rather
+    // than restating the constants, because both suppressors expire and an
+    // unqualified "will not be re-raised" describes the unbounded behaviour the
+    // ceiling was added to remove (BLO-27676 review). So the preview has to echo
+    // the windows it actually resolved.
+    expect(withDefaults.reescalationCooldownMs).toBe(DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS);
+    expect(withDefaults.unchangedTargetSuppressionMs).toBe(
+      DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+    );
 
     const preview = await heartbeatSvc.buildIssueGraphLivenessAutoRecoveryPreview({
       now,
@@ -1818,6 +1830,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(preview.recoverableFindings).toBe(1);
     expect(preview.skippedReescalationCooldown).toBe(0);
     expect(preview.skippedUnchangedTarget).toBe(0);
+    // An override has to travel too: echoing the default here would have the
+    // dialog promise a 7d hold on a run whose target gate is switched off.
+    expect(preview.unchangedTargetSuppressionMs).toBe(0);
 
     const run = await heartbeatSvc.reconcileIssueGraphLiveness({
       now,
