@@ -680,6 +680,107 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      # BLO-28999: `needs.<lane>.result` cannot distinguish an ARC mid-job
+      # runner kill from a real lane failure — GitHub records both as
+      # `failure`. Go back to the Actions API for the per-job detail the
+      # aggregation step below cannot see, and hand it the subset of failed
+      # lanes that were actually killed.
+      #
+      # All three steps are gated on there being a failure at all, so the
+      # overwhelmingly common all-green run pays nothing: no checkout, no
+      # toolchain setup, no API calls. That also keeps `verify` light enough
+      # not to become a victim of the same pool saturation it now reports on.
+      - name: Checkout repository
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: actions/checkout@v6
+
+      # `arc-light` does not ship a usable Node by default — the `policy` job
+      # on the same pool sets one up explicitly before its `node --test` steps.
+      - name: Setup Node
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Classify failed lanes as infrastructure kills or real failures
+        id: classify_lanes
+        if: ${{ contains(needs.*.result, 'failure') }}
+        # This step decides only which WORDING explains the failure, never
+        # whether `verify` passes. If it errors, the aggregation step below
+        # still runs (`if: always()`) and falls back to the pre-existing
+        # failure wording.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
+          TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
+          GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
+          WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
+          OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
+          OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
+        run: |
+          # Keep these three arrays in the same order — scripts/__tests__/
+          # pr-verify-lane-outcome.test.mjs asserts the pairing, and also
+          # asserts each lane_job_names entry matches that job's `name:`.
+          lane_names=(
+            helm_chart
+            typecheck_release_registry
+            general_tests
+            worktree_install
+            opencode_responses_replay
+            opencode_k8s_seed_cold_start
+            build
+            vendor_claude_k8s
+          )
+          lane_results=(
+            "$HELM_CHART_RESULT"
+            "$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            "$GENERAL_TESTS_RESULT"
+            "$WORKTREE_INSTALL_RESULT"
+            "$OPENCODE_RESPONSES_REPLAY_RESULT"
+            "$OPENCODE_K8S_SEED_COLD_START_RESULT"
+            "$BUILD_RESULT"
+            "$VENDOR_CLAUDE_K8S_RESULT"
+          )
+          lane_job_names=(
+            "Helm chart"
+            "Typecheck + Release Registry"
+            "General tests"
+            "Worktree install (NODE_ENV=production)"
+            "OpenCode Responses replay"
+            "k8s-ro seed transport cold start"
+            "Build"
+            "Vendored claude_k8s adapter"
+          )
+
+          # `failed` and `job_names` are built in lockstep so the Nth failed
+          # lane's job name is the Nth entry — the script pairs them by index.
+          # Appending to `job_names` outside this branch would map every lane
+          # onto the wrong job and silently disable the classifier.
+          failed=()
+          job_names=()
+          for i in "${!lane_names[@]}"; do
+            case "${lane_results[$i]}" in
+              success | cancelled | skipped) ;;
+              *)
+                failed+=("${lane_names[$i]}")
+                job_names+=("${lane_job_names[$i]}")
+                ;;
+            esac
+          done
+
+          infra=""
+          if [ "${#failed[@]}" -gt 0 ]; then
+            # The script degrades to an empty set on any error, so a
+            # classification problem can never change the gate — only the
+            # wording the aggregation step picks.
+            infra="$(LANE_JOB_NAMES="$(printf '%s\n' "${job_names[@]}")" \
+              node scripts/classify-lane-failures.mjs "${failed[@]}" | tail -n 1)"
+          fi
+          echo "infra_lanes=$infra" >>"$GITHUB_OUTPUT"
+
       # BLO-20867: an upstream lane can end up `cancelled` or `skipped` rather
       # than `failure`. A plain `test "$X" = "success"` makes every one of
       # these look like an identical failing required check, so authors
@@ -700,8 +801,19 @@ jobs:
       #   - skipped:   the lane never ran because a dependency it needs
       #     (typically `policy`) did not succeed. The defect, if any, is in
       #     that dependency, not in this lane.
+      #   - infrastructure (BLO-28999): the lane's job was killed mid-run by
+      #     the runner pool. GitHub reports this as `failure`, so without the
+      #     classify step above it is indistinguishable from the first case
+      #     and reads as a defect in the diff. Split out here so the killed
+      #     lane gets the "not your diff, re-run it" wording that already
+      #     existed for `cancelled` but could never fire for a kill.
       - name: Fail if any split verify lane failed
+        # Must run even when the classify step above was skipped or errored —
+        # this step IS the gate, and its verdict may never depend on the
+        # classifier being available.
+        if: always()
         env:
+          INFRA_LANES: ${{ steps.classify_lanes.outputs.infra_lanes }}
           HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
@@ -735,13 +847,33 @@ jobs:
           cancelled_lanes=()
           skipped_lanes=()
           failed_lanes=()
+          infra_lanes=()
           for i in "${!lane_names[@]}"; do
             lane="${lane_names[$i]}"
             case "${lane_results[$i]}" in
               success) ;;
               cancelled) cancelled_lanes+=("$lane") ;;
               skipped) skipped_lanes+=("$lane") ;;
-              *) failed_lanes+=("$lane") ;;
+              *)
+                # BLO-28999: a lane the classifier proved was killed mid-job
+                # by the runner pool is reported as infrastructure, not as a
+                # failure. Anything it could not prove stays a failure — the
+                # fallback is the pre-existing wording, so an unavailable or
+                # erroring classifier degrades to today's behaviour rather
+                # than excusing a real defect.
+                is_infra=0
+                for infra_lane in $INFRA_LANES; do
+                  if [ "$infra_lane" = "$lane" ]; then
+                    is_infra=1
+                    break
+                  fi
+                done
+                if [ "$is_infra" -eq 1 ]; then
+                  infra_lanes+=("$lane")
+                else
+                  failed_lanes+=("$lane")
+                fi
+                ;;
             esac
           done
 
@@ -759,6 +891,11 @@ jobs:
 
           if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
             echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
+            any_non_success=1
+          fi
+
+          if [ "${#infra_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane infrastructure kill::Upstream lane(s) were KILLED MID-JOB by the CI runner pool, not failed: ${infra_lanes[*]}. This is not a report of a defect in this PR's diff — the runner hosting the lane was terminated before it could produce a result (see BLO-28999). Re-run the job to get a real result."
             any_non_success=1
           fi
 
