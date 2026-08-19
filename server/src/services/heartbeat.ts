@@ -29657,6 +29657,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
+        // BLO-22048: only the FIRST dep-blocked fire creates the park and returns
+        // `dep_blocked_scheduled` above. Every later fire meets that park and
+        // coalesces into it instead — still a deferral, since the merged run stays
+        // parked and no turn executes. Without signalling it here the sink stays
+        // null from deferral #2 onward and the issue-monitor dispatcher destroys
+        // the monitor exactly as it did before the fix.
+        //
+        // Gate on status as well as reason: `scheduledRetryReason` is never
+        // cleared on promotion, so a *running* run still carries
+        // "dependency_blocked". Coalescing into one of those is a real dispatch
+        // and must keep consuming the monitor.
+        if (
+          suppression &&
+          outcome.run.status === "scheduled_retry" &&
+          outcome.run.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON
+        ) {
+          suppression.dependencyBlockedRetryAt = outcome.run.scheduledRetryAt ?? null;
+        }
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
       }
