@@ -6560,6 +6560,23 @@ export function issueService(db: Db) {
         //   - the lock is held by a TERMINAL run. Nothing owns the work, the row
         //     is just littered, so reap it and take the key.
         if (owner === null || (await clearExecutionRunIfTerminal(owner.id))) {
+          if (owner) {
+            // Reaping calls `restoreCheckoutPromotedStatus`, so an authorization
+            // check on THIS issue can change a SIBLING issue's status. That is
+            // legitimate self-healing, but invisible — log it so the change is
+            // attributable when someone later asks why the owner moved.
+            logger.info(
+              {
+                issueId: id,
+                reapedOwnerIssueId: owner.id,
+                reapedOwnerIdentifier: owner.identifier,
+                reapedExecutionRunId: owner.executionRunId,
+                actorAgentId,
+                actorRunId,
+              },
+              "reaped a routine dispatch lock held by a terminal run on a sibling issue",
+            );
+          }
           try {
             return await fn(id, actorAgentId, actorRunId);
           } catch (retryError) {
