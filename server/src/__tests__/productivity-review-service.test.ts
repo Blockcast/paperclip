@@ -232,13 +232,21 @@ describeEmbeddedPostgres("productivity review service", () => {
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
     logBytes?: number | null;
-    // BLO-26165: defaults to a value distinct from the DB's own default of
-    // `"not_applicable"` so existing fixtures — which model a run that
-    // genuinely executed and simply produced no comment — are not silently
-    // excluded from the no-comment-streak walk by the new
-    // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filter. Pass `"not_applicable"`
-    // explicitly to model a never-invoked run (BLO-23096).
+    logStore?: string | null;
+    // BLO-26165 (narrowing): the DB default, matching production
+    // (`heartbeat_runs.issue_comment_status` defaults to `"not_applicable"`).
+    // The original BLO-26165 fix defaulted this to `"retry_exhausted"` instead,
+    // deliberately off the production default, so that fixtures would not be
+    // swept up by the `issueCommentStatus` exclusion. That made the whole suite
+    // model a run population production never produces — and hid the false
+    // negative that exclusion introduced. The exclusion now keys on
+    // `isNeverInvokedRun` (run telemetry) rather than this column, so fixtures
+    // can carry the honest default again.
     issueCommentStatus?: string;
+    // Wake reason written into `contextSnapshot`. Production stamps
+    // `issueCommentStatus: "not_applicable"` for every reason outside the
+    // four-item `shouldRequireIssueCommentForWake` whitelist.
+    wakeReason?: string;
     errorCode?: string | null;
     spacingMs?: number;
   }) {
@@ -255,14 +263,18 @@ describeEmbeddedPostgres("productivity review service", () => {
         triggerDetail: "system",
         startedAt: input.startedAt === undefined ? createdAt : input.startedAt,
         finishedAt: (input.status ?? "succeeded") === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
-        contextSnapshot: input.contextSource
-          ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
-          : { issueId: input.issueId, taskId: input.issueId },
+        contextSnapshot: {
+          issueId: input.issueId,
+          taskId: input.issueId,
+          ...(input.contextSource ? { source: input.contextSource } : {}),
+          ...(input.wakeReason ? { wakeReason: input.wakeReason } : {}),
+        },
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         errorCode: input.errorCode !== undefined ? input.errorCode : undefined,
         logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
-        issueCommentStatus: input.issueCommentStatus ?? "retry_exhausted",
+        logStore: input.logStore !== undefined ? input.logStore : undefined,
+        issueCommentStatus: input.issueCommentStatus ?? "not_applicable",
         nextAction: input.nextAction === undefined ? "Continue processing the next batch." : input.nextAction,
         createdAt,
         updatedAt: createdAt,
@@ -874,25 +886,20 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
-  // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` never
-  // had an adapter container created for it (BLO-23096: `preferred_workspace_
-  // unrealizable` / `adapter_failed` setup failures — the same shape as this
-  // fixture's runs, but with `livenessState: null` because classification
-  // never ran, which is exactly the case `isNeverExecutedRun`'s
-  // `livenessState !== "failed"` check cannot catch). There was nothing
-  // capable of writing a comment, so it must not count toward
-  // `no_comment_streak`.
-  it("excludes never-invoked runs (issueCommentStatus: not_applicable) from the no-comment streak, even when the never-executed liveness heuristic misses them (BLO-26165)", async () => {
+  // BLO-26165: a run whose adapter container was never created (BLO-23096:
+  // `preferred_workspace_unrealizable` / `adapter_failed` setup failures at
+  // 584ms/1,097ms lifetimes, with `usageJson`, `logBytes` and `logStore` all
+  // null and `livenessState: null` because classification never ran — exactly
+  // the case `isNeverExecutedRun`'s `livenessState !== "failed"` check cannot
+  // catch). There was nothing capable of writing a comment, so it must not
+  // count toward `no_comment_streak`.
+  it("excludes never-invoked runs (no adapter ever created) from the no-comment streak, even when the never-executed liveness heuristic misses them (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
-    // Mirrors the BLO-23096 fixture: 25 consecutive terminal runs whose
-    // adapter never started. `livenessState: null` means `isNeverExecutedRun`
-    // alone would NOT exclude these (it requires `livenessState === "failed"`)
-    // — only the new `issueCommentStatus` predicate does. Anchored 2h before
-    // `now` (outside the 1h/6h high_churn windows) so that once no_comment_streak
-    // and runtime_failure_streak are both correctly suppressed, the fixture
-    // doesn't accidentally trip `high_churn` instead — this test is only about
-    // proving no review fires at all.
+    // Anchored 2h before `now` (outside the 1h/6h high_churn windows) so that
+    // once no_comment_streak and runtime_failure_streak are both correctly
+    // suppressed, the fixture doesn't accidentally trip `high_churn` instead —
+    // this test is only about proving no review fires at all.
     const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
     await insertRuns({
       companyId: seeded.companyId,
@@ -904,6 +911,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: null,
       usageJson: null,
       logBytes: null,
+      logStore: null,
       issueCommentStatus: "not_applicable",
     });
 
@@ -913,6 +921,61 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
     const reviews = await listProductivityReviews(seeded.companyId);
     expect(reviews).toHaveLength(0);
+  });
+
+  // BLO-26165 NEGATIVE CONTROL (required). This is the test that fails against
+  // the first BLO-26165 fix (#1342) and must keep passing after it.
+  //
+  // #1342 excluded on `issueCommentStatus === "not_applicable"`, treating it as
+  // proof no adapter ran. It is not: `finalizeIssueCommentPolicy` stamps that
+  // status on runs that provably executed, whenever
+  // `shouldRequireIssueCommentForWake` returns false. That helper is a
+  // four-item whitelist (`issue_assigned`, `execution_review_requested`,
+  // `execution_approval_requested`, `execution_changes_requested`), so an
+  // `issue_monitor_due` run — like every `heartbeat_timer`,
+  // `issue_comment_mentioned`, `issue_continuation_needed` and recovery-lane
+  // run — gets `not_applicable` no matter how much work it did. Under #1342 the
+  // streak below reads 0 and the detector is silent while an agent burns
+  // 10 consecutive wakes without a word. That is the inverse of the false
+  // positive BLO-26165 was opened for, and it disables the detector on the
+  // overwhelming majority of wake reasons.
+  //
+  // These runs carry positive proof of invocation: a real usage blob, a log
+  // store, and non-zero log bytes.
+  it("counts executed runs stamped issueCommentStatus: not_applicable toward the streak — comment policy is not an invocation signal (BLO-26165 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      wakeReason: "issue_monitor_due",
+      issueCommentStatus: "not_applicable",
+      livenessState: "advanced",
+      usageJson: { inputTokens: 4200, outputTokens: 1350 },
+      logBytes: 512_000,
+      logStore: "s3",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain(
+      `No-comment streak (terminal, turn-executing runs): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+    );
+    // The label must not claim these were never invoked — they were.
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 0",
+    );
+    expect(reviews[0]?.description).toContain(
+      `Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, counted toward the streak — BLO-26165): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+    );
   });
 
   it("still fires no_comment_streak on a streak of executed, comment-required-but-missed runs (BLO-26165 control)", async () => {
@@ -936,14 +999,14 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 0",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 0",
     );
   });
 
   it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
-    // Most recent 5 runs never invoked (adapter never started, not_applicable).
+    // Most recent 5 runs never invoked (adapter never started).
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -954,6 +1017,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: null,
       usageJson: null,
       logBytes: null,
+      logStore: null,
       issueCommentStatus: "not_applicable",
     });
     // Older 10 runs genuinely executed and stayed silent.
@@ -976,7 +1040,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 5",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 5",
     );
   });
 
@@ -1404,7 +1468,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 3",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 3",
     );
     // BLO-22436 (Ally follow-up): all 3 non-executing runs are also counted
     // above as never-invoked — the evidence block must say so rather than
