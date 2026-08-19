@@ -20232,7 +20232,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.buildRunOutputSilence(run, now);
   }
 
-  async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: { lookbackHours?: number; now?: Date }) {
+  async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: {
+    lookbackHours?: number;
+    now?: Date;
+    // Mirrors `reconcileIssueGraphLiveness` below, and for the same reason: this
+    // wrapper is the only way into the preview from typechecked callers, and the
+    // preview now applies both re-escalation suppressors. An option the service
+    // accepts but this literal type omits is an excess-property error for every
+    // caller under `src/`, so previewing the documented rollback lever would be
+    // unreachable while running it is not.
+    reescalationCooldownMs?: number;
+    unchangedTargetSuppressionMs?: number;
+  }) {
     return recovery.buildIssueGraphLivenessAutoRecoveryPreview(opts);
   }
 

@@ -102,6 +102,8 @@ function emptyRecoveryPreview(): IssueGraphLivenessAutoRecoveryPreview {
     findings: 0,
     recoverableFindings: 0,
     skippedOutsideLookback: 0,
+    skippedReescalationCooldown: 0,
+    skippedUnchangedTarget: 0,
     items: [],
   };
 }
@@ -484,6 +486,36 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
       enableServerInfoDebugView: true,
     });
     expect(toggle?.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("reports suppressed findings instead of promising to create them", async () => {
+    // BLO-27676 review: the confirm button is labelled from
+    // `recoverableFindings`, so a preview that counted suppressed findings
+    // promised rows the run would not create. The steady-state case is every
+    // stale finding suppressed -- which must read as "already reported", not as
+    // "nothing is wrong".
+    mockInstanceSettingsApi.previewIssueGraphLivenessAutoRecovery.mockResolvedValue({
+      ...emptyRecoveryPreview(),
+      findings: 3,
+      recoverableFindings: 0,
+      skippedReescalationCooldown: 3,
+      skippedUnchangedTarget: 2,
+    });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(AUTO_RECOVERY_TOGGLE_SELECTOR)?.click();
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("3 current findings have already been escalated and resolved");
+    expect(document.body.textContent).toContain("2 of those are held until the target changes");
+    // Nothing to create, so the button must not offer a count.
+    const buttonLabels = [...document.body.querySelectorAll<HTMLButtonElement>("button")].map(
+      (button) => button.textContent,
+    );
+    expect(buttonLabels).toContain("Enable");
+    expect(buttonLabels.some((label) => label?.startsWith("Enable and create"))).toBe(false);
   });
 
   it("removes the auto-recovery confirmation overlay after enabling only", async () => {
