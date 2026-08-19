@@ -211,8 +211,13 @@ export function analyzeMigrationNumbering(
   ensureNoDuplicates(journalTags, "migration journal");
   ensureStrictlyOrdered(journalTags, "migration journal");
   ensureJournalMatchesFiles(migrationFiles, journalTags);
-  ensureFilesAreJournaled(migrationFiles, journalTags, unjournaledAllowlist);
+  // Order matters. A new `0150_foo.sql` added un-journaled next to a journaled
+  // `0150_bar.sql` is one mistake with two symptoms. Reporting "no journal entry"
+  // first sends the author to add the entry, which only then trips
+  // `ensureNoDuplicates(journalTags)` on the collision — two round trips to
+  // diagnose one problem. The collision is the actionable root cause, so it goes first.
   ensureNoDuplicateFileNumbers(migrationFiles, duplicateFileNumberAllowlist);
+  ensureFilesAreJournaled(migrationFiles, journalTags, unjournaledAllowlist);
 }
 
 export async function readMigrationNumberingInput(): Promise<MigrationNumberingInput> {

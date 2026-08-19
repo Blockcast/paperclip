@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { applyPendingMigrations, inspectMigrations } from "./client.js";
+import { GRANDFATHERED_UNJOURNALED_MIGRATIONS } from "./check-migration-numbering.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -8,10 +9,6 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-if (!embeddedPostgresSupport.supported) {
-  console.warn(`SKIP: ${embeddedPostgresSupport.reason ?? "unsupported"}`);
-}
 
 // The 9 un-journaled .sql files on master and the objects they create.
 const UNJOURNALED_EXPECTATIONS = [
@@ -30,6 +27,17 @@ const UNJOURNALED_EXPECTATIONS = [
   { file: "0116_evidence_verdict_idx_partial", index: "issues_company_evidence_verdict_evaluated_idx" },
 ];
 
+// Needs no database, so it still runs where embedded postgres is unavailable.
+describe("un-journaled migration coverage (BLO-27927)", () => {
+  it("covers exactly the files the checker grandfathers", () => {
+    // The two lists describe the same population. Without this, adding an
+    // allowlist entry leaves the new file untested by the regression guard below.
+    expect(new Set(UNJOURNALED_EXPECTATIONS.map((expectation) => `${expectation.file}.sql`))).toEqual(
+      new Set(GRANDFATHERED_UNJOURNALED_MIGRATIONS),
+    );
+  });
+});
+
 describeEmbeddedPostgres("un-journaled migrations still apply (BLO-27927)", () => {
   it("applies un-journaled .sql files to a fresh database", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-blo27927-");
@@ -37,13 +45,20 @@ describeEmbeddedPostgres("un-journaled migrations still apply (BLO-27927)", () =
     try {
       await applyPendingMigrations(database.connectionString);
       const state = await inspectMigrations(database.connectionString);
-      console.log(`\n[STATE] status=${state.status} available=${state.availableMigrations.length}`);
 
-      // Which migration files did the apply path record as applied?
+      // The load-bearing fact of BLO-27927: the apply path is directory-driven,
+      // not journal-driven, so EVERY .sql on disk is applied — not just the 213
+      // journaled ones. Read the raw table rather than state.appliedMigrations,
+      // which resolves hashes and can fall back to slicing by row count
+      // (client.ts loadAppliedMigrations), making it circular for this assertion.
       const applied = await sql<{ hash: string; created_at: string }[]>`
         select hash, created_at::text from drizzle.__drizzle_migrations order by created_at
       `;
-      console.log(`[APPLIED ROWS] ${applied.length}`);
+      expect(
+        applied.length,
+        `every .sql on disk should be applied: ${state.availableMigrations.length} files on disk, ` +
+          `${applied.length} rows in drizzle.__drizzle_migrations`,
+      ).toBe(state.availableMigrations.length);
 
       const results: string[] = [];
       for (const exp of UNJOURNALED_EXPECTATIONS) {
@@ -71,9 +86,6 @@ describeEmbeddedPostgres("un-journaled migrations still apply (BLO-27927)", () =
         }
         results.push(`${present ? "PRESENT" : "MISSING"}  ${exp.file}  ->  ${what}`);
       }
-      console.log("\n===== UN-JOURNALED OBJECT PRESENCE ON FRESH DB =====");
-      for (const line of results) console.log(line);
-      console.log("====================================================\n");
 
       const missing = results.filter((r) => r.startsWith("MISSING"));
       expect(missing, `missing objects:\n${missing.join("\n")}`).toEqual([]);

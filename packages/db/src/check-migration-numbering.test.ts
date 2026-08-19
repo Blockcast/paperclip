@@ -11,6 +11,11 @@ import {
  * Pre-fix checker: the assertions that existed before BLO-27927. Used as the
  * negative control — every new test below must pass against this and fail
  * against the real checker, otherwise the guard is not actually guarding.
+ *
+ * KEEP THIS FROZEN. It is a replica of removed code, not a wrapper around it,
+ * so nothing makes it track the real checker. "Improving" it to match the
+ * current implementation would make every negative control below vacuous
+ * without failing anything.
  */
 function analyzeWithPreFixChecker(input: MigrationNumberingInput): void {
   const { migrationFiles, journalTags } = input;
@@ -162,10 +167,33 @@ describe("the real packages/db/src/migrations tree", () => {
       expect(journaled.has(entry), `${entry} is allowlisted but is now journaled`).toBe(false);
     }
 
+    const filesByNumber = new Map<string, string[]>();
+    for (const file of migrationFiles) {
+      const number = file.match(/^(\d{4})_/)?.[1];
+      if (!number) continue;
+      const bucket = filesByNumber.get(number);
+      if (bucket) bucket.push(file);
+      else filesByNumber.set(number, [file]);
+    }
+
     for (const group of GRANDFATHERED_DUPLICATE_FILE_NUMBERS) {
       for (const entry of group) {
         expect(files.has(entry), `${entry} is allowlisted but absent from disk`).toBe(true);
       }
+
+      // A group only exempts anything if it matches a bucket exactly
+      // (ensureNoDuplicateFileNumbers). One whose members do not share a single
+      // number, or that is no longer the full set of files on that number, can
+      // never match — it is dead weight that silently outlives the collision it
+      // was written for.
+      const numbers = new Set(group.map((entry) => entry.match(/^(\d{4})_/)?.[1]));
+      expect(numbers.size, `allowlisted group does not share one number: ${group.join(", ")}`).toBe(1);
+
+      const number = [...numbers][0]!;
+      expect(
+        [...(filesByNumber.get(number) ?? [])].sort(),
+        `allowlisted group for ${number} is no longer the exact set of files on that number`,
+      ).toEqual([...group].sort());
     }
   });
 });
