@@ -84,8 +84,17 @@ test('soak runs the script rather than an inline --repeat', () => {
 });
 
 test('soak spawns exactly one fresh vitest process per iteration', () => {
-  // Exactly one invocation in the whole script...
-  const invocations = scriptCode.match(/vitest run/g) ?? [];
+  // Exactly one invocation in the whole script... counted over executable
+  // lines only. A raw whole-file count is coupled to the script never naming
+  // the phrase in output, and the header already prints
+  // `process_model=one-fresh-vitest-process-per-iteration` -- one rewording
+  // away from a guard that trips on its own log line, the same trap the
+  // comment above calls out for `--repeat`.
+  const executable = scriptCode
+    .split('\n')
+    .filter((line) => !/^\s*(printf|echo)\b/.test(line))
+    .join('\n');
+  const invocations = executable.match(/vitest run/g) ?? [];
   assert.equal(
     invocations.length,
     1,
@@ -132,12 +141,27 @@ test('soak samples its load baseline after a settle window, not at script start'
   // verdict blames a CFS quota that is not there. Pin the mechanism: the
   // baseline must come from the settling sampler, not a bare /proc/loadavg read.
   assert.match(scriptCode, /BASELINE_LOAD="\$\(sample_baseline_load\)"/);
+  // End the slice at the function's own closing brace, NOT at the call site.
+  // Anchoring on the assignment swept in the `echo "soak: settling
+  // ${LOAD_SETTLE_S}s ..."` block that sits between the two, so a
+  // /LOAD_SETTLE_S/ match was satisfied by the LOG MESSAGE and the function
+  // body went unguarded -- replacing the whole sampler with a single bare
+  // `read_load0` left this suite green. The closing brace is the first `\n}`
+  // after the definition: the loop ends in `done` and the awk `BEGIN { ... }`
+  // is inline, so neither introduces an earlier line-initial brace.
+  const samplerStart = scriptCode.indexOf('sample_baseline_load() {');
+  assert.ok(samplerStart > 0, 'expected a sample_baseline_load definition');
   const sampler = scriptCode.slice(
-    scriptCode.indexOf('sample_baseline_load() {'),
-    scriptCode.indexOf('BASELINE_LOAD="$(sample_baseline_load)"'),
+    samplerStart,
+    scriptCode.indexOf('\n}', samplerStart),
   );
-  assert.ok(sampler.length > 0, 'expected a sample_baseline_load definition');
+  assert.ok(sampler.length > 0, 'expected a sample_baseline_load body');
+  // Assert the MECHANISM, not the token. A single post-settle read is a
+  // weaker, spikier baseline than the minimum-across-window this test exists
+  // to pin, and it would pass a bare /LOAD_SETTLE_S/ check.
   assert.match(sampler, /LOAD_SETTLE_S/);
+  assert.match(sampler, /\bsleep\b/, 'sampler must actually wait, not read once');
+  assert.match(sampler, /\(a < b\)/, 'sampler must keep the minimum, not the last read');
 
   // Every tunable that feeds a `sleep` is validated -- with no `set -e`,
   // `sleep abc` fails and the soak continues as a silently different experiment.
@@ -148,4 +172,28 @@ test('soak samples its load baseline after a settle window, not at script start'
       `expected ${knob} to be validated as an integer before it reaches sleep`,
     );
   }
+});
+
+test('load attribution bounds the burner delta from BOTH sides', () => {
+  // The floor alone (`dlmean >= workers * 0.5`) leaves the pass band open at
+  // the top, so a neighbour's load reads as ours and the summary claims a
+  // regime that was only partly this job's. That is the one failure direction
+  // that can manufacture a false AC2 green, so both bounds are pinned here.
+  const ceiling = scriptCode.indexOf('dlmean > workers * 1.5');
+  const floor = scriptCode.indexOf('dlmean >= workers * 0.5');
+  assert.ok(ceiling > 0, 'expected an upper bound on the attributable delta');
+  assert.ok(floor > 0, 'expected a lower bound on the attributable delta');
+
+  // Ordering is load-bearing, not cosmetic: `dlmean > workers * 1.5` also
+  // satisfies `>= workers * 0.5`, so if the floor is tested first the ceiling
+  // becomes unreachable dead code and over-attribution goes silent again.
+  assert.ok(
+    ceiling < floor,
+    'the ceiling branch must precede the floor branch or it is dead code',
+  );
+
+  // ...and the ceiling must actually withdraw attribution, so the REGIME line
+  // inherits the caveat rather than reporting a clean REACHED.
+  const ceilingBranch = scriptCode.slice(ceiling, floor);
+  assert.match(ceilingBranch, /attributed = 0/);
 });
