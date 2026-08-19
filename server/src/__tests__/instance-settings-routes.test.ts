@@ -627,4 +627,61 @@ describe("instance settings routes", () => {
     expect(res.status).toBe(403);
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
   });
+
+  it("rejects a hook command pointing at a nonexistent absolute script (BLO-28782)", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: "node /app/server/dist/cli/ccrotate-relogin-trigger.js" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details?.reason).toBe("lifecycle_hook_command_unresolved");
+    expect(res.body.details?.findings?.[0]?.missingPaths).toEqual([
+      "/app/server/dist/cli/ccrotate-relogin-trigger.js",
+    ]);
+    expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  it("accepts clearing a hook command", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: null });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      quotaExhaustedCmd: null,
+    });
+  });
+
+  it("does not block an unrelated patch when other hooks are already drifted", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ keyboardShortcuts: true });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalled();
+  });
 });
