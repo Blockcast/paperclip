@@ -1422,6 +1422,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      costs: {
+        async recordFinanceEvent(
+          params: WorkerToHostMethods["costs.finance.create"][0],
+        ): Promise<WorkerToHostMethods["costs.finance.create"][1]> {
+          return callHost("costs.finance.create", params);
+        },
+      },
+
       metrics: {
         async write(name: string, value: number, tags?: Record<string, string>): Promise<void> {
           await callHost("metrics.write", { name, value, tags });

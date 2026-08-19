@@ -162,8 +162,45 @@ describe("runQuotaExhaustedHook", () => {
     expect(second.status).toBe("debounced");
     // Activity log only written for the actual run (debounced calls don't produce duplicate audit rows).
     expect(logActivity).toHaveBeenCalledTimes(1);
-    // Debounced call still triggers onSuccess so the agent gets re-woken.
+    // Debounced call still triggers onSuccess so the agent gets re-woken --
+    // but only because the preceding hook (`true`) exited 0. See the
+    // failed-hook case below.
     expect(onSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-wake on debounce when the preceding hook failed", async () => {
+    // Regression: a stale/broken quotaExhaustedCmd (e.g. one pointing at a
+    // retired CLI, exiting 1 with MODULE_NOT_FOUND) used to still re-wake the
+    // agent via the time-based debounce branch, because that branch called
+    // onSuccess without consulting the previous result. The agent then ran
+    // again against the same exhausted credential and looped -- leasing a k8s
+    // environment per lap while making no progress.
+    mockSettings("false");
+
+    const first = await runQuotaExhaustedHook({
+      db: fakeDb,
+      agentId: "a1",
+      companyId: "c1",
+      runId: null,
+      errorCode: "provider_quota_exhausted",
+      adapterType: "test",
+    });
+    expect(first.status).toBe("ran");
+    expect(first.result?.ok).toBe(false);
+
+    const onSuccess = vi.fn();
+    const second = await runQuotaExhaustedHook({
+      db: fakeDb,
+      agentId: "a2",
+      companyId: "c1",
+      runId: null,
+      errorCode: "provider_quota_exhausted",
+      adapterType: "test",
+      onSuccess,
+    });
+
+    expect(second.status).toBe("debounced");
+    expect(onSuccess).not.toHaveBeenCalled();
   });
 
   it("records failure when command exits non-zero", async () => {

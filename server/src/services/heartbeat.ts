@@ -547,6 +547,58 @@ const execFile = promisify(execFileCallback);
 // terminalized still owns its issue lock); sourced from there so the two cannot
 // drift apart again. See issue-execution-lock.ts for the drift this closed.
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES;
+// BLO-22060: how many times a run whose issue lock the stale-lock sweep has
+// already released may be re-adopted as that issue's executionRunId by the
+// legacy-run fallback below.
+//
+// sweepStaleIssueLocks bounds a pre-claim lock at STALE_PRE_CLAIM_ISSUE_LOCK_MS
+// from executionLockedAt, and on expiry clears the issue columns but leaves the
+// run alive so a park can still fire. Without this bound the fallback simply
+// re-selected that same released run — cancelStaleScheduledRetry declines to
+// cancel a park owned by the issue's own assignee — and re-stamped
+// executionLockedAt = now(). The cap was real but renewable: a capacity park
+// deadlined days out could re-acquire a fresh 6h lock on every wake.
+//
+// Deliberately NOT scoped to `scheduled_retry`. The sweep releases, and counts,
+// three shapes of holder, and every one of them is selectable by the fallback
+// via EXECUTION_PATH_HEARTBEAT_RUN_STATUSES (now every non-terminal status,
+// sourced from ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES, so the candidate set
+// is a superset of the three below and the bound still covers all of them):
+//   - `queued`   — a run stamped onto the lock at enqueue time and never
+//                  claimed (BLO-18995). This is the *original* renewable shape.
+//   - `running`  — a silent run past STALE_RUNNING_ISSUE_LOCK_MS (BLO-19941).
+//   - `scheduled_retry` — a park (BLO-21309).
+// A status-scoped bound also let a released park evade it by simply being
+// promoted: promoteDueScheduledRetry flips the run to `queued` and the run
+// carries its release count across, so a `scheduled_retry`-only predicate
+// stopped applying to the very same row. The count is a property of the run's
+// history, not of the status it happens to hold at select time.
+//
+// At 1, the first release is final: the run keeps the one lock window it had
+// already been granted and is never re-adopted afterwards, so total lock time
+// attributable to a single run is bounded regardless of wake volume.
+//
+// Still required after master's 8446c1011, which narrowed the fallback's issue
+// -lock stamp to `running` runs only. That removes the *renewal* (a swept park
+// no longer re-stamps executionLockedAt) but not the *absorption*: the park is
+// still assigned to `activeExecutionRun`, so the wake is consumed by a run that
+// will not execute until its deadline and no live run is produced. Observed in
+// production on BLO-22438, where two comments were absorbed by a park deadlined
+// six days out. This bound removes the released run from the candidate set
+// entirely, so the wake falls through and a real run is created.
+//
+// Declining adoption strands nothing, because this fallback is not how a live
+// run acquires the lock in the first place. promoteDueScheduledRetry's UPDATE
+// is conditioned only on the run row (`status='scheduled_retry' and
+// scheduledRetryAt <= now`) and never reads the issue lock, and claimQueuedRun
+// re-stamps under `or(isNull(executionRunId), eq(executionRunId, claimed.id))`
+// — so a park still fires and a `queued` run still claims, both re-acquiring if
+// the issue is free. If a fresh run has taken the issue by then the retry
+// declines to claim and is cancelled, which is the correct outcome: live work
+// outranks a days-old continuation. For a swept `running` holder, declining is
+// the whole point — the sweep has already declared it silent, and re-adopting
+// it would re-wedge the issue behind a run nothing is driving.
+const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -715,7 +767,7 @@ export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS =
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
-export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 72;
+export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
 
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
@@ -1020,14 +1072,12 @@ function readTransientRecoveryContractFromRun(
  * Module-scoped and exported so the exact-head requirement is unit-testable
  * without standing up the whole external-lifecycle finalize path.
  *
- * `githubHasReviewerEvidenceForPr` derives its comment-mode `headPrefix` from
- * the resolved head; when the wake carried no head SHA it falls back to
- * fetching the PR's current head, and if THAT fetch fails there is no prefix,
- * the comment-mode pass is skipped entirely, and the probe can answer
- * `{found: false}` while a comment-mode review exists. That is additive
- * elsewhere, but here a false negative authorizes a retry — so require the
- * wake's exact head and report an unresolved head as unproven (`null`),
- * never as `false`.
+ * `githubHasReviewerEvidenceForPr` keys its comment-mode pass on the resolved
+ * head; when the wake carried no head SHA it falls back to fetching the PR's
+ * current head, and if THAT fetch fails it answers `{found: false}` without
+ * having proven anything. That is additive elsewhere, but here a false negative
+ * authorizes a retry — so require the wake's exact head and report an unresolved
+ * head as unproven (`null`), never as `false`.
  */
 export async function probeStaleKillReviewEvidence(
   run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
@@ -21963,6 +22013,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // has already been created" case -- if a refactor moves isolation binding
   // to after Job creation, or lets a bound reservation re-enter the throw
   // path, that test fails before this function can strand a live Job.
+  // BLO-22060 decision — the uncapped re-queue attempt count here is
+  // INTENTIONAL, and deliberately not bounded the way the parked-retry
+  // re-adoption above now is. Recorded so it stays a decision rather than an
+  // omission:
+  //
+  //  - This path never resets the stale-lock clock by itself. It leaves
+  //    issues.executionLockedAt untouched, and the sweep's `queued` branch
+  //    measures from that column, so a run stuck deferring is still swept 6h
+  //    after its original lock. The clock only moves when the run is genuinely
+  //    re-claimed (claimQueuedRun re-stamps executionLockedAt) — i.e. when it
+  //    made real progress toward dispatch, not while it sits parked.
+  //  - The failure mode it protects against is transient by construction: the
+  //    conflict is raised only while another live run holds the same mutable
+  //    isolation scope, so the correct response is to wait for that run, and
+  //    the wait is already capped at K8S_ISOLATION_RETRY_MAX_DELAY_MS (5 min)
+  //    per attempt.
+  //  - Capping attempts would convert "the neighbour is taking a long time"
+  //    into a failed run. That trades a bounded wait for lost work, on a
+  //    condition we cannot distinguish from a slow-but-healthy neighbour.
+  //  - A genuine live-lock is therefore a bug in reservation binding, not
+  //    something a retry cap should paper over — and it is already observable
+  //    without one: retryAttempt is stamped on the run event and the log line
+  //    at the end of this function, so a climbing count is visible per run.
+  //
+  // Revisit if that log ever shows attempts climbing without a distinct
+  // conflictingRunId, which would mean the scope is never actually released.
   async function deferRunForK8sIsolationConflict(
     run: typeof heartbeatRuns.$inferSelect,
     conflict: ExternalRuntimeIsolationConflictError,
@@ -27807,6 +27883,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(heartbeatRuns.companyId, issue.companyId),
                 inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                // BLO-22060: a run whose issue lock the stale-lock sweep has
+                // already released is not an adoption candidate any more.
+                // Excluded in SQL rather than after the fact so a *different*
+                // eligible run for this issue is still found and adopted
+                // normally — only the burnt-out holder is passed over. Applies
+                // to every status this fallback selects, not just
+                // `scheduled_retry`: the sweep releases and counts `queued`
+                // (BLO-18995) and silent-`running` (BLO-19941) holders too, and
+                // a released park that is later promoted arrives here as
+                // `queued` carrying its count. See
+                // MAX_SWEPT_ISSUE_LOCK_RELEASES.
+                lt(heartbeatRuns.issueLockReleaseCount, MAX_SWEPT_ISSUE_LOCK_RELEASES),
               ),
             )
             .orderBy(
@@ -27820,6 +27908,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (await cancelStaleScheduledRetry(legacyRun)) {
               activeExecutionRun = null;
             } else {
+              // Master (8446c1011) narrowed the issue-lock stamp to `running`
+              // legacy runs: a `queued`/`scheduled_retry` holder is adopted as
+              // the in-memory `activeExecutionRun` for this wake but no longer
+              // re-stamps `executionLockedAt`. That kills the *renewal* half of
+              // BLO-22060; the release bound in the SELECT above kills the
+              // *absorption* half, so a swept park cannot silently swallow the
+              // wake either.
               activeExecutionRun = legacyRun;
               if (legacyRun.status === "running") {
                 const legacyAgent = await tx
@@ -27827,7 +27922,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   .from(agents)
                   .where(eq(agents.id, legacyRun.agentId))
                   .then((rows) => rows[0] ?? null);
-                await tx
+                // BLO-22060: guard the adoption on the lock still being free.
+                // The enclosing transaction DOES hold this issue row `for
+                // update` (taken at the top, before the issue is read), so a
+                // concurrent writer that goes through the same path cannot
+                // interleave here — this predicate is not load-bearing against
+                // that class of race. It is kept as a cheap assertion of the
+                // invariant the block is written against: every branch above
+                // either left executionRunId null or cleared it, so adoption
+                // must never overwrite a live holder. If the row lock is ever
+                // narrowed, or a writer that does not take it is added, this
+                // fails closed instead of silently stamping over the holder —
+                // and the fallback below then adopts whoever actually holds the
+                // issue.
+                const adopted = await tx
                   .update(issues)
                   .set({
                     executionRunId: legacyRun.id,
@@ -27835,7 +27943,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     executionLockedAt: new Date(),
                     updatedAt: new Date(),
                   })
-                  .where(eq(issues.id, issue.id));
+                  .where(and(eq(issues.id, issue.id), isNull(issues.executionRunId)))
+                  .returning({ id: issues.id })
+                  .then((rows) => rows[0] ?? null);
+
+                if (!adopted) {
+                  const currentHolderId = await tx
+                    .select({ executionRunId: issues.executionRunId })
+                    .from(issues)
+                    .where(eq(issues.id, issue.id))
+                    .then((rows) => rows[0]?.executionRunId ?? null);
+                  activeExecutionRun = currentHolderId
+                    ? await tx
+                      .select()
+                      .from(heartbeatRuns)
+                      .where(eq(heartbeatRuns.id, currentHolderId))
+                      .then((rows) => rows[0] ?? null)
+                    : null;
+                }
               }
             }
           }
@@ -30779,6 +30904,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     sweepStaleIssueLocks,
 
+    // BLO-22060: already the injected dependency behind recoveryService,
+    // productivity-review and task-watchdogs; exposed here so the issue-lock
+    // adoption path can be driven directly from a test rather than only through
+    // a plugin-host or route wrapper.
+    enqueueWakeup,
     reconcileDetachedQueuedRuns,
 
     buildIssueGraphLivenessAutoRecoveryPreview,

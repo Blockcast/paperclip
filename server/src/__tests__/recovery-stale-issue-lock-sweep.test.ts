@@ -610,6 +610,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const result = await sweepPromise!;
 
     expect(result.cleared).toBe(0);
+    // BLO-22060: a bump landing on the sweep's own 30s cadence can starve the
+    // clear indefinitely, and `cleared: 0` alone reads identically to a quiet
+    // pass. Count the bailout so the starvation is observable.
+    expect(result.skippedByConcurrentLockChange).toBe(1);
+    expect(result.skippedByConcurrentLockChangeIssueIds).toEqual([issueId]);
     const row = await db
       .select({
         executionRunId: issues.executionRunId,
@@ -1626,6 +1631,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     scheduledRetryAt: Date;
     scheduledRetryReason?: string | null;
     sameRunHoldsCheckout?: boolean;
+    // Only the wake-driven case needs this: enqueueWakeup resolves a
+    // responsible user before it can seed a run, and throws 422 without one.
+    // Left null by default so the sweep-only cases keep their existing shape.
+    responsibleUserId?: string | null;
   }) {
     const wedgedRunId = randomUUID();
     const issueId = randomUUID();
@@ -1649,6 +1658,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       status: "in_progress",
       priority: "critical",
       assigneeAgentId: input.agentId,
+      responsibleUserId: input.responsibleUserId ?? null,
       checkoutRunId: input.sameRunHoldsCheckout === false ? null : wedgedRunId,
       executionRunId: wedgedRunId,
       executionLockedAt: input.lockedAt,
@@ -1712,6 +1722,335 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.executionRunId).toBeNull();
+  });
+
+  // BLO-22060: the cap the test above proves is renewable unless the release is
+  // recorded on the run. The sweep deliberately leaves the parked run alive, and
+  // enqueueWakeup's legacy-run fallback re-selected exactly that run —
+  // cancelStaleScheduledRetry declines to cancel a park owned by the issue's own
+  // assignee — then re-stamped executionLockedAt = now(). One wake restored the
+  // full 6h window, so a capacity park deadlined days out kept the issue out of
+  // service for its assignee indefinitely, in 6h slices rather than one block.
+  it("does not let a wake re-adopt a parked retry whose lock the sweep already released (BLO-22060)", async () => {
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedWedgedScheduledRetryIssue({
+      companyId,
+      agentId,
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      // Capacity parks take their horizon from the provider's reset, so the
+      // deadline is routinely days out — the whole window this bug covers.
+      scheduledRetryAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+      sameRunHoldsCheckout: false,
+      responsibleUserId: "responsible-user",
+    });
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const sweep = await heartbeat.sweepStaleIssueLocks();
+    expect(sweep.cleared).toBe(1);
+    expect(sweep.issueIds).toContain(issueId);
+
+    // The release is recorded on the run, because the issue columns it was
+    // recorded on are exactly what the sweep just nulled.
+    const releasedRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(releasedRun?.issueLockReleaseCount).toBe(1);
+    // The park itself survives — the sweep releases the lock, it does not cancel
+    // the retry, so the run still fires when its deadline arrives.
+    expect(releasedRun?.status).toBe("scheduled_retry");
+
+    // `manual` is user-initiated and so bypasses the ccrotate availability gate,
+    // keeping this hermetic. The adoption path under test is shared by every
+    // wake source.
+    const wake = await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+
+    // The assertion that survives master's 8446c1011. That commit stopped the
+    // legacy fallback from re-stamping `executionLockedAt` for a non-`running`
+    // holder, which fixes the visible renewal — but it still assigns the park to
+    // `activeExecutionRun`, so a same-agent wake is *coalesced into a run that
+    // will not execute until its deadline* and produces nothing. Observed in
+    // production on BLO-22438: two comments, both absorbed, zero runs.
+    //
+    // enqueueWakeup returns the run row itself, and the coalesce branch returns
+    // the run it merged into — so absorption is exactly `wake.id === wedgedRunId`
+    // with the park's own status. Asserting the fresh `queued` run positively
+    // keeps this non-vacuous: a suppressed wake returns null, which would
+    // satisfy any `not.toBe` on its own.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
+
+    const afterWake = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+
+    // The core assertion: the burnt-out park is not the holder again. Before the
+    // fix this was `wedgedRunId` with a brand-new executionLockedAt.
+    expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // And the sweep's release stays effective: nothing re-armed a 6h window on
+    // behalf of the run that just lost one.
+    const reReleasedRun = await db
+      .select({ issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(reReleasedRun?.issueLockReleaseCount).toBe(1);
+
+    // Idempotent under wake volume: the bound is on the run, not on the wake, so
+    // repeat wakes cannot walk it back.
+    const secondWake = await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+    const afterSecondWake = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(afterSecondWake?.executionRunId).not.toBe(wedgedRunId);
+    expect(secondWake?.run?.id).not.toBe(wedgedRunId);
+  });
+
+  // BLO-22060 review follow-up: the bound must not be status-scoped. The sweep
+  // releases — and counts — three shapes of holder, and enqueueWakeup's
+  // legacy-run fallback selects all three via
+  // EXECUTION_PATH_HEARTBEAT_RUN_STATUSES. Scoping the predicate to
+  // `scheduled_retry` left the *original* renewable shape (BLO-18995's never-
+  // claimed `queued` lock) and BLO-19941's silent-`running` lock re-adoptable on
+  // every wake, and let a released park evade the bound outright by being
+  // promoted — promotion flips the run to `queued`, carrying its release count
+  // across, so a status-scoped predicate stopped applying to the same row.
+  async function seedSweptAdoptableIssue(input: {
+    companyId: string;
+    agentId: string;
+    status: "queued" | "running" | "scheduled_retry";
+    lockedAt: Date;
+    // `running` holders are bounded on their own most-recent activity, never on
+    // the lock timestamp — see runningLockStaleBasis.
+    lastSignalAt?: Date;
+    scheduledRetryAt?: Date;
+  }) {
+    const wedgedRunId = randomUUID();
+    const issueId = randomUUID();
+    const runningSignal = input.status === "running" ? (input.lastSignalAt ?? null) : null;
+    await db.insert(heartbeatRuns).values({
+      id: wedgedRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: input.status,
+      invocationSource: "automation",
+      startedAt: runningSignal,
+      lastOutputAt: runningSignal,
+      lastUsefulActionAt: runningSignal,
+      ...(input.status === "scheduled_retry"
+        ? {
+            scheduledRetryAt: input.scheduledRetryAt ?? new Date(Date.now() - 60_000),
+            scheduledRetryAttempt: 1,
+            // Deliberately not one of the reasons in
+            // SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK, which the
+            // sweep refuses to release at all.
+            scheduledRetryReason: "ccrotate_capacity",
+          }
+        : {}),
+      // The fallback matches candidates on this. A run without it is not an
+      // adoption candidate at all, which would make the assertions vacuous.
+      contextSnapshot: { issueId, taskId: issueId },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      title: `Lock held by a run at ${input.status}`,
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: input.agentId,
+      // enqueueWakeup resolves a responsible user before it can seed a run.
+      responsibleUserId: "responsible-user",
+      checkoutRunId: null,
+      executionRunId: wedgedRunId,
+      executionLockedAt: input.lockedAt,
+    });
+    return { wedgedRunId, issueId };
+  }
+
+  it("does not let a wake re-adopt a never-claimed queued run whose lock the sweep released (BLO-22060)", async () => {
+    // The BLO-18995 shape: four enqueue paths stamp the lock at enqueue time
+    // alongside a freshly-inserted `queued` run. If that run is never claimed the
+    // sweep is the only thing that releases it — and re-adoption here restored
+    // the full 6h window, so the issue was never actually freed for its assignee.
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedSweptAdoptableIssue({
+      companyId,
+      agentId,
+      status: "queued",
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const sweep = await heartbeat.sweepStaleIssueLocks();
+    expect(sweep.cleared).toBe(1);
+    expect(sweep.issueIds).toContain(issueId);
+
+    // Non-vacuity: the release is counted for a `queued` holder too, and the run
+    // is still alive and therefore still selectable by the fallback.
+    const released = await db
+      .select({
+        status: heartbeatRuns.status,
+        issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(released?.status).toBe("queued");
+    expect(released?.issueLockReleaseCount).toBe(1);
+
+    const wake = await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+
+    const afterWake = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // Not just un-stamped — un-absorbed. A released holder must not swallow the
+    // wake as a coalesce target either (see the scheduled_retry case above).
+    // The positive `queued` assertion keeps this non-vacuous.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
+  });
+
+  it("does not let a wake re-adopt a silent running run whose lock the sweep released (BLO-22060)", async () => {
+    // BLO-19941's shape. Re-adopting a holder the sweep has already declared
+    // silent re-wedges the issue behind a run nothing is driving.
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedSweptAdoptableIssue({
+      companyId,
+      agentId,
+      status: "running",
+      lockedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+      // Every activity stamp well past STALE_RUNNING_ISSUE_LOCK_MS (2h).
+      lastSignalAt: new Date(Date.now() - 5 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const sweep = await heartbeat.sweepStaleIssueLocks();
+    expect(sweep.cleared).toBe(1);
+    expect(sweep.issueIds).toContain(issueId);
+
+    const released = await db
+      .select({
+        status: heartbeatRuns.status,
+        issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(released?.status).toBe("running");
+    expect(released?.issueLockReleaseCount).toBe(1);
+
+    const wake = await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+
+    const afterWake = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // Not just un-stamped — un-absorbed. A released holder must not swallow the
+    // wake as a coalesce target either (see the scheduled_retry case above).
+    // The positive `queued` assertion keeps this non-vacuous.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
+  });
+
+  it("does not let a released park evade the bound by being promoted to queued (BLO-22060)", async () => {
+    // The status-transition hole. The park is released and counted while it is
+    // `scheduled_retry`, then promoteDueScheduledRetries flips the same row to
+    // `queued`. A predicate keyed on status stopped applying at that point, so
+    // the next wake re-adopted the run and re-stamped executionLockedAt — the
+    // bound was one promotion away from being renewable again.
+    const { companyId, agentId } = await seed();
+    const { issueId, wedgedRunId } = await seedSweptAdoptableIssue({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      lockedAt: new Date(Date.now() - 13 * 60 * 60 * 1000),
+      // Due, so promotion below is real rather than simulated by a status poke.
+      scheduledRetryAt: new Date(Date.now() - 60_000),
+    });
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const sweep = await heartbeat.sweepStaleIssueLocks();
+    expect(sweep.cleared).toBe(1);
+    expect(sweep.issueIds).toContain(issueId);
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(new Date());
+    expect(promotion.runIds).toContain(wedgedRunId);
+
+    // The release count survives the status transition — that is what lets the
+    // bound keep applying to a row that is no longer a `scheduled_retry`.
+    const promoted = await db
+      .select({
+        status: heartbeatRuns.status,
+        issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, wedgedRunId))
+      .then((rows) => rows[0]);
+    expect(promoted?.status).toBe("queued");
+    expect(promoted?.issueLockReleaseCount).toBe(1);
+
+    const wake = await heartbeat.enqueueWakeup(agentId, {
+      source: "manual",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      payload: { issueId },
+    });
+
+    const afterWake = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(afterWake?.executionRunId).not.toBe(wedgedRunId);
+    // Not just un-stamped — un-absorbed. A released holder must not swallow the
+    // wake as a coalesce target either (see the scheduled_retry case above).
+    // The positive `queued` assertion keeps this non-vacuous.
+    expect(wake).not.toBeNull();
+    expect(wake?.id).not.toBe(wedgedRunId);
+    expect(wake?.status).toBe("queued");
   });
 
   it.each([

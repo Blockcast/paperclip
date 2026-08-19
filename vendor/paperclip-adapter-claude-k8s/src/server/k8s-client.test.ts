@@ -78,6 +78,7 @@ function makePodWithSecretVolumes() {
           env: [],
           volumeMounts: [
             { name: "gbrain-authbot-service-key", mountPath: "/var/run/authbot" },
+            { name: "github-token", mountPath: "/paperclip/.secrets/github-token" },
             { name: "github-merge-token", mountPath: "/paperclip/.secrets/github-merge-token" },
           ],
         },
@@ -92,6 +93,13 @@ function makePodWithSecretVolumes() {
             items: [{ key: "gbrain-plugin-service-key", path: "gbrain-plugin-service-key" }],
           },
         },
+        {
+          name: "github-token",
+          secret: { secretName: "paperclip-github-mcp-token", defaultMode: 292 },
+        },
+        // The server pod genuinely mounts the user seat; the fixture keeps it so
+        // the allowlist is exercised against a realistic pod rather than one
+        // curated to contain only inheritable volumes (BLO-24056).
         {
           name: "github-merge-token",
           secret: { secretName: "paperclip-github-merge-token", defaultMode: 292 },
@@ -188,7 +196,10 @@ describe("getSelfPodInfo secret volume capture", () => {
     const { getSelfPodInfo } = await import("./k8s-client.js");
     const info = await getSelfPodInfo(KC);
 
-    const whole = info.secretVolumes.find((v) => v.volumeName === "github-merge-token");
+    // Uses the App token, not the user seat: the seat is no longer inheritable
+    // (BLO-24056), so it can never appear in secretVolumes and would make this
+    // assertion vacuously unreachable rather than testing whole-Secret capture.
+    const whole = info.secretVolumes.find((v) => v.volumeName === "github-token");
     expect(whole).toBeDefined();
     expect(whole?.items).toBeUndefined();
   });
@@ -295,10 +306,14 @@ describe("getSelfPodInfo inheritance allowlist (BLO-22514)", () => {
   it("keeps agent-facing secret volumes and drops the rest", async () => {
     podFixtures[KC] = podWithEnv([], {
       volumes: [
+        { name: "github-token", secret: { secretName: "paperclip-github-mcp-token" } },
+        // The user seat is mounted on the SERVER pod but must not propagate
+        // into agent Jobs (BLO-24056) — it belongs on the dropped side now.
         { name: "github-merge-token", secret: { secretName: "paperclip-github-merge-token" } },
         { name: "db-creds", secret: { secretName: "paperclip-db-credentials" } },
       ],
       volumeMounts: [
+        { name: "github-token", mountPath: "/paperclip/.secrets/github-token" },
         { name: "github-merge-token", mountPath: "/paperclip/.secrets/github-merge-token" },
         { name: "db-creds", mountPath: "/paperclip/.secrets/db" },
       ],
@@ -307,8 +322,14 @@ describe("getSelfPodInfo inheritance allowlist (BLO-22514)", () => {
     const info = await getSelfPodInfo(KC);
 
     expect(info.secretVolumes.map((v) => v.secretName)).toEqual([
-      "paperclip-github-merge-token",
+      "paperclip-github-mcp-token",
     ]);
+    // Explicit rather than implied by the toEqual above: this is the whole
+    // point of the change, and a future edit that re-widens the allowlist
+    // should fail on a line that says so.
+    expect(info.secretVolumes.map((v) => v.secretName)).not.toContain(
+      "paperclip-github-merge-token",
+    );
   });
 
   it("drops every envFrom source by default", async () => {
