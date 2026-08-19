@@ -45,6 +45,7 @@ import {
   GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
   GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
   findOpenDependabotAlertIssue,
+  findTerminalDependabotAlertIssues,
   recordDependabotWebhookDiagnostic,
   resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
@@ -1371,12 +1372,69 @@ function isUniqueDependabotAlertConflict(error: unknown): boolean {
   );
 }
 
+// BLO-28981: a re-fire arriving for an alert whose previous cycle was already
+// adjudicated and closed. The body is deliberately short -- the reopened row
+// already carries the previous cycle's comments and receipts, which is the
+// whole point of reopening rather than filing a fresh row. What it must add is
+// (a) that this is a *repeat*, not a first sighting, (b) which delivery
+// re-fired it, and (c) pointers to any earlier sibling rows that predate the
+// reopen behaviour, so the full adjudication chain is reachable from the one
+// surviving row.
+function buildDependabotRefireComment(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+  reopenedFromStatus: string;
+  priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const priorLines = input.priorAdjudications.length
+    ? [
+        "",
+        `## Earlier rows for this same alert (${input.priorAdjudications.length})`,
+        ...input.priorAdjudications.map((prior) => {
+          const closedAt = prior.completedAt ? prior.completedAt.toISOString() : "close time not recorded";
+          return `- ${prior.identifier ?? "(no identifier)"} — \`${prior.status}\`, ${closedAt}`;
+        }),
+        "",
+        "Read those before re-investigating: this alert has been adjudicated before, and the previous conclusion very likely still applies.",
+      ]
+    : [];
+  return [
+    `[github-dependabot-refire] GitHub re-fired this alert (\`${input.alert.action}\`) after it was closed as \`${input.reopenedFromStatus}\`.`,
+    "",
+    "This issue was **reopened in place** rather than refiled, so every comment above is the prior adjudication of this same alert.",
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- Severity: ${input.alert.severity}`,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    ...priorLines,
+    "",
+    "If the earlier adjudication still holds, close this issue again citing it — do not repeat the investigation. If the dependency genuinely regressed, remediate as normal.",
+  ].join("\n");
+}
+
 // Finds the open issue for this alert (originId is the stable
 // `github-dependabot:<repo>#<alertNumber>` key), or creates one. A
 // `reintroduced`/`reopened` redelivery for an alert that already has an open
 // issue reuses it rather than spawning a duplicate remediation run — the
 // Release Engineer sees one issue per alert to comment on and dedupe against,
 // per BLO-16319's verifying signal.
+//
+// BLO-28981: when there is no open issue but the same originId has already
+// been adjudicated and closed, reopen the most recent terminal row instead of
+// minting a fresh one. `issues_active_dependabot_alert_uq` only constrains
+// non-terminal rows, so nothing stopped the intake from stacking a new
+// full-weight issue per re-fire cycle (measured: 24 rows across 8 originIds on
+// `Blockcast/magma`). Reopening keeps exactly one row per alert forever and,
+// more importantly, keeps the prior adjudication attached to it — the next
+// agent to pick it up reads why this was closed last time instead of starting
+// cold. The wake still fires against the returned issue id, so a dependency
+// that was genuinely fixed and then regressed still reaches an assignee; this
+// changes which row the signal lands on, never whether it lands.
 async function resolveDependabotAlertIssue(
   db: Db,
   input: {
@@ -1385,10 +1443,28 @@ async function resolveDependabotAlertIssue(
     originId: string;
     repoFullName: string;
     alert: DependabotAlertContext;
+    deliveryId: string | null;
   },
-): Promise<{ id: string; identifier: string | null; reused: boolean }> {
+): Promise<{ id: string; identifier: string | null; reused: boolean; reopened: boolean }> {
   const existing = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-  if (existing) return { id: existing.id, identifier: existing.identifier, reused: true };
+  if (existing) return { id: existing.id, identifier: existing.identifier, reused: true, reopened: false };
+
+  const priorTerminal = await findTerminalDependabotAlertIssues(db, input.companyId, input.originId);
+  const reopenTarget = priorTerminal[0] ?? null;
+  if (reopenTarget) {
+    const reopened = await reopenTerminalDependabotAlertIssue(db, {
+      ...input,
+      target: reopenTarget,
+      priorAdjudications: priorTerminal.slice(1),
+    });
+    if (reopened) return reopened;
+    // Lost the reopen race to a concurrent delivery (or the row moved out of a
+    // terminal status between the read and the write). Whichever writer won
+    // left an open row behind; reuse it rather than falling through to create
+    // a duplicate.
+    const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
+    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false };
+  }
 
   const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
   const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
@@ -1406,13 +1482,96 @@ async function resolveDependabotAlertIssue(
       originId: input.originId,
       originFingerprint: input.originId,
     });
-    return { id: created.id, identifier: created.identifier, reused: false };
+    return { id: created.id, identifier: created.identifier, reused: false, reopened: false };
   } catch (error) {
     if (!isUniqueDependabotAlertConflict(error)) throw error;
     const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true };
+    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false };
     throw error;
   }
+}
+
+// Reopens a closed Dependabot alert row and records why, atomically. Returns
+// null when the row was no longer terminal at write time — the UPDATE's own
+// WHERE re-checks the status against the latest row version, so a concurrent
+// delivery that already reopened it cannot be double-applied (the same
+// optimistic-concurrency shape reopenInReviewIssueForActionablePrFeedback uses
+// for its `in_review` guard).
+async function reopenTerminalDependabotAlertIssue(
+  db: Db,
+  input: {
+    companyId: string;
+    assigneeAgentId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+    target: { id: string; identifier: string | null; status: string };
+    priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
+  },
+): Promise<{ id: string; identifier: string | null; reused: boolean; reopened: boolean } | null> {
+  const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
+  const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
+  const now = new Date();
+  const externalKey = `${input.originId}:refire:${input.deliveryId ?? input.alert.action}`;
+  const body = buildDependabotRefireComment({
+    repoFullName: input.repoFullName,
+    alert: input.alert,
+    deliveryId: input.deliveryId,
+    reopenedFromStatus: input.target.status,
+    priorAdjudications: input.priorAdjudications,
+  });
+
+  return db.transaction(async (tx) => {
+    const updated = await tx
+      .update(issues)
+      .set({
+        status: "todo",
+        priority,
+        assigneeAgentId,
+        assigneeUserId: null,
+        // The row is being handed back to the queue: any execution lock left
+        // over from the run that closed it would otherwise make the reopened
+        // issue look checked-out by a run that has long since finished.
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        completedAt: null,
+        cancelledAt: null,
+        updatedAt: now,
+      })
+      .where(and(eq(issues.id, input.target.id), inArray(issues.status, ["done", "cancelled"])))
+      .returning({ id: issues.id, identifier: issues.identifier })
+      .then((rows) => rows[0] ?? null);
+    if (!updated) return null;
+
+    // Idempotent on the delivery id, so a GitHub replay of the same re-fire
+    // does not stack duplicate notices on the reopened row.
+    await tx
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: input.target.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body,
+        metadata: {
+          kind: "github_dependabot_refire",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          reopenedFromStatus: input.target.status,
+          priorAdjudicationIdentifiers: input.priorAdjudications.map((prior) => prior.identifier),
+        } as never,
+      })
+      .onConflictDoNothing();
+
+    return { id: updated.id, identifier: updated.identifier, reused: true, reopened: true };
+  });
 }
 
 function buildDependabotTerminalReceipt(input: {
@@ -3703,6 +3862,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           originId: taskKey,
           repoFullName: alertRepoFullName,
           alert,
+          deliveryId,
         });
 
         const heartbeat = heartbeatService(db, {

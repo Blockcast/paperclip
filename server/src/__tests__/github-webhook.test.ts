@@ -7498,6 +7498,267 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
   });
 
+  // BLO-28981: `issues_active_dependabot_alert_uq` only constrains non-terminal
+  // rows, so once a cycle's issue closed, the next re-fire matched nothing in
+  // findOpenDependabotAlertIssue and the intake minted a brand-new full-weight
+  // row. On `Blockcast/magma` that produced 8 alerts x 3 cycles = 24 rows under
+  // 8 identical originIds, each one context-free -- the adjudication that closed
+  // the previous cycle never travelled with the alert, so the same conclusion
+  // was re-derived every cycle at ~8 agent runs a time.
+  it("reopens the adjudicated issue instead of refiling when a closed alert re-fires", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const [originalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(originalIssue!.status).toBe("todo");
+
+    // The cycle is adjudicated and closed.
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    const [closed] = await db.select().from(issues).where(eq(issues.id, originalIssue!.id));
+    expect(closed!.status).toBe("done");
+
+    // GitHub re-fires the same alert.
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-1",
+    );
+    expect(refire.status).toBe(200);
+    expect(refire.body).toMatchObject({ dependabotWakeFired: true });
+
+    // The row count does not grow: this is the fourth-row check the production
+    // verifying signal watches for.
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(1);
+    expect(alertIssues[0]!.id).toBe(originalIssue!.id);
+
+    // ...and it is reopened, assigned, and no longer carrying the closed row's
+    // completion timestamp or a stale execution lock.
+    const reopened = alertIssues[0]!;
+    expect(reopened.status).toBe("todo");
+    expect(reopened.assigneeAgentId).toBe(agentId);
+    expect(reopened.completedAt).toBeNull();
+    expect(reopened.checkoutRunId).toBeNull();
+    expect(reopened.executionRunId).toBeNull();
+
+    // The re-fire is recorded on the row, so the next agent to pick it up reads
+    // that this is a repeat rather than starting cold.
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, reopened.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(1);
+    expect(refireComments[0]!.body).toContain("reopened in place");
+    expect(refireComments[0]!.body).toContain("Action: `reintroduced`");
+    expect(refireComments[0]!.body).toContain("GitHub delivery: `delivery-refire-1`");
+    // The prior adjudication is the terminal receipt already on this row.
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, reopened.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+  });
+
+  // The regression signal must survive the dedupe: reopening changes WHICH row
+  // the alert lands on, never whether it reaches someone. A dependency that was
+  // genuinely fixed and then reintroduced by a later commit still has to wake an
+  // assignee.
+  it("still wakes an assignee when a closed alert is genuinely reintroduced", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-2",
+    );
+    expect(refire.body).toMatchObject({ dependabotWakeFired: true });
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue!.status).toBe("todo");
+    expect(issue!.assigneeAgentId).toBe(agentId);
+
+    // The re-fire enqueued its own wake, keyed on this delivery. Do NOT assert a
+    // run-count delta here: the re-fire shares the alert's taskKey with the
+    // "created" run, so if that run is still queued, enqueueWakeup's generic
+    // coalescing (coalescePendingTaskScopeWake) merges the re-fire into it
+    // instead of queuing a second -- see the sibling "reuses the open issue"
+    // test. Whether it coalesces depends on how far the earlier run has
+    // progressed, which is not deterministic across suite orderings. The wake
+    // request is the durable evidence that the regression reached the assignee.
+    const wakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(
+      wakes.some((wake) =>
+        wake.idempotencyKey === "github-dependabot:Blockcast/paperclip#58:reintroduced:delivery-refire-2",
+      ),
+    ).toBe(true);
+
+    // ...and whichever run(s) exist all point at the one surviving issue.
+    const runs = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    for (const run of runs) {
+      expect((run.contextSnapshot as Record<string, unknown>).issueId).toBe(issue!.id);
+    }
+  });
+
+  // The normal path must not regress: an alert nobody has seen before still gets
+  // a full-weight issue, with no reopen machinery involved.
+  it("still files a fresh issue for a first-ever alert with no prior adjudication", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const res = await postDependabot(app, dependabotPayload("critical", "created", 4242), "delivery-first");
+    expect(res.body).toMatchObject({ dependabotWakeFired: true });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originId, "github-dependabot:Blockcast/paperclip#4242"),
+        ),
+      );
+    expect(alertIssues).toHaveLength(1);
+    const issue = alertIssues[0]!;
+    expect(issue.status).toBe("todo");
+    expect(issue.assigneeAgentId).toBe(agentId);
+    // Full alert body, not a reopen notice.
+    expect(issue.description).toContain("## Acceptance criteria");
+    expect(issue.description).toContain("security/dependabot/4242");
+
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(0);
+  });
+
+  // Pre-fix history: the 24 rows already in production sit under the same
+  // originId as terminal siblings. The reopened row must name them so the whole
+  // adjudication chain stays reachable from the one row that survives.
+  it("carries prior adjudication rows into the reopened issue", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    // An older, already-closed duplicate from before this fix shipped. Terminal
+    // rows are outside the partial unique index, which is exactly why the old
+    // behaviour could stack them.
+    const [legacyDuplicate] = await db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Dependabot critical alert: vitest in Blockcast/paperclip#58",
+        description: "Adjudicated in an earlier cycle.",
+        status: "done",
+        priority: "critical",
+        originKind: "github_dependabot_alert",
+        originId: "github-dependabot:Blockcast/paperclip#58",
+        originFingerprint: "github-dependabot:Blockcast/paperclip#58",
+        // Real rows carry an identifier from issueService.create; a raw insert
+        // does not, and the identifier is what the reopen notice links to.
+        issueNumber: 22652,
+        identifier: "BLO-22652",
+        completedAt: new Date("2026-08-06T00:00:00.000Z"),
+        createdAt: new Date("2026-08-06T00:00:00.000Z"),
+      })
+      .returning({ id: issues.id, identifier: issues.identifier });
+
+    await postDependabot(app, dependabotPayload("critical", "reintroduced"), "delivery-refire-3");
+
+    // Still no new row: two terminal rows existed, and the newest was reopened.
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(2);
+    const open = alertIssues.filter((row) => row.status === "todo");
+    expect(open).toHaveLength(1);
+    expect(open[0]!.id).not.toBe(legacyDuplicate!.id);
+
+    const [refireComment] = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, open[0]!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComment!.body).toContain("Earlier rows for this same alert (1)");
+    expect(refireComment!.body).toContain(legacyDuplicate!.identifier!);
+    expect(refireComment!.body).toContain("adjudicated before");
+  });
+
+  // GitHub 200-acks mean it will not retry, but manual replays and re-scans do
+  // redeliver. A replayed re-fire must not stack duplicate notices on the row.
+  it("dedupes a replayed re-fire delivery against the reopened issue", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    await postDependabot(app, dependabotPayload("critical", "reintroduced"), "delivery-refire-4");
+
+    // Close it again, then replay the exact same re-fire delivery id.
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed-2");
+    await postDependabot(app, dependabotPayload("critical", "reintroduced"), "delivery-refire-4");
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(1);
+
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, alertIssues[0]!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(1);
+  });
+
   it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
