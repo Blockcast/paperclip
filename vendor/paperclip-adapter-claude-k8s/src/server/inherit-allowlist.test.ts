@@ -169,11 +169,23 @@ describe("inherit allowlist — default deny", () => {
 });
 
 describe("inherit allowlist — secret volumes", () => {
-  it("keeps the three agent-facing secret mounts", () => {
+  it("keeps the two agent-facing secret mounts", () => {
     // values.blockcast.yaml documents this propagation as intentional.
     expect(isAgentInheritableSecretVolume("authbot-mcp-consumer-service-keys")).toBe(true);
     expect(isAgentInheritableSecretVolume("paperclip-github-mcp-token")).toBe(true);
-    expect(isAgentInheritableSecretVolume("paperclip-github-merge-token")).toBe(true);
+  });
+
+  it("does NOT propagate the user-seat token into agent Jobs (BLO-24056)", () => {
+    // The seat is a review-clearing identity on repos whose ruleset names the
+    // Ally team. Propagating it made that a fleet-wide capability (108 agent
+    // Job pods mounted it) rather than one service's. It was also unusable
+    // from an agent by construction: the `gh` wrapper reads
+    // PAPERCLIP_GITHUB_TOKEN_FILE (pinned to the App token), GH_TOKEN
+    // overrides are no-ops in these pods, and shipped skills may not name the
+    // seat path (shipped-catalog.test.ts CREDENTIAL_SELECTOR_PATTERNS).
+    // The control plane keeps its own mount via values.blockcast.yaml.
+    expect(isAgentInheritableSecretVolume("paperclip-github-merge-token")).toBe(false);
+    expect(AGENT_SECRET_VOLUME_ALLOWLIST.has("paperclip-github-merge-token")).toBe(false);
   });
 
   it("drops a server-only secret mount", () => {

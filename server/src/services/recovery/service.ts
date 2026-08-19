@@ -152,6 +152,13 @@ function recoveryActionBoundsAtCreation(now: Date): { maxAttempts: number; timeo
 // reset and is routinely days away; letting that horizon set the lock lifetime
 // took the issue out of service for the whole park, for its own assignee.
 export const STALE_PRE_CLAIM_ISSUE_LOCK_MS = 6 * 60 * 60 * 1000;
+// BLO-22060: sentinel return from the sweep transaction meaning "the lock moved
+// between the pre-transaction scan and the FOR UPDATE revalidation, so this pass
+// declined to clear it". Distinct from `null`, which means "revalidated and the
+// lock is legitimately not stale". Only the former can starve the clear when a
+// renewal keeps landing on the sweep's cadence, so only the former is counted
+// and logged.
+const LOCK_CHANGED_UNDER_SWEEP: unique symbol = Symbol("staleIssueLockSweep.lockChangedUnderSweep");
 export const ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT = 5;
 const ASSIGNMENT_RECOVERY_CAPACITY_RESERVATION_STATUS = "assignment_recovery_capacity_reserved";
 // Enqueue normally finishes in seconds; an hour-old reservation has lost its owning process.
@@ -448,6 +455,14 @@ type StrandedRecoveryCause =
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
+
+const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
+  "job_failed",
+  "k8s_pod_schedule_failed",
+  "adapter_failed",
+  "external_lifecycle_stale_killed",
+  "k8s_concurrency_guard_unreachable",
+]);
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -4177,7 +4192,9 @@ export function recoveryService(
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
     const routeToOriginal = input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
-      input.recoveryCause === "codex_output_inactivity_monitor";
+      input.recoveryCause === "codex_output_inactivity_monitor" ||
+      input.recoveryCause === "stranded_assigned_issue" &&
+        ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(input.latestRun?.errorCode ?? "");
     if (input.recoveryCause === "provider_quota") {
       const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
       if (!retryAgentId) {
@@ -6351,15 +6368,6 @@ export function recoveryService(
         continue;
       }
 
-      const agent = await getAgent(agentId);
-      const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
-        : false;
-      if (issue.status !== "in_review" && !agentInvokable) {
-        result.skipped += 1;
-        continue;
-      }
-
       if (await hasActiveExecutionPath(
         issue.companyId,
         issue.id,
@@ -6430,6 +6438,81 @@ export function recoveryService(
         // issue whose only crime was being adopted once.
         adoptionHandoverLostSuccessor = !adoptingRun;
         latestRun = adoptingRun;
+      }
+      const agent = await getAgent(agentId);
+      const agentInvokable = agent && agent.companyId === issue.companyId
+        ? await isAgentInvokable(agent)
+        : false;
+      if (
+        latestRun?.errorCode === "issue_dependencies_blocked" &&
+        (issue.status === "in_review" || !agentInvokable)
+      ) {
+        const readiness = await issuesSvc.getDependencyReadiness(issue.id);
+        const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
+        // A dependency-ready issue has no blocker wake backstop unless this
+        // reconciliation persists one. Do not manufacture a blocked state for
+        // that case: the blocked-only reconciler would immediately flip it to
+        // todo and this sweep could put it back into blocked on every pass.
+        let nextStatus: "blocked" | "todo" | null = readiness.unresolvedBlockerCount > 0
+          ? "blocked"
+          : null;
+        if (readiness.unresolvedBlockerCount === 0 && resolvedBlockerIssueId && issue.assigneeAgentId) {
+          // `enqueueWakeup` signals "woke nobody" two different ways, and only one of
+          // them is a null return. The benign deferrals (wake-on-demand disabled,
+          // cooldown, concurrency gating) return null, but a wholly non-invokable
+          // assignee — paused, terminated, invalid org chain — or an exhausted budget
+          // THROWS a 409 instead (`heartbeat.ts` invokability and budget guards).
+          //
+          // That throw is the *expected* shape here, not an anomaly: one of the two
+          // ways to reach this branch at all is `!agentInvokable`. Letting it escape
+          // would abort the entire sweep mid-loop, so a single paused assignee would
+          // strand every issue queued behind it. Treat it exactly like a declined wake:
+          // leave `nextStatus` null so the issue keeps the status it already has, and
+          // let the blockers-resolved sweep pick it up once the assignee is invokable.
+          try {
+            const wake = await deps.enqueueWakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              payload: {
+                issueId: issue.id,
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+                backstop: "stranded_recovery_reconciliation",
+              },
+              idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({
+                dependentIssueId: issue.id,
+                resolvedBlockerIssueId,
+              }),
+              requestedByActorType: "system",
+              requestedByActorId: "stranded_recovery_reconciliation",
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                source: "recovery.reconcile_stranded_assigned_issue",
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+              },
+            });
+            if (wake) nextStatus = "todo";
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id, agentId: issue.assigneeAgentId, resolvedBlockerIssueId },
+              "failed to enqueue dependency wake during stranded recovery reconciliation; leaving issue status unchanged",
+            );
+          }
+        }
+        const updated = nextStatus === null || issue.status === nextStatus
+          ? issue
+          : await issuesSvc.update(issue.id, { status: nextStatus });
+        if (updated) result.issueIds.push(issue.id);
+        result.skipped += 1;
+        continue;
+      }
+      if (issue.status !== "in_review" && !agentInvokable) {
+        result.skipped += 1;
+        continue;
       }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
@@ -9373,6 +9456,15 @@ export function recoveryService(
     const result = {
       cleared: 0,
       issueIds: [] as string[],
+      // BLO-22060: the sweep revalidates every candidate under FOR UPDATE and
+      // bails out silently when the lock moved between the scan and the
+      // transaction. That is correct — but it was also invisible, so a renewal
+      // landing repeatedly on the sweep's own cadence (30s) could starve the
+      // clear indefinitely and look identical to "nothing was stale". Count the
+      // bailouts so the starvation is observable in the sweep result and in the
+      // log line below.
+      skippedByConcurrentLockChange: 0,
+      skippedByConcurrentLockChangeIssueIds: [] as string[],
     };
 
     const candidates = await db
@@ -9587,10 +9679,15 @@ export function recoveryService(
           .then((rows) => rows[0] ?? null);
 
         if (!currentIssue) return null;
-        if (currentIssue.checkoutRunId !== issue.checkoutRunId) return null;
-        if (currentIssue.executionRunId !== issue.executionRunId) return null;
+        // BLO-22060: concurrent-bump bailouts — the lock moved between the
+        // pre-transaction scan and this revalidation. Report them distinctly
+        // from "revalidated and found not stale" (plain null below) so a lock
+        // that keeps being renewed under the sweep is visible rather than
+        // indistinguishable from a quiet pass.
+        if (currentIssue.checkoutRunId !== issue.checkoutRunId) return LOCK_CHANGED_UNDER_SWEEP;
+        if (currentIssue.executionRunId !== issue.executionRunId) return LOCK_CHANGED_UNDER_SWEEP;
         if ((currentIssue.executionLockedAt?.getTime() ?? null) !== (issue.executionLockedAt?.getTime() ?? null)) {
-          return null;
+          return LOCK_CHANGED_UNDER_SWEEP;
         }
 
         const currentReferencedRunIds = [
@@ -9721,7 +9818,26 @@ export function recoveryService(
           })
           .then((rows) => rows[0] ?? null);
 
-        if (!updated) return null;
+        if (!updated) return LOCK_CHANGED_UNDER_SWEEP;
+
+        // BLO-22060: the release must outlive the issue row we just nulled.
+        // The run itself is deliberately left alive (a `scheduled_retry` park
+        // still has to fire at its deadline, and a `queued` run must stay
+        // claimable), and enqueueWakeup's legacy-run fallback would otherwise
+        // re-adopt that same run and re-stamp executionLockedAt, restarting the
+        // 6h clock on every wake. Recording the release on the run is what lets
+        // adoption decline. Counted for whatever status held the lock — the
+        // fallback can select `queued`, `running` and `scheduled_retry` alike,
+        // and a released park that is later promoted reaches it as `queued`.
+        if (currentIssue.executionRunId) {
+          await tx
+            .update(heartbeatRuns)
+            .set({
+              issueLockReleaseCount: sql`${heartbeatRuns.issueLockReleaseCount} + 1`,
+              updatedAt: clearedAt,
+            })
+            .where(eq(heartbeatRuns.id, currentIssue.executionRunId));
+        }
 
         // BLO-21621: clearing a stale pre-claim lock is the only positive
         // evidence that a queued row previously owned, and then lost, this
@@ -10006,6 +10122,21 @@ export function recoveryService(
         }
       });
 
+      if (sweepOutcome === LOCK_CHANGED_UNDER_SWEEP) {
+        result.skippedByConcurrentLockChange += 1;
+        result.skippedByConcurrentLockChangeIssueIds.push(issue.id);
+        logger.warn(
+          {
+            issueId: issue.id,
+            companyId: issue.companyId,
+            executionRunId: issue.executionRunId,
+            checkoutRunId: issue.checkoutRunId,
+            scannedExecutionLockedAt: issue.executionLockedAt?.toISOString() ?? null,
+          },
+          "stale issue lock sweep skipped: lock changed between scan and clear",
+        );
+        continue;
+      }
       if (!sweepOutcome) continue;
       const { updated } = sweepOutcome;
 

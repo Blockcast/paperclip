@@ -805,8 +805,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       id: randomUUID(),
       agentId: coderId,
       status: "failed",
-      error: "adapter failed",
-      errorCode: "adapter_failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
       contextSnapshot: { retryReason: "issue_continuation_needed" },
       livenessState: "needs_followup",
       resultJson: null,
@@ -965,7 +965,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ["adapter_failed", "successful_run_missing_state", "coder"],
     ["codex_output_inactivity_monitor", undefined, "coder"],
     ["workspace_validation_failed", "workspace_validation_failed", "manager"],
-    ["adapter_failed", undefined, "manager"],
+    ["adapter_failed", undefined, "coder"],
+    ["job_failed", undefined, "coder"],
+    ["k8s_pod_schedule_failed", undefined, "coder"],
   ] as const)(
     "routes %s recovery through the cause-keyed playbook",
     async (errorCode, explicitCause, expectedOwner) => {
@@ -1000,6 +1002,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .from(issueRecoveryActions)
         .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
       expect(action?.ownerAgentId).toBe(expectedOwnerId);
+      if (expectedOwner === "coder") {
+        expect(action?.returnOwnerAgentId).toBe(coderId);
+      }
       if (errorCode === "workspace_validation_failed") {
         expect(action?.wakePolicy).toMatchObject({
           type: "manual_repair_required",
@@ -1014,7 +1019,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         expect.objectContaining({
           reason: "source_scoped_recovery_action",
           payload: expect.objectContaining({
-            recoveryCause: explicitCause ?? (errorCode === "adapter_failed" ? "stranded_assigned_issue" : errorCode),
+            recoveryCause: explicitCause ?? (
+              errorCode === "process_lost" || errorCode === "codex_output_inactivity_monitor"
+                ? errorCode
+                : "stranded_assigned_issue"
+            ),
           }),
         }),
       );
@@ -1608,8 +1617,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       id: randomUUID(),
       agentId: coderId,
       status: "failed",
-      error: "adapter failed",
-      errorCode: "adapter_failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
       contextSnapshot: { retryReason: "issue_continuation_needed" },
       livenessState: "needs_followup",
       resultJson: null,
@@ -1681,8 +1690,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const baseRun = {
       agentId: coderId,
       status: "failed",
-      error: "adapter failed",
-      errorCode: "adapter_failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
       contextSnapshot: { retryReason: "issue_continuation_needed" },
       livenessState: "needs_followup",
       resultJson: null,
@@ -1856,8 +1865,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const baseRun = {
       agentId: coderId,
       status: "failed",
-      error: "adapter failed",
-      errorCode: "adapter_failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
       contextSnapshot: { retryReason: "issue_continuation_needed" },
       livenessState: "needs_followup",
       resultJson: null,
@@ -2009,8 +2018,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           id: randomUUID(),
           agentId: engId,
           status: "failed",
-          error: "adapter failed",
-          errorCode: "adapter_failed",
+          error: "agent is not invokable",
+          errorCode: "agent_not_invokable",
           contextSnapshot: { retryReason: "issue_continuation_needed" },
           livenessState: "needs_followup",
           resultJson: null,
@@ -2128,8 +2137,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           id: randomUUID(),
           agentId: runAgentId,
           status: "failed",
-          error: "adapter failed",
-          errorCode: "adapter_failed",
+          error: "agent is not invokable",
+          errorCode: "agent_not_invokable",
           contextSnapshot: { retryReason: "issue_continuation_needed" },
           livenessState: "needs_followup",
           resultJson: null,
@@ -2188,6 +2197,104 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }
 
     expect(enqueueWakeup.mock.calls.map((call) => call[0])).toEqual([emId, ctoId]);
+  });
+
+  // BLO-19123 F1. Infra faults clear on their own, so escalating them up the manager ladder
+  // manufactures the re-home ratchet this issue exists to remove: the manager inherits a row
+  // it cannot act on, and the IC who was actually doing the work is never woken again.
+  // `seedRoutingCase` is shared by the route-back cases and the control so the ONLY variable
+  // between them is the error code.
+  const seedRoutingCase = async () => {
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const ctoId = randomUUID();
+    const emId = randomUUID();
+    const engId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `RT${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Infra Routing Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentBase = {
+      companyId,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    } as const;
+    await db.insert(agents).values([
+      { ...agentBase, id: ceoId, name: "CEO", role: "ceo" },
+      { ...agentBase, id: ctoId, name: "CTO", role: "cto", reportsTo: ceoId },
+      { ...agentBase, id: emId, name: "EM", role: "engineer", reportsTo: ctoId },
+      { ...agentBase, id: engId, name: "Eng", role: "engineer", reportsTo: emId },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Infra fault routing",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: engId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => ({ id: randomUUID() })),
+    });
+    const sweep = async (errorCode: string) => {
+      const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: fresh!,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: engId,
+          status: "failed",
+          error: errorCode,
+          errorCode,
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      return row!;
+    };
+    return { sweep, emId, engId };
+  };
+
+  it.each([
+    "job_failed",
+    "k8s_pod_schedule_failed",
+    "adapter_failed",
+    "external_lifecycle_stale_killed",
+    "k8s_concurrency_guard_unreachable",
+  ])("routes a %s strand back to the original agent instead of the manager ladder", async (errorCode) => {
+    const { sweep, engId } = await seedRoutingCase();
+    const action = await sweep(errorCode);
+    // The AC's assertion: the infra class must not transfer ownership at all.
+    expect(action.ownerAgentId).toBe(action.returnOwnerAgentId);
+    expect(action).toMatchObject({ ownerAgentId: engId, returnOwnerAgentId: engId });
+    expect(action.evidence).toMatchObject({ routingFallbackReason: null });
+  });
+
+  it("still escalates a non-infra strand to the manager ladder", async () => {
+    // The control that makes the cases above load-bearing rather than vacuous: an identical
+    // sweep whose only difference is a fault that does NOT clear on its own still transfers.
+    const { sweep, emId, engId } = await seedRoutingCase();
+    const action = await sweep("workspace_validation_failed");
+    expect(action).toMatchObject({ ownerAgentId: emId, previousOwnerAgentId: engId });
+    expect(action.ownerAgentId).not.toBe(action.returnOwnerAgentId);
   });
 
   it("re-anchors the handoff grant when the same agent is transferred away by a distinct failed run", async () => {
@@ -2258,8 +2365,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           id: runId,
           agentId: runAgentId,
           status: "failed",
-          error: "adapter failed",
-          errorCode: "adapter_failed",
+          // The error code must stay OUT of `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` (BLO-19123
+          // F1). This test's subject is the handoff-grant ANCHOR, and an anchor only exists
+          // because ownership was transferred away — so it needs a fault that still takes the
+          // manager ladder. `adapter_failed` was that before F1 reclassified it as a
+          // self-clearing infra fault which now routes back to the original agent, leaving
+          // nothing transferred and nothing to anchor. Do not "restore" it.
+          error: "workspace validation failed",
+          errorCode: "workspace_validation_failed",
           contextSnapshot: { retryReason: "issue_continuation_needed" },
           livenessState: "needs_followup",
           resultJson: null,
@@ -2379,8 +2492,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           id: randomUUID(),
           agentId: runAgentId,
           status: "failed",
-          error: "adapter failed",
-          errorCode: "adapter_failed",
+          // Must stay out of `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` (BLO-19123 F1) for the same
+          // reason as the re-anchoring test above: no transfer means no anchor to preserve.
+          error: "workspace validation failed",
+          errorCode: "workspace_validation_failed",
           contextSnapshot: { retryReason: "issue_continuation_needed" },
           livenessState: "needs_followup",
           resultJson: null,
@@ -2472,8 +2587,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const baseRun = {
       agentId: engId,
       status: "failed",
-      error: "adapter failed",
-      errorCode: "adapter_failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
       contextSnapshot: { retryReason: "issue_continuation_needed" },
       livenessState: "needs_followup",
       resultJson: null,
@@ -2747,8 +2862,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const baseRun = {
       agentId: coderId,
       status: "failed",
-      error: "adapter failed",
-      errorCode: "adapter_failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
       contextSnapshot: { retryReason: "issue_continuation_needed" },
       livenessState: "needs_followup",
       resultJson: null,
@@ -3617,11 +3732,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
-  it("marks a recovery action stale when a blocked source issue is manually moved to todo", async () => {
-    const { companyId, managerId, sourceIssueId } = await seedCompany();
+  it("hands stale recovery back when a blocked source issue is manually moved to todo", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({ status: "blocked", assigneeAgentId: managerId, assigneeUserId: null })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -3630,6 +3745,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       kind: "issue_graph_liveness",
       ownerType: "agent",
       ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
       cause: "issue_graph_liveness",
       fingerprint: "graph-liveness:manual-restore",
       evidence: { latestIssueStatus: "blocked" },
@@ -3646,6 +3763,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(patched.body).toMatchObject({
       id: sourceIssueId,
       status: "todo",
+      assigneeAgentId: coderId,
+      assigneeUserId: null,
       activeRecoveryAction: null,
     });
 
@@ -3659,6 +3778,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resolutionNote: "Recovery action became stale because the source issue was manually moved from blocked to todo.",
     });
     expect(actionRow?.resolvedAt).toBeTruthy();
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({ status: "todo", assigneeAgentId: coderId, assigneeUserId: null });
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
 
     const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
@@ -3674,6 +3795,81 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")?.details).toMatchObject({
       source: "source_revalidation",
       trigger: "issue_update",
+    });
+  });
+
+  it("does not hand a user-assigned blocked issue to a recovery return owner", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:user-owned-blocked",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Leave the human-owned issue alone.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const patched = await request(createApp())
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "todo" })
+      .expect(200);
+
+    expect(patched.body).toMatchObject({
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user",
+    });
+  });
+
+  it("rejects a blocked-to-todo hand-back to a terminated return owner", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId, assigneeUserId: null })
+      .where(eq(issues.id, sourceIssueId));
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, coderId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:terminated-return-owner",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+
+    await request(createApp())
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "todo" })
+      .expect(409);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: managerId,
+      assigneeUserId: null,
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+      returnOwnerAgentId: coderId,
     });
   });
 

@@ -51,7 +51,7 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginPerformActionContext } from "./protocol.js";
+import type { PluginPerformActionContext, WorkerToHostMethods } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -1145,6 +1145,36 @@ export interface PluginLogger {
 // ---------------------------------------------------------------------------
 
 /**
+ * `ctx.costs` — record settlement-side finance events.
+ *
+ * Requires `costs.write` capability.
+ *
+ * This writes `finance_events`, **not** `cost_events`. Execution adapters already
+ * emit a `cost_events` row per run from their own token accounting; a plugin writing
+ * there would double-count the same traffic. `finance_events` is the settlement ledger
+ * that sits alongside those estimates, so an external biller can be reconciled against
+ * what the adapters self-reported.
+ *
+ * @see PLUGIN_SPEC.md §15.1 — Capabilities: Data Write
+ */
+export interface PluginCostsClient {
+  /**
+   * Record a finance event.
+   *
+   * Idempotent on `(companyId, externalInvoiceId)`: calling again with the same
+   * `externalInvoiceId` returns the existing row with `created: false` rather than
+   * inserting a duplicate. Always supply a stable `externalInvoiceId` for anything
+   * a scheduled job may re-run.
+   *
+   * Set `estimated: true` whenever the amount is derived from an estimate rather
+   * than a settled invoice.
+   */
+  recordFinanceEvent(
+    params: WorkerToHostMethods["costs.finance.create"][0],
+  ): Promise<WorkerToHostMethods["costs.finance.create"][1]>;
+}
+
+/**
  * `ctx.metrics` — write plugin-contributed metrics.
  *
  * Requires `metrics.write` capability.
@@ -2212,6 +2242,9 @@ export interface PluginContext {
 
   /** Register agent tool handlers. Requires `agent.tools.register`. */
   tools: PluginToolsClient;
+
+  /** Record settlement-side finance events. Requires `costs.write`. */
+  costs: PluginCostsClient;
 
   /** Write plugin metrics. Requires `metrics.write`. */
   metrics: PluginMetricsClient;

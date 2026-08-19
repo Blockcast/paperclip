@@ -13,10 +13,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
-const repoRoot = path.resolve(new URL("..", import.meta.url).pathname);
+// fileURLToPath, not URL.pathname: pathname does not percent-decode, so a
+// checkout path containing a space or non-ASCII character would resolve wrong.
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const scriptPath = path.join(repoRoot, "scripts/approve-paperclip-api-digest.sh");
 const script = readFileSync(scriptPath, "utf8");
 
@@ -31,11 +34,36 @@ function extractShellFunction(name) {
   return lines.slice(start, end + 1).join("\n");
 }
 
+// The defaults are READ OUT OF THE SCRIPT, not hard-coded. The whole point of
+// extracting the function is that a rename fails here rather than silently
+// testing a stale copy — but that guarantee was hollow while the two numbers the
+// budget assertion depends on were literals. Changing the script's ceiling to 4
+// would have left `total === 286` passing green while the real budget became
+// 158s and the script's own "40 attempts ~= 286s" comment became false: a silent
+// divergence in the exact quantity this fix exists to control.
+function shellDefault(knob) {
+  const m = script.match(new RegExp(`\\$\\{PAPERCLIP_APPROVAL_${knob}:-(\\d+)\\}`));
+  assert.ok(m, `could not read the PAPERCLIP_APPROVAL_${knob} default out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+// Likewise the upper bounds, so the rejection tests cannot drift from the script.
+function shellLimit(name) {
+  const m = script.match(new RegExp(`^${name}=(\\d+)$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+const DEFAULT_ATTEMPTS = shellDefault("PROBE_ATTEMPTS");
+const DEFAULT_MAX_SLEEP = shellDefault("PROBE_MAX_SLEEP_SECONDS");
+const ATTEMPTS_LIMIT = shellLimit("PROBE_ATTEMPTS_LIMIT");
+const MAX_SLEEP_LIMIT = shellLimit("PROBE_MAX_SLEEP_SECONDS_LIMIT");
+
 const backoffSource = extractShellFunction(FUNCTION_NAME);
 
 // Returns the delay the shipping function yields for each attempt, under the
 // given ceiling. One bash invocation per call, not per attempt.
-function delaysFor(attempts, maxSleepSeconds = 8) {
+function delaysFor(attempts, maxSleepSeconds = DEFAULT_MAX_SLEEP) {
   const harness = [
     "set -euo pipefail",
     `PROBE_MAX_SLEEP_SECONDS=${maxSleepSeconds}`,
@@ -58,9 +86,49 @@ test("backoff follows the documented 1,1,2,2,4,4,8,8 ramp and holds at the ceili
   assert.deepEqual(delaysFor(range(1, 12)), [1, 1, 2, 2, 4, 4, 8, 8, 8, 8, 8, 8]);
 });
 
-test("the default 40-attempt window spends the sleep budget the comment claims", () => {
-  const total = delaysFor(range(1, 40)).reduce((sum, delay) => sum + delay, 0);
-  assert.equal(total, 286);
+// The budget prose wraps across several `#` lines, so assertions about it match
+// a normalised form rather than a brittle single-line regex.
+const commentText = script
+  .split("\n")
+  .filter((line) => line.trimStart().startsWith("#"))
+  .map((line) => line.trimStart().replace(/^#\s?/, ""))
+  .join(" ")
+  .replace(/\s+/g, " ");
+
+test("the script documents BOTH sleep quantities, and both match the arithmetic", () => {
+  // Two different numbers live here and conflating them is the exact defect this
+  // guards: probe_backoff_seconds summed over every attempt, versus what the
+  // loop actually sleeps — the final attempt does not sleep, so the loop spends
+  // one whole ceiling less. The prior version of this test asserted only the
+  // former while the comment claimed it was the latter, so the suite actively
+  // defended a figure that was wrong by exactly PROBE_MAX_SLEEP_SECONDS.
+  assert.equal(DEFAULT_ATTEMPTS, 40, "default attempt count moved; update the script comment too");
+  assert.equal(DEFAULT_MAX_SLEEP, 8, "default ceiling moved; update the script comment too");
+
+  const sum = (delays) => delays.reduce((total, delay) => total + delay, 0);
+  const functionTotal = sum(delaysFor(range(1, DEFAULT_ATTEMPTS)));
+  const loopSleeps = sum(delaysFor(range(1, DEFAULT_ATTEMPTS - 1)));
+
+  assert.equal(functionTotal, 286);
+  assert.equal(loopSleeps, 278);
+  assert.equal(
+    functionTotal - loopSleeps,
+    DEFAULT_MAX_SLEEP,
+    "the skipped final sleep should be exactly one ceiling",
+  );
+
+  // Expected prose is built FROM the computed values, so the comment cannot
+  // drift away from the arithmetic in either direction.
+  assert.match(
+    commentText,
+    new RegExp(`over ${DEFAULT_ATTEMPTS} attempts totals ${functionTotal}s`),
+    `the script comment no longer states the function's ${functionTotal}s total`,
+  );
+  assert.match(
+    commentText,
+    new RegExp(`exhausted window spends ${loopSleeps}s sleeping`),
+    `the script comment no longer states the loop's real ${loopSleeps}s budget`,
+  );
 });
 
 test("a raised ceiling is honoured and never exceeded", () => {
@@ -140,6 +208,50 @@ test("an empty probe knob falls through to the default rather than failing", () 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /is not a positive integer/);
+});
+
+// Shape validation alone left the same class of hazard the clamp closed:
+// PAPERCLIP_APPROVAL_PROBE_ATTEMPTS=4000 is one stray zero on the default 40 and
+// buys ~8.9h of probing while the in-flight approval lock is held. Only CI has a
+// deadline; the hand-invoked path documented in the runbook has none.
+//
+// The two 20-digit cases are the reason the guard checks digit WIDTH before
+// magnitude. `(( ))` is signed 64-bit: 2^64 + 40 wraps to exactly 40, so a bare
+// `(( value > limit ))` returns false and passes it through to
+// `seq 1 "$PROBE_ATTEMPTS"`, which iterates on the unwrapped literal
+// essentially forever with the lock held. 99999999999999999999 was caught
+// before only by luck — it wraps to 7766279631452241919, still above the limit.
+test("an out-of-range probe knob is rejected before the approval ring is touched", () => {
+  const cases = [
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", String(ATTEMPTS_LIMIT + 1)],
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "4000"],
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "18446744073709551656"],
+    ["PAPERCLIP_APPROVAL_PROBE_ATTEMPTS", "99999999999999999999"],
+    ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", String(MAX_SLEEP_LIMIT + 1)],
+    ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", "86400"],
+    ["PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS", "18446744073709555200"],
+  ];
+  for (const [knob, value] of cases) {
+    const result = runWithKnobs({ [knob]: value });
+    assert.equal(result.status, 2, `${knob}='${value}' should exit 2, got ${result.status}`);
+    assert.match(
+      result.stderr,
+      new RegExp(`${knob}=.*exceeds the \\d+ maximum`),
+      `${knob}='${value}' should name the knob and its bound, got: ${result.stderr}`,
+    );
+  }
+});
+
+// The bound is a fat-finger guard, not a policy: a deliberate widening well past
+// the default must still be accepted, right up to the limit.
+test("a deliberately widened knob at the limit is still accepted", () => {
+  const result = runWithKnobs({
+    PAPERCLIP_APPROVAL_PROBE_ATTEMPTS: String(ATTEMPTS_LIMIT),
+    PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS: String(MAX_SLEEP_LIMIT),
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
+  assert.doesNotMatch(result.stderr, /is not a positive integer|exceeds the/);
 });
 
 test("valid knobs pass validation and the script proceeds to the deploy credential", () => {

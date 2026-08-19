@@ -128,16 +128,57 @@ fi
 # in-flight lock held. The exhaustion message at the end of this script actively
 # directs operators to raise the attempt count, so these are turned by hand
 # under pressure and must fail legibly.
+#
+# An explicitly-empty value falls through to the default on purpose: a CI `env:`
+# expression that resolves to "" must not fail a deploy.
+#
+# Shape AND magnitude are both checked. A bare digits pattern would accept 4000
+# — one stray zero on the default 40 — which is ~8.9h of probing while holding
+# the in-flight approval lock. That is the same hazard class the exponent clamp
+# closes. The exhaustion message points an operator at this exact knob while a
+# release is wedged, and only CI has a deadline to catch an overshoot (bash does
+# run the EXIT trap on SIGTERM, so the CI kill at least retires the lock); the
+# hand-invoked path has none. The ceilings below are fat-finger guards, not
+# policy: a deliberate widening well past the default still fits.
 PROBE_ATTEMPTS="${PAPERCLIP_APPROVAL_PROBE_ATTEMPTS:-40}"
 PROBE_MAX_SLEEP_SECONDS="${PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS:-8}"
-if [[ ! "$PROBE_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "PAPERCLIP_APPROVAL_PROBE_ATTEMPTS='${PROBE_ATTEMPTS}' is not a positive integer" >&2
+PROBE_ATTEMPTS_LIMIT=1000
+PROBE_MAX_SLEEP_SECONDS_LIMIT=3600
+
+# Shape, then WIDTH, then magnitude — in that order, because `(( ))` evaluates in
+# signed 64-bit and silently wraps. 18446744073709551656 (2^64 + 40) satisfies
+# `^[1-9][0-9]*$`, wraps to 40 in arithmetic, and would sail through a bare
+# magnitude check — after which `seq 1 "$PROBE_ATTEMPTS"` iterates on the
+# unwrapped literal essentially forever with the in-flight lock held, the exact
+# hazard the ceiling exists to close. Rejecting on digit count first means no
+# value wide enough to wrap ever reaches arithmetic. The width is derived from
+# the limit rather than hardcoded, so it cannot drift away from it.
+#
+# Returns 1 for a malformed value and 2 for an out-of-range one, so the caller
+# can attach knob-specific guidance to the range case only.
+require_bounded_positive_int() {
+  local name="$1" value="$2" limit="$3"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${name}='${value}' is not a positive integer" >&2
+    return 1
+  fi
+  if (( ${#value} > ${#limit} )) || (( value > limit )); then
+    echo "${name}='${value}' exceeds the ${limit} maximum" >&2
+    return 2
+  fi
+}
+
+knob_status=0
+require_bounded_positive_int PAPERCLIP_APPROVAL_PROBE_ATTEMPTS \
+  "$PROBE_ATTEMPTS" "$PROBE_ATTEMPTS_LIMIT" || knob_status=$?
+if (( knob_status != 0 )); then
+  if (( knob_status == 2 )); then
+    echo "that many probes would hold the in-flight approval lock for hours; widen deliberately, not by typo" >&2
+  fi
   exit 2
 fi
-if [[ ! "$PROBE_MAX_SLEEP_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS='${PROBE_MAX_SLEEP_SECONDS}' is not a positive integer" >&2
-  exit 2
-fi
+require_bounded_positive_int PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS \
+  "$PROBE_MAX_SLEEP_SECONDS" "$PROBE_MAX_SLEEP_SECONDS_LIMIT" || exit 2
 if [[ -z "${PAPERCLIP_DEPLOY_KUBECONFIG:-}" \
       || ! -f "$PAPERCLIP_DEPLOY_KUBECONFIG" ]]; then
   echo "PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential used for the admission probe" >&2
@@ -684,7 +725,10 @@ fi
 # PROBE_ATTEMPTS and PROBE_MAX_SLEEP_SECONDS are resolved and range-checked in
 # the operator-env block near the top, before the in-flight lock is taken.
 #
-# 1,1,2,2,4,4,8,8,... capped. 40 attempts ≈ 286s of sleep. The exponent is
+# 1,1,2,2,4,4,8,8,... capped. Two different quantities, kept distinct on purpose
+# because conflating them is what this fix exists to prevent: probe_backoff_seconds
+# over 40 attempts totals 286s, but the loop skips the sleep after the final
+# attempt, so an exhausted window spends 278s sleeping. The exponent is
 # clamped before shifting: bash arithmetic is signed 64-bit, so `1 << 63` is
 # INT64_MIN and a raised PAPERCLIP_APPROVAL_PROBE_ATTEMPTS — which the
 # exhaustion message below tells operators to do — would otherwise hand `sleep`
@@ -777,7 +821,17 @@ for attempt in $(seq 1 "$PROBE_ATTEMPTS"); do
     break
   fi
   record_probe_attempt "$attempt"
-  sleep "$(probe_backoff_seconds "$attempt")"
+  # No sleep after the final attempt: the loop is about to end, so it buys
+  # nothing and would inflate the elapsed figure reported below by one whole
+  # ceiling — overstating the window in the very message an operator reads to
+  # decide whether to widen it. Spelled as an `if` rather than
+  # `(( … )) && sleep`: a false `(( … ))` yields a non-zero status, and this is
+  # the last command in the loop body, so the safe reading depends on a `set -e`
+  # exemption. An abort here would strand the in-flight lock; not worth the
+  # subtlety to save two lines.
+  if (( attempt < PROBE_ATTEMPTS )); then
+    sleep "$(probe_backoff_seconds "$attempt")"
+  fi
 done
 if [[ -z "$server_plan_ready" ]]; then
   probe_elapsed_seconds=$(( $(date +%s) - probe_started_at ))

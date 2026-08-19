@@ -8,6 +8,7 @@ import {
   authUsers,
   budgetIncidents,
   costEvents,
+  financeEvents,
   heartbeatRuns,
   invites,
   issues as issuesTable,
@@ -44,6 +45,7 @@ import { createMilestonesService } from "./milestones.js";
 import { documentService } from "./documents.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
+import { financeService } from "./finance.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -1453,6 +1455,83 @@ export function buildHostServices(
           entityId: params.entityId ?? pluginId,
           details: pluginActivityDetails(params.metadata),
         });
+      },
+    },
+
+    costs: {
+      async createFinanceEvent(params) {
+        const companyId = ensureCompanyId(params.companyId);
+
+        // finance_events is the settlement ledger that sits *alongside* the
+        // adapter-written cost_events estimates. Plugins deliberately cannot
+        // reach cost_events: adapters already emit a row per run for the same
+        // traffic, so a second writer there would double-count it.
+        const amountCents = Number(params.amountCents);
+        if (!Number.isFinite(amountCents) || !Number.isSafeInteger(amountCents)) {
+          throw new Error("amountCents must be a safe integer number of cents");
+        }
+        const occurredAt = new Date(params.occurredAt);
+        if (Number.isNaN(occurredAt.getTime())) {
+          throw new Error("occurredAt must be a valid ISO 8601 timestamp");
+        }
+        const biller = String(params.biller ?? "").trim();
+        if (!biller) throw new Error("biller is required");
+        const eventKind = String(params.eventKind ?? "").trim();
+        if (!eventKind) throw new Error("eventKind is required");
+
+        const externalInvoiceId = params.externalInvoiceId?.trim() || null;
+
+        // Idempotency: a scheduled reconciler re-running over the same window
+        // must not accumulate duplicate rows. Callers supply a stable
+        // externalInvoiceId and we treat it as the natural key.
+        //
+        // NOTE: select-then-insert is racy under concurrent writers. It is safe
+        // for the single-scheduled-job case this was built for. Hardening it
+        // needs a partial unique index on
+        // (company_id, external_invoice_id) WHERE external_invoice_id IS NOT NULL
+        // plus ON CONFLICT DO NOTHING — tracked as follow-up.
+        if (externalInvoiceId) {
+          const existing = await db
+            .select({ id: financeEvents.id })
+            .from(financeEvents)
+            .where(
+              and(
+                eq(financeEvents.companyId, companyId),
+                eq(financeEvents.externalInvoiceId, externalInvoiceId),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existing) {
+            logger.debug(
+              { pluginId, companyId, externalInvoiceId },
+              "Plugin finance event already recorded; returning existing row",
+            );
+            return { id: existing.id, created: false };
+          }
+        }
+
+        const event = await financeService(db).createEvent(companyId, {
+          eventKind,
+          biller,
+          provider: params.provider ?? null,
+          model: params.model ?? null,
+          amountCents,
+          currency: params.currency ?? "USD",
+          estimated: params.estimated ?? false,
+          quantity: params.quantity ?? null,
+          unit: params.unit ?? null,
+          externalInvoiceId,
+          description: params.description ?? null,
+          occurredAt,
+          metadataJson: params.metadata ? sanitiseMeta(params.metadata) : null,
+        });
+
+        logger.debug(
+          { pluginId, companyId, biller, amountCents, estimated: params.estimated ?? false },
+          "Plugin finance event recorded",
+        );
+        return { id: event.id, created: true };
       },
     },
 
