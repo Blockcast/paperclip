@@ -721,6 +721,35 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
+  it("stamps the running agent's git author identity on a created worktree, and re-stamps it on reuse", async () => {
+    // BLO-23894: the checkout's local user.email is the only thing that
+    // distinguishes one agent's `git push` from another's, and nothing used to
+    // set it. Reuse matters more than creation here: every already-existing
+    // checkout in the 2026-08-10 sweep reached a run through the reuse path.
+    const repoRoot = await createTempRepo();
+    const agentEmail = "codex-coder@paperclip.blockcast.net";
+
+    const created = await realizeWorktreeForTest(repoRoot, "HEAD");
+    await expect(readGit(created.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe(agentEmail);
+    await expect(readGit(created.cwd, ["config", "--local", "--get", "user.name"]))
+      .resolves.toBe("Codex Coder");
+    expect(created.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("per-agent git author identity")]),
+    );
+
+    await runGit(created.cwd, [
+      "config", "--local", "user.email",
+      "290875700+allyblockcast[bot]@users.noreply.github.com",
+    ]);
+
+    const reusedWorktree = await realizeWorktreeForTest(repoRoot, "HEAD");
+    expect(reusedWorktree.created).toBe(false);
+    expect(reusedWorktree.cwd).toBe(created.cwd);
+    await expect(readGit(reusedWorktree.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe(agentEmail);
+  });
+
   it("bases a fresh worktree on origin/master even when local master has unpushed commits", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const originHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);
@@ -2548,6 +2577,60 @@ describe("realizeExecutionWorkspace", () => {
       expect.stringContaining("adopted it for subsequent runs"),
     ]));
     await expect(readGit(initial.cwd, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 15_000);
+
+  it("re-stamps the agent git identity when a persisted worktree is reused without a provision command", async () => {
+    // BLO-23894: this reuse branch used to run provisioning only when a
+    // provisionCommand was configured, so the overwhelmingly common
+    // no-provision-command workspace was never stamped at all.
+    const repoRoot = await createTempRepo();
+    const initial = await realizeWorktreeForTest(repoRoot, "HEAD");
+    if (!initial.branchName) throw new Error("expected realized worktree branch name");
+
+    await runGit(initial.cwd, [
+      "config", "--local", "user.email",
+      "allyblockcast[bot]@users.noreply.github.com",
+    ]);
+    await runGit(initial.cwd, ["config", "--local", "user.name", "allyblockcast[bot]"]);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-identity",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: initial.cwd,
+        providerRef: initial.worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: initial.branchName,
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored?.cwd).toBe(initial.cwd);
+    await expect(readGit(initial.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("codex-coder@paperclip.blockcast.net");
+    await expect(readGit(initial.cwd, ["config", "--local", "--get", "user.name"]))
+      .resolves.toBe("Codex Coder");
   }, 15_000);
 
   it("classifies persisted git worktree branch incoherence as diverged when the checked-out branch is not forward", async () => {

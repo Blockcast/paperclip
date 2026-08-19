@@ -257,6 +257,7 @@ import {
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { ensureCheckoutGitIdentity } from "./git-checkout-identity.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -2501,7 +2502,14 @@ export function resolveRepoRelativeWorkspaceCwd(workspace: {
   return cwd;
 }
 
-async function ensureManagedProjectWorkspace(input: {
+/**
+ * Realize the managed checkout dir. Every exit here is an *unprovisioned*
+ * checkout: identity is applied by the `ensureManagedProjectWorkspace` wrapper
+ * below, which is the only caller. Keep it that way -- an early return added
+ * here inherits provisioning for free, whereas returning to a caller directly
+ * would silently reintroduce BLO-23894 for that path.
+ */
+async function resolveManagedProjectWorkspaceCheckout(input: {
   companyId: string;
   projectId: string;
   repoUrl: string | null;
@@ -2521,11 +2529,14 @@ async function ensureManagedProjectWorkspace(input: {
     return { cwd, warning: null };
   }
 
-  const gitDirExists = await fs
-    .stat(path.resolve(cwd, ".git"))
-    .then((entry) => entry.isDirectory())
+  // lstat + isDirectory()||isFile(): a linked worktree records `.git` as a FILE
+  // (a gitdir pointer), so an isDirectory()-only probe falls through to the
+  // "not a git checkout" branch below and mislabels a real checkout.
+  const gitMetadataExists = await fs
+    .lstat(path.resolve(cwd, ".git"))
+    .then((entry) => entry.isDirectory() || entry.isFile())
     .catch(() => false);
-  if (gitDirExists) {
+  if (gitMetadataExists) {
     return { cwd, warning: null };
   }
 
@@ -2550,6 +2561,35 @@ async function ensureManagedProjectWorkspace(input: {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
   }
+}
+
+/**
+ * Realize the managed checkout *and* stamp it with the running agent's git author
+ * identity (BLO-23894).
+ *
+ * The single exit point is the whole point: an already-cloned checkout is by far
+ * the common case, and it is the one the 2026-08-10 sweep found broken -- a fix
+ * applied only after a successful `git clone` would never reach any of the 29
+ * misconfigured checkouts. Provisioning here covers the pre-existing-`.git`
+ * return, the "exists but isn't a checkout" return (which includes linked
+ * worktrees), the repo-less return (a no-op, since there is no git metadata to
+ * write into), and the post-clone return alike.
+ */
+async function ensureManagedProjectWorkspace(input: {
+  companyId: string;
+  projectId: string;
+  repoUrl: string | null;
+  agent?: { id?: string | null; name?: string | null } | null;
+}): Promise<{ cwd: string; warnings: string[] }> {
+  const realized = await resolveManagedProjectWorkspaceCheckout(input);
+  const identity = await ensureCheckoutGitIdentity({
+    cwd: realized.cwd,
+    agent: input.agent ?? null,
+  });
+  return {
+    cwd: realized.cwd,
+    warnings: [realized.warning, identity.warning].filter((value): value is string => Boolean(value)),
+  };
 }
 
 type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
@@ -12235,7 +12275,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : projectWorkspaceRows;
       for (const workspace of realizationCandidates) {
         let projectCwd = readNonEmptyString(workspace.cwd);
-        let managedWorkspaceWarning: string | null = null;
+        let managedWorkspaceWarnings: string[] = [];
         // A workspace cwd is either an absolute host path or — for a repo-backed
         // workspace — a repo-relative subdirectory such as "packages/iwa". The
         // relative form only resolves once the repo is checked out, so realize
@@ -12252,11 +12292,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               companyId: agent.companyId,
               projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
               repoUrl: readNonEmptyString(workspace.repoUrl),
+              agent,
             });
             projectCwd = repoRelativeCwd
               ? await resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
               : managedWorkspace.cwd;
-            managedWorkspaceWarning = managedWorkspace.warning;
+            managedWorkspaceWarnings = managedWorkspace.warnings;
           } catch (error) {
             if (preferredWorkspace?.id === workspace.id) {
               preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
@@ -12278,7 +12319,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             repoUrl: workspace.repoUrl,
             repoRef: workspace.repoRef,
             workspaceHints,
-            warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
+            warnings: [preferredWorkspaceWarning, ...managedWorkspaceWarnings].filter(
               (value): value is string => Boolean(value),
             ),
             preferredProjectWorkspaceId,
@@ -12350,6 +12391,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: agent.companyId,
         projectId: workspaceProjectId,
         repoUrl: null,
+        agent,
       });
       return {
         cwd: managedWorkspace.cwd,
@@ -12359,7 +12401,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoUrl: null,
         repoRef: null,
         workspaceHints,
-        warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
+        warnings: managedWorkspace.warnings,
       };
     }
 
