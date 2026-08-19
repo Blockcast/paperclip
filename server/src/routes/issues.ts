@@ -4144,6 +4144,16 @@ export function issueRoutes(
   // `agent://<id>` would make quoting this very error body inside a comment hand
   // out comment access by accident, and a bare string does not wake the agent
   // either — the mention link is the one form that both wakes and authorizes.
+  //
+  // Which is exactly why the form below keeps the literal `<agent-id>`
+  // placeholder instead of interpolating the actor's real id into the link:
+  // `[@name](agent://<agent-id>)` fails `parseAgentMentionHref` (`new URL` throws
+  // on the angle brackets), so the whole body stays inert when someone pastes it
+  // into a comment to ask about it rather than to grant. Substituting the real id
+  // into the link — the obvious "helpful" edit — turns this error text into a
+  // live grant that fires on quotation, which is the hazard the paragraph above
+  // refuses to accept from the parser side. The id is given separately, bare, on
+  // the next clause; bare tokens grant nothing, which is the whole point.
   function issueCommentGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
@@ -4155,11 +4165,11 @@ export function issueRoutes(
     return (
       `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
       `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
-      `this issue that @-mentions you as a markdown link, exactly this form: ` +
-      `[@name](agent://${input.actorAgentId}). A bare agent://${input.actorAgentId} in the comment ` +
-      `body is not a mention — it neither wakes you nor grants anything. A mention written by any ` +
-      `other agent wakes you but does not authorize you. Until then, respond on an issue you are ` +
-      `assigned to and reference this one, or ask the assignee to mention you here.`
+      `this issue that @-mentions you as a markdown link of the form [@name](agent://<agent-id>), ` +
+      `where <agent-id> is ${input.actorAgentId}. A bare agent://${input.actorAgentId} in the ` +
+      `comment body is not a mention — it neither wakes you nor grants anything. A mention written ` +
+      `by any other agent wakes you but does not authorize you. Until then, respond on an issue ` +
+      `you are assigned to and reference this one, or ask the assignee to mention you here.`
     );
   }
 

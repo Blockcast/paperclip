@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { extractAgentMentionIds } from "@paperclipai/shared";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
@@ -2710,8 +2711,15 @@ describe("agent issue mutation checkout ownership", () => {
       // markdown link form, so the message has to show it. Prescribing "a comment
       // containing agent://<id>" sent an assignee to post a bare string that
       // grants nothing, and the retry returned this same text.
-      expect(remediation).toContain(`[@name](agent://${peerAgentId})`);
+      expect(remediation).toContain("[@name](agent://<agent-id>)");
       expect(remediation).toMatch(/bare agent:\/\/[^\s]+ in the comment body is not a mention/i);
+      // ...but the form is shown with a placeholder id, never the actor's real
+      // one, so the body cannot grant anything if it is pasted into a comment.
+      // The assignee who hit this 403 is precisely the actor who *can* grant, and
+      // quoting an error to ask about it is not consent to hand out write. This
+      // is the invariant, not the wording: whatever the text says, no substring
+      // of it may parse as a live mention.
+      expect(extractAgentMentionIds(remediation)).toEqual([]);
       // Corrects the specific false inference that caused the loop.
       expect(remediation).toMatch(/does not grant you comment access/i);
       // Names somewhere to respond instead, so the wake is not a dead end.
