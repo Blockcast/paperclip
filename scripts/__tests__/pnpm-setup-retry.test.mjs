@@ -20,6 +20,25 @@ const wrapperRef = "./.github/actions/setup-pnpm";
 // candidate exactly the same way but burns the runner for the full budget first.
 const MIN_TIMEOUT_MINUTES_FOR_RETRY = 10;
 
+// Direct calls are allowed at exactly these grandfathered sites. Keyed by
+// (workflow, ref) rather than matched as `@v\d+`, because a SHA pin -- the
+// direction repos drift for supply-chain reasons -- would sail straight past a
+// version-shaped pattern and reintroduce the bug the wrapper exists to fix.
+// Fails closed: an unlisted file, or a listed file on a different ref, is a
+// failure and has to be added here deliberately.
+const ALLOWED_DIRECT_CALLS = new Map([
+  ["e2e.yml", "v4"],
+  ["refresh-lockfile.yml", "v4"],
+  ["release-smoke.yml", "v4"],
+]);
+
+// Wrapper jobs that intentionally declare no budget and inherit GitHub's 360m
+// default. Everything else must declare one: otherwise "delete timeout-minutes"
+// becomes the cheapest way to satisfy the floor below, and trading a tight
+// budget for 360m is strictly worse merge-queue protection than the tight
+// budget was.
+const WRAPPER_JOBS_WITHOUT_A_BUDGET = new Set(["release-penstock-scope.yml:publish"]);
+
 const readWorkflows = async () => {
   const names = (await readdir(workflowDir)).filter((n) => n.endsWith(".yml"));
   return Promise.all(
@@ -64,34 +83,53 @@ const splitJobs = (body) => {
   return jobs;
 };
 
-test("no workflow reaches for pnpm/action-setup@v6-or-newer directly", async () => {
-  // v4 sites are grandfathered on purpose, not overlooked: v4 installs the exact
-  // requested version in one call with no self-update and no engine-identity
-  // verifier, so it never had this failure mode. Routing them through the
-  // wrapper would move them onto the v6 code path and hand them an exposure they
-  // do not currently have.
+test("no workflow reaches for pnpm/action-setup outside the grandfathered v4 sites", async () => {
+  // The v4 sites are grandfathered on purpose, not overlooked: v4 installs the
+  // exact requested version in one call with no self-update and no
+  // engine-identity verifier, so it never had this failure mode. Routing them
+  // through the wrapper would move them onto the v6 code path and hand them an
+  // exposure they do not currently have.
   for (const { name, body } of await readWorkflows()) {
-    const direct = [...stripComments(body).matchAll(/uses: pnpm\/action-setup@v(\d+)/g)]
-      .map((m) => Number(m[1]))
-      .filter((major) => major >= 6);
-
-    assert.equal(
-      direct.length,
-      0,
-      `${name} calls pnpm/action-setup@v${direct[0]} directly; use \`uses: ${wrapperRef}\` ` +
-        `so the registry fetch gets a retry (BLO-28813)`,
-    );
+    const file = name.slice(name.lastIndexOf("/") + 1);
+    // Deliberately NOT `@v(\d+)`: a SHA pin would not match, and would then be
+    // reported as "no direct calls" while reintroducing the bug.
+    for (const [, ref] of stripComments(body).matchAll(/uses: pnpm\/action-setup@(\S+)/g)) {
+      const allowed = ALLOWED_DIRECT_CALLS.get(file);
+      assert.equal(
+        ref,
+        allowed,
+        `${name} calls pnpm/action-setup@${ref} directly` +
+          (allowed
+            ? ` but is only grandfathered at @${allowed}`
+            : `; use \`uses: ${wrapperRef}\` so the registry fetch gets a retry`) +
+          ` (BLO-28813)`,
+      );
+    }
   }
 });
 
 test("every job that sets up pnpm has headroom for a second attempt", async () => {
   for (const { name, body } of await readWorkflows()) {
+    const file = name.slice(name.lastIndexOf("/") + 1);
     for (const job of splitJobs(stripComments(body))) {
       const text = job.lines.join("\n");
       if (!text.includes(wrapperRef)) continue;
 
       const declared = text.match(/^ {4}timeout-minutes: (\d+)$/m);
-      if (!declared) continue; // no explicit budget: GitHub's 360m default is ample
+      if (!declared) {
+        // Not a free pass: absence has to be listed. Otherwise deleting the
+        // line is the cheapest way to satisfy the floor, and inheriting
+        // GitHub's 360m default is strictly worse merge-queue protection than
+        // whatever tight budget was deleted.
+        assert.ok(
+          WRAPPER_JOBS_WITHOUT_A_BUDGET.has(`${file}:${job.name}`),
+          `${name} job "${job.name}" sets up pnpm with no timeout-minutes, so it inherits ` +
+            `GitHub's 360m default. Declare a budget of at least ` +
+            `${MIN_TIMEOUT_MINUTES_FOR_RETRY}m, or add it to WRAPPER_JOBS_WITHOUT_A_BUDGET ` +
+            `deliberately (BLO-28813)`,
+        );
+        continue;
+      }
 
       assert.ok(
         Number(declared[1]) >= MIN_TIMEOUT_MINUTES_FOR_RETRY,

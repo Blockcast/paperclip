@@ -84,12 +84,21 @@ runs:
         # completed in 70,506ms and was aborted anyway, so 120s turns that exact
         # case from a failure into a success.
         npm_config_fetch_timeout: "120000"
-        # pnpm's in-process retries are off on purpose: this action retries the
-        # whole step, and letting both layers retry multiplies the worst case
-        # (2 in-process x 2 step attempts = 6 registry stalls) inside jobs
-        # budgeted in single-digit minutes. One layer owns retry policy, and it
-        # is this one -- a fresh process on a fresh connection, jittered, which
-        # is a better retry than hammering a connection that just stalled.
+        # NOTE: `npm_config_*` is npm's namespace, not pnpm's, and run.ts spawns
+        # the bootstrap `npm ci` with `{...process.env}` -- so this disables
+        # retries for BOTH stages, not just the self-update the failures came
+        # from. That is deliberate, and the arithmetic is the reason:
+        #
+        #   per stage, master: 1 try + 2 in-process retries, 60s each, one step
+        #   per stage, here:   1 try each on 2 whole steps, 120s each, jittered
+        #
+        # So each stage trades 3 back-to-back attempts on one connection for 2
+        # attempts on fresh processes ~10-25s apart with double the deadline.
+        # Fewer raw attempts, better distributed, and bounded: leaving both
+        # layers on would be 2 in-process x 2 steps = up to 6 registry stalls,
+        # which does not fit the 10-minute floor the wrapper's own guard test
+        # asserts. Whoever next tunes this should move both stages together --
+        # this knob cannot separate them.
         npm_config_fetch_retries: "0"
       with:
         run_install: ${{ inputs.run_install }}
