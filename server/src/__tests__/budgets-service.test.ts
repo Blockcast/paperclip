@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   approvals,
@@ -132,6 +133,9 @@ describe("budgetService", () => {
     const dbStub = createDbStub([
       [policy],
       [{ total: 150 }],
+      // resolveOpenSoftIncidents() reads the open soft rows so it can withdraw
+      // any superseded soft card (BLO-28793); there are none here.
+      [],
       [],
       [{
         companyId: "company-1",
@@ -139,6 +143,8 @@ describe("budgetService", () => {
         status: "running",
         pauseReason: null,
       }],
+      // computeWindowBurn(): first cost event in the window.
+      [{ firstEventAt: new Date("2026-08-01T00:00:00Z") }],
     ]);
 
     dbStub.queueInsert([{
@@ -477,7 +483,8 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       .select()
       .from(budgetIncidents);
     expect(incidentRows.filter((incident) => incident.thresholdType === "soft")).toHaveLength(1);
-    expect(incidentRows[0]).toMatchObject({
+    const softIncident = incidentRows.find((incident) => incident.thresholdType === "soft")!;
+    expect(softIncident).toMatchObject({
       companyId,
       policyId: policy!.id,
       scopeType: "agent",
@@ -485,9 +492,34 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       thresholdType: "soft",
       amountLimit: 100,
       amountObserved: 80,
-      approvalId: null,
       status: "open",
     });
+
+    // BLO-28793: the warn threshold now files the board card, while the scope is
+    // still running and there is still cap left to raise. Two evaluations, one card.
+    expect(softIncident.approvalId).toBeTruthy();
+    const softApprovals = await db.select().from(approvals);
+    expect(softApprovals).toHaveLength(1);
+    const softApproval = softApprovals[0]!;
+    expect(softApproval).toMatchObject({
+      companyId,
+      type: "budget_override_required",
+      status: "pending",
+      idempotencyKey: `budget:${policy!.id}:soft:${softIncident.windowStart.toISOString()}`,
+    });
+    const softPayload = softApproval.payload as Record<string, unknown>;
+    expect(String(softPayload.title ?? "").trim().length).toBeGreaterThan(0);
+    expect(softPayload).toMatchObject({
+      thresholdType: "soft",
+      budgetAmount: 100,
+      observedAmount: 80,
+      remainingAmount: 20,
+    });
+    // Burn and runway are what make the card decidable: 80 spent, 20 left.
+    expect(softPayload.observedDailyBurn).toBeGreaterThan(0);
+    expect(typeof softPayload.projectedExhaustionAt).toBe("string");
+    expect(Date.parse(softPayload.projectedExhaustionAt as string)).toBeGreaterThan(Date.now());
+    expect(softPayload.projectedDaysRemaining).toBeGreaterThan(0);
 
     const [agentBeforeHardStop] = await db
       .select({ status: agents.status, pauseReason: agents.pauseReason })
@@ -512,12 +544,26 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       status: "open",
     });
 
-    const [approval] = await db.select().from(approvals);
+    // Crossing 100% is unchanged: a hard card is filed and the scope pauses. What
+    // is new is that the now-superseded soft card is withdrawn rather than left
+    // pending forever -- nothing resolves it once its incident is closed, because
+    // resolveOpenIncidentsForPolicy() only touches *open* incidents (BLO-28793).
+    const allApprovals = await db.select().from(approvals);
+    expect(allApprovals).toHaveLength(2);
+    const approval = allApprovals.find(
+      (row) => (row.payload as Record<string, unknown>).thresholdType === "hard",
+    );
     expect(approval).toMatchObject({
       companyId,
       type: "budget_override_required",
       status: "pending",
     });
+    expect(String((approval!.payload as Record<string, unknown>).title ?? "").trim().length)
+      .toBeGreaterThan(0);
+
+    const supersededSoft = allApprovals.find((row) => row.id === softApproval.id)!;
+    expect(supersededSoft).toMatchObject({ status: "withdrawn" });
+    expect(supersededSoft.decisionNote).toMatch(/[Ss]uperseded/);
 
     const [agentAfterHardStop] = await db
       .select({ status: agents.status, pauseReason: agents.pauseReason, pausedAt: agents.pausedAt })
@@ -568,6 +614,92 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       expect(call.details).not.toHaveProperty("prompt");
       expect(call.details).not.toHaveProperty("message");
     }
+  });
+
+  it("files the override card at warnPercent with multi-day runway, once, while the scope is still running (BLO-28793)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+
+    // The 2026-08-18 CTO wall, to scale: a $56,000 cap, warn at 80% = $44,800,
+    // leaving $11,200. A `lifetime` window is deliberate -- its windowStart is the
+    // 1970 epoch, so a burn rate measured against the nominal window would spread
+    // this spend over 56 years and report centuries of runway on the day before
+    // the wall. Burn is measured from the first counted cost event instead.
+    const capCents = 5_600_000;
+    const [policy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "lifetime",
+        amount: capCents,
+        warnPercent: 80,
+        hardStopEnabled: true,
+        notifyEnabled: true,
+        isActive: true,
+      })
+      .returning();
+
+    const fortyDaysAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    await insertCostEvent({ companyId, agentId, costCents: 4_479_999, occurredAt: fortyDaysAgo });
+    // Crosses warn ($44,800) and stops there -- still $11,200 under the cap.
+    const warnEvent = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(warnEvent);
+
+    const incidentRows = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId));
+    expect(incidentRows).toHaveLength(1);
+    expect(incidentRows[0]).toMatchObject({ thresholdType: "soft", status: "open" });
+
+    const cards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cards).toHaveLength(1);
+    const payload = cards[0]!.payload as Record<string, unknown>;
+
+    expect(cards[0]).toMatchObject({ type: "budget_override_required", status: "pending" });
+    expect(String(payload.title ?? "").trim().length).toBeGreaterThan(0);
+    expect(payload.title).toContain("warn threshold");
+    expect(payload).toMatchObject({
+      thresholdType: "soft",
+      budgetAmount: capCents,
+      observedAmount: 4_480_000,
+      remainingAmount: 1_120_000,
+    });
+
+    // ~$1,120/day over 40 days, so ~10 days of runway -- against a measured ~5h
+    // board decision latency. That margin is the entire point of the change.
+    expect(payload.observedDailyBurn).toBeCloseTo(112_000, -3);
+    expect(payload.projectedDaysRemaining as number).toBeGreaterThanOrEqual(9);
+    expect(payload.projectedDaysRemaining as number).toBeLessThan(11);
+    const projectedAt = Date.parse(payload.projectedExhaustionAt as string);
+    expect(projectedAt).toBeGreaterThan(Date.now() + 8 * 24 * 60 * 60 * 1000);
+
+    // The scope keeps running: this is a warning, not the hard stop.
+    const [agentRow] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    expect(agentRow).toMatchObject({ status: "active", pauseReason: null });
+    expect(cancelWorkForScope).not.toHaveBeenCalled();
+
+    // Idempotency: re-evaluating the same policy in the same window files nothing
+    // more, including after further spend that stays inside the warn band.
+    await service.evaluateCostEvent(warnEvent);
+    await service.evaluateCostEvent(warnEvent);
+    const moreSpend = await insertCostEvent({ companyId, agentId, costCents: 500_000 });
+    await service.evaluateCostEvent(moreSpend);
+
+    const cardsAfter = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cardsAfter).toHaveLength(1);
+    expect(cardsAfter[0]!.id).toBe(cards[0]!.id);
+    expect(cardsAfter[0]!.status).toBe("pending");
+    expect(cardsAfter[0]!.idempotencyKey).toBe(
+      `budget:${policy!.id}:soft:${incidentRows[0]!.windowStart.toISOString()}`,
+    );
   });
 
   it("hard-stops project work until a valid budget raise resumes it and overview reconciles ledger spend", async () => {
