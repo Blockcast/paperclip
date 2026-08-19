@@ -35,7 +35,7 @@ import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -520,6 +520,43 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
   if (latestRun?.errorCode !== "adapter_failed") return false;
   return /(?:usage|rate|quota) limit|quota (?:exceeded|reset)|try again after/i.test(latestRun.error ?? "");
+}
+
+// BLO-20933: a run that dies because its POD vanished (eviction, preemption, node
+// drain, or the Job being deleted out from under it) is an infrastructure event, not
+// an agent/adapter failure — the run never got a chance to succeed or fail on its own
+// merits. `paperclip-adapter-claude-k8s` cannot always tell a vanished pod apart from a
+// genuine crash at exit time, so a truncated stream surfaces as the same `claude_truncated`
+// code either way; the distinguishing signal is the pod-removal wording
+// `describeTruncationCause` attaches to the error text when the pod is confirmed missing.
+// `k8s_job_deleted_externally` is unambiguous by code alone. Exported so the routing
+// decision this feeds is auditable/testable independent of the cause plumbing below.
+//
+// `paperclip-adapter-claude-k8s`'s `execute.ts` emits exactly one fixed string for a
+// confirmed-missing pod: "pod is gone — Job pod was removed (eviction, preemption, or
+// external delete) before exit could be read". The eviction/preemption/external-delete
+// wording only ever appears inside that same sentence, so matching on it independently
+// added no true-positive coverage — it only widened the surface for an unrelated
+// `claude_truncated` message that happens to mention "eviction" to false-collide. The
+// two adapter markers below are the actual signal.
+export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean {
+  if (!latestRun) return false;
+  if (latestRun.errorCode === "k8s_job_deleted_externally") return true;
+  if (latestRun.errorCode !== "claude_truncated") return false;
+  return /pod is gone|pod was removed/i.test(latestRun.error ?? "");
+}
+
+// BLO-20933: `issuesSvc.update` enforces `expectedCurrentAssigneeAgentId` by THROWING a 409
+// (both from the pre-read snapshot check and from the zero-matched-rows path), never by
+// returning falsy. A recovery escalation that loses the assignee race must treat that as
+// "another writer won, skip this issue" rather than letting it propagate: the caller's
+// per-issue loop would otherwise abort the whole batch. Matched on the precondition detail
+// we set ourselves so unrelated 409s still surface.
+function isAssigneePreconditionConflict(error: unknown): boolean {
+  if (!(error instanceof HttpError) || error.status !== 409) return false;
+  const details = error.details;
+  if (!details || typeof details !== "object") return false;
+  return "expectedAssigneeAgentId" in details;
 }
 
 function resolveStrandedRecoveryCause(
@@ -4225,14 +4262,70 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     preferredOwnerAgentId?: string | null;
+    existingReturnOwnerAgentId?: string | null;
+    existingOwnerAgentId?: string | null;
   }) {
+    // `originalAgentId` intentionally keeps `latestRun.agentId` as the first candidate:
+    // `provider_quota` retries need the agent who actually hit the quota, which can
+    // diverge from `issue.assigneeAgentId` once THIS function has already escalated
+    // ownership to the manager on an earlier sweep — conflating "current assignee" with
+    // "the quota-hit run's agent" would retry the manager against a quota that was never
+    // theirs. `returnOwnerAgentId` below (used by the `routeToOriginal` re-dispatch causes)
+    // wants the opposite priority.
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
-    const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
+    // BLO-20933: prefer the issue's lock-fresh current assignee over the failed run's
+    // `agentId`. The two diverge whenever the issue was reassigned after that run started
+    // (or the run predates the current assignment) — routing back to a stale run-agent
+    // would hand the re-dispatch to someone who is no longer the owner.
+    //
+    // The recorded return owner is pinned ONLY when the current assignee is this
+    // subsystem's own escalation artifact. Once a prior sweep transferred ownership, it
+    // also wrote that owner onto the issue (`assigneeAgentId: action.ownerAgentId` below),
+    // so `assignee === existingOwnerAgentId` identifies an assignment WE manufactured —
+    // there the recorded return owner is the durable truth and reusing the assignee would
+    // make the manager the return owner and lose the original assignee permanently.
+    //
+    // When the assignee is anyone else, a third party genuinely reassigned the issue after
+    // the escalation, and that decision outranks our record. Pinning unconditionally here
+    // silently reverted such a reassignment from the second sweep onward — a laundering bug
+    // inside the laundering fix, re-introducing exactly the misrouting this issue exists to
+    // kill. `existingOwnerAgentId ?? existingReturnOwnerAgentId` is the comparison basis so
+    // that owner-less actions (a `provider_quota` wait records only a return owner) are
+    // still measured against the owner they effectively named.
+    const priorRecoveryOwnerAgentId = input.existingOwnerAgentId ??
+      input.existingReturnOwnerAgentId ??
+      null;
+    const assigneeSupersedesRecoveryOwner = input.issue.assigneeAgentId != null &&
+      priorRecoveryOwnerAgentId != null &&
+      input.issue.assigneeAgentId !== priorRecoveryOwnerAgentId;
+    const returnOwnerAgentId =
+      (assigneeSupersedesRecoveryOwner ? null : input.existingReturnOwnerAgentId) ??
+      input.issue.assigneeAgentId ??
+      originalAgentId;
     const routeToOriginal = input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
       input.recoveryCause === "codex_output_inactivity_monitor" ||
-      input.recoveryCause === "stranded_assigned_issue" &&
-        ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(input.latestRun?.errorCode ?? "");
+      // BLO-20933: an infra-class `stranded_assigned_issue` (pod eviction/preemption/
+      // external delete) is nobody's fault — transferring ownerAgentId up the manager
+      // ladder for it concentrates load on the manager for an event the current
+      // assignee had no part in. Re-dispatch to the existing assignee instead, same as
+      // the other transient causes above.
+      //
+      // Two tests, deliberately kept separate because they answer the question with
+      // different evidence:
+      //   * ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES — codes that are infra-class by code
+      //     ALONE (`job_failed`, `k8s_pod_schedule_failed`, …). No message needed.
+      //   * isInfraClassStrandedFailure — the codes that are ambiguous by code alone.
+      //     `claude_truncated` is emitted both for a genuine mid-stream crash and for a
+      //     pod that vanished before exit could be read, so only the adapter's
+      //     pod-removal wording separates them; `k8s_job_deleted_externally` is
+      //     unambiguous but is absent from the set above.
+      // Neither subsumes the other, so the union is the correct predicate. BLO-20321 —
+      // this ticket's live proof instance — is `claude_truncated` + pod-removal text and
+      // is matched ONLY by the second test.
+      (input.recoveryCause === "stranded_assigned_issue" &&
+        (ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(input.latestRun?.errorCode ?? "") ||
+          isInfraClassStrandedFailure(input.latestRun)));
     if (input.recoveryCause === "provider_quota") {
       const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
       if (!retryAgentId) {
@@ -4249,13 +4342,13 @@ export function recoveryService(
       };
     }
     if (routeToOriginal) {
-      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
+      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, returnOwnerAgentId);
       if (ownerAgentId) {
-        return { ownerAgentId, returnOwnerAgentId: originalAgentId, routingFallbackReason: null };
+        return { ownerAgentId, returnOwnerAgentId, routingFallbackReason: null };
       }
       return {
         ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
-        returnOwnerAgentId: originalAgentId,
+        returnOwnerAgentId,
         routingFallbackReason: "The original assignee is not invokable; recovery fell through to the manager ladder.",
       };
     }
@@ -4581,6 +4674,10 @@ export function recoveryService(
       latestRunFailureSummary: summarizeRunFailureForIssueComment(input.latestRun),
       retryReason: readNonEmptyString(context.retryReason) ?? null,
       recoveryCause: input.recoveryCause,
+      // BLO-20933: audit trail for the routing decision above — records whether the
+      // terminal cause was classified infrastructure-class (pod eviction/preemption/
+      // external delete) independent of which `recoveryCause` bucket it landed in.
+      infraClassCause: isInfraClassStrandedFailure(input.latestRun),
       originalAssigneeMcpKeys: extractAgentMcpKeys(input.sourceAssignee),
       originalAssigneeCapabilities: summarizeAgentCapabilities(input.sourceAssignee),
       sourceRunId: input.successfulRunHandoffEvidence?.sourceRunId ?? null,
@@ -4602,11 +4699,19 @@ export function recoveryService(
   }, dbOrTx: Db | DbTransaction = db) {
     const actionSvc = dbOrTx === db ? recoveryActionsSvc : issueRecoveryActionService(dbOrTx);
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+    // Read the existing action before the upsert. Two consumers depend on it:
+    //   - `existingReturnOwnerAgentId` below, so a repeat takeover cannot overwrite the
+    //     originally-recorded return owner with the current (manager) one;
+    //   - `previousAttemptAt` further down, to compare against issue.lastActivityAt and
+    //     suppress duplicate non-assignee wakes when nothing changed.
+    const existingAction = await actionSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
     const routing = await resolveStrandedRecoveryRouting({
       issue: input.issue,
       latestRun: input.latestRun,
       recoveryCause,
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
+      existingReturnOwnerAgentId: existingAction?.returnOwnerAgentId,
+      existingOwnerAgentId: existingAction?.ownerAgentId,
     });
     const ownerAgentId = routing.ownerAgentId;
     // BLO-18996: the single predicate for "will any sweep wake an owner for this action".
@@ -4627,9 +4732,6 @@ export function recoveryService(
     const now = new Date();
     const boundsAtCreation = wakesOwner ? recoveryActionBoundsAtCreation(now) : null;
 
-    // Read existing action before upsert so we can compare lastAttemptAt against
-    // issue.lastActivityAt and suppress duplicate non-assignee wakes when nothing changed.
-    const existingAction = await actionSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
     const previousAttemptAt = existingAction?.lastAttemptAt
       ? new Date(existingAction.lastAttemptAt as Date | string)
       : null;
@@ -5677,8 +5779,40 @@ export function recoveryService(
         status: "blocked" as const,
         blockedByIssueIds: blockerIds,
         assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
+        // Do not overwrite an ordinary reassignment that commits after the
+        // lock-fresh read. The issue service repeats this snapshot in the SQL
+        // WHERE clause, so a blocked UPDATE is rejected against the latest
+        // assignee rather than applying the stale recovery decision.
+        expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
       };
-      const updated = await issuesSvc.update(input.issue.id, issueUpdate, mutationDb);
+      // That rejection arrives as a thrown 409, not a falsy return (see
+      // `isAssigneePreconditionConflict`), so it must be caught here. Letting it escape
+      // aborts the caller's whole reconcile batch and leaves every remaining stranded
+      // issue unreconciled — a far larger fault than the one issue we lost the race on.
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(input.issue.id, issueUpdate, mutationDb);
+      } catch (error) {
+        if (!isAssigneePreconditionConflict(error)) throw error;
+        // Only the non-review path writes through `db`; the review-stage path writes through
+        // `tx`, where swallowing this would commit the action upsert without the matching
+        // issue UPDATE instead of rolling both back. That path also holds a `FOR UPDATE` row
+        // lock on the issue from its lock-fresh read, so a competing assignee write blocks
+        // until we commit and this conflict is unreachable there — but rethrow rather than
+        // trade an atomic rollback for a partial commit on an assumption.
+        if (input.expectedReviewStage) throw error;
+        logger.info(
+          {
+            issueId: fresh.id,
+            companyId: fresh.companyId,
+            expectedAssigneeAgentId: fresh.assigneeAgentId,
+            recoveryActionId: action.id,
+            recoveryCause,
+          },
+          "skipping stranded recovery escalation: assignee changed before the update could be applied",
+        );
+        return null;
+      }
       if (!updated) return null;
       if (isProviderQuotaWait) {
         return {
