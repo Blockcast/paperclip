@@ -218,7 +218,104 @@ describe("issue graph liveness classifier", () => {
     })).toEqual([]);
   });
 
-  it("does not flag an unassigned blocker that already has an active execution path", () => {
+  // BLO-27912: the deliberate-park disposition — the seventh satisfier on
+  // `hasExplicitWaitingPath`, and the only one an actor other than the row's assignee can
+  // set. Every assertion here is paired with its negative: a suppression test that does not
+  // also prove the detector still fires cannot distinguish "the park works" from "the
+  // detector is off", which is the failure mode the row's verifying signal calls out by name.
+  describe("deliberate-park disposition (BLO-27912)", () => {
+    const parkedBlocker = (overrides: Record<string, unknown> = {}) =>
+      issue({
+        id: blockerId,
+        identifier: "PAP-1704",
+        title: "Deliberately parked unblock work",
+        status: "backlog",
+        assigneeAgentId: "blocker-agent",
+        ...overrides,
+      });
+    const baseInput = (blocker: ReturnType<typeof parkedBlocker>) => ({
+      issues: [issue(), blocker],
+      relations: blocks,
+      agents: [
+        agent(),
+        manager,
+        agent({ id: "blocker-agent", name: "Blocker Agent", reportsTo: managerId }),
+      ],
+    });
+    const hoursFromNow = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1000);
+
+    it("suppresses blocked_by_assigned_backlog_issue while a park is in force, and fires without one", () => {
+      // The positive and negative halves differ in exactly one field, so the pair isolates
+      // the disposition rather than the surrounding fixture.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: hoursFromNow(72) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(baseInput(parkedBlocker()));
+      expect(unparked).toHaveLength(1);
+      expect(unparked[0]).toMatchObject({
+        issueId: blockedId,
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: blockerId,
+      });
+    });
+
+    it("suppresses blocked_by_unassigned_issue too, since a park answers every assignee-shaped rule", () => {
+      // BLO-24266 tripped both invariants, and the row's AC names both. An unassigned
+      // blocker is the harder case: there is no assignee to be "not working on it", so the
+      // park is the only thing standing between the leaf and a finding.
+      const unassigned = { status: "todo", assigneeAgentId: null };
+
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ ...unassigned, parkedUntil: hoursFromNow(24) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(baseInput(parkedBlocker(unassigned)));
+      expect(unparked.map((entry) => entry.state)).toEqual(["blocked_by_unassigned_issue"]);
+    });
+
+    it("restores detection once the park lapses, so suppression cannot become permanent", () => {
+      // The anti-silence guarantee. `parkedUntil` is compared against `now` by the
+      // classifier itself, so an elapsed park needs no un-parking write to stop suppressing
+      // — nobody has to remember to clean it up.
+      const lapsed = classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: hoursFromNow(-1) })),
+      );
+      expect(lapsed.map((entry) => entry.state)).toEqual(["blocked_by_assigned_backlog_issue"]);
+
+      // And an explicit un-park (the column cleared) is detectable immediately.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: null })),
+      ).map((entry) => entry.state)).toEqual(["blocked_by_assigned_backlog_issue"]);
+    });
+
+    it("reads the deadline as the DB and the API supply it, and ignores an unparsable one", () => {
+      // `readDateMs` accepts Date | string; the projection in recovery/service.ts hands over
+      // a Date, while a serialized input arrives as an ISO string. Both must suppress, or
+      // the park works on one caller and not the other.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: hoursFromNow(48).toISOString() })),
+      )).toEqual([]);
+
+      // Fails closed: garbage in the column suppresses nothing.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: "not-a-timestamp" })),
+      ).map((entry) => entry.state)).toEqual(["blocked_by_assigned_backlog_issue"]);
+    });
+
+    it("does not make a cancelled blocker acceptable", () => {
+      // The deliberate asymmetry documented on `hasExplicitWaitingPath`: parking says nobody
+      // should be working on this yet, not that depending on a cancelled row is coherent.
+      // `blockedFindingForLeaf` tests the cancelled shape before consulting the predicate,
+      // so this must keep reporting regardless of the park.
+      const findings = classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ status: "cancelled", parkedUntil: hoursFromNow(72) })),
+      );
+      expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
+    });
+  });
+
+
     const findings = classifyIssueGraphLiveness({
       issues: [
         issue(),

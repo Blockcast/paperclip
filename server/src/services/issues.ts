@@ -4546,6 +4546,10 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      // BLO-27912: keep this call site in step with the recovery sweep's own projection in
+      // recovery/service.ts. A park invisible to one of the two classifier callers would
+      // suppress in one surface and re-fire in the other.
+      parkedUntil: issue.parkedUntil,
       hasExternalWaitOwner: externalWaitFromDescription(issue.description ?? null) !== null,
     })),
     relations: graphRelations,
@@ -9543,6 +9547,18 @@ export function issueService(db: Db) {
          * down, not a fall-through.
          */
         suppressRoutineSchedulerFailureHeartbeat?: boolean;
+        /**
+         * BLO-27912: record or clear a deliberate-park disposition. The four `parked_*`
+         * columns are server-owned and derived here rather than accepted flat, for the
+         * same reason the `monitor_*` columns are derived from `executionPolicy.monitor`:
+         * `parkedByAgentId` must be stamped from the actor and `parkedAt` from the server
+         * clock, so a caller cannot forge either.
+         *
+         *   object  -> park (all four set)
+         *   null    -> un-park (all four cleared)
+         *   absent  -> leave the park exactly as it is
+         */
+        parkedDisposition?: IssueParkedDispositionInput | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -9567,6 +9583,7 @@ export function issueService(db: Db) {
         expectedCurrentExecutionState,
         expectedCurrentExecutionPolicy,
         suppressRoutineSchedulerFailureHeartbeat,
+        parkedDisposition,
         ...issueData
       } = data;
 
@@ -9732,6 +9749,25 @@ export function issueService(db: Db) {
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
+      }
+      // BLO-27912: derive the four server-owned park columns. Mirrors the monitor
+      // derivation in issue-execution-policy.ts: an object arms, an explicit `null`
+      // clears, and an absent key touches nothing. All four move together so a row can
+      // never carry a deadline with no reason, or a reason with no deadline — the
+      // liveness classifier keys suppression on `parkedUntil` alone, so a half-written
+      // park would suppress without stating why.
+      if (parkedDisposition !== undefined) {
+        if (parkedDisposition === null) {
+          patch.parkedUntil = null;
+          patch.parkedReason = null;
+          patch.parkedByAgentId = null;
+          patch.parkedAt = null;
+        } else {
+          patch.parkedUntil = new Date(parkedDisposition.until);
+          patch.parkedReason = parkedDisposition.reason;
+          patch.parkedByAgentId = actorAgentId ?? null;
+          patch.parkedAt = new Date();
+        }
       }
 
       const nextAssigneeAgentId =

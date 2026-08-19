@@ -768,6 +768,14 @@ export interface Issue {
   monitorAttemptCount?: number;
   monitorNotes?: string | null;
   monitorScheduledBy?: IssueMonitorScheduledBy | null;
+  // BLO-27912: the deliberate-park disposition. Server-owned (hence optional/read-only
+  // here) and written only via the nested `parkedDisposition` PATCH input. `parkedUntil`
+  // in the future is the seventh explicit waiting path the liveness sweep accepts; once it
+  // lapses the row is detectable again without anyone having to un-park it.
+  parkedUntil?: Date | null;
+  parkedReason?: string | null;
+  parkedByAgentId?: string | null;
+  parkedAt?: Date | null;
   executionWorkspaceId: string | null;
   executionWorkspacePreference: string | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;

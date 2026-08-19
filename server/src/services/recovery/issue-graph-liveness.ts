@@ -34,6 +34,15 @@ export interface IssueLivenessIssueInput {
   lastActivityAt?: Date | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  // BLO-27912: the row carries a deliberate-park disposition expiring at this instant, set
+  // via `parkedDisposition` by the assignee OR by an actor the assignee cannot block —
+  // the issue's creator, or a manager in the assignee's reporting chain. Unlike the six
+  // pre-existing satisfiers, this one is reachable by somebody other than the assignee,
+  // which is the whole point: a parked row's assignee is by construction not working on
+  // it, so gating the only silencing mechanism on them made the invariant unsatisfiable.
+  // Consumed by `hasExplicitWaitingPath` — see the note there for why it sits there rather
+  // than being scoped to one rule the way `hasExternalWaitOwner` is.
+  parkedUntil?: Date | string | null;
   // BLO-24662: the issue's description declares an `external owner:` / `external action:`
   // pair, i.e. a human gate narrated in prose rather than modelled as a blocker edge.
   // Consumed only by `blocked_without_blockers`, which is the one rule that
@@ -230,6 +239,21 @@ function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
   if (maxAttempts !== null && attemptCount >= maxAttempts) return false;
 
   return true;
+}
+
+/**
+ * BLO-27912: is a deliberate-park disposition currently in force?
+ *
+ * Deliberately keyed on the deadline alone rather than on a boolean or on the presence of
+ * `parkedReason`, and compared with `<= nowMs` exactly as `hasScheduledMonitor` does. That
+ * makes expiry the default: a park that nobody restates stops suppressing on its own, so
+ * the mechanism cannot decay into permanent silence on a leaf that genuinely needs
+ * escalating. Un-parking (writing `parkedDisposition: null`) clears the column and has the
+ * same effect immediately.
+ */
+function hasActiveParkedDisposition(issue: IssueLivenessIssueInput, nowMs: number) {
+  const parkedUntilMs = readDateMs(issue.parkedUntil);
+  return parkedUntilMs !== null && parkedUntilMs > nowMs;
 }
 
 function readPrincipalAgentId(principal: unknown): string | null {
@@ -446,9 +470,39 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     });
   }
 
+  /**
+   * Does somebody or something own the next action on this issue?
+   *
+   * Six of the seven satisfiers are reachable only by the row's own assignee, which is what
+   * BLO-27912 records as a defect rather than a design: a *deliberately parked* row is by
+   * construction one its assignee is not working on, so an invariant whose only escape
+   * hatch is the assignee is unsatisfiable exactly where it fires hardest. Three
+   * escalations landed on one leaf (BLO-24266) with a byte-identical `originFingerprint`,
+   * and two correct remedies — assigning an owner, adding a `blockedBy` edge — both failed
+   * because neither is on this list.
+   *
+   * `hasActiveParkedDisposition` is the seventh, and the only one a non-assignee can set.
+   *
+   * On why it belongs HERE rather than being scoped to a single rule the way BLO-24662
+   * scoped `hasExternalWaitOwner` to `blocked_without_blockers`: that signal is parsed out
+   * of description prose, so it is unattributed, unbounded and easy to write by accident —
+   * hence the narrow blast radius. A park is the opposite on every axis. It is structured,
+   * attributed to the agent that set it, and expires on a stated deadline, so it is a
+   * strictly stronger claim: "this row is deliberately not being worked, by decision of a
+   * named actor, until T." That claim answers every assignee-shaped rule below, not just
+   * one, and `blocked_by_assigned_backlog_issue` / `blocked_by_unassigned_issue` — the two
+   * that fired on BLO-24266 — are precisely the ones it must answer.
+   *
+   * It does NOT reach `blocked_by_cancelled_issue`, and that asymmetry is deliberate rather
+   * than incidental: `blockedFindingForLeaf` tests the cancelled shape BEFORE consulting
+   * this predicate, so a park cannot make a cancelled blocker acceptable. Parking says
+   * nobody should be working on this yet; it does not say a dependency on a cancelled row
+   * is a coherent thing to wait for.
+   */
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
     return Boolean(issue.assigneeUserId) ||
       hasScheduledMonitor(issue, nowMs) ||
+      hasActiveParkedDisposition(issue, nowMs) ||
       hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
       hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
