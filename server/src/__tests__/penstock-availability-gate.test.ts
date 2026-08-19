@@ -479,4 +479,86 @@ describe("createPenstockAvailabilityGate", () => {
     expect(codex).toMatchObject({ allow: false, provider: "codex" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("keys the cache per credential so an exhausted agent is not released by a healthy one", async () => {
+    // PEN-2385. Penstock answers per credential, so an `available` computed for
+    // the reviewer's token says nothing about an author's token. Ordered
+    // healthy-then-exhausted deliberately: this is the direction that *launches*
+    // a doomed run rather than merely delaying a fine one.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            state: "exhausted",
+            reason: "penstock.capacity_exhausted",
+            retry_after_seconds: 42,
+          }),
+          { status: 200 },
+        ),
+      );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+    const now = new Date("2026-06-30T08:00:00.000Z");
+
+    function checkAs(agentId: string, token: string) {
+      return gate.checkAdapter({
+        adapterType: "claude_k8s",
+        agentId,
+        adapterConfig: {
+          model: "claude-opus-5[1m]",
+          env: {
+            ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" },
+            ANTHROPIC_AUTH_TOKEN: { value: token },
+          },
+        },
+        now,
+        env: {},
+      });
+    }
+
+    const reviewer = await checkAs("agent-ally", "psk_reviewer");
+    const author = await checkAs("agent-author", "psk_author");
+
+    // Identical endpoint, provider and model; only the credential differs. A
+    // key that omitted it would hand the reviewer's cached allow to the author
+    // and dispatch a run that 429s before spending a token.
+    expect(reviewer).toEqual({ allow: true });
+    expect(author).toMatchObject({ allow: false, provider: "anthropic" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("still serves one cached verdict to repeat checks on the same credential", async () => {
+    // The credential dimension must not defeat caching itself: two agents
+    // sharing a token (the common `process.env` fallback) stay on one probe.
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+        { status: 200 },
+      ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+    const now = new Date("2026-06-30T08:00:00.000Z");
+
+    for (const agentId of ["agent-one", "agent-two"]) {
+      const result = await gate.checkAdapter({
+        adapterType: "claude_k8s",
+        agentId,
+        adapterConfig: { model: "claude-opus-5[1m]" },
+        now,
+        env: {
+          ANTHROPIC_BASE_URL: "https://api.penstock.run/anthropic",
+          ANTHROPIC_API_KEY: "psk_shared",
+        },
+      });
+      expect(result).toEqual({ allow: true });
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

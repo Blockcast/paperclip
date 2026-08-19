@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export interface PenstockAvailabilityGateLogger {
   info(payload: Record<string, unknown>, msg: string): void;
@@ -56,6 +56,58 @@ interface CacheEntry {
   result: PenstockAvailabilityGateResult;
 }
 
+/**
+ * Cache identity for one capacity verdict (PEN-2385).
+ *
+ * Every dimension the probe actually varies on has to appear here, or one
+ * agent's verdict is served to another agent the answer was never computed
+ * for. The credential is such a dimension and used to be missing.
+ *
+ * The readback authenticates as the *agent* -- `resolvePenstockCheck` reads
+ * `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` from that agent's
+ * `adapterConfig.env` before falling back to `process.env`, and
+ * `readPenstockCapacity` sends it as both `authorization` and `x-api-key`.
+ * Penstock answers per credential: quota and rate-limit state belong to the
+ * subscription behind the token, not to the endpoint. A fleet pointed at one
+ * `ANTHROPIC_BASE_URL` on one model therefore collapsed onto a single entry
+ * and inherited whichever agent probed first, in both directions:
+ *
+ *   - an exhausted credential's deny parked agents whose own credential was
+ *     fine, which is a capacity-gated wake for no reason;
+ *   - a healthy credential's allow released agents whose own credential was
+ *     exhausted, which dispatches a run that 429s before it spends a token --
+ *     the `rate_limit_exhausted` the gate exists to prevent.
+ *
+ * Observed 2026-08-18/19 on the Blockcast fleet: the reviewer held capacity
+ * and posted reviews while four authors on the same endpoint and model could
+ * not start, and a `/v1/pools/default/capacity` readback that was green for
+ * one credential was green for all of them.
+ *
+ * Hashed, not embedded: this string is a Map key that reaches logs and heap
+ * dumps, and a bearer token has no business in either. A truncated SHA-256 is
+ * sufficient -- the key needs to *distinguish* credentials, not authenticate
+ * them, and collisions here are the pre-existing behaviour rather than a new
+ * failure.
+ *
+ * Cost: probes now scale with distinct credentials rather than with distinct
+ * (endpoint, model) pairs. Each is one cached GET bounded by `cacheTtlMs`, so
+ * the ceiling is one probe per credential per TTL.
+ */
+function penstockCapacityCacheKey(input: {
+  capacityUrl: URL;
+  provider: PenstockProvider;
+  model: string;
+  token: string;
+}): string {
+  const credential = createHash("sha256").update(input.token).digest("hex").slice(0, 16);
+  return [
+    `${input.capacityUrl.origin}${input.capacityUrl.pathname}`,
+    input.provider,
+    input.model,
+    credential,
+  ].join("::");
+}
+
 interface ResolvedPenstockCheck {
   capacityUrl: URL;
   /**
@@ -95,7 +147,12 @@ export function createPenstockAvailabilityGate(
       if (!resolved) return { allow: true };
 
       const nowMs = input.now.getTime();
-      const key = `${resolved.capacityUrl.origin}${resolved.capacityUrl.pathname}::${provider}::${resolved.model}`;
+      const key = penstockCapacityCacheKey({
+        capacityUrl: resolved.capacityUrl,
+        provider,
+        model: resolved.model,
+        token: resolved.token,
+      });
       const cached = cache.get(key);
       if (cached && nowMs - cached.fetchedAt < cacheTtlMs) {
         return cached.result;
