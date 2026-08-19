@@ -476,7 +476,12 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
-  it("does not let an exact-head COMMENTED App review suppress the gate failure", async () => {
+  // BLO-28920: this outbox decides whether to post a "reviewer never finished"
+  // FAILURE status, which is an attestation question, not a merge-authorization
+  // one. An exact-head COMMENTED review proves the reviewer DID finish, so the
+  // red status would be a false alarm. Suppressing it does not authorize a
+  // merge: the required context simply stays unposted/pending (BLO-17456).
+  it("skips the failure write when an exact-head COMMENTED App review exists", async () => {
     setCreds();
     const { delivery } = await seedRun();
     const fetchMock = stubGithub({
@@ -487,8 +492,8 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
 
     await pollGitHubCommitStatusDeliveriesOnce(db);
 
-    expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
-    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "skipped" });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
   it("re-checks commit status after reviewer evidence before posting failure", async () => {
