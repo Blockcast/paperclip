@@ -25,7 +25,34 @@ spec:
         {{- with .Values.pod.labels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.pod.annotations }}
+      {{- /*
+      BLO-29008: stamp the deployed commit onto the WORKER pod template, the
+      same way deployment-api.yaml stamps the API tier.
+
+      This tier is the one that drives heartbeat dispatch. Before this stamp
+      existed there was no assertable signal for what commit it ran: the deploy
+      job waited only on `deployment/paperclip-api`, so a roll that updated the
+      api and left the worker behind reported `success` while the worker served
+      pre-fix code. In BLO-28920 that cost hours of a live incident with the
+      stated acceptance criterion ("paperclip-api deployed-commit is at or past
+      X") fully satisfied the whole time.
+
+      Kept structurally identical to the API stamp — reserved-key guard, then
+      40-hex validation, then a single merged key — so that setting it changes
+      NOTHING ELSE in the render. That property is what lets the deploy job
+      compare the two tiers' values directly.
+      */}}
+      {{- $podAnnotations := deepCopy (.Values.pod.annotations | default dict) }}
+      {{- if hasKey $podAnnotations "paperclip.blockcast.net/deployed-commit" }}
+      {{- fail "pod.annotations must not set reserved key paperclip.blockcast.net/deployed-commit; use worker.deployedCommit through the release workflow" }}
+      {{- end }}
+      {{- with .Values.worker.deployedCommit }}
+      {{- if not (regexMatch "^[0-9a-f]{40}$" .) }}
+      {{- fail (printf "worker.deployedCommit must be 40 lowercase hex characters, got %q" .) }}
+      {{- end }}
+      {{- $_ := set $podAnnotations "paperclip.blockcast.net/deployed-commit" . }}
+      {{- end }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

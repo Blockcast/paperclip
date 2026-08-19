@@ -886,6 +886,7 @@ jobs:
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
+            --set-string worker.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
             --atomic --wait --timeout 30m &
           helm_pid=$!
@@ -935,6 +936,15 @@ jobs:
 
           kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
 
+          # BLO-29008: the api Deployment is only ONE of the two tiers this
+          # release rolls. statefulset/paperclip runs PAPERCLIP_NODE_ROLE=worker
+          # -- the singleton that drives heartbeat dispatch and hosts the plugin
+          # workers -- so a release that settles the api and leaves the worker
+          # behind has shipped nothing for every heartbeat-path fix. Waiting on
+          # it here is what makes the job's `success` mean "both tiers are on
+          # this build" instead of "the HTTP tier is".
+          kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=30m
+
           # Use the approver's canonical projection verbatim. Comparing the live
           # object with the handed-off server plan proves the lock can be retired
           # by the next release and catches concurrent or admission-time drift.
@@ -962,6 +972,61 @@ jobs:
               .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
               (.spec.template.spec.containers | all(.image == $image))
             ' <<<"${live_json}" >/dev/null
+
+          # BLO-29008: two-tier convergence gate. Everything above this point
+          # verifies the api tier only -- against the approved plan, its marker,
+          # its commit and its digest. All of it passed during BLO-28920 while
+          # statefulset/paperclip sat on a 32h-old image, because nothing ever
+          # asked the worker what it was running.
+          #
+          # This block is the assertion that makes a partial roll a FAILURE
+          # rather than a green run. It reads the live objects (not the render),
+          # so it also catches a tier moved out-of-band by a hand-run
+          # `kubectl set image` / `helm upgrade` -- which is exactly how the
+          # BLO-28920 split arose, with no docker.yml deploy job involved at all.
+          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
+          commit_path='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/deployed-commit}'
+          api_image="$(kubectl -n "${NS}" get deployment paperclip-api \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          worker_image="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          api_commit="$(kubectl -n "${NS}" get deployment paperclip-api -o jsonpath="${commit_path}")"
+          worker_commit="$(kubectl -n "${NS}" get statefulset paperclip -o jsonpath="${commit_path}")"
+          sts_current_revision="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.status.currentRevision}')"
+          sts_update_revision="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.status.updateRevision}')"
+
+          tier_failures=""
+          if [ "${api_image}" != "${expected_image}" ]; then
+            tier_failures="${tier_failures}  api image     ${api_image:-<empty>} != ${expected_image}"$'\n'
+          fi
+          if [ "${worker_image}" != "${expected_image}" ]; then
+            tier_failures="${tier_failures}  worker image  ${worker_image:-<empty>} != ${expected_image}"$'\n'
+          fi
+          if [ "${api_commit}" != "${COMMIT}" ]; then
+            tier_failures="${tier_failures}  api commit    ${api_commit:-<unstamped>} != ${COMMIT}"$'\n'
+          fi
+          if [ "${worker_commit}" != "${COMMIT}" ]; then
+            tier_failures="${tier_failures}  worker commit ${worker_commit:-<unstamped>} != ${COMMIT}"$'\n'
+          fi
+          if [ "${sts_current_revision}" != "${sts_update_revision}" ]; then
+            tier_failures="${tier_failures}  worker revision unsettled: current ${sts_current_revision:-<empty>} != update ${sts_update_revision:-<empty>}"$'\n'
+          fi
+
+          if [ -n "${tier_failures}" ]; then
+            echo "Two-tier convergence check FAILED (BLO-29008)." >&2
+            echo "A partial roll must not report success: the worker tier drives" >&2
+            echo "heartbeat dispatch, so an api-only deploy ships nothing for it." >&2
+            echo "" >&2
+            printf '%s' "${tier_failures}" >&2
+            echo "" >&2
+            echo "  deployment/paperclip-api image:  ${api_image:-<empty>}" >&2
+            echo "  statefulset/paperclip   image:  ${worker_image:-<empty>}" >&2
+            echo "  expected image:                  ${expected_image}" >&2
+            exit 1
+          fi
+          echo "Two-tier convergence OK: api and worker both on ${expected_image} at ${COMMIT}"
 
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
