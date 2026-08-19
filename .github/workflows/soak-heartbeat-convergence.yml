@@ -30,6 +30,16 @@ on:
 permissions:
   contents: read
 
+# /proc/loadavg is host-wide — Linux does not namespace it by container or
+# cgroup — so two dispatches landing on the same runner would each read the
+# other's synthetic load and both report the regime as reached. That fails in
+# the flattering direction, which is the one that produces a false AC2 green.
+# Serialise instead. cancel-in-progress is false: a soak that has already burned
+# 40 minutes of its 20 iterations must not be discarded by a later dispatch.
+concurrency:
+  group: soak-heartbeat-convergence
+  cancel-in-progress: false
+
 jobs:
   soak:
     name: Soak ${{ inputs.iterations }}x @ ${{ inputs.ref }}
@@ -77,4 +87,9 @@ jobs:
           path: |
             soak-out/summary.txt
             soak-out/iter-*.log
+          # Safe to keep as `error`: the script creates soak-out/summary.txt
+          # before it validates anything, and writes the cause into it on every
+          # fatal path — so a genuine early exit still uploads an artifact that
+          # names the real failure, instead of this step failing second with a
+          # "no files found" message that masks it.
           if-no-files-found: error
