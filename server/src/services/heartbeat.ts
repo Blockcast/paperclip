@@ -11343,27 +11343,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // clearReason path above still hands a genuinely stuck issue to the
       // recovery lane rather than deferring forever (AC2). The safety property
       // is untouched: the park, not the monitor, governs execution (AC4).
-      if (monitorSuppression.dependencyBlockedRetryAt) {
-        const retryAt = monitorSuppression.dependencyBlockedRetryAt;
-        const deferredPolicy = monitor
-          ? normalizeIssueExecutionPolicy({
-              ...policy,
-              monitor: { ...monitor, nextCheckAt: retryAt.toISOString() },
-            })
-          : null;
-        if (deferredPolicy?.monitor) {
-          await db
-            .update(issues)
-            .set({
-              ...buildIssueMonitorDispatchRearmPatch({
-                issue: claimed,
-                policy: deferredPolicy,
-                attemptCount: nextAttemptCount,
-              }),
-              updatedAt: new Date(),
-            })
-            .where(eq(issues.id, claimed.id));
-        }
+      // Clamp the re-arm strictly forward. Only the FIRST fire's park instant is
+      // guaranteed to be in the future (it was just created at `now +
+      // DEP_BLOCKED_BASE_DELAY_MS`). Every later fire COALESCES into that same
+      // park, and coalescing updates only `contextSnapshot`/`updatedAt` — it
+      // never advances `scheduledRetryAt` — so the sink hands back the original
+      // instant, which is precisely the instant that made this dispatch due.
+      // Arming at it verbatim writes `monitorNextCheckAt <= now`, and because the
+      // re-arm patch also nulls `monitorWakeRequestedAt` the stale-claim guard
+      // will not throttle it either: the monitor is instantly re-due and burns an
+      // attempt on every scheduler pass, draining the maxAttempts budget far
+      // faster than the intended backoff schedule and churning the activity log.
+      // Clamping to the park's own base cadence is a no-op on the first-fire path
+      // (raw is already `now + DEP_BLOCKED_BASE_DELAY_MS` there) and only bites on
+      // the coalesce path this is guarding.
+      const rawDeferredRetryAt = monitorSuppression.dependencyBlockedRetryAt;
+      const deferredRetryAt = rawDeferredRetryAt
+        ? new Date(
+            Math.max(rawDeferredRetryAt.getTime(), input.now.getTime() + DEP_BLOCKED_BASE_DELAY_MS),
+          )
+        : null;
+      // Deferring is only safe when the re-arm can actually be PERSISTED. If the
+      // monitor policy is absent while `monitorNextCheckAt` is still set — the
+      // executionPolicy/monitor_* column drift the claim query below does not
+      // exclude — there is nothing to rebuild, and returning "deferred" without a
+      // write would leave `monitorNextCheckAt` in the past AND
+      // `monitorAttemptCount` unincremented. The row would then re-claim every
+      // staleClaimThreshold (5m) forever, with `exhaustedMonitorClearReason`
+      // reading the same frozen attempt count and never firing: an unbounded loop
+      // in the one branch whose comment claims boundedness. Falling through to the
+      // triggered patch instead clears the column and terminates, exactly as this
+      // drift state behaved before BLO-22048.
+      const deferredPolicy = deferredRetryAt && monitor
+        ? normalizeIssueExecutionPolicy({
+            ...policy,
+            monitor: { ...monitor, nextCheckAt: deferredRetryAt.toISOString() },
+          })
+        : null;
+      if (deferredRetryAt && deferredPolicy?.monitor) {
+        const retryAt = deferredRetryAt;
+        await db
+          .update(issues)
+          .set({
+            ...buildIssueMonitorDispatchRearmPatch({
+              issue: claimed,
+              policy: deferredPolicy,
+              attemptCount: nextAttemptCount,
+            }),
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, claimed.id));
         await logActivity(db, {
           companyId: claimed.companyId,
           actorType: input.actorType,
@@ -11378,7 +11407,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             nextCheckAt: retryAt.toISOString(),
             previousCheckAt: scheduledAtIso,
             monitorAttemptCount: nextAttemptCount,
-            rearmed: Boolean(deferredPolicy?.monitor),
             ...monitorMetadata,
             source: input.activitySource,
           },
@@ -11660,6 +11688,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let triggered = 0;
     let skipped = 0;
+    // Counted separately from `skipped`: a deferral declined nothing, it re-armed.
+    // Leaving it uncounted made `checked` exceed `triggered + skipped` with no
+    // explanation — the same "the deferral is invisible" shape BLO-22048 is about.
+    let dependencyBlockedDeferred = 0;
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
@@ -11705,6 +11737,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
+        if (result.outcome === "dependency_blocked_deferred") dependencyBlockedDeferred += 1;
       } catch (err) {
         logger.error({ err, issueId: claimed.id }, "issue monitor tick failed");
       }
@@ -11714,6 +11747,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       checked: dueMonitors.length,
       triggered,
       skipped,
+      dependencyBlockedDeferred,
     };
   }
 
@@ -29213,8 +29247,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * durable skip, gets counted terminal `suppressed`, and (having no reason)
    * lands on the `other` cause the outage alert pages on. A provider rate-limit
    * would page as "reviews are being dropped".
-   */
-  /**
+   *
    * `dependencyBlockedRetryAt` is the second `return null` that is a deferral
    * rather than a decline (BLO-22048): an unresolved `blockedBy` edge converts
    * the wake into a `dependency_blocked` scheduled_retry park. It carries the
@@ -29223,6 +29256,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `nextCheckAt` (already in the past, since it just fired) makes the monitor
    * re-dispatch on every scheduler tick, and each redispatch coalesces into the
    * same park, so the issue never moves but the activity log churns forever.
+   * Note the value is the park's instant as recorded, which on the coalesce path
+   * is the ORIGINAL park instant and can therefore already be in the past; the
+   * monitor caller clamps it forward before arming a timer on it.
    */
   type WakeSuppressionOutcome = {
     durableSkipReason: string | null;
@@ -31052,7 +31088,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return {
         checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped + expiredIssueMonitors.recovered,
+        // Blocker-deferred monitors delivered no wake, so they belong on the
+        // not-enqueued side of the ledger rather than silently widening the gap
+        // between `checked` and the two counters that explain it (BLO-22048).
+        skipped: skipped + issueMonitors.skipped + issueMonitors.dependencyBlockedDeferred +
+          expiredIssueMonitors.recovered,
         idleSkipped,
       };
     },
