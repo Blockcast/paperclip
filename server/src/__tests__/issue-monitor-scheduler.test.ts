@@ -258,6 +258,32 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     return { companyId, agentId, issueId, nextCheckAt };
   }
 
+  // BLO-22048: seeds an OPEN issue that blocks `issueId`, which is what makes
+  // `enqueueWakeup` park the monitor wake as a `dependency_blocked` scheduled
+  // retry instead of dispatching it. Every blocker-suppression test needs
+  // exactly this and nothing else, so keeping it here makes each test's own
+  // setup — the timing, the policy shape, the fire count — visible at a glance.
+  async function seedBlocker(companyId: string, issueId: string) {
+    const blockerId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    return { blockerId };
+  }
+
   // BLO-25865: seeds the exact live state observed on BLO-21020/BLO-22798 — a
   // monitor that already fired (status "triggered", monitorNextCheckAt null,
   // executionPolicy.monitor already stripped per buildIssueMonitorTriggeredPatch)
@@ -633,23 +659,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("keeps the monitor armed when the wake is suppressed by an unresolved blocker (BLO-22048)", async () => {
     const { companyId, issueId, nextCheckAt } = await seedFixture();
 
-    const blockerId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(issues).values({
-      id: blockerId,
-      companyId,
-      title: "Unresolved blocker",
-      status: "todo",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: `${issuePrefix}-2`,
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: issueId,
-      type: "blocks",
-    });
+    await seedBlocker(companyId, issueId);
 
     const heartbeat = createHeartbeat();
     const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
@@ -716,23 +726,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("consumes an attempt on the first blocker-suppressed deferral (BLO-22048)", async () => {
     const { companyId, issueId } = await seedFixture();
 
-    const blockerId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(issues).values({
-      id: blockerId,
-      companyId,
-      title: "Unresolved blocker",
-      status: "todo",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: `${issuePrefix}-2`,
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: issueId,
-      type: "blocks",
-    });
+    await seedBlocker(companyId, issueId);
 
     const heartbeat = createHeartbeat();
     await heartbeat.triggerIssueMonitor(issueId, {
@@ -764,23 +758,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("keeps the monitor armed on the SECOND blocker-suppressed deferral (BLO-22048)", async () => {
     const { companyId, issueId } = await seedFixture();
 
-    const blockerId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(issues).values({
-      id: blockerId,
-      companyId,
-      title: "Unresolved blocker",
-      status: "todo",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: `${issuePrefix}-2`,
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: issueId,
-      type: "blocks",
-    });
+    await seedBlocker(companyId, issueId);
 
     const heartbeat = createHeartbeat();
     await heartbeat.triggerIssueMonitor(issueId, {
@@ -816,6 +794,61 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(afterSecond.monitorNextCheckAt).not.toBeNull();
     expect(afterSecond.monitorAttemptCount).toBe(2);
     expect(normalizeIssueExecutionPolicy(afterSecond.executionPolicy ?? null)?.monitor ?? null).not.toBeNull();
+
+    // ...and it must be re-armed STRICTLY IN THE FUTURE of the instant that just
+    // fired. This is the assertion that separates the fix from the bug: the
+    // coalesce branch reports the ORIGINAL park instant (coalescing never
+    // advances `scheduledRetryAt`), which is exactly the `now` this fire ran at.
+    // Arming there writes `monitorNextCheckAt <= now`, and since the re-arm patch
+    // nulls `monitorWakeRequestedAt` the stale-claim guard does not throttle it —
+    // so the monitor is immediately re-due and burns an attempt every scheduler
+    // pass. Surviving-but-already-due is NOT the intended behaviour, and the
+    // not-null/attemptCount assertions above pass in both worlds.
+    expect(afterSecond.monitorNextCheckAt!.getTime()).toBeGreaterThan(
+      afterFirst.monitorNextCheckAt!.getTime(),
+    );
+  });
+
+  // BLO-22048 (drift / termination): the deferral re-arms by writing a rebuilt
+  // monitor policy, so it can only defer when there IS a policy to rebuild. The
+  // dispatch claim query filters on the `monitorNextCheckAt` COLUMN and never
+  // checks that `executionPolicy.monitor` still exists, so a drifted row — column
+  // armed, policy monitor gone — is claimable. Returning "deferred" for that row
+  // without persisting anything leaves `monitorNextCheckAt` at its original past
+  // instant AND `monitorAttemptCount` frozen, so it re-claims every
+  // staleClaimThreshold (5m) forever while `exhaustedMonitorClearReason` re-reads
+  // the same attempt count and never fires: unbounded, in the exact branch whose
+  // comment claims boundedness. Master terminated here (the triggered patch nulls
+  // the column), so deferring unconditionally would be a REGRESSION, not a fix.
+  it("terminates instead of deferring when the monitor policy has drifted away (BLO-22048)", async () => {
+    const { companyId, issueId, nextCheckAt } = await seedFixture();
+
+    // Drift the row: keep the column armed, drop the policy monitor. This is the
+    // shape a whole-object executionPolicy overwrite leaves behind.
+    await db.update(issues).set({ executionPolicy: null }).where(eq(issues.id, issueId));
+
+    await seedBlocker(companyId, issueId);
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.triggerIssueMonitor(issueId, {
+      now: new Date("2026-04-11T12:31:00.000Z"),
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    const drifted = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    // Forward progress is the property under test: the row must not be left
+    // re-claimable at the SAME past instant with the SAME attempt count, because
+    // that combination is what cannot terminate. Consuming the column is how this
+    // drift state has always terminated.
+    expect(drifted.monitorNextCheckAt).toBeNull();
+    expect(drifted.monitorNextCheckAt?.toISOString()).not.toBe(nextCheckAt.toISOString());
   });
 
   // BLO-22048 (boundary, pre-fix history): before the fix the monitor was
@@ -831,23 +864,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       monitor: { timeoutAt: timeoutAt.toISOString() },
     });
 
-    const blockerId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(issues).values({
-      id: blockerId,
-      companyId,
-      title: "Unresolved blocker",
-      status: "todo",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: `${issuePrefix}-2`,
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: issueId,
-      type: "blocks",
-    });
+    await seedBlocker(companyId, issueId);
 
     const heartbeat = createHeartbeat();
     await heartbeat.triggerIssueMonitor(issueId, {
@@ -921,23 +938,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       monitor: { maxAttempts: 1 },
     });
 
-    const blockerId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(issues).values({
-      id: blockerId,
-      companyId,
-      title: "Unresolved blocker",
-      status: "todo",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: `${issuePrefix}-2`,
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerId,
-      relatedIssueId: issueId,
-      type: "blocks",
-    });
+    await seedBlocker(companyId, issueId);
 
     const heartbeat = createHeartbeat();
 
