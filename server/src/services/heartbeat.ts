@@ -11297,6 +11297,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     try {
+      // BLO-22048: an unresolved blocker makes enqueueWakeup park the wake as a
+      // `dependency_blocked` scheduled_retry and return null *without throwing*,
+      // so the triggered patch below would otherwise fire for a wake that never
+      // ran. The sink is how that deferral is distinguished from a real dispatch.
+      const monitorSuppression: WakeSuppressionOutcome = {
+        durableSkipReason: null,
+        providerCapacityDeferred: false,
+        dependencyBlockedRetryAt: null,
+      };
       await enqueueWakeup(targetAgentId, {
         source: input.source,
         triggerDetail: input.triggerDetail,
@@ -11324,7 +11333,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...reviewRecoveryContext,
           manualTrigger: input.activitySource === "manual",
         },
-      });
+      }, monitorSuppression);
+
+      // The wake was parked behind an unresolved blocker, so no turn ran. Keep
+      // the monitor instead of consuming it, re-armed at the park's own retry
+      // instant — arming at the original (now-past) nextCheckAt would re-fire
+      // every tick into the same coalesced park. The attempt IS consumed, so
+      // this stays bounded by DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS and the
+      // clearReason path above still hands a genuinely stuck issue to the
+      // recovery lane rather than deferring forever (AC2). The safety property
+      // is untouched: the park, not the monitor, governs execution (AC4).
+      if (monitorSuppression.dependencyBlockedRetryAt) {
+        const retryAt = monitorSuppression.dependencyBlockedRetryAt;
+        const deferredPolicy = monitor
+          ? normalizeIssueExecutionPolicy({
+              ...policy,
+              monitor: { ...monitor, nextCheckAt: retryAt.toISOString() },
+            })
+          : null;
+        if (deferredPolicy?.monitor) {
+          await db
+            .update(issues)
+            .set({
+              ...buildIssueMonitorDispatchRearmPatch({
+                issue: claimed,
+                policy: deferredPolicy,
+                attemptCount: nextAttemptCount,
+              }),
+              updatedAt: new Date(),
+            })
+            .where(eq(issues.id, claimed.id));
+        }
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_dependency_blocked_deferred",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            nextCheckAt: retryAt.toISOString(),
+            previousCheckAt: scheduledAtIso,
+            monitorAttemptCount: nextAttemptCount,
+            rearmed: Boolean(deferredPolicy?.monitor),
+            ...monitorMetadata,
+            source: input.activitySource,
+          },
+        });
+        return { outcome: "dependency_blocked_deferred" as const, nextCheckAt: retryAt.toISOString() };
+      }
 
       await db
         .update(issues)
@@ -28765,7 +28825,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "dep_blocked_scheduled") return null;
+      if (outcome.kind === "dep_blocked_scheduled") {
+        // Signal the deferral only here, after the transaction has committed,
+        // so nothing can read "deferred until T" for a park that rolled back —
+        // the same ordering rule the provider-capacity gate documents above.
+        // Without this the caller cannot tell this `null` from a durable
+        // decline, and the issue-monitor dispatcher destroys a monitor whose
+        // wake never ran (BLO-22048).
+        if (suppression) suppression.dependencyBlockedRetryAt = outcome.run.scheduledRetryAt ?? null;
+        return null;
+      }
+      if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
@@ -29126,9 +29196,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * lands on the `other` cause the outage alert pages on. A provider rate-limit
    * would page as "reviews are being dropped".
    */
+  /**
+   * `dependencyBlockedRetryAt` is the second `return null` that is a deferral
+   * rather than a decline (BLO-22048): an unresolved `blockedBy` edge converts
+   * the wake into a `dependency_blocked` scheduled_retry park. It carries the
+   * park's `scheduledRetryAt` rather than a bare boolean because the issue
+   * monitor caller has to re-arm *at that instant* — re-arming at the original
+   * `nextCheckAt` (already in the past, since it just fired) makes the monitor
+   * re-dispatch on every scheduler tick, and each redispatch coalesces into the
+   * same park, so the issue never moves but the activity log churns forever.
+   */
   type WakeSuppressionOutcome = {
     durableSkipReason: string | null;
     providerCapacityDeferred: boolean;
+    dependencyBlockedRetryAt: Date | null;
   };
 
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
@@ -29140,11 +29221,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const suppression: WakeSuppressionOutcome = {
       durableSkipReason: null,
       providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
     };
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
       suppression.durableSkipReason = null;
       suppression.providerCapacityDeferred = false;
+      suppression.dependencyBlockedRetryAt = null;
       try {
         const result = await enqueueWakeup(agentId, opts, suppression);
         if (!result && githubReviewReason !== null) {
@@ -29324,6 +29407,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const suppression: WakeSuppressionOutcome = {
         durableSkipReason: null,
         providerCapacityDeferred: false,
+        dependencyBlockedRetryAt: null,
       };
       try {
         const recoveredRun = await enqueueWakeup(row.agentId, originalOpts, suppression);
