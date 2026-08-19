@@ -4129,6 +4129,21 @@ export function issueRoutes(
   // far as labelling the boundary "grant" and its own note suggests "retry with
   // a mention", which is a trap: the mention has to come from a *specific*
   // author, and a mention from anyone else leaves the agent looping.
+  // PEN-2394: the text below used to say "a comment containing agent://<id>",
+  // and that form grants nothing. `agentHasMentionGrantOnIssue` prefilters with
+  // a LIKE on the raw substring but then gates on `extractAgentMentionIds`,
+  // whose regex only matches the markdown link `[label](agent://<id>)`. So an
+  // assignee who followed this message to the letter got the same 403 back,
+  // still telling them to do what they had already done — and, because the
+  // remediation was plausible, they kept retrying it instead of escalating.
+  // Tested with a control arm: the grant string was posted verbatim by the named
+  // assignee and the denial was byte-identical to an issue where nothing was
+  // ever posted.
+  //
+  // The fix is the message, not the check. Widening the parser to accept a bare
+  // `agent://<id>` would make quoting this very error body inside a comment hand
+  // out comment access by accident, and a bare string does not wake the agent
+  // either — the mention link is the one form that both wakes and authorizes.
   function issueCommentGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
@@ -4140,9 +4155,11 @@ export function issueRoutes(
     return (
       `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
       `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
-      `this issue containing agent://${input.actorAgentId}. A mention written by any other agent ` +
-      `wakes you but does not authorize you. Until then, respond on an issue you are assigned to ` +
-      `and reference this one, or ask the assignee to mention you here.`
+      `this issue that @-mentions you as a markdown link, exactly this form: ` +
+      `[@name](agent://${input.actorAgentId}). A bare agent://${input.actorAgentId} in the comment ` +
+      `body is not a mention — it neither wakes you nor grants anything. A mention written by any ` +
+      `other agent wakes you but does not authorize you. Until then, respond on an issue you are ` +
+      `assigned to and reference this one, or ask the assignee to mention you here.`
     );
   }
 

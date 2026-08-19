@@ -2200,6 +2200,80 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  // PEN-2394: the assignee posted the grant string exactly as the 403 body told
+  // them to — a bare `agent://<id>` — and the mentioned agent was still denied.
+  // The SQL prefilter in `agentHasMentionGrantOnIssue` is a LIKE on that raw
+  // substring, so the comment IS fetched; `extractAgentMentionIds` then drops it
+  // because only the markdown link form is a mention. That gap is why the
+  // remediation read as a no-op. Both halves are pinned here: the bare string is
+  // deliberately inert (an assignee quoting a 403 body must not hand out write by
+  // accident), and the link form is the channel the message now names.
+  it("grants only on the markdown mention link, not on a bare agent:// string from the same assignee", async () => {
+    const company = await createCompany(db, "MentionCommentBareString");
+    const allowedProject = await createProject(db, company.id, "MentionBareAllowed");
+    const targetProject = await createProject(db, company.id, "MentionBareTarget");
+    const assigneeAgent = await createAgent(db, company.id, { role: "coach" });
+    const mentionedAgent = await createAgent(db, company.id, {
+      role: "qa",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: company.id,
+            projectIds: [allowedProject.id],
+          },
+        },
+      },
+    });
+    const issue = await createIssue(db, company.id, {
+      title: "Bare grant string reply target",
+      projectId: targetProject.id,
+      assigneeAgentId: assigneeAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const decideComment = () => authorization.decide({
+      actor: { type: "agent", agentId: mentionedAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        assigneeAgentId: assigneeAgent.id,
+        status: issue.status,
+      },
+    });
+
+    // The literal remediation the 403 used to prescribe, posted by the exact
+    // actor it named. Inert.
+    await db.insert(issueComments).values({
+      companyId: company.id,
+      issueId: issue.id,
+      authorAgentId: assigneeAgent.id,
+      authorType: "agent",
+      body: `Granting access: agent://${mentionedAgent.id}`,
+    });
+    await expect(decideComment()).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_low_trust_boundary",
+    });
+
+    // Same author, same issue, same agent id — only the form changes.
+    await db.insert(issueComments).values({
+      companyId: company.id,
+      issueId: issue.id,
+      authorAgentId: assigneeAgent.id,
+      authorType: "agent",
+      body: `Granting access: [@QA](agent://${mentionedAgent.id})`,
+    });
+    await expect(decideComment()).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_issue_mention_grant",
+    });
+  });
+
   it("does not grant mention-scoped issue access from self-authored or unauthorized-author comments", async () => {
     const company = await createCompany(db, "MentionCommentDenied");
     const allowedProject = await createProject(db, company.id, "MentionDeniedAllowed");

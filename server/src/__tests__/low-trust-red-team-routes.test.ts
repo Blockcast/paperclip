@@ -796,6 +796,58 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     expect(unmentionedComment.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
   });
 
+  // PEN-2394: the end-to-end cover for the documented remediation. The 403 body
+  // used to prescribe "a comment containing agent://<id>"; posting exactly that,
+  // as the assignee it named, left the denial byte-identical to an issue where
+  // nothing had been posted at all — so the remediation read as a no-op and got
+  // retried instead of escalated. This drives the real HTTP path: the prescribed
+  // string denies, the denial now names the form that works, and that form then
+  // clears the very same POST.
+  it("denies a bare agent:// grant string end-to-end and clears the deny once the assignee posts the mention link", async () => {
+    const fixture = await seedLowTrustFixture(db);
+    const [targetIssue] = await db.insert(issues).values({
+      companyId: fixture.company.id,
+      projectId: fixture.projects.outOfScope.id,
+      title: "Bare grant string mention target",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: fixture.agents.standard.id,
+      responsibleUserId: "board-user",
+    }).returning();
+
+    const postReply = () => request(createApp(db, agentActor(fixture)))
+      .post(`/api/issues/${targetIssue!.id}/comments`)
+      .send({ body: "Mention-scoped verification complete." });
+
+    // Arm 1 — the literal remediation, posted by the assignee it names.
+    await db.insert(issueComments).values({
+      companyId: fixture.company.id,
+      issueId: targetIssue!.id,
+      authorAgentId: fixture.agents.standard.id,
+      authorType: "agent",
+      body: `Granting access: agent://${fixture.agents.lowTrust.id}`,
+    });
+
+    const denied = await postReply();
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+
+    // Arm 2 — same author, same issue, same agent id; only the form changes.
+    await db.insert(issueComments).values({
+      companyId: fixture.company.id,
+      issueId: targetIssue!.id,
+      authorAgentId: fixture.agents.standard.id,
+      authorType: "agent",
+      body: `Granting access: [@Low Trust Reviewer](agent://${fixture.agents.lowTrust.id})`,
+    });
+
+    const allowed = await postReply();
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(201);
+    expect(allowed.body).toMatchObject({
+      issueId: targetIssue!.id,
+      authorAgentId: fixture.agents.lowTrust.id,
+    });
+  });
+
   it("propagates denied low-trust policy conflicts on control-plane guards", async () => {
     const fixture = await seedLowTrustFixture(db);
     const conflictingExecutionPolicy = {
