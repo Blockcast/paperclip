@@ -108,6 +108,23 @@ api:
   # 40 lowercase hex, or empty to render no annotation.
   deployedCommit: ""
 
+# -- Singleton worker tier (the `paperclip` StatefulSet). This tier runs
+# `PAPERCLIP_NODE_ROLE=worker`: it drives heartbeat dispatch and hosts the
+# plugin workers. It is NOT optional the way `api` is — the StatefulSet always
+# renders; this block only carries release-job metadata for it.
+worker:
+  # -- Exact Git commit SHA deployed by the release job (BLO-29008), stamped
+  # onto the WORKER pod template as `paperclip.blockcast.net/deployed-commit`.
+  # 40 lowercase hex, or empty to render no annotation.
+  #
+  # Mirrors `api.deployedCommit` and is set from the same `${COMMIT}` in the
+  # same `helm upgrade`, so the two cannot diverge by construction. The deploy
+  # job additionally asserts the LIVE objects agree, which is the check that
+  # actually holds: before BLO-29008 the worker carried no stamp at all, so a
+  # deploy that rolled the api and left the worker on older code reported
+  # `success` and every tier-level signal read green (BLO-28920).
+  deployedCommit: ""
+
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
   # -- Service type. Keep `ClusterIP`; cloudflared or Ingress handle external exposure.
