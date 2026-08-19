@@ -16,10 +16,16 @@
  * The second half of this file pins the genuine 4xx rejections on the same
  * route, so a future "make webhooks retryable" change cannot quietly convert
  * real client errors into infinite sender retry loops.
+ *
+ * "Not ready" is a partition, not a negation. `uninstalled` survives soft
+ * delete for 30 days and still resolves on this route, so it answers 410 —
+ * retrying a removed plugin could never succeed, and telling senders to do so
+ * would swap dropped payloads for an unclearable alarm.
  */
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PLUGIN_STATUSES } from "@paperclipai/shared";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -115,9 +121,24 @@ describe("webhook ingestion: plugin-not-ready is retryable", () => {
     vi.clearAllMocks();
   });
 
-  // "error" is the status the alertmanager plugin latched into during the
-  // outage, so it is the exact case that caused the data loss.
-  for (const status of ["error", "installed", "disabled", "starting"]) {
+  // Driven off the real enum, not a hand-written list, so the matrix cannot
+  // drift from the domain: the day someone adds a PluginStatus this fails
+  // loudly and forces a retryable-or-terminal decision instead of silently
+  // inheriting one. ("error" is the status the alertmanager plugin latched
+  // into during the outage, so it is the exact case that caused the data loss.)
+  const RETRYABLE_STATUSES = PLUGIN_STATUSES.filter(
+    (status) => status !== "ready" && status !== "uninstalled",
+  );
+
+  it("covers every non-ready status exactly once", () => {
+    // Guards the two filters above against a status being added and silently
+    // falling outside both this matrix and the terminal test below.
+    expect([...RETRYABLE_STATUSES, "uninstalled", "ready"].sort()).toEqual(
+      [...PLUGIN_STATUSES].sort(),
+    );
+  });
+
+  for (const status of RETRYABLE_STATUSES) {
     it(`answers 503 with Retry-After when plugin status is "${status}"`, async () => {
       mockPlugin({ status });
       const { app, workerManager } = await createApp();
@@ -143,7 +164,39 @@ describe("webhook ingestion: plugin-not-ready is retryable", () => {
     const res = await postAlert(app);
 
     expect(res.status).toBe(503);
-    expect(res.status).not.toBe(400);
+  }, 20_000);
+});
+
+describe("webhook ingestion: uninstalled is terminal, not retryable", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("answers 410 (not 503) for an uninstalled plugin, with no Retry-After", async () => {
+    // Soft delete keeps the row for 30 days and the resolution path does not
+    // filter by status, so a catch-all `!== "ready"` would tell senders to
+    // retry a deliberately removed plugin until the purge. Alertmanager would
+    // requeue forever and AlertmanagerWebhookNotificationsFailing (BLO-20813)
+    // would stay lit with no operator action able to clear it — trading
+    // dropped payloads for an unclearable alarm.
+    mockPlugin({ status: "uninstalled" });
+    const { app, workerManager } = await createApp();
+
+    const res = await postAlert(app);
+
+    expect(res.status).toBe(410);
+    expect(res.headers["retry-after"]).toBeUndefined();
+    expect(workerManager.call).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("reports uninstalled as gone rather than as a readiness problem", async () => {
+    mockPlugin({ status: "uninstalled" });
+    const { app } = await createApp();
+
+    const res = await postAlert(app);
+
+    expect(res.body.error).toContain("uninstalled");
+    expect(res.body.error).not.toContain("not ready");
   }, 20_000);
 });
 

@@ -241,6 +241,35 @@ const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
  * senders, short enough that a normal restart re-delivers promptly.
  */
 const WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS = 30;
+/**
+ * Non-`ready` plugin statuses from which webhook ingestion can recover *without
+ * the sender changing anything* — the same resource returns to `ready` on its
+ * own or on an operator action that does not recreate it. These answer 503 and
+ * are safe to retry indefinitely.
+ *
+ * `disabled` is deliberately on this list: an operator disabling a plugin for
+ * maintenance is exactly the person who wants the deliveries made during the
+ * window to land once they re-enable it, and `enable` restores the same row.
+ * The cost is honest — a plugin left disabled for a long time keeps
+ * `AlertmanagerWebhookNotificationsFailing` lit — but that alarm has a real
+ * operator action that clears it, which is the line this partition draws.
+ *
+ * `uninstalled` is *not* here, and must never be: soft delete keeps the row for
+ * 30 days (`DELETE /plugins/:pluginId` without `purge`) and the resolution path
+ * does not filter by status, so a catch-all `!== "ready"` would answer
+ * `503 + Retry-After` for a deliberately removed plugin until the purge. Senders
+ * would requeue forever with no action able to clear it. Getting back to `ready`
+ * from `uninstalled` requires a *reinstall* — a new lifecycle, not a retry — so
+ * the endpoint is genuinely gone and says so with 410.
+ *
+ * @see BLO-28659 — why readiness is retryable at all
+ */
+const WEBHOOK_RETRYABLE_PLUGIN_STATUSES = new Set<PluginStatus>([
+  "installed",
+  "disabled",
+  "error",
+  "upgrade_pending",
+]);
 const MEMORY_PLUGIN_KEYWORDS = ["gbrain", "hindsight", "memory", "plugin-secrets"] as const;
 
 type RagHealthBucketCacheEntry = {
@@ -3150,7 +3179,8 @@ export function pluginRoutes(
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
    * - 400 if the manifest is missing or lacks the webhooks.receive capability
-   * - 503 (with `Retry-After`) if the plugin is not in ready state
+   * - 410 if the plugin has been uninstalled (the endpoint is gone for good)
+   * - 503 (with `Retry-After`) if the plugin is not ready but can recover
    * - 502 if the worker is unavailable or the RPC call fails
    *
    * Readiness is a *transient, server-side* condition, so it answers 503 and
@@ -3159,6 +3189,12 @@ export function pluginRoutes(
    * outage ("notify retry canceled due to unrecoverable error ... status code
    * 400"), destroying every alert that fired across a 5.8h window. Keep this
    * retryable; delayed alerts are recoverable, dropped ones are not.
+   *
+   * "Not ready" is a *partition*, not a negation — see
+   * {@link WEBHOOK_RETRYABLE_PLUGIN_STATUSES}. Recoverable statuses retry;
+   * `uninstalled` is terminal and answers 410, because telling a sender to
+   * retry a plugin that no longer exists trades dropped payloads for an
+   * unclearable alarm and an unbounded retry loop.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -3177,9 +3213,18 @@ export function pluginRoutes(
 
     // Step 2: Validate the plugin is in 'ready' state.
     //
-    // 503 + Retry-After, not 400: the request is well-formed and the fault is
-    // ours. Matching the sibling guard at the plugin-scoped API route above.
+    // Partition, not negation. Recoverable states answer 503 + Retry-After —
+    // the request is well-formed and the fault is ours, matching the sibling
+    // guard on the plugin-scoped API route above. `uninstalled` is terminal:
+    // the row survives soft delete for 30 days and resolves here, so retrying
+    // it could never succeed.
     if (plugin.status !== "ready") {
+      if (!WEBHOOK_RETRYABLE_PLUGIN_STATUSES.has(plugin.status as PluginStatus)) {
+        res.status(410).json({
+          error: `Plugin has been uninstalled (current status: ${plugin.status})`,
+        });
+        return;
+      }
       res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
       res.status(503).json({
         error: `Plugin is not ready (current status: ${plugin.status})`,
