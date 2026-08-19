@@ -295,11 +295,26 @@ function consolidatedReviewHead(body: string): string | null {
     return null;
   }
   const attestations = Array.from(
-    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*([0-9a-f]{40})\s*_?\s*(?=\n|$)/gi),
+    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*`?([0-9a-f]{40})`?\s*_?\s*(?=\n|$)/gi),
     (match) => match[1]!.toLowerCase(),
   );
   return attestations.length === 1 ? attestations[0]! : null;
 }
+
+/**
+ * Page cap for BOTH evidence surfaces below. Deliberately far smaller than
+ * `GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES` (500), because this predicate runs
+ * on every reviewer-run completion and so its request budget is a hot path,
+ * whereas the comment-review gate that owns that constant runs rarely.
+ *
+ * What it DOES share with that constant is the contract that matters: reaching
+ * the cap returns an `{error}`, never a silently truncated `{found:false}`. A
+ * truncated negative here would re-raise `pr_review_output_missing` and post a
+ * false "reviewer never finished" status — i.e. it would reproduce BLO-28920,
+ * merely gated on thread length instead of review state. These threads do get
+ * long (28 stacked marker requests on one PR), so the cap is reachable.
+ */
+const REVIEWER_EVIDENCE_MAX_PAGES = 10;
 
 /**
  * Authoritatively check whether the reviewer GitHub App actually REVIEWED this
@@ -328,20 +343,29 @@ function consolidatedReviewHead(body: string): string | null {
  * Found when the configured App identity left EITHER surface at the exact head,
  * because Ally posts on either and each surface is individually blind to the
  * other:
- *  - a formal review with `commit_id === headSha`, in ANY state; or
+ *  - a formal SUBMITTED review with `commit_id === headSha`, in any submitted
+ *    state (`COMMENTED` / `CHANGES_REQUESTED` / `APPROVED` / `DISMISSED` — a
+ *    dismissed review still happened, it was only disposed of afterwards); or
  *  - an issue comment carrying the canonical consolidated-review heading and a
  *    single `Reviewed head:` attestation equal to that head (comment-mode
  *    reviews file no review object and so carry no `commit_id`).
  *
- * Deliberately NOT accepted, so a genuinely missing review still fails: the
- * same-slug bare user seat (a distinct principal — see
- * `githubReviewerIdentityMatches`), and any review at a head other than the
- * required one.
+ * Deliberately NOT accepted, so a genuinely missing review still fails:
+ *  - the same-slug bare user seat (a distinct principal — see
+ *    `githubReviewerIdentityMatches`);
+ *  - any review at a head other than the required one;
+ *  - a `PENDING` review. That is an *unsubmitted draft*, returned by GitHub only
+ *    to the identity that created it — which is this App — and it already
+ *    carries a `commit_id`. The MCP review flow is `create pending` → `add
+ *    comments` → `submit`, so a run that dies mid-flow leaves exactly such a
+ *    draft; accepting it would let that run self-attest and would defeat the
+ *    one case this predicate exists to catch.
  *
- * Returns `{error}` on invalid configuration, missing creds/token, or any non-OK
- * or failed reviews/comments fetch. Callers fail completion closed with a
- * retryable verification-unavailable error. An unresolved required head returns
- * `{found:false}` and never accepts arbitrary review evidence.
+ * Returns `{error}` on invalid configuration, missing creds/token, any non-OK
+ * or failed reviews/comments fetch, or an exhausted pagination cap. Callers fail
+ * completion closed with a retryable verification-unavailable error. An
+ * unresolved required head returns `{found:false}` and never accepts arbitrary
+ * review evidence.
  */
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
@@ -362,10 +386,12 @@ export async function githubHasReviewerEvidenceForPr(input: {
     headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
   if (!headSha) return { found: false };
 
-  // 1) Formal reviews — the configured App at this exact head, in any state.
-  // `COMMENTED` counts: see the merge-authorization vs attestation note above.
+  // 1) Formal reviews — the configured App at this exact head, in any SUBMITTED
+  // state. `COMMENTED` counts: see the merge-authorization vs attestation note
+  // above. `PENDING` does not: it is an unsubmitted draft visible only to its
+  // creator, which is this App.
   try {
-    for (let page = 1; page <= 10; page += 1) {
+    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
       if (!res.ok) {
@@ -381,9 +407,11 @@ export async function githubHasReviewerEvidenceForPr(input: {
         const authorLogin = review.user?.login ?? "";
         const commitId = headShaHex(review.commit_id);
         if (!githubReviewerIdentityMatches(authorLogin, botLogin)) continue;
+        if ((review.state ?? "").toUpperCase() === "PENDING") continue;
         if (commitId === headSha) return { found: true, via: "review" };
       }
       if (batch.length < 100) break;
+      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: "reviews_pagination_exhausted" };
     }
   } catch {
     return { error: "reviews_fetch_failed" };
@@ -393,7 +421,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
   // posting a consolidated comment and files no review object at all, so a PR it
   // demonstrably reviewed can report zero reviews on surface (1).
   try {
-    for (let page = 1; page <= 10; page += 1) {
+    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
       if (!res.ok) {
@@ -406,6 +434,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
         if (consolidatedReviewHead(comment.body ?? "") === headSha) return { found: true, via: "comment" };
       }
       if (batch.length < 100) break;
+      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: "comments_pagination_exhausted" };
     }
   } catch {
     return { error: "comments_fetch_failed" };

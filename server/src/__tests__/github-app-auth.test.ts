@@ -524,6 +524,83 @@ describe("githubHasReviewerEvidenceForPr", () => {
         githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
       ).resolves.toEqual({ found: false });
     });
+
+    // (e) A PENDING review is an unsubmitted draft, returned by GitHub only to
+    // the identity that created it — this App — and it already carries a
+    // commit_id. The MCP flow is `create pending` -> `add comments` -> `submit`,
+    // so a run that dies mid-flow leaves exactly this shape. Accepting it would
+    // let that run self-attest and defeat (d) on the one path that matters.
+    it("(e) rejects a PENDING (unsubmitted draft) Bot review at the exact head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: AMT_HEAD, state: "PENDING" }],
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: false });
+    });
+
+    // A DISMISSED review still happened; it was only disposed of afterwards. It
+    // is real run output and must keep attesting, so the PENDING guard above
+    // must not be widened into a general "only these states" allowlist.
+    it("(e2) still accepts a DISMISSED Bot review at the exact head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: AMT_HEAD, state: "DISMISSED" }],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: true, via: "review" });
+    });
+
+    // (f) Exhausting the page cap must surface an error, never a truncated
+    // `{found:false}`. A silent truncation would re-raise
+    // pr_review_output_missing and post a false "reviewer never finished"
+    // status — reproducing BLO-28920, gated on thread length instead of state.
+    it("(f) errors rather than reporting a truncated negative when reviews paginate past the cap", async () => {
+      setCreds();
+      const fullPage = Array.from({ length: 100 }, () => ({
+        user: { login: "someone-else" },
+        commit_id: AMT_STALE_HEAD,
+        state: "COMMENTED",
+      }));
+      stubGithub({ reviews: fullPage, comments: [] });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_pagination_exhausted" });
+    });
+
+    it("(f2) errors rather than reporting a truncated negative when comments paginate past the cap", async () => {
+      setCreds();
+      const fullPage = Array.from({ length: 100 }, () => ({
+        user: { login: "someone-else" },
+        body: "not a review",
+      }));
+      stubGithub({ reviews: [], comments: fullPage });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "comments_pagination_exhausted" });
+    });
+
+    // Ally emits the bare 40-hex form today, but AGENTS.md documents a
+    // backticked variant; tolerate both so a formatting change cannot make
+    // comment-mode reviews silently invisible.
+    it("(g) accepts a backticked `Reviewed head:` attestation", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [],
+        comments: [
+          {
+            user: { login: "allyblockcast[bot]" },
+            body: `## Ally — Consolidated PR Review\n\nReviewed head: \`${AMT_HEAD}\`\n`,
+          },
+        ],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: true, via: "comment" });
+    });
   });
 });
 
