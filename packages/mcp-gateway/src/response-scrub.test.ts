@@ -743,3 +743,289 @@ describe("scrubJsonValue — env serialized as a mapping", () => {
     expect(JSON.stringify(out)).toContain("creds");
   });
 });
+
+/**
+ * The three groups below cover one defect class in three places: a line that
+ * matched no redact pattern and was therefore emitted. The scanner's in-block
+ * default is now to redact, so these fixtures pin the *allowlist* — both that
+ * unrecognized content is dropped, and that the three keys a Kubernetes env
+ * entry legally carries still survive.
+ */
+describe("scrubYamlText — every env: spelling opens the block", () => {
+  // `env:` had a block pattern and an inline pattern, and two patterns must be
+  // tested in some order. Both matched `env: # vars`; the inline one won and
+  // emitted the line *without* opening the block, so every value below it
+  // missed the in-block guard.
+  for (const [label, suffix] of [
+    ["a trailing comment", " # container vars"],
+    ["an anchor", " &shared"],
+    ["a tag", " !!seq"],
+    ["an anchor and a comment", " &shared # reused"],
+    ["a tab before an anchor", "\t&shared"],
+    ["a tag and an anchor", " !!seq &shared"],
+  ] as const) {
+    it(`enters a block whose env: key carries ${label}`, () => {
+      const pod = ["    env:" + suffix, "    - name: OPENAI_API_KEY", `      value: ${LEAK}`].join(
+        "\n",
+      );
+
+      const out = scrubYamlText(pod);
+
+      expectNoLeak(out);
+      // The name is the diagnostic the grant exists for, so it must survive.
+      expect(out).toContain("OPENAI_API_KEY");
+      expect(out).toContain(REDACTED);
+    });
+  }
+
+  it("fails closed on an alias, whose anchor may never have been scrubbed", () => {
+    const out = scrubYamlText(`    env: *shared\n`);
+
+    expect(out).toContain(REDACTED);
+  });
+
+  for (const [label, suffix] of [
+    ["a block scalar", " |"],
+    ["a folded scalar", " >"],
+  ] as const) {
+    it(`fails closed on env: introducing ${label}`, () => {
+      const out = scrubYamlText(`    env:${suffix}\n      OPENAI_API_KEY=${LEAK}\n`);
+
+      expectNoLeak(out);
+    });
+  }
+
+  it("redacts an env: scalar in KEY=VALUE form but keeps the name", () => {
+    const out = scrubYamlText(`    env: OPENAI_API_KEY=${LEAK}\n`);
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("leaves a plain env: scalar alone — it is prose, not a k8s env value", () => {
+    // Failing closed here is not free: redaction sets the changed flag, which
+    // re-serializes the whole body and rounds integers above 2^53. `env` is
+    // never a bare scalar in Kubernetes, so this text belongs to some other
+    // body the gateway proxies and must come back untouched.
+    const text = "  note: see env: config for details\n";
+
+    expect(scrubYamlText(text)).toBe(text);
+  });
+});
+
+describe("scrubYamlText — unrecognized content inside an env block", () => {
+  for (const [label, entry] of [
+    ["a KEY=VALUE scalar entry", `    - OPENAI_API_KEY=${LEAK}`],
+    ["a double-quoted KEY=VALUE entry", `    - "OPENAI_API_KEY=${LEAK}"`],
+    ["a single-quoted KEY=VALUE entry", `    - 'OPENAI_API_KEY=${LEAK}'`],
+    ["a bare scalar entry", `    - ${LEAK}`],
+    ["a flow sequence entry", `    - [OPENAI_API_KEY, ${LEAK}]`],
+    ["an unknown key", `      unknownKey: ${LEAK}`],
+    ["a near-miss key spelling", `      Value: ${LEAK}`],
+  ] as const) {
+    it(`redacts ${label}`, () => {
+      const out = scrubYamlText(`    env:\n${entry}\n`);
+
+      expectNoLeak(out);
+    });
+  }
+
+  it("keeps the variable name of a KEY=VALUE entry", () => {
+    const out = scrubYamlText(`    env:\n    - OPENAI_API_KEY=${LEAK}\n`);
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+  });
+
+  it("preserves a valueFrom subtree — the allowlist must not over-redact", () => {
+    // Guards the other direction: an allowlist that dropped these would destroy
+    // the diagnostics the grant exists for, which is the outcome ask 2 was
+    // filed to avoid.
+    const pod = [
+      "    env:",
+      "    - name: TOKEN",
+      "      valueFrom:",
+      "        secretKeyRef:",
+      "          name: creds",
+      "          key: token",
+      "    - name: OPENAI_API_KEY",
+      `      value: ${LEAK}`,
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    expectNoLeak(out);
+    expect(out).toContain("valueFrom:");
+    expect(out).toContain("secretKeyRef:");
+    expect(out).toContain("name: creds");
+    expect(out).toContain("key: token");
+  });
+
+  it("keeps sibling container fields once the env block ends", () => {
+    const pod = [
+      "  - name: server",
+      "    env:",
+      "    - name: OPENAI_API_KEY",
+      `      value: ${LEAK}`,
+      "    image: ghcr.io/example/app:v1",
+      "    restartCount: 7",
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    expectNoLeak(out);
+    expect(out).toContain("image: ghcr.io/example/app:v1");
+    expect(out).toContain("restartCount: 7");
+  });
+});
+
+describe("scrubJsonValue — env entries that are not objects", () => {
+  it("redacts a KEY=VALUE string entry and keeps the name", () => {
+    // `KEY=VALUE` is the OCI/Docker env shape. A scalar is not an object, so
+    // the `value` lookup never ran and the entry was returned intact.
+    const out = JSON.stringify(scrubJsonValue({ env: [`OPENAI_API_KEY=${LEAK}`] }));
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+    expect(out).toContain(REDACTED);
+  });
+
+  for (const [label, env] of [
+    ["a nested array entry", [["OPENAI_API_KEY", LEAK]]],
+    ["a string entry with no separator", [LEAK]],
+  ] as const) {
+    it(`redacts ${label}`, () => {
+      expectNoLeak(JSON.stringify(scrubJsonValue({ env })));
+    });
+  }
+
+  it("redacts an env serialized as a single KEY=VALUE string", () => {
+    const out = JSON.stringify(scrubJsonValue({ env: `OPENAI_API_KEY=${LEAK}` }));
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+  });
+
+  it("leaves a plain env string alone, matching the YAML path", () => {
+    const out = scrubJsonValue({ env: "see config" });
+
+    expect(JSON.stringify(out)).toContain("see config");
+  });
+
+  it("leaves a null entry untouched rather than inventing a redaction", () => {
+    expect(JSON.stringify(scrubJsonValue({ env: [null] }))).toBe('{"env":[null]}');
+  });
+});
+
+describe("scrubResponseBody — SSE sniff skips leading bytes", () => {
+  // The sniff is the fallback for an upstream that omits content-type. It was
+  // anchored on a 6-byte window with no allowance for leading bytes, while the
+  // JSON sniff already skipped whitespace — and that asymmetry meant a stream
+  // opening on a blank line or a BOM was classified as neither, so the whole
+  // stream including its data: payloads came back unscrubbed.
+  const frame = `data: {"env":[{"name":"OPENAI_API_KEY","value":"${LEAK}"}]}\n\n`;
+
+  for (const [label, prefix] of [
+    ["a blank line", "\n"],
+    ["CRLF", "\r\n"],
+    ["a BOM", "﻿"],
+    ["indentation", "  "],
+    ["a BOM then a blank line", "﻿\n"],
+  ] as const) {
+    it(`scrubs a stream that opens on ${label}`, () => {
+      const out = scrubResponseBody(Buffer.from(prefix + frame, "utf8"), null).toString("utf8");
+
+      expectNoLeak(out);
+      expect(out).toContain(REDACTED);
+    });
+  }
+
+  it("still leaves a leading-whitespace body that is not a stream byte-exact", () => {
+    const body = Buffer.from("  this is plain prose, not an event stream\n", "utf8");
+
+    expect(scrubResponseBody(body, null)).toBe(body);
+  });
+});
+
+/**
+ * The `valueFrom` subtree is the one place inside an env block where lines pass
+ * through, so it is the one place the in-block default-redact can be escaped.
+ * The first case below is a REGRESSION guard: `valueFrom:` / `value:` was
+ * already redacted before this block existed, by the plain in-block scanner.
+ * An earlier draft of the subtree branch emitted every deeper line
+ * unclassified, which re-opened it — a fix that loosened what the module
+ * already enforced. These fixtures pin both directions.
+ */
+describe("scrubYamlText — the valueFrom subtree is classified, not trusted", () => {
+  for (const [label, key] of [
+    ["a value: key", "value"],
+    ["an unknown key", "anything"],
+    ["a near-miss selector", "secretKeyReff"],
+  ] as const) {
+    it(`redacts ${label} nested under valueFrom`, () => {
+      const out = scrubYamlText(
+        ["    env:", "    - name: A", "      valueFrom:", `        ${key}: ${LEAK}`].join("\n"),
+      );
+
+      expectNoLeak(out);
+      expect(out).toContain(REDACTED);
+    });
+  }
+
+  it("keeps every EnvVarSource selector and leaf — the allowlist must not over-redact", () => {
+    const pod = [
+      "    env:",
+      "    - name: A",
+      "      valueFrom:",
+      "        secretKeyRef:",
+      "          name: creds",
+      "          key: token",
+      "          optional: true",
+      "    - name: B",
+      "      valueFrom:",
+      "        fieldRef:",
+      "          apiVersion: v1",
+      "          fieldPath: metadata.name",
+      "    - name: C",
+      "      valueFrom:",
+      "        resourceFieldRef:",
+      "          containerName: app",
+      "          resource: limits.cpu",
+      "          divisor: '1'",
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    for (const kept of [
+      "secretKeyRef:",
+      "name: creds",
+      "key: token",
+      "optional: true",
+      "fieldRef:",
+      "fieldPath: metadata.name",
+      "resourceFieldRef:",
+      "containerName: app",
+      "resource: limits.cpu",
+    ]) {
+      expect(out).toContain(kept);
+    }
+    expect(out).not.toContain(REDACTED);
+  });
+});
+
+describe("scrubJsonValue — Docker/OCI spells the key Env", () => {
+  // The scalar-entry handling exists because `KEY=VALUE` is the OCI/Docker env
+  // encoding. Docker also spells the key `Env` (`Config.Env`), so recognizing
+  // that encoding under the lowercase key only would cover half the shape it
+  // was added for.
+  it("redacts a capitalized Env list and keeps the name", () => {
+    const out = JSON.stringify(scrubJsonValue({ Env: [`OPENAI_API_KEY=${LEAK}`] }));
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+  });
+
+  it("redacts a capitalized Env mapping", () => {
+    expectNoLeak(JSON.stringify(scrubJsonValue({ Env: { OPENAI_API_KEY: LEAK } })));
+  });
+});
