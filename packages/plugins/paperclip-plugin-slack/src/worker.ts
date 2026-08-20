@@ -247,6 +247,30 @@ function canProcessMutatingApprovalWebhook(
 }
 
 /**
+ * Outcome of resolving a company's Slack signing secret.
+ *
+ * The three cases are kept distinct on purpose. An earlier revision collapsed
+ * them all into `string | null`, where `null` reaches `verifySlackSignature`
+ * and means *skip verification* — so a transient config/secret-store failure
+ * silently downgraded a company that HAS configured verification to
+ * unverified for that delivery, turning an infra blip into an
+ * authentication-bypass window on a public endpoint.
+ *
+ * - `none`        — this company has configured no signing secret. The
+ *                   deliberate, pre-existing "skip verification if not
+ *                   configured" behavior, now evaluated per company.
+ * - `secret`      — verify against this value.
+ * - `unavailable` — configured (or possibly configured) but unreadable. The
+ *                   caller MUST reject the delivery: we cannot tell a genuine
+ *                   Slack request from a forged one, so failing closed is the
+ *                   only safe reading.
+ */
+type SigningSecretResolution =
+  | { kind: "none" }
+  | { kind: "secret"; value: string }
+  | { kind: "unavailable"; reason: "missing_company" | "config_read_failed" | "secret_resolve_failed" };
+
+/**
  * Resolve the Slack signing secret this delivery's own company configured,
  * for signature verification and the mutating-approval gate. Never the
  * `setup()` bootstrap snapshot — same reasoning as `resolveInteractionScope`:
@@ -255,16 +279,14 @@ function canProcessMutatingApprovalWebhook(
  * it to verify a DIFFERENT company's request would accept a signature that
  * was never actually produced with that company's secret.
  *
- * Returns `null` (never throws) for a missing companyId, a config/secret read
- * failure, or a company that simply hasn't configured a signing secret — the
- * last case intentionally matches the pre-existing "skip verification if not
- * configured" behavior, now evaluated per company instead of once globally.
+ * Never throws; a read failure is reported as `unavailable` rather than
+ * conflated with "not configured". See `SigningSecretResolution`.
  */
 async function resolveCompanySigningSecret(
   ctx: PluginContext,
   companyId: string,
-): Promise<string | null> {
-  if (!companyId) return null;
+): Promise<SigningSecretResolution> {
+  if (!companyId) return { kind: "unavailable", reason: "missing_company" };
   let raw: Record<string, unknown> | null | undefined;
   try {
     raw = await ctx.config.get(companyId);
@@ -273,20 +295,30 @@ async function resolveCompanySigningSecret(
       `Could not load config to resolve the Slack signing secret for company ${companyId}`,
       { err },
     );
-    return null;
+    return { kind: "unavailable", reason: "config_read_failed" };
   }
   const ref = (raw as unknown as SlackPluginConfig | undefined)
     ?.slackSigningSecretRef;
-  if (!ref) return null;
+  if (!ref) return { kind: "none" };
+  let value: string | null;
   try {
-    return await ctx.secrets.resolve(ref, { companyId });
+    value = await ctx.secrets.resolve(ref, { companyId });
   } catch (err) {
     ctx.logger.warn(
       `Could not resolve slackSigningSecretRef for company ${companyId}`,
       { err },
     );
-    return null;
+    return { kind: "unavailable", reason: "secret_resolve_failed" };
   }
+  // A configured ref that resolves to an empty value is a broken secret, not
+  // an opt-out of verification — treat it as unreadable rather than `none`.
+  if (!value) {
+    ctx.logger.warn(
+      `slackSigningSecretRef for company ${companyId} resolved to an empty value`,
+    );
+    return { kind: "unavailable", reason: "secret_resolve_failed" };
+  }
+  return { kind: "secret", value };
 }
 
 // --- Helpers ---
@@ -594,11 +626,20 @@ async function handleSlashCommand(
   try {
     switch (subcommand) {
       case "status":
-        await handleStatusCommand(ctx, companyId, responseUrl);
+        await handleStatusCommand(
+          ctx,
+          companyId,
+          responseUrl,
+          await resolveCompanyBaseUrl(ctx, companyId),
+        );
         break;
       case "help":
       case "":
-        await handleHelpCommand(ctx, responseUrl);
+        await handleHelpCommand(
+          ctx,
+          responseUrl,
+          await resolveCompanyBaseUrl(ctx, companyId),
+        );
         break;
       case "agents":
         await handleAgentsCommand(ctx, companyId, responseUrl);
@@ -688,10 +729,34 @@ async function handleSlashCommand(
   }
 }
 
+/**
+ * Best-effort read of this company's dashboard base URL, for cosmetic links.
+ *
+ * Never `pluginConfig`: that is the setup()-time bootstrap snapshot which the
+ * host always hands the worker as `{}` on a multi-company install, so
+ * `pluginConfig.paperclipBaseUrl` is `undefined` on every such install — which
+ * shipped a URL-less button on the status card and rendered a literal
+ * `undefined` as the link target in the help card.
+ *
+ * Cosmetic-only, so unlike `resolveInteractionScope` this degrades instead of
+ * refusing: `/clip status` and `/clip help` are read-only and still useful
+ * without a dashboard link, so an unreadable or unset config returns `null`
+ * and the caller omits the link rather than failing the command.
+ */
+async function resolveCompanyBaseUrl(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<string | null> {
+  const config = await loadCompanyConfig(ctx, companyId, "dashboard link lookup");
+  const base = config?.paperclipBaseUrl?.trim();
+  return base ? base.replace(/\/+$/, "") : null;
+}
+
 async function handleStatusCommand(
   ctx: PluginContext,
   companyId: string,
   responseUrl: string,
+  baseUrl: string | null,
 ): Promise<void> {
   const agents = await ctx.agents.list({ companyId, limit: 100, offset: 0 });
   const activeAgents = agents.filter(
@@ -730,17 +795,24 @@ async function handleStatusCommand(
           { type: "mrkdwn", text: `*Recent Completions*\n${issueSummary}` },
         ],
       },
-      {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "View Dashboard" },
-            url: pluginConfig.paperclipBaseUrl,
-            action_id: "view_dashboard",
-          },
-        ],
-      },
+      // Omitted entirely when this company has no readable dashboard URL: a
+      // Block Kit button with no `url` renders as a dead control, which is a
+      // worse answer than not offering the button at all.
+      ...(baseUrl
+        ? [
+            {
+              type: "actions",
+              elements: [
+                {
+                  type: "button",
+                  text: { type: "plain_text", text: "View Dashboard" },
+                  url: baseUrl,
+                  action_id: "view_dashboard",
+                },
+              ],
+            },
+          ]
+        : []),
     ],
   });
 }
@@ -748,6 +820,7 @@ async function handleStatusCommand(
 async function handleHelpCommand(
   ctx: PluginContext,
   responseUrl: string,
+  baseUrl: string | null,
 ): Promise<void> {
   await respondEphemeral(ctx, responseUrl, {
     text: "Available /clip commands",
@@ -774,15 +847,21 @@ async function handleHelpCommand(
           ].join("\n"),
         },
       },
-      {
-        type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: `<${pluginConfig.paperclipBaseUrl}|Open Paperclip Dashboard>`,
-          },
-        ],
-      },
+      // Omitted when this company has no readable dashboard URL, rather than
+      // interpolating an undefined base into the link target.
+      ...(baseUrl
+        ? [
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: `<${baseUrl}|Open Paperclip Dashboard>`,
+                },
+              ],
+            },
+          ]
+        : []),
     ],
   });
 }
@@ -1133,6 +1212,21 @@ const plugin = definePlugin({
     const config = rawConfig as unknown as SlackPluginConfig;
     pluginCtx = ctx;
     pluginConfig = config;
+    // Deliberately NOT converted to a per-delivery call, unlike the two
+    // `paperclipBaseUrl` reads on the slash-command path. `setBaseUrl` mutates
+    // a module-level global in formatters.ts (`dashboardBase`) that twelve URL
+    // builders read, so calling it per delivery would let two concurrent
+    // deliveries race and stamp company A's dashboard host into company B's
+    // message — converting a cosmetic wrong-host default into exactly the
+    // cross-tenant leak this change exists to remove.
+    //
+    // Left as-is because it is correct where it fires: `bootstrapCompanyId` is
+    // set only on a single-company install, which is the one case where this
+    // snapshot carries that company's real value. On a multi-company install
+    // it never fires and the formatters keep their localhost default, which is
+    // wrong-but-inert. Making those links correct per company means threading
+    // the base URL through the formatter signatures — a wider refactor tracked
+    // separately, not smuggled into a credential-scoping fix.
     if (config.paperclipBaseUrl) {
       setBaseUrl(config.paperclipBaseUrl);
     }
@@ -2359,10 +2453,33 @@ const plugin = definePlugin({
     // snapshot — see resolveCompanySigningSecret.
     const body = input.parsedBody as Record<string, unknown> | undefined;
     const isVerificationChallenge = body?.type === "url_verification";
-    const signingSecret = isVerificationChallenge
-      ? null
-      : await resolveCompanySigningSecret(pluginCtx, input.companyId);
+    let signingSecret: string | null = null;
     if (!isVerificationChallenge) {
+      const resolution = await resolveCompanySigningSecret(
+        pluginCtx,
+        input.companyId,
+      );
+      // Fail closed: "configured but unreadable" is NOT "not configured". If
+      // we cannot read the secret we cannot distinguish a genuine Slack
+      // delivery from a forged one, so drop it rather than processing an
+      // unverified request on a public endpoint. Only the explicit `none`
+      // case keeps the documented skip-if-unconfigured behavior.
+      if (resolution.kind === "unavailable") {
+        if (shouldEmitSigWarn()) {
+          pluginCtx.logger.warn(
+            "Rejected webhook: Slack signing secret unavailable, cannot verify signature",
+            {
+              reason: resolution.reason,
+              companyId: input.companyId,
+              endpointKey: input.endpointKey,
+              requestId: input.requestId,
+              suppressedSince: takeSuppressedSigCount(),
+            },
+          );
+        }
+        return;
+      }
+      signingSecret = resolution.kind === "secret" ? resolution.value : null;
       const sig = verifySlackSignature(input.headers, input.rawBody, signingSecret);
       if (!sig.ok) {
         // Throttle: at most one rejection warn per 5s (public endpoint).

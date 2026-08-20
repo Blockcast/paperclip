@@ -243,12 +243,19 @@ describe("Slack interactive surface tenant scoping (BLO-21083)", () => {
       requestId: "req-2",
     } as any);
 
+    // Rejected at the signature gate rather than further down in
+    // resolveInteractionScope: with no companyId there is no company whose
+    // signing secret could verify this delivery, so it cannot be
+    // authenticated at all and is refused before any handler runs.
+    //
+    // Asserted on effects, not on the rejection log line: that warn is
+    // throttled to one per 5s (public endpoint) and the throttle state is
+    // module-global across this file, so asserting the message here would
+    // make the test depend on which case ran first. The three assertions
+    // above are the security property itself.
     expect(ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(ctx.rpc.call).not.toHaveBeenCalled();
     expect(ctx.http.fetch).not.toHaveBeenCalled();
-    expect(ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("carried no companyId"),
-    );
   });
 
   it("an interaction for a company with no stored Slack config is refused — never falls back to a different company's token", async () => {
@@ -448,5 +455,198 @@ describe("Slack interactive surface tenant scoping (BLO-21083)", () => {
       "Rejected mutating Slack approval webhook: missing Slack signing secret",
       { source: "interactivity" },
     );
+  });
+});
+
+// BLO-21083 review follow-up (Ally, pullrequestreview-4987452894).
+//
+// The first revision of the per-company signing-secret resolution returned a
+// bare `string | null`, and `null` reaches `verifySlackSignature` meaning
+// *skip verification*. So "this company configured no secret" (a deliberate
+// opt-out) and "the secret could not be read" (an infra failure) were the
+// same value: a transient config/secret-store blip silently downgraded a
+// company that HAS configured verification to unverified for that delivery.
+//
+// That mattered because the mutating-approval gate is not the only consumer.
+// `canProcessMutatingApprovalWebhook` does block approvals on a null secret,
+// but the slash-command path (`/clip acp spawn`, which invokes agents),
+// `file_shared` → processMediaFile, and `message` → thread routing all
+// proceed — so during the window an unauthenticated POST naming any
+// companyId would have been processed.
+//
+// `/clip help` is used as the probe below because it is the cheapest path
+// that is NOT behind the approval gate and has a directly observable effect
+// (it posts the help card to `response_url` via ctx.http.fetch). Each of the
+// two fail-closed cases was confirmed to FAIL against the pre-fix resolver
+// (which returned null and therefore skipped verification, serving the
+// unsigned request) before being accepted.
+describe("Slack webhook signing-secret resolution fails closed (BLO-21083 review)", () => {
+  const HELP_BODY = new URLSearchParams({
+    command: "/clip",
+    text: "help",
+    response_url: "https://hooks.slack.test/help",
+    user_id: "U_B",
+    channel_id: CHANNEL,
+  }).toString();
+
+  const slashDelivery = (companyId: string, headers: Record<string, string>) =>
+    ({
+      companyId,
+      endpointKey: WEBHOOK_KEYS.slashCommand,
+      headers,
+      rawBody: HELP_BODY,
+      parsedBody: {},
+      requestId: "req-sig",
+    }) as any;
+
+  it("a configured signing secret that FAILS to resolve rejects the delivery — an infra blip must not become skip-verification", async () => {
+    const { ctx } = mkCtx({
+      companyConfigs: {
+        [COMPANY_B]: { slackTokenRef: "ref-b", slackSigningSecretRef: "sig-ref" },
+      },
+      // The secret store is down for this ref.
+      secrets: { "ref-b": "xoxb-b", "sig-ref": new Error("secret store unavailable") },
+    });
+    await plugin.definition.setup?.(ctx as any);
+
+    // Unsigned: pre-fix this was served, because the failed resolve produced
+    // `null` and `null` meant "skip verification".
+    await plugin.definition.onWebhook?.(slashDelivery(COMPANY_B, {}));
+
+    expect(ctx.http.fetch).not.toHaveBeenCalled();
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Could not resolve slackSigningSecretRef"),
+      expect.objectContaining({ err: expect.anything() }),
+    );
+  });
+
+  it("a config read failure rejects the delivery rather than falling through to skip-verification", async () => {
+    const { ctx } = mkCtx({
+      companyConfigs: {
+        [COMPANY_B]: { slackTokenRef: "ref-b", slackSigningSecretRef: "sig-ref" },
+      },
+      secrets: { "ref-b": "xoxb-b", "sig-ref": SIGNING_SECRET },
+    });
+    ctx.config.get.mockImplementation(async (companyId?: string) => {
+      if (companyId === COMPANY_B) throw new Error("config store unavailable");
+      return {};
+    });
+    await plugin.definition.setup?.(ctx as any);
+
+    await plugin.definition.onWebhook?.(slashDelivery(COMPANY_B, {}));
+
+    expect(ctx.http.fetch).not.toHaveBeenCalled();
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Could not load config to resolve the Slack signing secret"),
+      expect.objectContaining({ err: expect.anything() }),
+    );
+  });
+
+  it("a company that configured NO signing secret still skips verification — the documented opt-out is preserved, not tightened", async () => {
+    const { ctx, fetchCalls } = mkCtx({
+      // No slackSigningSecretRef at all.
+      companyConfigs: { [COMPANY_B]: { slackTokenRef: "ref-b" } },
+      secrets: { "ref-b": "xoxb-b" },
+    });
+    await plugin.definition.setup?.(ctx as any);
+
+    await plugin.definition.onWebhook?.(slashDelivery(COMPANY_B, {}));
+
+    // Served, exactly as before this change: `none` is not `unavailable`.
+    expect(fetchCalls.map((c) => c.url)).toContain("https://hooks.slack.test/help");
+    expect(ctx.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("signing secret unavailable"),
+      expect.anything(),
+    );
+  });
+
+  it("a configured secret that resolves EMPTY is treated as unreadable, not as an opt-out", async () => {
+    const { ctx } = mkCtx({
+      companyConfigs: {
+        [COMPANY_B]: { slackTokenRef: "ref-b", slackSigningSecretRef: "sig-ref" },
+      },
+      secrets: { "ref-b": "xoxb-b", "sig-ref": "" },
+    });
+    await plugin.definition.setup?.(ctx as any);
+
+    await plugin.definition.onWebhook?.(slashDelivery(COMPANY_B, {}));
+
+    expect(ctx.http.fetch).not.toHaveBeenCalled();
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved to an empty value"),
+    );
+  });
+});
+
+// BLO-21083 review follow-up: two reads of the setup()-time bootstrap
+// snapshot survived on the slash-command path. Because the host always hands
+// the worker `{}`, `pluginConfig.paperclipBaseUrl` was `undefined` on every
+// multi-company install — the status card shipped a button with no `url` and
+// the help card rendered a literal `undefined` as its link target.
+describe("Slack slash-command dashboard links are per-company (BLO-21083 review)", () => {
+  const slashBody = (text: string) =>
+    new URLSearchParams({
+      command: "/clip",
+      text,
+      response_url: "https://hooks.slack.test/cmd",
+      user_id: "U_B",
+      channel_id: CHANNEL,
+    }).toString();
+
+  const bodyOf = (call: { init: any } | undefined) =>
+    call?.init?.body ? String(call.init.body) : "";
+
+  it("the help card links to the DELIVERING company's dashboard, never `undefined` and never another company's host", async () => {
+    const { ctx, fetchCalls } = mkCtx({
+      companyConfigs: {
+        [COMPANY_A]: { slackTokenRef: "ref-a", paperclipBaseUrl: "https://pc-a.example" },
+        [COMPANY_B]: { slackTokenRef: "ref-b", paperclipBaseUrl: "https://pc-b.example/" },
+      },
+      secrets: { "ref-a": "xoxb-a", "ref-b": "xoxb-b" },
+    });
+    await plugin.definition.setup?.(ctx as any);
+
+    const rawBody = slashBody("help");
+    await plugin.definition.onWebhook?.({
+      companyId: COMPANY_B,
+      endpointKey: WEBHOOK_KEYS.slashCommand,
+      headers: {},
+      rawBody,
+      parsedBody: {},
+      requestId: "req-help",
+    } as any);
+
+    const sent = bodyOf(fetchCalls.find((c) => c.url === "https://hooks.slack.test/cmd"));
+    expect(sent).toContain("https://pc-b.example|Open Paperclip Dashboard");
+    // The pre-fix bug, stated as an assertion.
+    expect(sent).not.toContain("undefined");
+    // No bleed from the other configured tenant.
+    expect(sent).not.toContain("pc-a.example");
+  });
+
+  it("the status card omits the dashboard button entirely when the company has no base URL, rather than shipping a url-less button", async () => {
+    const { ctx, fetchCalls } = mkCtx({
+      // Configured for Slack, but no paperclipBaseUrl.
+      companyConfigs: { [COMPANY_B]: { slackTokenRef: "ref-b" } },
+      secrets: { "ref-b": "xoxb-b" },
+    });
+    await plugin.definition.setup?.(ctx as any);
+
+    const rawBody = slashBody("status");
+    await plugin.definition.onWebhook?.({
+      companyId: COMPANY_B,
+      endpointKey: WEBHOOK_KEYS.slashCommand,
+      headers: {},
+      rawBody,
+      parsedBody: {},
+      requestId: "req-status",
+    } as any);
+
+    const sent = bodyOf(fetchCalls.find((c) => c.url === "https://hooks.slack.test/cmd"));
+    // The card is still delivered...
+    expect(sent).toContain("Paperclip Status");
+    // ...but with no dead control and no stringified undefined.
+    expect(sent).not.toContain("view_dashboard");
+    expect(sent).not.toContain("undefined");
   });
 });
