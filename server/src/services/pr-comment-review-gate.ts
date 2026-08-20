@@ -5,6 +5,28 @@
  * Ally must emit a plain PR comment when it cannot formally review its own
  * App-authored pull request, so Critical/Important findings on that surface
  * otherwise have no effect on merge eligibility.
+ *
+ * SCOPE — this context speaks for the COMMENT surface only (BLO-28988).
+ *
+ * It answers exactly one question: "does Ally's comment-shaped review carry an
+ * unresolved finding against this head?" It is NOT a "was this head reviewed at
+ * all" gate, and must not be widened into one. Ally reviews most pull requests
+ * through a formal `pull_request_review` object (`COMMENTED`) and posts no
+ * comment-shaped review at all, so on those the comment surface is simply not
+ * engaged and there is nothing here to block. Reporting a non-success state for
+ * that case would red-flag every healthy pull request — the same failure mode
+ * `values.blockcast.yaml` already documents for the sibling
+ * `prReviewGateStatusContext` ("would leave every healthy PR at 'Expected —
+ * waiting for status' forever").
+ *
+ * Whether a head must be reviewed by *someone* is a branch-protection policy
+ * question owned by the formal surface (`reviewDecision`) — see BLO-26602 and
+ * BLO-20673. Do not answer it here by overloading this context.
+ *
+ * What this file must never do is emit `success` alongside a description that
+ * asserts a deficiency: that pairing reads as "gate passed" while claiming
+ * nothing attests to the head, which is what BLO-28988 was filed about. Every
+ * `success` reason below states what was checked and why nothing blocks.
  */
 import { loadConfig } from "../config.js";
 import {
@@ -30,6 +52,7 @@ export interface CommentReviewGateComment {
 
 export type CommentReviewGateVerdict =
   | { state: "success"; reason: string }
+  | { state: "pending"; reason: string }
   | { state: "failure"; reason: string; commentCreatedAt: string };
 
 function toEpochMs(value: string | Date): number {
@@ -48,18 +71,21 @@ function isAllyConsolidatedReviewComment(
   );
 }
 
-function latestAllyCommentForHead(
+/**
+ * Latest comment-shaped Ally review, optionally restricted to one exact head.
+ * Pass `requiredHead: null` to find the most recent one whatever head it named.
+ */
+function latestAllyReviewComment(
   comments: CommentReviewGateComment[],
-  headSha: string,
   reviewerBotLogin: string,
+  requiredHead: string | null,
 ): CommentReviewGateComment | null {
-  const normalizedHead = headSha.trim().toLowerCase();
   let latest: CommentReviewGateComment | null = null;
   let latestTime = -Infinity;
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
-    if (extractAllyReviewedHeadSha(comment.body) !== normalizedHead) continue;
+    if (requiredHead !== null && extractAllyReviewedHeadSha(comment.body) !== requiredHead) continue;
 
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
@@ -75,7 +101,23 @@ function latestAllyCommentForHead(
 
 /**
  * Evaluate only the comment-shaped review surface for one exact PR head.
- * Formal reviews remain owned by GitHub's normal reviewDecision path.
+ * Formal reviews remain owned by GitHub's normal reviewDecision path — see the
+ * SCOPE note at the top of this file before widening any branch here.
+ *
+ * State meanings, all scoped to the comment surface:
+ *   failure — a comment-shaped review of THIS head carries an unresolved finding.
+ *   pending — the surface could not be evaluated at all. Not a pass: reporting
+ *             success would assert a clean surface we never actually read.
+ *   success — nothing on this surface blocks. Each success reason states which
+ *             case applied, so a green status is never paired with a description
+ *             a reader can mistake for a deficiency (BLO-28988).
+ *
+ * A finding deliberately does NOT carry across a replacement head: only an
+ * exact-head attestation gates, so a stale comment cannot block a head that may
+ * already contain the fix (BLO-21907 / #1262). Requiring a *fresh* re-review to
+ * go green would additionally couple this gate to reviewer delivery, the least
+ * reliable link in the chain (BLO-28920, BLO-28968). The superseded case
+ * therefore gets its own reason string rather than its own state.
  */
 export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
@@ -84,28 +126,44 @@ export function evaluateCommentReviewGate(input: {
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
-  if (!headSha) return { state: "success", reason: "No head SHA was supplied to evaluate against." };
+  // An inability to evaluate is not a pass. Reporting success here would assert
+  // a clean surface we never read.
+  if (!headSha) {
+    return { state: "pending", reason: "Comment-review surface not evaluated: no head SHA was supplied." };
+  }
 
-  const latest = latestAllyCommentForHead(input.comments ?? [], headSha, reviewerBotLogin);
-  if (!latest) {
+  const comments = input.comments ?? [];
+  const normalizedHead = headSha.toLowerCase();
+  const latestForHead = latestAllyReviewComment(comments, reviewerBotLogin, normalizedHead);
+
+  if (latestForHead) {
+    if (hasActionablePrReviewFeedback(latestForHead.body)) {
+      return {
+        state: "failure",
+        reason:
+          "Ally's most recent consolidated-review comment for this head carries an unresolved finding.",
+        commentCreatedAt: new Date(toEpochMs(latestForHead.createdAt)).toISOString(),
+      };
+    }
     return {
       state: "success",
-      reason: "No Ally consolidated-review comment attests to reviewing this head.",
+      reason: "Ally's consolidated-review comment for this head reports no unresolved findings.",
     };
   }
 
-  if (hasActionablePrReviewFeedback(latest.body)) {
+  // Nothing attests to this head. Name which case it is, so a reader can tell a
+  // superseded earlier review apart from a surface that was never engaged. Both
+  // pass: see the note above on why a finding does not carry across heads.
+  if (latestAllyReviewComment(comments, reviewerBotLogin, null)) {
     return {
-      state: "failure",
-      reason:
-        "Ally's most recent consolidated-review comment for this head carries an unresolved finding.",
-      commentCreatedAt: new Date(toEpochMs(latest.createdAt)).toISOString(),
+      state: "success",
+      reason: "No comment-review finding for this head; an earlier head's review does not carry over.",
     };
   }
 
   return {
     state: "success",
-    reason: "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+    reason: "Comment-review surface clear: no Ally comment-shaped review gates this head.",
   };
 }
 
