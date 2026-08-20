@@ -1405,7 +1405,19 @@ function buildDependabotAlertIssueBody(input: {
     "## Note on the Dependabot Alerts REST API (operational, not evidentiary)",
     "Every field under **Alert** above comes from this delivery's GitHub webhook payload. Do NOT call the GitHub Dependabot Alerts REST API to re-derive them: some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires. Treat that 403 as expected and work from this issue instead of chasing the API.",
     "",
-    "This note is scoped to re-deriving the metadata fields above. It is NOT an evidentiary standard: it does not restrict which **Verifying signal** branch you may use, and it does not forbid the repository contents API or GraphQL.",
+    "This note is scoped to re-deriving the metadata fields above. It is NOT an evidentiary standard: it does not restrict which **Verifying signal** branch you may use, and it does not forbid the repository contents API. It does rule out one specific query as state evidence -- see the next section.",
+    "",
+    "## Alert state may be unreadable, and the unreadable case LOOKS LIKE ZERO",
+    "Branches 2 and 3 both require observing terminal alert state, which needs the `Dependabot alerts` repository permission (GitHub App) or the `security_events` scope (classic PAT). When no credential available to you holds it, the two read paths fail in **different** ways and only one fails loudly:",
+    "- REST `GET /repos/{owner}/{repo}/dependabot/alerts/{n}` returns a visible `403`: `Resource not accessible by integration` for an App installation, `You are not authorized to perform this operation.` for a PAT missing the scope. Both differ from the `Dependabot alerts are disabled for this repository` variant above -- these mean the credential lacks the permission, not that the repository has the feature switched off.",
+    "- GraphQL `repository.vulnerabilityAlerts` returns **`totalCount: 0` with no `errors` block**: an unerrored empty connection, indistinguishable from a repository that genuinely has no alerts. Zero across `[OPEN, FIXED, DISMISSED, AUTO_DISMISSED]` on a repository that demonstrably has alerts is the signature of the permission gap.",
+    "",
+    "So do NOT use `vulnerabilityAlerts` as terminal-state evidence, and do NOT close this issue on a zero it returns. An absence-shaped answer from a permission-gated source means UNKNOWN, never NONE. Closing on that zero is a silent false-green on security work.",
+    "",
+    "## When branch 1 is unsatisfiable (phantom alerts)",
+    "If the manifest named above no longer exists on the default branch there is no code change to make and branch 1 cannot be satisfied. Confirm with `GET /repos/{owner}/{repo}/contents/{manifest_path}` returning `404`, then:",
+    "1. Establish whether the dependency is vulnerable anywhere in the repository via `GET /repos/{owner}/{repo}/dependency-graph/sbom`. That endpoint needs only `contents: read`, so it answers when the alerts API does not, and it is repository-wide rather than per-manifest -- which is exactly what the phantom case needs. Resolved versions outside the vulnerable range across every entry are strong evidence there is nothing to remediate.",
+    "2. Escalate to a repository admin instead of treating it as code work, and say on this issue that you are doing so. Only an admin can rebuild the repository's dependency graph (the durable fix when a deleted manifest keeps getting re-indexed) or dismiss the alert in the GitHub UI. Do NOT close this issue as a substitute for dismissal, and do NOT poll for a state change: neither action moves alert state, and a dismissal an agent cannot perform will not happen on a timer.",
   ].join("\n");
 }
 

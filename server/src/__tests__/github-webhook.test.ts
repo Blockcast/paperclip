@@ -7645,7 +7645,26 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(description).toContain("## Note on the Dependabot Alerts REST API (operational, not evidentiary)");
     expect(description).toContain("403 Dependabot alerts are disabled for this repository");
     expect(description).toContain("It is NOT an evidentiary standard");
-    expect(description).toContain("does not forbid the repository contents API or GraphQL");
+    expect(description).toContain("does not forbid the repository contents API");
+
+    // BLO-28884: the note used to end "...contents API or GraphQL", which
+    // affirmatively licensed `vulnerabilityAlerts` as an evidence source. That
+    // query returns an unerrored `totalCount: 0` when the credential lacks the
+    // Dependabot alerts permission, so the old wording pointed agents at a
+    // silent false-green: read 0, conclude "no open alert", close as done.
+    expect(description).not.toContain("does not forbid the repository contents API or GraphQL");
+    expect(description).toContain("## Alert state may be unreadable, and the unreadable case LOOKS LIKE ZERO");
+    expect(description).toContain("`totalCount: 0` with no `errors` block");
+    expect(description).toContain("An absence-shaped answer from a permission-gated source means UNKNOWN, never NONE");
+    // Both 403 shapes, so a missing permission is not mis-diagnosed as the
+    // repo having the feature switched off.
+    expect(description).toContain("Resource not accessible by integration");
+    expect(description).toContain("You are not authorized to perform this operation.");
+    // AC2: the non-agent escalation path is named, with the SBOM read that
+    // still works when the alerts API does not.
+    expect(description).toContain("## When branch 1 is unsatisfiable (phantom alerts)");
+    expect(description).toContain("dependency-graph/sbom");
+    expect(description).toContain("Escalate to a repository admin");
 
     // Preserve the operational prohibition verbatim while changing closure criteria.
     expect(description).toContain(
