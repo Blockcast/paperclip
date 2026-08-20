@@ -3610,6 +3610,29 @@ async function recordWorkspaceCommandOperation(
 }
 
 /**
+ * Stamp the running agent's git author identity onto a checkout that is about to
+ * be handed to a run, and return the warning (if any) as an array ready to merge
+ * into a `RealizedExecutionWorkspace.warnings` list (BLO-23894).
+ *
+ * This exists for the `project_primary` strategy, which does not go through
+ * `provisionExecutionWorktree`: it runs the agent directly in the base checkout
+ * (or, on the persisted path, in a recorded/rebound one). That strategy is the
+ * *default* -- `asString(rawStrategy.type, "project_primary")` -- so leaving it
+ * unstamped would leave the most common configuration exhibiting exactly the
+ * defect this change is meant to close.
+ *
+ * Never throws: `ensureCheckoutGitIdentity` reports failures as a warning, and a
+ * checkout that could not be stamped is still a usable checkout.
+ */
+async function stampCheckoutIdentity(
+  cwd: string | null | undefined,
+  agent: ExecutionWorkspaceAgentRef,
+): Promise<string[]> {
+  const identity = await ensureCheckoutGitIdentity({ cwd, agent });
+  return identity.warning ? [identity.warning] : [];
+}
+
+/**
  * Final step of every worktree realization path: stamp the running agent's git
  * author identity (BLO-23894), then run the configured provision command if
  * there is one.
@@ -3751,13 +3774,16 @@ export async function realizeExecutionWorkspace(input: {
         recorder: input.recorder ?? null,
       });
     }
+    // The default strategy runs the agent directly in the base checkout, so this
+    // is the identity seam for it — there is no worktree funnel on this path.
+    const identityWarnings = await stampCheckoutIdentity(input.base.baseCwd, input.agent);
     return {
       ...input.base,
       strategy: "project_primary",
       cwd: input.base.baseCwd,
       branchName: null,
       worktreePath: null,
-      warnings,
+      warnings: [...warnings, ...identityWarnings],
       created: false,
       baseRefSha: null,
     };
@@ -4109,6 +4135,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
               cwd: managedCwd,
               warnings: [
                 `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
+                ...(await stampCheckoutIdentity(managedCwd, input.agent)),
               ],
             };
           }
@@ -4118,7 +4145,12 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     if (!await directoryExists(cwd)) {
       return null;
     }
-    return realized;
+    // Persisted `project_primary` reuse: the recorded cwd is handed straight to
+    // the run, so this is the last chance to stamp it (BLO-23894).
+    return {
+      ...realized,
+      warnings: [...realized.warnings, ...(await stampCheckoutIdentity(cwd, input.agent))],
+    };
   }
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);

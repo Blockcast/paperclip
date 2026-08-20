@@ -3,11 +3,11 @@
  *
  * Every agent pod pushes with the same shared `allyblockcast[bot]` GitHub App
  * credential, so the only thing that distinguishes one agent's commit from
- * another's on the `git push` path is the *local* `user.name`/`user.email` of
- * the checkout it commits from. Nothing provisioned that: a 2026-08-10 sweep of
- * 71 checkouts under `/paperclip/work` found 11 already stamped with the shared
- * App identity and 18 with no local identity at all, and AGENTS.md compensated
- * by asking every agent to run `git config` by hand.
+ * another's once it reaches the remote is the *local* `user.name`/`user.email`
+ * of the checkout it commits from. Nothing provisioned that: a 2026-08-10 sweep
+ * of 71 checkouts under `/paperclip/work` found 11 already stamped with the
+ * shared App identity and 18 with no local identity at all, and AGENTS.md
+ * compensated by asking every agent to run `git config` by hand.
  *
  * This module is that provisioning step. It is called from every path that
  * hands a checkout to a run -- the managed project workspace in `heartbeat.ts`
@@ -86,6 +86,12 @@ export type CheckoutGitIdentityStatus =
   | "skipped_no_git"
   /** No agent to attribute to; a placeholder identity would be worse. */
   | "skipped_no_agent"
+  /**
+   * The checkout carries an identity paperclip did not write -- a human's, in a
+   * checkout they also use. Left untouched on purpose; see the policy note on
+   * `ensureCheckoutGitIdentity`.
+   */
+  | "skipped_foreign_identity"
   /** Local config already held exactly this agent's identity. */
   | "unchanged"
   /** Local config was unset, App-stamped, or another agent's -- now corrected. */
@@ -107,6 +113,19 @@ export type CheckoutGitIdentityResult = {
 export function isSharedAppAuthorEmail(value: string | null | undefined): boolean {
   if (typeof value !== "string") return false;
   return SHARED_APP_AUTHOR_EMAIL_SET.has(value.trim().toLowerCase());
+}
+
+/**
+ * True for an address in paperclip's own synthesized namespace, i.e. one this
+ * module wrote on some earlier run (possibly for a different agent).
+ *
+ * This is what makes it safe to re-point a checkout from agent A to agent B
+ * without also trampling an address the *user* configured: paperclip only
+ * rewrites values it owns.
+ */
+export function isPaperclipProvisionedAuthorEmail(value: string | null | undefined): boolean {
+  if (typeof value !== "string") return false;
+  return value.trim().toLowerCase().endsWith(`@${PAPERCLIP_AGENT_EMAIL_DOMAIN}`);
 }
 
 /**
@@ -225,15 +244,34 @@ export async function ensureCheckoutGitIdentity(input: {
     const currentName = await readLocalConfigValue(runGit, cwd, "user.name");
 
     // "Correct" means correct *for this agent*: a checkout is handed to one run
-    // at a time and that run's agent is the one about to commit from it, so a
-    // stale value -- unset, App-stamped, or another agent's -- is the same
-    // defect in each case. Matching values are left untouched, which is what
-    // keeps repeated provisioning idempotent.
+    // at a time and that run's agent is the one about to commit from it.
     if (currentEmail === identity.email && currentName === identity.name) {
       return {
         status: "unchanged",
         email: identity.email,
         name: identity.name,
+        previousEmail: currentEmail,
+        warning: null,
+      };
+    }
+
+    // Only rewrite values paperclip owns. Unset and both App forms are exactly
+    // the broken populations this change exists to repair; a paperclip-domain
+    // address is one we wrote ourselves on an earlier run, so re-pointing it to
+    // the current agent is ours to do. Anything else is a human's identity in a
+    // checkout they also use -- most reachable via the `project_primary`
+    // strategy, which runs the agent directly in the project checkout -- and
+    // silently rewriting a user's `user.email` there would be a worse bug than
+    // the one being fixed.
+    const ownsCurrentIdentity =
+      currentEmail === null
+      || isSharedAppAuthorEmail(currentEmail)
+      || isPaperclipProvisionedAuthorEmail(currentEmail);
+    if (!ownsCurrentIdentity) {
+      return {
+        status: "skipped_foreign_identity",
+        email: currentEmail,
+        name: currentName,
         previousEmail: currentEmail,
         warning: null,
       };
