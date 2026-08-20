@@ -44,6 +44,17 @@ export function withStateLock<T>(
   return run;
 }
 
+/**
+ * Number of lock keys with an unsettled chain.
+ *
+ * Exported for the bounded-map regression: `withStateLock` drops a key once its
+ * tail settles, and a refactor that stopped doing so would leak one promise per
+ * company per day in a long-lived worker with no visible symptom.
+ */
+export function pendingLockKeyCount(): number {
+  return chains.size;
+}
+
 /** Lock key for a company's `recent-watch-events` queue. */
 export const watchQueueLockKey = (companyId: string): string =>
   `watch-queue:${companyId}`;
