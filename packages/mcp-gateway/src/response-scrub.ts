@@ -60,24 +60,46 @@
  *    above 2^53 and rewrite `1.0` as `1`. Redaction still re-serializes — that
  *    cost is accepted only on bodies we actually had to change.
  *
- * SCOPE HONESTY: this closes the `env`-value and `Secret`-material paths on
- * responses that traverse this gateway. It is not a general secret detector, and
- * it does not by itself establish the fleet-wide invariant that agent-visible
- * tool output is systematically scrubbed — see PEN-2370 ask 3.
+ * SCOPE HONESTY: this closes the `env`-value, `Secret`-material and container
+ * `command`/`args` paths on responses that traverse this gateway. It is not a
+ * general secret detector, and it does not by itself establish the fleet-wide
+ * invariant that agent-visible tool output is systematically scrubbed — see
+ * PEN-2370 ask 3.
  *
- * Two paths through the same tools are known to be OUT of scope here, named so
- * that a reader does not mistake this module for covering them:
+ * `spec.containers[].command` / `args` (PEN-2431, door #5) is redacted, with the
+ * decision and its cost recorded here rather than left implicit:
  *
- * - `spec.containers[].command` / `args`. A credential passed as `--token=…`
- *   rides the same `pods_get` response this module scrubs and is returned in the
- *   clear. Redacting argv wholesale would remove most of the diagnostic value of
- *   reading a pod, so it needs its own decision rather than a silent widening
- *   here.
- * - `ConfigMap` `data`. Deliberately preserved (see 5) because a ConfigMap read
- *   is a legitimate diagnostic; a ConfigMap used to carry a credential is
- *   therefore still exposed.
+ * - **What.** Inside a container list only, every argv token is redacted. A
+ *   `--flag=value` token keeps its flag name (`--namespace=<redacted>`); a bare
+ *   positional has no name to keep and goes wholesale. There is no
+ *   pass-through arm — a token is redacted one way or the other.
+ * - **Cost, stated plainly.** Flag *values* and bare positionals are gone, and
+ *   that includes subcommands: `kubectl get pods` reads as three redactions.
+ *   Reading what a container is actually doing is materially degraded. This is
+ *   the price of default-deny on a field with no name/value split, and it was
+ *   chosen over PEN-2431's option 2 (redact only high-entropy-looking tokens)
+ *   because that is an allowlist wearing a denylist's clothes — it fails open on
+ *   exactly the credential that does not look like one.
+ * - **Why the container-list gate.** `args:` is not `env:`. This gateway also
+ *   proxies the GitHub and Paperclip upstreams, where `args:` appears in every
+ *   Actions workflow and MCP tool schema. Redacting a bare `args:` would corrupt
+ *   ordinary traffic on a key far more common than `env:`.
  *
- * Both are instances of ask 3's point: the invariant, not the instance.
+ * One path through the same tools is knowingly OUT of scope, named so that a
+ * reader does not mistake this module for covering it:
+ *
+ * - `ConfigMap` `data`. Deliberately preserved: a ConfigMap read is a
+ *   legitimate diagnostic — it is how the PEN-2370 evidence was gathered
+ *   without re-probing a pod — and it has no name/value split to exploit
+ *   either. **Residual risk accepted, explicitly: a ConfigMap used to carry a
+ *   credential is still returned in the clear.** Unlike argv, there is no
+ *   structural gate that separates the credential case from the diagnostic one,
+ *   so redacting it would cost the diagnostic outright.
+ *
+ * Both are instances of ask 3's point: the invariant, not the instance. Note
+ * what door #5 cost to close — one redaction rule *and* one pre-filter probe
+ * (`CONTAINERS_KEY_PROBE`), because a rule is only as reachable as the filter
+ * that routes bodies to it. A field-enumeration control keeps producing this.
  */
 
 export const REDACTED = "<redacted>";
@@ -113,6 +135,7 @@ const RESOURCE_ECHO_ANNOTATIONS = [
 function mightContainSecrets(text: string): boolean {
   if (ENV_KEY_PROBE.test(text)) return true;
   if (SECRET_KIND_PROBE.test(text)) return true;
+  if (CONTAINERS_KEY_PROBE.test(text)) return true;
   return RESOURCE_ECHO_ANNOTATIONS.some((a) => text.includes(a));
 }
 
@@ -139,6 +162,27 @@ const ENV_KEY_PROBE = /(^|[^A-Za-z0-9_])(["']?)env\2\s*:/i;
  * every downstream Secret rule rather than just one of them.
  */
 const SECRET_KIND_PROBE = /(["']?)kind\1\s*:\s*(["']?)Secret(List)?\2(\s|,|}|$)/i;
+
+/**
+ * A container list, in any of the three spellings Kubernetes uses.
+ *
+ * Needed because a pod whose only secret carrier is `args:` contains no `env`
+ * key and no `kind: Secret`, so neither probe above tripped and the body was
+ * never handed to a scanner at all — the argv rules below then had nothing to
+ * run on. This is the exact fail-open the two docblocks above were each written
+ * for, hit a third time: **a redaction rule is only ever as reachable as this
+ * pre-filter.** Adding a rule downstream without a probe that trips on the
+ * shape carrying it is a silent no-op, and it looks like a fix.
+ *
+ * Gated on the *container list* rather than on `command:`/`args:` so the probe
+ * and the redaction rule agree on scope: argv is only redacted inside a
+ * container list, so a body with no container list has nothing to redact and is
+ * correctly skipped. Matching bare `args:` here would also route every GitHub
+ * Actions workflow and MCP tool schema this gateway proxies into the YAML
+ * scanner for nothing.
+ */
+const CONTAINERS_KEY_PROBE =
+  /(^|[^A-Za-z0-9_])(["']?)(init|ephemeral)?containers\2\s*:/i;
 
 function leadingIndent(line: string): number {
   let i = 0;
@@ -296,6 +340,70 @@ const SECRET_KIND_LINE = /^\s*(-\s+)?(["']?)kind\2:\s*(["']?)Secret(List)?\3\s*(
 const SECRET_MATERIAL_KEYS = new Set(["data", "stringdata"]);
 const SECRET_KINDS = new Set(["secret", "secretlist"]);
 
+/**
+ * A container-list key (PEN-2431, door #5).
+ *
+ * argv redaction is gated on being *inside* one of these, and that gate is the
+ * whole reason the feature is safe to ship here. `env:` is a rare enough key
+ * that failing closed on a bare one costs little; `args:` is not. This same
+ * gateway proxies the GitHub and Paperclip upstreams, where `args:` appears in
+ * every Actions workflow, every MCP tool schema, and — measured, not
+ * hypothesized — in the body of PEN-2431 itself. A bare `args:` trigger would
+ * corrupt ordinary traffic on a key that is orders of magnitude more common
+ * than `env:`, so the structural context is load-bearing, not decoration.
+ */
+const CONTAINERS_KEY =
+  /^(\s*)(-\s+)?(["']?)(containers|initContainers|ephemeralContainers)\3:(.*)$/i;
+/** `command:`/`args:` — only honored inside a container list. */
+const ARGV_KEY = /^(\s*)(-\s+)?(["']?)(command|args)\3:(.*)$/i;
+const CONTAINER_LIST_KEYS = new Set([
+  "containers",
+  "initcontainers",
+  "ephemeralcontainers",
+]);
+const ARGV_KEYS = new Set(["command", "args"]);
+
+function isContainerListKey(key: string): boolean {
+  return CONTAINER_LIST_KEYS.has(key.toLowerCase());
+}
+function isArgvKey(key: string): boolean {
+  return ARGV_KEYS.has(key.toLowerCase());
+}
+
+/**
+ * Redact one argv token, keeping the flag name when there is one.
+ *
+ * PEN-2431 offered four directions and this is deliberately none of them
+ * verbatim; see the SCOPE section above for why options 1 and 2 were rejected.
+ * The rule here has NO pass-through arm: a token is either `--flag=<redacted>`
+ * or `<redacted>` outright. That is what separates it from option 1, which kept
+ * non-matching tokens in the clear and would have printed a redaction marker
+ * beside a plaintext positional — the false-assurance failure design note 4
+ * rejects.
+ *
+ * Keeping the flag name mirrors design note 2: `--namespace=<redacted>` still
+ * tells a reader the container takes a namespace flag. The diagnostic cost is
+ * real and is stated in the SCOPE section: flag *values* and bare positionals
+ * (including subcommands like `get pods`) are gone.
+ */
+function redactArgvToken(token: string): string {
+  const eq = token.indexOf("=");
+  if (token.startsWith("-") && eq > 0) {
+    return `${token.slice(0, eq)}=${REDACTED}`;
+  }
+  return REDACTED;
+}
+
+/** Strip one layer of matching YAML quotes, so the flag name can be read. */
+function unquoteScalar(token: string): string {
+  const t = token.trim();
+  if (t.length >= 2 && (t.startsWith('"') || t.startsWith("'"))) {
+    const q = t[0]!;
+    if (t.endsWith(q)) return t.slice(1, -1);
+  }
+  return t;
+}
+
 function isSecretMaterialKey(key: string): boolean {
   return SECRET_MATERIAL_KEYS.has(key.toLowerCase());
 }
@@ -394,6 +502,11 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
   // While set, we are swallowing the continuation lines of a value we already
   // replaced; every line indented deeper than this belongs to that value.
   let swallowDeeperThan: number | null = null;
+  // Indentation of an open container-list key, or null when outside one. argv
+  // redaction is gated on this being non-null (PEN-2431).
+  let containersBlockIndent: number | null = null;
+  // Indentation of an open `command:`/`args:` block inside that container list.
+  let argvBlockIndent: number | null = null;
 
   const emit = (content: string, index: number): void => {
     out.push(content + seps[index]!);
@@ -417,6 +530,45 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
     if (envBlockIndent !== null && !continuesBlock(line, envBlockIndent)) {
       envBlockIndent = null;
       refSubtreeIndent = null;
+    }
+
+    // Close the argv and container blocks the same way the env block closes.
+    // argv closes first: it is nested inside the container list, so a line that
+    // ends the outer block necessarily ends the inner one too.
+    if (argvBlockIndent !== null && !continuesBlock(line, argvBlockIndent)) {
+      argvBlockIndent = null;
+    }
+    if (
+      containersBlockIndent !== null &&
+      !continuesBlock(line, containersBlockIndent)
+    ) {
+      containersBlockIndent = null;
+      argvBlockIndent = null;
+    }
+
+    // Inside a `command:`/`args:` block, every sequence entry is material until
+    // proven otherwise. There is no allowlist arm here because argv has no
+    // schema-closed key set to allowlist — unlike an env entry, which can only
+    // legally carry `name`/`value`/`valueFrom`.
+    if (argvBlockIndent !== null && !isBlank(line)) {
+      if (COMMENT_LINE.test(line)) {
+        emit(line, index);
+        continue;
+      }
+      const dashMatch = SEQUENCE_DASH.exec(line);
+      if (dashMatch) {
+        const indent = leadingIndent(line);
+        const dash = dashMatch[1]!;
+        const token = unquoteScalar(line.slice(indent + dash.length));
+        redact(
+          `${" ".repeat(indent)}${dash}"${redactArgvToken(token)}"`,
+          index,
+        );
+        // A wrapped or block scalar continues on deeper-indented lines; the
+        // same reasoning as `value:` applies, so drop them.
+        swallowDeeperThan = indent + dash.length;
+        continue;
+      }
     }
 
     // Inside a `valueFrom:` subtree. Its keys are references, but the subtree
@@ -464,6 +616,43 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         const [, indent, dash = "", quote, key] = secretData;
         redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
         swallowDeeperThan = indent!.length + dash.length;
+        continue;
+      }
+    }
+
+    // Open a container list. The key itself carries nothing, so it is emitted
+    // as-is; only the flag is set. Not `continue`d past the env branch below,
+    // because a `containers:` line is never also an `env:` line.
+    const containersKey = CONTAINERS_KEY.exec(line);
+    if (containersKey) {
+      const [, indent, dash = ""] = containersKey;
+      containersBlockIndent = indent!.length + dash.length;
+      argvBlockIndent = null;
+      emit(line, index);
+      continue;
+    }
+
+    // `command:`/`args:`, honored ONLY inside a container list. Outside one this
+    // falls through untouched, which is the point: see CONTAINERS_KEY.
+    if (containersBlockIndent !== null) {
+      const argvKey = ARGV_KEY.exec(line);
+      if (argvKey) {
+        const [, indent, dash = "", quote, key, suffix] = argvKey;
+        const ownIndent = indent!.length + dash.length;
+        const rest = suffix!.trim().replace(NODE_PROPERTIES, "").trim();
+        if (rest === "" || rest.startsWith("#")) {
+          // A block sequence follows on the next lines.
+          emit(line, index);
+          argvBlockIndent = ownIndent;
+          continue;
+        }
+        // Anything else on the same line — a flow sequence (`args: [--t=x]`), an
+        // alias, a block scalar — sits inside a construct this scanner does not
+        // parse. Fail closed on the whole value, and open the block too so that
+        // any content which does follow is guarded rather than emitted.
+        redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+        swallowDeeperThan = ownIndent;
+        argvBlockIndent = ownIndent;
         continue;
       }
     }
@@ -607,11 +796,17 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
  * upgrade cannot silently turn this scrubber into a no-op.
  */
 export function scrubJsonValue(node: unknown): unknown {
-  return scrubJsonValueTracked(node, { changed: false }, false);
+  return scrubJsonValueTracked(node, { changed: false }, false, false);
 }
 
-function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boolean): unknown {
-  if (Array.isArray(node)) return node.map((n) => scrubJsonValueTracked(n, ctx, inSecret));
+function scrubJsonValueTracked(
+  node: unknown,
+  ctx: ScrubContext,
+  inSecret: boolean,
+  inContainers: boolean,
+): unknown {
+  if (Array.isArray(node))
+    return node.map((n) => scrubJsonValueTracked(n, ctx, inSecret, inContainers));
   if (!node || typeof node !== "object") return node;
 
   const source = node as Record<string, unknown>;
@@ -626,6 +821,16 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
     if (nowSecret && isSecretMaterialKey(key)) {
       result[key] = REDACTED;
       ctx.changed = true;
+      continue;
+    }
+    // `command`/`args` inside a container list (PEN-2431). Gated on
+    // `inContainers` for the same reason the YAML path gates on an open
+    // container block: a bare `args` array is ordinary GitHub/Paperclip traffic.
+    if (inContainers && isArgvKey(key) && Array.isArray(value)) {
+      result[key] = value.map((entry) =>
+        typeof entry === "string" ? redactArgvToken(entry) : REDACTED,
+      );
+      if (value.length > 0) ctx.changed = true;
       continue;
     }
     if (isEnvKey(key) && Array.isArray(value)) {
@@ -670,7 +875,7 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
           // A nested object here is a `valueFrom`-shaped reference, which names a
           // source without carrying it; anything scalar is the material itself.
           inner && typeof inner === "object"
-            ? scrubJsonValueTracked(inner, ctx, nowSecret)
+            ? scrubJsonValueTracked(inner, ctx, nowSecret, inContainers)
             : REDACTED,
         ]),
       );
@@ -697,7 +902,12 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
       result[key] = mightContainSecrets(value) ? scrubTextTracked(value, ctx) : value;
       continue;
     }
-    result[key] = scrubJsonValueTracked(value, ctx, nowSecret);
+    result[key] = scrubJsonValueTracked(
+      value,
+      ctx,
+      nowSecret,
+      inContainers || isContainerListKey(key),
+    );
   }
 
   return result;
@@ -716,7 +926,7 @@ function scrubTextTracked(text: string, ctx: ScrubContext): string {
     try {
       const parsed: unknown = JSON.parse(text);
       const nested: ScrubContext = { changed: false };
-      const scrubbed = JSON.stringify(scrubJsonValueTracked(parsed, nested, false));
+      const scrubbed = JSON.stringify(scrubJsonValueTracked(parsed, nested, false, false));
       if (nested.changed) {
         ctx.changed = true;
         return scrubbed;
@@ -815,7 +1025,7 @@ function startsWithSseField(body: Buffer): boolean {
 
 function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
   try {
-    return JSON.stringify(scrubJsonValueTracked(JSON.parse(text), ctx, false));
+    return JSON.stringify(scrubJsonValueTracked(JSON.parse(text), ctx, false, false));
   } catch {
     return null;
   }
