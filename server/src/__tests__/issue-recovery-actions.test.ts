@@ -25,6 +25,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
@@ -741,6 +742,80 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         recoveryActionId: action!.id,
         backstop: "stranded_recovery_wake_backstop",
       },
+    });
+  });
+
+  /**
+   * BLO-19124. The all-skipped sweep is the diagnostic case and it used to emit nothing:
+   * the backstop logged only on `healed > 0`, and both `reconcileIssueGraphLiveness`
+   * callers in index.ts log only when `escalationsCreated`/`dependencyWakesHealed` move.
+   * So the state where every candidate is gated — the state that leaves actions reaching
+   * their horizon at attemptCount 0 — was invisible, and the per-gate counters that name
+   * the responsible gate were computed and discarded.
+   *
+   * Asserting on the counter payload rather than just the message is what makes this a
+   * regression test: dropping the `else if` branch, or logging a bare message without the
+   * breakdown, both fail here.
+   */
+  it("reports the per-gate skip breakdown when a sweep redelivers nothing", async () => {
+    const { companyId, sourceIssueId, managerId, issue, latestRun, stageId } =
+      await seedPendingReviewRecovery();
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    enqueueWakeup.mockRejectedValueOnce(new Error("wake dispatch unavailable"));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "in_review",
+      latestRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: { stageId, participantAgentId: managerId, executionRunId: null },
+    })).rejects.toThrow("wake dispatch unavailable");
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+
+    // Inside the cooldown rather than past it, so the sweep selects the candidate and then
+    // gates it: checked = 1, healed = 0 — the shape production is stuck in.
+    const now = new Date();
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(now.getTime() - 60 * 1000) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => logger);
+    let calls: unknown[][] = [];
+    let result: Awaited<ReturnType<typeof recovery.reconcileStrandedRecoveryWakeBackstop>>;
+    try {
+      result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+        companyId,
+        now,
+        cooldownMs: 30 * 60 * 1000,
+      });
+      // Snapshot before restoring: mockRestore() clears mock.calls.
+      calls = infoSpy.mock.calls.map((call) => [...call]);
+    } finally {
+      infoSpy.mockRestore();
+    }
+
+    expect(result).toMatchObject({ checked: 1, healed: 0, cooldownSkipped: 1 });
+
+    const reported = calls.find(
+      (call) => call[1] === "stranded recovery wake backstop redelivered nothing this sweep",
+    );
+    expect(reported, "all-skipped sweep must emit its per-gate breakdown").toBeDefined();
+    expect(reported?.[0]).toMatchObject({ checked: 1, cooldownSkipped: 1 });
+    // Every gate is present even at zero, so the line is a usable time series rather than
+    // a shape that changes with whichever gate happened to fire.
+    expect(reported?.[0]).toMatchObject({
+      livePathSkipped: expect.any(Number),
+      pauseHoldSkipped: expect.any(Number),
+      exhaustedSkipped: expect.any(Number),
+      candidateLimitSkipped: expect.any(Number),
+      enqueueFailed: expect.any(Number),
     });
   });
 

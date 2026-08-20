@@ -67,6 +67,8 @@ import {
   type AcpRuntimeUsageCost,
 } from "acpx/runtime";
 import {
+  ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS,
+  ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS,
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
@@ -1524,6 +1526,85 @@ async function emitAcpxLog(ctx: AdapterExecutionContext, payload: Record<string,
   await ctx.onLog("stdout", `${JSON.stringify(payload)}\n`);
 }
 
+/**
+ * Await session establishment while emitting periodic elapsed-time progress.
+ *
+ * `runtime.ensureSession` spawns the agent process and performs the
+ * `session/new`|`session/load` handshake. Neither is covered by
+ * `adapterConfig.timeoutSec`, which only arms a timer around the turn once the
+ * handle exists, so a stalled handshake used to leave the run log frozen at
+ * its pre-exec lines with no way to tell a stall from a dead process.
+ *
+ * Emitting progress here keeps the run's last-output timestamp advancing, which
+ * is what makes such a stall observable to operators and to staleness
+ * detection. Deliberately does NOT terminate the attempt: handshakes have been
+ * observed recovering as late as 43.20h, so choosing a kill threshold needs the
+ * distribution this instrumentation is meant to collect. Payload carries only
+ * stage/elapsed/attempt metadata -- never prompts, credentials, env values, or
+ * model output.
+ */
+export async function awaitSessionWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  meta: { attempt: "initial" | "fresh_retry"; resume: boolean },
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const firstDelayMs = Math.max(1, delays.firstDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS);
+  const maxDelayMs = Math.max(firstDelayMs, delays.maxDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS);
+  const startedAtMs = Date.now();
+  const emit = async (stage: "started" | "waiting" | "established" | "failed") => {
+    await emitAcpxLog(ctx, {
+      type: "acpx.session_establish",
+      stage,
+      attempt: meta.attempt,
+      resume: meta.resume,
+      elapsedMs: Math.max(0, Date.now() - startedAtMs),
+      observedAt: new Date().toISOString(),
+    });
+  };
+
+  await emit("started");
+
+  let timer: NodeJS.Timeout | null = null;
+  let delayMs = firstDelayMs;
+  let stopped = false;
+  const scheduleNext = () => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void emit("waiting")
+        .catch(() => {})
+        .finally(() => {
+          delayMs = Math.min(delayMs * 2, maxDelayMs);
+          scheduleNext();
+        });
+    }, delayMs);
+    // Progress reporting must never be the reason the process stays alive.
+    timer.unref?.();
+  };
+  const stop = () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  // Start the work before scheduling, so a synchronous throw cannot leak a timer.
+  const pending = start();
+  scheduleNext();
+  try {
+    const handle = await pending;
+    stop();
+    await emit("established").catch(() => {});
+    return handle;
+  } catch (err) {
+    stop();
+    await emit("failed").catch(() => {});
+    throw err;
+  }
+}
+
 async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeEvent) {
   if (event.type === "text_delta") {
     await emitAcpxLog(ctx, {
@@ -1990,13 +2071,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     try {
       if (!handle) {
         try {
-          handle = await runtime.ensureSession({
-            sessionKey: prepared.sessionKey,
-            agent: prepared.acpxAgent,
-            mode: prepared.mode,
-            cwd: prepared.cwd,
-            resumeSessionId,
-          });
+          handle = await awaitSessionWithProgress(
+            ctx,
+            { attempt: "initial", resume: Boolean(resumeSessionId) },
+            () =>
+              runtime.ensureSession({
+                sessionKey: prepared.sessionKey,
+                agent: prepared.acpxAgent,
+                mode: prepared.mode,
+                cwd: prepared.cwd,
+                resumeSessionId,
+              }),
+          );
         } catch (err) {
           if (!resumeSessionId || !isResumeFailure(err)) throw err;
           clearSession = true;
@@ -2005,12 +2091,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             "stdout",
             `[paperclip] ACPX resume session "${resumeSessionId}" is unavailable; retrying with a fresh session.\n`,
           );
-          handle = await runtime.ensureSession({
-            sessionKey: prepared.sessionKey,
-            agent: prepared.acpxAgent,
-            mode: prepared.mode,
-            cwd: prepared.cwd,
-          });
+          handle = await awaitSessionWithProgress(
+            ctx,
+            { attempt: "fresh_retry", resume: false },
+            () =>
+              runtime.ensureSession({
+                sessionKey: prepared.sessionKey,
+                agent: prepared.acpxAgent,
+                mode: prepared.mode,
+                cwd: prepared.cwd,
+              }),
+          );
         }
       }
     } catch (err) {
