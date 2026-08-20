@@ -1,10 +1,11 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueComments, issues, routineRuns, routines } from "@paperclipai/db";
 
 import {
-  buildAgentHealthReceiptKeyLikePattern,
+  AGENT_HEALTH_RECEIPT_KEY_LIKE_PATTERN,
   buildSchedulerFailureHeartbeatKey,
+  parseAgentHealthReceiptWindowKey,
 } from "./origins.js";
 
 // `issues.originKind` for a routine's scheduled execution issue. A bare string
@@ -63,6 +64,84 @@ function dispositionClause(
 }
 
 /**
+ * BLO-28871: the lower bound of the window this run owns, exclusive.
+ *
+ * A runbook keys its receipt to *its own* window convention, which the platform
+ * does not own and must not hard-code: the live agent-health routine floors
+ * `triggeredAt` to the UTC 6-hour slot, so its receipt is keyed `:00:00` while
+ * the run triggered at `:07:xx`. Matching the raw timestamp matched nothing.
+ * Rather than parse the cron, bound the window with what the scheduler already
+ * knows -- the routine's own adjacent runs. Any receipt keyed in
+ * `(previousRun.triggeredAt, thisRun.triggeredAt]` belongs to this window and
+ * no other, for any convention that stamps a key inside the window it describes.
+ *
+ * Exclusive at the lower end on purpose: a convention that keys the *raw*
+ * trigger time would otherwise let the previous window's receipt suppress this
+ * one.
+ *
+ * With no earlier run, fall back to the spacing implied by the *next* run, so a
+ * routine's first window is still bounded. With neither neighbour the routine
+ * has exactly one run ever, so every `agent-health:` receipt keyed at or before
+ * it necessarily belongs to this window and `null` (unbounded below) is right.
+ *
+ * Stated limit: if two runs of the same routine trigger close enough together
+ * to share one runbook slot (a catch-up burst), the later run's interval is too
+ * narrow to see the slot's receipt and it can still draw a false receipt. That
+ * is bounded to burst runs rather than every window, and the duplicate-dispatch
+ * path that produces most of them is already suppressed upstream (BLO-19954).
+ * Widening the interval past the adjacent run is the worse trade: it would let
+ * one window's receipt vouch for another, which converts a false alarm into
+ * silence on a genuinely dark window.
+ */
+async function resolveWindowStartExclusive(db: Db, input: {
+  companyId: string;
+  routineId: string;
+  windowAt: Date;
+}) {
+  const scope = and(
+    eq(routineRuns.companyId, input.companyId),
+    eq(routineRuns.routineId, input.routineId),
+  );
+  const previousRunAt = await db
+    .select({ triggeredAt: routineRuns.triggeredAt })
+    .from(routineRuns)
+    .where(and(scope, lt(routineRuns.triggeredAt, input.windowAt)))
+    .orderBy(desc(routineRuns.triggeredAt))
+    .limit(1)
+    .then((rows) => rows[0]?.triggeredAt ?? null);
+  if (previousRunAt) return previousRunAt;
+
+  const nextRunAt = await db
+    .select({ triggeredAt: routineRuns.triggeredAt })
+    .from(routineRuns)
+    .where(and(scope, gt(routineRuns.triggeredAt, input.windowAt)))
+    .orderBy(asc(routineRuns.triggeredAt))
+    .limit(1)
+    .then((rows) => rows[0]?.triggeredAt ?? null);
+  if (!nextRunAt) return null;
+  return new Date(input.windowAt.getTime() - (nextRunAt.getTime() - input.windowAt.getTime()));
+}
+
+function isWithinWindow(keyedAt: Date | null, window: {
+  windowAt: Date;
+  windowStartExclusive: Date | null;
+}) {
+  if (!keyedAt) return false;
+  if (keyedAt.getTime() > window.windowAt.getTime()) return false;
+  return !window.windowStartExclusive || keyedAt.getTime() > window.windowStartExclusive.getTime();
+}
+
+// The receipt states which interval it searched, not just which window it is
+// about. A reader who sees `carried no agent-health:<rawTriggeredAt>:*` cannot
+// tell whether the guard looked for the runbook's actual key -- BLO-28871 is
+// what that ambiguity cost.
+function describeSearchedWindow(windowKey: string, windowStartExclusive: Date | null) {
+  return windowStartExclusive
+    ? `after \`${windowStartExclusive.toISOString()}\` and at or before \`${windowKey}\``
+    : `at or before \`${windowKey}\``;
+}
+
+/**
  * BLO-21395: cross-post a deduplicated failure receipt to the routine's alert
  * surface (`routines.parentIssueId`) when a scheduled window stops being live
  * without the runbook ever emitting for it. The in-run pre-flight heartbeat
@@ -78,9 +157,20 @@ function dispositionClause(
  * off a single checkout-shaped activity event, then succeeded without ever
  * reaching the runbook's own emission step, then stranded. That proxy suppressed
  * the receipt on the exact window this predicate exists to catch. A window that
- * already carries the runbook's own `agent-health:<windowKey>:*` receipt on the
- * alert surface got a normal emission and needs no scheduler receipt; this is
- * the only thing that suppresses emission here.
+ * already carries the runbook's own `agent-health:` receipt on the alert surface
+ * got a normal emission and needs no scheduler receipt; this is the only thing
+ * that suppresses emission here.
+ *
+ * BLO-28871: that suppression was dead code in production for its first three
+ * weeks. It compared the *raw* `triggeredAt` against keys the runbook stamps at
+ * the floored UTC slot, two strings that can never be equal, so every window --
+ * including ones the runbook had already reported -- was eligible for a receipt
+ * asserting the opposite. Window membership is now decided from the parsed key
+ * against the interval bounded by the routine's adjacent runs; see
+ * `resolveWindowStartExclusive`. The receipt's *own* key still uses the raw
+ * `triggeredAt`: it is stable per (routine, run), and the CTO namespace ruling
+ * on BLO-21395 deliberately keeps scheduler receipts out of the runbook's
+ * `windowCoverage7d`. Only the lookup was wrong.
  *
  * BLO-27572: extracted out of the recovery service so the *cancellation*
  * transition can reach it too. A stranded window retired by an agent or a human
@@ -130,17 +220,29 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
         .where(eq(routineRuns.id, issue.originRunId))
         .then((rows) => rows[0] ?? null)
       : null;
-    const windowKey = (run?.triggeredAt ?? issue.createdAt).toISOString();
+    const windowAt = run?.triggeredAt ?? issue.createdAt;
+    const windowKey = windowAt.toISOString();
+    const windowStartExclusive = await resolveWindowStartExclusive(db, {
+      companyId: issue.companyId,
+      routineId: routine.id,
+      windowAt,
+    });
 
     const hasNormalEmission = await db
-      .select({ id: issueComments.id })
+      .select({ idempotencyKey: issueComments.idempotencyKey })
       .from(issueComments)
       .where(and(
         eq(issueComments.issueId, routine.parentIssueId),
-        sql`${issueComments.idempotencyKey} LIKE ${buildAgentHealthReceiptKeyLikePattern(windowKey)}`,
+        sql`${issueComments.idempotencyKey} LIKE ${AGENT_HEALTH_RECEIPT_KEY_LIKE_PATTERN}`,
       ))
-      .limit(1)
-      .then((rows) => rows.length > 0);
+      .then((rows) =>
+        rows.some((row) =>
+          isWithinWindow(parseAgentHealthReceiptWindowKey(row.idempotencyKey), {
+            windowAt,
+            windowStartExclusive,
+          })
+        )
+      );
     if (hasNormalEmission) return;
 
     const idempotencyKey = buildSchedulerFailureHeartbeatKey({ routineId: routine.id, windowKey });
@@ -150,8 +252,9 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
       routine.parentIssueId,
       [
         `**Scheduler-side failure heartbeat.** As of \`${observedAt}\`, window \`${windowKey}\` of routine ` +
-          `\`${routine.title}\` (\`${routine.id}\`) carried no \`agent-health:${windowKey}:*\` receipt on this ` +
-          `issue; ${dispositionClause(disposition, issueUiLink(issue, prefix))}`,
+          `\`${routine.title}\` (\`${routine.id}\`) carried no \`agent-health:*\` receipt keyed ` +
+          `${describeSearchedWindow(windowKey, windowStartExclusive)} on this issue; ` +
+          `${dispositionClause(disposition, issueUiLink(issue, prefix))}`,
         "",
         `- Routine run: \`${issue.originRunId ?? "unknown"}\``,
         `- Idempotency key: \`${idempotencyKey}\``,
