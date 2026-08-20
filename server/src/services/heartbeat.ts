@@ -25474,19 +25474,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // 484/700 fleet parks at median 4.6h under `transient_failure` while
       // correctly-gated capacity parks sat at 17.9m, for the identical error.
       //
-      // Clamping here is safe for the reason the gate writer is safe, and it is
-      // NOT "retry into a closed door": coming due does not dispatch. A promoted
-      // retry re-enters via `automation`, which `gateAppliesToWake` covers, so
-      // the wake-time ccrotate gate re-probes capacity (a cached availability
-      // check, not a paid invocation) and re-defers under
-      // CCROTATE_CAPACITY_RETRY_REASON when the pool is still empty. So the run
-      // stays in `scheduled_retry` — a live execution path, so no strand — and
-      // recovers within one ceiling of capacity actually returning rather than
-      // sleeping to a horizon we already decided not to trust.
+      // Clamping here is safe only because of the paired change in
+      // `promoteScheduledRetryRun`, and the reason is worth stating precisely
+      // because the obvious version of it is WRONG. It is tempting to argue
+      // "coming due does not dispatch, since the wake-time ccrotate gate
+      // (`gateAppliesToWake`) covers `automation` wakes" — that is false.
+      // `promoteDueScheduledRetries` selects `scheduled_retry` rows straight
+      // from the DB and calls `promoteScheduledRetryRun`; it never enters
+      // `wakeup()`, so the wake-time gate never evaluates for a promoted retry.
+      // The ONLY thing standing between a shortened capacity park and a
+      // dispatch into a still-empty pool is the capacity re-probe branch in
+      // `promoteScheduledRetryRun`, which is why BLO-28919 extends that branch
+      // to cover a capacity park labelled `transient_failure`. Shortening the
+      // horizon without that would burn a paid attempt per hop against a closed
+      // door — BLO-24011 inverted. Do not weaken one half without the other.
       //
-      // This also relabels the park: once the gate re-defers it, the row carries
-      // the capacity reason it always belonged to instead of the scheduler's
-      // defaulted `transient_failure`.
+      // With both halves in place the run re-probes capacity for free (a cached
+      // availability check, not a paid invocation) and re-defers while the pool
+      // is empty, so it stays in `scheduled_retry` — a live execution path, so
+      // no strand — and recovers within one ceiling of capacity actually
+      // returning rather than sleeping to a horizon we already distrust.
+      //
+      // The re-defer also relabels the park to CCROTATE_CAPACITY_RETRY_REASON,
+      // so it stops reading as the scheduler's defaulted `transient_failure`.
       //
       // Deliberate consequence, recorded rather than hidden: a multi-day outage
       // now escalates to an operator-visible issue at the capacity path's
