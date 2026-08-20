@@ -1063,7 +1063,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(sourceAfter?.status).toBe("blocked");
   });
 
-  it("does not strand a zero-pre-existing-blocker source in blocked when the escalation edge would cycle", async () => {
+  it("writes no reverse edge when the source already blocks its open escalation", async () => {
     await enableAutoRecovery();
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -1089,11 +1089,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       permissions: {},
     });
 
-    // Source issue is in_review with no assignee and no pre-existing
-    // blockers of its own -- the self-referential "in_review_without_action_path"
-    // finding treats the issue as both the source and its own recovery
-    // issue, so this is the shape that hits the cycle fallback with an
-    // empty blockerIds set.
+    // Source issue is in_review with no assignee and no pre-existing blockers
+    // of its own -- the self-referential "in_review_without_action_path"
+    // finding treats the issue as both the source and its own recovery issue.
+    // Before BLO-28618 this shape reached the cycle fallback in
+    // `ensureIssueBlockedByEscalation` with an empty blockerIds set; that
+    // function is gone and no edge is written at all now, so the case is kept
+    // as the stronger invariant -- see the reverse-edge setup below.
     const issueTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
     await db.insert(issues).values({
       id: issueId,
@@ -1131,10 +1133,14 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         issueId,
       ].join(":"),
     });
-    // Craft the cycle: the source issue already blocks the escalation issue
-    // (e.g. left over from an earlier partial recovery), so adding the
-    // reverse edge -- escalation blocks source -- forms a 2-cycle. The
-    // source has no *other* blockers of its own.
+    // The source issue already blocks the escalation issue (e.g. left over from
+    // an earlier partial recovery). Under the old code, adding the reverse edge
+    // -- escalation blocks source -- would have formed a 2-cycle and taken the
+    // cycle fallback. BLO-28618 removed the reverse-edge write entirely, so the
+    // assertions below are now the stronger claim: no edge is added, this
+    // pre-existing edge is left alone, and the source's status is untouched.
+    // `persistedBlockers` staying empty is what would catch a reintroduced
+    // self-blocker edge.
     await db.insert(issueRelations).values({
       companyId,
       issueId,
