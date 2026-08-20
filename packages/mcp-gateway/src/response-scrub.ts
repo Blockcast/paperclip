@@ -826,11 +826,30 @@ function scrubJsonValueTracked(
     // `command`/`args` inside a container list (PEN-2431). Gated on
     // `inContainers` for the same reason the YAML path gates on an open
     // container block: a bare `args` array is ordinary GitHub/Paperclip traffic.
-    if (inContainers && isArgvKey(key) && Array.isArray(value)) {
-      result[key] = value.map((entry) =>
-        typeof entry === "string" ? redactArgvToken(entry) : REDACTED,
-      );
-      if (value.length > 0) ctx.changed = true;
+    //
+    // Default-deny on the *shape*, not just on the array shape. An earlier
+    // version required `Array.isArray(value)`, which made the two paths
+    // disagree: the YAML scanner fails closed on a scalar `command:` (any
+    // non-empty suffix is redacted wholesale), while a JSON `"command"` holding
+    // a string or a mapping fell through to the generic recursion and was
+    // emitted in the clear. That is the exact failure this path exists to
+    // prevent — an upstream shape change silently turning the scrubber into a
+    // no-op — so every non-empty shape is now material until proven otherwise.
+    if (inContainers && isArgvKey(key)) {
+      if (Array.isArray(value)) {
+        result[key] = value.map((entry) =>
+          typeof entry === "string" ? redactArgvToken(entry) : REDACTED,
+        );
+        if (value.length > 0) ctx.changed = true;
+      } else if (value === null || value === undefined) {
+        // No material to redact, and no name worth inventing.
+        result[key] = value;
+      } else {
+        // A scalar or a mapping. Neither carries a flag name we can preserve
+        // token-by-token, so redact wholesale — matching the YAML path.
+        result[key] = REDACTED;
+        ctx.changed = true;
+      }
       continue;
     }
     if (isEnvKey(key) && Array.isArray(value)) {

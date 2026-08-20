@@ -1271,6 +1271,52 @@ describe("argv redaction inside a container list (PEN-2431 door #5)", () => {
     expect(out).toContain("restartCount: 3");
   });
 
+  /**
+   * Shape parity between the two paths. The YAML scanner fails closed on a
+   * scalar `command:` — any non-empty suffix is redacted wholesale — but the
+   * JSON walker originally required `Array.isArray(value)`, so a `"command"`
+   * holding a string or a mapping fell through the generic recursion and was
+   * emitted in the clear. Both shapes are asserted here because the JSON path
+   * exists precisely so an upstream shape change cannot silently turn this
+   * scrubber into a no-op; a shape it passes through defeats its own reason to
+   * exist. The array case above is the discriminator: it redacted before this
+   * fix and still does, so these two are the change and not a broken harness.
+   */
+  it("redacts a scalar-string command inside a container list (JSON path)", () => {
+    const out = JSON.stringify(
+      scrubJsonValue({
+        kind: "Pod",
+        spec: { containers: [{ name: "server", command: `/bin/sh -c TOKEN=${LEAK}` }] },
+      }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("server");
+  });
+
+  it("redacts a mapping-shaped command inside a container list (JSON path)", () => {
+    const out = JSON.stringify(
+      scrubJsonValue({
+        kind: "Pod",
+        spec: { containers: [{ name: "server", command: { run: `TOKEN=${LEAK}` } }] },
+      }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("server");
+  });
+
+  it("leaves a null command untouched — no material, no name to invent", () => {
+    const out = JSON.stringify(
+      scrubJsonValue({
+        kind: "Pod",
+        spec: { containers: [{ name: "server", command: null }] },
+      }),
+    );
+
+    expect(out).toContain('"command":null');
+  });
+
   it("leaves 'args' outside a container list untouched", () => {
     // The shape this gateway carries constantly: an Actions workflow / MCP tool
     // schema. Redacting a bare `args:` would corrupt ordinary traffic on a key
