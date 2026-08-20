@@ -8223,6 +8223,19 @@ export function recoveryService(
     return { id: mostRecentDone.id, reason: "unchanged_target" as const };
   }
 
+  type LivenessBlockerPruneOutcome = {
+    /** The fabricated edge was found and cleared. */
+    pruned: boolean;
+    /**
+     * The edge was cleared but the status restore did not land, so the source
+     * is left at `blocked` with nothing unresolved -- the very
+     * `blocked_without_blockers` state this prune exists to avoid producing.
+     */
+    restoreDegraded: boolean;
+  };
+
+  const PRUNE_NOT_APPLICABLE: LivenessBlockerPruneOutcome = { pruned: false, restoreDegraded: false };
+
   /**
    * Prunes a legacy fabricated blocker edge (recovery issue -> its own source)
    * left behind by escalations filed before BLO-28618 stopped writing them.
@@ -8235,18 +8248,20 @@ export function recoveryService(
    * disposition its own body prescribes -- left 11 of 11 sources in that state.
    * So restore the status in the same pass whenever nothing unresolved remains.
    */
-  async function removeRecoveryBlockerFromSource(recovery: typeof issues.$inferSelect) {
+  async function removeRecoveryBlockerFromSource(
+    recovery: typeof issues.$inferSelect,
+  ): Promise<LivenessBlockerPruneOutcome> {
     const parsed = parseLivenessIncidentKey(recovery.originId);
-    if (!parsed) return false;
+    if (!parsed) return PRUNE_NOT_APPLICABLE;
     const sourceIssue = await db
       .select()
       .from(issues)
       .where(and(eq(issues.companyId, recovery.companyId), eq(issues.id, parsed.issueId)))
       .then((rows) => rows[0] ?? null);
-    if (!sourceIssue) return false;
+    if (!sourceIssue) return PRUNE_NOT_APPLICABLE;
 
     const blockerIds = await existingBlockerIssueIds(sourceIssue.companyId, sourceIssue.id);
-    if (!blockerIds.includes(recovery.id)) return false;
+    if (!blockerIds.includes(recovery.id)) return PRUNE_NOT_APPLICABLE;
     const nextBlockerIds = blockerIds.filter((blockerId) => blockerId !== recovery.id);
 
     // Compute what survives the prune BEFORE writing, so the edge clear and the
@@ -8261,23 +8276,41 @@ export function recoveryService(
 
     let restoredSourceStatus = false;
     let restoreSkippedReason: string | null = null;
+    let restoreDegraded = false;
     try {
       const updated = await issuesSvc.update(sourceIssue.id, {
         blockedByIssueIds: nextBlockerIds,
         ...(shouldRestoreStatus ? { status: "todo" as const } : {}),
       });
-      restoredSourceStatus = shouldRestoreStatus && updated?.status === "todo";
+      // `update` resolves to null when no row matched (issues.ts:9716) -- the
+      // source was deleted mid-sweep. Nothing was written: the blocker sync at
+      // issues.ts:9727 sits *after* that early return, so the edge is still
+      // there. Report no prune rather than counting a write that never landed.
+      if (!updated) return PRUNE_NOT_APPLICABLE;
+      restoredSourceStatus = shouldRestoreStatus && updated.status === "todo";
     } catch (err) {
       if (!shouldRestoreStatus) throw err;
-      // Status restore refused (e.g. a concurrent write re-added a blocker).
-      // Still drop the fabricated edge -- leaving it is the wedge -- and let the
-      // next sweep's dead-end finding surface the source honestly.
+      // NOT a blocker-validation refusal. `issuesSvc.update` only validates
+      // blockers when the patch sets `in_progress` (issues.ts:9670), so a
+      // `todo` patch is never rejected for unresolved blockers -- a concurrent
+      // write re-adding a blocker cannot land us here. What reaches this arm is
+      // infrastructure failure: lock timeout, transient DB fault, serialization
+      // error. Retry the edge clear alone, because leaving the fabricated edge
+      // in place is the wedge BLO-28618 exists to remove.
+      //
+      // That retry is a DEGRADED outcome, not a success: it clears the edge and
+      // leaves the source at `blocked` with nothing unresolved, which is the
+      // `blocked_without_blockers` state that re-arms the detector against this
+      // same source. Log at `error` and count it, so a silent re-arm cannot
+      // hide behind an incremented `blockerRelationsRemoved`.
       restoreSkippedReason = err instanceof Error ? err.message : String(err);
-      logger.warn(
+      logger.error(
         { err, issueId: sourceIssue.id, companyId: sourceIssue.companyId, recoveryIssueId: recovery.id },
-        "pruned liveness recovery blocker but could not restore source issue status",
+        "pruned liveness recovery blocker but could not restore source issue status; source left in the blocked_without_blockers trigger state",
       );
-      await issuesSvc.update(sourceIssue.id, { blockedByIssueIds: nextBlockerIds });
+      const retried = await issuesSvc.update(sourceIssue.id, { blockedByIssueIds: nextBlockerIds });
+      if (!retried) return PRUNE_NOT_APPLICABLE;
+      restoreDegraded = true;
     }
 
     await logActivity(db, {
@@ -8301,7 +8334,7 @@ export function recoveryService(
       },
     });
 
-    return true;
+    return { pruned: true, restoreDegraded };
   }
 
   async function hasActiveRunForIssueId(companyId: string, issueId: string) {
@@ -8360,7 +8393,9 @@ export function recoveryService(
     const result = {
       retired: 0,
       activeSkipped: 0,
+      sourceStillOpenSkipped: 0,
       blockerRelationsRemoved: 0,
+      blockerPruneRestoreDegraded: 0,
       retiredIssueIds: [] as string[],
     };
 
@@ -8394,12 +8429,27 @@ export function recoveryService(
       // directly against the source's status. Without this the detector files a
       // row and cancels it one sweep later, which is worse than the wedge it
       // replaced.
+      //
+      // KNOWN GAP -- BLO-29137: this skip has no exit. The only automatic
+      // retirement path left is the source reaching `done`/`cancelled`, and
+      // suppression is edge-independent, so a row that is filed and never
+      // worked hides its source *and* its leaf indefinitely. Do NOT "fix" this
+      // by adding an age bound here first: retiring a row is itself the
+      // re-file trigger (`openRecoveryIssues` treats only `done`/`cancelled` as
+      // terminal), so a bound applied before BLO-28618 step 2 lands would
+      // re-introduce the amplifier on a timer. `sourceStillOpenSkipped` below
+      // exists to size this population in the meantime.
       if (sourceIssue && !["done", "cancelled"].includes(sourceIssue.status)) {
         result.activeSkipped += 1;
+        result.sourceStillOpenSkipped += 1;
         continue;
       }
-      if (await removeRecoveryBlockerFromSource(recovery)) {
+      const prune = await removeRecoveryBlockerFromSource(recovery);
+      if (prune.pruned) {
         result.blockerRelationsRemoved += 1;
+      }
+      if (prune.restoreDegraded) {
+        result.blockerPruneRestoreDegraded += 1;
       }
       if (await hasActiveRunForIssueId(recovery.companyId, recovery.id)) {
         result.activeSkipped += 1;
@@ -8426,13 +8476,18 @@ export function recoveryService(
       );
 
     let blockerRelationsRemoved = 0;
+    let blockerPruneRestoreDegraded = 0;
     for (const recovery of closedRecoveries) {
-      if (await removeRecoveryBlockerFromSource(recovery)) {
+      const prune = await removeRecoveryBlockerFromSource(recovery);
+      if (prune.pruned) {
         blockerRelationsRemoved += 1;
+      }
+      if (prune.restoreDegraded) {
+        blockerPruneRestoreDegraded += 1;
       }
     }
 
-    return { blockerRelationsRemoved };
+    return { blockerRelationsRemoved, blockerPruneRestoreDegraded };
   }
 
   function normalizeIssueGraphLivenessAutoRecoveryLookbackHours(raw: unknown) {
@@ -9654,8 +9709,19 @@ export function recoveryService(
       skippedUnchangedTarget: 0,
       obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
       obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
+      // Breakout of the dominant `activeSkipped` arm. `activeSkipped` stays the
+      // total so existing consumers keep working; this names the "source is
+      // still open" rows specifically, which is the BLO-29137 population --
+      // rows with no automatic exit. Rows deferred by an in-flight run are
+      // `activeSkipped - sourceStillOpenSkipped`.
+      obsoleteRecoveriesSourceStillOpenSkipped: obsoleteRecoveryCleanup.sourceStillOpenSkipped,
       obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
+      // Edge cleared but the status restore did not land -- the source is left
+      // in the `blocked_without_blockers` trigger state. Non-zero means the
+      // detector has been silently re-armed against those sources.
+      obsoleteRecoveryBlockerPruneRestoreDegraded: obsoleteRecoveryCleanup.blockerPruneRestoreDegraded,
       doneRecoveryBlockerRelationsRemoved: doneRecoveryBlockerCleanup.blockerRelationsRemoved,
+      doneRecoveryBlockerPruneRestoreDegraded: doneRecoveryBlockerCleanup.blockerPruneRestoreDegraded,
       dependencyWakeBackstopChecked: 0,
       dependencyWakesHealed: 0,
       dependencyWakeExistingSkipped: 0,
