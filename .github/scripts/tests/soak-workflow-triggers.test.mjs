@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,6 +30,24 @@ const scriptCode = script
   .split('\n')
   .filter((line) => !/^\s*#/.test(line))
   .join('\n');
+
+// Every other test in this file reads the script as TEXT, which cannot notice
+// that the text stopped being a valid program. That is not hypothetical: the
+// verdict block is one large awk program wrapped in a shell single-quote, so a
+// lone apostrophe anywhere inside it -- including in an awk comment -- ends the
+// quote early and the remainder parses as shell. Both times that happened while
+// writing this suite, all other tests stayed green. The soak is a 50-90 minute
+// dispatch, so the alternative to this check is burning a runner to learn the
+// script does not parse.
+test('soak script is syntactically valid bash', () => {
+  const { status, stderr, error } = spawnSync(
+    'bash',
+    ['-n', path.join(scriptsDir, SOAK_SCRIPT)],
+    { encoding: 'utf8' },
+  );
+  assert.equal(error, undefined, `could not run bash -n: ${error?.message}`);
+  assert.equal(status, 0, `bash -n rejected the soak script:\n${stderr}`);
+});
 
 // BLO-28888 AC: the soak is ~50-90 minutes of self-hosted runner time. It is an
 // on-demand job, and wiring it to any per-PR event would put that on the
@@ -174,17 +193,56 @@ test('soak samples its load baseline after a settle window, not at script start'
   }
 });
 
+test('both sleep-fed knobs are reachable from a dispatch', () => {
+  // The test above proves the SCRIPT validates these knobs; it says nothing
+  // about whether a dispatch can actually set them. That gap is not theoretical:
+  // deleting both `env:` lines from the workflow left the whole suite green,
+  // so the escape hatch could regress to unreachable while the script comment
+  // still advertised it -- and the two knobs are 5.5 minutes of pure `sleep` at
+  // the defaults, which is exactly what a smoke dispatch needs to zero.
+  // Assert the full path: input declared -> wired into the step's env.
+  for (const [input, env] of [
+    ['load_settle_s', 'LOAD_SETTLE_S'],
+    ['load_warmup_s', 'LOAD_WARMUP_S'],
+  ]) {
+    assert.match(
+      soak,
+      new RegExp(`^ {6}${input}:$`, 'm'),
+      `expected a \`${input}\` workflow_dispatch input`,
+    );
+    assert.match(
+      soak,
+      new RegExp(`${env}: \\$\\{\\{ inputs\\.${input} \\}\\}`),
+      `expected ${env} to be wired to inputs.${input} so a dispatch can set it`,
+    );
+  }
+});
+
 test('load attribution bounds the burner delta from BOTH sides', () => {
   // The floor alone (`dlmean >= workers * 0.5`) leaves the pass band open at
   // the top, so a neighbour's load reads as ours and the summary claims a
   // regime that was only partly this job's. That is the one failure direction
   // that can manufacture a false AC2 green, so both bounds are pinned here.
-  const ceiling = scriptCode.indexOf('dlmean > workers * 1.5');
+  const ceiling = scriptCode.indexOf('dlmean > workers +');
   const floor = scriptCode.indexOf('dlmean >= workers * 0.5');
   assert.ok(ceiling > 0, 'expected an upper bound on the attributable delta');
   assert.ok(floor > 0, 'expected a lower bound on the attributable delta');
 
-  // Ordering is load-bearing, not cosmetic: `dlmean > workers * 1.5` also
+  // The tolerance must carry an ABSOLUTE floor, not just a ratio. vitest itself
+  // contributes ~1-3 runnable tasks whatever the burner count, so a purely
+  // multiplicative band (the `workers * 1.5` this replaced) shrinks below that
+  // contaminant exactly where headroom is scarcest: at LOAD_WORKERS=1 the
+  // ceiling was 1.5, and runs whose load was entirely their own reported
+  // "not solely ours". Above 4 burners the ratio dominates and the band is
+  // unchanged, so this pins the small-count shape without touching `auto`.
+  const ceilingExpr = scriptCode.slice(ceiling, scriptCode.indexOf('\n', ceiling));
+  assert.match(
+    ceilingExpr,
+    /workers \* 0\.5 > 2 \? workers \* 0\.5 : 2/,
+    'the ceiling tolerance must keep an absolute floor for vitest\'s own load',
+  );
+
+  // Ordering is load-bearing, not cosmetic: a delta above the ceiling also
   // satisfies `>= workers * 0.5`, so if the floor is tested first the ceiling
   // becomes unreachable dead code and over-attribution goes silent again.
   assert.ok(
