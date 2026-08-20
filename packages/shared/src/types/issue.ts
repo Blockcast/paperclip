@@ -776,6 +776,20 @@ export interface Issue {
   parkedReason?: string | null;
   parkedByAgentId?: string | null;
   parkedAt?: Date | null;
+  /**
+   * Flat scheduled-retry projection carried by every issue **list** row
+   * (BLO-28843). Present-and-null when the issue has no run parked in
+   * `scheduled_retry`; never absent on a list row.
+   *
+   * These mirror the `scheduledRetry` object returned by the single-issue read
+   * for the same issue — an issue is attended by exactly one of three paths (a
+   * live `activeRun`, an armed `monitor*`, or a scheduled retry), and a list
+   * consumer that reads only the first two systematically over-reports
+   * "unattended".
+   */
+  scheduledRetryAt?: Date | null;
+  scheduledRetryReason?: string | null;
+  scheduledRetryAttempt?: number | null;
   executionWorkspaceId: string | null;
   executionWorkspacePreference: string | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
