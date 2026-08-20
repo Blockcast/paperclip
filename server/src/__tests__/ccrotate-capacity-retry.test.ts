@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CAPACITY_ESCALATION_AFTER_MS,
   CCROTATE_CAPACITY_MAX_PARK_MS,
   CCROTATE_CAPACITY_PARK_JITTER_RATIO,
+  CCROTATE_CAPACITY_RESULT_KEYS,
   LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS,
   MAX_TRANSIENT_RETRY_HORIZON_MS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+  applyCcrotateCapacityDecision,
   clampTransientRetryHorizon,
+  resolveCapacityEscalation,
   resolveCcrotateCapacityRetry,
 } from "../services/ccrotate-capacity-retry.js";
 
@@ -300,6 +304,142 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
     // The 96x gap the census measured. If someone retunes either constant, this
     // is the line that makes them look at the other one.
     expect(MAX_TRANSIENT_RETRY_HORIZON_MS / CCROTATE_CAPACITY_MAX_PARK_MS).toBe(96);
+  });
+
+  it("survives every outage on record without exhausting (the invariant that would have caught it)", () => {
+    // BLO-28919 Suggestion 2. The Critical was not an arithmetic slip, it was a
+    // MISSING TEST: nothing asserted that the give-up horizon covers the outages
+    // actually recorded, so a docblock claiming "~7.5 days" could sit above a
+    // real bound of 12h and no suite cared.
+    //
+    // This is deliberately written against the ESCALATION HORIZON rather than
+    // `attempts x cadence`. That product is what broke — it couples re-probe
+    // promptness to outage tolerance, so shortening a hop silently shrank
+    // coverage. Asserting on the horizon means the cadence constant can move
+    // freely and this assertion still means what it says.
+    expect(
+      CAPACITY_ESCALATION_AFTER_MS,
+      `the capacity give-up horizon (${(CAPACITY_ESCALATION_AFTER_MS / 3_600_000).toFixed(1)}h) must ` +
+        `cover the longest recorded provider outage ` +
+        `(${(LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS / 3_600_000).toFixed(1)}h) with headroom, or a ` +
+        `recorded-length outage hard-exhausts and its GitHub deliveries are lost for real`,
+    ).toBeGreaterThan(LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS);
+
+    // The retired rule, kept as an explicit tripwire: had this been asserted,
+    // 48 x 15m = 12h would have failed against both recorded windows instead of
+    // shipping behind a stale comment.
+    const retiredAttemptCap = 48;
+    expect(
+      retiredAttemptCap * CCROTATE_CAPACITY_MAX_PARK_MS,
+      "documents WHY the attempt-count rule was retired rather than re-tuned",
+    ).toBeLessThan(LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS);
+  });
+
+  describe("capacity escalation horizon (BLO-28919)", () => {
+    it("does not escalate while the pool has been down less than the horizon", () => {
+      const plan = resolveCapacityEscalation({
+        firstDeferredAtIso: new Date(NOW.getTime() - 12 * 60 * 60 * 1000).toISOString(),
+        now: NOW,
+      });
+      expect(plan.exhausted).toBe(false);
+      expect(plan.elapsedMs).toBe(12 * 60 * 60 * 1000);
+    });
+
+    it("escalates once the pool has been down longer than the horizon", () => {
+      const plan = resolveCapacityEscalation({
+        firstDeferredAtIso: new Date(
+          NOW.getTime() - CAPACITY_ESCALATION_AFTER_MS - 1000,
+        ).toISOString(),
+        now: NOW,
+      });
+      expect(plan.exhausted).toBe(true);
+    });
+
+    it("fails open on an absent, unparseable, or future origin rather than escalating", () => {
+      // A premature escalation cancels the run and loses the delivery; a
+      // restarted clock costs one extra horizon of cached GETs. The asymmetry
+      // decides the direction, so every ambiguous value must restart the clock.
+      for (const firstDeferredAtIso of [
+        undefined,
+        null,
+        "",
+        "not-a-date",
+        42,
+        {},
+        // `Date.parse` LENIENCY, and the nastiest case of the set. A bare year
+        // parses to a real instant in 2020, so a truncated value would pin the
+        // chain origin ~6 years back and force an immediate cancel on the next
+        // hop — the premature exhaustion this whole change removes. The future
+        // guard cannot catch it because 2020 is in the past; only strict
+        // round-trip validation of the stored serialization does.
+        "2020",
+        "2026-08-20",
+        // Clock skew between the two writers must not read as "down forever".
+        new Date(NOW.getTime() + 60 * 60 * 1000).toISOString(),
+      ]) {
+        const plan = resolveCapacityEscalation({ firstDeferredAtIso, now: NOW });
+        expect(plan.exhausted, `must not escalate on ${JSON.stringify(firstDeferredAtIso)}`).toBe(
+          false,
+        );
+        expect(plan.elapsedMs).toBe(0);
+        expect(plan.firstDeferredAtIso).toBe(NOW.toISOString());
+      }
+    });
+
+    it("keeps the chain origin OUT of the keys a re-defer wipes", () => {
+      // The infinite-park hazard, asserted structurally rather than by comment.
+      // Every key in `clearedOnRedefer` is deleted and rewritten on each hop; if
+      // the origin joined that list it would be re-seeded to `now` every hop,
+      // elapsed time would never grow, and the run would park forever.
+      expect(
+        CCROTATE_CAPACITY_RESULT_KEYS.clearedOnRedefer as readonly string[],
+      ).not.toContain(CCROTATE_CAPACITY_RESULT_KEYS.carriedAcrossRedefer);
+    });
+
+    it("sets the origin once and carries it across re-defers", () => {
+      const origin = new Date(NOW.getTime() - 9 * 60 * 60 * 1000).toISOString();
+      const decision = {
+        retryAtIso: new Date(NOW.getTime() + 60_000).toISOString(),
+        advertisedResumeAtIso: null,
+        clampedFromIso: null,
+        firstDeferredAtIso: NOW.toISOString(),
+      };
+
+      // First hop on an empty row seeds `now`.
+      const seeded = applyCcrotateCapacityDecision({}, decision);
+      expect(seeded.penstockCapacityFirstDeferredAt).toBe(NOW.toISOString());
+
+      // A subsequent hop must NOT advance it, or the horizon never elapses.
+      const carried = applyCcrotateCapacityDecision(
+        { penstockCapacityFirstDeferredAt: origin, penstockRetryAfterSeconds: 3834 },
+        decision,
+      );
+      expect(carried.penstockCapacityFirstDeferredAt).toBe(origin);
+      // ...while the descriptive keys are still wiped, per BLO-24011.
+      expect(carried.penstockRetryAfterSeconds).toBeUndefined();
+    });
+
+    it("replaces a corrupt stored origin instead of trusting it into an escalation", () => {
+      // A hand-edited or truncated value must not be able to pin the origin in
+      // the distant past and force an immediate cancel on the next hop. "2020"
+      // is the case a `Number.isFinite(Date.parse(...))` guard would have let
+      // through, so it is asserted alongside outright garbage.
+      for (const corrupt of ["garbage", "2020", "2026-08-20", 1_755_000_000_000]) {
+        const repaired = applyCcrotateCapacityDecision(
+          { penstockCapacityFirstDeferredAt: corrupt },
+          {
+            retryAtIso: new Date(NOW.getTime() + 60_000).toISOString(),
+            advertisedResumeAtIso: null,
+            clampedFromIso: null,
+            firstDeferredAtIso: NOW.toISOString(),
+          },
+        );
+        expect(
+          repaired.penstockCapacityFirstDeferredAt,
+          `a corrupt origin ${JSON.stringify(corrupt)} must be replaced, not trusted`,
+        ).toBe(NOW.toISOString());
+      }
+    });
   });
 
   it("only ever shortens a park, so a stale or near floor is never pushed out", () => {

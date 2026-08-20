@@ -369,12 +369,24 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 /**
  * BLO-28919: a capacity floor must land inside the capacity ceiling regardless
  * of which surface advertised it. The park is computed at finalization, so it is
- * measured from the run's own `startedAt` where available (falling back to now,
- * which only ever makes this assertion stricter), plus jitter and a slack
- * allowance for the run's own execution time.
+ * measured from the run's own `startedAt`, plus jitter and a slack allowance for
+ * the run's own execution time.
+ *
+ * `startedAt` is REQUIRED rather than falling back to `Date.now()`. The original
+ * fallback came with the claim that a later origin "only ever makes this
+ * assertion stricter", which is backwards for the bound that matters here: a
+ * later origin SHRINKS `parkMs`, so the `<= ceiling` check gets easier to
+ * satisfy, and a null-`startedAt` run would have passed more cheaply than it
+ * deserved. Failing loudly on a missing origin is the honest alternative, since
+ * a finalized run always has one.
  */
 function expectWithinCapacityCeiling(parkedIso: string, startedAt: Date | null) {
-  const originMs = startedAt ? startedAt.getTime() : Date.now();
+  expect(
+    startedAt,
+    "expectWithinCapacityCeiling needs the run's own startedAt: measuring from `now` " +
+      "loosens the ceiling bound rather than tightening it",
+  ).not.toBeNull();
+  const originMs = startedAt!.getTime();
   const parkMs = new Date(parkedIso).getTime() - originMs;
   const ceiling =
     CCROTATE_CAPACITY_MAX_PARK_MS * (1 + CCROTATE_CAPACITY_PARK_JITTER_RATIO) + 60_000;
@@ -853,12 +865,38 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     // advertisement no longer costs 24h of silence before the first re-probe,
     // and recovery lands within one ceiling of capacity actually returning.
     // `providerCapacityResetAt` keeps recording the capped horizon, so the
-    // provenance trail BLO-18285 built is intact.
+    // provenance trail BLO-18285 built is intact — asserted below rather than
+    // merely claimed here.
     const parkedIso = resultJson?.retryNotBefore as string | undefined;
     expect(parkedIso).toBeTruthy();
     expect(resultJson?.transientRetryNotBefore).toBe(parkedIso);
     expect(parkedIso).not.toBe(overCapAdvertisedIso);
     expectWithinCapacityCeiling(parkedIso!, failedRun?.startedAt ?? null);
+
+    // BLO-28919 review, Important 1. Before the floor clamp these two fields
+    // coincided, so the comment above was true without an assertion. They now
+    // deliberately DIVERGE — `providerCapacityResetAt` records the 24h
+    // horizon-capped instant (the provenance of what was asked for and bounded),
+    // while `retryNotBefore` is the 15m capacity-clamped floor the scheduler
+    // acts on. That divergence is exactly when an assertion starts earning its
+    // keep: a future writer that re-couples the two fields, or drops the
+    // horizon-capped record entirely, must fail here rather than silently lose
+    // the trail. BLO-24011's "two decisions wearing one row" was this class of
+    // confusion.
+    const capRecordedIso = resultJson?.providerCapacityResetAt as string | undefined;
+    expect(capRecordedIso, "the horizon-capped instant is still recorded").toBeTruthy();
+    expect(capRecordedIso, "it is the CAP, not the 88.8h advertisement").not.toBe(
+      overCapAdvertisedIso,
+    );
+    expect(
+      capRecordedIso,
+      "the capped-horizon record and the acted-on floor are intentionally different fields now",
+    ).not.toBe(parkedIso);
+    const capRecordedMs =
+      new Date(capRecordedIso!).getTime() - (failedRun?.startedAt?.getTime() ?? startedAt);
+    // One horizon cap from the run's own origin, allowing for execution time.
+    expect(capRecordedMs).toBeGreaterThan(PROVIDER_CAPACITY_MAX_HORIZON_MS - 60_000);
+    expect(capRecordedMs).toBeLessThanOrEqual(PROVIDER_CAPACITY_MAX_HORIZON_MS + 60_000);
 
     // Provenance records BOTH numbers: what we parked on, and what was actually
     // asked for. Without the latter the 88.8h advertisement — the whole reason
