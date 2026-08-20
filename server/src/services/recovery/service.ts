@@ -7903,9 +7903,27 @@ export function recoveryService(
     // result: every branch below already returns null for rows resolved before
     // that horizon (the cooldown branch needs `resolvedAtMs >= now - cooldownMs`;
     // the target branch returns null at `resolvedAtMs <= now -
-    // unchangedTargetSuppressionMs`). Excluding rows can only change WHICH row
-    // the `desc` ORDER BY picks if every candidate is excluded -- and that case
-    // returned null anyway.
+    // unchangedTargetSuppressionMs`).
+    //
+    // That the `desc` ORDER BY still picks the same row is NOT a separate
+    // argument that stands on its own -- it rests entirely on the skew allowance
+    // introduced below, so do not read it as surviving a smaller (or absent)
+    // `LIVENESS_SUPPRESSION_SCAN_SKEW_MS`. The guarantee is the superset
+    // property: GIVEN `completed_at <= updated_at + skew` on every row, any row
+    // with `resolvedAt >= now - horizon` also has `updated_at >= now - horizon -
+    // skew`, and so survives the filter. Every row capable of a non-null result
+    // therefore survives; if the global max `resolvedAt` survives it is still the
+    // max among survivors, and if it does not, no row clears the horizon and the
+    // answer is null either way.
+    //
+    // It is specifically NOT true that only excluding *every* candidate can move
+    // the pick -- excluding a strict subset can. Two `done` rows for one leaf
+    // under a 7d horizon: X at `completed_at = now-1h` / `updated_at = now-8d`,
+    // Y at both `now-3d`. X is dropped and Y is not, the winner flips from X to
+    // Y, and the outcome moves off the cooldown branch onto the leaf-read path,
+    // which can return null where the unfiltered query suppressed. X clears the
+    // invariant above by ~7d, which is exactly the point: it is the invariant,
+    // not the number of rows excluded, that the argument needs.
     //
     // The bound is on `updatedAt` rather than on `resolvedAtExpr` because only
     // the former is sargable. That makes it a superset ONLY up to skew between
@@ -7914,11 +7932,21 @@ export function recoveryService(
     // `services/issues.ts` builds its patch with `updatedAt: new Date()` and only
     // then calls `applyStatusSideEffects`, which sets `completedAt` from a second
     // clock read one request-body later -- so `completed_at >= updated_at` there,
-    // by however long the intervening validation and blocker reads take. (The
-    // escalation-close path below and the other four `update(issues)` sites do
-    // write both from one timestamp, and nothing bumps `updated_at` implicitly:
+    // by however long the intervening validation and blocker reads take. Every
+    // other path that writes `completed_at` runs in the SAFE direction: the
+    // escalation-close path below and the other `update(issues)` sites that
+    // touch it (`recovery/service.ts` reopen and bulk-close) set `completedAt`
+    // and `updatedAt` from one `input.now`, and the create path
+    // (`services/issues.ts`, `values.completedAt = new Date()`) is an INSERT
+    // where `updated_at` takes `defaultNow()` at DB-write time, so
+    // `completed_at <= updated_at` there. Nothing bumps `updated_at` implicitly:
     // there is no `$onUpdate` on the column, and migration 0076 mirrors
-    // `updated_at` INTO `last_activity_at`, not back.)
+    // `updated_at` INTO `last_activity_at`, not back. Deliberately not stated as
+    // a count of call sites -- an earlier revision of this comment said "the
+    // other four", which was already wrong when written and would rot on the
+    // next refactor. The skew allowance below is what makes the exact inventory
+    // non-load-bearing: it holds for ANY path whose gap stays under it,
+    // including ones added later.
     //
     // Unskewed, that leaves a real hole: a row with
     // `updated_at < cutoff <= completed_at` is dropped by the filter, the
@@ -8364,20 +8392,30 @@ export function recoveryService(
       // Residual divergence, deliberately not modelled here. This list is
       // complete as of this head rather than illustrative -- it is what a reader
       // deciding "is this preview/run gap known or new?" will trust, so it
-      // enumerates every pre-creation exit in
-      // `createIssueGraphLivenessEscalation` that the preview does not reproduce:
+      // enumerates every exit in `createIssueGraphLivenessEscalation` that
+      // CREATES NO ROW and that the preview does not reproduce. Selected by
+      // outcome rather than by position, because a reader checking that question
+      // cares whether a row appeared, not whether the exit happened before or
+      // after the INSERT was attempted:
       //
       //   1. source issue vanished, or crossed companies since collection
       //   2. automatic recovery suppressed by a pause hold
       //   3. recovery issue vanished since collection
       //   4. an OPEN escalation already exists (returns `existing`)
       //   5. no resolvable owner agent
+      //   6. a concurrent run won the unique-violation race: the INSERT throws,
+      //      the conflict resolves to the racing row, and it returns `existing`
+      //      (the `catch` on `isUniqueLivenessRecoveryConflict` below). This is
+      //      (4) reached one step later, and is the reason the list is scoped by
+      //      outcome -- under a "pre-creation exits" scope it would be excluded
+      //      on a technicality while still producing the divergence the note
+      //      exists to account for.
       //
-      // All five are pre-existing and unchanged in magnitude by BLO-27676,
+      // All six are pre-existing and unchanged in magnitude by BLO-27676,
       // unlike the two suppressors above -- which is why they are recorded here
-      // rather than replicated. (4) is additionally rare by construction: an
-      // open escalation contributes a waiting path for its own leaf, so the
-      // finding is usually not collected at all.
+      // rather than replicated. (4) and (6) are additionally rare by
+      // construction: an open escalation contributes a waiting path for its own
+      // leaf, so the finding is usually not collected at all.
       //
       // One attribution nuance, not a count difference: when a finding has BOTH
       // an open escalation and a resolved `done` one, the run books it to
