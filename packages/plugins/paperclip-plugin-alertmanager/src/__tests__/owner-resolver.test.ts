@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveAssigneeUserId,
+  resolveInvokableAssigneeAgentId,
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
@@ -442,4 +443,74 @@ describe("resolveAssigneeUserId — full chain", () => {
     expect(result.assigneeUserId).toBe("user-7");
     expect(result.assigneeAgentId).toBeUndefined();
   });
+});
+
+describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () => {
+  const mkAgentsCtx = (agent: { status: string } | null) => {
+    const agents = { get: vi.fn(async () => agent) };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    return {
+      ctx: { agents, logger } as unknown as Parameters<
+        typeof resolveInvokableAssigneeAgentId
+      >[0],
+      agents,
+      logger,
+    };
+  };
+
+  it("returns undefined immediately when no agentId was resolved", async () => {
+    const { ctx, agents } = mkAgentsCtx(null);
+    const result = await resolveInvokableAssigneeAgentId(ctx, "company-1", undefined);
+    expect(result).toBeUndefined();
+    expect(agents.get).not.toHaveBeenCalled();
+  });
+
+  it("passes through an invokable agent unchanged", async () => {
+    const { ctx } = mkAgentsCtx({ status: "idle" });
+    const result = await resolveInvokableAssigneeAgentId(
+      ctx,
+      "company-1",
+      "agent-active",
+    );
+    expect(result).toBe("agent-active");
+  });
+
+  it("falls back to unassigned and logs when the configured agent is paused", async () => {
+    const { ctx, agents, logger } = mkAgentsCtx({ status: "paused" });
+    const result = await resolveInvokableAssigneeAgentId(
+      ctx,
+      "company-1",
+      "c0bccc75-a449-4ece-a789-ce40bdd8e785",
+    );
+    expect(result).toBeUndefined();
+    expect(agents.get).toHaveBeenCalledWith(
+      "c0bccc75-a449-4ece-a789-ce40bdd8e785",
+      "company-1",
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("not invokable"),
+    );
+  });
+
+  it("falls back to unassigned when the configured agent no longer exists", async () => {
+    const { ctx, logger } = mkAgentsCtx(null);
+    const result = await resolveInvokableAssigneeAgentId(
+      ctx,
+      "company-1",
+      "deleted-agent",
+    );
+    expect(result).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("not-found"),
+    );
+  });
+
+  it.each(["terminated", "pending_approval"])(
+    "falls back to unassigned for non-invokable status %s",
+    async (status) => {
+      const { ctx } = mkAgentsCtx({ status });
+      const result = await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x");
+      expect(result).toBeUndefined();
+    },
+  );
 });

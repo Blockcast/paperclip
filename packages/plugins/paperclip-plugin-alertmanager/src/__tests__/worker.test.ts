@@ -109,6 +109,7 @@ const baseInput = (
 interface MockClients {
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
+  agents: { get: ReturnType<typeof vi.fn> };
   issues: {
     list: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
@@ -145,6 +146,12 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
     users: {
       get: vi.fn(async () => null),
       findByEmail: vi.fn(async () => null),
+    },
+    // Default every resolved agentId to invokable so pre-existing tests
+    // (written before BLO-26613's guard) keep exercising the assignment
+    // path they intend to; tests for the guard itself override this.
+    agents: {
+      get: vi.fn(async () => ({ status: "active" })),
     },
     issues: {
       list: vi.fn(async () => []),

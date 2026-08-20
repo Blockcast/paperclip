@@ -614,6 +614,7 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
         // (BLO-20467 retry idempotency); empty = "no prior attempt".
         list: vi.fn(async () => []),
       },
+      agents: { get: vi.fn(async () => ({ status: "active" })) },
       events: { emit: vi.fn() },
       activity: { log: vi.fn() },
       metrics: { write: vi.fn() },
