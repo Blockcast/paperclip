@@ -951,6 +951,88 @@ async function resolveCompanyJobScope(
   return { config, token };
 }
 
+const WATCH_QUEUE_MAX = 100;
+
+/**
+ * Drain one company's watch-event queue and process the batch.
+ *
+ * The drain is an atomic swap — take the queue and reset it in one locked step,
+ * then do the slow work outside the lock. Reading, awaiting `checkWatches` and
+ * only then writing `[]` destroys every event that arrives while `checkWatches`
+ * is invoking agents and posting to Slack (BLO-23143, Ally finding 2 on #996).
+ *
+ * Emptying the queue up front means a `checkWatches` failure would drop the
+ * batch, so it is put back. That re-queue is itself `ctx.state` I/O against the
+ * backend that just failed, and `checkWatches` swallows every per-watch error
+ * internally — so the only failures that reach it come from the watch-registry
+ * state calls, i.e. it runs almost exclusively when the backend is unhealthy.
+ * An unguarded re-queue therefore rethrows on exactly the occasions it exists to
+ * handle, and the batch is gone (BLO-28764).
+ *
+ * Two distinct outcomes, both bounded here rather than escaping to the caller:
+ *
+ * - Backend unhealthy for the whole tick: the swap's `set([])` fails too, so the
+ *   queue is never emptied and the batch survives untouched. Nothing is lost.
+ * - Backend completes the swap and then fails: the batch cannot be written back
+ *   to a store that is refusing writes. It is unrecoverable, so it is logged at
+ *   `error` with the company id and the event count instead of vanishing
+ *   silently. Holding it in memory for the next tick would preserve it at the
+ *   cost of duplicate delivery if the rejected `set` actually landed; that is a
+ *   deliberate at-most-once choice, not an oversight.
+ */
+async function drainAndCheckWatches(
+  ctx: PluginContext,
+  token: string,
+  companyId: string,
+): Promise<void> {
+  const queueKey = {
+    scopeKind: "company" as const,
+    scopeId: companyId,
+    stateKey: "recent-watch-events",
+  };
+  const recentEvents = await withStateLock(
+    watchQueueLockKey(companyId),
+    async () => {
+      const recentEventsRaw = await ctx.state.get(queueKey);
+      const drained = Array.isArray(recentEventsRaw)
+        ? (recentEventsRaw as Array<{
+            eventType: string;
+            payload: Record<string, unknown>;
+          }>)
+        : [];
+      if (drained.length > 0) await ctx.state.set(queueKey, []);
+      return drained;
+    },
+  );
+  if (recentEvents.length === 0) return;
+  try {
+    await checkWatches(ctx, token, companyId, recentEvents);
+  } catch (err) {
+    try {
+      await withStateLock(watchQueueLockKey(companyId), async () => {
+        const currentRaw = await ctx.state.get(queueKey);
+        const current = Array.isArray(currentRaw)
+          ? (currentRaw as typeof recentEvents)
+          : [];
+        // Keep the head, not the tail, on overflow. The whole point of this
+        // block is to preserve the drained batch, and `slice(-N)` would discard
+        // precisely that in favour of whatever arrived during the failed run.
+        const restored = [...recentEvents, ...current];
+        await ctx.state.set(queueKey, restored.slice(0, WATCH_QUEUE_MAX));
+      });
+      ctx.logger.error(
+        "check-watches failed for company; re-queued its events",
+        { companyId, err },
+      );
+    } catch (requeueErr) {
+      ctx.logger.error(
+        "check-watches failed for company and its drained events could not be re-queued; batch lost",
+        { companyId, droppedEventCount: recentEvents.length, err, requeueErr },
+      );
+    }
+  }
+}
+
 // --- Plugin definition ---
 const plugin = definePlugin({
   async setup(ctx) {
@@ -1181,8 +1263,8 @@ const plugin = definePlugin({
             eventType: event.eventType,
             payload: event.payload as Record<string, unknown>,
           });
-          if (recentEvents.length > 100) {
-            recentEvents.splice(0, recentEvents.length - 100);
+          if (recentEvents.length > WATCH_QUEUE_MAX) {
+            recentEvents.splice(0, recentEvents.length - WATCH_QUEUE_MAX);
           }
           await ctx.state.set(
             {
@@ -1284,77 +1366,26 @@ const plugin = definePlugin({
     ctx.jobs.register("check-watches", async () => {
       const companies = await listTargetCompanies(ctx);
       for (const company of companies) {
-        const scope = await resolveCompanyJobScope(
-          ctx,
-          company.id,
-          "check-watches",
-        );
-        if (!scope) continue;
-        const { token } = scope;
-        // Atomic swap: take the queue and reset it in one locked step, then
-        // do the slow work outside the lock. Reading, awaiting checkWatches
-        // and only then writing `[]` — as this did — destroys every event that
-        // arrives while checkWatches is invoking agents and posting to Slack
-        // (BLO-23143, Ally finding 2 on #996).
-        const recentEvents = await withStateLock(
-          watchQueueLockKey(company.id),
-          async () => {
-            const recentEventsRaw = await ctx.state.get({
-              scopeKind: "company",
-              scopeId: company.id,
-              stateKey: "recent-watch-events",
-            });
-            const drained = Array.isArray(recentEventsRaw)
-              ? (recentEventsRaw as Array<{
-                  eventType: string;
-                  payload: Record<string, unknown>;
-                }>)
-              : [];
-            if (drained.length > 0) {
-              await ctx.state.set(
-                {
-                  scopeKind: "company",
-                  scopeId: company.id,
-                  stateKey: "recent-watch-events",
-                },
-                [],
-              );
-            }
-            return drained;
-          },
-        );
-        if (recentEvents.length > 0) {
-          try {
-            await checkWatches(ctx, token, company.id, recentEvents);
-          } catch (err) {
-            // The swap above already emptied the queue, so a failure here
-            // would otherwise drop the whole batch — the old read-then-clear
-            // order at least left it in place. Put it back, ahead of anything
-            // that arrived meanwhile, and let the next tick retry it.
-            await withStateLock(watchQueueLockKey(company.id), async () => {
-              const currentRaw = await ctx.state.get({
-                scopeKind: "company",
-                scopeId: company.id,
-                stateKey: "recent-watch-events",
-              });
-              const current = Array.isArray(currentRaw)
-                ? (currentRaw as typeof recentEvents)
-                : [];
-              const restored = [...recentEvents, ...current];
-              await ctx.state.set(
-                {
-                  scopeKind: "company",
-                  scopeId: company.id,
-                  stateKey: "recent-watch-events",
-                },
-                restored.slice(-100),
-              );
-            });
-            ctx.logger.error(
-              "check-watches failed for company; re-queued its events",
-              { companyId: company.id, err },
-            );
-          }
+        // Each company's whole body is isolated, exactly as daily-digest above
+        // is. The atomic swap and the re-queue inside drainAndCheckWatches are
+        // both `ctx.state` I/O, so an unhealthy state backend throws here — and
+        // an unguarded throw aborts the loop and skips every later tenant for
+        // this tick. That is the same bug class as Ally finding 1 on #996,
+        // reintroduced on this path by the very fix for finding 2 (BLO-28764).
+        try {
+          const scope = await resolveCompanyJobScope(
+            ctx,
+            company.id,
+            "check-watches",
+          );
+          if (!scope) continue;
+          const { token } = scope;
+          await drainAndCheckWatches(ctx, token, company.id);
+        } catch (err) {
+          ctx.logger.error(
+            "check-watches failed for company; continuing with remaining companies",
+            { companyId: company.id, err },
+          );
         }
       }
     });

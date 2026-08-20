@@ -30,6 +30,13 @@ interface MkCtxOptions {
   invokeGate?: Promise<void>;
   /** Called on each `ctx.agents.invoke`. */
   onInvoke?: () => void;
+  /**
+   * Reject a `ctx.state` call. Called for every get/set/delete with the flat
+   * state id and the operation, so an outage modelled here is **not**
+   * key-selective the way a single-key `vi.fn` override is — which matters,
+   * because a real backend outage does not pick keys (BLO-28764).
+   */
+  stateFailWhen?: (stateKey: string, op: "get" | "set" | "delete") => boolean;
 }
 
 const mkCtx = (options: MkCtxOptions = {}) => {
@@ -41,6 +48,7 @@ const mkCtx = (options: MkCtxOptions = {}) => {
     failIssuesListFor = [],
     invokeGate,
     onInvoke,
+    stateFailWhen,
   } = options;
   const storedState = new Map(Object.entries(state));
   const registeredJobs = new Map<string, (...args: unknown[]) => unknown>();
@@ -85,6 +93,9 @@ const mkCtx = (options: MkCtxOptions = {}) => {
     state: {
       get: vi.fn(async (key: Parameters<typeof stateId>[0]) => {
         await tick();
+        if (stateFailWhen?.(stateId(key), "get")) {
+          throw new Error(`state backend unavailable: get ${stateId(key)}`);
+        }
         return storedState.get(stateId(key)) ?? null;
       }),
       set: vi.fn(async (key: Parameters<typeof stateId>[0], value: unknown) => {
@@ -93,10 +104,16 @@ const mkCtx = (options: MkCtxOptions = {}) => {
         // reader still sees the stale value — model it, or the mock serializes
         // the handlers by accident and hides the very bug under test.
         await tick();
+        if (stateFailWhen?.(stateId(key), "set")) {
+          throw new Error(`state backend unavailable: set ${stateId(key)}`);
+        }
         storedState.set(stateId(key), value);
       }),
       delete: vi.fn(async (key: Parameters<typeof stateId>[0]) => {
         await tick();
+        if (stateFailWhen?.(stateId(key), "delete")) {
+          throw new Error(`state backend unavailable: delete ${stateId(key)}`);
+        }
         storedState.delete(stateId(key));
       }),
     },
@@ -369,5 +386,132 @@ describe("watch-event queue integrity (BLO-23143 finding 2)", () => {
       expect.stringContaining("re-queued"),
       expect.objectContaining({ companyId }),
     );
+  });
+});
+
+// BLO-28764: the re-queue added above is itself unguarded `ctx.state` I/O, and
+// `checkWatches` swallows every per-watch failure internally — so the only
+// throws that reach it come from the watch-registry state calls. It therefore
+// runs almost exclusively when the state backend is unhealthy, and "recover by
+// writing to the backend that just failed" rethrows on exactly those occasions.
+//
+// The test above is green for the wrong reason: its mock rejects only the key
+// `instance:global:global-watches-list`, so the re-queue always finds a working
+// store. A real outage is not key-selective. These two use `stateFailWhen`,
+// which sees every key.
+describe("check-watches state-outage resilience (BLO-28764)", () => {
+  const watchFor = (companyId: string) => ({
+    id: `watch-${companyId}`,
+    companyId,
+    eventPattern: "issue.created",
+    prompt: "look at {{id}}",
+    agentId: "agent-1",
+    channelId: `C-${companyId}`,
+    createdAt: new Date().toISOString(),
+    triggerCount: 0,
+  });
+
+  it("keeps the drained batch and processes later companies when a tenant's state backend is down", async () => {
+    // Outage across *every* key of company-a — get and set alike. The drain's
+    // `set([])` fails with the rest, so the batch is never actually removed and
+    // nothing is lost. What the pre-change shape gets wrong is the blast radius:
+    // the rejection escapes the per-company loop, so the whole job rejects and
+    // company-b is denied its watch notifications for the tick.
+    const { ctx, registeredJobs, storedState, postedMessages } = mkCtx({
+      companies: [{ id: "outage-a" }, { id: "outage-b" }],
+      companyConfigs: {
+        "outage-a": { slackTokenRef: "tok" },
+        "outage-b": { slackTokenRef: "tok" },
+      },
+      secrets: { tok: "xoxb-token" },
+      state: {
+        "instance:global:global-watches-list": [watchFor("outage-b")],
+        [watchQueueKey("outage-a")]: [
+          { eventType: "issue.created", payload: { id: "issue-a" } },
+        ],
+        [watchQueueKey("outage-b")]: [
+          { eventType: "issue.created", payload: { id: "issue-b" } },
+        ],
+      },
+      stateFailWhen: (key) => key.startsWith("company:outage-a:"),
+    });
+
+    await plugin.definition.setup(ctx);
+    await expect(
+      registeredJobs.get("check-watches")!(),
+    ).resolves.toBeUndefined();
+
+    // Criterion 1: the events queued at drain time are still queued.
+    expect(
+      (storedState.get(watchQueueKey("outage-a")) as Array<{
+        payload: { id?: string };
+      }>).map((e) => e.payload.id),
+    ).toEqual(["issue-a"]);
+    // Criterion 2: the later tenant was not skipped.
+    expect(postedMessages.map((m) => m.channel)).toContain("C-outage-b");
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("continuing with remaining companies"),
+      expect.objectContaining({ companyId: "outage-a" }),
+    );
+  });
+
+  it("logs the unrecoverable batch and keeps going when the backend dies after the swap", async () => {
+    // The narrow window Ally described: the backend is healthy enough to
+    // complete the atomic swap, then refuses everything. The batch is already
+    // out of the queue and cannot be written back to a store that is rejecting
+    // writes — it is genuinely unrecoverable. Pre-change that rejection escapes
+    // the loop and the batch vanishes with no log at all; the requirement here
+    // is that it is named out loud and that company-b still gets its tick.
+    let swapped = false;
+    let requeueRefused = false;
+    const { ctx, registeredJobs, storedState, postedMessages } = mkCtx({
+      companies: [{ id: "midtick-a" }, { id: "midtick-b" }],
+      companyConfigs: {
+        "midtick-a": { slackTokenRef: "tok" },
+        "midtick-b": { slackTokenRef: "tok" },
+      },
+      secrets: { tok: "xoxb-token" },
+      state: {
+        "instance:global:global-watches-list": [watchFor("midtick-b")],
+        [watchQueueKey("midtick-a")]: [
+          { eventType: "issue.created", payload: { id: "issue-doomed" } },
+        ],
+        [watchQueueKey("midtick-b")]: [
+          { eventType: "issue.created", payload: { id: "issue-b" } },
+        ],
+      },
+      stateFailWhen: (key, op) => {
+        // Let the swap's reset land, then open the outage.
+        if (!swapped) {
+          if (key === watchQueueKey("midtick-a") && op === "set")
+            swapped = true;
+          return false;
+        }
+        // Refuse until the re-queue read has been turned away — the partition
+        // heals after that, so company-b's tick is unaffected.
+        if (requeueRefused) return false;
+        if (key === watchQueueKey("midtick-a") && op === "get")
+          requeueRefused = true;
+        return true;
+      },
+    });
+
+    await plugin.definition.setup(ctx);
+    await expect(
+      registeredJobs.get("check-watches")!(),
+    ).resolves.toBeUndefined();
+
+    // The honest residual, asserted rather than glossed: this batch is lost.
+    expect(storedState.get(watchQueueKey("midtick-a"))).toEqual([]);
+    // Criterion 4: lost loudly, with the company id and the size of the loss.
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("could not be re-queued"),
+      expect.objectContaining({
+        companyId: "midtick-a",
+        droppedEventCount: 1,
+      }),
+    );
+    // Criterion 2: and the next tenant still ran.
+    expect(postedMessages.map((m) => m.channel)).toContain("C-midtick-b");
   });
 });
