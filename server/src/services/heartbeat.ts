@@ -772,6 +772,44 @@ export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
 }
+
+// Wall-clock ceiling on a dependency-blocked park, enforced independently of
+// `scheduledRetryAttempt` (BLO-29055).
+//
+// Why an age bound is needed *in addition to* the attempt bound: when an issue's
+// blocker SET changes, the pending row is cancelled and a fresh one is inserted at
+// `scheduledRetryAttempt: 0` (see the churn branch in enqueueWakeup). That resets the
+// attempt budget, so an issue whose blockers churn faster than its backoff can be
+// re-parked forever at ANY attempt ceiling. Measured 2026-08-20: 87 of 112 live
+// dep-blocked rows sat at attempt > 20, the oldest parked 3.4 days.
+//
+// Derivation — deliberately NOT hand-picked. The full attempt budget spans:
+//   initial park            DEP_BLOCKED_BASE_DELAY_MS                    =   5 min
+//   attempts 1..3           10 + 20 + 40                                 =  70 min
+//   attempts 4..12          9 x DEP_BLOCKED_MAX_DELAY_MS (60 min capped) = 540 min
+//                                                                   total = 615 min ≈ 10.25 h
+// The ceiling must exceed that, or it would terminate rows still legitimately inside
+// their attempt budget. 12h is the smallest whole number of hours strictly greater
+// than 10.25h, so this bound can only ever fire on a row whose attempt counter was
+// reset — which is exactly the leak it exists to close.
+export const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
+
+// Lineage-stable origin for the age ceiling. `createdAt` is NOT usable on its own:
+// the churn path inserts a brand-new row, so a per-row createdAt resets alongside the
+// attempt counter. The first park stamps `depBlockedFirstParkedAt` into the context
+// snapshot and every subsequent re-park carries it forward; rows predating this field
+// fall back to their own createdAt, which is correct for a row that has never churned.
+export function readDepBlockedFirstParkedAt(run: {
+  contextSnapshot: unknown;
+  createdAt: Date;
+}): Date {
+  const raw = readNonEmptyString(parseObject(run.contextSnapshot).depBlockedFirstParkedAt);
+  if (raw) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return run.createdAt;
+}
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -14906,6 +14944,79 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const readiness = (await issuesSvc.listDependencyReadiness(dueRun.companyId, [depIssueId])).get(depIssueId);
         if (readiness && !readiness.isDependencyReady) {
           const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
+          // Age ceiling is evaluated BEFORE the attempt ceiling and independently of
+          // it (BLO-29055). A blocker-set change resets `scheduledRetryAttempt` to 0,
+          // so an attempt-only bound can be evaded indefinitely by churn; the age is
+          // carried across those re-parks and cannot be.
+          const firstParkedAt = readDepBlockedFirstParkedAt(dueRun);
+          const parkAgeMs = now.getTime() - firstParkedAt.getTime();
+          if (parkAgeMs > DEP_BLOCKED_MAX_PARK_AGE_MS) {
+            const expired = await db
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: `dependency-blocked park exceeded the ${Math.round(
+                  DEP_BLOCKED_MAX_PARK_AGE_MS / 3_600_000,
+                )}h maximum age (first parked ${firstParkedAt.toISOString()}, attempt ${
+                  dueRun.scheduledRetryAttempt ?? 0
+                }); blockers never resolved`,
+                errorCode: "issue_dependencies_blocked",
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, dueRun.id),
+                  eq(heartbeatRuns.status, "scheduled_retry"),
+                  lte(heartbeatRuns.scheduledRetryAt, now),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (expired) {
+              incrementDepBlockedMetric("dep_blocked_age_expired");
+              await appendRunEvent(expired, await nextRunEventSeq(expired.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: "dependency-blocked park exceeded its maximum age; terminated rather than re-deferred",
+                payload: {
+                  scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
+                  firstParkedAt: firstParkedAt.toISOString(),
+                  parkAgeMs,
+                  maxParkAgeMs: DEP_BLOCKED_MAX_PARK_AGE_MS,
+                  unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                },
+              });
+              if (expired.wakeupRequestId) {
+                await db
+                  .update(agentWakeupRequests)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: now,
+                    error: "Cancelled because the dependency-blocked park exceeded its maximum age",
+                    updatedAt: now,
+                  })
+                  .where(eq(agentWakeupRequests.id, expired.wakeupRequestId));
+              }
+              await db
+                .update(issues)
+                .set({
+                  executionRunId: null,
+                  executionAgentNameKey: null,
+                  executionLockedAt: null,
+                  updatedAt: now,
+                })
+                .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, expired.id)));
+              // Same reasoning as the attempt-exhausted branch below (BLO-20649): no
+              // run will resume this issue, so the checkout promotion comes back off.
+              await restoreCheckoutPromotedStatus(db, {
+                issueId: depIssueId,
+                companyId: expired.companyId,
+              });
+            }
+            return { outcome: "not_promoted", run: expired };
+          }
           if (nextAttempt > DEP_BLOCKED_MAX_RETRY_ATTEMPTS) {
             const exhausted = await db
               .update(heartbeatRuns)
@@ -27819,6 +27930,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null)
           : null;
 
+        // Set when a dep-blocked park is cancelled for blocker-set churn, so the
+        // replacement park inherits the original park instant (BLO-29055).
+        let carriedDepBlockedFirstParkedAt: Date | null = null;
+
         if (
           activeExecutionRun &&
           !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
@@ -28175,6 +28290,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const setsMatch =
             storedSet.size === currentSet.size && [...storedSet].every((id) => currentSet.has(id));
           if (!setsMatch) {
+            // Capture the park's lineage origin BEFORE cancelling, so the replacement
+            // row inherits it (BLO-29055). Without this the age ceiling would reset on
+            // every blocker-set change, exactly as the attempt counter does.
+            const churnedFirstParkedAt = readDepBlockedFirstParkedAt(activeExecutionRun);
             const cancelled = await cancelDepBlockedScheduledRetry(
               activeExecutionRun,
               "Cancelled because the dependency blocker set changed before the scheduled retry became due",
@@ -28183,10 +28302,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               {
                 previousUnresolvedBlockerIssueIds: [...storedSet],
                 currentUnresolvedBlockerIssueIds: currentBlockerIds,
+                depBlockedFirstParkedAt: churnedFirstParkedAt.toISOString(),
               },
             );
             if (cancelled) {
               activeExecutionRun = null;
+              carriedDepBlockedFirstParkedAt = churnedFirstParkedAt;
             }
           }
         }
@@ -28198,6 +28319,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...enrichedContextSnapshot,
             unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: dependencyReadiness.unresolvedBlockerCount,
+            // A first park stamps `now`; a re-park after blocker churn inherits the
+            // original instant so the age ceiling measures the whole wait (BLO-29055).
+            depBlockedFirstParkedAt: (carriedDepBlockedFirstParkedAt ?? now).toISOString(),
           };
           const wakeupRequest = await tx
             .insert(agentWakeupRequests)

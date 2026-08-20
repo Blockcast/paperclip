@@ -8,7 +8,12 @@ export type DepBlockedMetricKey =
   | "dep_blocked_reset"
   | "dep_blocked_promoted"
   | "dep_blocked_redeferred"
-  | "dep_blocked_exhausted";
+  | "dep_blocked_exhausted"
+  // Park terminated for exceeding DEP_BLOCKED_MAX_PARK_AGE_MS. Distinct from
+  // dep_blocked_exhausted (attempt budget) because the age ceiling exists to catch
+  // parks whose attempt counter was reset by blocker-set churn (BLO-29055) — the two
+  // must stay separable to tell "waited too long" from "retried too often".
+  | "dep_blocked_age_expired";
 
 const MAX_COUNTER_VALUE = Number.MAX_SAFE_INTEGER;
 
@@ -19,6 +24,7 @@ const counters: Record<DepBlockedMetricKey, number> = {
   dep_blocked_promoted: 0,
   dep_blocked_redeferred: 0,
   dep_blocked_exhausted: 0,
+  dep_blocked_age_expired: 0,
 };
 
 export function incrementDepBlockedMetric(key: DepBlockedMetricKey): void {
