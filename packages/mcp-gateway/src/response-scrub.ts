@@ -121,15 +121,24 @@ function mightContainSecrets(text: string): boolean {
  * double-quoted, or single-quoted. A plain `includes("env:")` missed `'env':`
  * entirely, so a single-quoted resource nested in a text field was never even
  * scanned.
+ *
+ * Case-insensitive for the reason given at `isEnvKey`: Docker/OCI spells the key
+ * `Env`. This probe gates whether a nested string is scanned at all, so leaving
+ * it case-sensitive meant an OCI-shaped resource carried in `content[].text` was
+ * never handed to a scanner — a fail-open one step before any redaction rule.
  */
-const ENV_KEY_PROBE = /(^|[^A-Za-z0-9_])(["']?)env\2\s*:/;
+const ENV_KEY_PROBE = /(^|[^A-Za-z0-9_])(["']?)env\2\s*:/i;
 
 /**
  * A `Secret`/`SecretList` document, in YAML or JSON spelling. Needed because a
  * Secret body contains no `env` key at all — the pre-filter did not trip on one
  * before, so `resources_get kind=Secret` was never scanned.
+ *
+ * Case-insensitive for the same reason as `ENV_KEY_PROBE`: this decides whether
+ * a body is scanned at all, so a non-canonical `kind` spelling here skipped
+ * every downstream Secret rule rather than just one of them.
  */
-const SECRET_KIND_PROBE = /(["']?)kind\1\s*:\s*(["']?)Secret(List)?\2(\s|,|}|$)/;
+const SECRET_KIND_PROBE = /(["']?)kind\1\s*:\s*(["']?)Secret(List)?\2(\s|,|}|$)/i;
 
 function leadingIndent(line: string): number {
   let i = 0;
@@ -187,8 +196,13 @@ const FLOW_SEQUENCE_ENTRY = /^(\s*)(-\s+)[{[]/;
  *
  * One pattern that matches every spelling, with the suffix classified after the
  * match, removes the ordering from the design rather than reordering it.
+ *
+ * Case-insensitive to agree with `isEnvKey`, which the JSON path uses. The two
+ * paths disagreeing about what counts as an env key is itself a fail-open: every
+ * non-lowercase spelling (`Env`, the Docker/OCI one) was redacted on the JSON
+ * path and emitted in the clear on this one, at every entry shape.
  */
-const ENV_KEY = /^(\s*)(-\s+)?(["']?)env\3:(.*)$/;
+const ENV_KEY = /^(\s*)(-\s+)?(["']?)env\3:(.*)$/i;
 /**
  * Leading YAML node properties: an anchor (`&name`) and/or a tag (`!!seq`).
  * These *label* a node without carrying its content, so an `env:` line whose
@@ -260,15 +274,47 @@ const ECHO_ANNOTATION_KEY = new RegExp(
  * consulted inside a document already identified as a Secret, so a ConfigMap's
  * `data` is untouched.
  */
-const SECRET_DATA_KEY = /^(\s*)(-\s+)?(["']?)(data|stringData)\3:(.*)$/;
+const SECRET_DATA_KEY = /^(\s*)(-\s+)?(["']?)(data|stringData)\3:(.*)$/i;
 /** A YAML document separator. */
 const DOC_SEPARATOR = /^---(\s|$)/;
 /** A `kind: Secret` / `kind: SecretList` line. */
-const SECRET_KIND_LINE = /^\s*(-\s+)?(["']?)kind\2:\s*(["']?)Secret(List)?\3\s*(#.*)?$/;
+const SECRET_KIND_LINE = /^\s*(-\s+)?(["']?)kind\2:\s*(["']?)Secret(List)?\3\s*(#.*)?$/i;
 
-/** Names whose value is the Secret's material, in the JSON shape. */
-const SECRET_MATERIAL_KEYS = new Set(["data", "stringData"]);
-const SECRET_KINDS = new Set(["Secret", "SecretList"]);
+/**
+ * Names whose value is the Secret's material, in the JSON shape.
+ *
+ * Compared case-insensitively, via `isSecretMaterialKey`/`isSecretKind` below,
+ * for the same reason `isEnvKey` is: a case-sensitive literal that gates
+ * *whether material is scanned at all* fails open on every other spelling.
+ * This gate gave up strictly more than the env one did — a Secret's `data` is
+ * pure credential material, where an env block at least keeps its names as the
+ * diagnostic payload. Measured before the change: `Kind: Secret`, `kind: secret`
+ * and `Data:` each emitted the Secret's material verbatim, while the canonical
+ * `kind: Secret` + `data:` redacted, so the mechanism worked and only the
+ * spelling defeated it.
+ */
+const SECRET_MATERIAL_KEYS = new Set(["data", "stringdata"]);
+const SECRET_KINDS = new Set(["secret", "secretlist"]);
+
+function isSecretMaterialKey(key: string): boolean {
+  return SECRET_MATERIAL_KEYS.has(key.toLowerCase());
+}
+
+function isSecretKind(kind: unknown): boolean {
+  return typeof kind === "string" && SECRET_KINDS.has(kind.toLowerCase());
+}
+
+/**
+ * The `kind` key itself, found without assuming its case. `source.kind` is an
+ * exact-property lookup, so a `Kind`-spelled document was never even a
+ * candidate for the Secret branch.
+ */
+function readKind(source: Record<string, unknown>): unknown {
+  for (const [key, value] of Object.entries(source)) {
+    if (key.toLowerCase() === "kind") return value;
+  }
+  return undefined;
+}
 
 /** Threaded through the scrubbers so a pure pass-through can be detected. */
 type ScrubContext = { changed: boolean };
@@ -573,11 +619,11 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
 
   // A `SecretList`'s items usually carry no `kind` of their own, so the flag has
   // to descend rather than be re-derived at each level.
-  const kind = source.kind;
-  const nowSecret = inSecret || (typeof kind === "string" && SECRET_KINDS.has(kind));
+  const kind = readKind(source);
+  const nowSecret = inSecret || isSecretKind(kind);
 
   for (const [key, value] of Object.entries(source)) {
-    if (nowSecret && SECRET_MATERIAL_KEYS.has(key)) {
+    if (nowSecret && isSecretMaterialKey(key)) {
       result[key] = REDACTED;
       ctx.changed = true;
       continue;
