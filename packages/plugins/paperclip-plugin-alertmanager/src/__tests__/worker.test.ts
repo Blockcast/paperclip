@@ -157,11 +157,14 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
     },
     // A correctly-configured instance can always resolve `FALLBACK_AGENT_NAME`
     // to exactly one agent. Tests that exercise the fail-closed path override
-    // this with zero or multiple matches.
+    // this with zero matches, multiple matches, or a non-invokable status.
+    // `status` is load-bearing: the resolver requires the match to be
+    // *invokable*, so an agent with no status would fail closed here exactly as
+    // a paused one does in production.
     agents: {
       list: vi.fn(async () => [
-        { id: FALLBACK_AGENT_ID, name: FALLBACK_AGENT_NAME },
-        { id: "agent-other", name: "Some Other Agent" },
+        { id: FALLBACK_AGENT_ID, name: FALLBACK_AGENT_NAME, status: "idle" },
+        { id: "agent-other", name: "Some Other Agent", status: "idle" },
       ]),
     },
     issues: {
@@ -1678,8 +1681,8 @@ describe("handleWebhook — owner resolution fallback chain", () => {
   it("fails closed when fallbackAgentName is ambiguous across agents", async () => {
     const { ctx, mocks } = mkCtx();
     mocks.agents.list.mockResolvedValueOnce([
-      { id: "agent-a", name: FALLBACK_AGENT_NAME },
-      { id: "agent-b", name: FALLBACK_AGENT_NAME },
+      { id: "agent-a", name: FALLBACK_AGENT_NAME, status: "idle" },
+      { id: "agent-b", name: FALLBACK_AGENT_NAME, status: "idle" },
     ]);
     const config = baseConfig({ ownerMap: {} });
     const alert = baseAlert({
@@ -1691,6 +1694,50 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
     ).rejects.toThrow(AlertDeliveryIncompleteError);
     expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+
+  it.each(["paused", "pending_approval"])(
+    "fails closed when the only fallback match is %s",
+    async (status) => {
+      // A name match is not enough — `agents.invoke` throws on these statuses,
+      // so assigning one would create an issue with a non-null assignee that
+      // can never be woken. That is the BLO-27435 harm with the ownerless-issue
+      // check passing clean, so it has to fail closed like any other
+      // misconfiguration.
+      const { ctx, mocks } = mkCtx();
+      mocks.agents.list.mockResolvedValueOnce([
+        { id: "agent-a", name: FALLBACK_AGENT_NAME, status },
+      ]);
+      const config = baseConfig({ ownerMap: {} });
+      const alert = baseAlert({
+        labels: { alertname: "X", severity: "warning" },
+        annotations: {},
+      });
+      const envelope = baseEnvelope({ alerts: [alert] });
+      await expect(
+        handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+      ).rejects.toThrow(AlertDeliveryIncompleteError);
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("resolves the invokable match when a same-named agent is paused", async () => {
+    // The ambiguity guard applies to *invokable* candidates: a leftover paused
+    // duplicate must not turn a working config into a hard failure.
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValueOnce([
+      { id: "agent-stale", name: FALLBACK_AGENT_NAME, status: "paused" },
+      { id: "agent-live", name: FALLBACK_AGENT_NAME, status: "idle" },
+    ]);
+    const config = baseConfig({ ownerMap: {} });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeAgentId).toBe("agent-live");
   });
 
   it("does not consult the fallback when an owner already resolved", async () => {
@@ -1842,7 +1889,11 @@ describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
     expect(mocks.issues.create).not.toHaveBeenCalled();
   });
 
-  it("suppresses the resolved path too — no close side effect", async () => {
+  it("has no resolve side effect when the rule never filed an issue", async () => {
+    // The AC's "no state side effect" case: opted out from the start, so there
+    // is no state row and handleResolved drops the unknown fingerprint. Note
+    // this passes for that reason and NOT because the opt-out gates the
+    // resolved path — the test below is the one that pins the gate's placement.
     const { ctx, mocks } = mkCtx();
     const alert = {
       ...optedOutAlert("critical"),
@@ -1857,6 +1908,91 @@ describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
       baseInput({ parsedBody: envelope }),
     );
     expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+  });
+
+  it("still closes a pre-existing tracked issue when the rule is opted out", async () => {
+    // Regression for the stranding hazard: gating the resolved path would mean
+    // handleResolved never runs, `state.resolvedAt` stays null, the issue never
+    // reaches a terminal status, and `advanceIssueLadder` (escalation.ts:377,380)
+    // keeps escalating — ultimately filing a board cover for a rule that was
+    // explicitly opted out and has already resolved. This is the modal adoption
+    // path: operators opt a rule out *because* it already filed noisy issues.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-tracked",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "OptedOut",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    mocks.issues.get.mockResolvedValue({ id: "issue-tracked", status: "todo" });
+    const alert = {
+      ...optedOutAlert("critical"),
+      status: "resolved" as const,
+      endsAt: "2026-04-29T09:00:00Z",
+    };
+    const envelope = baseEnvelope({ status: "resolved", alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-tracked",
+      { status: "cancelled" },
+      "company-1",
+    );
+    // The state write is the half that actually stops the ladder:
+    // advanceIssueLadder returns early on resolvedAt / escalationComplete.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        resolvedAt: "2026-04-29T09:00:00Z",
+        escalationComplete: true,
+        nextEscalationAt: null,
+      }),
+    );
+  });
+
+  it("still suppresses the firing path for a pre-existing tracked issue", async () => {
+    // The other half of the placement: letting resolve through must not let
+    // re-fires through. An opted-out rule stops generating activity on an issue
+    // it already filed.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-tracked",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "OptedOut",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    const envelope = baseEnvelope({ alerts: [optedOutAlert("critical")] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
   });
 

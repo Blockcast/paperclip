@@ -61,7 +61,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
 | `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24, clamped to a 720h (30-day) ceiling. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
-| `fallbackAgentName`  | string  | effectively yes | Exact agent **name** assigned when nothing else resolves an owner. Missing, unmatched, or ambiguous config **fails closed**: the alert creates no issue and the delivery is retried. |
+| `fallbackAgentName`  | string  | effectively yes | Exact agent **name** assigned when nothing else resolves an owner. Must match exactly one *invokable* agent. Missing, unmatched, ambiguous, or matching only a non-invokable agent (`paused` / `pending_approval` / broken reporting chain) **fails closed**: the alert creates no issue and the delivery is retried. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
 ### Example `AlertmanagerConfig` YAML
@@ -182,8 +182,21 @@ acknowledged: Alertmanager keeps retrying and the alert survives until an
 operator fixes `fallbackAgentName`. Watch `alertmanager.owner.fallback_failed`.
 
 `fallbackAgentName` matches on the agent's name, case-insensitively after
-trimming, and must match **exactly one** agent in the company. Zero matches
-(wrong name) and more than one match (ambiguous) both fail closed.
+trimming, and must match **exactly one invokable** agent in the company. Zero
+matches (wrong name) and more than one match (ambiguous) both fail closed.
+
+Invokability is part of the match, not a separate check. `ctx.agents.list`
+filters out only `terminated` agents, so a `paused` or `pending_approval` agent
+can still match a name — and `ctx.agents.invoke` throws on exactly those. An
+issue assigned to one of them has a non-null assignee that can never be woken,
+which reproduces the BLO-27435 harm while the ownerless-issue check reads clean.
+Candidates are therefore filtered through `getAgentWorkEligibility`, which also
+rejects a broken reporting chain, before the exactly-one test — so a leftover
+paused duplicate of the right name does not break an otherwise valid config,
+while a sole paused match fails closed with a log line naming the blocking
+reason (`paused`) rather than reporting the name as unmatched. Budget
+enforcement pauses agents, so this is a live runtime transition, not only a
+config typo.
 
 Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
@@ -198,9 +211,26 @@ Two gates keep low-value alerts from becoming issues:
   before this floor) still gets refreshed and still closes on resolve.
   Emits `alertmanager.webhook.below_issue_floor`.
 - **`paperclip_issue: "false"`** — as a label *or* an annotation — suppresses
-  the alert at **any** severity, before any issue or state side effect,
-  on both the firing and resolved paths. Emits
+  the alert at **any** severity. Like the floor, the gate is *creation-only*: it
+  suppresses the **firing** path entirely (no issue created, no existing one
+  refreshed, no state written, no suppression anchor banked) but deliberately
+  lets the **resolved** path through. Emits
   `alertmanager.webhook.issue_opt_out`.
+
+Letting resolve through is what keeps the opt-out from wedging the issues it was
+added to silence. Gating it too would mean `handleResolved` never runs for an
+opted-out rule, so `state.resolvedAt` would stay `null` and the issue would
+never reach a terminal status — and `advanceIssueLadder` returns early only on
+`resolvedAt`, `escalationComplete`, or a terminal issue status. The escalation
+sweep would keep climbing the ladder, waking agents, and eventually file a
+`[user-cover]` board escalation for a rule that was explicitly opted out and
+whose alert had already resolved. That is the normal adoption path, not an edge
+case: operators opt a rule out *because* it has already been filing noisy
+issues, so a tracked issue usually exists at that moment.
+
+This does not weaken the guarantee for a rule opted out from the start: with no
+issue ever filed there is no state row, and a resolved delivery for an unknown
+fingerprint is dropped without touching anything.
 
 Both are permanent policy decisions, so a failure to write their telemetry is
 logged but does not fail the delivery — otherwise Alertmanager would redeliver

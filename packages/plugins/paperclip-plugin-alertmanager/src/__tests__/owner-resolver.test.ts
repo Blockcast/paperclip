@@ -453,8 +453,17 @@ describe("resolveAssigneeUserId — full chain", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveFallbackAgentId", () => {
-  const mkAgentCtx = (agents: Array<{ id: string; name: string }>) => {
-    const list = vi.fn(async () => agents);
+  // `status` defaults to an invokable one so the name-matching cases below stay
+  // about names. The resolver additionally requires the match to be invokable,
+  // which the dedicated cases at the end of this block cover.
+  const mkAgentCtx = (
+    agents: Array<{ id: string; name: string; status?: string }>,
+  ) => {
+    const withStatus = agents.map((agent) => ({
+      status: "idle",
+      ...agent,
+    }));
+    const list = vi.fn(async () => withStatus);
     const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
     const ctx = { agents: { list }, logger } as unknown as Parameters<
       typeof resolveFallbackAgentId
@@ -496,7 +505,7 @@ describe("resolveFallbackAgentId", () => {
       resolveFallbackAgentId(ctx, "company-1", "Nobody"),
     ).resolves.toBeUndefined();
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("resolved to 0 agents"),
+      expect.stringContaining("resolved to 0 invokable agents"),
     );
   });
 
@@ -509,7 +518,7 @@ describe("resolveFallbackAgentId", () => {
       resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
     ).resolves.toBeUndefined();
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("resolved to 2 agents"),
+      expect.stringContaining("resolved to 2 invokable agents"),
     );
   });
 
@@ -517,5 +526,97 @@ describe("resolveFallbackAgentId", () => {
     const { ctx, list } = mkAgentCtx([{ id: "agent-1", name: "Ops Triage" }]);
     await resolveFallbackAgentId(ctx, "company-42", "Ops Triage");
     expect(list).toHaveBeenCalledWith({ companyId: "company-42" });
+  });
+
+  // -------------------------------------------------------------------------
+  // Invokability. `agents.list` filters only `terminated`, so paused and
+  // pending_approval agents come back and can be the single name match — while
+  // `agents.invoke` throws on exactly those. Assigning one yields a non-null
+  // assignee that can never be woken, so the fail-closed contract has to cover
+  // it or the ownerless-issue metric reads clean while the harm continues.
+  // -------------------------------------------------------------------------
+
+  it.each(["paused", "pending_approval", "terminated"])(
+    "refuses a sole name match that is %s",
+    async (status) => {
+      const { ctx, logger } = mkAgentCtx([
+        { id: "agent-1", name: "Ops Triage", status },
+      ]);
+      await expect(
+        resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+      ).resolves.toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("none are invokable"),
+      );
+    },
+  );
+
+  it("names the blocking reason rather than reporting an unmatched name", async () => {
+    // "paused" and "name is wrong" need different fixes, so an operator must
+    // not be sent hunting for a typo that isn't there.
+    const { ctx, logger } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage", status: "paused" },
+    ]);
+    await resolveFallbackAgentId(ctx, "company-1", "Ops Triage");
+    const message = logger.warn.mock.calls[0][0] as string;
+    expect(message).toContain("agent-1=paused");
+    expect(message).not.toContain("resolved to 0 invokable agents");
+  });
+
+  it.each(["idle", "running", "error"])(
+    "accepts an invokable status: %s",
+    async (status) => {
+      const { ctx } = mkAgentCtx([
+        { id: "agent-1", name: "Ops Triage", status },
+      ]);
+      await expect(
+        resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+      ).resolves.toBe("agent-1");
+    },
+  );
+
+  it("picks the invokable one when a same-named agent is paused", async () => {
+    // The ambiguity guard applies to invokable candidates only: a leftover
+    // paused duplicate must not break an otherwise working config.
+    const { ctx } = mkAgentCtx([
+      { id: "agent-stale", name: "Ops Triage", status: "paused" },
+      { id: "agent-live", name: "Ops Triage", status: "idle" },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toBe("agent-live");
+  });
+
+  it("still refuses when two invokable agents share the name", async () => {
+    const { ctx, logger } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage", status: "idle" },
+      { id: "agent-2", name: "Ops Triage", status: "running" },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved to 2 invokable agents"),
+    );
+  });
+
+  it("refuses a match whose reporting chain is broken", async () => {
+    // An invalid org chain blocks invoke just as surely as a paused status
+    // (server/src/services/agent-invokability.ts), and `agents.list` omits a
+    // terminated manager entirely — so the manager reads as missing here.
+    const { ctx, logger } = mkAgentCtx([
+      {
+        id: "agent-1",
+        name: "Ops Triage",
+        status: "idle",
+        reportsTo: "agent-gone",
+      } as { id: string; name: string; status: string },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("none are invokable"),
+    );
   });
 });
