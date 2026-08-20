@@ -175,10 +175,82 @@ function continuesBlock(line: string, blockIndent: number): boolean {
 const VALUE_KEY = /^(\s*)(-\s+)?(["']?)value\3:(.*)$/;
 /** Matches a sequence entry whose content opens a flow mapping or sequence. */
 const FLOW_SEQUENCE_ENTRY = /^(\s*)(-\s+)[{[]/;
-/** Matches an `env:` key that opens a block (nothing but a comment after it). */
-const ENV_BLOCK_KEY = /^(\s*)(-\s+)?(["']?)env\3:\s*(#.*)?$/;
-/** Matches an `env:` key whose value is inline (flow style, or an alias). */
-const ENV_INLINE_KEY = /^(\s*)(-\s+)?(["']?)env\3:[ \t]+(\S.*)$/;
+/**
+ * Matches an `env:` key, whatever follows it.
+ *
+ * This was two patterns — one for a block-opening `env:` and one for an inline
+ * value — and two patterns have to be tested in some order. Both matched
+ * `env: # vars`, the inline one was tested first, and because its suffix was
+ * neither `[` nor `{` the line was emitted *without opening the block*: every
+ * `value:` line below it then missed the in-block guard and printed in the
+ * clear. The same held for `env: &anchor` and `env: !!seq`.
+ *
+ * One pattern that matches every spelling, with the suffix classified after the
+ * match, removes the ordering from the design rather than reordering it.
+ */
+const ENV_KEY = /^(\s*)(-\s+)?(["']?)env\3:(.*)$/;
+/**
+ * Leading YAML node properties: an anchor (`&name`) and/or a tag (`!!seq`).
+ * These *label* a node without carrying its content, so an `env:` line whose
+ * suffix is nothing but properties still opens a block below it.
+ */
+const NODE_PROPERTIES = /^(?:[&!]\S*[ \t]*)+/;
+/** A comment-only line. */
+const COMMENT_LINE = /^\s*#/;
+/**
+ * Keys that may pass through an env block untouched: the variable's `name` (the
+ * diagnostic the grant exists for) and `valueFrom`, which names a source
+ * without carrying it.
+ */
+const NAME_KEY = /^(\s*)(-\s+)?(["']?)name\3:(.*)$/;
+const VALUE_FROM_KEY = /^(\s*)(-\s+)?(["']?)valueFrom\3:(.*)$/;
+/**
+ * The keys a `valueFrom` subtree may legally contain — the four `EnvVarSource`
+ * selectors and their scalar leaves. Enumerating them is not the denylist this
+ * module argues against: `EnvVarSource` is closed by the Kubernetes schema, so
+ * this is the same closed-allowlist argument the env block itself rests on, and
+ * `value` is deliberately absent from it.
+ */
+const REF_SUBTREE_KEY = new RegExp(
+  `^(\\s*)(-\\s+)?(["']?)(${[
+    "configMapKeyRef",
+    "fieldRef",
+    "resourceFieldRef",
+    "secretKeyRef",
+    "name",
+    "key",
+    "optional",
+    "apiVersion",
+    "fieldPath",
+    "containerName",
+    "resource",
+    "divisor",
+  ].join("|")})\\3:(.*)$`,
+);
+/** A sequence entry's `- ` introducer, and a dash with nothing after it. */
+const SEQUENCE_DASH = /^\s*(-\s+)/;
+const BARE_SEQUENCE_DASH = /^\s*-\s*$/;
+/**
+ * The OCI/Docker `KEY=VALUE` env entry shape. The name is kept and only the
+ * value dropped, matching design note 2 and the JSON path.
+ */
+const ENV_KEY_VALUE_ENTRY = /^(\s*)(-\s+)(["']?)([A-Za-z_][A-Za-z0-9_.-]*)=/;
+/**
+ * An `env:` scalar that can carry material: a flow collection, an alias (which
+ * may resolve to an anchor we never scrubbed), a block scalar, or the
+ * `KEY=VALUE` encoding. A plain scalar without `=` is prose in some other
+ * body this proxy carries, not a Kubernetes env value.
+ */
+const MATERIAL_BEARING_ENV_SCALAR = /^[[{*|>]|=/;
+/**
+ * Kubernetes spells this key `env`; Docker/OCI spells it `Env` (`Config.Env`).
+ * The scalar-entry handling below exists precisely because `KEY=VALUE` is the
+ * OCI/Docker env encoding, so recognizing that encoding while missing the key
+ * that carries it would leave the shape half-covered.
+ */
+function isEnvKey(key: string): boolean {
+  return key.toLowerCase() === "env";
+}
 /** Matches an annotation key we drop wholesale. */
 const ECHO_ANNOTATION_KEY = new RegExp(
   `^(\\s*)(-\\s+)?(["']?)(${RESOURCE_ECHO_ANNOTATIONS.map(escapeRegExp).join("|")})\\3:(.*)$`,
@@ -270,6 +342,9 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
 
   // Indentation of the currently open `env:` block, or null when outside one.
   let envBlockIndent: number | null = null;
+  // Indentation of an open `valueFrom:` key inside that block. Its subtree is
+  // references only, so it passes through the in-block allowlist in full.
+  let refSubtreeIndent: number | null = null;
   // While set, we are swallowing the continuation lines of a value we already
   // replaced; every line indented deeper than this belongs to that value.
   let swallowDeeperThan: number | null = null;
@@ -295,6 +370,29 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
 
     if (envBlockIndent !== null && !continuesBlock(line, envBlockIndent)) {
       envBlockIndent = null;
+      refSubtreeIndent = null;
+    }
+
+    // Inside a `valueFrom:` subtree. Its keys are references, but the subtree
+    // is NOT a hole in the in-block default: an unrecognized key here is
+    // redacted exactly as it would be one level up. Passing the whole subtree
+    // through unclassified was measurably worse than the code it replaced —
+    // `valueFrom:` / `value: <secret>` is redacted by the plain in-block
+    // scanner, so a blanket pass-through re-opened a case that was already
+    // closed. Deeper lines are classified, not trusted.
+    if (refSubtreeIndent !== null) {
+      if (!isBlank(line) && leadingIndent(line) > refSubtreeIndent) {
+        if (COMMENT_LINE.test(line) || REF_SUBTREE_KEY.test(line)) {
+          emit(line, index);
+          continue;
+        }
+        const indent = leadingIndent(line);
+        const dash = SEQUENCE_DASH.exec(line)?.[1] ?? "";
+        redact(`${" ".repeat(indent)}${dash}"${REDACTED}"`, index);
+        swallowDeeperThan = indent + dash.length;
+        continue;
+      }
+      refSubtreeIndent = null;
     }
 
     // Drop annotations that echo the entire resource (and thus its env values).
@@ -324,7 +422,85 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
       }
     }
 
+    // Any `env:` key, in a single branch, tested before the in-block scanner so
+    // that a nested one still opens its own block rather than being treated as
+    // unrecognized content.
+    const envKey = ENV_KEY.exec(line);
+    if (envKey) {
+      const [, indent, dash = "", quote, suffix] = envKey;
+      const ownIndent = indent!.length + dash.length;
+      // Strip anchors and tags before classifying: they label the node that
+      // follows, so `env: &shared` and `env: !!seq` open a block exactly as a
+      // bare `env:` does. Trim first — the suffix keeps the space after the
+      // colon, and an anchored pattern will not match past it.
+      const rest = suffix!.trim().replace(NODE_PROPERTIES, "").trim();
+      if (rest === "" || rest.startsWith("#")) {
+        emit(line, index);
+        envBlockIndent = ownIndent;
+        refSubtreeIndent = null;
+        continue;
+      }
+      // A plain scalar with no `=` in it is not a Kubernetes env value —
+      // `env` is a list there, never a scalar — so it is prose in a body this
+      // proxy happens to carry, and redacting it is a net loss. Not a stylistic
+      // point: redaction sets `ctx.changed`, which re-serializes the *whole*
+      // body, and `JSON.stringify` rounds integers above 2^53 and normalizes
+      // `1.0`. Failing closed here measurably corrupted
+      // `{"nodeId":9007199254740993,"ratio":1.0,"note":"env: none here"}`.
+      // So the fail-closed net is cast at the shapes that can actually carry
+      // material: flow collections, aliases (which may resolve to one), block
+      // scalars, and the `KEY=VALUE` encoding.
+      if (!MATERIAL_BEARING_ENV_SCALAR.test(rest)) {
+        emit(line, index);
+        continue;
+      }
+      // Fail closed on the whole value and swallow any continuation of it — and
+      // open the block as well, so that if content does follow (a shape we did
+      // not anticipate) it is still guarded rather than emitted in the clear.
+      redact(`${indent}${dash}${quote}env${quote}: "${REDACTED}"`, index);
+      swallowDeeperThan = ownIndent;
+      envBlockIndent = ownIndent;
+      refSubtreeIndent = null;
+      continue;
+    }
+
     if (envBlockIndent !== null) {
+      // Inside an env block the default is to REDACT, not to emit.
+      //
+      // Every fail-open this module has had was a line that reached the final
+      // `emit(line)` because it matched no redact pattern: a CRLF-terminated
+      // `value:`, a quoted key spelling, a `KEY=VALUE` scalar entry. A denylist
+      // has to enumerate every spelling secret material can take, and the
+      // enumeration is never finished. An allowlist only has to enumerate the
+      // three keys a Kubernetes env entry can legally carry, and that list is
+      // closed by the schema. Anything else in here is an upstream shape change
+      // or an attempt to smuggle material past the scanner; both are safer
+      // redacted than emitted.
+      //
+      // Blank lines and comments carry nothing and keep the output readable.
+      if (isBlank(line) || COMMENT_LINE.test(line)) {
+        emit(line, index);
+        continue;
+      }
+
+      // `valueFrom:` names a source — a ConfigMap/Secret key, a field path —
+      // without carrying its content, so the key itself passes through. What
+      // follows it is classified against `REF_SUBTREE_KEY` rather than trusted
+      // wholesale; see the subtree branch above for why.
+      const ref = VALUE_FROM_KEY.exec(line);
+      if (ref) {
+        emit(line, index);
+        refSubtreeIndent = leadingIndent(line) + (ref[2]?.length ?? 0);
+        continue;
+      }
+
+      // The variable's name is the diagnostic value the grant exists for:
+      // knowing *which* variables are set, without their values.
+      if (NAME_KEY.test(line) || BARE_SEQUENCE_DASH.test(line)) {
+        emit(line, index);
+        continue;
+      }
+
       const value = VALUE_KEY.exec(line);
       if (value) {
         const [, indent, dash = "", quote] = value;
@@ -356,31 +532,18 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         swallowDeeperThan = indent!.length + dash!.length;
         continue;
       }
-    }
 
-    // `env: [{name: A, value: B}]` — flow style on one line. We cannot cheaply
-    // rewrite the mapping in place, so we fail closed and drop the whole flow
-    // value rather than let an unparsed one through.
-    const inlineEnv = ENV_INLINE_KEY.exec(line);
-    if (inlineEnv) {
-      const [, indent, dash = "", quote, rest] = inlineEnv;
-      if (rest!.startsWith("[") || rest!.startsWith("{")) {
-        redact(`${indent}${dash}${quote}env${quote}: "${REDACTED}"`, index);
-        continue;
-      }
-      // An alias/anchor (`env: *shared`) carries no material by itself.
-      emit(line, index);
-      continue;
-    }
-
-    const envBlock = ENV_BLOCK_KEY.exec(line);
-    if (envBlock) {
-      const [, indent, dash = ""] = envBlock;
-      // The block's contents are owned by the `env` key itself. When env is the
-      // first key of a sequence entry (`- env:`), the dash is part of the
-      // indentation its children align against.
-      envBlockIndent = indent!.length + dash.length;
-      emit(line, index);
+      // Unrecognized inside an env block: fail closed. `- A=LEAKED` — the
+      // OCI/Docker `KEY=VALUE` shape — lands here, as does any spelling not yet
+      // imagined. Keep the variable name when the entry has the `KEY=` shape.
+      const indent = leadingIndent(line);
+      const dash = SEQUENCE_DASH.exec(line)?.[1] ?? "";
+      const keyValue = ENV_KEY_VALUE_ENTRY.exec(line);
+      const replacement = keyValue
+        ? `${" ".repeat(indent)}${dash}"${keyValue[4]}=${REDACTED}"`
+        : `${" ".repeat(indent)}${dash}"${REDACTED}"`;
+      redact(replacement, index);
+      swallowDeeperThan = indent + dash.length;
       continue;
     }
 
@@ -419,9 +582,26 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
       ctx.changed = true;
       continue;
     }
-    if (key === "env" && Array.isArray(value)) {
+    if (isEnvKey(key) && Array.isArray(value)) {
       result[key] = value.map((entry) => {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+        if (entry === null || entry === undefined) return entry;
+        // `KEY=VALUE` is the OCI/Docker env shape, and the generic recursion
+        // returned it untouched: a scalar is not an object, so the `value`
+        // lookup below never ran. This is the same hole the mapping case was
+        // added for — the JSON path exists so an upstream shape change cannot
+        // silently turn the scrubber into a no-op, and a shape it passes through
+        // in the clear defeats that. Keep the name, drop the material.
+        if (typeof entry === "string") {
+          ctx.changed = true;
+          const eq = entry.indexOf("=");
+          return eq > 0 ? `${entry.slice(0, eq)}=${REDACTED}` : REDACTED;
+        }
+        // A nested array (`[["A", "LEAKED"]]`) or any other non-object entry
+        // carries no name we can identify, so there is nothing to preserve.
+        if (typeof entry !== "object" || Array.isArray(entry)) {
+          ctx.changed = true;
+          return REDACTED;
+        }
         const envVar = entry as Record<string, unknown>;
         // Preserve `name` and any `valueFrom` reference; drop only the literal.
         if (!("value" in envVar)) return envVar;
@@ -436,7 +616,7 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
     // no-op, and the generic recursion below carries no "inside an env block"
     // state — so a mapping fell through it with every value in the clear. Redact
     // the values and keep the names, matching the list case and design note 2.
-    if (key === "env" && value && typeof value === "object") {
+    if (isEnvKey(key) && value && typeof value === "object") {
       const entries = Object.entries(value as Record<string, unknown>);
       result[key] = Object.fromEntries(
         entries.map(([name, inner]) => [
@@ -454,6 +634,15 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
     if (RESOURCE_ECHO_ANNOTATIONS.includes(key) && typeof value === "string") {
       result[key] = REDACTED;
       ctx.changed = true;
+      continue;
+    }
+    // An `env` serialized as a single scalar rather than a list or a mapping.
+    // Same discriminator as the YAML path: `KEY=VALUE` carries material, a
+    // plain string does not and belongs to some other body this proxy carries.
+    if (isEnvKey(key) && typeof value === "string" && value.includes("=")) {
+      ctx.changed = true;
+      const eq = value.indexOf("=");
+      result[key] = `${value.slice(0, eq)}=${REDACTED}`;
       continue;
     }
     if (typeof value === "string") {
@@ -556,8 +745,26 @@ function startsWithJsonPunctuation(body: Buffer): boolean {
  */
 const SSE_FIELD_HEAD = /^(?:event|data|id|retry):|^:/;
 
+/**
+ * The window is 8 bytes: `retry:` already consumes six, and skipping leading
+ * bytes below shifts the field name later in the buffer.
+ */
 function startsWithSseField(body: Buffer): boolean {
-  return SSE_FIELD_HEAD.test(body.subarray(0, 6).toString("latin1"));
+  let start = 0;
+  // The SSE spec requires a client to strip one leading BOM, so a stream that
+  // carries one is well-formed, not malformed.
+  if (body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) start = 3;
+  // And a leading blank line is an empty event dispatch. Neither shifted the
+  // field name out of an anchored 6-byte window before this: the sniff missed,
+  // the JSON sniff saw `e`, and the whole stream — `data:` payloads included —
+  // was returned unscrubbed. `startsWithJsonPunctuation` already skips
+  // whitespace, and that asymmetry was the entire gap.
+  while (start < body.length) {
+    const byte = body[start]!;
+    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) start += 1;
+    else break;
+  }
+  return SSE_FIELD_HEAD.test(body.subarray(start, start + 8).toString("latin1"));
 }
 
 function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
@@ -589,7 +796,16 @@ function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
  * fix. Terminators are normalized to LF, which only ever reaches the client on a
  * body we actually redacted; an untouched body is returned as the original
  * Buffer.
+ *
+ * The field match tolerates a leading BOM and indentation for the same reason.
+ * Teaching only the *sniff* to skip those bytes moved the fail-open one step
+ * down rather than closing it: the body was then correctly classified as SSE,
+ * but `"﻿data: …"` does not start with `data:`, so the payload was emitted
+ * in the clear anyway. Detection and framing have to agree about where a line
+ * begins.
  */
+const SSE_DATA_FIELD = /^[﻿\s]*data:/;
+
 function scrubSseFrames(text: string, ctx: ScrubContext): string {
   const out: string[] = [];
   let pending: string[] = [];
@@ -603,8 +819,9 @@ function scrubSseFrames(text: string, ctx: ScrubContext): string {
   };
 
   for (const line of text.split(/\r\n|\n|\r/)) {
-    if (line.startsWith("data:")) {
-      pending.push(line.slice("data:".length).trimStart());
+    const field = SSE_DATA_FIELD.exec(line);
+    if (field) {
+      pending.push(line.slice(field[0].length).trimStart());
       continue;
     }
     flush();
