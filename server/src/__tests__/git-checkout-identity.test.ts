@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   buildAgentGitIdentity,
   ensureCheckoutGitIdentity,
+  isPaperclipProvisionedAuthorEmail,
   isSharedAppAuthorEmail,
   PAPERCLIP_AGENT_EMAIL_DOMAIN,
   SHARED_APP_AUTHOR_EMAILS,
@@ -130,6 +131,24 @@ describe("isSharedAppAuthorEmail", () => {
   });
 });
 
+describe("isPaperclipProvisionedAuthorEmail", () => {
+  it("matches addresses in paperclip's own namespace, case-insensitively", () => {
+    expect(isPaperclipProvisionedAuthorEmail(AGENT_EMAIL)).toBe(true);
+    expect(isPaperclipProvisionedAuthorEmail(AGENT_EMAIL.toUpperCase())).toBe(true);
+    expect(isPaperclipProvisionedAuthorEmail(`  ${AGENT_EMAIL}  `)).toBe(true);
+  });
+
+  it("does not match a human address, the App forms, or a lookalike domain", () => {
+    expect(isPaperclipProvisionedAuthorEmail("omar@blockcast.net")).toBe(false);
+    expect(isPaperclipProvisionedAuthorEmail(APP_EMAIL_NUMERIC)).toBe(false);
+    expect(isPaperclipProvisionedAuthorEmail(null)).toBe(false);
+    // The suffix is anchored on "@", so a domain that merely *ends* with the
+    // literal does not read as paperclip-owned and keeps its identity.
+    expect(isPaperclipProvisionedAuthorEmail("a@evil-paperclip.blockcast.net")).toBe(false);
+    expect(isPaperclipProvisionedAuthorEmail("a@sub.paperclip.blockcast.net")).toBe(false);
+  });
+});
+
 describe("ensureCheckoutGitIdentity", () => {
   it("sets an unset local identity", async () => {
     const repo = initRepo(path.join(makeTempRoot(), "repo"));
@@ -191,7 +210,8 @@ describe("ensureCheckoutGitIdentity", () => {
 
   it("re-points a checkout stamped with a different agent's identity", async () => {
     // A managed project workspace is shared across a company's agents, and the
-    // agent about to run is the one that will commit from it.
+    // agent about to run is the one that will commit from it. Safe to rewrite
+    // because the address sits in paperclip's own namespace -- we wrote it.
     const repo = initRepo(path.join(makeTempRoot(), "repo"));
     git(["config", "--local", "user.email", `someone-else@${PAPERCLIP_AGENT_EMAIL_DOMAIN}`], repo);
     git(["config", "--local", "user.name", "Someone Else"], repo);
@@ -200,6 +220,46 @@ describe("ensureCheckoutGitIdentity", () => {
 
     expect(result.status).toBe("updated");
     expect(readLocal(repo, "user.email")).toBe(AGENT_EMAIL);
+  });
+
+  it("leaves a human's identity alone and writes nothing", async () => {
+    // The `project_primary` strategy runs the agent directly in the project
+    // checkout, and `git config --local` inside a linked worktree resolves to
+    // the parent repository's config -- so an unconditional rewrite would
+    // silently retarget a developer's `user.email` repo-wide. Only unset, the
+    // App forms, and paperclip's own namespace are ours to overwrite.
+    const repo = initRepo(path.join(makeTempRoot(), "repo"));
+    git(["config", "--local", "user.email", "omar@blockcast.net"], repo);
+    git(["config", "--local", "user.name", "Omar Ramadan"], repo);
+    const before = fs.readFileSync(path.join(repo, ".git", "config"), "utf8");
+
+    const calls: string[][] = [];
+    const result = await ensureCheckoutGitIdentity({
+      cwd: repo,
+      agent: AGENT,
+      runGit: recordingGit(calls),
+    });
+
+    expect(result.status).toBe("skipped_foreign_identity");
+    expect(result.previousEmail).toBe("omar@blockcast.net");
+    // A deliberate policy outcome, not a failure: nothing to surface to the run.
+    expect(result.warning).toBeNull();
+    expect(calls.every((args) => args.includes("--get"))).toBe(true);
+    expect(fs.readFileSync(path.join(repo, ".git", "config"), "utf8")).toBe(before);
+  });
+
+  it("still corrects an App-stamped checkout whose user.name is a human's", async () => {
+    // Ownership is decided on the email alone. A half-configured checkout --
+    // App email, leftover human name -- is still a misattributing checkout.
+    const repo = initRepo(path.join(makeTempRoot(), "repo"));
+    git(["config", "--local", "user.email", APP_EMAIL_NUMERIC], repo);
+    git(["config", "--local", "user.name", "Omar Ramadan"], repo);
+
+    const result = await ensureCheckoutGitIdentity({ cwd: repo, agent: AGENT });
+
+    expect(result.status).toBe("updated");
+    expect(readLocal(repo, "user.email")).toBe(AGENT_EMAIL);
+    expect(readLocal(repo, "user.name")).toBe("Platform SRE Engineer");
   });
 
   it("provisions a linked worktree, whose .git is a FILE", async () => {
@@ -322,6 +382,24 @@ describe("provisioning call-site invariants", () => {
     expect(identityAt).toBeGreaterThan(-1);
     expect(earlyReturnAt).toBeGreaterThan(-1);
     expect(identityAt).toBeLessThan(earlyReturnAt);
+  });
+
+  it("stamps identity on the project_primary strategy, which bypasses the worktree funnel", () => {
+    const source = readService("workspace-runtime.ts");
+
+    // `project_primary` is the DEFAULT strategy and returns a checkout without
+    // ever calling provisionExecutionWorktree, so it needs its own seam. Three
+    // call sites: realizeExecutionWorkspace's non-worktree return, and
+    // ensurePersistedExecutionWorkspaceAvailable's rebound-managed-cwd and
+    // recorded-cwd returns.
+    expect(source).toContain("async function stampCheckoutIdentity(");
+    expect(countOccurrences(source, "stampCheckoutIdentity(")).toBeGreaterThanOrEqual(4);
+
+    // The default must not be able to drift back to an unstamped literal return.
+    const realizeStart = source.indexOf('const strategyType = asString(rawStrategy.type, "project_primary");');
+    expect(realizeStart).toBeGreaterThan(-1);
+    const nonWorktreeBranch = source.slice(realizeStart, realizeStart + 1600);
+    expect(nonWorktreeBranch).toContain("stampCheckoutIdentity(input.base.baseCwd, input.agent)");
   });
 
   it("captures the funnel's warnings at every worktree call site", () => {
