@@ -52,6 +52,10 @@ import {
   restoreCheckoutPromotedStatus,
 } from "../services/issue-checkout-status.ts";
 import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
+import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -658,6 +662,115 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         .where(eq(issues.id, id))
         .then((rows) => rows[0]!);
     }
+
+    // BLO-28900: `tickDueIssueMonitors` only selects `in_progress`/`in_review`,
+    // agent-assigned rows. A demotion that leaves `monitor_next_check_at`
+    // populated produces a monitor that reads `scheduled` forever and can never
+    // fire — silent, and indistinguishable from an idle assignee.
+    function readMonitor(id: string) {
+      return db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0]!);
+    }
+
+    const MONITOR_CHECK_AT = "2026-09-01T12:00:00.000Z";
+
+    /**
+     * Arming goes through the route layer (`routes/issues.ts` computes the
+     * policy transition), so a service-level test writes the armed shape
+     * directly — built with the production builders rather than hand-rolled
+     * JSON, so the fixture cannot drift from what a real arm persists.
+     */
+    async function armMonitor(issueId: string, agentId: string) {
+      const policy = normalizeIssueExecutionPolicy({
+        monitor: { nextCheckAt: MONITOR_CHECK_AT, notes: "watch deploy", scheduledBy: "assignee" },
+      });
+      const fields = buildInitialIssueMonitorFields({
+        policy,
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+      });
+      await db
+        .update(issues)
+        .set({ ...fields, executionPolicy: policy as unknown as Record<string, unknown> })
+        .where(eq(issues.id, issueId));
+
+      const armed = await readMonitor(issueId);
+      // Guard the guard: if the arm silently no-ops the assertions below pass
+      // vacuously and the test proves nothing.
+      expect(armed.monitorNextCheckAt).not.toBeNull();
+      expect((armed.executionState as { monitor?: { status?: string } } | null)?.monitor?.status)
+        .toBe("scheduled");
+    }
+
+    it("clears a monitor the checkout-restore demotion would otherwise strand", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      const restored = await readMonitor(issue.id);
+      expect(restored.status).toBe("todo");
+      // The assignee survives a checkout-restore, so status is the only failed
+      // eligibility condition.
+      expect(restored.assigneeAgentId).toBe(agentId);
+      expect(restored.monitorNextCheckAt).toBeNull();
+      expect(restored.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "invalid_status" },
+      });
+      expect((restored.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+    });
+
+    it("clears a monitor when release strips both eligibility conditions", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+
+      await svc.release(issue.id, agentId, runId);
+
+      const released = await readMonitor(issue.id);
+      expect(released.status).toBe("todo");
+      expect(released.assigneeAgentId).toBeNull();
+      expect(released.monitorNextCheckAt).toBeNull();
+      // Release drops the agent assignee too, so the assignee condition is the
+      // one reported — release is the worst instance of this class, not a
+      // milder one.
+      expect(released.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "invalid_assignee" },
+      });
+    });
+
+    it("leaves a monitor armed when the run advances the issue to in_review", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await svc.update(issue.id, { status: "in_review" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      // The safety property runs the other way too: reconciliation must not
+      // disarm a monitor that is still deliverable, or the fix trades a silent
+      // stall for a silent cancellation.
+      const kept = await readMonitor(issue.id);
+      expect(kept.status).toBe("in_review");
+      expect(kept.monitorNextCheckAt?.toISOString()).toBe(MONITOR_CHECK_AT);
+      expect(kept.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+    });
 
     it("returns a todo issue to todo when the run releases without advancing it", async () => {
       const { agentId, issue, runId } = await seedCheckoutFixture("todo");
