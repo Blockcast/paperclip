@@ -479,6 +479,31 @@ const misplacedIssueParkedInputShape = {
 };
 
 /**
+ * BLO-27912: `parkedDisposition` is PATCH-only, and this states that rather than leaving it
+ * to be inferred from an omission.
+ *
+ * The four flat keys above are guarded because zod would strip them into a misleading 200.
+ * The nested key had exactly the same hole on the create path: `createIssueBaseSchema` is
+ * not `.strict()`, so `POST /issues` with a `parkedDisposition` returned `201 Created` and
+ * an UNPARKED row, with no signal — and the caller only finds out when the liveness
+ * invariant fires against a row they believe is parked. Guarding the flat shape while
+ * leaving the real shape silently stripped is the worse of the two failures, because the
+ * caller who guessed right is the one who gets no error.
+ *
+ * Scoped to create by construction: `updateIssueSchema` `.extend()`s the real schema over
+ * this key, so the rejection cannot leak onto the PATCH path that is supposed to accept it.
+ */
+export function parkedDispositionCreateRejectionMessage() {
+  return `\`parkedDisposition\` cannot be set when creating an issue, so it would be silently discarded — record the park with a follow-up PATCH /issues/:id instead: {"parkedDisposition":{"reason":"<why this row is deliberately not being worked, and what event ends the park>","until":"<ISO-8601, in the future and at most ${PARKED_DISPOSITION_MAX_HORIZON_DAYS} days out>"}}. A park is a statement about work already scoped and assigned — that it is correctly NOT being done, pending a named upstream event — so there is nothing to park at creation time, and admitting it here would let a row be born pre-suppressed: created and already invisible to the liveness invariants, having never once been looked at.`;
+}
+
+const parkedDispositionCreateGuardShape = {
+  parkedDisposition: z
+    .undefined({ errorMap: () => ({ message: parkedDispositionCreateRejectionMessage() }) })
+    .optional(),
+};
+
+/**
  * BLO-27912: how far into the future a park may reach.
  *
  * A park exists to say "this row is correctly not being worked, pending an upstream event
@@ -527,6 +552,7 @@ export type IssueParkedDispositionInput = z.infer<typeof issueParkedDispositionS
 const createIssueBaseSchema = z.object({
   ...misplacedIssueMonitorInputShape,
   ...misplacedIssueParkedInputShape,
+  ...parkedDispositionCreateGuardShape,
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
@@ -634,7 +660,9 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   hiddenAt: z.string().datetime().nullable().optional(),
   // BLO-27912: PATCH-only, like `reviewRequest`. A park is a statement about work already
   // scoped and assigned — there is nothing to park at creation time, and admitting it on
-  // create would let a row be born pre-suppressed.
+  // create would let a row be born pre-suppressed. Enforced rather than conventional: the
+  // create path carries `parkedDispositionCreateGuardShape`, and this `.extend()` is what
+  // overrides that rejection back to the real schema on update.
   parkedDisposition: issueParkedDispositionSchema.nullable().optional(),
 });
 

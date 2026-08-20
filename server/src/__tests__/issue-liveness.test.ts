@@ -313,6 +313,98 @@ describe("issue graph liveness classifier", () => {
       );
       expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
     });
+
+    // The two rules below are not named by the row's ACs, but they changed behaviour when
+    // `hasActiveParkedDisposition` went into `hasExplicitWaitingPath` rather than being
+    // scoped to a single rule. The broad placement is deliberate — a park is a structured,
+    // attributed, expiring claim that answers every assignee-shaped rule — but an
+    // undiscussed behaviour change is exactly the kind that regresses unnoticed, so pin
+    // both directions here. Unlike the `blocked_by_*` pairs above, these two fire against
+    // the row ITSELF rather than against its blocker, so each needs its own fixture.
+    it("suppresses in_review_without_action_path on a parked row, and fires without the park", () => {
+      const stalledReview = (overrides: Record<string, unknown> = {}) => issue({
+        id: "review-parked-1",
+        identifier: "PAP-1705",
+        title: "Parked review awaiting an upstream decision",
+        status: "in_review",
+        assigneeAgentId: coderId,
+        executionState: null,
+        ...overrides,
+      });
+      const input = (parked: ReturnType<typeof stalledReview>) => ({
+        issues: [parked],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(classifyIssueGraphLiveness(
+        input(stalledReview({ parkedUntil: hoursFromNow(72) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(input(stalledReview()));
+      expect(unparked.map((entry) => entry.state)).toEqual(["in_review_without_action_path"]);
+      expect(unparked[0]).toMatchObject({ issueId: "review-parked-1" });
+    });
+
+    it("suppresses blocked_without_blockers on a parked dead end, and fires without the park", () => {
+      // The dead-end shape: `blocked` with no blocker edges at all, so nothing can ever
+      // unblock it. A park is the honest answer here — `blockedWithoutBlockersFinding`'s own
+      // recommended action already says "assign a human owner or interaction if it is
+      // intentionally parked", so the park is the structured form of that instruction.
+      const deadEnd = (overrides: Record<string, unknown> = {}) => issue({
+        id: "dead-end-parked-1",
+        identifier: "PAP-1706",
+        title: "Parked dead end pending an upstream decision",
+        status: "blocked",
+        assigneeAgentId: coderId,
+        ...overrides,
+      });
+      const input = (parked: ReturnType<typeof deadEnd>) => ({
+        issues: [parked],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(classifyIssueGraphLiveness(
+        input(deadEnd({ parkedUntil: hoursFromNow(72) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(input(deadEnd()));
+      expect(unparked.map((entry) => entry.state)).toEqual(["blocked_without_blockers"]);
+      expect(unparked[0]).toMatchObject({ issueId: "dead-end-parked-1" });
+    });
+
+    // Both of the above must also come back on their own once the deadline passes — the
+    // anti-silence guarantee has to hold for every rule the park reaches, not just the two
+    // the ACs name.
+    it("restores detection on both extra rules once the park lapses", () => {
+      const lapsed = hoursFromNow(-1);
+
+      expect(classifyIssueGraphLiveness({
+        issues: [issue({
+          id: "review-parked-1",
+          identifier: "PAP-1705",
+          status: "in_review",
+          assigneeAgentId: coderId,
+          executionState: null,
+          parkedUntil: lapsed,
+        })],
+        relations: [],
+        agents: [agent(), manager],
+      }).map((entry) => entry.state)).toEqual(["in_review_without_action_path"]);
+
+      expect(classifyIssueGraphLiveness({
+        issues: [issue({
+          id: "dead-end-parked-1",
+          identifier: "PAP-1706",
+          status: "blocked",
+          assigneeAgentId: coderId,
+          parkedUntil: lapsed,
+        })],
+        relations: [],
+        agents: [agent(), manager],
+      }).map((entry) => entry.state)).toEqual(["blocked_without_blockers"]);
+    });
   });
 
   it("does not flag an unassigned blocker that already has an active execution path", () => {

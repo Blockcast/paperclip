@@ -382,6 +382,7 @@ export {
   misplacedIssueMonitorInputMessage,
   MISPLACED_ISSUE_PARKED_INPUT_KEYS,
   misplacedIssueParkedInputMessage,
+  parkedDispositionCreateRejectionMessage,
   issueParkedDispositionSchema,
   PARKED_DISPOSITION_MAX_HORIZON_DAYS,
   PARKED_DISPOSITION_MAX_HORIZON_MS,
