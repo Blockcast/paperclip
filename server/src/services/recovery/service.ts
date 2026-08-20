@@ -7656,6 +7656,9 @@ export function recoveryService(
           lastActivityAt: issues.lastActivityAt,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           monitorAttemptCount: issues.monitorAttemptCount,
+          // BLO-27912: the deliberate-park deadline. The classifier compares it against
+          // `now` itself, so an elapsed park is carried in and correctly stops suppressing.
+          parkedUntil: issues.parkedUntil,
           // BLO-24662: only used to derive the `hasExternalWaitOwner` boolean below. The
           // prose itself never reaches the classifier — a description can carry
           // external-wait details that are redacted on read.
