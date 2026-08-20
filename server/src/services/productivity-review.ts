@@ -293,11 +293,14 @@ type ProductivityReviewEvidence = {
   // BLO-26165: count of terminal runs excluded from the `noCommentStreak` walk
   // because no adapter container was ever created for them (`isNeverInvokedRun`
   // — `usageJson`, `logStore`, `logRef` all null and `logBytes` null-or-zero).
-  // These runs had nothing capable of writing a comment. Distinct from
-  // `runtimeFailureStreak`, whose `livenessState`/usage heuristic cannot see a
-  // pre-adapter setup failure because classification never ran, so the evidence
-  // block can tell a reviewer "this many runs never had a chance to comment"
-  // apart from "this many runs executed and stayed silent."
+  // These runs had nothing capable of writing a comment. Reported separately
+  // from `runtimeFailureStreak` so the evidence block can tell a reviewer "this
+  // many runs never had a chance to comment" apart from "this many runs
+  // executed and stayed silent." The two populations overlap in production —
+  // a pre-adapter setup failure IS classified (`livenessState: "failed"`) and
+  // so is usually caught by the runtime-failure heuristic too — which is why
+  // `nonExecutingAlsoNeverInvokedCount` measures the intersection rather than
+  // assuming disjointness.
   neverInvokedRunCount: number;
   // BLO-26165 (narrowing): of the runs eligible for the `noCommentStreak` walk,
   // how many carry `issueCommentStatus: "not_applicable"` —
@@ -1446,10 +1449,12 @@ function isNeverExecutedRun(
 // `finalizeIssueCommentPolicy` (heartbeat.ts) stamps that same status on runs
 // that provably executed — once when
 // `shouldRequireIssueCommentForWake` returns false, and once when a deferred
-// comment wake already exists. That helper is a four-item whitelist
-// (`issue_assigned`, `execution_review_requested`,
-// `execution_approval_requested`, `execution_changes_requested`), so keying
-// the streak on the column made every `heartbeat_timer`, `issue_monitor_due`,
+// comment wake already exists. That helper is a four-item wake-reason
+// whitelist (`issue_assigned`, `execution_review_requested`,
+// `execution_approval_requested`, `execution_changes_requested`) sitting
+// behind a fifth early exit for `contextSnapshot.skipIssueComment === true`,
+// so it is narrower still than the wake list alone suggests. Keying the streak
+// on the column made every `heartbeat_timer`, `issue_monitor_due`,
 // `issue_comment_mentioned`, `issue_continuation_needed`, `process_lost_retry`
 // and recovery-lane run structurally invisible to the silent-agent detector,
 // whether or not it ran a full model turn. An agent could go silent across
@@ -1457,29 +1462,47 @@ function isNeverExecutedRun(
 // *invocation* are two different facts sharing one column; only this predicate
 // tests the second one.
 //
-// Deliberately keyed on total absence of run telemetry rather than the
-// `logBytes` ceiling heuristic `isInfraFailureRun` uses. A container that
-// started writes its session boilerplate, so a non-null `logStore`/`logRef`
-// or any non-zero `logBytes` is positive evidence the adapter existed. An
-// explicit zero-token `usageJson` likewise means a session was created and
-// measured (the BLO-21769 shape) — that run was invoked and belongs to
-// `runtimeFailureStreak`, not here. Keeping the two disjoint is what lets the
-// evidence block name which one it is.
+// Keyed on total absence of run telemetry rather than the `logBytes` ceiling
+// heuristic `isInfraFailureRun` uses. `logStore`/`logRef` carry most of the
+// weight: they are written immediately after `runLogStore.begin`, which is one
+// of the first things the inner execution `try` does, so a setup failure that
+// throws before that block opens leaves both null. An explicit zero-token
+// `usageJson` means a session was created and measured (the BLO-21769 shape) —
+// that run was invoked and belongs to `runtimeFailureStreak`, not here.
 //
-// Independent of `livenessState` being *`failed`*, which is the gap that made
-// the original fix necessary: `classifyAndPersistRunLiveness` never runs for a
-// pre-adapter failure, so `isInfraFailureRun`'s `livenessState !== "failed"`
-// check cannot catch these rows. A *non-null* `livenessState` is still read as
-// positive proof of invocation, though — that column is only ever written by
-// `classifyAndPersistRunLiveness`, which runs after the adapter completes and
-// has adapter output to classify. This direction of the bias is deliberate:
-// wrongly excluding a run recreates the false negative above (a silent agent
-// reads as clean), while wrongly counting one produces a review a manager can
-// read the evidence block and dismiss. Prefer counting.
+// This is a deliberately *conservative* proxy, not proof a container existed.
+// The log store is opened before adapter resolution and well before
+// `adapter.execute`, so an `adapter_failed` run that never resolved a container
+// can still carry a non-null `logStore` and will be counted rather than
+// excluded. That bias is the one we want: wrongly excluding a run recreates the
+// false negative above (a silent agent reads as clean), while wrongly counting
+// one produces a review a manager can read the evidence block and dismiss.
+// Prefer counting.
+//
+// NOT keyed on `livenessState`, despite an earlier revision of this predicate
+// opening with `if (run.livenessState != null) return false;` on the theory
+// that the column is only ever written after the adapter completes. It is not:
+// the setup-failure branch of the outer catch in `executeRun` calls
+// `classifyAndPersistRunLiveness` for exactly these pre-adapter throws, and
+// `classifyRunLiveness` (run-liveness.ts) returns `"failed"` for any
+// non-`succeeded` run — it never returns null. `backfillMissingRunLivenessForIssue`
+// (activity.ts) is a second writer that fills any remaining null on an ordinary
+// issue-read path. The BLO-23096 rows therefore carry `livenessState: "failed"`,
+// and that guard disqualified the exact population this predicate was written
+// to catch, leaving it inert in production.
+//
+// Because those rows also satisfy `isInfraFailureRun` (failed liveness, null
+// usage, log bytes under the boilerplate ceiling), this predicate is mostly a
+// *subset* of `isNeverExecutedRun` rather than a widening of it. It still earns
+// its keep twice: it separates "no adapter was ever created" from "the runtime
+// failed after starting" in the manager-facing evidence block, and it catches
+// the rows where liveness classification never landed at all — the setup-failure
+// write is gated on the run still being `running`, and the backfill is
+// scheduled asynchronously, so `livenessState: null` is reachable and
+// `isInfraFailureRun` returns false for it.
 function isNeverInvokedRun(
-  run: Pick<HeartbeatRunRow, "usageJson" | "logBytes" | "logStore" | "logRef" | "livenessState">,
+  run: Pick<HeartbeatRunRow, "usageJson" | "logBytes" | "logStore" | "logRef">,
 ): boolean {
-  if (run.livenessState != null) return false;
   if (run.usageJson != null) return false;
   if (run.logStore != null || run.logRef != null) return false;
   return (run.logBytes ?? 0) === 0;
@@ -3001,10 +3024,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const executedTerminalRuns = terminalRuns.filter((run) => !isNeverExecutedRun(run));
     // BLO-26165: a run whose adapter container was never created had nothing
     // capable of writing a comment, so counting it as silence misattributes an
-    // infrastructure fact to the assignee. Excluded here rather than folded
-    // into `isNeverExecutedRun` because that predicate needs
-    // `livenessState === "failed"`, and a pre-adapter setup failure never gets
-    // classified at all.
+    // infrastructure fact to the assignee. Kept as its own predicate rather
+    // than folded into `isNeverExecutedRun` because it answers a different
+    // question — "was an adapter ever created" versus "did the runtime fail" —
+    // and the evidence block reports the two separately. In production the
+    // BLO-23096 rows satisfy both (the setup-failure path does stamp
+    // `livenessState: "failed"`, so `isInfraFailureRun` already excludes them);
+    // this filter is what still catches them when liveness classification never
+    // landed, and what keeps the count honest for the evidence line.
     //
     // Keyed on `isNeverInvokedRun` (absence of run telemetry), NOT on
     // `issueCommentStatus`. The latter conflates invocation with comment
