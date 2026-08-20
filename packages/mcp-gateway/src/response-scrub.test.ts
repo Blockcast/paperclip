@@ -1029,3 +1029,144 @@ describe("scrubJsonValue — Docker/OCI spells the key Env", () => {
     expectNoLeak(JSON.stringify(scrubJsonValue({ Env: { OPENAI_API_KEY: LEAK } })));
   });
 });
+
+describe("the two paths must agree on what an env key is", () => {
+  // The JSON path routed every env check through the case-insensitive
+  // `isEnvKey`, while the YAML scanner matched a lowercase `env` literal. The
+  // describe block above covers `Env` on the JSON path and passed while every
+  // non-lowercase spelling was emitted in the clear on the YAML one — a fixture
+  // for one path standing in for a rule that was only half-implemented. These
+  // assert the rule on the path that lacked it, at each entry shape.
+  for (const key of ["Env", "ENV", "eNv"]) {
+    it(`redacts a '${key}:' block on the YAML path — scalar KEY=VALUE entry`, () => {
+      const out = scrubYamlText(`    ${key}:\n    - OPENAI_API_KEY=${LEAK}\n`);
+
+      expectNoLeak(out);
+      expect(out).toContain("OPENAI_API_KEY");
+    });
+
+    it(`redacts a '${key}:' block on the YAML path — name/value entries`, () => {
+      const out = scrubYamlText(
+        `    ${key}:\n    - name: OPENAI_API_KEY\n      value: ${LEAK}\n`,
+      );
+
+      expectNoLeak(out);
+      expect(out).toContain("OPENAI_API_KEY");
+    });
+
+    it(`redacts a '${key}:' block on the YAML path — inline flow sequence`, () => {
+      expectNoLeak(
+        scrubYamlText(`    ${key}: [{name: OPENAI_API_KEY, value: ${LEAK}}]\n`),
+      );
+    });
+  }
+
+  // The pre-filter decides whether a nested string is scanned at all, so it
+  // failing open put the miss one step before any redaction rule.
+  it("scans a nested OCI-shaped resource carried in content[].text", () => {
+    const body = Buffer.from(
+      JSON.stringify({
+        content: [{ type: "text", text: `Env:\n- OPENAI_API_KEY=${LEAK}\n` }],
+      }),
+      "utf8",
+    );
+
+    expectNoLeak(scrubResponseBody(body, "application/json").toString("utf8"));
+  });
+
+  // Case-insensitivity must not cost the diagnostic: `ENV: production` is an
+  // ordinary ConfigMap key, and a plain scalar with no `=` is prose, not
+  // material. If this over-redacts, reading a ConfigMap stops being useful.
+  it("leaves a ConfigMap data key named ENV intact", () => {
+    for (const key of ["env", "ENV", "Env"]) {
+      const out = scrubYamlText(
+        `kind: ConfigMap\ndata:\n  ${key}: production\n  LOG_LEVEL: debug\n`,
+      );
+
+      expect(out).toContain(`${key}: production`);
+      expect(out).toContain("LOG_LEVEL: debug");
+      expect(out).not.toContain(REDACTED);
+    }
+  });
+});
+
+describe("the two paths must agree on what a Secret is", () => {
+  // Found by probing the fix above rather than by reading for it: `isEnvKey` was
+  // made case-insensitive on both paths while the Secret gates stayed literal.
+  // Measured before this change, each spelling below emitted the Secret's
+  // material verbatim while the canonical `kind: Secret` + `data:` redacted — so
+  // the mechanism was sound and only the spelling defeated it. This gate gives
+  // up more than the env one: a Secret's `data` is entirely material, where an
+  // env block at least keeps its names.
+  for (const kind of ["Secret", "secret", "SECRET", "SecretList"]) {
+    it(`redacts Secret material on the YAML path — 'kind: ${kind}'`, () => {
+      const out = scrubYamlText(`kind: ${kind}\ndata:\n  token: ${LEAK}\n`);
+
+      expectNoLeak(out);
+      expect(out).toContain(REDACTED);
+    });
+
+    it(`redacts Secret material on the JSON path — 'kind: ${kind}'`, () => {
+      expectNoLeak(JSON.stringify(scrubJsonValue({ kind, data: { token: LEAK } })));
+    });
+  }
+
+  // The `kind` key itself, not just its value.
+  for (const key of ["Kind", "KIND"]) {
+    it(`redacts Secret material on the YAML path — '${key}:' key`, () => {
+      expectNoLeak(scrubYamlText(`${key}: Secret\ndata:\n  token: ${LEAK}\n`));
+    });
+
+    it(`redacts Secret material on the JSON path — '${key}:' key`, () => {
+      expectNoLeak(
+        JSON.stringify(scrubJsonValue({ [key]: "Secret", data: { token: LEAK } })),
+      );
+    });
+  }
+
+  // And the material key's own spelling.
+  for (const dataKey of ["Data", "DATA", "StringData", "stringdata"]) {
+    it(`redacts Secret material on the YAML path — '${dataKey}:' key`, () => {
+      expectNoLeak(scrubYamlText(`kind: Secret\n${dataKey}:\n  token: ${LEAK}\n`));
+    });
+
+    it(`redacts Secret material on the JSON path — '${dataKey}:' key`, () => {
+      expectNoLeak(
+        JSON.stringify(scrubJsonValue({ kind: "Secret", [dataKey]: { token: LEAK } })),
+      );
+    });
+  }
+
+  // The reason the Secret gate is scoped to Secret documents at all: a
+  // ConfigMap's `data` is the diagnostic payload and must survive, at every
+  // spelling the widened gate now accepts. If this over-redacts, reading a
+  // ConfigMap stops being useful — which is Door #5's whole subject.
+  for (const dataKey of ["data", "Data", "DATA"]) {
+    it(`leaves ConfigMap '${dataKey}:' intact on the YAML path`, () => {
+      const out = scrubYamlText(
+        `kind: ConfigMap\n${dataKey}:\n  LOG_LEVEL: debug\n`,
+      );
+
+      expect(out).toContain("LOG_LEVEL: debug");
+      expect(out).not.toContain(REDACTED);
+    });
+
+    it(`leaves ConfigMap '${dataKey}:' intact on the JSON path`, () => {
+      const out = JSON.stringify(
+        scrubJsonValue({ kind: "ConfigMap", [dataKey]: { LOG_LEVEL: "debug" } }),
+      );
+
+      expect(out).toContain("debug");
+      expect(out).not.toContain(REDACTED);
+    });
+  }
+
+  // `kind: secretstore` is a different resource (external-secrets.io), not a
+  // Secret. Widening the gate must not swallow neighbouring kinds by prefix.
+  it("does not treat a 'secretstore' kind as a Secret", () => {
+    const out = scrubYamlText(`kind: secretstore\ndata:\n  LOG_LEVEL: debug\n`);
+
+    expect(out).toContain("LOG_LEVEL: debug");
+    expect(out).not.toContain(REDACTED);
+  });
+});
