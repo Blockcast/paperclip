@@ -115,6 +115,83 @@ describe("scrubYamlText — the shape kubectl actually emits", () => {
     expect(out).toContain(`env: "${REDACTED}"`);
   });
 
+  it("swallows a wrapped plain-scalar value, not just block scalars", () => {
+    // kubectl's serializer folds long values at spaces, so a value can continue
+    // on deeper-indented lines without any `|`/`>` marker. Handling only block
+    // scalars printed `value: "<redacted>"` and then the plaintext underneath
+    // it — worse than not scrubbing, because the marker implies it worked.
+    const pod = [
+      "    env:",
+      "    - name: CONNECTION_STRING",
+      `      value: some prefix ${LEAK}`,
+      `        ${LEAK}-continued`,
+      "    - name: AFTER",
+      "      value: plain",
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    expectNoLeak(out);
+    // The swallow stops at the next entry rather than eating the rest of the block.
+    expect(out).toContain("name: AFTER");
+    expect(out.match(/value: "<redacted>"/g)).toHaveLength(2);
+  });
+
+  it("swallows a double-quoted value wrapped across lines", () => {
+    const pod = [
+      "    env:",
+      "    - name: CONNECTION_STRING",
+      `      value: "prefix`,
+      `        ${LEAK}"`,
+      "    - name: AFTER",
+      "      value: plain",
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    expectNoLeak(out);
+    expect(out).toContain("name: AFTER");
+  });
+
+  it("fails closed on a flow-mapping entry inside a block env", () => {
+    // `- {name: A, value: B}` as a sequence entry: the value sits in a construct
+    // this scanner does not parse, so the entry is dropped rather than passed
+    // through. `env: [...]` on one line is a different shape, covered above.
+    const pod = [
+      "    env:",
+      `    - {name: OPENAI_API_KEY, value: ${LEAK}}`,
+      "    - name: AFTER",
+      "      value: plain",
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    expectNoLeak(out);
+    expect(out).toContain("name: AFTER");
+  });
+
+  it("does not let the value swallow a sibling valueFrom block", () => {
+    // The swallow boundary is load-bearing: `valueFrom:` sits at the same indent
+    // as `value:`, so it must survive, along with its deeper-indented children.
+    const pod = [
+      "    env:",
+      "    - name: LITERAL",
+      `      value: ${LEAK}`,
+      "    - name: FROM_SECRET",
+      "      valueFrom:",
+      "        secretKeyRef:",
+      "          name: app-credentials",
+      "          key: token",
+    ].join("\n");
+
+    const out = scrubYamlText(pod);
+
+    expectNoLeak(out);
+    expect(out).toContain("secretKeyRef:");
+    expect(out).toContain("name: app-credentials");
+    expect(out).toContain("key: token");
+  });
+
   it("leaves `value:` keys outside an env block alone", () => {
     // Redacting every `value:` in the document would destroy unrelated,
     // non-secret spec data.
@@ -176,6 +253,24 @@ describe("scrubYamlText — the shape kubectl actually emits", () => {
       "metadata:",
       "  annotations:",
       `    kubectl.kubernetes.io/last-applied-configuration: '{"env":[{"name":"A","value":"${LEAK}"}]}'`,
+      "  name: example",
+    ].join("\n");
+
+    const out = scrubYamlText(doc);
+
+    expectNoLeak(out);
+    expect(out).toContain("name: example");
+  });
+
+  it("swallows a wrapped echo annotation, whose value is long by nature", () => {
+    // The last-applied JSON is long, so it is the field most likely to be
+    // wrapped by the serializer. Redacting the key while printing the wrapped
+    // remainder would leak the resource echo this field is redacted to remove.
+    const doc = [
+      "metadata:",
+      "  annotations:",
+      `    kubectl.kubernetes.io/last-applied-configuration: '{"env":[{"name":"A",`,
+      `      "value":"${LEAK}"}]}'`,
       "  name: example",
     ].join("\n");
 
