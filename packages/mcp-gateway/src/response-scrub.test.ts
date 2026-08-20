@@ -1170,3 +1170,127 @@ describe("the two paths must agree on what a Secret is", () => {
     expect(out).not.toContain(REDACTED);
   });
 });
+
+/**
+ * PEN-2431, door #5: `spec.containers[].command` / `args`.
+ *
+ * Every test here pairs the absence assertion with a positive one on the same
+ * output. An assert-absence test passes when the harness is broken and produces
+ * nothing at all, so "the marker is gone" is only evidence if something that
+ * should have survived is demonstrably still there.
+ */
+describe("argv redaction inside a container list (PEN-2431 door #5)", () => {
+  const podYaml = (key: string, listKey = "containers") =>
+    [
+      "spec:",
+      `  ${listKey}:`,
+      "  - name: server",
+      "    image: ghcr.io/example/app:v1",
+      `    ${key}:`,
+      `    - --token=${LEAK}`,
+      "    - --namespace=kube-system",
+      "    restartCount: 3",
+      "",
+    ].join("\n");
+
+  for (const listKey of ["containers", "initContainers", "ephemeralContainers"]) {
+    for (const key of ["command", "args"]) {
+      it(`redacts '${key}' in '${listKey}' on the YAML path`, () => {
+        const out = scrubYamlText(podYaml(key, listKey));
+
+        expectNoLeak(out);
+        // Positive baseline: the surrounding diagnostics survive, so the
+        // absence above is redaction and not an empty return.
+        expect(out).toContain("name: server");
+        expect(out).toContain("image: ghcr.io/example/app:v1");
+        expect(out).toContain("restartCount: 3");
+        // Design note 2: the flag name is the diagnostic, so it is kept.
+        expect(out).toContain("--token=");
+        expect(out).toContain("--namespace=");
+      });
+
+      it(`redacts '${key}' in '${listKey}' on the JSON path`, () => {
+        const out = JSON.stringify(
+          scrubJsonValue({
+            spec: {
+              [listKey]: [
+                { name: "server", [key]: [`--token=${LEAK}`, "serve"] },
+              ],
+            },
+          }),
+        );
+
+        expectNoLeak(out);
+        expect(out).toContain("server");
+        expect(out).toContain("--token=");
+      });
+    }
+  }
+
+  it("redacts a bare positional argument, which has no flag name to keep", () => {
+    const out = JSON.stringify(
+      scrubJsonValue({
+        spec: { containers: [{ name: "c", args: [LEAK, "serve"] }] },
+      }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("c");
+    // No name/value split exists for a positional, so the whole token goes.
+    expect(out).toContain(REDACTED);
+  });
+
+  it("fails closed on a flow sequence rather than passing it through", () => {
+    const out = scrubYamlText(
+      `spec:\n  containers:\n  - name: c\n    args: [--token=${LEAK}]\n`,
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("name: c");
+  });
+
+  /**
+   * The regression that matters most, and the one the first cut of this fix
+   * missed: `pods_get` does not return a bare pod document. It returns JSON-RPC
+   * whose `content[].text` carries the YAML rendering, and a nested string is
+   * only handed to a scanner when `mightContainSecrets` trips on it. A pod
+   * whose only carrier is `args:` has no `env:` key and no `kind: Secret`, so
+   * every argv rule above was unreachable in the production shape while passing
+   * when called directly. A redaction rule is only as reachable as its
+   * pre-filter.
+   */
+  it("redacts argv through the production JSON-RPC envelope, not just direct calls", () => {
+    const body = JSON.stringify({
+      result: { content: [{ type: "text", text: podYaml("args") }] },
+    });
+
+    const out = scrubResponseBody(Buffer.from(body), "application/json").toString();
+
+    expectNoLeak(out);
+    expect(out).toContain("name: server");
+    expect(out).toContain("restartCount: 3");
+  });
+
+  it("leaves 'args' outside a container list untouched", () => {
+    // The shape this gateway carries constantly: an Actions workflow / MCP tool
+    // schema. Redacting a bare `args:` would corrupt ordinary traffic on a key
+    // far more common than `env:`.
+    const out = JSON.stringify(
+      scrubJsonValue({ jobs: { build: { steps: [{ args: ["--verbose"] }] } } }),
+    );
+
+    expect(out).toContain("--verbose");
+    expect(out).not.toContain(REDACTED);
+  });
+
+  it("leaves a ConfigMap carrying an 'args' key intact", () => {
+    // ConfigMap `data` stays preserved (recorded decision, residual risk), and
+    // the argv gate must not reach into it just because a key is named `args`.
+    const out = scrubYamlText(
+      "kind: ConfigMap\ndata:\n  args: --log-level=debug\n",
+    );
+
+    expect(out).toContain("--log-level=debug");
+    expect(out).not.toContain(REDACTED);
+  });
+});
