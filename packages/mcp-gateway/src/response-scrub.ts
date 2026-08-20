@@ -33,9 +33,11 @@
  *    walk that text with an indentation-aware scanner instead.
  *
  * 4. FAIL CLOSED. Where the scanner cannot confidently tell where a value ends
- *    (block scalars, flow mappings), it removes more rather than less. A
- *    scrubber that guesses in the permissive direction is worse than none: it
- *    produces false assurance.
+ *    (block scalars, wrapped plain/quoted scalars, flow mappings), it removes
+ *    more rather than less — every line indented deeper than a redacted key is
+ *    dropped, since it can only be a continuation of that value. A scrubber
+ *    that guesses in the permissive direction is worse than none: emitting
+ *    `value: "<redacted>"` above the plaintext manufactures false assurance.
  *
  * SCOPE HONESTY: this closes the `env`-value path on responses that traverse
  * this gateway. It is not a general secret detector, and it does not by itself
@@ -108,6 +110,8 @@ function continuesBlock(line: string, blockIndent: number): boolean {
 
 /** Matches a `value:` key, optionally as the first key of a sequence entry. */
 const VALUE_KEY = /^(\s*)(-\s+)?value:(.*)$/;
+/** Matches a sequence entry whose content opens a flow mapping or sequence. */
+const FLOW_SEQUENCE_ENTRY = /^(\s*)(-\s+)[{[]/;
 /** Matches an `env:` key that opens a block (nothing but a comment after it). */
 const ENV_BLOCK_KEY = /^(\s*)(-\s+)?env:\s*(#.*)?$/;
 /** Matches an `env:` key whose value is inline (flow style, or an alias). */
@@ -134,8 +138,8 @@ export function scrubYamlText(text: string): string {
 
   // Indentation of the currently open `env:` block, or null when outside one.
   let envBlockIndent: number | null = null;
-  // While set, we are swallowing the continuation lines of a redacted block
-  // scalar; every line indented deeper than this is part of the value.
+  // While set, we are swallowing the continuation lines of a value we already
+  // replaced; every line indented deeper than this belongs to that value.
   let swallowDeeperThan: number | null = null;
 
   for (const line of lines) {
@@ -154,25 +158,45 @@ export function scrubYamlText(text: string): string {
     // Drop annotations that echo the entire resource (and thus its env values).
     const echo = ECHO_ANNOTATION_KEY.exec(line);
     if (echo) {
-      const [, indent, dash = "", quote, key, rest] = echo;
+      const [, indent, dash = "", quote, key] = echo;
       out.push(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`);
-      if (opensBlockScalar(rest ?? "")) {
-        swallowDeeperThan = leadingIndent(line) + (dash?.length ?? 0);
-      }
+      // Same reasoning as `value:` below: any deeper-indented line that follows
+      // is a continuation of this scalar, never a sibling annotation, so drop it
+      // whatever style it was written in.
+      swallowDeeperThan = leadingIndent(line) + (dash?.length ?? 0);
       continue;
     }
 
     if (envBlockIndent !== null) {
       const value = VALUE_KEY.exec(line);
       if (value) {
-        const [, indent, dash = "", rest] = value;
+        const [, indent, dash = ""] = value;
         out.push(`${indent}${dash}value: "${REDACTED}"`);
-        if (opensBlockScalar(rest ?? "")) {
-          // `value: |` — the material is on the following, deeper-indented
-          // lines. Swallow them, or we would redact the key and print the
-          // secret directly underneath it.
-          swallowDeeperThan = indent.length + dash.length;
-        }
+        // Swallow every following line indented deeper than this key, whatever
+        // scalar style produced it. `value: |` is the obvious case, but a plain
+        // or quoted scalar wraps across lines too — kubectl's serializer folds
+        // long values at spaces — and a deeper-indented line after `value:` can
+        // only be a continuation of it. A sibling key (`valueFrom:`) sits at the
+        // *same* indent, so it survives.
+        //
+        // Restricting this to `|`/`>` was a real leak: we printed
+        // `value: "<redacted>"` and then the plaintext on the next line, which
+        // is worse than not scrubbing at all because the marker manufactures
+        // false assurance.
+        swallowDeeperThan = indent.length + dash.length;
+        continue;
+      }
+
+      // A sequence entry that opens a flow mapping (`- {name: A, value: B}`).
+      // The value sits inside a construct we do not parse, so fail closed and
+      // drop the entry rather than pass the literal through. Rare from
+      // kubectl's serializer, which emits block style, but this scanner runs on
+      // whatever the upstream sends, not on what we expect it to send.
+      const flowEntry = FLOW_SEQUENCE_ENTRY.exec(line);
+      if (flowEntry) {
+        const [, indent, dash] = flowEntry;
+        out.push(`${indent}${dash}"${REDACTED}"`);
+        swallowDeeperThan = indent.length + dash.length;
         continue;
       }
     }
@@ -207,11 +231,6 @@ export function scrubYamlText(text: string): string {
   }
 
   return out.join("\n");
-}
-
-/** True when a YAML scalar header defers the value to following lines. */
-function opensBlockScalar(rest: string): boolean {
-  return /^\s*[|>]/.test(rest);
 }
 
 /**
