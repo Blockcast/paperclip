@@ -1722,8 +1722,10 @@ export {
 } from "./validators/index.js";
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./types/milestone.js";
 export {
+  approvalGateSchema,
   createApprovalSchema,
   listApprovalsQuerySchema,
+  parseApprovalGate,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
@@ -1731,6 +1733,7 @@ export {
   resubmitApprovalSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
+  type ApprovalGate,
   type CreateApproval,
   type ListApprovalsQuery,
   type UpsertBudgetPolicy,

@@ -240,6 +240,62 @@ export async function githubGetPullRequestGate(input: {
   return { state: body.state, merged: body.merged === true };
 }
 
+/**
+ * Terminal-state lookup for a single Actions run, used to decide whether a board
+ * approval card that points at that run is still worth a human's attention.
+ *
+ * The three outcomes are kept distinct on purpose (BLO-29359). A card must only be
+ * closed on positive evidence that its gate is over: `not_found` is that evidence
+ * (the run is gone), `error` explicitly is NOT — a rate-limited or 5xx lookup must
+ * leave the card alone and retry, or a throttled GitHub would silently retire live
+ * gates.
+ */
+export type WorkflowRunLookup =
+  | { outcome: "found"; status: string; conclusion: string | null; htmlUrl: string | null }
+  | { outcome: "not_found" }
+  | { outcome: "error"; retryable: boolean; reason: string };
+
+export async function githubGetWorkflowRun(input: {
+  repoFullName: string;
+  runId: number;
+}): Promise<WorkflowRunLookup> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) {
+    return { outcome: "error", retryable: tokenResult.retryable, reason: tokenResult.reason };
+  }
+
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  let res: Response;
+  try {
+    res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/actions/runs/${input.runId}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+    });
+  } catch {
+    return { outcome: "error", retryable: true, reason: "workflow_run_fetch_failed" };
+  }
+  if (res.status === 404) return { outcome: "not_found" };
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("workflow_run", res);
+    return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+  }
+  const body = (await res.json().catch(() => null)) as {
+    status?: string;
+    conclusion?: string | null;
+    html_url?: string;
+  } | null;
+  if (typeof body?.status !== "string") {
+    // A 200 without a status is not evidence of anything; treat as retryable so a
+    // malformed response cannot retire a live gate.
+    return { outcome: "error", retryable: true, reason: "workflow_run_status_missing" };
+  }
+  return {
+    outcome: "found",
+    status: body.status,
+    conclusion: typeof body.conclusion === "string" ? body.conclusion : null,
+    htmlUrl: typeof body.html_url === "string" ? body.html_url : null,
+  };
+}
+
 /** Extract the leading 7-40 hex chars of a head SHA, or null. */
 function headShaHex(headSha: string | null | undefined): string | null {
   if (!headSha) return null;
