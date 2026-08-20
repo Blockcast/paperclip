@@ -561,7 +561,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateApproval",
-      "Create a board approval request, optionally linked to one or more issues. Pass idempotencyKey (a stable token derived from the ask itself, e.g. \"rotate-creds:BLO-18969\") so a retry replays the original instead of filing a duplicate: the response then carries deduplicated:true and a statusReadback line telling you the original is still pending. A pending approval emits nothing on its own, so use that readback — or paperclipListApprovals with view=count — instead of re-filing to find out.",
+      "Create a board approval request, optionally linked to one or more issues. Pass idempotencyKey (a stable token derived from the ask itself, e.g. \"rotate-creds:BLO-18969\") so a retry replays the original instead of filing a duplicate: the response then carries deduplicated:true and a statusReadback line telling you the original is still pending. A pending approval emits nothing on its own, so use that readback — or paperclipListApprovals with view=count — instead of re-filing to find out. When the ask is \"a human must click a GitHub Actions gate\", ALSO set payload.gate = {kind:\"github_actions_run\", repoFullName, runId} (url optional) — naming the run in prose alone leaves nothing able to tell whether that gate is still alive, and the card then outlives its run and sends approvers to a dead gate. With payload.gate set, the card is closed automatically and the death announced on every linked issue once the run terminates (BLO-29359).",
       createApprovalToolSchema,
       async ({ companyId, ...body }) => {
         const resolved = await client.resolveCompany({ override: companyId });
