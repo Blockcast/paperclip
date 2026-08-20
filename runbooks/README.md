@@ -55,6 +55,15 @@ platform cannot resolve automatically. Each runbook should be:
   an all-clear. Trigger: alert `PaperclipOverdueScheduledRetry`,
   `PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed`, or
   `max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`.
+- [`external-runtime-reservation-stranded.md`](external-runtime-reservation-stranded.md)
+  — an agent holds an unreleased `external_runtime_reservations` row whose run
+  is terminal or silent. The row IS the agent's concurrency lock, so the blast
+  radius is every launch for that agent, not just the run that stranded it.
+  Covers the adapter-type-migration cause (BLO-27700), why the raw
+  `..._oldest_age_seconds` gauge must not be alerted on, and why clearing
+  `job_name`/`job_uid` to unwedge it leaks a live pod. Trigger: alert
+  `PaperclipExternalRuntimeReservationStranded` or
+  `PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed`.
 - [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
   — you are adjudicating an open productivity review and the reviewed issue's
   monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active

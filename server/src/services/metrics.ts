@@ -129,6 +129,18 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
+// BLO-28865. Deliberately NOT a threshold over the pre-existing
+// EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC: that gauge is unlabelled and
+// measures reservation age only, so it cannot separate a stranded row from a
+// legitimately long run (measured 7d spread: ~93 min to ~9.0h, all healthy)
+// and cannot name the wedged agent. This gauge encodes the correlation in SQL
+// instead -- it only counts a reservation whose run is terminal or silent --
+// so the alert is a plain threshold over a series that is already 0 for a
+// healthy long run.
+export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
+  "paperclip_external_runtime_reservation_stranded_oldest_age_seconds";
+export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -1101,6 +1113,8 @@ let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
+let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
+let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -1157,6 +1171,8 @@ function ensureRegistry(): {
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
+  externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
+  externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -1175,6 +1191,8 @@ function ensureRegistry(): {
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
     || !queuedRunAgeMetricsRefreshSuccess
+    || !externalRuntimeReservationStrandedOldestAge
+    || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -1296,6 +1314,30 @@ function ensureRegistry(): {
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess.set(0);
+    externalRuntimeReservationStrandedOldestAge = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest STRANDED unreleased external-runtime reservation for an agent "
+        + "(BLO-28865). Stranded means the reservation's heartbeat run is already terminal, or the run "
+        + "is non-terminal but has emitted nothing past the hard-stale floor. A legitimately "
+        + "long-running run is neither, so it contributes 0 -- that is the whole point, and the reason "
+        + "this exists alongside " + EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC + " rather than "
+        + "being a threshold over it: that gauge is unlabelled and measures age alone, which cannot "
+        + "distinguish a wedge from a long run. Reset-then-set every refresh so an agent whose "
+        + "reservation is released reads back an explicit 0 rather than a frozen stale value or an "
+        + "absent series (an absent series and 'nothing stuck' render identically). Labeled by bounded "
+        + "agent_id so the alert names who is wedged.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    externalRuntimeReservationStrandMetricsRefreshSuccess = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent stranded-reservation database refresh completed before metrics "
+        + "exposition; 0 when it failed, so stale strand ages cannot be read as fresh.",
+      registers: [registry],
+    });
+    externalRuntimeReservationStrandMetricsRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -1668,6 +1710,9 @@ function ensureRegistry(): {
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
+    externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
+    externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
+      externalRuntimeReservationStrandMetricsRefreshSuccess,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -1882,7 +1927,19 @@ export function recordAgentZeroTokenCompletedRunStreak(
   return { ...labels, streak };
 }
 
-const EXTERNAL_RUNTIME_RESERVATION_EVENTS = new Set(["reserved", "contended", "launching", "launched", "released"]);
+const EXTERNAL_RUNTIME_RESERVATION_EVENTS = new Set([
+  "reserved",
+  "contended",
+  "launching",
+  "launched",
+  "released",
+  // BLO-28865. Distinct from every other label here: the rest are lifecycle
+  // transitions, this one is a fault -- a launch arriving under a Job name the
+  // reservation was not launched with (the adapter-type strand). It is
+  // enumerated rather than left to fall through to "other" precisely so it can
+  // be alerted and graphed on its own.
+  "name_mismatch",
+]);
 
 export function recordExternalRuntimeReservationEvent(event: string): string {
   const normalized = EXTERNAL_RUNTIME_RESERVATION_EVENTS.has(event) ? event : "other";
@@ -1950,6 +2007,38 @@ export function setScheduledRetryParkHorizonMetrics(
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
   ensureRegistry().scheduledRetryParkHorizonRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the oldest STRANDED external-runtime reservation age per known agent
+ * (BLO-28865). Same reset-then-set contract as
+ * {@link setQueuedRunOldestAgeMetrics}, and for the same reason: an agent whose
+ * reservation is released must read 0 rather than retaining an age that would
+ * hold the strand alert open forever.
+ */
+export function setExternalRuntimeReservationStrandedOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().externalRuntimeReservationStrandedOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/** Mark whether the stranded-reservation gauge was refreshed from the database. */
+export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().externalRuntimeReservationStrandMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -2410,6 +2499,8 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
   queuedRunAgeMetricsRefreshSuccess = null;
+  externalRuntimeReservationStrandedOldestAge = null;
+  externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
