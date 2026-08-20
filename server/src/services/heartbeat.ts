@@ -185,6 +185,7 @@ import {
   matchesTaskKey,
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
+import { readOrphanedRunTerminalResult } from "./orphaned-run-terminal-result.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -20484,6 +20485,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleKill?: boolean;
   }) {
     let preserveRecordedOutcome = false;
+    // PEN-2421: set when the run's own pod-written terminal result
+    // is what rescued the outcome, so the run record distinguishes an
+    // agent-self-reported success from the PR-review evidence path below.
+    let recoveredTerminalResult: { subtype: string | null } | null = null;
     let prReviewIncompleteOverride: {
       errorCode: string;
       errorMessage: string;
@@ -20550,6 +20555,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reviewEvidence.status === "archived_repo_skipped" ||
         reviewEvidence.status === "self_review_skipped";
     }
+    // PEN-2421: a TTL-collected Job is not evidence that its run
+    // died. Agent Jobs set `ttlSecondsAfterFinished`, so the Job object is
+    // correctly GC'd minutes after a *successful* agent exits; if the adapter
+    // owner died before finalizing, this sweep then finds no Job and records
+    // `job_missing` over a run that had succeeded. That both corrupts run
+    // statistics (failure counts contain successes) and manufactures the waste
+    // it reports, because the run is rescheduled and already-delivered work is
+    // re-done.
+    //
+    // The agent's own terminal verdict survives on the shared data PVC, so
+    // consult it before concluding the run was lost. Deliberately last and
+    // additive: it runs only when the BLO-18106 PR-review evidence path neither
+    // preserved the outcome nor found a review incomplete, so no existing
+    // finalization decision changes. Only an explicit `is_error: false` terminal
+    // event can rescue a run -- an absent, empty, or truncated artifact stays
+    // `job_missing`, which is what keeps a genuinely destroyed run failed.
+    if (
+      !input.staleKill && !input.jobStatus && !preserveRecordedOutcome && !prReviewIncompleteOverride
+    ) {
+      const recovered = await readOrphanedRunTerminalResult({
+        companyId: input.run.companyId,
+        agentId: input.run.agentId,
+        runId: input.run.id,
+      });
+      const rescued = recovered.outcome === "found" && recovered.succeeded;
+      if (rescued) {
+        preserveRecordedOutcome = true;
+        recoveredTerminalResult = { subtype: recovered.subtype };
+      }
+      await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: rescued
+          ? "Recovered a successful terminal result from the run's own output artifact during missing-Job recovery"
+          : `Missing-Job recovery found no successful terminal result artifact: ${
+            recovered.outcome === "found" ? `reported ${recovered.subtype ?? "failure"}` : recovered.reason
+          }`,
+        payload: {
+          outcome: recovered.outcome,
+          ...(recovered.outcome === "found"
+            ? { succeeded: recovered.succeeded, subtype: recovered.subtype }
+            : { reason: recovered.reason }),
+        },
+      });
+    }
     const baseTerminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
@@ -20614,6 +20665,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }
               : {}),
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(recoveredTerminalResult
+              ? {
+                  recoveredFrom: "pod_terminal_result",
+                  recoveredResultSubtype: recoveredTerminalResult.subtype,
+                }
+              : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
