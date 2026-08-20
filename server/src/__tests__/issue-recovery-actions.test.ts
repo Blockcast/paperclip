@@ -6175,9 +6175,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
      * BLO-28871. Every test above stamps `triggeredAt` exactly on a slot
      * boundary, so the raw key and the runbook's floored key happen to be the
      * same string and the suppression guard looked correct. Production is not
-     * like that: the live cron is `7 */6 * * *`, so runs trigger at `:07:xx`
-     * while every receipt on the alert surface is keyed to the floored UTC slot.
-     * These use the real shape.
+     * like that: the live cron fires at minute 7 of every sixth hour, so runs
+     * trigger at `:07:xx` while every receipt on the alert surface is keyed to
+     * the floored UTC slot. These use the real shape.
      */
     describe("window identity is the routine's window, not the raw trigger timestamp", () => {
       // The BLO-28387 shape, measured live: window `2026-08-18T00:00:00.000Z`
