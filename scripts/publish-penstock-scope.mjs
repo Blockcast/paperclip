@@ -28,13 +28,21 @@
  * SAFETY
  * ------
  * Dry-run by default (`npm publish --dry-run`). Pass `--publish` to actually
- * publish; `--provenance` is added only in CI (OIDC). The workflow that calls this
- * is `workflow_dispatch`-only, so nothing publishes on push.
+ * publish. The workflow that calls this is `workflow_dispatch`-only, so nothing
+ * publishes on push.
+ *
+ * `--provenance` is NOT passed by the release workflow and cannot be. npm rejects a
+ * sigstore attestation minted off a self-hosted runner ("Only 'github-hosted'
+ * runners are supported when publishing with provenance", 422), and
+ * scripts/check-github-runner-labels.mjs requires every workflow in this repo to
+ * use an ARC label — so there is no runner here that can attest. The flag is kept
+ * for a local/hosted publish outside CI. OIDC trusted publishing — the
+ * authentication half — works on ARC and is unaffected.
  *
  * Usage:
  *   node scripts/publish-penstock-scope.mjs --version 2026.614.0            # dry-run (default)
  *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --bootstrap # one-time local 2FA first-publish
- *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --publish --provenance  # CI/OIDC (the workflow)
+ *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --publish   # CI/OIDC on ARC (the workflow)
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";

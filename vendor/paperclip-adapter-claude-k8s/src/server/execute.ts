@@ -1448,6 +1448,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     envSecret = built.envSecret;
     mcpConfigSecret = built.mcpConfigSecret;
     podLogPath = built.podLogPath;
+    await onLog("stdout", `[paperclip] Resolved ServiceAccount: ${built.serviceAccountName}\n`);
     if (built.skippedLabels.length > 0) {
       await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
     }
@@ -1462,6 +1463,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         commandNotes: [
           `Image: ${job.spec?.template.spec?.containers[0]?.image ?? "unknown"}`,
           `Namespace: ${namespace}`,
+          `ServiceAccount: ${built.serviceAccountName}`,
           `Timeout: ${timeoutSec}s`,
           `Skills (${desiredSkills.length}): ${skillSummary}`,
         ],

@@ -147,6 +147,20 @@ env:
   # -- Extra environment variables merged verbatim into the container spec.
   # Example: `[{name: NODE_OPTIONS, value: --max-old-space-size=3072}]`.
   extra: []
+  # Deployment requirement, not a default this chart can safely set:
+  # the bundled `claude_k8s` adapter resolves its Job pod ServiceAccount from
+  # the per-agent `serviceAccountName` config field, then from
+  # PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME, and then *refuses to build the Job
+  # manifest* rather than falling through to the namespace `default`
+  # ServiceAccount, which has no cluster-scoped read (BLO-21499/BLO-21812).
+  # So if you run `claude_k8s` agents that have no per-agent value, add to
+  # `env.extra` above:
+  #   - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
+  #     value: <a ServiceAccount that exists in the release namespace>
+  # Left unset here deliberately: the correct account name is cluster-specific
+  # and a wrong-but-present default would fail at pod admission instead of at
+  # Job build, which is the harder failure to read. See
+  # values.blockcast.yaml for the Blockcast overlay that sets it.
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
 # plugins or runtime helpers read from disk (for example Authbot service keys).
