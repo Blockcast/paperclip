@@ -322,6 +322,8 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   applyCcrotateCapacityDecision,
+  CCROTATE_CAPACITY_INTENDED_COVERAGE_MS,
+  CCROTATE_CAPACITY_MAX_PARK_MS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
 } from "./ccrotate-capacity-retry.js";
 import {
@@ -731,15 +733,21 @@ const K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS = Math.max(
 // surfaces for operator attention instead of looping forever. PEN-382.
 //
 // BLO-22860 raised this from 24. It is not an independent knob: it is the
-// second half of the horizon cap above, and the two MUST be sized together.
-// Before the cap, attempts were paced by the provider's own `resumeAt`, so 24
-// of them spanned however long the provider asked for. Capping each hop makes
-// the ceiling bind on wall clock instead — at the 4h maximum hop, 24 attempts
-// would have covered only ~3.5 days, converting the 5.2-day window observed on
-// BLO-22844 into a hard exhaustion (strictly worse than the uncapped park this
-// issue set out to fix). 48 attempts cover ~7.5 days, clearing both windows on
-// record with headroom. Shorten the cap or the max hop and this must grow.
-export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 48;
+// second half of the horizon cap, and the two MUST be sized together. That
+// pairing used to be asserted by this comment and enforced by nobody, and it
+// drifted — the text below derived 48 from a "4h maximum hop" that matches no
+// constant in the tree, concluding "~7.5 days" against a shipped pair that
+// actually buys 12h. The count is now derived from the cap it is paired with,
+// so shortening the cap grows the count instead of silently cutting coverage.
+//
+// The value is unchanged: ceil(12h / 15m) = 48. See
+// CCROTATE_CAPACITY_INTENDED_COVERAGE_MS for the coverage figure, the
+// contradiction between this file's and ccrotate-capacity-retry.ts's accounts
+// of whether exhaustion is the desired outcome, and the open decision on
+// whether 12h is the right target at all.
+export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = Math.ceil(
+  CCROTATE_CAPACITY_INTENDED_COVERAGE_MS / CCROTATE_CAPACITY_MAX_PARK_MS,
+);
 // When adapter resolution momentarily falls back to the no-op `process`
 // adapter for a non-process agent type (e.g. claude_k8s briefly unresolved),
 // we treat it as a transient miss and schedule a quick bounded retry instead

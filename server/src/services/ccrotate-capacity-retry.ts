@@ -38,10 +38,46 @@
 
 /**
  * Longest a capacity deferral may park before re-probing. Paired with
- * CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS (24) this bounds a non-recovering pool at
- * roughly six hours of polling before it escalates for operator attention.
+ * CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS this bounds a non-recovering pool before
+ * it escalates for operator attention; the coverage that pair buys is named and
+ * derived at {@link CCROTATE_CAPACITY_INTENDED_COVERAGE_MS} below rather than
+ * restated here, so shortening this cap cannot silently shorten coverage.
  */
 export const CCROTATE_CAPACITY_MAX_PARK_MS = 15 * 60 * 1000;
+
+/**
+ * How long the capacity re-probe loop is intended to keep polling before it
+ * gives up and escalates. `CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS` is derived from
+ * this and {@link CCROTATE_CAPACITY_MAX_PARK_MS}, so the pair cannot drift the
+ * way TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS was introduced to stop (BLO-23525).
+ *
+ * The value is the coverage already shipping today (48 attempts x 15m), named
+ * rather than changed. Two docblocks previously derived the attempt count from
+ * numbers that match no constant in the tree, and they contradicted each other:
+ *
+ *   - heartbeat.ts reasoned at a "4h maximum hop" (no such constant; the hop cap
+ *     is the 15m above) and concluded "48 attempts cover ~7.5 days".
+ *   - this file reasoned at "(24) ... roughly six hours" — correct when the
+ *     attempt count was 24, stale since BLO-22860 raised it to 48.
+ *
+ * Neither described the shipped pair. Deriving from one named figure makes the
+ * arithmetic checkable and puts any future change to coverage in one place.
+ *
+ * They also disagree on whether exhaustion is the *goal* or a *failure*:
+ * this file's header calls escalating after exhaustion "the outcome we want
+ * from a multi-day outage rather than silent frozen work", while heartbeat.ts
+ * calls hard exhaustion "strictly worse than the uncapped park this issue set
+ * out to fix". Both are shipped, and they cannot both be the intent.
+ *
+ * OPEN DECISION (not resolved here, deliberately): 12h of coverage is far short
+ * of {@link LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS} (124.8h), which would
+ * need ~500 attempts at this cap. Whether to buy that coverage, or to accept
+ * exhaustion and escalate, is the same question the two docblocks answer
+ * differently — an operator/product call, not one to settle by picking a
+ * constant. This change makes the shortfall explicit and leaves the number
+ * alone; {@link ccrotateCapacityCoverageShortfallMs} reports the gap.
+ */
+export const CCROTATE_CAPACITY_INTENDED_COVERAGE_MS = 12 * 60 * 60 * 1000;
 
 /**
  * Jitter as a fraction of the resolved delay. Spreads a cohort that was denied
@@ -222,6 +258,21 @@ export const LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS = 124.8 * 60 * 60 * 10
 export const TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS = Math.ceil(
   LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS / MAX_TRANSIENT_RETRY_HORIZON_MS,
 );
+
+/**
+ * How far {@link CCROTATE_CAPACITY_INTENDED_COVERAGE_MS} falls short of the
+ * longest capacity outage on record, in ms (0 when it covers it).
+ *
+ * Reporting the gap rather than closing it is deliberate — see the OPEN
+ * DECISION on the coverage constant. This exists so the shortfall is a value
+ * something can assert on, instead of a subtraction nobody performs.
+ */
+export function ccrotateCapacityCoverageShortfallMs(): number {
+  return Math.max(
+    0,
+    LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS - CCROTATE_CAPACITY_INTENDED_COVERAGE_MS,
+  );
+}
 
 /**
  * Clamp a provider-advertised retry floor so a finalized run cannot park past
