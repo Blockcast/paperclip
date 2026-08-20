@@ -660,3 +660,86 @@ describe("scrubResponseBody — pass-through is byte-exact", () => {
     expectNoLeak(out.toString("utf8"));
   });
 });
+
+/**
+ * Three fail-opens found by probing the scrubber's own entry point rather than
+ * re-reading it. Each one returned the payload with the plaintext intact, so the
+ * assertion that matters is the absence of the marker — not the presence of
+ * `<redacted>`, which was never emitted on these paths at all.
+ */
+describe("scrubResponseBody — fail-opens in stream detection and framing", () => {
+  const leakyPayload = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      content: [{ type: "text", text: `env:\n- name: OPENAI_API_KEY\n  value: ${LEAK}\n` }],
+    },
+  });
+
+  it("scrubs a stream whose lines are terminated by a lone CR", () => {
+    // All three of CRLF, LF and CR terminate a line in an event stream.
+    // Splitting on "\n" alone left a CR-only stream as one unsplit line, so no
+    // line began with `data:` and the whole body passed through in the clear.
+    const body = Buffer.from(`event: message\rdata: ${leakyPayload}\r\r`);
+
+    const out = scrubResponseBody(body, "text/event-stream").toString("utf8");
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+    expect(out).toContain("OPENAI_API_KEY");
+  });
+
+  it("scrubs a stream that opens on a field other than event:/data:", () => {
+    // With no content-type to dispatch on, the sniff decides. It recognized only
+    // `event:`/`data:`, so a stream opening on `id:` was classified as neither
+    // SSE nor JSON and returned untouched.
+    const body = Buffer.from(`id: 7\ndata: ${leakyPayload}\n\n`);
+
+    const out = scrubResponseBody(body, null).toString("utf8");
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("scrubs a stream that opens on a comment line", () => {
+    const body = Buffer.from(`:keep-alive\ndata: ${leakyPayload}\n\n`);
+
+    expectNoLeak(scrubResponseBody(body, null).toString("utf8"));
+  });
+
+  it("leaves a non-SSE body that merely opens on an SSE-looking token byte-exact", () => {
+    // Widening the sniff must not start rewriting unrelated traffic: with no
+    // `data:` lines there is nothing to redact, so the original Buffer is
+    // returned rather than a re-serialized copy.
+    const body = Buffer.from("id: 7\nnote: nothing secret here\n");
+
+    expect(scrubResponseBody(body, null)).toBe(body);
+  });
+});
+
+describe("scrubJsonValue — env serialized as a mapping", () => {
+  it("redacts the values of an env mapping and keeps the names", () => {
+    // Kubernetes emits env as a list, but the JSON path exists so an upstream
+    // shape change cannot silently make this a no-op. The generic recursion
+    // carries no "inside env" state, so a mapping fell through with every value
+    // in the clear.
+    const out = JSON.stringify(
+      scrubJsonValue({ kind: "Pod", spec: { containers: [{ env: { OPENAI_API_KEY: LEAK } }] } }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+    expect(out).toContain(REDACTED);
+  });
+
+  it("preserves a valueFrom-shaped reference inside an env mapping", () => {
+    const out = scrubJsonValue({
+      kind: "Pod",
+      env: { TOKEN: { secretKeyRef: { name: "creds", key: "token" } } },
+    });
+
+    // A reference names a source without carrying the material, so it survives.
+    expect(JSON.stringify(out)).toContain("secretKeyRef");
+    expect(JSON.stringify(out)).toContain("creds");
+  });
+});
