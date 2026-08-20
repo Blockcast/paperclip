@@ -39,10 +39,31 @@
  *    that guesses in the permissive direction is worse than none: emitting
  *    `value: "<redacted>"` above the plaintext manufactures false assurance.
  *
- * SCOPE HONESTY: this closes the `env`-value path on responses that traverse
- * this gateway. It is not a general secret detector, and it does not by itself
- * establish the fleet-wide invariant that agent-visible tool output is
- * systematically scrubbed — see PEN-2370 ask 3.
+ *    Note that fail-closed substitution changes YAML *types*: `env:` becomes a
+ *    string where a list was, and a dropped flow entry becomes a string where a
+ *    mapping was. That is deliberate — a client that re-parses the scrubbed
+ *    document may hit a type error rather than find a redaction marker, and a
+ *    type error is the safe direction to fail in.
+ *
+ * 5. `Secret` IS COVERED, NOT JUST `env`. The same read-only grant serves
+ *    `resources_get`/`resources_list` with an arbitrary `apiVersion`/`kind`, and
+ *    a `v1 Secret` carries its material directly in `data` (base64) and
+ *    `stringData` (plaintext). Scrubbing `pods_get` while leaving that path open
+ *    would close the harder route and leave the easier one, so within a document
+ *    whose `kind` is `Secret`/`SecretList` we redact both keys wholesale. Other
+ *    kinds keep their `data` — a ConfigMap read stays fully diagnostic.
+ *
+ * 6. PASS-THROUGH IS BYTE-EXACT. When nothing was redacted we return the
+ *    original Buffer rather than a re-serialized copy. This gateway also proxies
+ *    the GitHub and Paperclip upstreams, where a diff or issue body mentioning
+ *    `env:` is routine; re-stringifying those would silently round integers
+ *    above 2^53 and rewrite `1.0` as `1`. Redaction still re-serializes — that
+ *    cost is accepted only on bodies we actually had to change.
+ *
+ * SCOPE HONESTY: this closes the `env`-value and `Secret`-material paths on
+ * responses that traverse this gateway. It is not a general secret detector, and
+ * it does not by itself establish the fleet-wide invariant that agent-visible
+ * tool output is systematically scrubbed — see PEN-2370 ask 3.
  */
 
 export const REDACTED = "<redacted>";
@@ -64,15 +85,37 @@ const RESOURCE_ECHO_ANNOTATIONS = [
 ];
 
 /**
- * Cheap pre-filter. Scrubbing is a no-op for the overwhelming majority of
- * responses (tool listings, metrics, Linear payloads), and we are on the hot
- * path for every proxied response, so skip the scan unless the body could
- * plausibly contain something we redact.
+ * Cheap pre-filter for *decoded* strings.
+ *
+ * Used to decide whether to recurse into a string field that may itself hold a
+ * serialized resource (`content[].text`, an annotation map). It is deliberately
+ * NOT used to gate parsing of a whole response body: on a raw body a nested
+ * JSON resource appears escaped (`\"env\":`), which matches neither an `env:`
+ * nor an `"env"` probe, so gating on the raw bytes made the JSON path
+ * unreachable from the only entry point the proxy uses. `scrubResponseBody`
+ * dispatches on the body's *shape* instead and relies on this filter — which
+ * only ever sees decoded strings — to keep the walk cheap.
  */
 function mightContainSecrets(text: string): boolean {
-  if (text.includes("env:") || text.includes('"env"')) return true;
+  if (ENV_KEY_PROBE.test(text)) return true;
+  if (SECRET_KIND_PROBE.test(text)) return true;
   return RESOURCE_ECHO_ANNOTATIONS.some((a) => text.includes(a));
 }
+
+/**
+ * An `env` key in any of the spellings the scanners below accept: bare,
+ * double-quoted, or single-quoted. A plain `includes("env:")` missed `'env':`
+ * entirely, so a single-quoted resource nested in a text field was never even
+ * scanned.
+ */
+const ENV_KEY_PROBE = /(^|[^A-Za-z0-9_])(["']?)env\2\s*:/;
+
+/**
+ * A `Secret`/`SecretList` document, in YAML or JSON spelling. Needed because a
+ * Secret body contains no `env` key at all — the pre-filter did not trip on one
+ * before, so `resources_get kind=Secret` was never scanned.
+ */
+const SECRET_KIND_PROBE = /(["']?)kind\1\s*:\s*(["']?)Secret(List)?\2(\s|,|}|$)/;
 
 function leadingIndent(line: string): number {
   let i = 0;
@@ -108,21 +151,77 @@ function continuesBlock(line: string, blockIndent: number): boolean {
   return line.slice(indent).startsWith("- ");
 }
 
-/** Matches a `value:` key, optionally as the first key of a sequence entry. */
-const VALUE_KEY = /^(\s*)(-\s+)?value:(.*)$/;
+/**
+ * Matches a `value:` key, optionally as the first key of a sequence entry.
+ *
+ * The key name may be quoted. YAML allows `"value": x` and `'value': x`, and
+ * both reached the plaintext before this was accounted for — the same quoting
+ * allowance `ECHO_ANNOTATION_KEY` already made.
+ */
+const VALUE_KEY = /^(\s*)(-\s+)?(["']?)value\3:(.*)$/;
 /** Matches a sequence entry whose content opens a flow mapping or sequence. */
 const FLOW_SEQUENCE_ENTRY = /^(\s*)(-\s+)[{[]/;
 /** Matches an `env:` key that opens a block (nothing but a comment after it). */
-const ENV_BLOCK_KEY = /^(\s*)(-\s+)?env:\s*(#.*)?$/;
+const ENV_BLOCK_KEY = /^(\s*)(-\s+)?(["']?)env\3:\s*(#.*)?$/;
 /** Matches an `env:` key whose value is inline (flow style, or an alias). */
-const ENV_INLINE_KEY = /^(\s*)(-\s+)?env:[ \t]+(\S.*)$/;
+const ENV_INLINE_KEY = /^(\s*)(-\s+)?(["']?)env\3:[ \t]+(\S.*)$/;
 /** Matches an annotation key we drop wholesale. */
 const ECHO_ANNOTATION_KEY = new RegExp(
   `^(\\s*)(-\\s+)?(["']?)(${RESOURCE_ECHO_ANNOTATIONS.map(escapeRegExp).join("|")})\\3:(.*)$`,
 );
+/**
+ * Matches the `data:`/`stringData:` key of a Secret, block or inline. Only
+ * consulted inside a document already identified as a Secret, so a ConfigMap's
+ * `data` is untouched.
+ */
+const SECRET_DATA_KEY = /^(\s*)(-\s+)?(["']?)(data|stringData)\3:(.*)$/;
+/** A YAML document separator. */
+const DOC_SEPARATOR = /^---(\s|$)/;
+/** A `kind: Secret` / `kind: SecretList` line. */
+const SECRET_KIND_LINE = /^\s*(-\s+)?(["']?)kind\2:\s*(["']?)Secret(List)?\3\s*(#.*)?$/;
+
+/** Names whose value is the Secret's material, in the JSON shape. */
+const SECRET_MATERIAL_KEYS = new Set(["data", "stringData"]);
+const SECRET_KINDS = new Set(["Secret", "SecretList"]);
+
+/** Threaded through the scrubbers so a pure pass-through can be detected. */
+type ScrubContext = { changed: boolean };
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Flag every line belonging to a document whose `kind` is `Secret`.
+ *
+ * This needs a pass of its own because the key order works against a streaming
+ * scanner: Kubernetes serializes fields alphabetically, so `data:` arrives
+ * *before* `kind: Secret`. A single forward pass would have to redact `data`
+ * before it could know the document was a Secret.
+ */
+function markSecretDocuments(lines: string[]): boolean[] {
+  const flags = new Array<boolean>(lines.length).fill(false);
+  let start = 0;
+
+  const finish = (end: number): void => {
+    let isSecret = false;
+    for (let i = start; i < end; i += 1) {
+      if (SECRET_KIND_LINE.test(lines[i]!)) {
+        isSecret = true;
+        break;
+      }
+    }
+    if (isSecret) for (let i = start; i < end; i += 1) flags[i] = true;
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    if (DOC_SEPARATOR.test(lines[i]!)) {
+      finish(i);
+      start = i + 1;
+    }
+  }
+  finish(lines.length);
+  return flags;
 }
 
 /**
@@ -133,7 +232,26 @@ function escapeRegExp(s: string): string {
  * spec — images, phases, restart counts, resource limits — survives intact.
  */
 export function scrubYamlText(text: string): string {
-  const lines = text.split("\n");
+  return scrubYamlTextTracked(text, { changed: false });
+}
+
+function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
+  // Split so that each line's own terminator is preserved and re-emitted. A
+  // plain `split("\n")` left a trailing `\r` glued to the line content, and
+  // since `.` does not match `\r` and these patterns are not `/m`-flagged,
+  // `value: SECRET\r` failed to match while `env:\r` still matched (its `\s*`
+  // absorbed the `\r`). The block was entered and every value line inside it
+  // was then emitted verbatim — a silent fail-open on any CRLF upstream. A lone
+  // `\r` is a YAML line break too, so it is split on as well.
+  const parts = text.split(/(\r\n|\n|\r)/);
+  const lines: string[] = [];
+  const seps: string[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    lines.push(parts[i]!);
+    seps.push(parts[i + 1] ?? "");
+  }
+
+  const secretDoc = markSecretDocuments(lines);
   const out: string[] = [];
 
   // Indentation of the currently open `env:` block, or null when outside one.
@@ -142,7 +260,17 @@ export function scrubYamlText(text: string): string {
   // replaced; every line indented deeper than this belongs to that value.
   let swallowDeeperThan: number | null = null;
 
-  for (const line of lines) {
+  const emit = (content: string, index: number): void => {
+    out.push(content + seps[index]!);
+  };
+  const redact = (content: string, index: number): void => {
+    ctx.changed = true;
+    emit(content, index);
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+
     if (swallowDeeperThan !== null) {
       if (isBlank(line) || leadingIndent(line) > swallowDeeperThan) {
         // Part of the block scalar we already replaced. Drop it.
@@ -159,7 +287,7 @@ export function scrubYamlText(text: string): string {
     const echo = ECHO_ANNOTATION_KEY.exec(line);
     if (echo) {
       const [, indent, dash = "", quote, key] = echo;
-      out.push(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`);
+      redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
       // Same reasoning as `value:` below: any deeper-indented line that follows
       // is a continuation of this scalar, never a sibling annotation, so drop it
       // whatever style it was written in.
@@ -167,11 +295,26 @@ export function scrubYamlText(text: string): string {
       continue;
     }
 
+    // A Secret carries its material in `data`/`stringData` rather than in an
+    // `env` block, so it needs its own key. Redacting the whole subtree rather
+    // than each entry is the fail-closed choice and costs no diagnostics: unlike
+    // env, where the *names* are the diagnostic value, a Secret's keys are
+    // already visible in the pods that mount it.
+    if (secretDoc[index]) {
+      const secretData = SECRET_DATA_KEY.exec(line);
+      if (secretData) {
+        const [, indent, dash = "", quote, key] = secretData;
+        redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+        swallowDeeperThan = indent!.length + dash.length;
+        continue;
+      }
+    }
+
     if (envBlockIndent !== null) {
       const value = VALUE_KEY.exec(line);
       if (value) {
-        const [, indent, dash = ""] = value;
-        out.push(`${indent}${dash}value: "${REDACTED}"`);
+        const [, indent, dash = "", quote] = value;
+        redact(`${indent}${dash}${quote}value${quote}: "${REDACTED}"`, index);
         // Swallow every following line indented deeper than this key, whatever
         // scalar style produced it. `value: |` is the obvious case, but a plain
         // or quoted scalar wraps across lines too — kubectl's serializer folds
@@ -183,7 +326,7 @@ export function scrubYamlText(text: string): string {
         // `value: "<redacted>"` and then the plaintext on the next line, which
         // is worse than not scrubbing at all because the marker manufactures
         // false assurance.
-        swallowDeeperThan = indent.length + dash.length;
+        swallowDeeperThan = indent!.length + dash.length;
         continue;
       }
 
@@ -195,8 +338,8 @@ export function scrubYamlText(text: string): string {
       const flowEntry = FLOW_SEQUENCE_ENTRY.exec(line);
       if (flowEntry) {
         const [, indent, dash] = flowEntry;
-        out.push(`${indent}${dash}"${REDACTED}"`);
-        swallowDeeperThan = indent.length + dash.length;
+        redact(`${indent}${dash}"${REDACTED}"`, index);
+        swallowDeeperThan = indent!.length + dash!.length;
         continue;
       }
     }
@@ -206,13 +349,13 @@ export function scrubYamlText(text: string): string {
     // value rather than let an unparsed one through.
     const inlineEnv = ENV_INLINE_KEY.exec(line);
     if (inlineEnv) {
-      const [, indent, dash = "", rest] = inlineEnv;
-      if (rest.startsWith("[") || rest.startsWith("{")) {
-        out.push(`${indent}${dash}env: "${REDACTED}"`);
+      const [, indent, dash = "", quote, rest] = inlineEnv;
+      if (rest!.startsWith("[") || rest!.startsWith("{")) {
+        redact(`${indent}${dash}${quote}env${quote}: "${REDACTED}"`, index);
         continue;
       }
       // An alias/anchor (`env: *shared`) carries no material by itself.
-      out.push(line);
+      emit(line, index);
       continue;
     }
 
@@ -222,15 +365,15 @@ export function scrubYamlText(text: string): string {
       // The block's contents are owned by the `env` key itself. When env is the
       // first key of a sequence entry (`- env:`), the dash is part of the
       // indentation its children align against.
-      envBlockIndent = indent.length + dash.length;
-      out.push(line);
+      envBlockIndent = indent!.length + dash.length;
+      emit(line, index);
       continue;
     }
 
-    out.push(line);
+    emit(line, index);
   }
 
-  return out.join("\n");
+  return out.join("");
 }
 
 /**
@@ -241,33 +384,50 @@ export function scrubYamlText(text: string): string {
  * upgrade cannot silently turn this scrubber into a no-op.
  */
 export function scrubJsonValue(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(scrubJsonValue);
+  return scrubJsonValueTracked(node, { changed: false }, false);
+}
+
+function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boolean): unknown {
+  if (Array.isArray(node)) return node.map((n) => scrubJsonValueTracked(n, ctx, inSecret));
   if (!node || typeof node !== "object") return node;
 
   const source = node as Record<string, unknown>;
   const result: Record<string, unknown> = {};
 
+  // A `SecretList`'s items usually carry no `kind` of their own, so the flag has
+  // to descend rather than be re-derived at each level.
+  const kind = source.kind;
+  const nowSecret = inSecret || (typeof kind === "string" && SECRET_KINDS.has(kind));
+
   for (const [key, value] of Object.entries(source)) {
+    if (nowSecret && SECRET_MATERIAL_KEYS.has(key)) {
+      result[key] = REDACTED;
+      ctx.changed = true;
+      continue;
+    }
     if (key === "env" && Array.isArray(value)) {
       result[key] = value.map((entry) => {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
         const envVar = entry as Record<string, unknown>;
         // Preserve `name` and any `valueFrom` reference; drop only the literal.
-        return "value" in envVar ? { ...envVar, value: REDACTED } : envVar;
+        if (!("value" in envVar)) return envVar;
+        ctx.changed = true;
+        return { ...envVar, value: REDACTED };
       });
       continue;
     }
     if (RESOURCE_ECHO_ANNOTATIONS.includes(key) && typeof value === "string") {
       result[key] = REDACTED;
+      ctx.changed = true;
       continue;
     }
     if (typeof value === "string") {
       // Resource echoes also appear as YAML/JSON text nested in string fields
       // (annotation maps, `content[].text`). Recurse into the text.
-      result[key] = mightContainSecrets(value) ? scrubText(value) : value;
+      result[key] = mightContainSecrets(value) ? scrubTextTracked(value, ctx) : value;
       continue;
     }
-    result[key] = scrubJsonValue(value);
+    result[key] = scrubJsonValueTracked(value, ctx, nowSecret);
   }
 
   return result;
@@ -277,16 +437,29 @@ export function scrubJsonValue(node: unknown): unknown {
  * Scrub a text payload that may be YAML, JSON, or several YAML documents.
  */
 export function scrubText(text: string): string {
+  return scrubTextTracked(text, { changed: false });
+}
+
+function scrubTextTracked(text: string, ctx: ScrubContext): string {
   const trimmed = text.trimStart();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
-      return JSON.stringify(scrubJsonValue(JSON.parse(text)));
+      const parsed: unknown = JSON.parse(text);
+      const nested: ScrubContext = { changed: false };
+      const scrubbed = JSON.stringify(scrubJsonValueTracked(parsed, nested, false));
+      if (nested.changed) {
+        ctx.changed = true;
+        return scrubbed;
+      }
+      // Nothing to redact in this nested document. Return the original text so a
+      // pass-through stays byte-exact rather than being silently re-serialized.
+      return text;
     } catch {
       // Not valid JSON after all — fall through to the YAML scanner, which
       // degrades gracefully on arbitrary text.
     }
   }
-  return scrubYamlText(text);
+  return scrubYamlTextTracked(text, ctx);
 }
 
 /**
@@ -298,19 +471,48 @@ export function scrubText(text: string): string {
  * scrubber that corrupts unrelated traffic is a worse failure than one that
  * misses a body we did not recognize. The formats we *do* recognize are the
  * ones that carry k8s resources.
+ *
+ * Dispatch is on the body's *shape*, not on a content probe. Probing the raw
+ * bytes for `env:`/`"env"` skipped any body whose resource arrived as JSON
+ * nested in `content[].text`, because there the key is escaped (`\"env\":`) and
+ * matches neither form — which made the entire JSON path dead code from this
+ * entry point. The per-string filter inside the walk sees decoded strings and is
+ * sound, so that is where the cheap check belongs.
  */
 export function scrubResponseBody(body: Buffer, contentType?: string | null): Buffer {
-  const text = body.toString("utf8");
-  if (!mightContainSecrets(text)) return body;
+  const isSse = (contentType ?? "").includes("text/event-stream") || startsWithSseField(body);
+  if (!isSse && !startsWithJsonPunctuation(body)) return body;
 
-  const isSse = (contentType ?? "").includes("text/event-stream") || /^(event|data):/m.test(text);
-  const scrubbed = isSse ? scrubSseFrames(text) : scrubJsonRpcBody(text);
-  return scrubbed === null ? body : Buffer.from(scrubbed, "utf8");
+  const text = body.toString("utf8");
+  const ctx: ScrubContext = { changed: false };
+  const scrubbed = isSse ? scrubSseFrames(text, ctx) : scrubJsonRpcBody(text, ctx);
+
+  // Returning the original Buffer — not a re-serialized equal-looking one — is
+  // what keeps pass-through byte-exact. `JSON.parse`/`JSON.stringify` is lossy
+  // for integers above 2^53 and normalizes `1.0` to `1`, and this gateway also
+  // proxies GitHub and Paperclip bodies that legitimately mention `env:`.
+  if (scrubbed === null || !ctx.changed) return body;
+  return Buffer.from(scrubbed, "utf8");
 }
 
-function scrubJsonRpcBody(text: string): string | null {
+/** First non-whitespace byte is `{` or `[`, checked without allocating. */
+function startsWithJsonPunctuation(body: Buffer): boolean {
+  for (const byte of body) {
+    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
+    return byte === 0x7b /* { */ || byte === 0x5b /* [ */;
+  }
+  return false;
+}
+
+/** Body opens an SSE field line (`event:` / `data:`), checked on the Buffer. */
+function startsWithSseField(body: Buffer): boolean {
+  const head = body.subarray(0, 6).toString("latin1");
+  return head.startsWith("event:") || head.startsWith("data:");
+}
+
+function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
   try {
-    return JSON.stringify(scrubJsonValue(JSON.parse(text)));
+    return JSON.stringify(scrubJsonValueTracked(JSON.parse(text), ctx, false));
   } catch {
     return null;
   }
@@ -322,15 +524,20 @@ function scrubJsonRpcBody(text: string): string | null {
  * SSE payloads may be split across consecutive `data:` lines that concatenate
  * into one JSON document, so we buffer a run of them and scrub the join. Blank
  * lines terminate an event and are emitted verbatim to keep the stream valid.
+ *
+ * Note that a buffered run is re-emitted as a *single* `data:` line, joined with
+ * `""`. The SSE spec joins multi-line data with `"\n"`, so this is only
+ * equivalent because the payloads here are JSON, where whitespace between tokens
+ * is insignificant. Do not reuse this helper for a non-JSON `data:` stream.
  */
-function scrubSseFrames(text: string): string {
+function scrubSseFrames(text: string, ctx: ScrubContext): string {
   const out: string[] = [];
   let pending: string[] = [];
 
   const flush = (): void => {
     if (pending.length === 0) return;
     const joined = pending.join("");
-    const scrubbed = scrubJsonRpcBody(joined);
+    const scrubbed = scrubJsonRpcBody(joined, ctx);
     out.push(`data: ${scrubbed ?? joined}`);
     pending = [];
   };
