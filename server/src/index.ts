@@ -1615,6 +1615,28 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Approval-gate reconciler (BLO-29359). Closes board approval cards whose
+  // external GitHub gate has terminated and announces the death on every linked
+  // issue. Worker-tier only and idempotent: each close re-checks that the card is
+  // still undecided, so a human decision landing mid-sweep always wins. Requires
+  // GitHub App credentials — without them every lookup defers and the sweep is a
+  // no-op, so it is gated on them rather than logging once per pass.
+  if (config.approvalGateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Approval-gate reconciler disabled: GitHub App credentials are not configured (BLO-29359)",
+      );
+    } else {
+      const { startApprovalGateReconciler } = await import("./services/approval-gate-reconciler.js");
+      logger.info(
+        { intervalMinutes: config.approvalGateReconcilerIntervalMinutes },
+        "Approval-gate reconciler enabled (BLO-29359)",
+      );
+      startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
+    }
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.

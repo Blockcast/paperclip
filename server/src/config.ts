@@ -102,6 +102,11 @@ export interface Config {
   // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
   strandedBlockedIssueReconcilerEnabled: boolean;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Approval-gate reconciler (BLO-29359): closes board approval cards whose
+  // external GitHub gate has terminated, so an approver is never sent to a dead
+  // run. Worker-tier only, same rationale as the PR reconciler.
+  approvalGateReconcilerEnabled: boolean;
+  approvalGateReconcilerIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -425,6 +430,18 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES) || 15,
   );
+  const approvalGateReconcilerEnabled =
+    process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED === "true"
+      : true;
+  // 10 minutes: the cost of a stale card is an approver walking to a dead gate, and
+  // the observed gate lifetimes that produced this defect were hours, not minutes.
+  // Each sweep costs one GitHub REST call per pending gate card, so the population
+  // (pending cards carrying a gate) bounds the rate-limit exposure, not the cadence.
+  const approvalGateReconcilerIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES) || 10,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -471,6 +488,8 @@ export function loadConfig(): Config {
     prReconcilerEnrichLoc,
     strandedBlockedIssueReconcilerEnabled,
     strandedBlockedIssueReconcilerIntervalMinutes,
+    approvalGateReconcilerEnabled,
+    approvalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
     serveUi:

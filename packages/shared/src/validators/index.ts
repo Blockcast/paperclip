@@ -551,13 +551,16 @@ export {
 } from "./goal.js";
 
 export {
+  approvalGateSchema,
   createApprovalSchema,
   listApprovalsQuerySchema,
+  parseApprovalGate,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
+  type ApprovalGate,
   type CreateApproval,
   type ListApprovalsQuery,
   type ResolveApproval,
