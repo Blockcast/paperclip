@@ -322,6 +322,9 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   applyCcrotateCapacityDecision,
+  resolveCapacityEscalation,
+  CAPACITY_ESCALATION_AFTER_MS,
+  CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
 } from "./ccrotate-capacity-retry.js";
 import {
@@ -730,16 +733,22 @@ const K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS = Math.max(
 // Backstop so a pool that never recovers eventually stops re-deferring and
 // surfaces for operator attention instead of looping forever. PEN-382.
 //
-// BLO-22860 raised this from 24. It is not an independent knob: it is the
-// second half of the horizon cap above, and the two MUST be sized together.
-// Before the cap, attempts were paced by the provider's own `resumeAt`, so 24
-// of them spanned however long the provider asked for. Capping each hop makes
-// the ceiling bind on wall clock instead — at the 4h maximum hop, 24 attempts
-// would have covered only ~3.5 days, converting the 5.2-day window observed on
-// BLO-22844 into a hard exhaustion (strictly worse than the uncapped park this
-// issue set out to fix). 48 attempts cover ~7.5 days, clearing both windows on
-// record with headroom. Shorten the cap or the max hop and this must grow.
-export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 48;
+// BLO-28919: this is now measured on the WALL CLOCK, not in attempts. The
+// attempt count that used to live here (48) was the real give-up horizon and
+// its own docblock had the arithmetic wrong by ~15x — it reasoned at a "4h
+// maximum hop" that matched no constant in the tree and concluded "48 attempts
+// cover ~7.5 days", where 48 x CCROTATE_CAPACITY_MAX_PARK_MS (15m) is 12h.
+// Both provider outages on record (BLO-22844 at 124.8h, BLO-23438 at ~5.2d)
+// fall outside 12h, so they would have hard-exhausted — the outcome the comment
+// below at the exhaustion branch calls "lost for real, not merely late".
+//
+// The fix is structural rather than a bigger number: `attempts x cadence`
+// couples re-probe promptness to outage tolerance, so shortening a hop silently
+// shrinks coverage with nothing failing. That coupling is why this class
+// recurred four times. See CAPACITY_ESCALATION_AFTER_MS for the full argument.
+// `scheduledRetryAttempt` still increments, but it is observability only and
+// terminates nothing.
+export { CAPACITY_ESCALATION_AFTER_MS };
 // When adapter resolution momentarily falls back to the no-op `process`
 // adapter for a non-process agent type (e.g. claude_k8s briefly unresolved),
 // we treat it as a transient miss and schedule a quick bounded retry instead
@@ -14750,16 +14759,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (capacity) {
         const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
-        if (nextAttempt > CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS) {
-          // The pool never recovered within the retry budget. Terminate the
-          // scheduled retry so it surfaces for operator attention instead of
-          // looping forever.
+        // BLO-28919: the give-up condition is how long the pool has ACTUALLY
+        // been down, not how many times we looked. Reading the chain origin off
+        // the row rather than counting hops is what decouples outage tolerance
+        // from re-probe cadence; see CAPACITY_ESCALATION_AFTER_MS.
+        const capacityEscalation = resolveCapacityEscalation({
+          firstDeferredAtIso: parseObject(dueRun.resultJson)[
+            CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY
+          ],
+          now,
+        });
+        if (capacityEscalation.exhausted) {
+          // The pool never recovered inside the escalation horizon. Terminate
+          // the scheduled retry so it surfaces for operator attention instead
+          // of looping forever.
+          const downForHours = (capacityEscalation.elapsedMs / (60 * 60 * 1000)).toFixed(1);
           const exhausted = await db
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: `provider capacity retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; pool did not recover`,
+              error: `provider capacity retry exhausted after ${downForHours}h unavailable (${dueRun.scheduledRetryAttempt ?? 0} re-probes); pool did not recover`,
               errorCode: "rate_limit_exhausted",
               updatedAt: now,
             })
@@ -14798,10 +14818,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eventType: "lifecycle",
               stream: "system",
               level: "warn",
-              message: "provider capacity retry exhausted; pool did not recover within the retry budget",
+              message:
+                "provider capacity retry exhausted; pool did not recover within the escalation horizon",
               payload: {
                 scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
-                maxAttempts: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+                capacityUnavailableMs: capacityEscalation.elapsedMs,
+                capacityEscalationAfterMs: capacityEscalation.escalateAfterMs,
+                capacityFirstDeferredAt: capacityEscalation.firstDeferredAtIso,
                 ccrotateTarget: capacity.target,
                 providerCapacityReason: capacity.reason,
                 ...(capacity.penstockProvider ? { penstockProvider: capacity.penstockProvider } : {}),
@@ -14857,6 +14880,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryAfterSeconds: capacity.penstockRetryAfterSeconds,
           advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
           clampedFromIso: capacityRetryPlan.clampedFromIso,
+          // Set once for the chain. `resolveCapacityEscalation` already echoed
+          // back the stored origin when the row had one, so passing it here is
+          // idempotent — it only takes effect on the first hop.
+          firstDeferredAtIso: capacityEscalation.firstDeferredAtIso,
         });
         const rescheduled = await db
           .update(heartbeatRuns)
@@ -14892,6 +14919,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload: {
               scheduledRetryAttempt: nextAttempt,
               scheduledRetryAt: nextDueAt.toISOString(),
+              // How long the pool has been down, and the horizon it is racing.
+              // Reported on every hop so a chain approaching escalation is
+              // legible without replaying the whole run history (BLO-28919).
+              capacityUnavailableMs: capacityEscalation.elapsedMs,
+              capacityEscalationAfterMs: capacityEscalation.escalateAfterMs,
+              capacityFirstDeferredAt: capacityEscalation.firstDeferredAtIso,
               ccrotateTarget: capacity.target,
               providerCapacityReason: capacity.reason,
               ...(capacityRetryPlan.clampedFromIso
@@ -27460,9 +27493,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // value there would reintroduce the very park this clamp removes, on the
       // next failure of the same run. The provider's claim is preserved
       // verbatim under its own key instead.
+      const capacityDeferredAt = new Date();
       const capacityRetryPlan = resolveCcrotateCapacityRetry({
         resumeAt: gateResult.resumeAt,
-        now: new Date(),
+        now: capacityDeferredAt,
         defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
       });
       const advertisedResumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
@@ -27604,6 +27638,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 retryAfterSeconds: gateResult.retryAfterSeconds,
                 advertisedResumeAtIso: advertisedResumeAtIso,
                 clampedFromIso: capacityRetryPlan.clampedFromIso,
+                // First hop of a fresh chain by construction — this is the
+                // insert path — so the escalation clock starts here rather than
+                // at the first re-defer. Same instant the park was computed
+                // from, so the origin and the first hop cannot disagree
+                // (BLO-28919).
+                firstDeferredAtIso: capacityDeferredAt.toISOString(),
               },
             ),
             contextSnapshot: retryContextSnapshot,

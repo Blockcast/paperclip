@@ -15,7 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS, heartbeatService } from "../services/heartbeat.js";
+import { CAPACITY_ESCALATION_AFTER_MS, heartbeatService } from "../services/heartbeat.js";
 import {
   CCROTATE_CAPACITY_MAX_PARK_MS,
   CCROTATE_CAPACITY_PARK_JITTER_RATIO,
@@ -704,11 +704,17 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     );
   });
 
-  it("stops re-deferring and terminates once the retry cap is reached", async () => {
+  it("stops re-deferring and terminates once the pool has been down past the escalation horizon", async () => {
     const { companyId, agentId } = await seedAgent();
     const runId = randomUUID();
     const due = new Date("2026-04-20T03:02:00.000Z");
-    // A capacity retry that has already exhausted its attempts budget.
+    // BLO-28919: exhaustion is now decided on WALL CLOCK, not attempt count, so
+    // this row is aged past the escalation horizon rather than given a large
+    // `scheduledRetryAttempt`. The attempt count is deliberately left LOW to
+    // prove attempts no longer terminate anything: under the old
+    // `attempts > CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS` rule this row would have
+    // been re-deferred, not exhausted.
+    const firstDeferredAt = new Date(due.getTime() - CAPACITY_ESCALATION_AFTER_MS - 60 * 60 * 1000);
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
@@ -717,9 +723,12 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       status: "scheduled_retry",
       scheduledRetryReason: "ccrotate_capacity",
       scheduledRetryAt: due,
-      scheduledRetryAttempt: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+      scheduledRetryAttempt: 3,
       errorCode: "rate_limit_exhausted",
-      resultJson: { errorFamily: "rate_limit_exhausted" },
+      resultJson: {
+        errorFamily: "rate_limit_exhausted",
+        penstockCapacityFirstDeferredAt: firstDeferredAt.toISOString(),
+      },
       contextSnapshot: { wakeSource: "assignment" },
     });
 
@@ -751,6 +760,119 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     expect(escalations[0]?.status).toBe("todo");
   });
 
+  it("keeps re-deferring a young chain no matter how many attempts it has burned", async () => {
+    // BLO-28919 Critical 1, reproduced. This is the row shape the old rule got
+    // wrong: `attempts x CCROTATE_CAPACITY_MAX_PARK_MS` made 48 hops = 12h the
+    // real give-up horizon, so a pool 3h into an outage that had been re-probed
+    // briskly would be CANCELLED — and a GitHub delivery parked there is "lost
+    // for real, not merely late". Both outages on record (124.8h, ~5.2d) sit
+    // outside 12h, so the population this ticket is about would have hard
+    // exhausted. Attempts must no longer terminate anything.
+    const { companyId, agentId } = await seedAgent();
+    const runId = randomUUID();
+    const due = new Date("2026-04-20T03:02:00.000Z");
+    const attemptsPastOldCap = 96; // 2x the retired 48-attempt cap
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAt: due,
+      scheduledRetryAttempt: attemptsPastOldCap,
+      errorCode: "rate_limit_exhausted",
+      resultJson: {
+        errorFamily: "rate_limit_exhausted",
+        // Well inside the escalation horizon: the provider has been down 3h.
+        penstockCapacityFirstDeferredAt: new Date(
+          due.getTime() - 3 * 60 * 60 * 1000,
+        ).toISOString(),
+      },
+      contextSnapshot: { wakeSource: "assignment" },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGate(new Date("2026-04-20T09:00:00.000Z")),
+      skipQueuedRunDispatch: true,
+    });
+    await heartbeat.promoteDueScheduledRetries(due);
+
+    const row = await db
+      .select({
+        status: heartbeatRuns.status,
+        attempt: heartbeatRuns.scheduledRetryAttempt,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(
+      row?.status,
+      "a pool only 3h into an outage must keep re-deferring however many attempts it has burned",
+    ).toBe("scheduled_retry");
+    expect(row?.attempt).toBe(attemptsPastOldCap + 1);
+
+    // No escalation issue: the horizon has not elapsed, so nothing is escalated.
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, companyId), eq(issues.originKind, "ccrotate_capacity_exhausted")),
+      );
+    expect(escalations.length, "a young chain files no escalation").toBe(0);
+  });
+
+  it("carries the chain origin across a re-defer, so the horizon can actually elapse", async () => {
+    // The infinite-park hazard, pinned end-to-end. `applyCcrotateCapacityDecision`
+    // deletes and rewrites every key in CCROTATE_CAPACITY_DECISION_KEYS on each
+    // hop by design. If `penstockCapacityFirstDeferredAt` were in that list it
+    // would be re-seeded to `now` every hop, elapsed time would never grow, and
+    // the run would park FOREVER — strictly worse than the 24h backstop this
+    // ticket removed. This asserts the value survives a real re-defer.
+    const { companyId, agentId } = await seedAgent();
+    const runId = randomUUID();
+    const due = new Date("2026-04-20T03:02:00.000Z");
+    const origin = new Date(due.getTime() - 5 * 60 * 60 * 1000).toISOString();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAt: due,
+      scheduledRetryAttempt: 1,
+      errorCode: "rate_limit_exhausted",
+      resultJson: {
+        errorFamily: "rate_limit_exhausted",
+        penstockCapacityFirstDeferredAt: origin,
+        // A stale descriptive field that MUST be replaced on re-defer, proving
+        // the wipe still happens and only the origin is exempt from it.
+        penstockRetryAfterSeconds: 3834,
+      },
+      contextSnapshot: { wakeSource: "assignment" },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGate(new Date("2026-04-20T09:00:00.000Z")),
+      skipQueuedRunDispatch: true,
+    });
+    await heartbeat.promoteDueScheduledRetries(due);
+
+    const result = await db
+      .select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => (rows[0]?.resultJson ?? {}) as Record<string, unknown>);
+
+    expect(
+      result.penstockCapacityFirstDeferredAt,
+      "the chain origin is set once and survives the decision-key wipe",
+    ).toBe(origin);
+  });
+
   it("coalesces escalation to one issue per pool when multiple agents exhaust the same target", async () => {
     const { companyId, agentId: agentA } = await seedAgent();
     const due = new Date("2026-04-20T03:02:00.000Z");
@@ -768,9 +890,15 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
         status: "scheduled_retry",
         scheduledRetryReason: "ccrotate_capacity",
         scheduledRetryAt: due,
-        scheduledRetryAttempt: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+        scheduledRetryAttempt: 3,
         errorCode: "rate_limit_exhausted",
-        resultJson: { errorFamily: "rate_limit_exhausted" },
+        resultJson: {
+          errorFamily: "rate_limit_exhausted",
+          // Aged past the wall-clock escalation horizon (BLO-28919).
+          penstockCapacityFirstDeferredAt: new Date(
+            due.getTime() - CAPACITY_ESCALATION_AFTER_MS - 60 * 60 * 1000,
+          ).toISOString(),
+        },
         contextSnapshot: { wakeSource: "assignment" },
       });
 
