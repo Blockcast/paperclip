@@ -26,6 +26,7 @@
 # Env:
 #   ITERATIONS    iteration count (default 20)
 #   LOAD_WORKERS  "auto" (default) | "off" | integer count of busy-loop workers
+#   LOAD_SETTLE_S seconds to settle before sampling the load baseline (default 90)
 #   LOAD_WARMUP_S seconds to let the load average converge (default 240)
 #   OUT_DIR       output directory (default ./soak-out)
 #
@@ -256,10 +257,16 @@ printf 'finished=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SUMMARY"
 #     therefore not attributable to this job on its own.
 # The verdict still tests observed load against TARGET_LOAD_PER_CORE; the
 # attribution line says whether that observation is plausibly ours.
+#
+# Everything from the opening quote below to the closing `}'` is ONE shell
+# single-quoted string, so a lone apostrophe anywhere inside it -- including in
+# an awk comment -- ends the quote and the remainder parses as shell. Write them
+# escaped ('\'') as the strings below do. The suite runs `bash -n` over this
+# file precisely because a break here is invisible to a text-matching test.
 verdict="$(
   printf '%s\n' "${LOADS[@]}" | paste -d' ' - <(printf '%s\n' "${DURS[@]}") | awk \
     -v n="$NPROC" -v target="$TARGET_LOAD_PER_CORE" -v base="$BASELINE_DUR_S" \
-    -v workers="$WORKERS" -v baseload="$BASELINE_LOAD" '
+    -v workers="$WORKERS" -v baseload="$BASELINE_LOAD" -v settle="$LOAD_SETTLE_S" '
     {
       l = $1; d = $2;
       lsum += l; dsum += d;
@@ -278,6 +285,15 @@ verdict="$(
         lmin, lmean, lmax, lmin / n, lmean / n, lmax / n, n;
       printf "load0 delta vs pre-burner baseline %.2f: min=%+.2f mean=%+.2f max=%+.2f\n",
         baseload, dlmin, dlmean, dlmax;
+      # The reader of the artifact is the one who needs the baseline'\''s limit, and
+      # they only get these numbers -- so state it here rather than leaving it in
+      # the source comment on LOAD_SETTLE_S. The ceiling below makes an inflated
+      # delta VISIBLE; it does not make the baseline correct.
+      if (settle > 0)
+        printf "  ^ that baseline is the MINIMUM across a %ds settle window, which assumes the pre-soak install load DECAYS. On a runner whose load is RISING the minimum is the first sample, so the baseline is a floor rather than a true baseline and these deltas are upper bounds. An in-band delta is therefore not by itself proof the load was ours -- read the attribution line below.\n",
+          settle;
+      else
+        printf "  ^ that baseline is a SINGLE immediate reading (settle=0), so it still carries the pre-soak install'\''s decaying load. These deltas UNDERSTATE the burners'\'' contribution and can read as a CFS quota that is not there. Fine for a smoke dispatch; not AC2-grade evidence.\n";
       printf "duration mean=%ds max=%ds vs series-1 idle baseline ~%ss (%.2fx mean)\n",
         dmean, dmax, base, dmean / base;
       if (workers > 0)
@@ -296,7 +312,7 @@ verdict="$(
           attributed = 1;
           print "LOAD ATTRIBUTION: no synthetic load requested and none observed; this was an idle-regime run.";
         }
-      } else if (dlmean > workers * 1.5) {
+      } else if (dlmean > workers + (workers * 0.5 > 2 ? workers * 0.5 : 2)) {
         # The ceiling the floor below implies. A burner is a busy-loop, so N of
         # them raise the run queue by ~N and the delta should approach `workers`
         # from EITHER side. Without this branch the pass band is [workers*0.5,
@@ -309,6 +325,20 @@ verdict="$(
         # the asymmetry this closes -- with LOAD_WORKERS=off the same neighbour
         # load is already caught above, so without a ceiling the attribution
         # check was strictly WEAKER in the normal mode than in the off mode.
+        #
+        # The tolerance is ADDITIVE (`workers + max(workers*0.5, 2)`), not the
+        # multiplicative `workers * 1.5` it replaces, because the contaminant it
+        # is trying to exclude is additive: vitest itself contributes ~1-3
+        # runnable tasks regardless of burner count. A pure ratio scales the
+        # headroom with `workers` and so vanishes exactly where it is needed --
+        # at `auto` sizing (13 burners) 1.5x leaves 6.5 of slack, but a smoke
+        # dispatch pinning LOAD_WORKERS=1 got a ceiling of 1.5, BELOW what
+        # vitest alone adds, so a run whose load was entirely its own reported
+        # "not solely ours" (verified: workers=1/2/3 at dlmean +2.40/+3.80/+5.00
+        # all read EXCEEDS). The absolute floor of 2 is that vitest allowance.
+        # Above 4 burners `workers*0.5` dominates and the band is identical to
+        # the old 1.5x, so `auto` behaviour is unchanged -- this only restores
+        # the shape of the band at the small pinned counts smoke runs use.
         attributed = 0;
         printf "LOAD ATTRIBUTION: mean load0 delta (%+.2f) EXCEEDS the %d burner(s) started — load beyond this job'\''s is present (/proc/loadavg is host-wide). The regime reading is not solely ours.\n",
           dlmean, workers;
