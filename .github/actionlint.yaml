@@ -1,3 +1,11 @@
+# BLO-23511: declares this repo's ARC pools so actionlint's runner-label check
+# does not flag every self-hosted label as unknown.
+#
+# Must stay in lockstep with `ALLOWED_RUNNERS` in
+# scripts/check-github-runner-labels.mjs. A pool added to only one list gives a
+# split verdict — one gate red, the other green — so the "runner-label
+# allowlists agree" test in scripts/check-workflows-parse.test.mjs asserts the
+# two match.
 self-hosted-runner:
   labels:
     - default

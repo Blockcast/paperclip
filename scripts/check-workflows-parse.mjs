@@ -68,12 +68,13 @@ export function runCheck({
   repoRoot = process.cwd(),
   actionlintBin = process.env.ACTIONLINT_BIN || "actionlint",
   spawn = spawnSync,
+  readdir = readdirSync,
   log = console.log,
   error = console.error,
 } = {}) {
   let files;
   try {
-    files = collectWorkflowFiles(repoRoot);
+    files = collectWorkflowFiles(repoRoot, { readdir });
   } catch (cause) {
     error(`Could not read ${WORKFLOWS_DIR}: ${cause.message}`);
     return 1;
