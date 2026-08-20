@@ -64,6 +64,20 @@
  * responses that traverse this gateway. It is not a general secret detector, and
  * it does not by itself establish the fleet-wide invariant that agent-visible
  * tool output is systematically scrubbed — see PEN-2370 ask 3.
+ *
+ * Two paths through the same tools are known to be OUT of scope here, named so
+ * that a reader does not mistake this module for covering them:
+ *
+ * - `spec.containers[].command` / `args`. A credential passed as `--token=…`
+ *   rides the same `pods_get` response this module scrubs and is returned in the
+ *   clear. Redacting argv wholesale would remove most of the diagnostic value of
+ *   reading a pod, so it needs its own decision rather than a silent widening
+ *   here.
+ * - `ConfigMap` `data`. Deliberately preserved (see 5) because a ConfigMap read
+ *   is a legitimate diagnostic; a ConfigMap used to carry a credential is
+ *   therefore still exposed.
+ *
+ * Both are instances of ask 3's point: the invariant, not the instance.
  */
 
 export const REDACTED = "<redacted>";
@@ -416,6 +430,27 @@ function scrubJsonValueTracked(node: unknown, ctx: ScrubContext, inSecret: boole
       });
       continue;
     }
+    // An `env` that is a *mapping* rather than a list. Kubernetes never
+    // serializes env this way, but the JSON path exists precisely so that an
+    // upstream changing its shape cannot silently turn this scrubber into a
+    // no-op, and the generic recursion below carries no "inside an env block"
+    // state — so a mapping fell through it with every value in the clear. Redact
+    // the values and keep the names, matching the list case and design note 2.
+    if (key === "env" && value && typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>);
+      result[key] = Object.fromEntries(
+        entries.map(([name, inner]) => [
+          name,
+          // A nested object here is a `valueFrom`-shaped reference, which names a
+          // source without carrying it; anything scalar is the material itself.
+          inner && typeof inner === "object"
+            ? scrubJsonValueTracked(inner, ctx, nowSecret)
+            : REDACTED,
+        ]),
+      );
+      if (entries.some(([, inner]) => !inner || typeof inner !== "object")) ctx.changed = true;
+      continue;
+    }
     if (RESOURCE_ECHO_ANNOTATIONS.includes(key) && typeof value === "string") {
       result[key] = REDACTED;
       ctx.changed = true;
@@ -504,10 +539,25 @@ function startsWithJsonPunctuation(body: Buffer): boolean {
   return false;
 }
 
-/** Body opens an SSE field line (`event:` / `data:`), checked on the Buffer. */
+/**
+ * Body opens an SSE field line, checked on the Buffer.
+ *
+ * This sniff is the fallback for when the upstream omits `content-type`, so it
+ * has to cover every field an event stream may legally open on — not just the
+ * two we expect. A stream that opened on `id:`, `retry:` or a `:` comment line
+ * was classified as neither SSE nor JSON, and `scrubResponseBody` returns such
+ * bodies unchanged: the whole stream, including its `data:` payloads, passed
+ * through unscrubbed.
+ *
+ * Widening this is safe in the other direction. A non-SSE body that happens to
+ * open on one of these tokens still has no `data:` lines for `scrubSseFrames`
+ * to rewrite, so it comes back unchanged and `ctx.changed` stays false — which
+ * returns the original Buffer byte-for-byte.
+ */
+const SSE_FIELD_HEAD = /^(?:event|data|id|retry):|^:/;
+
 function startsWithSseField(body: Buffer): boolean {
-  const head = body.subarray(0, 6).toString("latin1");
-  return head.startsWith("event:") || head.startsWith("data:");
+  return SSE_FIELD_HEAD.test(body.subarray(0, 6).toString("latin1"));
 }
 
 function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
@@ -529,6 +579,16 @@ function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
  * `""`. The SSE spec joins multi-line data with `"\n"`, so this is only
  * equivalent because the payloads here are JSON, where whitespace between tokens
  * is insignificant. Do not reuse this helper for a non-JSON `data:` stream.
+ *
+ * Line splitting accepts CRLF, LF *and* a lone CR, because all three terminate a
+ * line in an event stream. Splitting on `"\n"` alone made a CR-only stream a
+ * single unsplit line, so no line ever began with `data:`, nothing was scrubbed,
+ * and the body passed through with its payloads in the clear. This is the same
+ * fail-open class as the CRLF hole in `scrubYamlTextTracked` — fixing that one
+ * scanner's line handling and leaving this one's is how the class survives a
+ * fix. Terminators are normalized to LF, which only ever reaches the client on a
+ * body we actually redacted; an untouched body is returned as the original
+ * Buffer.
  */
 function scrubSseFrames(text: string, ctx: ScrubContext): string {
   const out: string[] = [];
@@ -542,7 +602,7 @@ function scrubSseFrames(text: string, ctx: ScrubContext): string {
     pending = [];
   };
 
-  for (const line of text.split("\n")) {
+  for (const line of text.split(/\r\n|\n|\r/)) {
     if (line.startsWith("data:")) {
       pending.push(line.slice("data:".length).trimStart());
       continue;
