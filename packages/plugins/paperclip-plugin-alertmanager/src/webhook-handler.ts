@@ -495,7 +495,10 @@ export async function handleFiring(
   // still closes it. Gating the whole delivery instead would strand those
   // legacy issues open forever, which is the resolution behavior this ticket
   // explicitly excludes from scope.
-  if ((alert.labels.severity ?? "").trim().toLowerCase() === "info") {
+  //
+  // Reads the `severity` already computed above rather than re-reading the
+  // label: two normalizations of one value drift the moment either changes.
+  if (severity.trim().toLowerCase() === "info") {
     ctx.logger.info(
       `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
     );
@@ -561,12 +564,24 @@ export async function handleFiring(
     // operator fixes `fallbackAgentName`. Returning here would acknowledge the
     // delivery and destroy the alert silently — the BLO-20467 loss class.
     ctx.logger.warn(
-      `Cannot create issue for ${alertname}: fallbackAgentName is missing, unmatched, or ambiguous; refusing ownerless issue creation`,
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, unmatched, ambiguous, or matched only non-invokable agents; refusing ownerless issue creation`,
     );
-    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
-      alertname,
-      severity,
-    });
+    try {
+      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+        alertname,
+        severity,
+      });
+    } catch (metricErr) {
+      // Unlike the policy drops above, this path throws either way — so the
+      // wrapper is not about the delivery outcome, it is about the message.
+      // An unwrapped metrics outage would replace the explicit
+      // "Fallback owner resolution failed" below with an opaque metrics error,
+      // degrading the diagnostic for exactly the misconfiguration this path
+      // exists to surface.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record fallback owner failure metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     throw new Error(
       `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
     );
@@ -892,11 +907,13 @@ export async function handleWebhook(
     const status = effectiveAlertStatus(alert, body);
     const alertname = alert.labels.alertname ?? "unknown";
     try {
-      // Rule-level opt-out, honored before handleFiring/handleResolved so it
-      // precedes *every* issue and state side effect, at any severity — an
-      // opted-out rule must not create an issue, reopen one, or bank a
-      // suppression anchor. Accepted from either labels or annotations because
-      // Prometheus rules commonly carry policy in annotations.
+      // Rule-level opt-out, honored before handleFiring so it precedes every
+      // issue-creating and state-writing side effect on the firing path, at any
+      // severity — an opted-out rule must not create an issue, refresh one, or
+      // bank a suppression anchor. Accepted from either labels or annotations
+      // because Prometheus rules commonly carry policy in annotations.
+      //
+      // It deliberately does NOT gate the resolved path; see the dispatch below.
       const policyValues = [
         alert.labels.paperclip_issue,
         alert.annotations.paperclip_issue,
@@ -927,26 +944,46 @@ export async function handleWebhook(
         (value) =>
           typeof value === "string" && value.trim().toLowerCase() === "false",
       );
-      if (optedOut) {
-        ctx.logger.info(
-          `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
-        );
-        try {
-          await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
-            alertname,
-          });
-        } catch (metricErr) {
-          // Best-effort for the same reason as the creation floor: a permanent
-          // policy drop must stay acknowledged even if telemetry is down.
-          ctx.logger.error(
-            `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
-          );
-        }
-        continue;
-      }
       if (status === "firing") {
+        if (optedOut) {
+          ctx.logger.info(
+            `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
+          );
+          try {
+            await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+              alertname,
+            });
+          } catch (metricErr) {
+            // Best-effort for the same reason as the creation floor: a permanent
+            // policy drop must stay acknowledged even if telemetry is down.
+            ctx.logger.error(
+              `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
+            );
+          }
+          continue;
+        }
         await handleFiring(ctx, config, alert);
       } else if (status === "resolved") {
+        // Creation-only, exactly like the severity floor in handleFiring, and
+        // for the same reason. Gating this path too would strand any issue the
+        // rule had *already* filed: handleResolved would never run, so
+        // `state.resolvedAt` would stay null and the issue would never reach
+        // done/cancelled. `advanceIssueLadder` (escalation.ts:377,380) returns
+        // early only on resolvedAt, escalationComplete, or a terminal issue
+        // status — none of which would ever happen — so the sweep would keep
+        // advancing the ladder, waking agents, and eventually file a
+        // [user-cover] board escalation for a rule that was explicitly opted
+        // out and whose alert had already resolved.
+        //
+        // That is the modal adoption path, not an exotic one: operators opt a
+        // rule out *because* it has been filing noisy issues, so a tracked
+        // issue almost always exists at that moment. An opt-out is meant to
+        // stop new noise, not to wedge the issues it already made.
+        //
+        // This does not weaken the "no state side effect" guarantee for a rule
+        // opted out from the start: with no issue ever filed there is no state
+        // row, and handleResolved drops an unknown fingerprint without touching
+        // anything.
         await handleResolved(ctx, config, alert);
       } else {
         ctx.logger.warn(
