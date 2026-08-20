@@ -117,10 +117,43 @@ export const DEFAULT_MAX_ESCALATED = 15;
  * how the User seat slipped through — GraphQL renders App logins *without* the
  * suffix, so `login === "allyblockcast"` alone cannot tell the two apart, and
  * the reviewer-side answer is that it does not need to: neither can answer.
+ *
+ * **Deliberately wider than {@link AGENT_AUTHOR_LOGINS}.** This is the
+ * *exclusion* set, and a false negative here is permanent: one review from an
+ * unlisted Ally identity marks a PR `answered_by_human` and suppresses its
+ * escalation forever. `blockcast-ci-packages` is Ally's prior review identity —
+ * `.planning/ally-app/ally-app-setup.md` documents the
+ * `blockcast-ci-packages` -> `ally` migration, and historical reviews under it
+ * still sit on open PRs. The set mirrors `isConfiguredPrReviewerAuthor` in
+ * `server/src/routes/github-webhook.ts`, which is the repo's existing authority
+ * on "is this login Ally": `ally | allyblockcast | blockcast-ci-packages`.
+ * Keep the two in step.
  */
-export const ALLY_REVIEW_IDENTITY_LOGINS: readonly string[] = Object.freeze(["allyblockcast"]);
+export const ALLY_REVIEW_IDENTITY_LOGINS: readonly string[] = Object.freeze([
+  "ally",
+  "allyblockcast",
+  "blockcast-ci-packages",
+]);
 
 const ALLY_REVIEW_IDENTITY_SET = new Set(ALLY_REVIEW_IDENTITY_LOGINS);
+
+/**
+ * Logins that count as *authoring* an agent PR — narrower on purpose.
+ *
+ * Authorship and reviewer-exclusion pull in opposite directions, so one list
+ * cannot serve both. Widening the exclusion set is safe (it only ever withholds
+ * an "answered" verdict); widening authorship is not, because it would pull
+ * PRs written by other bots into a sweep scoped to *agent* PRs — and a human's
+ * PR waiting on a human review is an ordinary queue, not a structural dead end.
+ *
+ * Only `allyblockcast` authors PRs today: every agent pod pushes through the
+ * `allyblockcast[bot]` App installation (AGENTS.md, "Commit attribution is
+ * write-path dependent"). `blockcast-ci-packages` reviewed but never authored,
+ * so it belongs in the exclusion set and not here.
+ */
+export const AGENT_AUTHOR_LOGINS: readonly string[] = Object.freeze(["allyblockcast"]);
+
+const AGENT_AUTHOR_SET = new Set(AGENT_AUTHOR_LOGINS);
 
 /** Strip a `[bot]` suffix and case-fold, so App and User logins compare equal. */
 export function normalizeReviewLogin(login: string | null | undefined): string | null {
@@ -265,10 +298,12 @@ export function unansweredDays(pr: AgeingPullRequest, now: Date): number {
  * True when the PR was authored by an agent identity.
  *
  * Agent-authored is the scope because a human's own PR needing a human review is
- * an ordinary queue, not a structural dead end.
+ * an ordinary queue, not a structural dead end. Uses the narrow
+ * {@link AGENT_AUTHOR_LOGINS}, not the wider reviewer-exclusion set.
  */
 export function isAgentAuthoredPullRequest(pr: AgeingPullRequest): boolean {
-  return isAllyReviewIdentity(pr.authorLogin);
+  const normalized = normalizeReviewLogin(pr.authorLogin);
+  return normalized !== null && AGENT_AUTHOR_SET.has(normalized);
 }
 
 export type SelectAgedReviewRequestOptions = {
@@ -316,8 +351,11 @@ function validateShape(pr: AgeingPullRequest): string | null {
   }
   // An absent `reviews` *key* is a mapping failure — the caller forgot to fetch
   // them — and would make every PR look unanswered. An explicit `[]` is a real
-  // "nobody has reviewed" and is fine.
-  if (pr.reviews !== undefined && pr.reviews !== null && !Array.isArray(pr.reviews)) {
+  // "nobody has reviewed" and is fine. Gate on key presence, not on
+  // `!== undefined`: the latter exempts exactly the case this rejects, and the
+  // failure runs toward escalating everything.
+  if (!Object.prototype.hasOwnProperty.call(pr, "reviews")) return "missing reviews key";
+  if (pr.reviews !== null && !Array.isArray(pr.reviews)) {
     return "reviews is present but not an array";
   }
   return null;
@@ -347,6 +385,22 @@ function validateMaxEscalated(maxEscalated: number): void {
 }
 
 /**
+ * Validate the clock's other operand.
+ *
+ * `now` is the same hazard as the threshold and needs the same guard: an
+ * `Invalid Date` makes `unansweredDays` return `NaN`, every `days > threshold`
+ * false, and the whole input tallies as `within_threshold` — a silent clean
+ * sweep. Note this is the *only* silent path: a non-`Date` `now` throws inside
+ * the per-PR `try` and at least lands in `malformed`, whereas an invalid `Date`
+ * object sails through arithmetic without raising.
+ */
+function validateNow(now: Date): void {
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+    throw new Error(`now must be a valid Date, got ${String(now)}`);
+  }
+}
+
+/**
  * Select agent-authored PRs whose pending review request has gone unanswered
  * past the threshold.
  *
@@ -363,6 +417,7 @@ export function selectAgedReviewRequests(
   const maxEscalated = options.maxEscalated ?? DEFAULT_MAX_ESCALATED;
   validateThreshold(escalateAfterDays);
   validateMaxEscalated(maxEscalated);
+  validateNow(options.now);
 
   const skipped = emptySkipTally();
   const malformed: MalformedPullRequest[] = [];
@@ -401,8 +456,10 @@ export function selectAgedReviewRequests(
     }
 
     let days: number;
+    let clockAt: Date;
     try {
-      days = unansweredDays(pr, options.now);
+      clockAt = reviewRequestClockAt(pr);
+      days = (options.now.getTime() - clockAt.getTime()) / 86_400_000;
     } catch (error) {
       malformed.push({
         pullRequest: pr,
@@ -418,7 +475,7 @@ export function selectAgedReviewRequests(
     const reviews = Array.isArray(pr.reviews) ? pr.reviews : [];
     overdue.push({
       ...pr,
-      requestClockAt: reviewRequestClockAt(pr),
+      requestClockAt: clockAt,
       unansweredDays: days,
       allyOnlyReviews:
         reviews.length > 0 && reviews.every((review) => isAllyReviewIdentity(review.authorLogin)),
@@ -468,7 +525,9 @@ export function sanitizeRenderedField(value: string | null | undefined, fallback
     singleLine.length > MAX_RENDERED_FIELD_CHARS
       ? `${singleLine.slice(0, MAX_RENDERED_FIELD_CHARS)}…`
       : singleLine;
-  return bounded.replace(/`/g, "'").replace(/^[#>*\-+_=|[\]]+\s*/, "");
+  // Strip leading markers repeatedly: a single non-global pass leaves a nested
+  // marker behind, so `"> # text"` would still render as a heading.
+  return bounded.replace(/`/g, "'").replace(/^(?:[#>*\-+_=|[\]]+\s*)+/, "");
 }
 
 export function formatPullRequestRef(pr: AgeingPullRequest): string {

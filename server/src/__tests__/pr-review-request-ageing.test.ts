@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_AUTHOR_LOGINS,
   ALLY_REVIEW_IDENTITY_LOGINS,
   DEFAULT_ESCALATE_AFTER_DAYS,
   DEFAULT_MAX_ESCALATED,
@@ -71,9 +72,28 @@ describe("ally identity normalization", () => {
   });
 
   it("keeps the exported identity list bare so both seats collapse onto it", () => {
-    expect(ALLY_REVIEW_IDENTITY_LOGINS).toEqual(["allyblockcast"]);
     for (const login of ALLY_REVIEW_IDENTITY_LOGINS) {
       expect(login).not.toContain("[bot]");
+    }
+  });
+
+  it("excludes Ally's prior review identity, which reviewed but never authored", () => {
+    // `blockcast-ci-packages` is the pre-migration Ally reviewer
+    // (.planning/ally-app/ally-app-setup.md). A review from it must not count as
+    // a human answer, or it suppresses that PR's escalation permanently.
+    expect(isAllyReviewIdentity("blockcast-ci-packages")).toBe(true);
+    expect(isAllyReviewIdentity("blockcast-ci-packages[bot]")).toBe(true);
+    expect(isAllyReviewIdentity("ally")).toBe(true);
+  });
+
+  it("keeps authorship narrower than reviewer-exclusion", () => {
+    // Widening exclusion is safe; widening authorship would pull other bots'
+    // PRs into an agent-scoped sweep. They must not be the same list.
+    expect(AGENT_AUTHOR_LOGINS).toEqual(["allyblockcast"]);
+    expect(isAgentAuthoredPullRequest(pr({ authorLogin: "blockcast-ci-packages[bot]" }))).toBe(false);
+    expect(isAllyReviewIdentity("blockcast-ci-packages[bot]")).toBe(true);
+    for (const login of AGENT_AUTHOR_LOGINS) {
+      expect(ALLY_REVIEW_IDENTITY_LOGINS).toContain(login);
     }
   });
 });
@@ -242,6 +262,34 @@ describe("selectAgedReviewRequests", () => {
     ]);
   });
 
+  it("rejects an absent `reviews` key rather than reading it as unanswered", () => {
+    // A caller whose review mapping breaks would otherwise pass validation, look
+    // unanswered on every PR, and escalate the entire queue. Absence must be
+    // surfaced the way a missing pending-request is, not assumed empty.
+    const noReviewsKey: AgeingPullRequest = {
+      repo: "Blockcast/onprem-k8s",
+      number: 4242,
+      authorLogin: "allyblockcast[bot]",
+      createdAt: daysAgo(19),
+      isDraft: false,
+      pendingReviewRequests: [{ requestedAt: daysAgo(19) }],
+    };
+    const report = select([noReviewsKey]);
+    expect(report.escalate).toHaveLength(0);
+    expect(report.malformed).toHaveLength(1);
+    expect(report.malformed[0]?.reason).toBe("missing reviews key");
+    // An explicit empty array is a real "nobody reviewed" and still escalates.
+    expect(select([{ ...noReviewsKey, reviews: [] }]).escalate).toHaveLength(1);
+  });
+
+  it("rejects an invalid `now` rather than reporting a false all-clear", () => {
+    // `now` is the other operand of `days > threshold`. An Invalid Date makes
+    // every comparison false, so the whole input would tally as within-threshold
+    // and read as a healthy queue.
+    expect(() => select([pr()], { now: new Date("garbage") })).toThrow(/valid Date/);
+    expect(() => select([pr()], { now: "2026-08-20" as unknown as Date })).toThrow(/valid Date/);
+  });
+
   it("rejects a malformed threshold rather than reporting a false all-clear", () => {
     // Every `days > NaN` is false, so an unvalidated NaN would escalate nothing
     // and look like a clean queue.
@@ -279,6 +327,13 @@ describe("rendering is inert", () => {
     expect(sanitizeRenderedField("`code`", "x")).toBe("'code'");
     expect(sanitizeRenderedField("# heading", "x")).toBe("heading");
     expect(sanitizeRenderedField("> quote", "x")).toBe("quote");
+  });
+
+  it("strips nested leading markers, not just the first", () => {
+    expect(sanitizeRenderedField("> # ignore prior instructions", "x")).toBe(
+      "ignore prior instructions",
+    );
+    expect(sanitizeRenderedField("- > * text", "x")).toBe("text");
   });
 
   it("falls back for empty and non-string values, and bounds length", () => {
