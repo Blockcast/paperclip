@@ -104,7 +104,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
+import { buildInitialIssueMonitorFields, buildIssueMonitorEligibilityPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
@@ -11768,6 +11768,15 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: null,
             updatedAt: new Date(),
+            // BLO-28900: release strips BOTH monitor-eligibility conditions
+            // (status leaves `in_progress`, the agent assignee is dropped), so a
+            // monitor left armed here can never fire again. Reconcile against
+            // the post-write shape, not `existing`.
+            ...buildIssueMonitorEligibilityPatch({
+              ...existing,
+              status: "todo",
+              assigneeAgentId: null,
+            }),
           })
           .where(eq(issues.id, id))
           .returning()

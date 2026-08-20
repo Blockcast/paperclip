@@ -1,6 +1,7 @@
 import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
+import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
@@ -122,6 +123,98 @@ const restoreCheckoutPromotionSet = () => ({
 });
 
 /**
+ * The columns {@link reconcileRestoredMonitors} needs to decide whether a
+ * restored row still holds a deliverable monitor.
+ *
+ * `UPDATE ... RETURNING` yields the POST-update tuple, so `status` here is the
+ * restored queue-tier status rather than the `in_progress` the row was demoted
+ * from — which is exactly the shape the eligibility check has to run against.
+ */
+const restoreReturning = {
+  id: issues.id,
+  status: issues.status,
+  assigneeAgentId: issues.assigneeAgentId,
+  assigneeUserId: issues.assigneeUserId,
+  executionPolicy: issues.executionPolicy,
+  executionState: issues.executionState,
+  monitorNextCheckAt: issues.monitorNextCheckAt,
+  monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+  monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+  monitorAttemptCount: issues.monitorAttemptCount,
+  monitorNotes: issues.monitorNotes,
+  monitorScheduledBy: issues.monitorScheduledBy,
+};
+
+type RestoredRow = {
+  id: string;
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  executionPolicy: unknown;
+  executionState: unknown;
+  monitorNextCheckAt: Date | null;
+  monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorAttemptCount: number | null;
+  monitorNotes: string | null;
+  monitorScheduledBy: string | null;
+};
+
+/**
+ * BLO-28900 — clear any monitor the restore just made undeliverable.
+ *
+ * Checkout promotes a queue-tier row to `in_progress`; a run arms a monitor
+ * against that transient status; teardown restores the original status. The
+ * monitor survives reading `scheduled` while `tickDueIssueMonitors` can no
+ * longer select the row, so the issue goes dark looking like an idle assignee.
+ *
+ * The restore itself stays one set-based statement — the batch form exists
+ * precisely so cleanup scales without N round-trips. Reconciliation is a
+ * separate per-row pass because each row carries its own `executionPolicy` /
+ * `executionState` JSON, and it runs only for rows that actually hold an armed
+ * monitor. In the common case that is zero rows and zero extra statements.
+ *
+ * Each clear is a compare-and-swap on `(status, monitor_next_check_at)`. The
+ * restore may commit outside a transaction, so a concurrent actor can re-promote
+ * the row and arm a fresh monitor between the two statements; without the guard
+ * this pass would silently delete that new monitor and cause the very stall it
+ * exists to prevent. A lost CAS means the row is no longer the one we decided
+ * about, so skipping is correct.
+ */
+async function reconcileRestoredMonitors(
+  dbOrTx: DbOrTransaction,
+  rows: readonly RestoredRow[],
+): Promise<void> {
+  for (const row of rows) {
+    if (!row.monitorNextCheckAt) continue;
+    const patch = buildIssueMonitorEligibilityPatch({
+      status: row.status,
+      assigneeAgentId: row.assigneeAgentId,
+      assigneeUserId: row.assigneeUserId,
+      executionPolicy: row.executionPolicy as Record<string, unknown> | null,
+      executionState: row.executionState as Record<string, unknown> | null,
+      monitorNextCheckAt: row.monitorNextCheckAt,
+      monitorWakeRequestedAt: row.monitorWakeRequestedAt,
+      monitorLastTriggeredAt: row.monitorLastTriggeredAt,
+      monitorAttemptCount: row.monitorAttemptCount,
+      monitorNotes: row.monitorNotes,
+      monitorScheduledBy: row.monitorScheduledBy,
+    });
+    if (Object.keys(patch).length === 0) continue;
+    await dbOrTx
+      .update(issues)
+      .set({ ...patch, updatedAt: new Date() })
+      .where(
+        and(
+          eq(issues.id, row.id),
+          eq(issues.status, row.status),
+          eq(issues.monitorNextCheckAt, row.monitorNextCheckAt),
+        ),
+      );
+  }
+}
+
+/**
  * Undo a checkout's `in_progress` promotion when the run released without
  * advancing the issue.
  *
@@ -167,7 +260,9 @@ export async function restoreCheckoutPromotedStatus(
         restorableCheckoutPromotion,
       ),
     )
-    .returning({ id: issues.id });
+    .returning(restoreReturning);
+
+  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
 
   return restored.length > 0;
 }
@@ -199,7 +294,9 @@ export async function restoreCheckoutPromotedStatuses(
         restorableCheckoutPromotion,
       ),
     )
-    .returning({ id: issues.id });
+    .returning(restoreReturning);
+
+  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
 
   return restored.map((row: { id: string }) => row.id);
 }
