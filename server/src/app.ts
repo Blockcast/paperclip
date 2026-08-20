@@ -75,6 +75,7 @@ import {
   refreshQueuedRunAgeMetrics,
   refreshScheduledRetryParkHorizonMetrics,
 } from "./services/queued-run-age-metrics.js";
+import { refreshExternalRuntimeReservationStrandMetrics } from "./services/external-runtime-reservation-strand-metrics.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -324,6 +325,13 @@ export async function createApp(
       });
       await refreshScheduledRetryParkHorizonMetrics(db).catch((err) => {
         logger.warn({ err }, "failed to refresh scheduled-retry park horizon metrics before scrape");
+      });
+      // BLO-28865. Swallowing the rejection here is safe and intended: the
+      // refresh has already set its own freshness gauge to 0 on the way out,
+      // which is what makes the stale age ineligible for the strand alert and
+      // pages the refresh failure on its own. Same contract as the two above.
+      await refreshExternalRuntimeReservationStrandMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh stranded-reservation metrics before scrape");
       });
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);

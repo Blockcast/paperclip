@@ -3695,6 +3695,50 @@ export function agentRoutes(
           updatedAt: new Date(),
         })
         .where(eq(agentRuntimeState.agentId, agent.id));
+
+      // BLO-28865: the in-flight run's external-runtime reservation is not
+      // portable across adapters either, and unlike the session id it is
+      // load-bearing. `recordExpectedExternalRuntimeJobName` matches a
+      // `launched` reservation by exact `expectedJobName` equality; the new
+      // adapter presents a differently-prefixed Job name, so zero rows match
+      // and every subsequent launch throws. The row stays unreleased, so it
+      // keeps holding the agent's slot
+      // (`external_runtime_reservations_active_slot_idx`) and ALL launches for
+      // that agent stall -- not just the migrated one. Before this, recovery
+      // was incidental: it arrived only when the orphaned Job exited on its
+      // own or was force-killed at EXTERNAL_LIFECYCLE_HARD_STALE_MS (45 min).
+      //
+      // Cancel the in-flight runs instead of touching the reservation. This is
+      // deliberate, and the ordering is the whole point: the reservation still
+      // holds the OLD Job's name/UID, which is the only handle the cancel
+      // cascade's exact-name delete has on it. `cancelActiveForAgent` ->
+      // `cancelActiveForAgentInternal` finalizes the run terminal, deletes
+      // that exact old-named Job, then promotes the next queued run. The
+      // reaper releases the now-terminal run's reservation on its next pass.
+      //
+      // Do NOT "fix" this by re-arming the reservation instead
+      // (`rearmExternalRuntimeReservationForRetry`): it nulls jobName/jobUid,
+      // which unwedges launches while abandoning a live pre-migration Job that
+      // still holds node CPU and can still make model calls.
+      //
+      // Gate on the PREVIOUS adapter type: the stranded reservation and the
+      // orphaned Job both belong to the substrate being migrated away from. A
+      // process -> claude_k8s change has no external-lifecycle run to cancel.
+      if (EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(existing.adapterType)) {
+        try {
+          await heartbeat.cancelActiveForAgent(
+            id,
+            `Cancelled because the agent's adapter type changed from ${existing.adapterType} to ${agent.adapterType}`,
+          );
+        } catch {
+          // Non-fatal, and deliberately so: the adapter-type change itself has
+          // already committed, and refusing to return it would leave the
+          // caller believing the migration failed when it did not. The reaper
+          // still reaches this state via the hard-stale path, just slowly --
+          // which is exactly the pre-BLO-28865 behaviour, i.e. this catch
+          // degrades to the old outcome rather than to a worse one.
+        }
+      }
     }
 
     // Auto-wakeup when heartbeat.enabled flips false → true (BLO-13048).

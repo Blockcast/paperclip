@@ -606,6 +606,58 @@ spec:
             summary: "Paperclip plugin-status collector has reported no successful tick for {{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }} (series absent)"
             description: "paperclip_plugin_status_collector_last_success_timestamp_seconds{role=\"worker\"} has been entirely absent for {{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }} (BLO-21092 Ally review). This is the worker-down / collector-never-started case that PaperclipPluginStatusCollectorStale cannot detect: with no series, `time() - <gauge>` yields an empty vector instead of a growing number, so the staleness rule stays silent forever. While this fires, paperclip_plugin_error is absent too -- which on a dashboard looks identical to every plugin being healthy, exactly the invisible failure BLO-20410 was. Check that a worker-tier pod is Running with PAPERCLIP_NODE_ROLE != 'api', that it is a live Prometheus scrape target (the `paperclip-workers` Service must stay within the ServiceMonitor selector), and grep worker logs for 'plugin-status-metrics'."
             runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+    - name: paperclip-external-runtime-reservation-stranded
+      rules:
+        - alert: PaperclipExternalRuntimeReservationStranded
+          # BLO-28865 (parent BLO-27700). DECISION THIS INFORMS: an agent's
+          # launch path is wedged and a human or agent must intervene. An
+          # unreleased external_runtime_reservations row holds the agent's slot
+          # via external_runtime_reservations_active_slot_idx, so while it sits
+          # there NO run dispatches for that agent -- not just the one that
+          # stranded it. The originating incident (adapter-type change
+          # re-prefixing the Job name, agent-opencode-* -> ac-*) wedged two
+          # agents for as long as it took a HUMAN to notice, because nothing
+          # here paged.
+          #
+          # Deliberately NOT a threshold over
+          # paperclip_external_runtime_reservation_oldest_age_seconds, which is
+          # the obvious rule and the wrong one. That gauge is a single
+          # unlabelled global measuring reservation AGE alone, so it cannot
+          # separate a stranded row from a legitimately long run -- measured 7d
+          # spread across healthy replicas ran ~93 min to ~9.0h -- and cannot
+          # name the wedged agent even when it does fire.
+          #
+          # This gauge instead encodes the correlation the issue requires
+          # (age PLUS a run-status or silence condition) in SQL, so the rule
+          # itself is a plain threshold. The server counts a reservation only
+          # when its run is already terminal, or its run is non-terminal but
+          # has emitted nothing past the 45m hard-stale floor. A healthy long
+          # run is neither, so it publishes 0 and can never trip this.
+          #
+          # Gauge under `for:` rather than a summed count, and a per-replica
+          # freshness gate rather than an `on()` join -- both for exactly the
+          # reasons spelled out on PaperclipQueuedRunStranded above.
+          expr: max by (agent_id) (paperclip_external_runtime_reservation_stranded_oldest_age_seconds and on(instance) (paperclip_external_runtime_reservation_strand_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.externalRuntimeReservationStrandedAgeSeconds }}
+          for: {{ .Values.prometheusRule.externalRuntimeReservationStrandedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a stranded external-runtime reservation and cannot launch"
+            description: "Agent {{`{{ $labels.agent_id }}`}} holds an unreleased external_runtime_reservations row that has been alive for {{`{{ $value }}`}}s and whose heartbeat run is either terminal or silent past the 45m hard-stale floor (BLO-28865). That row holds the agent's slot through external_runtime_reservations_active_slot_idx, so EVERY launch for this agent is blocked, not only the run that stranded it. The age is only trusted while paperclip_external_runtime_reservation_strand_metrics_refresh_success is 1. First check whether the agent's adapterType changed recently -- that is the known cause, and it should now self-heal via the cancel cascade, so a firing alert means either the cascade did not run or this is a different strand. Then check paperclip_external_runtime_reservation_events_total{event=\"name_mismatch\"}: a nonzero rate means launches are being rejected because the Job name disagrees with the reservation. Inspect with `select id, agent_id, run_id, state, expected_job_name, job_name, job_uid, reserved_at from external_runtime_reservations where released_at is null order by reserved_at asc`. Do NOT clear job_name/job_uid to unwedge it: those are the only handle on the orphaned Job, and dropping them leaks a live pod that can still make model calls."
+            runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
+        - alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed
+          # Separate from the strand alert for the same reason the queued-run
+          # pair is separate: a failed refresh means the age is not fresh, not
+          # that nothing is stranded. Page on it so the freshness gate cannot
+          # silently hide a real wedge.
+          expr: paperclip_external_runtime_reservation_strand_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.externalRuntimeReservationStrandMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip stranded-reservation metric refresh is failing"
+            description: "The most recent /metrics stranded-reservation database refresh failed (BLO-28865), so strand ages may be stale and PaperclipExternalRuntimeReservationStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as a healthy launch path."
+            runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

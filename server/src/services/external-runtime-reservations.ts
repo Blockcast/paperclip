@@ -33,6 +33,43 @@ export class ExternalRuntimeIsolationConflictError extends Error {
   }
 }
 
+/**
+ * BLO-28865: a `launched` reservation whose incoming Job name disagrees with
+ * the one already stamped on it. Split out from the generic "no longer
+ * launchable" error because it is a materially different condition with a
+ * different operator response.
+ *
+ * Generic non-launchable means the reservation moved on (released, re-armed,
+ * raced) -- the run lost, and retrying is the answer. A name MISMATCH means
+ * the reservation is intact and correct and the *caller* changed identity
+ * underneath it: an adapter-type change re-prefixes the Job name
+ * (`agent-opencode-*` -> `ac-*`), so every launch for that agent throws while
+ * the unreleased row keeps holding the slot. Retrying never clears it.
+ *
+ * Carrying the ids as fields rather than only interpolating them into a
+ * message means the mismatch is greppable and can be counted separately -- the
+ * pre-BLO-28865 code swallowed both conditions into one string, which is why
+ * the wedge was diagnosed by a human reading logs instead of by a metric.
+ */
+export class ExternalRuntimeJobNameMismatchError extends Error {
+  readonly code = "external_runtime_job_name_mismatch";
+
+  constructor(
+    readonly runId: string,
+    readonly reservationId: string,
+    readonly expectedJobName: string | null,
+    readonly receivedJobName: string,
+  ) {
+    super(
+      `External runtime reservation ${reservationId} for run ${runId} is launched under a different Job name: `
+      + `expected ${expectedJobName ?? "<none>"}, received ${receivedJobName}. `
+      + "This is the adapter-type-change strand shape (BLO-28865): the reservation still holds the "
+      + "pre-change Job identity, so it cannot be re-armed without leaking that Job.",
+    );
+    this.name = "ExternalRuntimeJobNameMismatchError";
+  }
+}
+
 function isConstraintConflict(error: unknown, expectedConstraint: string): boolean {
   let current: unknown = error;
   for (let depth = 0; current && depth < 6; depth += 1) {
@@ -573,6 +610,33 @@ export async function recordExpectedExternalRuntimeJobName(
 
   const active = await getActiveExternalRuntimeReservation(db, input.runId);
   if (active) {
+    // BLO-28865: name the mismatch instead of folding it into the generic
+    // message. `launched` + a differing expectedJobName is the adapter-type
+    // strand: the reservation is healthy, the incoming identity is not. It
+    // gets its own error type and its own metric event so it is separable from
+    // "this reservation moved on", which is retryable and routine.
+    if (
+      active.state === "launched"
+      && active.expectedJobName !== input.jobName
+    ) {
+      recordExternalRuntimeReservationEvent("name_mismatch");
+      logger.error(
+        {
+          runId: input.runId,
+          reservationId: active.id,
+          reservationState: active.state,
+          expectedJobName: active.expectedJobName,
+          receivedJobName: input.jobName,
+        },
+        "external-runtime reservation launched under a different Job name (adapter-type strand)",
+      );
+      throw new ExternalRuntimeJobNameMismatchError(
+        input.runId,
+        active.id,
+        active.expectedJobName,
+        input.jobName,
+      );
+    }
     throw new Error(
       `External runtime reservation for run ${input.runId} is no longer launchable: `
       + `state ${active.state}, expected ${active.expectedJobName ?? "<none>"}, received ${input.jobName}`,
