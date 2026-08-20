@@ -2552,6 +2552,154 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(handoffWakeups).toHaveLength(0);
   });
 
+  // PEN-2421: agent Jobs set `ttlSecondsAfterFinished`, so a Job is
+  // correctly garbage-collected minutes after a *successful* agent exits. If the
+  // adapter owner died before finalizing, this sweep then finds no Job and used
+  // to record `job_missing` over a run that had succeeded -- corrupting run
+  // statistics and rescheduling already-delivered work. The agent's own terminal
+  // result survives on the shared data PVC and is now consulted.
+  describe("TTL-collected Job with a surviving terminal result artifact", () => {
+    async function withPodLogArtifact(
+      input: { companyId: string; agentId: string; runId: string; isolationKey?: string },
+      lines: string[],
+    ) {
+      const base = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pod-log-"));
+      const dir = input.isolationKey
+        ? path.join(base, input.companyId, input.agentId, "isolated", input.isolationKey)
+        : path.join(base, input.companyId, input.agentId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, `${input.runId}.pod.ndjson`), lines.join("\n"), "utf-8");
+      const previous = process.env.RUN_LOG_BASE_PATH;
+      process.env.RUN_LOG_BASE_PATH = base;
+      return () => {
+        if (previous === undefined) delete process.env.RUN_LOG_BASE_PATH;
+        else process.env.RUN_LOG_BASE_PATH = previous;
+      };
+    }
+
+    async function reapVanishedJob(jobName: string) {
+      mockListManagedAgentJobs.mockResolvedValueOnce([]);
+      mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+        phase: "missing",
+        reason: "NotFound",
+        name: jobName,
+      });
+      return heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    }
+
+    async function seedVanishedRun(jobName: string) {
+      const fixture = await seedRunFixture({
+        adapterType: "claude_k8s",
+        agentStatus: "idle",
+        externalRunId: jobName,
+      });
+      await seedAdapterInvokeEvent(fixture);
+      await seedLaunchedReservation({ ...fixture, jobName });
+      return fixture;
+    }
+
+    it("preserves a successful outcome recovered from the run's own output artifact", async () => {
+      const jobName = "agent-claude-ttl-collected-success";
+      const fixture = await seedVanishedRun(jobName);
+      // Deliberately the same generic progress artifact the neighbouring
+      // "does not treat generic run artifacts" case uses: on its own it must not
+      // rescue the run. What is different here is the authoritative terminal
+      // verdict below -- and it is also what makes the run "productive" enough
+      // for the existing corrective handoff to be relevant.
+      await db.insert(issueComments).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: fixture.agentId,
+        createdByRunId: fixture.runId,
+        body: "Progress update written before the lifecycle Job was TTL-collected.",
+      });
+      const restoreEnv = await withPodLogArtifact(fixture, [
+        JSON.stringify({ type: "system", subtype: "init" }),
+        JSON.stringify({ type: "assistant", message: { content: "working" } }),
+        JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 119 }),
+      ]);
+      try {
+        const result = await reapVanishedJob(jobName);
+
+        expect(result.runIds).toContain(fixture.runId);
+        const run = await heartbeat.getRun(fixture.runId);
+        expect(run).toMatchObject({ status: "succeeded", errorCode: null });
+        expect(
+          (run?.resultJson as Record<string, any> | null)?.externalLifecycleRecovery,
+        ).toMatchObject({
+          reason: "job_missing_recorded_outcome_preserved",
+          recoveredFrom: "pod_terminal_result",
+          recoveredResultSubtype: "success",
+        });
+        // The run succeeded but may never have written its issue disposition, so
+        // the existing status-only corrective wake must still fire.
+        const handoffWakeups = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.agentId, fixture.agentId),
+            eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+          ));
+        expect(handoffWakeups).toHaveLength(1);
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    it("recovers the artifact written under the isolated-run layout", async () => {
+      const jobName = "agent-claude-ttl-collected-isolated";
+      const fixture = await seedVanishedRun(jobName);
+      const restoreEnv = await withPodLogArtifact(
+        { ...fixture, isolationKey: "issue-1234" },
+        [JSON.stringify({ type: "result", subtype: "success", is_error: false })],
+      );
+      try {
+        await reapVanishedJob(jobName);
+        expect(await heartbeat.getRun(fixture.runId)).toMatchObject({
+          status: "succeeded",
+          errorCode: null,
+        });
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    it("keeps the run failed when the artifact reports an error", async () => {
+      const jobName = "agent-claude-ttl-collected-error";
+      const fixture = await seedVanishedRun(jobName);
+      const restoreEnv = await withPodLogArtifact(fixture, [
+        JSON.stringify({ type: "result", subtype: "success", is_error: true }),
+      ]);
+      try {
+        await reapVanishedJob(jobName);
+        expect(await heartbeat.getRun(fixture.runId)).toMatchObject({
+          status: "failed",
+          errorCode: "job_missing",
+        });
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    it("keeps the run failed when the artifact was truncated before its result event", async () => {
+      const jobName = "agent-claude-ttl-collected-truncated";
+      const fixture = await seedVanishedRun(jobName);
+      const restoreEnv = await withPodLogArtifact(fixture, [
+        JSON.stringify({ type: "system", subtype: "init" }),
+        JSON.stringify({ type: "assistant", message: { content: "killed mid-run" } }),
+      ]);
+      try {
+        await reapVanishedJob(jobName);
+        expect(await heartbeat.getRun(fixture.runId)).toMatchObject({
+          status: "failed",
+          errorCode: "job_missing",
+        });
+      } finally {
+        restoreEnv();
+      }
+    });
+  });
+
   it("keeps a fresh ownerless run when the exact Job lookup is inconclusive", async () => {
     const jobName = "agent-opencode-inventory-inconclusive";
     const { companyId, agentId, runId } = await seedRunFixture({
