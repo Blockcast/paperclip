@@ -368,6 +368,60 @@ test("classifier reports a timeout expiry as a real failure, not an infrastructu
   );
 });
 
+test("classifier declines to excuse a job whose annotations could not be read", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The timeout override is reachable ONLY through the annotations, so an
+  // unreadable set must not read as "this job did not time out". `null` is
+  // absence of evidence; `[]` is evidence of absence.
+  assert.equal(
+    classifyJobFailure(TIMED_OUT_JOB, null),
+    "reported",
+    "unreadable annotations must keep the ordinary failure wording — a job-level timeout " +
+      "has no failing step, so degrading to the step-shape signal would announce a hung " +
+      "test as a pool kill",
+  );
+
+  // Falsification: with the SAME job, an empty-but-readable set is the
+  // pre-fix behaviour. If these two ever agree, the distinction is gone.
+  assert.equal(
+    classifyJobFailure(TIMED_OUT_JOB, []),
+    "infrastructure",
+    "fixture no longer exercises the distinction between unavailable and empty annotations",
+  );
+
+  // The cost of the fix, stated explicitly: a genuine kill we cannot prove is
+  // also reported. That is the same trade the no-matching-job branch makes.
+  assert.equal(
+    classifyJobFailure(KILLED_JOB, null),
+    "reported",
+    "an unprovable kill is reported rather than excused",
+  );
+  assert.equal(
+    classifyJobFailure(KILLED_JOB, []),
+    "infrastructure",
+    "signal 2 must stay live when the annotations were genuinely queried and empty",
+  );
+});
+
+test("a lane whose job is missing from the annotations map is reported, not excused", async () => {
+  const { classifyLaneFailures } = await import("../classify-lane-failures.mjs");
+
+  // main() populates an entry for every failing job, so a missing entry means
+  // the annotations were never obtained. Coalescing that to `[]` here would
+  // re-disarm the override one layer below classifyJobFailure.
+  const { infrastructure, reported } = classifyLaneFailures({
+    lanes: ["typecheck_release_registry"],
+    laneJobNames: ["Typecheck + Release Registry"],
+    jobs: [TIMED_OUT_JOB],
+    annotationsByJobId: {},
+  });
+  assert.deepEqual({ infrastructure, reported }, {
+    infrastructure: [],
+    reported: ["typecheck_release_registry"],
+  });
+});
+
 test("a timed-out lane keeps the unchanged failure wording end to end", async () => {
   const { classifyLaneFailures } = await import("../classify-lane-failures.mjs");
 
@@ -652,7 +706,14 @@ test("verify surfaces a degraded classifier instead of silently reporting no kil
 // main() end-to-end. Spawns the real script with a preloaded `fetch` stub so
 // argv parsing, LANE_JOB_NAMES newline splitting, pagination and the
 // single-line stdout contract that `tail -n 1` depends on are all exercised.
-function runClassifierMain({ argv, laneJobNames, jobs, annotations = {}, failStatus = null }) {
+function runClassifierMain({
+  argv,
+  laneJobNames,
+  jobs,
+  annotations = {},
+  failStatus = null,
+  annotationsFailStatus = null,
+}) {
   const dir = mkdtempSync(join(tmpdir(), "classify-main-"));
   const preload = join(dir, "stub-fetch.mjs");
   writeFileSync(
@@ -669,6 +730,12 @@ globalThis.fetch = async (url) => {
   }
   const annMatch = String(url).match(/\\/check-runs\\/(\\d+)\\/annotations/);
   if (annMatch) {
+    // Distinct from failStatus: the jobs call succeeds and only the
+    // annotations call fails, which is the reachable shape now that
+    // \`actions: read\` and \`checks: read\` are separate scopes.
+    if (fixture.annotationsFailStatus) {
+      return { ok: false, status: fixture.annotationsFailStatus, statusText: "Forbidden", json: async () => ({}) };
+    }
     return { ok: true, status: 200, statusText: "OK", json: async () => fixture.annotations[annMatch[1]] ?? [] };
   }
   throw new Error("unexpected URL " + url);
@@ -687,7 +754,12 @@ globalThis.fetch = async (url) => {
       GITHUB_REPOSITORY: "Blockcast/paperclip",
       GITHUB_RUN_ID: "32309028606",
       LANE_JOB_NAMES: laneJobNames.join("\n"),
-      CLASSIFY_FIXTURE: JSON.stringify({ pages: [jobs], annotations, failStatus }),
+      CLASSIFY_FIXTURE: JSON.stringify({
+        pages: [jobs],
+        annotations,
+        failStatus,
+        annotationsFailStatus,
+      }),
     },
   });
   rmSync(dir, { recursive: true, force: true });
@@ -731,6 +803,46 @@ test("main() degrades to an empty verdict AND a stderr diagnostic on a 403", () 
   // into its "classifier degraded" warning annotation.
   assert.match(result.stderr, /classify-lane-failures:/);
   assert.match(result.stderr, /403/);
+});
+
+test("main() reports a timed-out lane when only the annotations call is forbidden", () => {
+  // `actions: read` and `checks: read` are separate scopes, so the jobs call can
+  // succeed while `/check-runs/{id}/annotations` 403s, rate-limits or 5xxs. The
+  // blanket `failStatus` case above cannot reach this: it fails the jobs call
+  // first and never enters the annotations loop.
+  const result = runClassifierMain({
+    argv: ["typecheck_release_registry"],
+    laneJobNames: ["Typecheck + Release Registry"],
+    jobs: [{ ...TIMED_OUT_JOB, name: "Typecheck + Release Registry" }],
+    annotationsFailStatus: 403,
+  });
+
+  assert.equal(result.status, 0, `main() exited ${result.status}: ${result.stderr}`);
+  assert.equal(
+    result.stdout.trim(),
+    "",
+    "a timed-out lane whose annotations are unreadable must not be excused as a pool kill",
+  );
+  // And the degradation must be audible, so pr.yml raises its warning
+  // annotation rather than presenting the verdict as clean.
+  assert.match(result.stderr, /annotations unavailable for job/);
+  assert.match(result.stderr, /403/);
+});
+
+test("main() still excuses a provable kill when the annotations call succeeds", () => {
+  // Falsification for the test above: same lane, same code path, annotations
+  // readable — the classifier must still name the killed lane. Otherwise the
+  // fix above could pass by disabling detection outright.
+  const result = runClassifierMain({
+    argv: ["typecheck_release_registry"],
+    laneJobNames: ["Typecheck + Release Registry"],
+    jobs: [{ ...KILLED_JOB, id: 10, name: "Typecheck + Release Registry" }],
+    annotations: { 10: KILLED_ANNOTATIONS },
+  });
+
+  assert.equal(result.status, 0, `main() exited ${result.status}: ${result.stderr}`);
+  assert.equal(result.stdout.trim(), "typecheck_release_registry");
+  assert.equal(result.stderr.trim(), "", "a clean classification must not raise the degraded warning");
 });
 
 test("main() refuses to guess when lane job names are missing", () => {

@@ -55,17 +55,47 @@ const RUNNER_LOSS_PATTERNS = [
 // script's purpose and turning a real red into an invitation to re-run
 // forever. Not hypothetical here: a degraded npm registry already converted a
 // fast red into a `policy` timeout once (BLO-28813).
+//
+// Job-level only. `pr.yml` sets `timeout-minutes` on the job, and that is the
+// shape this string matches. A STEP-level `timeout-minutes` renders
+// differently: it leaves the timed-out step at `failure`, so signal 2 declines
+// to excuse it and no override is needed — but signal 1 would still fire if the
+// runner also emitted a cancellation annotation. No lane sets a step-level
+// timeout today (the only one in the file is verify's own classify bound, which
+// is never classified), so nothing is broken. A future step-level timeout on a
+// lane would need its own pattern here.
 const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
 
 /**
  * Classify a single Actions job as an infrastructure kill or a real failure.
  *
+ * `annotations` distinguishes two states that must not be conflated:
+ *   - `[]`    — queried successfully, the job carries no failure annotation.
+ *               Evidence of absence; the signals below decide.
+ *   - `null`  — could NOT be queried (403, rate limit, 5xx). Absence of
+ *               evidence, and NOT usable as a negative result.
+ *
  * @param {{conclusion?: string, steps?: Array<{conclusion?: string}>}} job
- * @param {Array<{annotation_level?: string, message?: string}>} annotations
+ * @param {Array<{annotation_level?: string, message?: string}> | null} annotations
  * @returns {"infrastructure" | "reported"}
  */
 export function classifyJobFailure(job, annotations = []) {
   if (job?.conclusion !== "failure") return "reported";
+
+  // Everywhere else in this script, missing evidence keeps the ordinary failure
+  // wording (see the no-matching-job branch in classifyLaneFailures). Here that
+  // rule is load-bearing rather than merely consistent: the timeout override is
+  // reachable ONLY through the annotations, so treating an unavailable set as
+  // an empty one silently disarms it — and signal 2 then answers
+  // `infrastructure` for every timed-out job, because a job-level timeout
+  // leaves the in-flight step `cancelled` and the rest `skipped`, i.e. with no
+  // failing step at all. That is the one place the fail-safe direction inverts:
+  // for a kill, degrading to signal 2 is safe; for a timeout it produces
+  // exactly the misattribution this script exists to prevent, and it does so
+  // when the pool is degraded and these API calls are least reliable. So
+  // decline to excuse a kill we cannot prove, rather than risk excusing a
+  // timeout we cannot see.
+  if (!Array.isArray(annotations)) return "reported";
 
   const failureAnnotations = annotations.filter(
     (annotation) => annotation?.annotation_level === "failure",
@@ -148,7 +178,10 @@ export function classifyLaneFailures({ lanes, laneJobNames, jobs, annotationsByJ
     }
 
     const allKilled = failingJobs.every(
-      (job) => classifyJobFailure(job, annotationsByJobId[job.id] ?? []) === "infrastructure",
+      // `?? null`, NOT `?? []`: a job with no entry in the map is a job whose
+      // annotations we never obtained, which classifyJobFailure must be able to
+      // tell apart from a job that genuinely had none.
+      (job) => classifyJobFailure(job, annotationsByJobId[job.id] ?? null) === "infrastructure",
     );
     (allKilled ? infrastructure : reported).push(lane);
   }
@@ -214,10 +247,20 @@ async function main() {
         token,
         repository,
       );
-    } catch {
-      // Annotations are one of two independent signals — losing them degrades
-      // to the step-shape check rather than failing the classification.
-      annotationsByJobId[job.id] = [];
+    } catch (error) {
+      // `null`, not `[]`: the annotations are one of two independent signals,
+      // but they are the ONLY route to the timeout override, so an unreadable
+      // set must not read downstream as "this job did not time out". `actions:
+      // read` and `checks: read` are distinct scopes, so the jobs call above
+      // can succeed while this one 403s. classifyJobFailure keeps the ordinary
+      // failure wording for these.
+      annotationsByJobId[job.id] = null;
+      // Say so on stderr: pr.yml turns any output here into the "lane
+      // classifier degraded" warning, so a silent catch would hide a
+      // systematically degraded classifier behind a normal-looking verdict.
+      process.stderr.write(
+        `classify-lane-failures: annotations unavailable for job ${job.id} (${job.name ?? "unnamed"}), keeping the ordinary failure wording: ${error.message}\n`,
+      );
     }
   }
 
