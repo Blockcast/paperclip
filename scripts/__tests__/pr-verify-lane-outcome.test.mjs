@@ -404,6 +404,30 @@ test("classifier declines to excuse a job whose annotations could not be read", 
   );
 });
 
+// The state you get by OMISSION must be the safe one. Every call site passes
+// annotations explicitly today, so this default is currently unreachable —
+// which is exactly why it is worth pinning: an exported function whose unsafe
+// reading is its default will eventually be called by omission, and the failure
+// would be silent (a timed-out lane announced as a pool kill, the very
+// misattribution this script exists to prevent).
+test("classifyJobFailure defaults to the safe state when annotations are omitted", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  assert.equal(
+    classifyJobFailure(TIMED_OUT_JOB),
+    "reported",
+    "omitting annotations must read as 'never queried', not as 'queried and empty'",
+  );
+
+  // Falsification: the same job WITH an explicit empty set is the permissive
+  // reading. If these two ever agree, the default has drifted back to `[]`.
+  assert.equal(
+    classifyJobFailure(TIMED_OUT_JOB, []),
+    "infrastructure",
+    "fixture no longer distinguishes the omitted argument from an explicit empty set",
+  );
+});
+
 test("a lane whose job is missing from the annotations map is reported, not excused", async () => {
   const { classifyLaneFailures } = await import("../classify-lane-failures.mjs");
 
@@ -540,6 +564,49 @@ test("verify step ignores an unknown lane name in INFRA_LANES", () => {
   assert.notEqual(result.status, 0);
   assert.match(result.stdout, /::error title=verify: lane failure::/);
   assert.doesNotMatch(result.stdout, /::error title=verify: lane infrastructure kill::/);
+});
+
+// `lane_names` is duplicated across the two verify steps — the classify step,
+// which decides WHICH failed lanes were killed, and the aggregation step, which
+// decides what to say about them. Each step's internal pairing is asserted
+// above, but nothing pins the two steps against EACH OTHER, and both drift
+// directions are silent: a lane added only to the aggregation step never
+// reaches the classifier and keeps the ordinary failure wording, while one
+// added only to the classify step is ignored by the aggregation loop. Neither
+// errors and neither reddens a test — detection coverage just narrows.
+//
+// Set equality, not order equality: each step pairs its own arrays by index and
+// is separately asserted for that, so the steps do not have to agree on order
+// to both be correct. Membership is the real invariant.
+test("both verify steps list the same lanes", () => {
+  const readLaneNames = (haystack, from = 0) => {
+    const start = haystack.indexOf("lane_names=(", from);
+    assert.notEqual(start, -1, "could not find lane_names");
+    const end = haystack.indexOf(")", start);
+    assert.notEqual(end, -1, "could not find the end of lane_names");
+    return haystack
+      .slice(start + "lane_names=(".length, end)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .sort();
+  };
+
+  const classifyStart = workflow.indexOf(
+    "\n      - name: Classify failed lanes as infrastructure kills or real failures\n",
+  );
+  assert.notEqual(classifyStart, -1, "pr.yml must define the lane classification step");
+
+  const classifyLanes = readLaneNames(workflow, classifyStart);
+  const aggregationLanes = readLaneNames(getVerifyLaneScript());
+
+  assert.ok(classifyLanes.length > 0, "could not parse the classify step's lane_names");
+  assert.deepEqual(
+    classifyLanes,
+    aggregationLanes,
+    "the classify and aggregation steps must cover the same lanes — a lane present in only " +
+      "one of them silently loses runner-kill detection while both steps keep working",
+  );
 });
 
 // The classify step carries a THIRD parallel array mapping each lane to the

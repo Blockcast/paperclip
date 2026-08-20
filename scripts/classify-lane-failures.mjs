@@ -75,11 +75,18 @@ const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
  *   - `null`  — could NOT be queried (403, rate limit, 5xx). Absence of
  *               evidence, and NOT usable as a negative result.
  *
+ * The default is `null`, the SAFE state, so omitting the argument cannot assert
+ * a negative result the caller never obtained. `[]` as the default would make
+ * the permissive reading the one you get by accident: a one-argument call on a
+ * timed-out job would take signal 2 and answer `infrastructure`, the exact
+ * misattribution the guard below exists to prevent. Every call site passes the
+ * argument explicitly today, which is why this costs nothing to get right now.
+ *
  * @param {{conclusion?: string, steps?: Array<{conclusion?: string}>}} job
  * @param {Array<{annotation_level?: string, message?: string}> | null} annotations
  * @returns {"infrastructure" | "reported"}
  */
-export function classifyJobFailure(job, annotations = []) {
+export function classifyJobFailure(job, annotations = null) {
   if (job?.conclusion !== "failure") return "reported";
 
   // Everywhere else in this script, missing evidence keeps the ordinary failure
