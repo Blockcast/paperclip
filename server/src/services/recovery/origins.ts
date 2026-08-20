@@ -116,13 +116,53 @@ export function buildSchedulerFailureHeartbeatKey(input: {
   ].join(":");
 }
 
-// BLO-24543: SQL LIKE pattern for "this window already has a normal
-// emission." `windowKey` is an ISO-8601 timestamp (no `%`/`_` wildcard
-// characters), so this is a literal prefix match, not a real glob. Reading
-// this prefix is the receipt-absence predicate itself -- it replaces the old
-// `lastUsefulActionAt IS NOT NULL` proxy, which was too permissive: a run can
-// set that column off a single early activity event (e.g. checkout) and then
-// still strand before ever reaching the runbook's own emission step.
-export function buildAgentHealthReceiptKeyLikePattern(windowKey: string) {
-  return `${AGENT_HEALTH_RECEIPT_KEY_PREFIX}:${windowKey}:%`;
+// BLO-24543: SQL LIKE pattern for "the alert surface carries a normal
+// emission." Reading these keys is the receipt-absence predicate itself -- it
+// replaces the old `lastUsefulActionAt IS NOT NULL` proxy, which was too
+// permissive: a run can set that column off a single early activity event
+// (e.g. checkout) and then still strand before ever reaching the runbook's own
+// emission step.
+//
+// BLO-28871: this deliberately does NOT interpolate a window key. The previous
+// `agent-health:<windowKey>:%` form pinned the match to one exact timestamp
+// string, and the platform's window identity is not the runbook's: the
+// scheduler knows the raw `triggeredAt` (`:07:xx` under the live `7 */6 * * *`
+// cron) while every receipt on the live alert surface is keyed to the floored
+// UTC slot (`:00:00`). Those two strings can never be equal, so the guard
+// matched nothing in production. Match the whole namespace here and decide
+// window membership from the parsed key -- see
+// `parseAgentHealthReceiptWindowKey`.
+export const AGENT_HEALTH_RECEIPT_KEY_LIKE_PATTERN = `${AGENT_HEALTH_RECEIPT_KEY_PREFIX}:%`;
+
+// The window instant inside `agent-health:<windowKey>:<fingerprint>`. Not a
+// `split(":")`: `<windowKey>` is an ISO-8601 instant that contains its own
+// colons, and `<fingerprint>` is runbook-owned free text. Both formats observed
+// on the live alert surface are accepted -- `2026-08-03T18:00:00Z` (seconds)
+// and `2026-08-19T00:00:00.000Z` (milliseconds) -- plus an explicit numeric
+// offset, since this convention belongs to the runbook and may drift again.
+const AGENT_HEALTH_RECEIPT_WINDOW_KEY_PATTERN = new RegExp(
+  `^${AGENT_HEALTH_RECEIPT_KEY_PREFIX}:`
+    + "(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d{1,9})?)?)"
+    + "(Z|[+-]\\d{2}:?\\d{2})?"
+    + "(?::|$)",
+);
+
+/**
+ * BLO-28871: parse the window instant a runbook stamped into its own receipt
+ * key. Returns `null` for anything that is not an `agent-health:` key with a
+ * readable ISO-8601 window -- including a null key, which is the shape every
+ * pre-`2026-07-31` emission on the live alert surface has. An unparseable or
+ * absent window cannot be attributed to a window, so it must never suppress a
+ * scheduler receipt; that is what keeps the July-shaped true positives true.
+ *
+ * A form with no explicit offset is read as UTC. Every observed convention
+ * stamps the UTC slot, and the JS default of local time would make this parse
+ * depend on the server's timezone.
+ */
+export function parseAgentHealthReceiptWindowKey(idempotencyKey: string | null | undefined) {
+  if (!idempotencyKey) return null;
+  const match = AGENT_HEALTH_RECEIPT_WINDOW_KEY_PATTERN.exec(idempotencyKey);
+  if (!match) return null;
+  const parsed = new Date(`${match[1]}${match[2] ?? "Z"}`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }

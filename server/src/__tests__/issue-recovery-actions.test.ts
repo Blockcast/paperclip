@@ -5673,8 +5673,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       routineId: string;
       triggeredAt: Date;
       issueNumber: number;
+      // BLO-28871: other runs of the same routine. The window a run owns is
+      // bounded by its neighbours rather than by a hard-coded cron interval, so
+      // any test that exercises the receipt-absence predicate against a
+      // floored key needs at least the preceding run to exist.
+      siblingTriggeredAt?: Date[];
     }) {
       const routineRunId = randomUUID();
+      for (const triggeredAt of input.siblingTriggeredAt ?? []) {
+        await db.insert(routineRuns).values({
+          id: randomUUID(),
+          companyId: input.companyId,
+          routineId: input.routineId,
+          source: "schedule",
+          status: "received",
+          triggeredAt,
+        });
+      }
       await db.insert(routineRuns).values({
         id: routineRunId,
         companyId: input.companyId,
@@ -5878,7 +5893,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         `scheduler-heartbeat:${routineId}:${windowKey}`,
       );
       expect(alertSurfaceComments[0]!.body).toContain("carried no");
-      expect(alertSurfaceComments[0]!.body).toContain(`agent-health:${windowKey}:*`);
+      // BLO-28871: the receipt names the interval it searched, not a single
+      // raw-timestamp key it never actually looked for.
+      expect(alertSurfaceComments[0]!.body).toContain("`agent-health:*` receipt keyed");
+      expect(alertSurfaceComments[0]!.body).toContain(`at or before \`${windowKey}\``);
       expect(alertSurfaceComments[0]!.body).toContain("run_crashed");
     });
 
@@ -5988,7 +6006,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(alertSurfaceComments[0]!.body).toContain(windowKey);
       expect(alertSurfaceComments[0]!.body).toContain(issue.identifier!);
       expect(alertSurfaceComments[0]!.body).toContain("carried no");
-      expect(alertSurfaceComments[0]!.body).toContain(`agent-health:${windowKey}:*`);
+      // BLO-28871: the receipt names the interval it searched, not a single
+      // raw-timestamp key it never actually looked for.
+      expect(alertSurfaceComments[0]!.body).toContain("`agent-health:*` receipt keyed");
+      expect(alertSurfaceComments[0]!.body).toContain(`at or before \`${windowKey}\``);
       expect(alertSurfaceComments[0]!.body).toContain("retired to `cancelled`");
       expect(alertSurfaceComments[0]!.body).toContain("from `in_progress`");
     });
@@ -6148,6 +6169,291 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(afterCancel[0]!.idempotencyKey).toBe(`scheduler-heartbeat:${routineId}:${windowKey}`);
       // The surviving row is the original strand-time one, not a rewrite.
       expect(afterCancel[0]!.body).toContain("external_lifecycle_stale_killed");
+    });
+
+    /**
+     * BLO-28871. Every test above stamps `triggeredAt` exactly on a slot
+     * boundary, so the raw key and the runbook's floored key happen to be the
+     * same string and the suppression guard looked correct. Production is not
+     * like that: the live cron is `7 */6 * * *`, so runs trigger at `:07:xx`
+     * while every receipt on the alert surface is keyed to the floored UTC slot.
+     * These use the real shape.
+     */
+    describe("window identity is the routine's window, not the raw trigger timestamp", () => {
+      // The BLO-28387 shape, measured live: window `2026-08-18T00:00:00.000Z`
+      // carried `agent-health:2026-08-18T00:00:00.000Z:missed_window`, but its
+      // run triggered at `00:07:06.458Z`. Cancelling that row used to post a
+      // receipt asserting the window carried no `agent-health:` receipt -- onto
+      // the very issue holding one.
+      it("suppresses a cancel-time receipt when the runbook keyed its emission to the floored slot", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt: new Date("2026-08-18T00:07:06.458Z"),
+          siblingTriggeredAt: [new Date("2026-08-17T18:07:06.101Z")],
+          issueNumber: 508,
+        });
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-18T00:00:00.000Z:missed_window",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const alertSurfaceComments = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId));
+        expect(alertSurfaceComments).toHaveLength(1);
+        expect(alertSurfaceComments[0]!.idempotencyKey).toBe(
+          "agent-health:2026-08-18T00:00:00.000Z:missed_window",
+        );
+      });
+
+      // Same suppression on the strand path, which reaches the predicate
+      // through `recovery/service.ts` rather than the issue-update transition.
+      it("suppresses a strand-time receipt when the runbook keyed its emission to the floored slot", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt: new Date("2026-08-15T06:07:21.003Z"),
+          siblingTriggeredAt: [new Date("2026-08-15T00:07:18.771Z")],
+          issueNumber: 509,
+        });
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-15T06:00:00.000Z:missed_window",
+        });
+
+        const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+        const staleKillRun = {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "External lifecycle Job stale-killed",
+          errorCode: "external_lifecycle_stale_killed",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: null,
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        } as const;
+        await recoveryService(db, { enqueueWakeup }).escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun: staleKillRun,
+        });
+
+        const alertSurfaceComments = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId));
+        expect(alertSurfaceComments).toHaveLength(1);
+        expect(alertSurfaceComments[0]!.idempotencyKey).toBe(
+          "agent-health:2026-08-15T06:00:00.000Z:missed_window",
+        );
+      });
+
+      // The older convention observed on the live alert surface: seconds
+      // precision, no milliseconds, and an opaque hash fingerprint. Parsed, not
+      // string-matched, so a format drift the runbook owns cannot silently
+      // re-break the guard.
+      it("suppresses on the older seconds-precision key format", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt: new Date("2026-08-03T18:07:04.909Z"),
+          siblingTriggeredAt: [new Date("2026-08-03T12:07:11.010Z")],
+          issueNumber: 510,
+        });
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep completed normally for this window.",
+          idempotencyKey: "agent-health:2026-08-03T18:00:00Z:c722100afingerprint",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const alertSurfaceComments = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId));
+        expect(alertSurfaceComments).toHaveLength(1);
+        expect(alertSurfaceComments[0]!.idempotencyKey).toBe(
+          "agent-health:2026-08-03T18:00:00Z:c722100afingerprint",
+        );
+      });
+
+      // The true positive must stay true. This is the live BLO-20930 shape:
+      // window `2026-08-02T12:07:15.190Z`, nothing keyed inside it. The
+      // pre-convention emissions that fill the alert surface before
+      // `2026-07-31` carry no `idempotencyKey` at all, and an emission that
+      // cannot be attributed to a window must not suppress one.
+      it("still emits exactly one receipt for a genuinely dark window", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const triggeredAt = new Date("2026-08-02T12:07:15.190Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          siblingTriggeredAt: [new Date("2026-08-02T06:07:09.220Z")],
+          issueNumber: 511,
+        });
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep ran in this window but stamped no idempotency key.",
+          idempotencyKey: null,
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const alertSurfaceComments = await db
+          .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId));
+        const receipts = alertSurfaceComments.filter((row) =>
+          row.idempotencyKey?.startsWith("scheduler-heartbeat:")
+        );
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+        // The receipt states the interval it searched, bounded below by the
+        // preceding run rather than by a hard-coded 6-hour interval.
+        expect(receipts[0]!.body).toContain("after `2026-08-02T06:07:09.220Z`");
+        expect(receipts[0]!.body).toContain("at or before `2026-08-02T12:07:15.190Z`");
+      });
+
+      // The interval must not be so wide that the *previous* window's receipt
+      // suppresses this one -- that would trade the false alarm this issue
+      // fixes for silence on a real dark window, which is worse.
+      it("does not let the preceding window's receipt suppress this window", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const triggeredAt = new Date("2026-08-19T00:07:26.722Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          siblingTriggeredAt: [new Date("2026-08-18T18:07:02.500Z")],
+          issueNumber: 512,
+        });
+        // Belongs to the 18:00 window, which is entirely before this one.
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-18T18:00:00.000Z:missed_window",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId))
+          .then((rows) => rows.filter((row) => row.idempotencyKey?.startsWith("scheduler-heartbeat:")));
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+      });
+
+      // A receipt keyed to a *later* window cannot vouch for this one either.
+      it("does not let a following window's receipt suppress this window", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const triggeredAt = new Date("2026-08-19T06:07:19.400Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          siblingTriggeredAt: [
+            new Date("2026-08-19T00:07:26.722Z"),
+            new Date("2026-08-19T12:07:03.118Z"),
+          ],
+          issueNumber: 513,
+        });
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-19T12:00:00.000Z:missed_window",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId))
+          .then((rows) => rows.filter((row) => row.idempotencyKey?.startsWith("scheduler-heartbeat:")));
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+      });
     });
   });
 
