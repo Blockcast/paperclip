@@ -1597,6 +1597,175 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  // BLO-27912. `hasExplicitWaitingPath` accepted six satisfiers for "somebody owns the
+  // next action here" and every one was assignee-reachable only, so a deliberately-parked
+  // row — one whose assignee is by construction NOT working on it — had no attainable way
+  // to say so. Measured on the live instance (BLO-24266): an actor holding BOTH the
+  // `createdByAgentId` and manager-chain grants got 403 `deny_missing_grant` on every
+  // mechanism that would have silenced the false incident. These tests pin the 403 -> 2xx
+  // transition for the one narrow shape, and the 403 everywhere around it.
+  describe("deliberate-park disposition PATCH (BLO-27912)", () => {
+    const parkedBody = {
+      parkedDisposition: {
+        reason: "Gated on upstream fMP4 contract scheduling; no timer owns the event.",
+        until: "2026-09-30T00:00:00.000Z",
+      },
+    };
+    // Grants `issue:comment` (the action the creator / manager-chain allow-paths are
+    // defined over) and denies the general mutation boundary, which is exactly the
+    // position the CTO was measured in on BLO-24266.
+    const commentOnlyDecide = (reason: string) => async (input: { action: string }) => {
+      if (input.action === "issue:comment") {
+        return { allowed: true, action: input.action, reason, explanation: "Comment grant." };
+      }
+      if (input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No general issue mutation grant.",
+      };
+    };
+
+    beforeEach(() => {
+      // A backlog row assigned to somebody else: the shape that produced the loop.
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "backlog",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+        executionState: null,
+        monitorNextCheckAt: null,
+      }));
+    });
+
+    for (const reason of ["allow_manager_chain", "allow_issue_creator"]) {
+      it(`lets a non-assignee holding only ${reason} record a park, and forwards it as the nested input`, async () => {
+        mockAccessService.decide.mockImplementation(commentOnlyDecide(reason));
+
+        const res = await request(await createApp(ownerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send(parkedBody);
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        // Forwarded as the nested disposition and nothing else. The four `parked_*`
+        // columns are derived server-side from this, so `parkedByAgentId` / `parkedAt`
+        // cannot be forged by the caller.
+        expect(mockIssueService.update).toHaveBeenCalledWith(
+          issueId,
+          expect.objectContaining({ parkedDisposition: parkedBody.parkedDisposition }),
+        );
+        // The AC that a park changes none of the row's own fields, asserted rather than
+        // assumed: nothing else may ride along on this grant.
+        const forwarded = mockIssueService.update.mock.calls.at(-1)?.[1] ?? {};
+        for (const field of ["status", "priority", "assigneeAgentId", "blockedByIssueIds"]) {
+          expect(forwarded).not.toHaveProperty(field);
+        }
+      });
+    }
+
+    it("lets the same actor un-park, so suppression cannot be made one-way", async () => {
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parkedDisposition: null });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ parkedDisposition: null }),
+      );
+    });
+
+    it("refuses a park bundled with any other field, so the grant cannot be widened", async () => {
+      // The shape gate. `parkedDisposition` alongside `status` would reach a status
+      // transition through a path that deliberately skips the mutation boundary.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ ...parkedBody, status: "todo" });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a park from an actor holding neither grant", async () => {
+      // Fails closed: the widening is keyed on the two named allow-paths, not on the
+      // request merely being park-shaped.
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+        if (input.action === "issue:read") {
+          return {
+            allowed: true,
+            action: input.action,
+            reason: "allow_explicit_grant",
+            explanation: "Allowed by test grant.",
+          };
+        }
+        return {
+          allowed: false,
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "No grant at all.",
+        };
+      });
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(parkedBody);
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects the flat parked_* keys instead of silently discarding them", async () => {
+      // Same trap the misplaced monitor keys guard against: a caller who guesses the flat
+      // shape would otherwise be stripped by zod, get a 200, and believe the row is parked.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parkedUntil: "2026-09-30T00:00:00.000Z" });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a deadline that is in the past or beyond the horizon", async () => {
+      // The anti-silence bound, enforced at the edge. A lapsed deadline suppresses
+      // nothing, and an unbounded one is permanent silence.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+      const app = await createApp(ownerActor());
+
+      for (const until of ["2020-01-01T00:00:00.000Z", "2099-01-01T00:00:00.000Z"]) {
+        const res = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ parkedDisposition: { reason: "still waiting upstream", until } });
+        expect(res.status, `until=${until} body=${JSON.stringify(res.body)}`).toBe(400);
+      }
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("requires a stated reason", async () => {
+      // A park whose reason is unstated is indistinguishable from the stall it suppresses.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parkedDisposition: { until: "2026-09-30T00:00:00.000Z" } });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
   // BLO-21947. The BLO-18294 convergence guard stops re-arming after N
   // re-checks against an unchanged gate set and deliberately bars the assignee
   // from granting itself a fresh budget — "a non-assignee actor must make that
