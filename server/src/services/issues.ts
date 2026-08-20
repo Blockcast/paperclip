@@ -902,7 +902,37 @@ type IssueWithLabels = IssueRow & {
   labelIds: string[];
   watchdog?: IssueWatchdogSummary | null;
 };
-type IssueWithLabelsAndRun = IssueWithLabels & { activeRun: IssueActiveRunRow | null };
+/**
+ * BLO-28843: the third liveness path, flattened onto every list row.
+ *
+ * An issue is *attended* by exactly one of three paths: a live run, an armed
+ * monitor, or a scheduled retry. The list projection already carried the first
+ * two (`activeRun`, six `monitor*` columns) and omitted the third entirely, so
+ * an auditor filtering list rows for retry state read `undefined` on every row
+ * and computed zero retry-attended issues — a plausible number, not an error.
+ * Nothing signalled that the field had never been projected, and the bias only
+ * ever runs one way: a run parked on a concrete `scheduledRetryAt` was
+ * indistinguishable from an abandoned row.
+ *
+ * These keys are therefore **always present** on a list row, explicitly `null`
+ * when there is no scheduled retry. An absent key is what made the failure
+ * silent; a present `null` is honest. Flat scalars (not a nested object) to
+ * match the existing `monitor*` convention, so no consumer has to special-case
+ * a nullable sub-object.
+ */
+type IssueScheduledRetryProjection = {
+  scheduledRetryAt: Date | null;
+  scheduledRetryReason: string | null;
+  scheduledRetryAttempt: number | null;
+};
+const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
+  scheduledRetryAt: null,
+  scheduledRetryReason: null,
+  scheduledRetryAttempt: null,
+};
+type IssueWithLabelsAndRun = IssueWithLabels
+  & { activeRun: IssueActiveRunRow | null }
+  & IssueScheduledRetryProjection;
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -2645,6 +2675,63 @@ async function activeRunMapForIssues(
   return map;
 }
 
+/**
+ * BLO-28843: batch equivalent of `getCurrentScheduledRetryForIssue`, for the
+ * list projection.
+ *
+ * Selection and tie-break MUST stay identical to the single-issue read, because
+ * the contract is that a list row's `scheduledRetryAt` equals what
+ * `getIssue` returns for the same issue in the same minute: earliest
+ * `scheduledRetryAt`, then `createdAt`, then `id`. The `agents` inner join is
+ * carried over for the same reason — it is a row filter there, so dropping it
+ * here could make the list report a retry the single read does not.
+ *
+ * Reads the `context_issue_id` generated stored column (migration 0079) rather
+ * than re-extracting `context_snapshot ->> 'issueId'`, so this stays off the
+ * per-row JSONB detoast path on a query that runs over a whole page of issues.
+ */
+async function scheduledRetryProjectionMapForIssues(
+  dbOrTx: any,
+  companyId: string,
+  issueIds: string[],
+): Promise<Map<string, IssueScheduledRetryProjection>> {
+  const map = new Map<string, IssueScheduledRetryProjection>();
+  const uniqueIssueIds = [...new Set(issueIds)];
+  if (uniqueIssueIds.length === 0) return map;
+
+  for (const issueIdChunk of chunkList(uniqueIssueIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const rows = await dbOrTx
+      .select({
+        issueId: heartbeatRuns.contextIssueId,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          inArray(heartbeatRuns.contextIssueId, issueIdChunk),
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+
+    // Rows arrive in the single-read tie-break order, so first-seen per issue is
+    // the same row `getCurrentScheduledRetryForIssue` would have returned.
+    for (const row of rows as Array<{ issueId: string | null } & IssueScheduledRetryProjection>) {
+      if (!row.issueId || map.has(row.issueId)) continue;
+      map.set(row.issueId, {
+        scheduledRetryAt: row.scheduledRetryAt ?? null,
+        scheduledRetryReason: row.scheduledRetryReason ?? null,
+        scheduledRetryAttempt: row.scheduledRetryAttempt ?? null,
+      });
+    }
+  }
+  return map;
+}
+
 async function liveDescendantCountMapForIssues(
   dbOrTx: any,
   companyId: string,
@@ -3544,13 +3631,24 @@ const issueListSelect = {
   lastEvidenceVerdictEvaluatedAt: issues.lastEvidenceVerdictEvaluatedAt,
 };
 
+/**
+ * Attaches the two derived liveness projections every list row carries:
+ * `activeRun` and the flat `scheduledRetry*` scalars (BLO-28843).
+ *
+ * `retryMap` is deliberately a **required** parameter. The defect this closes
+ * was a projection that silently omitted a key, so the failure mode has to be a
+ * compile error at any new call site, not a row that quietly ships without the
+ * field.
+ */
 function withActiveRuns(
   issueRows: IssueWithLabels[],
   runMap: Map<string, IssueActiveRunRow>,
+  retryMap: Map<string, IssueScheduledRetryProjection>,
 ): IssueWithLabelsAndRun[] {
   return issueRows.map((row) => ({
     ...row,
     activeRun: row.executionRunId ? (runMap.get(activeRunMapKey(row.companyId, row.executionRunId)) ?? null) : null,
+    ...(retryMap.get(row.id) ?? EMPTY_SCHEDULED_RETRY_PROJECTION),
   }));
 }
 
@@ -4928,7 +5026,11 @@ async function listBlockedInboxIssues(
       description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
     }));
   const withLabels = await withIssueLabels(dbOrTx, rows);
-  const withRuns = withActiveRuns(withLabels, await activeRunMapForIssues(dbOrTx, withLabels));
+  const withRuns = withActiveRuns(
+    withLabels,
+    await activeRunMapForIssues(dbOrTx, withLabels),
+    await scheduledRetryProjectionMapForIssues(dbOrTx, companyId, withLabels.map((row: IssueWithLabels) => row.id)),
+  );
   if (withRuns.length === 0) return [];
 
   const issueIds = withRuns.map((row) => row.id);
@@ -7058,8 +7160,13 @@ export function issueService(db: Db) {
         : (limit === undefined ? baseQuery : baseQuery.limit(limit));
       const rows = await pageQuery;
       const withLabels = await withIssueLabels(db, rows);
-      const runMap = await activeRunMapForIssues(db, withLabels);
-      const withRuns = withActiveRuns(withLabels, runMap);
+      // Both derived maps are built from the already-paginated page, so this
+      // stays additive to the row shape and neutral to `limit`/`offset`.
+      const [runMap, retryMap] = await Promise.all([
+        activeRunMapForIssues(db, withLabels),
+        scheduledRetryProjectionMapForIssues(db, companyId, withLabels.map((row: IssueWithLabels) => row.id)),
+      ]);
+      const withRuns = withActiveRuns(withLabels, runMap, retryMap);
       if (withRuns.length === 0) {
         return withRuns;
       }
