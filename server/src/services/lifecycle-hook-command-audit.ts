@@ -25,7 +25,8 @@
  * a deleted file cannot break a string in a database row. The load-bearing
  * guard is therefore a *boot-time* audit: config is unchanged, but the image
  * underneath it changed. Write-time validation (also wired here) only catches
- * the easier case of someone typing a path that is already wrong.
+ * the easier case of someone typing a path that is already wrong, and is
+ * advisory for the same reason the boot audit is non-fatal — see below.
  *
  * ## Detection strategy: precision over recall
  *
@@ -43,8 +44,14 @@
  * would train operators to ignore the signal. A missing absolute script path
  * is unambiguous: `spawn(..., { shell: true })` will fail on it every time.
  *
- * API and worker tiers run the identical image, so an absolute path under the
- * image root resolves the same on whichever tier performs the audit.
+ * A finding is therefore evidence, not a verdict, and no caller treats it as
+ * one. API and worker tiers run the identical image, so a path *baked into the
+ * image* resolves the same on whichever tier audits it — but a path on a
+ * **mounted volume** is per-pod, and a worker-only script is genuinely missing
+ * when the API tier stats it. Neither caller can tell those two apart, which is
+ * why the boot audit only logs and the write path only warns: the cost of a
+ * false positive must stay bounded at noise, never reach refusing a write or
+ * stopping the instance from serving.
  */
 
 import { existsSync } from "node:fs";
