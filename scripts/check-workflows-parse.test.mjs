@@ -9,17 +9,21 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
+import { ALLOWED_RUNNERS } from "./check-github-runner-labels.mjs";
 import {
   DETERMINISM_FLAGS,
   WORKFLOWS_DIR,
   collectWorkflowFiles,
   runCheck,
 } from "./check-workflows-parse.mjs";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // The f94d5212 shape: a heredoc body and its `EOF` terminator at column 0
 // inside a `run: |` block scalar. YAML strips the block's common indent, so
@@ -83,7 +87,7 @@ test("an empty workflow set fails instead of passing vacuously", () => {
   }
 });
 
-test("an unreadable workflows directory fails rather than reporting green", () => {
+test("a missing workflows directory fails rather than reporting green", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "wf-parse-missing-"));
   const { sink } = silent();
   try {
@@ -91,6 +95,24 @@ test("an unreadable workflows directory fails rather than reporting green", () =
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("an unreadable workflows directory fails rather than reporting green", () => {
+  // Injected rather than staged on disk: a real EACCES fixture needs a chmod
+  // that root ignores, so the CI runner would silently exercise the success
+  // path instead. ENOENT is covered by the test above.
+  const { sink, lines } = silent();
+  const code = runCheck({
+    repoRoot: "/nonexistent-does-not-matter",
+    readdir: () => {
+      throw Object.assign(new Error("EACCES: permission denied, scandir"), { code: "EACCES" });
+    },
+    spawn: () => ({ status: 0 }),
+    log: sink,
+    error: sink,
+  });
+  assert.equal(code, 1);
+  assert.match(lines.join("\n"), /Could not read .*permission denied/);
 });
 
 test("a missing actionlint binary fails closed and says how to get it", () => {
@@ -214,3 +236,39 @@ test(
     }
   },
 );
+
+// Extracts the `self-hosted-runner.labels` sequence. Deliberately narrow, and
+// returns null rather than [] when the block is not found so the caller fails
+// closed instead of comparing against an empty set. Line-scanning a YAML file
+// is the very sin this gate exists to catch, but it is safe here: actionlint
+// parses this same config with a real parser on every `policy` run, so a
+// malformed .github/actionlint.yaml is already red before this test matters.
+function actionlintRunnerLabels(configText) {
+  const lines = configText.split("\n");
+  const start = lines.findIndex((line) => /^\s*labels:\s*$/.test(line));
+  if (start === -1) return null;
+
+  const labels = [];
+  for (const line of lines.slice(start + 1)) {
+    const match = line.match(/^\s+-\s+(\S+)\s*$/);
+    if (!match) break;
+    labels.push(match[1]);
+  }
+  return labels.length > 0 ? labels : null;
+}
+
+test("runner-label allowlists agree between actionlint.yaml and check-github-runner-labels.mjs", () => {
+  const configPath = path.join(repoRoot, ".github", "actionlint.yaml");
+  const declared = actionlintRunnerLabels(readFileSync(configPath, "utf8"));
+
+  assert.ok(
+    declared,
+    `Could not find a self-hosted-runner.labels list in ${configPath}. Both runner-label gates read from these lists, so an unreadable one is a failure, not a pass.`,
+  );
+
+  assert.deepEqual(
+    [...declared].sort(),
+    [...ALLOWED_RUNNERS].sort(),
+    "The ARC pool lists have drifted. .github/actionlint.yaml feeds actionlint's runner-label check and ALLOWED_RUNNERS in scripts/check-github-runner-labels.mjs feeds the dedicated label checker; a pool declared in only one makes that gate red while the other passes. Add the label to both.",
+  );
+});

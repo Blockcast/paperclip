@@ -36,6 +36,9 @@ description: Install the pinned actionlint binary, verified by SHA256.
 
 outputs:
   bin:
+    # Provided as a stable interface for callers that want an explicit path.
+    # pr.yml does not use it — the gate finds actionlint on PATH via the
+    # $GITHUB_PATH write in the install step below.
     description: Absolute path to the verified actionlint binary.
     value: ${{ steps.install.outputs.bin }}
 
@@ -90,5 +93,11 @@ runs:
         chmod +x "${dest}/actionlint"
 
         echo "bin=${dest}/actionlint" >> "$GITHUB_OUTPUT"
+        # The $GITHUB_PATH write is the load-bearing wiring, not the output
+        # above: the gate resolves the binary by name off PATH
+        # (ACTIONLINT_BIN || "actionlint" in scripts/check-workflows-parse.mjs)
+        # and pr.yml uses this action without an `id:`, so it never reads
+        # `outputs.bin`. Removing this line breaks the gate even though the
+        # output still looks correct.
         echo "${dest}" >> "$GITHUB_PATH"
         "${dest}/actionlint" --version
