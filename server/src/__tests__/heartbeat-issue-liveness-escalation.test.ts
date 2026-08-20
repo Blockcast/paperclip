@@ -1624,7 +1624,15 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const now = new Date();
     const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
 
-    const ceilingMs = 7 * 24 * 60 * 60 * 1000;
+    // Derived, never hardcoded: the whole value of this fixture is positional --
+    // `completedAt` 5s inside the ceiling and `updatedAt` 5s outside it, so the
+    // row is reachable ONLY via the skew allowance. A literal `7 * 24 * ...`
+    // would not fail if the constant were tuned upward; both columns would land
+    // well inside the wider horizon, the row would pass the filter with or
+    // without skew, and the assertions would still hold -- the test would stop
+    // testing the boundary silently, exactly when someone is changing the thing
+    // it guards.
+    const ceilingMs = DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS;
     const completedAt = new Date(now.getTime() - ceilingMs + 5_000);
     const updatedAt = new Date(now.getTime() - ceilingMs - 5_000);
     // Quiet well before the resolution, so the leaf-activity check cannot be
