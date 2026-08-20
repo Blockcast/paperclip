@@ -135,10 +135,19 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
   // assertions below to the aggregation step — the one that IS the gate — so
   // they keep describing the script they were written for rather than
   // silently retargeting onto whichever step happens to appear first.
-  const aggregationBody = verifyBody.slice(
-    verifyBody.indexOf("- name: Fail if any split verify lane failed"),
+  // Capture the index and assert it before slicing: `indexOf` returns -1 when
+  // the step name is absent, and `slice(-1)` then yields the last character of
+  // the file — a truthy one-character string, so asserting on the slice can
+  // never fail. The regression would still be caught by the `lane_names`
+  // assertion below, but it would report a missing array rather than the
+  // missing step this assertion exists to name.
+  const aggregationStart = verifyBody.indexOf("- name: Fail if any split verify lane failed");
+  assert.notEqual(
+    aggregationStart,
+    -1,
+    "verify must retain the lane-outcome aggregation step.",
   );
-  assert.ok(aggregationBody, "verify must retain the lane-outcome aggregation step.");
+  const aggregationBody = verifyBody.slice(aggregationStart);
 
   const laneNames = parseBashArrayElements(aggregationBody, "lane_names");
   const laneResults = parseBashArrayElements(aggregationBody, "lane_results");
