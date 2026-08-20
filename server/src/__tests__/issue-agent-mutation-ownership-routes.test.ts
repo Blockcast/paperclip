@@ -4502,6 +4502,189 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
+  // BLO-29150: `isCurrentIssueExecutionRun` is assignee-agnostic, so before the
+  // route-local opt-in a run holding a lock left stale by a reassignment could
+  // hard-delete a row that had since been assigned to another agent — the row
+  // and its attachment objects, irreversibly.
+  //
+  // Asserted as a MATRIX on purpose. The single fixed cell is the cheap
+  // assertion and the useless one: the short-circuit is shared by ~25 routes, so
+  // a later change there can flip a *different* cell, and a test that pins only
+  // the non-assignee case would stay green while the legitimate owner lost the
+  // ability to delete its own issue.
+  describe("BLO-29150: DELETE /issues/:id does not take a bare run lock as delete authority", () => {
+    const staleLockRunId = "99999999-9999-4999-8999-999999999911";
+
+    function expectRowSurvived() {
+      expect(mockIssueService.remove).not.toHaveBeenCalled();
+      // The route deletes attachment objects from storage after `remove`, so a
+      // surviving row must also mean surviving objects.
+      expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+    }
+
+    it("refuses the lock holder once the row is assigned to another agent", async () => {
+      useProductionIssueAuthorization([makeAgent(peerAgentId), makeAgent(ownerAgentId)]);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+        .delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+      expectRowSurvived();
+    });
+
+    it("gives the lock holder exactly the same answer as the no-lock control", async () => {
+      useProductionIssueAuthorization([makeAgent(peerAgentId), makeAgent(ownerAgentId)]);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ assigneeAgentId: ownerAgentId, checkoutRunId: null, executionRunId: null }),
+      );
+
+      const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+      expectRowSurvived();
+    });
+
+    // The sharper case: an actor that DOES clear the issue:mutate boundary
+    // (company-wide grant, the permissive default in this suite) still must not
+    // delete a row assigned elsewhere on the strength of the lock. Without this
+    // cell, "fix it by leaning on the boundary" would look sufficient.
+    it("refuses a boundary-clearing lock holder that is not the assignee", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+        .delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue is checked out by another agent");
+      expectRowSurvived();
+    });
+
+    it("still lets the assignee holding the lock delete its own issue", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: ownerRunId,
+          executionRunId: ownerRunId,
+        }),
+      );
+
+      const res = await request(await createApp(ownerActor())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.remove).toHaveBeenCalledWith(issueId);
+    });
+
+    it("keeps the assignee's other run fenced off by the checkout assertion", async () => {
+      const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.assertCheckoutOwner.mockRejectedValue(new HttpError(409, "Issue run ownership conflict"));
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue run ownership conflict");
+      expectRowSurvived();
+    });
+
+    // Pins the deliberate carve-out rather than leaving it implicit: an
+    // unassigned row has no assignee to diverge from, so the lock holder is
+    // still authorized and behaviour is unchanged from before the fix.
+    it("leaves the unassigned-row lock holder able to delete", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: null,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+        .delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.remove).toHaveBeenCalledWith(issueId);
+    });
+
+    // The sweep the issue asked for. Of the destructive routes sharing this
+    // helper, these two are the ones whose effect is irreversible and whose
+    // only gate was the lock: attachment delete calls
+    // `storage.deleteObject` before the row, and `workProductsSvc.remove` is a
+    // hard `db.delete`. Neither is protected by its neighbouring
+    // `assertDeliverableMutationAllowedByRunContext` call, which filters cheap
+    // status-only/planning-only recovery runs by context snapshot and returns
+    // true for an ordinary run.
+    describe("the same rule covers the other irreversible routes on this helper", () => {
+      const lockedIssue = () =>
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        });
+
+      it("refuses attachment delete from a lock holder that is not the assignee", async () => {
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+        mockIssueService.getAttachmentById.mockResolvedValue({
+          id: "attachment-1",
+          companyId,
+          issueId,
+          objectKey: "issues/attachment-1/report.txt",
+        });
+
+        const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+          .delete("/api/attachments/attachment-1");
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+        expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
+      });
+
+      it("refuses work-product delete from a lock holder that is not the assignee", async () => {
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+
+        const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+          .delete("/api/work-products/product-1");
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(mockWorkProductService.remove).not.toHaveBeenCalled();
+      });
+
+      // The reversible routes on this helper are deliberately NOT opted in, so
+      // a lock holder can still wind down its own in-flight work. Asserted so
+      // that a later blanket application of the option trips a test instead of
+      // silently narrowing them.
+      it("leaves the reversible routes on this helper untouched", async () => {
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+
+        const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+          .delete(`/api/issues/${issueId}/watchdog`);
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockTaskWatchdogService.disableForIssue).toHaveBeenCalled();
+      });
+    });
+  });
+
   // BLO-22876 review: the reroute is route-scoped by construction — only
   // `PATCH /api/issues/:id` passes `allowManagerChainNonInvokableReroute`, and
   // the option defaults false everywhere else. Assert that boundary directly
