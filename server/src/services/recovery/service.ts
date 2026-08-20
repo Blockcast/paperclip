@@ -107,6 +107,44 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+/**
+ * Ceiling on the `unchanged_target` re-escalation suppressor (BLO-27676).
+ *
+ * The target-state gate is what lets this class terminate, but on its own it is
+ * permanent: the leaf is quiet by construction -- that is the precondition of
+ * the finding -- so an escalation closed `done` WITHOUT giving the leaf an
+ * action path would never be re-reported. That is a silent hole in a liveness
+ * detector, and closing a report without acting on the leaf is a routine path,
+ * not an edge case. This bounds it: worst case the class re-reports weekly
+ * instead of every ~75 min (a ~130x reduction) while still eventually speaking
+ * about a genuinely abandoned row.
+ *
+ * Set to 0 to disable the target-state suppressor entirely and fall back to the
+ * pre-BLO-27676 time-only behaviour.
+ */
+export const DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Skew allowance on the suppressor's sargable `updated_at` scan bound
+ * (BLO-27676 review).
+ *
+ * `findSuppressingResolvedLivenessRecoveryIssue` orders and compares on
+ * `coalesce(completed_at, updated_at)` but must FILTER on bare `updated_at`,
+ * because only the bare column is servable by `issues_company_updated_idx` and
+ * the alternative is an unbounded scan of the company's whole escalation
+ * history. Those two are not the same instant: `services/issues.ts` stamps
+ * `updatedAt` when it builds the patch and `completedAt` from a second clock
+ * read later in the same request, so `completed_at` can lead `updated_at` by
+ * however long the intervening work takes.
+ *
+ * Without slack, a row resolved within that gap of the horizon boundary is
+ * filtered out, the suppressor returns null, and the escalation re-raises --
+ * the exact loop this issue exists to close, just through a much narrower door.
+ * One minute is several orders of magnitude above the observed intra-request
+ * gap and several orders below the 60m floor of the horizon it widens, so it
+ * closes the hole without meaningfully enlarging the scan.
+ */
+export const LIVENESS_SUPPRESSION_SCAN_SKEW_MS = 60 * 1000;
 
 type RecoveryActionBoundsConfig = {
   maxAttempts: number;
@@ -7851,15 +7889,141 @@ export function recoveryService(
     }) ?? null;
   }
 
-  async function findRecentCompletedLivenessRecoveryIssue(
+  /**
+   * Should we suppress re-raising an escalation we have already delivered once?
+   *
+   * Two suppressors (BLO-27676):
+   *
+   *   1. `cooldown` -- a `done` escalation for this incident inside `cooldownMs`.
+   *      Debounces the detector against its own sweep cadence. Unchanged.
+   *
+   *   2. `unchanged_target` -- a `done` escalation for this incident whose leaf
+   *      target has had no activity since it resolved. This is the termination
+   *      path the class lacked. The old rule was purely time-based: it consulted
+   *      only elapsed time, never the target, so it always expired and an
+   *      unchanged leaf re-escalated forever. Measured on one leaf: four
+   *      byte-identical `originFingerprint` rows over five days at ~75 min
+   *      inter-arrival, which is exactly this 60 min cooldown plus the next
+   *      sweep. We have already reported this leaf in this state to an owner who
+   *      resolved the report; re-delivering an unchanged fact on a timer is
+   *      noise, not liveness.
+   *
+   *      Bounded by `DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS` (7d).
+   *      Without a ceiling this suppressor is permanent, because the leaf is
+   *      quiet by construction: an escalation closed `done` without giving the
+   *      leaf an action path would never be re-reported, which is a silent hole
+   *      in a liveness detector and the exact defect this class started as, with
+   *      the sign flipped. The ceiling keeps the worst case at weekly rather
+   *      than never.
+   *
+   * `cooldownMs` (the public `reescalationCooldownMs` option) governs suppressor
+   * 1 only; passing 0 no longer disables re-escalation suppression outright, it
+   * disables the weaker of the two. Pass `unchangedTargetSuppressionMs: 0` for
+   * the pre-BLO-27676 time-only behaviour.
+   *
+   * Note this is a suppressor on RE-escalation only. Suppression while an
+   * escalation is still open is a separate, deliberate mechanism -- the open row
+   * contributes a waiting path for its leaf, so the finding does not re-fire.
+   * That behaviour is intentional and is pinned by "treats open recovery issues
+   * as active waiting paths for non-assigned-backlog states" and by "creates one
+   * bounded escalation for an assigned backlog blocker leaf"; do not remove it in
+   * an attempt to fix the loop. The loop lives here, in the re-arm.
+   *
+   * What still re-arms, so this cannot degrade into "stop escalating":
+   *   - any activity on the leaf after the resolution
+   *   - the suppression ceiling elapsing (see 2 above)
+   *   - a different invariant state (the fingerprint carries `state`)
+   *   - a `cancelled` rather than `done` prior escalation
+   *   - a leaf we cannot read (fails open)
+   *
+   * Trade-off, now bounded rather than open-ended: an escalation resolved `done`
+   * WITHOUT actually giving the leaf an action path will not re-raise under the
+   * same fingerprint until the leaf is touched or the ceiling elapses. That is
+   * the intended reading of "closing a row must not, by itself, regenerate it";
+   * the alternative is the unbounded loop this replaces, and cancelling rather
+   * than closing re-arms immediately. Resolving an escalation does not itself
+   * write to the leaf (`removeRecoveryBlockerFromSource` touches the SOURCE), so
+   * the comparison is stable rather than self-clearing.
+   */
+  async function findSuppressingResolvedLivenessRecoveryIssue(
     finding: IssueLivenessFinding,
     now: Date,
     cooldownMs: number,
+    unchangedTargetSuppressionMs: number,
   ) {
-    if (cooldownMs <= 0) return null;
-    const cutoff = new Date(now.getTime() - cooldownMs);
-    return db
-      .select({ id: issues.id })
+    // With both suppressors off the function can only return null (the cooldown
+    // branch needs `cooldownMs > 0`, the target-state branch needs
+    // `unchangedTargetSuppressionMs > 0`), so skip the query rather than issuing
+    // it once per finding per sweep to discard the row. Keeps "suppression fully
+    // disabled" genuinely free instead of merely inert.
+    if (cooldownMs <= 0 && unchangedTargetSuppressionMs <= 0) return null;
+
+    // The ORDER BY must be the same expression that `resolvedAtMs` reads below,
+    // or the row selected is not the row whose timestamp is compared. Ordering
+    // by `updatedAt` alone was wrong in both directions: any post-close edit to
+    // an older escalation (reopen/re-close, assignee change, retitle, label)
+    // bumps its `updatedAt` above a newer resolution, so it wins the sort while
+    // contributing an older `completedAt` -- which reinstates the very loop this
+    // suppressor removes -- and on rows where `completedAt` is null the drifting
+    // `updatedAt` silently swallows a genuine leaf touch. Pinned by "picks the
+    // most recently resolved escalation even when an older row was edited after
+    // it closed".
+    const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`;
+    // Keep the scan bounded. Neither OR arm is servable for these rows: the
+    // fingerprint arm's only indexes (`issues_active_liveness_recovery_leaf_uq`,
+    // `issues_active_alert_escalation_cover_uq` -- schema/issues.ts) are partial
+    // on `status not in ('done','cancelled')`, mutually exclusive with the
+    // `status = 'done'` filter below, so the planner falls back to the
+    // `(company_id, origin_kind)` prefix of `issues_company_origin_idx` and reads
+    // the company's ENTIRE escalation history -- which only ever grows, since
+    // resolved rows are never pruned. The version this replaced was bounded to
+    // the 60m cooldown by a `gte(updatedAt, cutoff)` servable by
+    // `issues_company_updated_idx`; dropping it was required for the 7d
+    // target-state window, but nothing replaced it, and this runs once per stale
+    // finding per sweep AND synchronously inside the operator preview endpoint.
+    //
+    // Bounding by `max(cooldownMs, unchangedTargetSuppressionMs)` cannot change a
+    // result: every branch below already returns null for rows resolved before
+    // that horizon (the cooldown branch needs `resolvedAtMs >= now - cooldownMs`;
+    // the target branch returns null at `resolvedAtMs <= now -
+    // unchangedTargetSuppressionMs`). Excluding rows can only change WHICH row
+    // the `desc` ORDER BY picks if every candidate is excluded -- and that case
+    // returned null anyway.
+    //
+    // The bound is on `updatedAt` rather than on `resolvedAtExpr` because only
+    // the former is sargable. That makes it a superset ONLY up to skew between
+    // the two columns, and the skew does not run in the convenient direction: on
+    // the primary write path `completed_at` is the LATER of the two.
+    // `services/issues.ts` builds its patch with `updatedAt: new Date()` and only
+    // then calls `applyStatusSideEffects`, which sets `completedAt` from a second
+    // clock read one request-body later -- so `completed_at >= updated_at` there,
+    // by however long the intervening validation and blocker reads take. (The
+    // escalation-close path below and the other four `update(issues)` sites do
+    // write both from one timestamp, and nothing bumps `updated_at` implicitly:
+    // there is no `$onUpdate` on the column, and migration 0076 mirrors
+    // `updated_at` INTO `last_activity_at`, not back.)
+    //
+    // Unskewed, that leaves a real hole: a row with
+    // `updated_at < cutoff <= completed_at` is dropped by the filter, the
+    // suppressor returns null, and the escalation re-raises -- this issue's loop
+    // again, through a much narrower door. It only bites within one
+    // request-duration of the horizon boundary, where the row was about to expire
+    // anyway, but "narrow" is not "closed", and a seconds-wide window on a 7d
+    // horizon is exactly the shape that shows up once in production and never in
+    // a test. `LIVENESS_SUPPRESSION_SCAN_SKEW_MS` restores the superset property
+    // for any gap below it, at the cost of scanning a bounded sliver more. Pinned
+    // by "holds a leaf whose escalation closed with completed_at ahead of
+    // updated_at at the horizon edge". No migration needed.
+    const suppressionHorizonMs = Math.max(cooldownMs, unchangedTargetSuppressionMs);
+    const horizonCutoff = new Date(
+      now.getTime() - suppressionHorizonMs - LIVENESS_SUPPRESSION_SCAN_SKEW_MS,
+    );
+    const mostRecentDone = await db
+      .select({
+        id: issues.id,
+        completedAt: issues.completedAt,
+        updatedAt: issues.updatedAt,
+      })
       .from(issues)
       .where(
         and(
@@ -7870,13 +8034,56 @@ export function recoveryService(
             eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
           ),
           visibleIssueCondition(),
+          // `done` only, deliberately. A `cancelled` escalation means the report
+          // was wrong or was consolidated away -- not that the leaf was given an
+          // action path -- so that shape must re-escalate immediately. Pinned by
+          // "re-escalates immediately after a matching escalation is cancelled".
           eq(issues.status, "done"),
-          gte(issues.updatedAt, cutoff),
+          // Sargable superset of the suppression horizon -- see the note above
+          // the query. Restores the bound the 60m cooldown used to provide, and
+          // carries a skew allowance because `completed_at` can lead
+          // `updated_at` on the primary close path.
+          gte(issues.updatedAt, horizonCutoff),
         ),
       )
-      .orderBy(desc(issues.updatedAt), desc(issues.id))
+      .orderBy(desc(resolvedAtExpr), desc(issues.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+    if (!mostRecentDone) return null;
+
+    const resolvedAtMs = (mostRecentDone.completedAt ?? mostRecentDone.updatedAt)?.getTime();
+    if (resolvedAtMs === undefined || !Number.isFinite(resolvedAtMs)) return null;
+
+    if (cooldownMs > 0 && resolvedAtMs >= now.getTime() - cooldownMs) {
+      return { id: mostRecentDone.id, reason: "cooldown" as const };
+    }
+
+    // Bound the target-state suppressor before paying for the leaf read. 0
+    // disables it outright; past the ceiling we re-raise even on an untouched
+    // leaf, so a report closed without acting on the target cannot go silent
+    // forever. Pinned by "re-escalates an untouched leaf once the suppression
+    // ceiling has elapsed".
+    if (unchangedTargetSuppressionMs <= 0) return null;
+    if (resolvedAtMs <= now.getTime() - unchangedTargetSuppressionMs) return null;
+
+    const leaf = await db
+      .select({ lastActivityAt: issues.lastActivityAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, finding.companyId),
+          eq(issues.id, livenessRecoveryLeafIssueId(finding)),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    // Leaf unreadable -> fall through and let the escalation be raised. Failing
+    // open keeps a genuinely abandoned row escalating, which this must not regress.
+    const leafActivityMs = leaf?.lastActivityAt?.getTime();
+    if (leafActivityMs === undefined || !Number.isFinite(leafActivityMs)) return null;
+    if (leafActivityMs > resolvedAtMs) return null;
+
+    return { id: mostRecentDone.id, reason: "unchanged_target" as const };
   }
 
   async function removeRecoveryBlockerFromSource(recovery: typeof issues.$inferSelect) {
@@ -8114,11 +8321,50 @@ export function recoveryService(
     return lastActivityAt <= staleAt;
   }
 
+  /**
+   * The two re-escalation suppression windows, normalized once (BLO-27676
+   * review). Read by BOTH the preview and the run: they are paired operator
+   * endpoints, so a default that drifts between them makes the preview describe
+   * a run nobody can trigger. Sharing the normalization is what keeps
+   * `recoverableFindings` and `escalationsCreated` answerable from one rule.
+   */
+  function normalizeLivenessSuppressionWindows(opts?: {
+    reescalationCooldownMs?: number;
+    unchangedTargetSuppressionMs?: number;
+  }) {
+    return {
+      reescalationCooldownMs: Math.max(
+        0,
+        Math.floor(
+          asNumber(opts?.reescalationCooldownMs, DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS),
+        ),
+      ),
+      unchangedTargetSuppressionMs: Math.max(
+        0,
+        Math.floor(
+          asNumber(
+            opts?.unchangedTargetSuppressionMs,
+            DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+          ),
+        ),
+      ),
+    };
+  }
+
   async function buildIssueGraphLivenessAutoRecoveryPreview(
-    opts?: { lookbackHours?: number; now?: Date },
+    opts?: {
+      lookbackHours?: number;
+      now?: Date;
+      // Same knobs the run takes, for the same reason: an operator who previews
+      // with the documented rollback lever must see the run that lever produces.
+      reescalationCooldownMs?: number;
+      unchangedTargetSuppressionMs?: number;
+    },
   ): Promise<IssueGraphLivenessAutoRecoveryPreview> {
     const now = opts?.now ?? new Date();
     const lookbackHours = normalizeIssueGraphLivenessAutoRecoveryLookbackHours(opts?.lookbackHours);
+    const { reescalationCooldownMs, unchangedTargetSuppressionMs } =
+      normalizeLivenessSuppressionWindows(opts);
     // `lookbackHours` is now a min-staleness threshold (post-2026-05-06
     // RCA gate inversion). A finding is escalation-eligible when its
     // recoveryIssue hasn't seen meaningful activity since this cutoff.
@@ -8135,11 +8381,39 @@ export function recoveryService(
     const recoveryById = new Map(recoveryRows.map((row) => [row.id, row]));
     const items: IssueGraphLivenessAutoRecoveryPreviewItem[] = [];
     let skippedNotYetStale = 0;
+    let skippedReescalationCooldown = 0;
+    let skippedUnchangedTarget = 0;
 
     for (const finding of findings) {
       const lastActivityAt = recoveryIssueLastActivityForFinding(finding, activityByIssueKey);
       if (!isLivenessFindingStaleEnoughForEscalation(finding, staleAt, activityByIssueKey)) {
         skippedNotYetStale += 1;
+        continue;
+      }
+      // Apply the same re-escalation suppressors the run applies (BLO-27676
+      // review). Without this the preview counts every stale finding while the
+      // run creates only the unsuppressed ones, and the operator surface states
+      // the difference as a promise -- the confirm dialog's button is literally
+      // labelled "Enable and create {recoverableFindings}"
+      // (`ui/src/pages/InstanceExperimentalSettings.tsx`). The divergence
+      // pre-dates BLO-27676 but its magnitude did not: the cooldown alone could
+      // only over-report on findings resolved within the last hour, whereas the
+      // target-state gate spans 7d and selects exactly the population an
+      // operator previews -- leaves already reported once and since quiet. The
+      // steady state was a preview listing n and a run creating zero.
+      //
+      // Cost is one indexed `select` per stale finding, plus a leaf read only
+      // for findings that reach the target-state branch -- the same per-finding
+      // cost the run already pays, on a read-only operator-triggered endpoint.
+      const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
+        finding,
+        now,
+        reescalationCooldownMs,
+        unchangedTargetSuppressionMs,
+      );
+      if (suppressed) {
+        skippedReescalationCooldown += 1;
+        if (suppressed.reason === "unchanged_target") skippedUnchangedTarget += 1;
         continue;
       }
       const recoveryIssue = recoveryById.get(finding.recoveryIssueId);
@@ -8167,6 +8441,44 @@ export function recoveryService(
       findings: findings.length,
       recoverableFindings: items.length,
       skippedOutsideLookback: skippedNotYetStale,
+      // Named to match the run's counters so the two responses compare
+      // field-for-field.
+      //
+      // Residual divergence, deliberately not modelled here. This list is
+      // complete as of this head rather than illustrative -- it is what a reader
+      // deciding "is this preview/run gap known or new?" will trust, so it
+      // enumerates every pre-creation exit in
+      // `createIssueGraphLivenessEscalation` that the preview does not reproduce:
+      //
+      //   1. source issue vanished, or crossed companies since collection
+      //   2. automatic recovery suppressed by a pause hold
+      //   3. recovery issue vanished since collection
+      //   4. an OPEN escalation already exists (returns `existing`)
+      //   5. no resolvable owner agent
+      //
+      // All five are pre-existing and unchanged in magnitude by BLO-27676,
+      // unlike the two suppressors above -- which is why they are recorded here
+      // rather than replicated. (4) is additionally rare by construction: an
+      // open escalation contributes a waiting path for its own leaf, so the
+      // finding is usually not collected at all.
+      //
+      // One attribution nuance, not a count difference: when a finding has BOTH
+      // an open escalation and a resolved `done` one, the run books it to
+      // `existingEscalations` (its `existing` check at the `findOpenLiveness*`
+      // call above precedes its suppressor call) while the preview books it to
+      // `skippedReescalationCooldown`. Neither creates a row, so
+      // `recoverableFindings == escalationsCreated` still holds.
+      skippedReescalationCooldown,
+      skippedUnchangedTarget,
+      // Echo the resolved windows so the operator surface can state the bounds
+      // rather than hardcoding them. Both suppressors expire, and a dialog that
+      // says "will not be re-raised" unqualified asserts the unbounded
+      // behaviour the ceiling was added to remove -- the same
+      // surface-promises-what-the-run-won't-do defect this PR round exists to
+      // close (BLO-27676 review). These are the values this preview used, so
+      // the string stays true under a tuned constant or an overridden knob.
+      reescalationCooldownMs,
+      unchangedTargetSuppressionMs,
       items,
     };
   }
@@ -8307,6 +8619,7 @@ export function recoveryService(
     runId?: string | null;
     now: Date;
     reescalationCooldownMs: number;
+    unchangedTargetSuppressionMs: number;
   }) {
     const issue = await db
       .select()
@@ -8337,12 +8650,14 @@ export function recoveryService(
       });
       return { kind: "existing" as const, escalationIssueId: existing.id };
     }
-    if (await findRecentCompletedLivenessRecoveryIssue(
+    const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
       input.finding,
       input.now,
       input.reescalationCooldownMs,
-    )) {
-      return { kind: "cooldown" as const };
+      input.unchangedTargetSuppressionMs,
+    );
+    if (suppressed) {
+      return { kind: "suppressed" as const, reason: suppressed.reason };
     }
 
     const ownerSelection = await resolveEscalationOwnerAgentId(input.finding, recoveryIssue);
@@ -9117,6 +9432,36 @@ export function recoveryService(
         { healed: result.healed, issueIds: result.issueIds },
         "stranded recovery wake backstop redelivered undelivered recovery-action wakes",
       );
+    } else if (result.checked > 0) {
+      // The all-skipped sweep is the one that matters and it used to be the one that said
+      // nothing: the healed>0 branch above was the only log here, and both callers in
+      // index.ts log `reconcileIssueGraphLiveness` only when `escalationsCreated` or
+      // `dependencyWakesHealed` moved. So a sweep that examined a full page of candidates
+      // and redelivered none emitted no record at all, and the per-gate counters below were
+      // computed and dropped on the floor. That is why BLO-19124 could measure the symptom
+      // (actions reaching their 6h horizon at attemptCount 0-1 of a 5-attempt budget) but
+      // not the cause: nothing said which gate consumed the ~11 unused redelivery slots.
+      // `info` rather than `warn` because this fires on the 30s scheduler tick and an
+      // idle-but-healthy fleet legitimately skips every candidate (live path, cooldown).
+      // The value is the time series, not any single line.
+      logger.info(
+        {
+          checked: result.checked,
+          noOwnerSkipped: result.noOwnerSkipped,
+          causeSkipped: result.causeSkipped,
+          exhaustedSkipped: result.exhaustedSkipped,
+          cooldownSkipped: result.cooldownSkipped,
+          livePathSkipped: result.livePathSkipped,
+          interactionSkipped: result.interactionSkipped,
+          pauseHoldSkipped: result.pauseHoldSkipped,
+          claimLost: result.claimLost,
+          candidateLimitSkipped: result.candidateLimitSkipped,
+          deferredOrFailed: result.deferredOrFailed,
+          enqueueFailed: result.enqueueFailed,
+          backlogParkedResolved: result.backlogParkedResolved,
+        },
+        "stranded recovery wake backstop redelivered nothing this sweep",
+      );
     }
 
     return result;
@@ -9129,6 +9474,7 @@ export function recoveryService(
     issueCreatedAtGte?: Date | null;
     now?: Date;
     reescalationCooldownMs?: number;
+    unchangedTargetSuppressionMs?: number;
   }) {
     let findings = await collectIssueGraphLivenessFindings();
     if (opts?.issueCreatedAtGte) {
@@ -9160,10 +9506,10 @@ export function recoveryService(
     // RCA gate inversion). Escalate when an issue has been silently quiet
     // for at least this long.
     const staleAt = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
-    const reescalationCooldownMs = Math.max(
-      0,
-      Math.floor(asNumber(opts?.reescalationCooldownMs, DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS)),
-    );
+    // Shared with the preview so the paired operator endpoints cannot disagree
+    // about the default windows (BLO-27676 review).
+    const { reescalationCooldownMs, unchangedTargetSuppressionMs } =
+      normalizeLivenessSuppressionWindows(opts);
     const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
     const activityByIssueKey = await loadLivenessRecoveryIssueLastActivityByKey(findings);
     const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();
@@ -9178,6 +9524,7 @@ export function recoveryService(
       skippedAutoRecoveryDisabled: 0,
       skippedOutsideLookback: 0,
       skippedReescalationCooldown: 0,
+      skippedUnchangedTarget: 0,
       obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
       obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
       obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
@@ -9269,6 +9616,7 @@ export function recoveryService(
         runId: opts?.runId ?? null,
         now,
         reescalationCooldownMs,
+        unchangedTargetSuppressionMs,
       });
       if (escalation.kind === "created") {
         result.escalationsCreated += 1;
@@ -9278,8 +9626,13 @@ export function recoveryService(
         result.existingEscalations += 1;
         result.issueIds.push(finding.issueId);
         result.escalationIssueIds.push(escalation.escalationIssueId);
-      } else if (escalation.kind === "cooldown") {
+      } else if (escalation.kind === "suppressed") {
+        // `skippedReescalationCooldown` is the aggregate across BOTH suppressors
+        // and is kept stable for existing dashboards; `skippedUnchangedTarget` is
+        // the subset attributable to the target-state gate, so the true
+        // cooldown-only count is the difference.
         result.skippedReescalationCooldown += 1;
+        if (escalation.reason === "unchanged_target") result.skippedUnchangedTarget += 1;
         result.skipped += 1;
       } else {
         result.skipped += 1;
