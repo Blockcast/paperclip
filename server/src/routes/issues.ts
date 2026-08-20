@@ -5691,6 +5691,17 @@ export function issueRoutes(
        * route whose blast radius you have actually checked.
        */
       allowCreatorOrManagerChainOwnership?: boolean;
+      /**
+       * BLO-29150: DELETE /issues/:id only. A bare run lock proves "this run is
+       * executing this row" — the right predicate for mutating in-flight work,
+       * and the wrong one for destroying the row and its attachment objects.
+       * `isCurrentIssueExecutionRun` is assignee-agnostic, so a lock left stale
+       * by a reassignment authorized an irreversible hard delete of a row that
+       * now belongs to another agent. Opt in from routes whose effect outlives
+       * the run holding the lock; leave it off where the lock holder is only
+       * concluding its own in-flight work.
+       */
+      requireAssignmentForRunLockAuthority?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -5721,7 +5732,27 @@ export function issueRoutes(
       return true;
     }
     if (isCurrentIssueExecutionRun(req, issue)) {
-      return true;
+      // BLO-29150: the lock alone is authority for every route that has not
+      // opted in. Where it has, the holder must ALSO still be the assignee.
+      // The stale pair "A holds the lock, B is the assignee" is produced by
+      // ordinary operation, not by abuse: the heartbeat's reassignment
+      // lock-release (services/heartbeat.ts) deliberately leaves a `running`
+      // holder's lock in place, and escalateStaleRunRefire
+      // (services/recovery/service.ts) plus agents.remove (services/agents.ts)
+      // strand it outright.
+      //
+      // Falling through instead of returning false is deliberate: the actor may
+      // still hold real authority over this row — a checkout-management
+      // override, or an unassigned row — and the checks below are what decide
+      // that. Returning false here would deny a manager that legitimately
+      // clears the boundary.
+      if (
+        !options.requireAssignmentForRunLockAuthority ||
+        issue.assigneeAgentId === null ||
+        issue.assigneeAgentId === actorAgentId
+      ) {
+        return true;
+      }
     }
     const isActiveRecoveryActionOwner = async () => {
       if (!options.allowRecoveryActionOwner || req.actor.companyId !== issue.companyId) return false;
@@ -9396,7 +9427,16 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // BLO-29150: `workProductsSvc.remove` is a hard `db.delete`, so the same
+    // rule as DELETE /issues/:id applies — a run lock left stale by a
+    // reassignment is not authority to destroy the row.
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, issue, {
+        requireAssignmentForRunLockAuthority: true,
+      }))
+    ) {
+      return;
+    }
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
     const removed = await workProductsSvc.remove(id);
     if (!removed) {
@@ -12007,7 +12047,16 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    // BLO-29150: `svc.remove` is a hard delete and the attachment objects go
+    // with it, so this route does not accept a bare checkout/execution run lock
+    // as delete authority — see requireAssignmentForRunLockAuthority.
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, existing, {
+        requireAssignmentForRunLockAuthority: true,
+      }))
+    ) {
+      return;
+    }
     const attachments = await svc.listAttachments(id);
 
     const issue = await svc.remove(id);
@@ -14353,7 +14402,19 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // BLO-29150: this route deletes the storage object before the row, so it is
+    // the same irreversible class as DELETE /issues/:id. The
+    // `assertDeliverableMutationAllowedByRunContext` call below is NOT an
+    // ownership gate — it only filters cheap status-only / planning-only
+    // recovery runs by their context snapshot, and returns true for an ordinary
+    // run — so it does not close this hole on its own.
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, issue, {
+        requireAssignmentForRunLockAuthority: true,
+      }))
+    ) {
+      return;
+    }
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
     try {
