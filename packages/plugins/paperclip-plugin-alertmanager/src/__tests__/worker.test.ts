@@ -1696,6 +1696,56 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(mocks.issues.create).not.toHaveBeenCalled();
   });
 
+  it("resolves the fallback owner once per delivery, not once per alert", async () => {
+    // `resolveFallbackAgentId` is an unwindowed company-wide `agents.list`, and
+    // the host answers it with two full-table selects plus a costEvents
+    // aggregation. Most firing alerts reach the fallback rung, so an
+    // un-memoized lookup multiplies that by the batch size — worst exactly
+    // during a storm, when the batch is largest and the host is busiest.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    const alerts = ["fp-a", "fp-b", "fp-c"].map((fingerprint) =>
+      baseAlert({
+        labels: { alertname: "X", severity: "warning" },
+        annotations: {},
+        fingerprint,
+      }),
+    );
+    const envelope = baseEnvelope({ alerts });
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    expect(mocks.issues.create).toHaveBeenCalledTimes(3);
+    // All three are assigned — the memo caches the resolution, not a skip.
+    for (const call of mocks.issues.create.mock.calls) {
+      expect(call[0].assigneeAgentId).toBe(FALLBACK_AGENT_ID);
+    }
+    expect(mocks.agents.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not cache a transient agents.list failure across the batch", async () => {
+    // The memo holds a config fact, so a *refusal* (bad name / paused) is
+    // legitimately cached for the delivery. A thrown host error is not a config
+    // fact — caching it would let one blip poison every remaining alert in the
+    // batch, converting a single-alert retry into a whole-delivery failure.
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockRejectedValueOnce(new Error("host down"));
+    const config = baseConfig({ ownerMap: {} });
+    const alerts = ["fp-fails", "fp-succeeds"].map((fingerprint) =>
+      baseAlert({
+        labels: { alertname: "X", severity: "warning" },
+        annotations: {},
+        fingerprint,
+      }),
+    );
+    const envelope = baseEnvelope({ alerts });
+    // The delivery still fails overall, so Alertmanager retries the lost alert.
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+    // But the second alert re-attempted the lookup and got its issue.
+    expect(mocks.agents.list).toHaveBeenCalledTimes(2);
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["paused", "pending_approval"])(
     "fails closed when the only fallback match is %s",
     async (status) => {
@@ -2021,6 +2071,8 @@ describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
   it("drops the alert when paperclip_issue is not a string", async () => {
     // `isAlertmanagerPayload` validates that `labels` is an object but not that
     // its values are strings, so a rule can genuinely deliver a JSON boolean.
+    // Note this builds a FIRING alert — the resolved counterpart is the test
+    // below, which pins that the malformed gate is scoped to this branch.
     const { ctx, mocks } = mkCtx();
     const alert = baseAlert({
       labels: { alertname: "BadPolicy", severity: "critical" },
@@ -2039,6 +2091,66 @@ describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
       "alertmanager.alert.malformed",
       1,
       { alertname: "BadPolicy" },
+    );
+  });
+
+  it("still closes a pre-existing tracked issue when paperclip_issue is malformed", async () => {
+    // Regression for the same stranding hazard as the opt-out, one branch
+    // higher: the malformed guard used to `continue` before the status
+    // dispatch, so a resolved alert carrying a non-string `paperclip_issue`
+    // never reached handleResolved. `state.resolvedAt` stayed null, the issue
+    // never reached a terminal status, and advanceIssueLadder kept escalating —
+    // turning a YAML `true` written where a `"true"` was meant into a
+    // permanently escalating issue for an alert that had already cleared.
+    //
+    // `paperclip_issue` is a creation policy that the resolved path never
+    // reads, so a defect in it must not suppress the close.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-tracked",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "BadPolicy",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    mocks.issues.get.mockResolvedValue({ id: "issue-tracked", status: "todo" });
+    const alert = {
+      ...baseAlert({
+        labels: { alertname: "BadPolicy", severity: "critical" },
+        annotations: {},
+      }),
+      status: "resolved" as const,
+      endsAt: "2026-04-29T09:00:00Z",
+    };
+    (alert.labels as Record<string, unknown>).paperclip_issue = false;
+    const envelope = baseEnvelope({ status: "resolved", alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-tracked",
+      { status: "cancelled" },
+      "company-1",
+    );
+    // The state write is the half that actually stops the ladder.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        resolvedAt: "2026-04-29T09:00:00Z",
+        escalationComplete: true,
+        nextEscalationAt: null,
+      }),
     );
   });
 

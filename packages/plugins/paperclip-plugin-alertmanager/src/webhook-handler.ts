@@ -286,6 +286,56 @@ function suppressionExpiryLabel(
 }
 
 /**
+ * Per-delivery memo for the named-fallback owner lookup.
+ *
+ * `resolveFallbackAgentId` is one unwindowed `ctx.agents.list({ companyId })`,
+ * and that call is not cheap on the host side: `server/src/services/agents.ts`
+ * issues two full-table selects for the company (the filtered rows plus the org
+ * chain) and then `hydrateAgentSpend`, which aggregates `costEvents` for the
+ * current month. The fallback rung is also the *common* path — by BLO-20576's
+ * own numbers most firing alerts resolve to no owner — so without a memo every
+ * alert in a batch pays it, and a storm is exactly when the batch is largest
+ * and the host is busiest.
+ *
+ * The resolution is constant for a given `(companyId, fallbackAgentName)`
+ * within a single `handleWebhook` call, so caching it there collapses N host
+ * round-trips to one without changing any semantics. Scoping the memo to the
+ * delivery (rather than the module) is what keeps it correct: a config edit or
+ * an agent being paused takes effect on the very next delivery.
+ */
+export type FallbackOwnerMemo = Map<string, Promise<string | undefined>>;
+
+function resolveFallbackAgentIdMemoized(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  fallbackAgentName: string | undefined,
+  memo: FallbackOwnerMemo | undefined,
+): Promise<string | undefined> {
+  if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
+  // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
+  // operator-supplied config, so any single-character separator could be
+  // embedded in a name to collide with another company's key.
+  const key = JSON.stringify([companyId, fallbackAgentName ?? ""]);
+  const cached = memo.get(key);
+  if (cached) return cached;
+  const pending = resolveFallbackAgentId(
+    ctx,
+    companyId,
+    fallbackAgentName,
+  ).catch((err: unknown) => {
+    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to
+    // `undefined` and IS cached — it is a config fact, stable for the delivery.
+    // A *throw* is a transient host fault, and caching it would let one failed
+    // `agents.list` poison every remaining alert in the batch, converting a
+    // blip that previously cost one alert into a whole-delivery failure.
+    memo.delete(key);
+    throw err;
+  });
+  memo.set(key, pending);
+  return pending;
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -294,6 +344,7 @@ export async function handleFiring(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  fallbackOwnerMemo?: FallbackOwnerMemo,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -554,7 +605,12 @@ export async function handleFiring(
   const fallbackAssigneeAgentId =
     createAssigneeAgentId || createAssigneeUserId
       ? undefined
-      : await resolveFallbackAgentId(ctx, companyId, config.fallbackAgentName);
+      : await resolveFallbackAgentIdMemoized(
+          ctx,
+          companyId,
+          config.fallbackAgentName,
+          fallbackOwnerMemo,
+        );
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
   if (!finalAssigneeAgentId && !createAssigneeUserId) {
     // Fail closed. Throwing (rather than returning) is deliberate: this is a
@@ -895,6 +951,10 @@ export async function handleWebhook(
   }
 
   const failedFingerprints: string[] = [];
+  // Scoped to this delivery — see FallbackOwnerMemo. A storm is the case that
+  // matters: without it, every ownerless alert in the batch repeats the same
+  // company-wide agent lookup.
+  const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
 
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
@@ -907,44 +967,49 @@ export async function handleWebhook(
     const status = effectiveAlertStatus(alert, body);
     const alertname = alert.labels.alertname ?? "unknown";
     try {
-      // Rule-level opt-out, honored before handleFiring so it precedes every
-      // issue-creating and state-writing side effect on the firing path, at any
-      // severity — an opted-out rule must not create an issue, refresh one, or
-      // bank a suppression anchor. Accepted from either labels or annotations
-      // because Prometheus rules commonly carry policy in annotations.
+      // Rule-level `paperclip_issue` policy, honored before handleFiring so it
+      // precedes every issue-creating and state-writing side effect on the
+      // firing path, at any severity — an opted-out rule must not create an
+      // issue, refresh one, or bank a suppression anchor. Accepted from either
+      // labels or annotations because Prometheus rules commonly carry policy in
+      // annotations.
       //
-      // It deliberately does NOT gate the resolved path; see the dispatch below.
+      // BOTH gates it produces — the malformed drop and the opt-out — are
+      // evaluated here but applied only inside the firing branch, and
+      // deliberately do NOT gate the resolved path; see the dispatch below for
+      // why. `paperclip_issue` is a *creation* policy: nothing on the resolved
+      // path reads it, so neither a malformed value nor an explicit opt-out has
+      // any business suppressing the close of an issue that was already filed.
       const policyValues = [
         alert.labels.paperclip_issue,
         alert.annotations.paperclip_issue,
       ];
-      if (
-        policyValues.some(
-          (value) => value !== undefined && typeof value !== "string",
-        )
-      ) {
-        // A non-string here means the rule author wrote something structurally
-        // wrong. Refusing to guess is safer than coercing: `paperclip_issue`
-        // decides whether a page becomes an issue at all.
-        ctx.logger.warn(
-          `paperclip-plugin-alertmanager: dropping alert ${alert.fingerprint} because paperclip_issue must be a string when provided`,
-        );
-        try {
-          await ctx.metrics.write("alertmanager.alert.malformed", 1, {
-            alertname,
-          });
-        } catch (metricErr) {
-          ctx.logger.error(
-            `paperclip-plugin-alertmanager: failed to record malformed alert metric for ${alert.fingerprint}: ${String(metricErr)}`,
-          );
-        }
-        continue;
-      }
+      const malformedPolicy = policyValues.some(
+        (value) => value !== undefined && typeof value !== "string",
+      );
       const optedOut = policyValues.some(
         (value) =>
           typeof value === "string" && value.trim().toLowerCase() === "false",
       );
       if (status === "firing") {
+        if (malformedPolicy) {
+          // A non-string here means the rule author wrote something structurally
+          // wrong. Refusing to guess is safer than coercing: `paperclip_issue`
+          // decides whether a page becomes an issue at all.
+          ctx.logger.warn(
+            `paperclip-plugin-alertmanager: dropping alert ${alert.fingerprint} because paperclip_issue must be a string when provided`,
+          );
+          try {
+            await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+              alertname,
+            });
+          } catch (metricErr) {
+            ctx.logger.error(
+              `paperclip-plugin-alertmanager: failed to record malformed alert metric for ${alert.fingerprint}: ${String(metricErr)}`,
+            );
+          }
+          continue;
+        }
         if (optedOut) {
           ctx.logger.info(
             `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
@@ -962,23 +1027,31 @@ export async function handleWebhook(
           }
           continue;
         }
-        await handleFiring(ctx, config, alert);
+        await handleFiring(ctx, config, alert, fallbackOwnerMemo);
       } else if (status === "resolved") {
-        // Creation-only, exactly like the severity floor in handleFiring, and
-        // for the same reason. Gating this path too would strand any issue the
-        // rule had *already* filed: handleResolved would never run, so
-        // `state.resolvedAt` would stay null and the issue would never reach
+        // Reached with BOTH policy gates above deliberately bypassed — this
+        // path is creation-only, exactly like the severity floor in
+        // handleFiring, and for the same reason. Gating it would strand any
+        // issue the rule had *already* filed: handleResolved would never run,
+        // so `state.resolvedAt` would stay null and the issue would never reach
         // done/cancelled. `advanceIssueLadder` (escalation.ts:377,380) returns
         // early only on resolvedAt, escalationComplete, or a terminal issue
         // status — none of which would ever happen — so the sweep would keep
         // advancing the ladder, waking agents, and eventually file a
-        // [user-cover] board escalation for a rule that was explicitly opted
-        // out and whose alert had already resolved.
+        // [user-cover] board escalation for an alert that had already resolved.
         //
-        // That is the modal adoption path, not an exotic one: operators opt a
-        // rule out *because* it has been filing noisy issues, so a tracked
-        // issue almost always exists at that moment. An opt-out is meant to
-        // stop new noise, not to wedge the issues it already made.
+        // That is the modal adoption path for the opt-out, not an exotic one:
+        // operators opt a rule out *because* it has been filing noisy issues,
+        // so a tracked issue almost always exists at that moment. An opt-out is
+        // meant to stop new noise, not to wedge the issues it already made.
+        //
+        // The malformed gate reaches the same conclusion by a shorter route: a
+        // non-string `paperclip_issue` is a defect in a *creation* policy, and
+        // dropping the resolve over it would convert a typo — a YAML `true`
+        // where a `"true"` was meant — into a permanently escalating issue for
+        // an alert that has cleared. The firing-side drop already refuses to
+        // guess what the author meant; the resolve never had to guess, because
+        // it does not read the value at all.
         //
         // This does not weaken the "no state side effect" guarantee for a rule
         // opted out from the start: with no issue ever filed there is no state
