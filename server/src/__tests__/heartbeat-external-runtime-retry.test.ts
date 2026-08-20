@@ -1623,10 +1623,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .where(eq(agents.id, agentId));
 
     // What routes/agents.ts now invokes from its adapter-type-change block.
-    await heartbeat.cancelActiveForAgent(
+    const cancelled = await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
       agentId,
       "Cancelled because the agent's adapter type changed from opencode_k8s to claude_k8s",
     );
+    expect(cancelled).toBe(1);
 
     // AC#2 -- the load-bearing one. The orphaned pre-change Job must be torn
     // down, and it can only be targeted by the OLD name/UID. A fix that
@@ -1684,6 +1685,47 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     const nextClaim = await claimRunWithExternalRuntimeSlot(db, nextRunId, new Date(), 0);
     expect(nextClaim).not.toBeNull();
     expect(nextClaim!.reservation.agentId).toBe(agentId);
+  }, 120_000);
+
+  it("leaves a queued run alone -- only reservation holders are cancelled (BLO-28865)", async () => {
+    const { companyId, agentId, runId } = await seedMigratingAgentWithLaunchedReservation();
+
+    // A second run that was never dispatched: no reservation, no Job. It would
+    // launch perfectly well under the new adapter, so the migration must not
+    // kill it. This is the difference between this narrow helper and the
+    // pause path's cancelActiveForAgent, which cancels every queued/running/
+    // scheduled_retry run for the agent.
+    const queuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    await db
+      .update(agents)
+      .set({ adapterType: "claude_k8s", updatedAt: new Date() })
+      .where(eq(agents.id, agentId));
+
+    const cancelled = await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
+      agentId,
+      "Cancelled because the agent's adapter type changed from opencode_k8s to claude_k8s",
+    );
+
+    // Exactly one: the reservation holder. Not the queued run.
+    expect(cancelled).toBe(1);
+
+    const statuses = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const byId = new Map(statuses.map((row) => [row.id, row.status]));
+    expect(byId.get(runId)).toBe("cancelled");
+    expect(byId.get(queuedRunId)).not.toBe("cancelled");
   }, 120_000);
 
   it("names a Job-name mismatch distinctly instead of folding it into the generic non-launchable error (BLO-28865)", async () => {

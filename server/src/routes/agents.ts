@@ -3711,10 +3711,16 @@ export function agentRoutes(
       // Cancel the in-flight runs instead of touching the reservation. This is
       // deliberate, and the ordering is the whole point: the reservation still
       // holds the OLD Job's name/UID, which is the only handle the cancel
-      // cascade's exact-name delete has on it. `cancelActiveForAgent` ->
-      // `cancelActiveForAgentInternal` finalizes the run terminal, deletes
-      // that exact old-named Job, then promotes the next queued run. The
-      // reaper releases the now-terminal run's reservation on its next pass.
+      // cascade's exact-name delete has on it. `cancelRunInternal` finalizes
+      // the run terminal, deletes that exact old-named Job, then promotes the
+      // next queued run. The reaper releases the now-terminal run's
+      // reservation on its next pass.
+      //
+      // Scoped to reservation HOLDERS specifically, not every active run for
+      // the agent (which is what the pause path's `cancelActiveForAgent`
+      // does). A `queued` run has never been dispatched, holds no reservation
+      // and no Job, and would launch perfectly well under the new adapter --
+      // killing it would be collateral damage from a config edit.
       //
       // Do NOT "fix" this by re-arming the reservation instead
       // (`rearmExternalRuntimeReservationForRetry`): it nulls jobName/jobUid,
@@ -3726,7 +3732,7 @@ export function agentRoutes(
       // process -> claude_k8s change has no external-lifecycle run to cancel.
       if (EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(existing.adapterType)) {
         try {
-          await heartbeat.cancelActiveForAgent(
+          await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
             id,
             `Cancelled because the agent's adapter type changed from ${existing.adapterType} to ${agent.adapterType}`,
           );

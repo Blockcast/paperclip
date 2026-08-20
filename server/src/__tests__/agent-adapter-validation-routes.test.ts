@@ -47,6 +47,7 @@ const mockBudgetService = vi.hoisted(() => ({
 
 const mockHeartbeatService = vi.hoisted(() => ({
   cancelActiveForAgent: vi.fn(),
+  cancelExternalRuntimeReservationHoldersForAgent: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -652,14 +653,14 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockHeartbeatService.cancelActiveForAgent).toHaveBeenCalledWith(
+    expect(mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.stringContaining("adapter type changed"),
     );
     // The reason must name BOTH adapter types: it lands in the run's cancel
     // event and is the only breadcrumb tying a cancelled run to the migration
     // that caused it.
-    const [, reason] = mockHeartbeatService.cancelActiveForAgent.mock.calls.at(-1) ?? [];
+    const [, reason] = mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent.mock.calls.at(-1) ?? [];
     expect(String(reason)).toContain("opencode_k8s");
     expect(String(reason)).toContain("codex_local");
   });
@@ -677,7 +678,7 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockHeartbeatService.cancelActiveForAgent).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent).not.toHaveBeenCalled();
   });
 
   it("does not cancel runs when a PATCH leaves the adapter type unchanged (BLO-28865 AC#6)", async () => {
@@ -718,7 +719,7 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockHeartbeatService.cancelActiveForAgent).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent).not.toHaveBeenCalled();
   });
 
   it("still applies the adapter-type change when the cancel cascade throws (BLO-28865)", async () => {
@@ -746,7 +747,7 @@ describe("agent routes adapter validation", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-    mockHeartbeatService.cancelActiveForAgent.mockRejectedValueOnce(new Error("kube unavailable"));
+    mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent.mockRejectedValueOnce(new Error("kube unavailable"));
 
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
