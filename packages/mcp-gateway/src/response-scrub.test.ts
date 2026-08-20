@@ -403,3 +403,260 @@ describe("scrubText", () => {
     expect(out.match(/value: "<redacted>"/g)).toHaveLength(2);
   });
 });
+
+/**
+ * Line-ending coverage. Before this suite existed, every fixture in this file
+ * used `\n`, which is exactly why a CRLF fail-open could ship: `env:\r` still
+ * matched (its `\s*` absorbed the `\r`) so the block was entered, but
+ * `value: X\r` did not (`.` does not match `\r` and the pattern is not
+ * `/m`-flagged), so every value line inside the block was emitted verbatim.
+ */
+describe("scrubYamlText — line endings", () => {
+  const cases: ReadonlyArray<readonly [string, string]> = [
+    ["LF", "\n"],
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+  ];
+
+  for (const [label, eol] of cases) {
+    it(`redacts env values with ${label} terminators`, () => {
+      const pod = [
+        "    env:",
+        "    - name: OPENAI_API_KEY",
+        `      value: ${LEAK}`,
+        "    image: ghcr.io/example/app:v1",
+      ].join(eol);
+
+      const out = scrubYamlText(pod);
+
+      expectNoLeak(out);
+      expect(out).toContain("name: OPENAI_API_KEY");
+      expect(out).toContain(`value: "${REDACTED}"`);
+      // Terminators are preserved, not normalized: this is a proxy, and
+      // rewriting an upstream's line endings is its own kind of corruption.
+      expect(out).toContain(`image: ghcr.io/example/app:v1`);
+      expect(out.split(eol)).toHaveLength(4);
+    });
+  }
+
+  it("swallows a CRLF block scalar continuation", () => {
+    // The fail-closed swallow has to work per line-ending style too, or the
+    // marker prints above the plaintext.
+    const pod = ["    env:", "    - name: CERT", "      value: |", `        ${LEAK}`, "    image: x"].join(
+      "\r\n",
+    );
+
+    expectNoLeak(scrubYamlText(pod));
+  });
+});
+
+/**
+ * Quoted key spellings. YAML permits `"value": x` and `'value': x`, and the
+ * annotation pattern already allowed for quoting — the omission in the env and
+ * value patterns was an oversight, and each spelling passed plaintext through.
+ */
+describe("scrubYamlText — quoted keys", () => {
+  it("redacts a double-quoted value key", () => {
+    expectNoLeak(scrubYamlText(`    env:\n    - name: A\n      "value": ${LEAK}`));
+  });
+
+  it("redacts a single-quoted value key", () => {
+    expectNoLeak(scrubYamlText(`    env:\n    - name: A\n      'value': ${LEAK}`));
+  });
+
+  it("enters a block opened by a quoted env key", () => {
+    expectNoLeak(scrubYamlText(`    "env":\n    - name: A\n      value: ${LEAK}`));
+    expectNoLeak(scrubYamlText(`    'env':\n    - name: A\n      value: ${LEAK}`));
+  });
+
+  it("fails closed on a quoted env key with an inline flow value", () => {
+    const out = scrubYamlText(`    "env": [{name: A, value: ${LEAK}}]`);
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+});
+
+/**
+ * `Secret` coverage. The same read-only grant serves `resources_get` with an
+ * arbitrary kind, and a Secret carries its material directly rather than in an
+ * `env` block — so scrubbing only `env` closed the harder path and left the
+ * easier one open.
+ */
+describe("Secret material", () => {
+  // Kubernetes serializes fields alphabetically, so `data` precedes
+  // `kind: Secret`. A fixture in that order is the one that catches a scanner
+  // which decides on first sight of the kind.
+  const secretYaml = [
+    "apiVersion: v1",
+    `data:`,
+    `  token: ${LEAK}_BASE64`,
+    "kind: Secret",
+    "metadata:",
+    "  name: agent-credentials",
+    "  namespace: paperclip",
+    "stringData:",
+    `  plainToken: ${LEAK}_PLAIN`,
+    "type: Opaque",
+  ].join("\n");
+
+  it("redacts both data and stringData in a YAML Secret", () => {
+    const out = scrubYamlText(secretYaml);
+
+    expectNoLeak(out);
+    // Identity survives — which Secret this is remains diagnostic.
+    expect(out).toContain("name: agent-credentials");
+    expect(out).toContain("type: Opaque");
+    expect(out).toContain(`data: "${REDACTED}"`);
+    expect(out).toContain(`stringData: "${REDACTED}"`);
+  });
+
+  it("redacts a Secret arriving as YAML in an MCP content block", () => {
+    const body = Buffer.from(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        result: { content: [{ type: "text", text: secretYaml }] },
+      }),
+    );
+
+    expectNoLeak(scrubResponseBody(body, "application/json").toString("utf8"));
+  });
+
+  it("redacts a Secret in the structural JSON path", () => {
+    const out = scrubJsonValue({
+      kind: "Secret",
+      metadata: { name: "agent-credentials" },
+      data: { token: `${LEAK}_BASE64` },
+      stringData: { plainToken: `${LEAK}_PLAIN` },
+    });
+
+    expectNoLeak(JSON.stringify(out));
+    expect(out).toMatchObject({ data: REDACTED, stringData: REDACTED });
+  });
+
+  it("redacts SecretList items, which carry no kind of their own", () => {
+    const out = scrubJsonValue({
+      kind: "SecretList",
+      items: [{ metadata: { name: "a" }, data: { token: `${LEAK}_BASE64` } }],
+    });
+
+    expectNoLeak(JSON.stringify(out));
+  });
+
+  it("leaves a ConfigMap's data intact — only Secrets lose it", () => {
+    // Over-redacting here would remove real diagnostic value for no security
+    // gain, so the kind check has to be load-bearing in both directions.
+    const configMap = ["apiVersion: v1", "data:", "  LOG_LEVEL: debug", "kind: ConfigMap"].join("\n");
+
+    expect(scrubYamlText(configMap)).toBe(configMap);
+    expect(scrubJsonValue({ kind: "ConfigMap", data: { LOG_LEVEL: "debug" } })).toEqual({
+      kind: "ConfigMap",
+      data: { LOG_LEVEL: "debug" },
+    });
+  });
+
+  it("scopes redaction to the Secret document in a multi-document stream", () => {
+    const docs = [secretYaml, "---", "apiVersion: v1", "data:", "  LOG_LEVEL: debug", "kind: ConfigMap"].join(
+      "\n",
+    );
+
+    const out = scrubText(docs);
+
+    expectNoLeak(out);
+    expect(out).toContain("LOG_LEVEL: debug");
+  });
+});
+
+/**
+ * The JSON serialization path, driven through the entry point the proxy
+ * actually calls. Every prior JSON-path test invoked `scrubJsonValue` directly,
+ * so none of them could catch that the raw-body pre-filter made this path
+ * unreachable: nested JSON spells the key `\"env\":`, which matched neither the
+ * `env:` nor the `"env"` probe.
+ */
+describe("scrubResponseBody — JSON-serialized resources", () => {
+  it("scrubs a resource that arrives as JSON inside content[].text", () => {
+    const resource = JSON.stringify({
+      kind: "Pod",
+      spec: { containers: [{ name: "c", env: [{ name: "OPENAI_API_KEY", value: LEAK }] }] },
+    });
+    const body = Buffer.from(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 4,
+        result: { content: [{ type: "text", text: resource }] },
+      }),
+    );
+
+    const out = scrubResponseBody(body, "application/json").toString("utf8");
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+    expect(JSON.parse(out)).toMatchObject({ jsonrpc: "2.0", id: 4 });
+  });
+
+  it("scrubs a JSON-serialized Secret inside content[].text", () => {
+    const resource = JSON.stringify({
+      kind: "Secret",
+      stringData: { plainToken: LEAK },
+    });
+    const body = Buffer.from(JSON.stringify({ result: { content: [{ type: "text", text: resource }] } }));
+
+    expectNoLeak(scrubResponseBody(body, "application/json").toString("utf8"));
+  });
+
+  it("scrubs a JSON resource delivered over SSE", () => {
+    const resource = JSON.stringify({
+      kind: "Pod",
+      spec: { containers: [{ env: [{ name: "A", value: LEAK }] }] },
+    });
+    const payload = JSON.stringify({ result: { content: [{ type: "text", text: resource }] } });
+    const body = Buffer.from(`event: message\ndata: ${payload}\n\n`);
+
+    const out = scrubResponseBody(body, "text/event-stream").toString("utf8");
+
+    expectNoLeak(out);
+    expect(out).toContain("event: message");
+  });
+});
+
+/**
+ * Pass-through fidelity. `scrubJsonRpcBody` used to reparse and re-stringify
+ * any body containing the substring `env:` even when nothing was redacted,
+ * which silently rounded large integers and normalized `1.0` to `1`. This
+ * gateway also proxies GitHub and Paperclip, where an issue body or diff
+ * mentioning `env:` is routine — this PR's own diff would have triggered it.
+ */
+describe("scrubResponseBody — pass-through is byte-exact", () => {
+  it("returns the original buffer when a body mentions env: but carries nothing to redact", () => {
+    const body = Buffer.from('{"result":{"note":"see env: config for details"}}');
+
+    expect(scrubResponseBody(body, "application/json")).toBe(body);
+  });
+
+  it("does not round numbers in a body it does not redact", () => {
+    const raw = '{"result":{"note":"env: x","nodeId":12345678901234567890,"ratio":1.0}}';
+
+    const out = scrubResponseBody(Buffer.from(raw), "application/json").toString("utf8");
+
+    expect(out).toBe(raw);
+    expect(out).toContain("12345678901234567890");
+    expect(out).toContain("1.0");
+  });
+
+  it("returns the original buffer for a Secret-shaped key on a non-Secret kind", () => {
+    const body = Buffer.from('{"result":{"kind":"ConfigMap","data":{"LOG_LEVEL":"debug"}}}');
+
+    expect(scrubResponseBody(body, "application/json")).toBe(body);
+  });
+
+  it("still re-serializes when it did redact something", () => {
+    const body = Buffer.from(JSON.stringify({ result: { env: [{ name: "A", value: LEAK }] } }));
+
+    const out = scrubResponseBody(body, "application/json");
+
+    expect(out).not.toBe(body);
+    expectNoLeak(out.toString("utf8"));
+  });
+});
