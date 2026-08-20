@@ -1374,6 +1374,24 @@ describe("buildJobManifest", () => {
       expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
     });
 
+    // Both `.trim()` calls in resolveServiceAccountName are load-bearing:
+    // serviceAccountName is a `type: "text"` field, so a whitespace-only value
+    // is reachable from the UI form, and a bare `||` would pass it straight
+    // through as a Job SA name the API server rejects.
+    it("treats a whitespace-only per-agent serviceAccountName as unset and falls back to the fleet default", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      ctx.config = { serviceAccountName: "   " };
+      const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip");
+      expect(serviceAccountName).toBe("paperclip");
+    });
+
+    it("refuses to build the manifest when both the per-agent value and the fleet default are whitespace-only", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "  ";
+      ctx.config = { serviceAccountName: "  " };
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
+    });
+
     it("refuses to build the manifest — never silently lands on the namespace `default` ServiceAccount — when neither serviceAccountName nor the fleet default is set", () => {
       delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
       expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
