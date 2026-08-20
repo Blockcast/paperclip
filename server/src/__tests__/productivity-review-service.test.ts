@@ -245,7 +245,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     issueCommentStatus?: string;
     // Wake reason written into `contextSnapshot`. Production stamps
     // `issueCommentStatus: "not_applicable"` for every reason outside the
-    // four-item `shouldRequireIssueCommentForWake` whitelist.
+    // four-item `shouldRequireIssueCommentForWake` whitelist — and also
+    // whenever `contextSnapshot.skipIssueComment === true`, a fifth early exit
+    // that makes the required set narrower than the wake list alone.
     wakeReason?: string;
     errorCode?: string | null;
     spacingMs?: number;
@@ -273,7 +275,25 @@ describeEmbeddedPostgres("productivity review service", () => {
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         errorCode: input.errorCode !== undefined ? input.errorCode : undefined,
         logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
-        logStore: input.logStore !== undefined ? input.logStore : undefined,
+        // BLO-26165: default to a run that HAS a log store, because production
+        // only produces the null shape for a pre-adapter failure. `logStore`
+        // and `logRef` are written immediately after `runLogStore.begin`, the
+        // first thing `executeRun`'s inner `try` does — so every run that got
+        // as far as the adapter has them set, and only a setup failure that
+        // threw earlier leaves them null.
+        //
+        // This default is load-bearing for `isNeverInvokedRun`, which reads
+        // `logStore`/`logRef` as its invocation signal. Leaving it null made
+        // the baseline fixture — a `succeeded` run with `livenessState:
+        // "advanced"` — indistinguishable from a run whose adapter never
+        // existed, so every ordinary silent-streak test would have been
+        // silently excluded from the numerator. Fixtures that mean "never
+        // invoked" pass `logStore: null` explicitly.
+        //
+        // No other predicate reads `logStore`: `isInfraFailureRun` keys on
+        // `livenessState`/`usageJson`/`logBytes`, so this default does not
+        // disturb the never-executed or runtime-failure populations.
+        logStore: input.logStore !== undefined ? input.logStore : "s3",
         issueCommentStatus: input.issueCommentStatus ?? "not_applicable",
         nextAction: input.nextAction === undefined ? "Continue processing the next batch." : input.nextAction,
         createdAt,
@@ -886,21 +906,32 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
-  // BLO-26165: a run whose adapter container was never created (BLO-23096:
-  // `preferred_workspace_unrealizable` / `adapter_failed` setup failures at
-  // 584ms/1,097ms lifetimes, with `usageJson`, `logBytes` and `logStore` all
-  // null and `livenessState: null` because classification never ran — exactly
-  // the case `isNeverExecutedRun`'s `livenessState !== "failed"` check cannot
-  // catch). There was nothing capable of writing a comment, so it must not
-  // count toward `no_comment_streak`.
-  it("excludes never-invoked runs (no adapter ever created) from the no-comment streak, even when the never-executed liveness heuristic misses them (BLO-26165)", async () => {
+  // BLO-26165 / BLO-23096: the 25-run `preferred_workspace_unrealizable`
+  // streak that produced the false-positive review this issue was opened for.
+  // Nothing capable of writing a comment ever existed, so the assignee-facing
+  // `no_comment_streak` must not fire.
+  //
+  // What DOES fire — correctly — is `runtime_failure_streak`. These rows are
+  // terminal, `livenessState: "failed"`, zero-token infra failures, which is
+  // exactly that trigger's population. It is the platform-owner-facing signal,
+  // and its own body says "infrastructure signal, not an agent-performance
+  // verdict; do not decompose, block, or cancel the underlying work on the
+  // strength of this alone." Asserting `created === 0` here would only be
+  // reachable with a `livenessState: null` fixture that production never
+  // writes for a terminal setup failure. The acceptance criterion is that no
+  // *`no_comment_streak`* review is created, not that the window goes unreported.
+  it("attributes the BLO-23096 never-invoked streak to runtime_failure_streak, never to no_comment_streak (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
-    // Anchored 2h before `now` (outside the 1h/6h high_churn windows) so that
-    // once no_comment_streak and runtime_failure_streak are both correctly
-    // suppressed, the fixture doesn't accidentally trip `high_churn` instead —
-    // this test is only about proving no review fires at all.
+    // Anchored 2h before `now` (outside the 1h/6h high_churn windows) so the
+    // fixture cannot trip `high_churn` and muddy which trigger won.
     const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    // Production shape for a `preferred_workspace_unrealizable` pre-adapter
+    // throw. `livenessState` is "failed", NOT null: the setup-failure branch of
+    // `executeRun`'s outer catch calls `classifyAndPersistRunLiveness`, and
+    // `classifyRunLiveness` returns "failed" for any non-succeeded run.
+    // `usageJson`/`logStore`/`logRef` stay null because the throw precedes
+    // `runLogStore.begin`.
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -908,7 +939,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       count: 25,
       now: insertNow,
       status: "failed",
-      livenessState: null,
+      errorCode: "preferred_workspace_unrealizable",
+      livenessState: "failed",
       usageJson: null,
       logBytes: null,
       logStore: null,
@@ -918,9 +950,18 @@ describeEmbeddedPostgres("productivity review service", () => {
     const service = productivityReviewService(db);
     const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
 
-    expect(result.created).toBe(0);
+    expect(result.created).toBe(1);
     const reviews = await listProductivityReviews(seeded.companyId);
-    expect(reviews).toHaveLength(0);
+    expect(reviews).toHaveLength(1);
+    // The assignee-facing trigger must not be the one that fired.
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).not.toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    // Proves the invocation predicate is live against the production row shape:
+    // a predicate that short-circuits on non-null `livenessState` reports 0.
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 25",
+    );
   });
 
   // BLO-26165 NEGATIVE CONTROL (required). This is the test that fails against
@@ -930,8 +971,10 @@ describeEmbeddedPostgres("productivity review service", () => {
   // proof no adapter ran. It is not: `finalizeIssueCommentPolicy` stamps that
   // status on runs that provably executed, whenever
   // `shouldRequireIssueCommentForWake` returns false. That helper is a
-  // four-item whitelist (`issue_assigned`, `execution_review_requested`,
-  // `execution_approval_requested`, `execution_changes_requested`), so an
+  // four-item wake-reason whitelist (`issue_assigned`,
+  // `execution_review_requested`, `execution_approval_requested`,
+  // `execution_changes_requested`) behind a fifth early exit for
+  // `contextSnapshot.skipIssueComment === true`, so an
   // `issue_monitor_due` run — like every `heartbeat_timer`,
   // `issue_comment_mentioned`, `issue_continuation_needed` and recovery-lane
   // run — gets `not_applicable` no matter how much work it did. Under #1342 the
@@ -1006,7 +1049,10 @@ describeEmbeddedPostgres("productivity review service", () => {
   it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
-    // Most recent 5 runs never invoked (adapter never started).
+    // Most recent 5 runs never invoked (adapter never started). Production
+    // shape: `livenessState: "failed"` — see the BLO-23096 fixture above. This
+    // is what makes the assertion below a real regression test: a predicate
+    // that short-circuits on non-null `livenessState` reports 0 here, not 5.
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -1014,7 +1060,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       count: 5,
       now,
       status: "failed",
-      livenessState: null,
+      errorCode: "preferred_workspace_unrealizable",
+      livenessState: "failed",
       usageJson: null,
       logBytes: null,
       logStore: null,
@@ -1042,6 +1089,44 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain(
       "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 5",
     );
+  });
+
+  // BLO-26165: the branch where `isNeverInvokedRun` is load-bearing rather than
+  // a subset of `isNeverExecutedRun`. Liveness classification is not guaranteed
+  // to land on a setup failure — the write in the outer catch is gated on the
+  // run still being `running`, and `backfillMissingRunLivenessForIssue` is
+  // scheduled asynchronously — so `livenessState: null` is reachable on a
+  // terminal never-invoked run. `isInfraFailureRun` requires
+  // `livenessState === "failed"` and therefore returns false for these rows;
+  // without the invocation predicate they would walk straight into the streak
+  // and fire a review against an assignee that was never invoked.
+  it("excludes never-invoked runs whose liveness classification never landed, which isInfraFailureRun cannot catch (BLO-26165)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Anchored outside the 1h/6h high_churn windows so a suppressed
+    // no_comment_streak doesn't simply trip a different trigger.
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: insertNow,
+      status: "failed",
+      errorCode: "preferred_workspace_unrealizable",
+      livenessState: null,
+      usageJson: null,
+      logBytes: null,
+      logStore: null,
+      issueCommentStatus: "not_applicable",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(0);
   });
 
   // BLO-22097: a post-model failure whose result event never arrives leaves
@@ -1287,6 +1372,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write.
       // `cancelQueuedRunForBlockedDependencies` never calls
@@ -1444,6 +1534,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
       issueCommentStatus: "not_applicable",
@@ -1499,6 +1594,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
       issueCommentStatus: "not_applicable",
@@ -1548,6 +1648,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
       issueCommentStatus: "not_applicable",
