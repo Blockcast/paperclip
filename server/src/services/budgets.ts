@@ -317,6 +317,13 @@ export function buildApprovalPayload(input: {
  * audit/trace handle, and the authoritative suppression is the pre-existing
  * `budget_incidents` row check in `createIncidentIfNeeded`, which is keyed on
  * exactly the same triple.
+ *
+ * Since BLO-28908 a window can legitimately carry more than one card per
+ * threshold -- a cap raise closes the incident and the next crossing files a
+ * fresh card -- so this value is deliberately *not* unique per card. Nothing
+ * enforces it (see above), and making it unique would have to encode the cap,
+ * which changes the key of the first card and breaks its use as a stable handle.
+ * Join through `budget_incidents.approval_id` when you need one exact card.
  */
 export function budgetApprovalIdempotencyKey(
   policyId: string,
@@ -500,6 +507,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     // separate `new Date()` readings would let the payload disagree with itself.
     const now = new Date();
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind, now);
+    // Suppress only while an incident for this (policy, window, threshold) is still
+    // *open*. Closed rows must not hold the slot: `raise_budget_and_resume` resolves
+    // every open incident on the policy, so a `ne(status, "dismissed")` check -- what
+    // this was until BLO-28908 -- meant one cap raise silenced the policy for the rest
+    // of the window on both thresholds. The hard path made that dangerous rather than
+    // merely quiet, because `pauseAndCancelScopeForBudget` is not gated on the card
+    // being filed: the next wall in the same window paused the scope with no board
+    // card at all. Zero notice, where BLO-28793 was filed over 76 ms of it.
+    //
+    // `open` is the right key rather than "the cap changed since the last card"
+    // (`amountLimit != policy.amount`), which was the first shape considered: a board
+    // that raises a cap to clear a burst and later lowers it back would match the
+    // earlier row again and re-silence the policy at exactly the cap that already
+    // proved too low. What a still-open incident means is "the board has a live card
+    // for this and has not acted"; anything closed is a decided crossing, and the next
+    // crossing is a new event that deserves its own card.
+    //
+    // `budget_incidents_policy_window_threshold_idx` carries the same predicate and is
+    // the backstop if these two ever drift.
     const existing = await db
       .select()
       .from(budgetIncidents)
@@ -508,7 +534,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           eq(budgetIncidents.policyId, policy.id),
           eq(budgetIncidents.windowStart, start),
           eq(budgetIncidents.thresholdType, thresholdType),
-          ne(budgetIncidents.status, "dismissed"),
+          eq(budgetIncidents.status, "open"),
         ),
       )
       .then((rows) => rows[0] ?? null);
@@ -1229,12 +1255,20 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         },
       });
 
-      const [updated] = await hydrateIncidentRows([{
-        ...incident,
-        status: input.action === "raise_budget_and_resume" ? "resolved" : "dismissed",
-        resolvedAt: new Date(),
-        updatedAt: new Date(),
-      }]);
+      // Report the row as it actually is now, not as the requested action implies.
+      // The raise path closes incidents with a `status = "open"` filter, so a submit
+      // against an already-resolved or dismissed incident id leaves that row
+      // untouched -- it resolves whatever was open, resumes the scope and withdraws
+      // the other cards, all correctly, but the incident named in the request did not
+      // change. Echoing the requested outcome back told the caller otherwise
+      // (BLO-28908, from the #1415 review). The side effects were always right; the
+      // return value was the part that lied.
+      const finalRow = await db
+        .select()
+        .from(budgetIncidents)
+        .where(eq(budgetIncidents.id, incident.id))
+        .then((rows) => rows[0] ?? null);
+      const [updated] = await hydrateIncidentRows([finalRow ?? incident]);
       return updated!;
     },
   };
