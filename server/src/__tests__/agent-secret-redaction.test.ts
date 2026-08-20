@@ -795,3 +795,118 @@ describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () =>
     });
   });
 });
+
+// BLO-27991: `PATCH /agents/:id` carrying only `adapterConfig` takes the weak
+// authorization branch (`allow_self`), and the sync path behind it authorizes a
+// binding on same-company membership alone. Without a route guard any agent can
+// bind any company secret to itself. `decide` is mocked allow throughout, so
+// these assert the guard specifically and not the surrounding authorization.
+describe("agent self-service secret binding guard", () => {
+  const otherSecretId = "33333333-3333-4333-8333-333333333333";
+
+  const secretRefBinding = {
+    type: "secret_ref",
+    secretId: otherSecretId,
+    version: "latest",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.getById.mockResolvedValue(baseAgent);
+    mockAgentService.update.mockResolvedValue(baseAgent);
+    mockAgentService.create.mockResolvedValue(baseAgent);
+    mockAgentService.getChainOfCommand.mockResolvedValue([]);
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: baseAgent });
+    mockAccessService.getMembership.mockResolvedValue(null);
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.decide.mockResolvedValue({ allowed: true });
+    mockApprovalService.findOpenHireApprovalForAgent.mockResolvedValue(null);
+    mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
+    mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  it("refuses an agent self-PATCH of adapterConfig.env carrying a secret_ref", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { GITHUB_MERGE_TOKEN: secretRefBinding } } });
+
+    expect(res.status).toBe(403);
+    // Refused, not silently ignored: nothing may reach the service, because the
+    // service is what writes the company_secret_bindings row.
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // The guard is actor-conditional, so the identical request from a board actor
+  // must get past it. It cannot reach 200 in this harness: routes/agents.ts
+  // imports secretService directly rather than through ../services/index.js, so
+  // the real service runs against a db stub that cannot model a company secret
+  // and fails downstream with "Secret must belong to same company". That
+  // downstream failure is itself the evidence — it is only reachable after the
+  // guard has allowed the request through. The board path actually creating a
+  // binding row is covered DB-backed in agents-service-secret-bindings.test.ts.
+  it("does not apply the guard to a board actor making the same request", async () => {
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { GITHUB_MERGE_TOKEN: secretRefBinding } } });
+
+    expect(res.status).not.toBe(403);
+    expect(JSON.stringify(res.body)).not.toContain("cannot create or modify secret bindings");
+    expect(res.body.error).toBe("Secret must belong to same company");
+  });
+
+  it("refuses an agent self-PATCH carrying a user_secret_ref", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { GITHUB_TOKEN: { type: "user_secret_ref", key: "github_token" } } } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a secret_ref smuggled in outside env", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { apiKey: secretRefBinding } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // The guard must not break the honest path. A GET redacts every binding to
+  // the sentinel, so a round-tripping agent sends `***` and never a literal
+  // binding; `stripRedactedEnvBindingsFromAdapterConfig` restores it from
+  // stored state after the guard has run.
+  it("allows an agent self-PATCH that round-trips the redacted sentinel", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { OPENAI_API_KEY: "***" }, cwd: "/workspace" } });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  // Same missing check, reached without a self-PATCH: an agent holding
+  // canCreateAgents can bind a secret into an agent it creates.
+  it("refuses an agent-authored create that carries a secret_ref", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "Exfil",
+        role: "engineer",
+        adapterType: "claude_local",
+        adapterConfig: { env: { GITHUB_MERGE_TOKEN: secretRefBinding } },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+});

@@ -552,6 +552,48 @@ function assertClass3StaticLeaseAllowed(input: {
   }
 }
 
+/**
+ * Decide a binding's projection classification from inputs the server owns
+ * (BLO-27991).
+ *
+ * `assertClass3StaticLeaseAllowed` returns early for anything not labelled
+ * `class_3_static_lease`, so when the label was taken from the caller a caller
+ * could simply omit it and skip the restriction that slot is meant to carry.
+ * `targetType` comes from the sync target and `configPath` from the binding's
+ * own location, so the allowlist slot is derivable without trusting the caller.
+ *
+ * A caller that declares class-3 at a slot that is not allowlisted is still
+ * rejected rather than silently downgraded, so an honest-but-wrong declaration
+ * stays loud.
+ *
+ * Note the allowlist's `key` is a capability key (`slack.bot_token`), not the
+ * secret's own `companySecrets.key` — those are unrelated, so classification
+ * cannot be derived by matching the secret record.
+ */
+function resolveProjectionClassification(input: {
+  targetType: SecretBindingTargetType;
+  configPath: string;
+  declaredProjectionClass?: SecretProjectionClass | null;
+}): { projectionClass: SecretProjectionClass; projectionAllowlistKey: string | null } {
+  const allowlistEntry = CLASS3_STATIC_LEASE_ALLOWLIST.find((entry) =>
+    entry.targetType === input.targetType && entry.configPath === input.configPath
+  );
+  if (allowlistEntry) {
+    return {
+      projectionClass: "class_3_static_lease",
+      projectionAllowlistKey: allowlistEntry.key,
+    };
+  }
+  if ((input.declaredProjectionClass ?? "unclassified") === "class_3_static_lease") {
+    throw unprocessable("Class-3 static lease binding is outside the approved allowlist", {
+      code: "class_3_static_lease_not_allowed",
+      targetType: input.targetType,
+      configPath: input.configPath,
+    });
+  }
+  return { projectionClass: "unclassified", projectionAllowlistKey: null };
+}
+
 function defaultProviderConfigStatus(provider: SecretProvider): SecretProviderConfigStatus {
   return COMING_SOON_SECRET_PROVIDERS.has(provider) ? "coming_soon" : "ready";
 }
@@ -3580,8 +3622,11 @@ export function secretService(db: Db) {
       }> = [];
       for (const ref of refs) {
         await assertSecretInCompany(companyId, ref.secretId);
-        const projectionClass = ref.projectionClass ?? "unclassified";
-        const projectionAllowlistKey = ref.projectionAllowlistKey ?? null;
+        const { projectionClass, projectionAllowlistKey } = resolveProjectionClassification({
+          targetType: target.targetType,
+          configPath: ref.configPath,
+          declaredProjectionClass: ref.projectionClass,
+        });
         assertClass3StaticLeaseAllowed({
           targetType: target.targetType,
           configPath: ref.configPath,

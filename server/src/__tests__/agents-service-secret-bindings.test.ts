@@ -724,6 +724,99 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  // BLO-27991: the stored classification must come from inputs the server owns
+  // (target type + config path), not from the caller-supplied binding. Omitting
+  // the label used to skip the class-3 restriction entirely, because
+  // assertClass3StaticLeaseAllowed returns early for anything not labelled.
+  it("derives class-3 lease metadata server-side when the caller omits it", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `slack-omitted-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "slack-test-token",
+    });
+
+    const created = await agentService(db).create(companyId, {
+      name: "Slack Omitted Class",
+      role: "briefing",
+      adapterType: "codex_local",
+      adapterConfig: {
+        env: {
+          SLACK_BOT_TOKEN: {
+            type: "secret_ref",
+            secretId: secret.id,
+            version: "latest",
+          },
+        },
+      },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, created.id),
+      ));
+
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({
+      configPath: "env.SLACK_BOT_TOKEN",
+      projectionClass: "class_3_static_lease",
+      projectionAllowlistKey: "slack.bot_token",
+    });
+  });
+
+  it("ignores a caller-supplied allowlist key on an allowlisted slot", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `slack-spoofed-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "slack-test-token",
+    });
+
+    const created = await agentService(db).create(companyId, {
+      name: "Slack Spoofed Key",
+      role: "briefing",
+      adapterType: "codex_local",
+      adapterConfig: {
+        env: {
+          SLACK_BOT_TOKEN: {
+            type: "secret_ref",
+            secretId: secret.id,
+            version: "latest",
+            projectionClass: "unclassified",
+            projectionAllowlistKey: "attacker.controlled",
+          },
+        },
+      },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, created.id),
+      ));
+
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({
+      projectionClass: "class_3_static_lease",
+      projectionAllowlistKey: "slack.bot_token",
+    });
+  });
+
   it("rejects class-3 env lease bindings outside the enumerated allowlist", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

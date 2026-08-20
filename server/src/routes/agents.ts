@@ -3,6 +3,7 @@ import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { collectAgentAdapterSecretBindingPaths } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -1752,12 +1753,45 @@ export function agentRoutes(
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
 
+  /**
+   * An agent must not be able to bind a company secret to itself (BLO-27991).
+   *
+   * `PATCH /agents/:id` carrying only `adapterConfig` takes the weak
+   * authorization branch (`allow_self`, no change grant), and the sync path it
+   * feeds — `syncAgentAdapterEnvBindings` -> `syncSecretRefsForTarget` — only
+   * checks that the referenced secret is in the same company. Without this
+   * guard any agent can mint a `company_secret_bindings` row pointing at any
+   * company secret and have it projected into its own pod, because the runtime
+   * re-check (`assertBindingContext`) validates against that very row.
+   *
+   * Refusing outright is safe: GET redacts every binding to the `***` sentinel
+   * and `stripRedactedEnvBindingsFromAdapterConfig` restores it from stored
+   * state, so an honest agent round-trip never carries a literal binding. Board
+   * and system actors are unaffected, as are the service-internal callers
+   * (company-package import, built-in agent reconciler) that bypass this route.
+   */
+  function assertNoAgentSecretBindingMutation(
+    req: Request,
+    adapterConfig: Record<string, unknown>,
+    path = "adapterConfig",
+  ) {
+    if (req.actor.type !== "agent" || !adapterConfig) return;
+    const bindingPaths = collectAgentAdapterSecretBindingPaths(adapterConfig);
+    if (bindingPaths.length === 0) return;
+    throw forbidden(
+      "Agent-authenticated callers cannot create or modify secret bindings "
+        + `(${bindingPaths.map((bindingPath) => `${path}.${bindingPath}`).join(", ")}). `
+        + "Secret bindings must be configured by a board actor.",
+    );
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentSecretBindingMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),

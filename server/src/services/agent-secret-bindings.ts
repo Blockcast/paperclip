@@ -91,6 +91,41 @@ function collectSecretRefs(adapterConfig: unknown): Array<{
   return refs;
 }
 
+/**
+ * Config paths in an adapterConfig that would be written as secret bindings by
+ * {@link syncAgentAdapterEnvBindings}.
+ *
+ * Deliberately mirrors the traversal and parse used by `collectSecretRefs` and
+ * `collectUserSecretRefs` below: a binding shape this misses but those collect
+ * would be a binding an agent could create while the route guard stayed silent.
+ * Keep the three in lockstep.
+ */
+export function collectAgentAdapterSecretBindingPaths(adapterConfig: unknown): string[] {
+  const config = asRecord(adapterConfig);
+  if (!config) return [];
+  const paths: string[] = [];
+
+  const envValue = asRecord(config.env);
+  for (const [key, rawBinding] of Object.entries(envValue ?? {})) {
+    if (isSecretBindingRef(rawBinding)) paths.push(`env.${key}`);
+  }
+
+  for (const [key, rawBinding] of Object.entries(config)) {
+    if (key === "env") continue;
+    if (isSecretBindingRef(rawBinding)) paths.push(key);
+  }
+
+  return paths;
+}
+
+function isSecretBindingRef(rawBinding: unknown): boolean {
+  const parsed = envBindingSchema.safeParse(rawBinding);
+  if (!parsed.success) return false;
+  const binding = parsed.data;
+  if (typeof binding !== "object" || binding === null) return false;
+  return binding.type === "secret_ref" || binding.type === "user_secret_ref";
+}
+
 function collectUserSecretRefs(adapterConfig: unknown): Array<{
   definitionKey: string;
   configPath: string;
