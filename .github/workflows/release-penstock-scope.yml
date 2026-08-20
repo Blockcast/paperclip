@@ -73,11 +73,22 @@ jobs:
           pnpm --filter @paperclipai/shared build
           pnpm --filter @paperclipai/plugin-sdk build
 
+      # NO --provenance, and it must not be re-added here. npm rejects a sigstore
+      # attestation minted on a self-hosted runner:
+      #   422 Unprocessable Entity - Error verifying sigstore provenance bundle:
+      #   Unsupported GitHub Actions runner environment: "self-hosted".
+      #   Only "github-hosted" runners are supported when publishing with provenance.
+      # Attesting would therefore require `runs-on: ubuntu-latest`, which
+      # scripts/check-github-runner-labels.mjs rejects — every workflow in this repo
+      # must use an ARC label. Publishing with provenance is consequently not
+      # available here at all without a deliberate change to that allowlist.
+      # OIDC trusted publishing (authentication) is unaffected by runner type and
+      # still applies, so this remains a token-less publish.
       - name: Publish under @penstock (OIDC)
         if: ${{ !inputs.dry_run }}
         env:
           VERSION: ${{ inputs.version }}
-        run: node scripts/publish-penstock-scope.mjs --version "$VERSION" --publish --provenance
+        run: node scripts/publish-penstock-scope.mjs --version "$VERSION" --publish
 
       - name: Dry run (pack + validate only)
         if: ${{ inputs.dry_run }}
