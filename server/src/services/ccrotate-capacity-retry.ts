@@ -192,8 +192,34 @@ export function applyCcrotateCapacityDecision(
  * Deliberately far looser than CCROTATE_CAPACITY_MAX_PARK_MS. This bounds the
  * *general* bounded-retry scheduler, which serves every transient family, so the
  * goal is only to remove the pathological horizon named in the acceptance
- * criteria — not to second-guess ordinary provider backoff. At 24h every retry
- * the fleet actually schedules today is unaffected.
+ * criteria — not to second-guess ordinary provider backoff.
+ *
+ * ## This value is a backstop, NOT a sizing decision (BLO-28919)
+ *
+ * The sentence that used to close this comment — "At 24h every retry the fleet
+ * actually schedules today is unaffected" — was measured and **falsified** on
+ * 2026-08-19. A full parked census (700 runs) found `scheduledRetryReason =
+ * "transient_failure"` at p50 4.6h with **p90 == max == exactly 1440.0m**: the
+ * ceiling was binding on more than a tenth of the population, so the
+ * never-fires safety net had become the modal outcome. 484 of 700 fleet parks
+ * sat in that bucket while correctly-gated capacity parks sat at 17.9m — the
+ * identical provider error, 96x apart, decided only by which of the two
+ * `retryNotBefore` writers had run.
+ *
+ * The defect was never this number. It was that a *capacity* floor reached this
+ * generic backstop at all: the wake-gate writer clamps a capacity reset through
+ * {@link resolveCcrotateCapacityRetry} before persisting it, and the finalize
+ * writer did not. That is fixed at the writer (heartbeat.ts, where
+ * `effectiveRetryNotBefore` is computed), so capacity floors are bounded by
+ * CCROTATE_CAPACITY_MAX_PARK_MS and no longer arrive here.
+ *
+ * Lowering this constant was considered and rejected: it serves every transient
+ * family, and shortening it uniformly would retry non-capacity families sooner
+ * with no gate to protect them. Keep it as the loose last-resort bound it is —
+ * but do NOT re-derive a sizing claim from it, and if a census ever shows it
+ * binding again, that is evidence of a new unclamped writer upstream rather
+ * than a number that needs tuning. That inference is the one this comment
+ * previously got wrong.
  */
 export const MAX_TRANSIENT_RETRY_HORIZON_MS = 24 * 60 * 60 * 1000;
 

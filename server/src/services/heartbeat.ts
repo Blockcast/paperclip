@@ -14974,7 +14974,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // A ccrotate capacity defer must re-check the gate at promotion time: if the
     // pool is still exhausted, re-defer with backoff instead of promoting a run
     // that would dispatch and immediately 429. PEN-382.
-    if (dueRun.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON) {
+    //
+    // BLO-28919: that re-check must ALSO cover a capacity park the scheduler
+    // merely LABELLED `transient_failure`. `transient_failure` is the default
+    // `retryReason` of `scheduleBoundedRetryForRun`, so a provider capacity
+    // denial whose reset arrived as prose (parsed server-side, see
+    // PROVIDER_CAPACITY_RESET_AT_PATTERN) lands under that label with a
+    // capacity floor attached — measured at 484 of 700 fleet parks on
+    // 2026-08-19. Those rows reached here and were promoted straight to
+    // `queued` with no capacity re-probe, because this branch keyed on the
+    // reason rather than on the error family.
+    //
+    // This is the load-bearing half of the fix. Promotion does NOT run the
+    // wake-time penstock gate — `promoteDueScheduledRetries` reads
+    // `scheduled_retry` rows directly and never enters `wakeup()`, where
+    // `gateAppliesToWake` lives — so this branch is the only thing standing
+    // between a capacity park and a dispatch into a pool that is still empty.
+    // Shortening such a park without extending the re-probe to it would burn a
+    // paid attempt per hop against a closed door, which is BLO-24011 inverted.
+    const capacityDrivenTransientPark =
+      dueRun.scheduledRetryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      readHeartbeatRunErrorFamily(dueRun) === "rate_limit_exhausted" &&
+      readTransientRetryNotBeforeFromRun(dueRun) !== null;
+    if (
+      dueRun.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON ||
+      capacityDrivenTransientPark
+    ) {
       let capacity: {
         target: "claude" | "codex";
         reason: string;
@@ -15118,6 +15143,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .set({
             scheduledRetryAttempt: nextAttempt,
             scheduledRetryAt: nextDueAt,
+            // BLO-28919: a re-deferred capacity park carries the capacity reason
+            // from here on, whatever label it arrived with. This is the AC's
+            // labelling criterion: a park whose horizon is set by an advertised
+            // capacity floor must not read as `transient_failure`. It is also
+            // what makes the census split-check meaningful — a fall in the
+            // transient bucket has to show up as a rise in the capacity bucket
+            // with a 15m ceiling, rather than the same park under a new name.
+            scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
             resultJson: nextResultJson,
             updatedAt: now,
           })
@@ -25423,11 +25456,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : null;
       const persistedProviderCapacityResetAt =
         providerCapacityResetAt ?? providerCapacityOverHorizonParkAt ?? structuredProviderCapacityResetAt;
-      const effectiveRetryNotBefore =
+      const advertisedRetryNotBefore =
         adapterResult.retryNotBefore ??
         providerCapacityResetAt?.toISOString() ??
         providerCapacityOverHorizonParkAt?.toISOString() ??
         null;
+      // BLO-28919: `retryNotBefore` has two writers and they disagreed on its
+      // ceiling. `persistProviderCapacityRetry` (the wake-gate writer) runs the
+      // advertised reset through `resolveCcrotateCapacityRetry` FIRST and
+      // persists the clamped instant, precisely because
+      // `scheduleBoundedRetryForRun` treats this field as a retry floor and
+      // pushes `dueAt` out to it — its own comment says so. This writer did not,
+      // so the same capacity denial landed on a 24h ceiling
+      // (MAX_TRANSIENT_RETRY_HORIZON_MS, the generic read-side backstop) instead
+      // of the capacity ceiling of 15m: one field, one consumer, two ceilings
+      // 96x apart. That is the whole severity inversion measured on BLO-28919 —
+      // 484/700 fleet parks at median 4.6h under `transient_failure` while
+      // correctly-gated capacity parks sat at 17.9m, for the identical error.
+      //
+      // Clamping here is safe for the reason the gate writer is safe, and it is
+      // NOT "retry into a closed door": coming due does not dispatch. A promoted
+      // retry re-enters via `automation`, which `gateAppliesToWake` covers, so
+      // the wake-time ccrotate gate re-probes capacity (a cached availability
+      // check, not a paid invocation) and re-defers under
+      // CCROTATE_CAPACITY_RETRY_REASON when the pool is still empty. So the run
+      // stays in `scheduled_retry` — a live execution path, so no strand — and
+      // recovers within one ceiling of capacity actually returning rather than
+      // sleeping to a horizon we already decided not to trust.
+      //
+      // This also relabels the park: once the gate re-defers it, the row carries
+      // the capacity reason it always belonged to instead of the scheduler's
+      // defaulted `transient_failure`.
+      //
+      // Deliberate consequence, recorded rather than hidden: a multi-day outage
+      // now escalates to an operator-visible issue at the capacity path's
+      // attempt budget instead of silently re-parking 24h at a time. That is the
+      // disposition ccrotate-capacity-retry.ts already argues for ("a genuinely
+      // long outage still terminates ... rather than silent frozen work").
+      // Strictly a shortening operation. `resolveCcrotateCapacityRetry` falls
+      // back to its default poll delay when the advertised instant is absent,
+      // stale, or unparseable, which would PUSH a run whose floor is already in
+      // the past out past the base curve — so the clamp is adopted only when it
+      // lands earlier than what the provider advertised. The change can then
+      // only ever pull a park in, never delay one.
+      const capacityFloorClamp =
+        providerCapacityThrottleOverride && advertisedRetryNotBefore
+          ? resolveCcrotateCapacityRetry({
+              resumeAt: new Date(advertisedRetryNotBefore),
+              now: new Date(),
+              defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
+            })
+          : null;
+      const advertisedRetryNotBeforeMs = advertisedRetryNotBefore
+        ? new Date(advertisedRetryNotBefore).getTime()
+        : null;
+      const capacityFloorClampApplies =
+        capacityFloorClamp !== null &&
+        advertisedRetryNotBeforeMs !== null &&
+        Number.isFinite(advertisedRetryNotBeforeMs) &&
+        capacityFloorClamp.retryAt.getTime() < advertisedRetryNotBeforeMs;
+      const effectiveRetryNotBefore = capacityFloorClampApplies
+        ? capacityFloorClamp!.retryAt.toISOString()
+        : advertisedRetryNotBefore;
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
@@ -25674,6 +25764,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                             }
                           : {}),
                       },
+                    }
+                  : {}),
+                ...(capacityFloorClampApplies
+                  ? {
+                      // BLO-28919: same key the wake-gate writer uses, so a
+                      // clamped floor reads identically whichever writer set it.
+                      penstockCapacityParkClampedFrom: advertisedRetryNotBefore,
                     }
                   : {}),
                 ...(prReviewIncompleteOverride

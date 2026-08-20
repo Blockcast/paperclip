@@ -40,6 +40,10 @@ import {
 } from "../services/heartbeat.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../services/provider-capacity-horizon-bound.js";
 import {
+  CCROTATE_CAPACITY_MAX_PARK_MS,
+  CCROTATE_CAPACITY_PARK_JITTER_RATIO,
+} from "../services/ccrotate-capacity-retry.js";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -361,6 +365,26 @@ describe("provider 429 classification (hint-present variant)", () => {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+/**
+ * BLO-28919: a capacity floor must land inside the capacity ceiling regardless
+ * of which surface advertised it. The park is computed at finalization, so it is
+ * measured from the run's own `startedAt` where available (falling back to now,
+ * which only ever makes this assertion stricter), plus jitter and a slack
+ * allowance for the run's own execution time.
+ */
+function expectWithinCapacityCeiling(parkedIso: string, startedAt: Date | null) {
+  const originMs = startedAt ? startedAt.getTime() : Date.now();
+  const parkMs = new Date(parkedIso).getTime() - originMs;
+  const ceiling =
+    CCROTATE_CAPACITY_MAX_PARK_MS * (1 + CCROTATE_CAPACITY_PARK_JITTER_RATIO) + 60_000;
+  expect(
+    parkMs,
+    `a capacity floor must park within the ${CCROTATE_CAPACITY_MAX_PARK_MS / 60_000}m capacity ` +
+      `ceiling (+jitter), not the 24h generic backstop; got ${(parkMs / 60_000).toFixed(1)}m`,
+  ).toBeLessThanOrEqual(ceiling);
+  expect(parkMs).toBeGreaterThan(0);
+}
 const HINTED_429_TEST_ADAPTER = "provider_capacity_horizon_test";
 const UNHINTED_429_TEST_ADAPTER = "provider_capacity_horizon_control_test";
 const STRUCTURED_429_TEST_ADAPTER = "provider_capacity_horizon_structured_test";
@@ -664,11 +688,22 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
 
     const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
     expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
-    // The horizon was recovered from prose and persisted on both surfaces —
-    // the scheduler reads `transientRetryNotBefore`, the recovery sweep reads
-    // `retryNotBefore`. On master both are null.
-    expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
-    expect(resultJson?.transientRetryNotBefore).toBe(advertisedResetIso);
+    // BLO-28919 supersedes the original assertion here. The horizon is still
+    // recovered from prose and still persisted on both scheduler surfaces — but
+    // `retryNotBefore` is a retry FLOOR, so it now carries the capacity-clamped
+    // instant rather than the advertised one. Parking verbatim on a 4.6h
+    // advertisement is what put 484 of 700 fleet parks at p50 4.6h under
+    // `transient_failure` while correctly-gated capacity parks sat at 17.9m.
+    // The advertised value is not lost: it moves to
+    // `penstockCapacityParkClampedFrom`, and provenance keeps it below.
+    const clampedIso = resultJson?.retryNotBefore as string | undefined;
+    expect(clampedIso).toBeTruthy();
+    expect(clampedIso).not.toBe(advertisedResetIso);
+    expect(resultJson?.transientRetryNotBefore).toBe(clampedIso);
+    expect(resultJson?.penstockCapacityParkClampedFrom).toBe(advertisedResetIso);
+    expectWithinCapacityCeiling(clampedIso!, failedRun?.startedAt ?? null);
+    // Provenance is unchanged and still records what the provider actually
+    // advertised — that is its job, and it is now the only surface that does.
     expect(resultJson?.providerCapacityResetAt).toBe(advertisedResetIso);
     expect(resultJson?.providerCapacityResetProvenance).toEqual({
       source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
@@ -689,17 +724,19 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     // one of the statuses hasActiveExecutionPath treats as "still alive" —
     // which is what keeps the strand sweep from escalating this issue to
     // `stranded_assigned_issue`. The run never reaches BackoffLimitExceeded.
+    // This is the property BLO-18278 cared about and it is preserved: the park
+    // got shorter, it did not become a strand.
     expect(retryRun?.status).toBe("scheduled_retry");
     expect(retryRun?.scheduledRetryAttempt).toBe(1);
 
-    // The assertion this file exists for: `dueAt` is the provider's advertised
-    // reset exactly, not the family's own hop.
-    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(advertisedResetIso);
+    // `dueAt` tracks the clamped floor, which is what the scheduler now reads.
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(clampedIso);
 
-    // ...and that is materially beyond the flat 90s the rate-limit family would
-    // otherwise have used — the ~18x gap BLO-18278 measured.
+    // ...and it is still materially beyond the flat 90s the rate-limit family
+    // would otherwise have used — BLO-18278's ~18x gap is not reintroduced —
+    // while no longer running to the advertised horizon.
     const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - Date.now();
-    expect(scheduledInMs).toBeGreaterThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 10);
+    expect(scheduledInMs).toBeGreaterThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 5);
   }, 60_000);
 
   // The structured sibling of the case above. An adapter that parses the
@@ -718,7 +755,14 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
 
     const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
     expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
-    expect(resultJson?.retryNotBefore).toBe(advertisedResetIso);
+    // BLO-28919: clamped floor, advertised value preserved beside it. A
+    // structured hint is no more trustworthy as a park horizon than a parsed
+    // one — it is the same provider making the same claim.
+    const clampedIso = resultJson?.retryNotBefore as string | undefined;
+    expect(clampedIso).toBeTruthy();
+    expect(clampedIso).not.toBe(advertisedResetIso);
+    expect(resultJson?.penstockCapacityParkClampedFrom).toBe(advertisedResetIso);
+    expectWithinCapacityCeiling(clampedIso!, failedRun?.startedAt ?? null);
 
     // The horizon is re-derived server-side and re-emitted canonically rather
     // than trusted verbatim, so the value the comment can quote is ours.
@@ -732,13 +776,13 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
       horizonSource: "adapter_structured_retry_not_before",
     });
 
-    // And it still parks at the advertised instant rather than stranding.
+    // And it still parks rather than stranding — at the clamped floor now.
     await expect
       .poll(() => countRetriesOf(run!.id), { timeout: 5_000, interval: 50 })
       .toBe(1);
     const retryRun = await retryRowOf(run!.id);
     expect(retryRun?.status).toBe("scheduled_retry");
-    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(advertisedResetIso);
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(clampedIso);
   }, 60_000);
 
   // Pins the causal claim: it is the advertised horizon, not merely the 429
@@ -797,13 +841,24 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     const resultJson = failedRun?.resultJson as Record<string, unknown> | null;
     expect(resultJson?.errorFamily).toBe("rate_limit_exhausted");
 
-    // Both scheduler surfaces carry the capped park, not the advertised 88.8h
-    // instant and not null. On master all three of these are null.
+    // Both scheduler surfaces carry a park that is neither the advertised 88.8h
+    // instant nor null. On master all three of these are null.
+    //
+    // BLO-28919 changed WHICH bounded park this is. BLO-18285 parked at the 24h
+    // horizon cap; the floor is now additionally clamped to the capacity
+    // ceiling, so the run re-probes in minutes instead of sleeping a day. That
+    // preserves BLO-18285's actual requirement — never take the flat 90s hop
+    // and exhaust inside a closed window, stay in `scheduled_retry` so the
+    // strand sweep leaves the issue alone — and improves on it: an 88.8h
+    // advertisement no longer costs 24h of silence before the first re-probe,
+    // and recovery lands within one ceiling of capacity actually returning.
+    // `providerCapacityResetAt` keeps recording the capped horizon, so the
+    // provenance trail BLO-18285 built is intact.
     const parkedIso = resultJson?.retryNotBefore as string | undefined;
     expect(parkedIso).toBeTruthy();
     expect(resultJson?.transientRetryNotBefore).toBe(parkedIso);
-    expect(resultJson?.providerCapacityResetAt).toBe(parkedIso);
     expect(parkedIso).not.toBe(overCapAdvertisedIso);
+    expectWithinCapacityCeiling(parkedIso!, failedRun?.startedAt ?? null);
 
     // Provenance records BOTH numbers: what we parked on, and what was actually
     // asked for. Without the latter the 88.8h advertisement — the whole reason
@@ -827,13 +882,16 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
     expect(retryRun?.status).toBe("scheduled_retry");
     expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(parkedIso);
 
-    // The assertion that fails on master: the continuation sits at the cap,
-    // three orders of magnitude past the 90s hop it used to take. Measured from
-    // before `invoke`, so the elapsed run time makes it drift slightly past the
-    // cap — the park itself is computed at finalization.
+    // The assertion that fails on master: the continuation parks instead of
+    // taking the 90s hop. BLO-28919 bounds it by the capacity ceiling rather
+    // than the 24h horizon cap, so the lower bound is what matters here — it is
+    // still orders of magnitude past the flat hop, and it re-probes rather than
+    // sleeping to a horizon we already decided not to believe.
     const scheduledInMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - startedAt;
-    expect(scheduledInMs).toBeGreaterThan(PROVIDER_CAPACITY_MAX_HORIZON_MS * 0.9);
-    expect(scheduledInMs).toBeLessThanOrEqual(PROVIDER_CAPACITY_MAX_HORIZON_MS + 60_000);
+    expect(scheduledInMs).toBeGreaterThan(RATE_LIMIT_HEARTBEAT_RETRY_DELAY_MS * 5);
+    expect(scheduledInMs).toBeLessThanOrEqual(
+      CCROTATE_CAPACITY_MAX_PARK_MS * (1 + CCROTATE_CAPACITY_PARK_JITTER_RATIO) + 60_000,
+    );
   }, 60_000);
 
   // BLO-18285 review follow-up, and the counterpart to the test above: the same
@@ -974,6 +1032,13 @@ describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that 
 
     const retryRun = await retryRowOf(run!.id);
     expect(retryRun?.status).toBe("scheduled_retry");
-    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(proseUsableIso);
+    // BLO-28919: corroborated prose still parks — the point of this case — but
+    // at the capacity-clamped floor rather than the advertised instant.
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(resultJson?.retryNotBefore);
+    expect(resultJson?.penstockCapacityParkClampedFrom).toBe(proseUsableIso);
+    expectWithinCapacityCeiling(
+      resultJson?.retryNotBefore as string,
+      failedRun?.startedAt ?? null,
+    );
   }, 60_000);
 });
