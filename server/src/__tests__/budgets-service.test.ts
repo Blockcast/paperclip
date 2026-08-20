@@ -1018,4 +1018,248 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     });
     expect(overviewAfterResume.activeIncidents).toHaveLength(0);
   });
+
+  // BLO-28908. `createIncidentIfNeeded` used to suppress on any non-`dismissed`
+  // row for the (policy, window, threshold) triple, and `raise_budget_and_resume`
+  // sets exactly `resolved` -- so the healthy response to a card silenced that
+  // policy for the rest of the window on both thresholds. A `lifetime` window is
+  // used throughout so `windowStart` is a fixed value for the whole test and the
+  // suppression key cannot roll over mid-run.
+
+  it("re-arms the warn card after a cap raise inside the same window (BLO-28908)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 1000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    // Cross the first warn threshold (80% of 1000) and stop short of the cap.
+    const firstWarn = await insertCostEvent({ companyId, agentId, costCents: 800 });
+    await service.evaluateCostEvent(firstWarn);
+
+    const firstIncident = await db.select().from(budgetIncidents).then((rows) => rows[0]!);
+    expect(firstIncident).toMatchObject({ thresholdType: "soft", status: "open", amountLimit: 1000 });
+    const firstCards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(firstCards).toHaveLength(1);
+    expect(firstCards[0]).toMatchObject({ status: "pending" });
+
+    // The board does the intended thing: raises the cap. This resolves the
+    // incident and approves its card.
+    const resolved = await service.resolveIncident(
+      companyId,
+      firstIncident.id,
+      { action: "raise_budget_and_resume", amount: 2000, decisionNote: "Raised to clear the burst." },
+      "board-user",
+    );
+    expect(resolved).toMatchObject({ status: "resolved", approvalStatus: "approved" });
+
+    // Cross the *new* warn threshold (80% of 2000 = 1600), still under the new cap.
+    const secondWarn = await insertCostEvent({ companyId, agentId, costCents: 800 });
+    await service.evaluateCostEvent(secondWarn);
+
+    const softRows = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "soft"));
+    expect(softRows).toHaveLength(2);
+    const reArmed = softRows.find((row) => row.status === "open")!;
+    expect(reArmed).toMatchObject({ amountLimit: 2000, amountObserved: 1600 });
+    expect(reArmed.id).not.toBe(firstIncident.id);
+
+    const cardsAfterRaise = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cardsAfterRaise).toHaveLength(2);
+    const secondCard = cardsAfterRaise.find((card) => card.id === reArmed.approvalId)!;
+    expect(secondCard).toMatchObject({ type: "budget_override_required", status: "pending" });
+    // The card carries the *new* cap, not the one the board already acted on.
+    expect(secondCard.payload as Record<string, unknown>).toMatchObject({
+      thresholdType: "soft",
+      budgetAmount: 2000,
+      observedAmount: 1600,
+      remainingAmount: 400,
+    });
+
+    // The scope keeps running -- this is still the warn threshold.
+    const [agentRow] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    expect(agentRow).toMatchObject({ status: "active", pauseReason: null });
+
+    // Re-arming must not become re-filing: with nothing changed since the second
+    // card, further evaluations add nothing (BLO-28793's idempotency AC).
+    await service.evaluateCostEvent(secondWarn);
+    await service.evaluateCostEvent(secondWarn);
+    const cardsAfterIdle = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cardsAfterIdle).toHaveLength(2);
+    expect(cardsAfterIdle.filter((card) => card.status === "pending")).toHaveLength(1);
+    const openAfterIdle = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.status, "open"));
+    expect(openAfterIdle).toHaveLength(1);
+    expect(openAfterIdle[0]!.id).toBe(reArmed.id);
+  });
+
+  it("files a card for the second hard wall in a window instead of pausing silently (BLO-28908)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 1000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    // Wall one.
+    const firstWall = await insertCostEvent({ companyId, agentId, costCents: 1000 });
+    await service.evaluateCostEvent(firstWall);
+
+    const firstHard = await db.select().from(budgetIncidents).then((rows) => rows[0]!);
+    expect(firstHard).toMatchObject({ thresholdType: "hard", status: "open", amountLimit: 1000 });
+    const [pausedOnce] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    expect(pausedOnce).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    // The board raises the cap and the scope resumes.
+    await service.resolveIncident(
+      companyId,
+      firstHard.id,
+      { action: "raise_budget_and_resume", amount: 2000, decisionNote: "Raised past the first wall." },
+      "board-user",
+    );
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    // `resumeScopeFromBudget` returns the agent to `idle`, not `active`.
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+
+    // Wall two, same window. This is the case the issue was filed on: the
+    // suppression check matched the resolved first-wall row and returned
+    // `created: false`, while `pauseAndCancelScopeForBudget` -- which is not gated
+    // on the card -- ran anyway. The scope went down with nothing on the board.
+    const secondWall = await insertCostEvent({ companyId, agentId, costCents: 1000 });
+    await service.evaluateCostEvent(secondWall);
+
+    // The invariant, asserted before any row-shape detail because it is the whole
+    // point: no scope is paused for budget without a live card naming the cap it
+    // hit. Read as one state, because either half alone is passable -- a card with
+    // no pause, or the silent pause this fixes.
+    const [pausedTwice] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    const liveCards = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.companyId, companyId));
+    const pendingCards = liveCards.filter((card) => card.status === "pending");
+    expect({
+      agentStatus: pausedTwice?.status,
+      pauseReason: pausedTwice?.pauseReason,
+      pendingCardCount: pendingCards.length,
+    }).toEqual({ agentStatus: "paused", pauseReason: "budget", pendingCardCount: 1 });
+
+    const hardRows = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    expect(hardRows).toHaveLength(2);
+    const secondHard = hardRows.find((row) => row.status === "open")!;
+    expect(secondHard).toMatchObject({ amountLimit: 2000, amountObserved: 2000 });
+    expect(secondHard.id).not.toBe(firstHard.id);
+
+    expect(pendingCards[0]!.id).toBe(secondHard.approvalId);
+    expect(pendingCards[0]!.payload as Record<string, unknown>).toMatchObject({
+      thresholdType: "hard",
+      budgetAmount: 2000,
+      observedAmount: 2000,
+    });
+    expect(cancelWorkForScope).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps dismissed semantics and reports the incident it actually changed (BLO-28908)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 1000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    const wall = await insertCostEvent({ companyId, agentId, costCents: 1000 });
+    await service.evaluateCostEvent(wall);
+    const firstHard = await db.select().from(budgetIncidents).then((rows) => rows[0]!);
+
+    // `keep_paused` dismisses the incident and rejects its card. A dismissed row
+    // never held the suppression slot, and still does not.
+    const dismissed = await service.resolveIncident(
+      companyId,
+      firstHard.id,
+      { action: "keep_paused", decisionNote: "Staying paused." },
+      "board-user",
+    );
+    expect(dismissed).toMatchObject({ status: "dismissed", approvalStatus: "rejected" });
+
+    await service.evaluateCostEvent(wall);
+    const afterDismiss = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.status, "open"));
+    expect(afterDismiss).toHaveLength(1);
+    expect(afterDismiss[0]!.id).not.toBe(firstHard.id);
+
+    // A stale submit against the dismissed incident id. The side effects are
+    // correct -- it resolves whatever is open, resumes the scope, withdraws the
+    // other card -- but the response used to claim it had resolved *this*
+    // incident, which it never touched. It reports the row's real state now.
+    const stale = await service.resolveIncident(
+      companyId,
+      firstHard.id,
+      { action: "raise_budget_and_resume", amount: 3000, decisionNote: "Late raise." },
+      "board-user",
+    );
+    expect(stale).toMatchObject({ id: firstHard.id, status: "dismissed", approvalStatus: "rejected" });
+
+    const [afterStaleRaise] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    expect(afterStaleRaise).toMatchObject({ status: "idle", pauseReason: null });
+    const openAfterStale = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.status, "open"));
+    expect(openAfterStale).toHaveLength(0);
+    const cardsAfterStale = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cardsAfterStale.filter((card) => card.status === "pending")).toHaveLength(0);
+    expect(cardsAfterStale.map((card) => card.status).sort()).toEqual(["rejected", "withdrawn"]);
+  });
 });
