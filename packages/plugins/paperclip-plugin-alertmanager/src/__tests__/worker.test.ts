@@ -1059,6 +1059,393 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// BLO-24177 — a terminal severity never becomes agent-actionable work
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — terminal severities (BLO-24177)", () => {
+  it("creates a severity=none alert already `done` and unassigned, bypassing owner/route resolution", async () => {
+    const { ctx, mocks } = mkCtx();
+    // ownerMap and issueRouteMap both have matching entries — proving the
+    // terminal path skips resolution entirely rather than resolving and
+    // then discarding the result.
+    const config = baseConfig({
+      ownerMap: { alertname: { Watchdog: "agent:c0bccc75-a449-4ece-a789-ce40bdd8e785" } },
+      issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      annotations: {},
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.status).toBe("done");
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+    expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.projectId).toBeUndefined();
+    expect(createArgs.goalId).toBeUndefined();
+    expect(mocks.users.findByEmail).not.toHaveBeenCalled();
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({ assigneeUserId: null, assigneeAgentId: null }),
+    );
+  });
+
+  it("re-fire on an already-done terminal issue only refreshes the description (no reopen)", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-watchdog", status: "done" });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({ description: expect.any(String) }),
+      "company-1",
+    );
+    const updatePatch = mocks.issues.update.mock.calls[0][1];
+    expect(updatePatch.status).toBeUndefined();
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("never re-opens a terminal row when the BLO-24234 suppression window expires", async () => {
+    // Regression guard for the BLO-24177 × BLO-24234 interaction. `decideRefire`
+    // reads any done/cancelled row as an *operator* close, so a terminal row that
+    // had banked a suppression anchor would, once the window lapsed, be re-opened
+    // as `todo` with an "you closed this but it kept firing" comment — silently
+    // re-manufacturing the agent-actionable Watchdog row this feature removes,
+    // ~24h after deploy. The terminal path must bypass that helper entirely.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      // Well past DEFAULT_OPERATOR_SUPPRESSION_HOURS (24).
+      operatorSuppressedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-watchdog", status: "done" });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    // Refreshed as evidence, never re-opened as work.
+    const updatePatch = mocks.issues.update.mock.calls[0][1];
+    expect(updatePatch.status).toBeUndefined();
+    expect(updatePatch.description).toEqual(expect.any(String));
+    expect(mocks.issues.update).not.toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({ status: "todo" }),
+      "company-1",
+    );
+    // No operator-close narrative applies: the plugin closed this row itself.
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    for (const suppressionMetric of [
+      "alertmanager.firing.reopened",
+      "alertmanager.firing.suppression_expired",
+      "alertmanager.firing.suppressed",
+    ]) {
+      expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+        suppressionMetric,
+        expect.any(Number),
+        expect.any(Object),
+      );
+    }
+    // The anchor is dropped rather than carried: a terminal row can never be
+    // operator-suppressed, so leaving it set would re-arm this every window.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+  });
+
+  it("never banks a suppression anchor on a terminal row inside the window", async () => {
+    // Second, independent guard on the same interaction. Even before the window
+    // lapses, routing a terminal row through `decideRefire` would persist an
+    // `operatorSuppressedAt` anchor onto its state record — state that is
+    // meaningless for a row the plugin closes itself, and that is precisely
+    // what the expiry branch later reads to justify a re-open. Pinning it here
+    // means the row never accumulates the input to that decision in the first
+    // place, not merely that the decision is overridden downstream.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      // Well inside DEFAULT_OPERATOR_SUPPRESSION_HOURS (24).
+      operatorSuppressedAt: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(),
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-watchdog", status: "done" });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+    // The delivery is still recorded as evidence, not swallowed as "suppressed".
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({ description: expect.any(String) }),
+      "company-1",
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("converges an assigned non-terminal severity=none row to unassigned `done`", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: "user-watchdog",
+      assigneeAgentId: "agent-watchdog",
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeUserId: "user-watchdog",
+      assigneeAgentId: "agent-watchdog",
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        status: "done",
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({ assigneeUserId: null, assigneeAgentId: null }),
+    );
+    // Not the reopen path — that metric is reserved for the resolvedAt=>done=>todo flow.
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("returns an auto-cancelled terminal issue to `done` on re-fire", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: "2026-04-29T09:00:00Z",
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "cancelled",
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        status: "done",
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({ resolvedAt: null }),
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("recovers a done terminal issue after state loss instead of creating a duplicate", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    mocks.state.get.mockResolvedValueOnce(null);
+    mocks.issues.list.mockResolvedValueOnce([
+      {
+        id: "issue-watchdog",
+        status: "done",
+        assigneeUserId: "user-watchdog",
+        assigneeAgentId: "agent-watchdog",
+      },
+    ]);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "done",
+      assigneeUserId: "user-watchdog",
+      assigneeAgentId: "agent-watchdog",
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      originKind: ORIGIN_KIND,
+      originId: "watchdog-1",
+      limit: 1,
+    });
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({
+        paperclipIssueId: "issue-watchdog",
+        assigneeUserId: null,
+        assigneeAgentId: null,
+      }),
+    );
+  });
+
+  it("fails the delivery when terminal convergence cannot clear the assignee", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-watchdog",
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeAgentId: "agent-watchdog",
+    });
+    mocks.issues.update.mockRejectedValueOnce(new Error("issues.update unavailable"));
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.state.set).not.toHaveBeenCalled();
+  });
+
+  it("honors an operator override list in place of the default", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ terminalSeverities: ["debug"] });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    // Override replaces the default list, so "none" is no longer terminal —
+    // falls through to the ordinary create path (status left to routing/default).
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.status).toBeUndefined();
+  });
+});
+
 describe("handleWebhook — resolved", () => {
   it("posts a comment when autoCloseOnResolve=false", async () => {
     const { ctx, mocks } = mkCtx();

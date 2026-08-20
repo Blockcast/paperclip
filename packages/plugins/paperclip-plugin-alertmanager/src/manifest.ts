@@ -2,6 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import {
   DEFAULT_SEVERITY_TO_PRIORITY,
   DEFAULT_ESCALATION_DEADLINE_MINUTES,
+  DEFAULT_TERMINAL_SEVERITIES,
   PLUGIN_ID,
   PLUGIN_VERSION,
   WEBHOOK_KEYS,
@@ -147,6 +148,14 @@ const manifest: PaperclipPluginManifestV1 = {
           "Delay before an unresolved alert climbs the reportsTo chain. Defaults: critical=30, warning=240.",
         default: DEFAULT_ESCALATION_DEADLINE_MINUTES,
         additionalProperties: { type: "number", minimum: 1 },
+      },
+      terminalSeverities: {
+        type: "array",
+        title: "Never-actionable severities (BLO-24177)",
+        description:
+          "Severities (case-insensitive) that never produce agent-actionable work — e.g. Prometheus's always-firing `Watchdog` dead-man's-switch heartbeat (severity=none). A matching alert's issue is created/kept `done` with no assignee, skipping owner-map and issue-route resolution entirely, while still being created/refreshed on every re-fire so it stays available as delivery-path evidence.",
+        default: DEFAULT_TERMINAL_SEVERITIES,
+        items: { type: "string" },
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint

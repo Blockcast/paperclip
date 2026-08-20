@@ -111,6 +111,16 @@ export const DEFAULT_OPERATOR_SUPPRESSION_HOURS = 24;
  */
 export const MAX_OPERATOR_SUPPRESSION_HOURS = 24 * 30;
 
+/**
+ * Default severities (BLO-24177) that never produce agent-actionable work.
+ * `none` is Prometheus's convention for the always-firing `Watchdog` alert
+ * (`vector(1)`) used as a dead-man's-switch heartbeat — it is designed to
+ * fire forever, so a normal `todo` issue for it can never be legitimately
+ * resolved and just recirculates through stranded-issue recovery. Operators
+ * can override via `config.terminalSeverities`.
+ */
+export const DEFAULT_TERMINAL_SEVERITIES: string[] = ["none"];
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {
@@ -264,6 +274,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
+  terminalSeverities: DEFAULT_TERMINAL_SEVERITIES,
 };
 
 /**
