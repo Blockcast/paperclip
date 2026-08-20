@@ -10,8 +10,17 @@
 image:
   repository: harbor.blockcast.net/paperclip/paperclip
   tag: sha-d1409bf-k8s-vendored
-  pullPolicy: Always
   # Bump this to the kkroo image tag built from this repo when deploying.
+  #
+  # Empty = derive the policy from whether the image is digest-pinned; see
+  # `paperclip.imagePullPolicy` in templates/_helpers.tpl for the reasoning.
+  # Every CI deploy path in .github/workflows/docker.yml passes
+  # `--set-string image.digest=sha256:...`, so production renders IfNotPresent
+  # and a pod restart on a node that already holds that digest no longer needs
+  # Harbor to be serving auth. A manual `helm upgrade` that passes no digest
+  # still renders Always, so the mutable `sha-` tag above keeps being
+  # re-resolved. Do not hardcode `Always` back here — BLO-29306.
+  pullPolicy: ""
 
 imagePullSecrets:
   - name: registry-blockcast-net-pull

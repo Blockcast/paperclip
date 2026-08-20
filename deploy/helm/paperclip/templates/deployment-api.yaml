@@ -175,7 +175,7 @@ spec:
       containers:
         - name: paperclip
           image: {{ include "paperclip.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "paperclip.imagePullPolicy" . }}
           securityContext:
             {{- toYaml .Values.pod.containerSecurityContext | nindent 12 }}
           workingDir: /app
