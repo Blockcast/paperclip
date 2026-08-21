@@ -1340,3 +1340,112 @@ describe("argv redaction inside a container list (PEN-2431 door #5)", () => {
     expect(out).not.toContain(REDACTED);
   });
 });
+
+/**
+ * The two paths must agree on the DEFAULT DIRECTION, not just on a key list.
+ *
+ * Every fail-open in this series has been a spelling some enumeration missed,
+ * landing on a branch that emitted rather than redacted. The YAML in-block
+ * scanner is default-deny, so it caught those by construction. The JSON path's
+ * env-entry branch was default-ALLOW — `if (!("value" in envVar)) return envVar`
+ * — so the identical logical input was redacted by one path and emitted in the
+ * clear by the other.
+ *
+ * Each case below is therefore asserted on BOTH paths from the same logical
+ * input. A one-sided test is what let this survive: the JSON path had tests, and
+ * they all passed, because they only ever fed it the canonical spelling.
+ */
+describe("the two paths must agree on what an env ENTRY is", () => {
+  for (const key of ["Value", "VALUE", "val", "values", "value "]) {
+    it(`redacts an env entry whose value key is ${JSON.stringify(key)} — JSON path`, () => {
+      const out = JSON.stringify(scrubJsonValue({ env: [{ name: "OPENAI_API_KEY", [key]: LEAK }] }));
+
+      expectNoLeak(out);
+      // The name is the diagnostic the grant exists for.
+      expect(out).toContain("OPENAI_API_KEY");
+    });
+
+    it(`redacts an env entry whose value key is ${JSON.stringify(key)} — YAML path`, () => {
+      const out = scrubYamlText(`    env:\n    - name: OPENAI_API_KEY\n      ${key}: ${LEAK}\n`);
+
+      expectNoLeak(out);
+      expect(out).toContain("OPENAI_API_KEY");
+    });
+  }
+
+  it("classifies a valueFrom subtree on the JSON path rather than trusting it", () => {
+    // A scalar leaf smuggled alongside a legitimate selector. The YAML path
+    // already classified this subtree; the JSON path passed it through whole.
+    const out = JSON.stringify(
+      scrubJsonValue({
+        env: [{ name: "A", valueFrom: { secretKeyRef: { name: "s", key: "k" }, sneak: LEAK } }],
+      }),
+    );
+
+    expectNoLeak(out);
+  });
+
+  it("keeps every EnvVarSource selector intact on the JSON path — no over-redaction", () => {
+    // The mirror of the above: default-deny must not cost the reference itself,
+    // which names a source without carrying it and is the diagnostic payload.
+    const out = JSON.stringify(
+      scrubJsonValue({
+        env: [
+          { name: "A", valueFrom: { secretKeyRef: { name: "s", key: "k", optional: true } } },
+          { name: "B", valueFrom: { fieldRef: { apiVersion: "v1", fieldPath: "metadata.name" } } },
+          {
+            name: "C",
+            valueFrom: { resourceFieldRef: { containerName: "app", resource: "limits.cpu" } },
+          },
+        ],
+      }),
+    );
+
+    expect(out).not.toContain(REDACTED);
+    expect(out).toContain('"fieldPath":"metadata.name"');
+    expect(out).toContain('"resource":"limits.cpu"');
+    expect(out).toContain('"optional":true');
+  });
+});
+
+/**
+ * Lines that end the env block from *inside* it.
+ *
+ * `continuesBlock` runs before the in-block scanner, so a line that ends the
+ * block is never classified by it: every `value:` after such a line missed the
+ * default-redact entirely. Neither shape below has to be adjacent to the value
+ * it exposes.
+ */
+describe("scrubYamlText — block termination cannot be induced from inside", () => {
+  it("holds the env block open across a comment at column 0", () => {
+    // YAML comments may sit at any column. Indentation is not structural for
+    // them, so treating one as a sibling key ended the block mid-entry.
+    const out = scrubYamlText(
+      `    env:\n    - name: OPENAI_API_KEY\n# an unindented comment\n      value: ${LEAK}\n`,
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+    // The comment itself carries nothing and stays, keeping output readable.
+    expect(out).toContain("# an unindented comment");
+  });
+
+  it("holds the env block open across a tab-indented line", () => {
+    // `leadingIndent` counts spaces, so a tab measured as indent 0. YAML forbids
+    // tabs in indentation, so this is never a legitimate sibling key.
+    const out = scrubYamlText(`    env:\n    - name: OPENAI_API_KEY\n\t  value: ${LEAK}\n`);
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+  });
+
+  it("still ends the block at a real sibling key that follows a comment", () => {
+    // The fail-closed widening must not swallow the rest of the container spec.
+    const out = scrubYamlText(
+      `    env:\n    - name: A\n      value: ${LEAK}\n# a comment\n    image: ghcr.io/example/app:v1\n`,
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("image: ghcr.io/example/app:v1");
+  });
+});

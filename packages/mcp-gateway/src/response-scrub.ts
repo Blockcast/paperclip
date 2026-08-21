@@ -209,13 +209,43 @@ function isBlank(line: string): boolean {
  * the first entry. A line at the block indent continues the block only when it
  * opens a sequence entry; anything else at that indent or shallower is a
  * sibling key and ends it.
+ *
+ * Two shapes are held INSIDE the block regardless of their indentation, because
+ * for both of them "indentation" is not the structural signal it looks like:
+ *
+ * - **A comment line.** YAML comments may sit at any column, including column 0
+ *   in the middle of a nested block. Letting one end the block meant the `value:`
+ *   lines *after* it missed the in-block default-redact and printed in the clear
+ *   — the comment did not have to be adjacent to the value, and a comment carries
+ *   no material of its own, so there is no cost to keeping it in.
+ * - **A tab-indented line.** `leadingIndent` counts spaces, so a line indented
+ *   with a tab measured as indent 0 and ended the block from *inside* it. YAML
+ *   forbids tabs in indentation outright, so such a line is never a legitimate
+ *   sibling key; holding it in the block hands it to the default-deny scanner,
+ *   which is the fail-closed direction. (The in-block patterns are `\s`-based and
+ *   match it, so it is classified rather than merely swallowed.)
+ *
+ * Both were reachable from inside an open env block, which is what made them
+ * fail-opens rather than cosmetic: the guard runs *before* the in-block scanner,
+ * so a line that ends the block is never classified by it.
  */
 function continuesBlock(line: string, blockIndent: number): boolean {
   if (isBlank(line)) return true;
+  if (COMMENT_LINE.test(line)) return true;
+  if (hasTabIndent(line)) return true;
   const indent = leadingIndent(line);
   if (indent > blockIndent) return true;
   if (indent < blockIndent) return false;
   return line.slice(indent).startsWith("- ");
+}
+
+/** A line whose leading whitespace contains a tab — illegal YAML indentation. */
+function hasTabIndent(line: string): boolean {
+  for (const ch of line) {
+    if (ch === "\t") return true;
+    if (ch !== " ") return false;
+  }
+  return false;
 }
 
 /**
@@ -268,22 +298,30 @@ const VALUE_FROM_KEY = /^(\s*)(-\s+)?(["']?)valueFrom\3:(.*)$/;
  * module argues against: `EnvVarSource` is closed by the Kubernetes schema, so
  * this is the same closed-allowlist argument the env block itself rests on, and
  * `value` is deliberately absent from it.
+ *
+ * Declared once and consumed by *both* scanners — the YAML `REF_SUBTREE_KEY`
+ * pattern below and the JSON `scrubEnvVarSource` walk. Two hand-maintained
+ * copies of a closed allowlist are the "two paths must agree" failure with extra
+ * steps: whichever copy is not updated becomes the fail-open, and it fails open
+ * silently because the other path's tests still pass.
  */
+const ENV_VAR_SOURCE_KEYS = [
+  "configMapKeyRef",
+  "fieldRef",
+  "resourceFieldRef",
+  "secretKeyRef",
+  "name",
+  "key",
+  "optional",
+  "apiVersion",
+  "fieldPath",
+  "containerName",
+  "resource",
+  "divisor",
+] as const;
+
 const REF_SUBTREE_KEY = new RegExp(
-  `^(\\s*)(-\\s+)?(["']?)(${[
-    "configMapKeyRef",
-    "fieldRef",
-    "resourceFieldRef",
-    "secretKeyRef",
-    "name",
-    "key",
-    "optional",
-    "apiVersion",
-    "fieldPath",
-    "containerName",
-    "resource",
-    "divisor",
-  ].join("|")})\\3:(.*)$`,
+  `^(\\s*)(-\\s+)?(["']?)(${ENV_VAR_SOURCE_KEYS.join("|")})\\3:(.*)$`,
 );
 /** A sequence entry's `- ` introducer, and a dash with nothing after it. */
 const SEQUENCE_DASH = /^\s*(-\s+)/;
@@ -789,6 +827,76 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
 }
 
 /**
+ * Redact one `EnvVar` object on the JSON path, default-deny.
+ *
+ * THE RULE: `name` passes, `valueFrom` is classified by `scrubEnvVarSource`,
+ * and **every other key is redacted** — including `value`, whatever its case or
+ * spelling. This mirrors the YAML in-block scanner exactly, which is the point:
+ * the two paths must agree on the *default direction*, not merely on a list of
+ * recognized keys.
+ *
+ * What this replaced was `if (!("value" in envVar)) return envVar` — an
+ * exact-spelling, exact-case membership test whose miss branch was
+ * PASS-THROUGH. So the JSON path was default-allow while the YAML path was
+ * default-deny, and every spelling outside the literal `value` walked through in
+ * the clear: `Value`, `VALUE`, `val`, `values`, `"value "`. Measured at
+ * `6827796` before this change, each of those leaked on the JSON path and was
+ * redacted on the YAML path from the identical logical input — so the disagreement
+ * was not theoretical, and the JSON path (which exists so an upstream shape
+ * change cannot silently turn the scrubber into a no-op) was the weaker of the
+ * two at exactly the job it was added to do.
+ *
+ * Default-deny costs nothing diagnostically here: `EnvVar` is closed by the
+ * Kubernetes schema to `name`/`value`/`valueFrom`, so a fourth key is an
+ * upstream shape change or an attempt to smuggle material past the scanner —
+ * both safer redacted than emitted.
+ */
+function scrubEnvVarObject(envVar: Record<string, unknown>, ctx: ScrubContext): unknown {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(envVar)) {
+    const lowered = key.toLowerCase();
+    if (lowered === "name") {
+      result[key] = value;
+      continue;
+    }
+    if (lowered === "valuefrom" && value && typeof value === "object") {
+      result[key] = scrubEnvVarSource(value, ctx);
+      continue;
+    }
+    result[key] = REDACTED;
+    ctx.changed = true;
+  }
+  return result;
+}
+
+/**
+ * Classify a `valueFrom` subtree on the JSON path rather than trusting it.
+ *
+ * `valueFrom` names a source without carrying it, so the *reference* must
+ * survive — losing it would remove the diagnostic the grant exists for. But the
+ * generic recursion passed the whole subtree through unclassified, so an extra
+ * scalar leaf smuggled alongside a legitimate `secretKeyRef` was emitted in the
+ * clear. The YAML path already classifies this subtree against the same closed
+ * allowlist and redacts unrecognized keys ("classified, not trusted"); this is
+ * that rule, on the other path.
+ */
+function scrubEnvVarSource(node: unknown, ctx: ScrubContext): unknown {
+  if (Array.isArray(node)) return node.map((n) => scrubEnvVarSource(n, ctx));
+  if (!node || typeof node !== "object") return node;
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    const allowed = ENV_VAR_SOURCE_KEYS.some((k) => k.toLowerCase() === key.toLowerCase());
+    if (!allowed) {
+      result[key] = REDACTED;
+      ctx.changed = true;
+      continue;
+    }
+    result[key] = value && typeof value === "object" ? scrubEnvVarSource(value, ctx) : value;
+  }
+  return result;
+}
+
+/**
  * Redact env values in a structurally-parsed JSON resource.
  *
  * The k8s MCP servers currently emit YAML, but the format is theirs to change
@@ -873,10 +981,7 @@ function scrubJsonValueTracked(
           return REDACTED;
         }
         const envVar = entry as Record<string, unknown>;
-        // Preserve `name` and any `valueFrom` reference; drop only the literal.
-        if (!("value" in envVar)) return envVar;
-        ctx.changed = true;
-        return { ...envVar, value: REDACTED };
+        return scrubEnvVarObject(envVar, ctx);
       });
       continue;
     }
