@@ -5860,17 +5860,23 @@ export function recoveryService(
       // assignee-execution population only; whether an `in_review` dependency wait
       // should also stop escalating is a separate question that needs its own evidence.
       //
-      // `recoveryOwnerAgentId == null` is that exclusion stated exactly, and it is
-      // narrower than the `previousStatus !== "in_review"` proxy it replaces. All five
-      // review-participant sites pass `recoveryOwnerAgentId: participantAgentId`, which
-      // the guard at the top of the `issue.status === "in_review"` block has already
-      // narrowed to a non-null string — so every one of them still escalates. No
-      // assignee-lane site passes the field at all. The status proxy also exempted the
-      // three assignee-lane sites that forward `previousStatus: issue.status`, and
-      // `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so an `in_review`
-      // issue with a non-pending execution state reaching the non_retryable branch was
-      // still escalating into the empty-blocker-set `blocked` state this gate exists to
-      // prevent — the measured 24/24 outcome, on the population the measurement covers.
+      // `recoveryOwnerAgentId == null` is that exclusion stated exactly, rather than
+      // proxied through `previousStatus !== "in_review"`. All five review-participant sites
+      // pass `recoveryOwnerAgentId: participantAgentId`, which the guard at the top of the
+      // `issue.status === "in_review"` block has already narrowed to a non-null string; no
+      // assignee-lane site passes the field at all. The status proxy was broader than its
+      // own justification: three assignee-lane sites forward `previousStatus: issue.status`
+      // and `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so it exempted
+      // them too.
+      //
+      // The two predicates are not currently distinguishable in practice. BLO-19123's F2
+      // (`3830d7bc`) added an earlier arm keyed on `errorCode === DEPENDENCY_BLOCKED &&
+      // (status === "in_review" || !agentInvokable)` that `continue`s before this gate is
+      // reached, so no `in_review` strand of either lane arrives here. This gate therefore
+      // covers the remaining and much larger population: `todo`/`in_progress` issues with
+      // an invokable assignee, which that arm does not match. The exact form is kept
+      // regardless — it states the intent instead of encoding an assumption about an
+      // upstream arm that may later narrow.
       if (input.recoveryOwnerAgentId == null && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
         // Diagnostic only, but worth the lock-held round-trip: `isDependencyReady`
         // is what separates a still-blocked wait from the defect-shaped

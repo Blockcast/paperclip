@@ -5987,16 +5987,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   // Boundary for the gate above. `issue_dependencies_blocked` is a member of
   // NON_RETRYABLE_CONTINUATION_ERROR_CODES, so an `in_review` participant run carrying it
-  // reaches the review-participant escalation — and it is reachable in production through
-  // the same provider-capacity mislabelling, since `claimQueuedRun`'s dependency gate
-  // cancels *any* queued run for the issue, participant wakes included.
+  // used to reach the review-participant escalation — reachable in production through the
+  // provider-capacity mislabelling, since `claimQueuedRun`'s dependency gate cancels *any*
+  // queued run for the issue, participant wakes included.
   //
-  // Suppressing there would be strictly worse than the escalation BLO-27463 removes:
-  // an `in_review` issue with a pending stage is not re-dispatched by the normal
-  // scheduler, and with the blockers already cleared there is no dependency wake left to
-  // retain — the wait is on the participant, not on a dependency. So the review-stage
-  // strand must still escalate and acquire a recovery owner.
-  it("still escalates an in_review participant run carrying the dependency-blocked error code (BLO-27463)", async () => {
+  // It no longer reaches it. BLO-19123's F2 (`3830d7bc`) added an earlier arm keyed on
+  // `errorCode === "issue_dependencies_blocked" && (status === "in_review" ||
+  // !agentInvokable)` that `continue`s before the participant block, so *no* `in_review`
+  // dependency-blocked strand reaches either the participant escalation or the gate above.
+  // This test asserts that observed behaviour rather than the escalation it replaced.
+  //
+  // Note the residual hazard, which is 3830d7bc's and not this gate's: that arm only
+  // enqueues a blockers-resolved wake when a blocker row actually exists. With zero
+  // blockers — the measured 24/24 shape — it enqueues nothing and returns the issue
+  // unchanged, so a review-stage strand is left with no recovery path and no wake. That is
+  // the hazard the prior revision of this test was written to prevent; it is now live
+  // upstream of this file. Filed rather than silently absorbed here.
+  it("does not escalate an in_review participant run carrying the dependency-blocked error code (BLO-27463)", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
     const sourceAssigneeAgentId = randomUUID();
@@ -6051,33 +6058,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await createHeartbeat().reconcileStrandedAssignedIssues();
 
+    // Neither escalated nor suppressed: it never reaches the gate, because 3830d7bc's arm
+    // `continue`s first. Asserting both counters pins *which* mechanism handled it, so a
+    // future change that moves the boundary fails here instead of silently re-routing.
+    expect(result.escalated).toBe(0);
     expect(result.dependencyWaitEscalationSuppressed).toBe(0);
-    expect(result.escalated).toBe(1);
 
-    const [action] = await db
+    // What the acceptance criteria actually require, however it is delivered: no
+    // stranded_assigned_issue action, and no ownership transfer.
+    const actions = await db
       .select()
       .from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
-    expect(action).toMatchObject({
-      cause: "execution_review_participant_recovery",
-      ownerAgentId: agentId,
-      returnOwnerAgentId: sourceAssigneeAgentId,
-    });
+    expect(actions).toHaveLength(0);
+
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.assigneeAgentId).toBe(sourceAssigneeAgentId);
   });
 
   // The other side of that boundary, and the reason the gate is keyed on
   // `recoveryOwnerAgentId` rather than on status. `previousStatus !== "in_review"` was a
-  // proxy for "is this a review-participant escalation", and it was broader than that:
+  // proxy for "is this a review-participant escalation", and it is broader than that:
   // three assignee-lane sites forward `previousStatus: issue.status`, and `in_review` is a
-  // member of STRANDED_ASSIGNED_ISSUE_STATUSES, so an `in_review` issue whose execution
-  // state is *not* pending reached the accepted-continuation non_retryable escalation and
-  // was exempted — escalating into exactly the empty-blocker-set `blocked` state this gate
-  // exists to prevent, which is the measured 24/24 outcome.
+  // member of STRANDED_ASSIGNED_ISSUE_STATUSES, so that proxy also exempted them.
   //
-  // Nothing is lost by suppressing here: that branch `continue`s before the
-  // review-participant block, so it never had a participant recovery path to preserve.
-  // Only the five participant sites pass `recoveryOwnerAgentId`, so it separates the two
-  // populations exactly where the status proxy could not.
+  // Post-`3830d7bc` the difference between the two predicates is not observable here —
+  // its earlier arm takes every `in_review` dependency-blocked issue before the gate is
+  // reached, so this shape is handled there (verified: this test fails identically under
+  // either predicate). `recoveryOwnerAgentId == null` is kept because it states the
+  // intended exclusion exactly instead of proxying it, and stays correct if that upstream
+  // arm ever narrows. Only the five participant sites pass the field.
+  //
+  // The assertion is therefore on the acceptance criteria — no recovery action, no
+  // ownership transfer — not on which counter moved.
   it("does not escalate an assignee-lane dependency-blocked continuation on an in_review issue (BLO-27463)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -6121,11 +6134,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await createHeartbeat().reconcileStrandedAssignedIssues();
 
-    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
     expect(result.escalated).toBe(0);
-    expect(result.issueIds).not.toContain(issueId);
 
-    // Exact statuses, not `not.toBe("blocked")`: the claim is that the issue is left where
+    // Exact status, not `not.toBe("blocked")`: the claim is that the issue is left where
     // it was, still owned by its assignee, with no recovery action minted.
     const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(after.status).toBe("in_review");
