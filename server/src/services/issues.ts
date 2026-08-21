@@ -3868,6 +3868,16 @@ export async function listBlockedIssueAutoResumeSuppressions(
  * `listBlockedIssueAutoResumeSuppressions`) so the eager path and the sweep
  * can never drift apart. `blocked` -> `todo` matches BLO-21523's accepted
  * safe default.
+ *
+ * Runs the readiness/suppression read and the flip in ONE transaction with the
+ * candidate rows and their current blockers locked `FOR UPDATE`, mirroring
+ * `stranded-blocked-issue-reconciler.ts`'s `lockCandidatesAndCurrentBlockers`.
+ * A write-time `status = 'blocked'` re-check alone is NOT sufficient here:
+ * adding a blocker edge does not change `status`, so an issue re-blocked
+ * between an unlocked read and the write is still `blocked` at write time, the
+ * guard stays true, and the flip lands `todo` on a genuinely blocked row. That
+ * state is self-permanent, because the phase-1 sweep only moves
+ * `blocked` -> `todo` and would never repair it.
  */
 export async function recomputeBlockedIssuesStatusIfReady(
   dbOrTx: Db,
@@ -3878,32 +3888,92 @@ export async function recomputeBlockedIssuesStatusIfReady(
   const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
   if (uniqueIssueIds.length === 0) return [];
 
-  const [readinessMap, suppressions] = await Promise.all([
-    listIssueDependencyReadinessMap(dbOrTx, companyId, uniqueIssueIds),
-    listBlockedIssueAutoResumeSuppressions(dbOrTx, companyId, uniqueIssueIds, options),
-  ]);
+  const flippedIds = await dbOrTx.transaction(async (tx) => {
+    // Lock the candidates, then their blocker rows. Relation writers lock the
+    // dependent before mutating its `blockedBy` edges, so once the candidates
+    // are locked the blocker set is stable; re-read it afterwards to catch a
+    // relation that committed immediately before the lock, and lock any newly
+    // visible blocker before the readiness check below.
+    await lockIssuesForUpdate(tx, uniqueIssueIds);
+    const initialBlockerIds = await listCurrentBlockerIssueIdsFor(tx, companyId, uniqueIssueIds);
+    const lockedIds = new Set([...uniqueIssueIds, ...initialBlockerIds]);
+    await lockIssuesForUpdate(tx, initialBlockerIds);
+    const currentBlockerIds = await listCurrentBlockerIssueIdsFor(tx, companyId, uniqueIssueIds);
+    await lockIssuesForUpdate(tx, currentBlockerIds.filter((id) => !lockedIds.has(id)));
 
-  const eligibleIds = uniqueIssueIds.filter((issueId) => {
-    const readiness = readinessMap.get(issueId);
-    return readiness?.isDependencyReady === true && !suppressions.has(issueId);
+    const [readinessMap, suppressions] = await Promise.all([
+      listIssueDependencyReadinessMap(tx, companyId, uniqueIssueIds),
+      listBlockedIssueAutoResumeSuppressions(tx, companyId, uniqueIssueIds, options),
+    ]);
+
+    const eligibleIds = uniqueIssueIds.filter((issueId) => {
+      const readiness = readinessMap.get(issueId);
+      return readiness?.isDependencyReady === true && !suppressions.has(issueId);
+    });
+    if (eligibleIds.length === 0) return [];
+
+    const flipped = await tx
+      .update(issues)
+      .set({ status: "todo", updatedAt: new Date() })
+      .where(
+        and(
+          inArray(issues.id, eligibleIds),
+          eq(issues.companyId, companyId),
+          eq(issues.status, "blocked"),
+        ),
+      )
+      .returning({ id: issues.id, identifier: issues.identifier });
+    return flipped;
   });
-  if (eligibleIds.length === 0) return [];
 
-  // Re-checks `status = 'blocked'` at write time, same as the reconciler —
-  // a concurrent writer that already moved the issue off `blocked` (or
-  // re-blocked it) since the readiness read above is skipped, not clobbered.
-  const flipped = await dbOrTx
-    .update(issues)
-    .set({ status: "todo", updatedAt: new Date() })
+  if (flippedIds.length > 0) {
+    // The sweep logs its flips; without this an eager flip leaves no trace on
+    // the issue or in the logs, making it impossible to attribute which
+    // mechanism drained a given row (BLO-21523's before/after verification).
+    logger.info(
+      {
+        companyId,
+        triggerPath: options.triggerPath ?? "eager_status_recompute",
+        reconciled: flippedIds.length,
+        sample: flippedIds.slice(0, 10).map((row) => row.identifier ?? row.id),
+      },
+      "eager status recompute flipped blocked issues with zero unresolved blockers to todo (BLO-21523)",
+    );
+  }
+  return flippedIds.map((row) => row.id);
+}
+
+/** `SELECT ... FOR UPDATE` over `issueIds`, ordered by id to avoid deadlocks. */
+async function lockIssuesForUpdate(dbOrTx: Pick<Db, "execute">, issueIds: string[]): Promise<void> {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))].sort();
+  if (uniqueIssueIds.length === 0) return;
+  await dbOrTx.execute(sql`
+    SELECT ${issues.id}
+    FROM ${issues}
+    WHERE ${inArray(issues.id, uniqueIssueIds)}
+    ORDER BY ${issues.id}
+    FOR UPDATE
+  `);
+}
+
+/** Distinct blocker issue ids currently blocking any of `dependentIssueIds`. */
+async function listCurrentBlockerIssueIdsFor(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  dependentIssueIds: string[],
+): Promise<string[]> {
+  if (dependentIssueIds.length === 0) return [];
+  const rows = await dbOrTx
+    .select({ blockerIssueId: issueRelations.issueId })
+    .from(issueRelations)
     .where(
       and(
-        inArray(issues.id, eligibleIds),
-        eq(issues.companyId, companyId),
-        eq(issues.status, "blocked"),
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.relatedIssueId, dependentIssueIds),
       ),
-    )
-    .returning({ id: issues.id });
-  return flipped.map((row) => row.id);
+    );
+  return [...new Set(rows.map((row) => row.blockerIssueId))];
 }
 
 /**

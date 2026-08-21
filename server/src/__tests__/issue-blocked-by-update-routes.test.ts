@@ -263,5 +263,46 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(await statusOf(dependentId)).toBe("blocked");
   });
+
+  // BLO-21523 phase 2 regression guard. The eager recompute must fire only on
+  // a real blocker-edge write. An issue with no blocker edges is always
+  // dependency-ready, so gating the recompute on the broader *wake* condition
+  // (which also fires on a transition *into* blocked, and on reassignment)
+  // would flip these rows straight back to `todo` — making `blocked`
+  // unsettable via this route and contradicting the 200 the caller just got.
+  // This is the dominant legitimate pattern: "blocked on a human / external
+  // gate" carries no issue-to-issue edge by construction.
+
+  it("setting status blocked on an issue with no blocker edges leaves it blocked", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const issueId = await seedIssue(companyId, prefix, 70, "Blocked on a human gate");
+    const app = createApp(companyId);
+
+    const blocked = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+    expect(blocked.status, JSON.stringify(blocked.body)).toBe(200);
+    expect(blocked.body.status).toBe("blocked");
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(await statusOf(issueId)).toBe("blocked");
+  });
+
+  it("reassigning a blocked issue that has an unresolved blocker leaves it blocked", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockerA = await seedIssue(companyId, prefix, 80, "Blocker A");
+    const dependentId = await seedIssue(companyId, prefix, 81, "Dependent issue", { status: "blocked" });
+    const app = createApp(companyId);
+
+    await db
+      .insert(issueRelations)
+      .values({ companyId, issueId: blockerA, relatedIssueId: dependentId, type: "blocks" });
+
+    const reassigned = await request(app)
+      .patch(`/api/issues/${dependentId}`)
+      .send({ assigneeAgentId: null });
+    expect(reassigned.status, JSON.stringify(reassigned.body)).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(await statusOf(dependentId)).toBe("blocked");
+  });
 });
 

@@ -11259,17 +11259,21 @@ export function issueRoutes(
         }
       }
 
-      // BLO-21523 phase 2: same trigger condition the wake below uses, minus
-      // the assignee requirement — clearing this issue's own last blocker
-      // (via `blockedByIssueIds`) must recompute its `status` even when it
-      // has no assignee yet to wake.
+      // BLO-21523 phase 2: clearing this issue's own last blocker (via
+      // `blockedByIssueIds`) must recompute its `status` even when it has no
+      // assignee yet to wake.
+      //
+      // Gated on an actual blocker-edge write, NOT on the broader wake
+      // condition below. The wake's other two disjuncts are not blocker
+      // transitions: `existing.status !== "blocked"` fires on a transition
+      // *into* blocked, and the assignee comparison fires on reassignment.
+      // Since an issue with no blocker edges is always dependency-ready,
+      // reusing them here would flip a bare `PATCH {status: "blocked"}` — the
+      // common "blocked on a human/external gate" escalation, which carries no
+      // edges by construction — straight back to `todo`, contradicting the
+      // 200 the caller just received and making `blocked` unsettable.
       const statusRecomputeCandidate =
-        issue.status === "blocked" &&
-        (
-          existing.status !== "blocked" ||
-          Array.isArray(req.body.blockedByIssueIds) ||
-          existing.assigneeAgentId !== issue.assigneeAgentId
-        );
+        issue.status === "blocked" && Array.isArray(req.body.blockedByIssueIds);
       if (statusRecomputeCandidate) {
         try {
           await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, [issue.id], {
@@ -11280,7 +11284,14 @@ export function issueRoutes(
         }
       }
 
-      const restoredBlockedReadyDependency = statusRecomputeCandidate && issue.assigneeAgentId;
+      const restoredBlockedReadyDependency =
+        issue.status === "blocked" &&
+        (
+          existing.status !== "blocked" ||
+          Array.isArray(req.body.blockedByIssueIds) ||
+          existing.assigneeAgentId !== issue.assigneeAgentId
+        ) &&
+        issue.assigneeAgentId;
       if (restoredBlockedReadyDependency && typeof dependencyReadinessSvc.getDependencyReadiness === "function") {
         const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
