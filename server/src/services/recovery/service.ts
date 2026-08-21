@@ -5812,12 +5812,11 @@ export function recoveryService(
         }
       } else if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
 
-      const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
-      const mutationDb = input.expectedReviewStage ? tx : db;
-      // BLO-27463: a terminal `issue_dependencies_blocked` run is a *wait state*,
-      // never a stranded execution path (see DEPENDENCY_BLOCKED_ERROR_CODE), so it
-      // must not open a stranded_assigned_issue action or move ownership up the org
-      // chain — regardless of whether the blockers have since cleared.
+      // BLO-27463: a terminal `issue_dependencies_blocked` run on the *assignee's own
+      // execution* is a wait state, never a stranded execution path (see
+      // DEPENDENCY_BLOCKED_ERROR_CODE), so it must not open a stranded_assigned_issue
+      // action or move ownership up the org chain — regardless of whether the blockers
+      // have since cleared.
       //
       // This previously only refused escalation while the issue was *still* not
       // dependency-ready. That predicate cannot fire on the population that actually
@@ -5834,10 +5833,31 @@ export function recoveryService(
       // infra-class and equally non-escalating. Refusing on the error code covers both
       // populations at the single gate every escalation caller passes through.
       //
-      // Skipping is safe for the dependency-ready case because the issue is left in a
-      // dispatchable status for the normal scheduler, and for the still-blocked case
-      // because it retains its edge-triggered dependency-resolved wake.
-      if (input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+      // Skipping is safe for that population two ways: a dependency-ready issue is left
+      // in a dispatchable status for the normal scheduler, and a still-blocked one
+      // retains its edge-triggered dependency-resolved wake.
+      //
+      // `previousStatus === "in_review"` is deliberately excluded, because neither of
+      // those safety arguments holds for a review-stage strand. Four of the five
+      // review-participant call sites below reach here with a *terminal participant
+      // run*, and because DEPENDENCY_BLOCKED_ERROR_CODE is a member of
+      // NON_RETRYABLE_CONTINUATION_ERROR_CODES the non-retryable branch catches it
+      // first. An `in_review` issue with a pending stage is not re-dispatched by the
+      // normal scheduler; and when its blockers have already cleared there is no
+      // dependency wake left to retain, because the wait is on the *participant*, not
+      // on a dependency. On the `!agentInvokable` branch the participant provably
+      // cannot be invoked, so suppressing here would leave the stage with no recovery
+      // path at all, silently re-skipped every sweep — strictly worse than the
+      // escalation this gate removes, and reachable in production because
+      // `claimQueuedRun`'s dependency gate cancels *any* queued run for the issue,
+      // participant wakes included. The measurement above covers the
+      // assignee-execution population only; whether an `in_review` dependency wait
+      // should also stop escalating is a separate question that needs its own evidence.
+      if (input.previousStatus !== "in_review" && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+        // Diagnostic only, but worth the lock-held round-trip: `isDependencyReady`
+        // is what separates a still-blocked wait from the defect-shaped
+        // "dependency-blocked with nothing blocking it" arm, and that distinction is
+        // the visibility this gate trades the escalation for.
         const readiness = await issuesSvc
           .listDependencyReadiness(fresh.companyId, [fresh.id], tx)
           .then((rows) => rows.get(fresh.id));
@@ -5854,6 +5874,9 @@ export function recoveryService(
         );
         return null;
       }
+
+      const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      const mutationDb = input.expectedReviewStage ? tx : db;
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
@@ -7730,9 +7753,21 @@ export function recoveryService(
         // the dependency wake then fires at an agent that is no longer the assignee.
         // Re-evaluate readiness *now* (not from the run's stale evidence): if the
         // dispatcher's own gate would still refuse, there is nothing an owner can do,
-        // so skip. Keep escalating when the issue is dependency-ready, because
-        // "dependency-blocked with nothing blocking it" is a real defect and is
-        // exactly the `blocked`-with-zero-blockers state this ticket forbids.
+        // so skip.
+        //
+        // BLO-27463 removed the other half of this rationale. It used to read: "Keep
+        // escalating when the issue is dependency-ready, because 'dependency-blocked
+        // with nothing blocking it' is a real defect and is exactly the
+        // `blocked`-with-zero-blockers state this ticket forbids." The defect is real,
+        // but escalation was measured to *produce* that state rather than prevent it —
+        // all 24 escalations opened this way between 2026-08-09 and 2026-08-18 came to
+        // rest `blocked` with an empty blocker set, undispatchable per BLO-21523. The
+        // dependency-ready arm is therefore refused outright at the transactional gate
+        // in `escalateStrandedAssignedIssue`, which every caller passes through, and
+        // the defect stays visible via its `dependencyWaitEscalationSuppressed` counter.
+        // The early `continue`s below remain worth keeping: they skip before the
+        // transaction and account the row as `dependencyWaitSkipped` (still blocked)
+        // rather than as a suppressed defect.
         if (classification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
           const readinessMap = await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]);
           const readiness = readinessMap.get(issue.id);
