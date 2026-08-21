@@ -2705,8 +2705,17 @@ describe("agent issue mutation checkout ownership", () => {
       expect(remediation, JSON.stringify(res.body)).toBeTruthy();
       // Names the assignee as the only agent who can grant...
       expect(remediation).toContain(`agent://${ownerAgentId}`);
-      // ...and the exact token they must write to do it.
+      // ...and the actor's id, which post-PEN-2394 is deliberately *not* "the
+      // token they must write": a bare `agent://<peerAgentId>` is precisely the
+      // form that grants nothing, and this assertion is satisfied by the very
+      // sentence that says so. The clause that makes the message actionable is
+      // the substitution instruction, so pin it separately — dropping "where
+      // <agent-id> is ..." would otherwise leave every assertion in this test
+      // green while the reader had to infer their own id from a don't-do-this
+      // sentence. Verified by deleting the clause: without the line below, this
+      // test and the red-team arm both still passed.
       expect(remediation).toContain(`agent://${peerAgentId}`);
+      expect(remediation).toContain(`where <agent-id> is ${peerAgentId}`);
       // PEN-2394: naming the token is not enough — the parser only accepts the
       // markdown link form, so the message has to show it. Prescribing "a comment
       // containing agent://<id>" sent an assignee to post a bare string that

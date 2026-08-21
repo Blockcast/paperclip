@@ -894,9 +894,15 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     const remediation = denied.body.details?.remediation as string | undefined;
     expect(remediation, JSON.stringify(denied.body)).toBeTruthy();
 
-    // Names the assignee as the grantor, and the actor's own id as the token.
+    // Names the assignee as the grantor, and the actor's own id as the value to
+    // substitute into the placeholder — not "the token to write", which is the
+    // one form PEN-2394 established grants nothing. Pin the substitution clause
+    // itself: the bare-id assertion below is also satisfied by the warning
+    // sentence, so on its own it would not notice the actionable half going
+    // missing.
     expect(remediation).toContain(`agent://${fixture.agents.standard.id}`);
     expect(remediation).toContain(fixture.agents.collaborator.id);
+    expect(remediation).toContain(`where <agent-id> is ${fixture.agents.collaborator.id}`);
     // Shows the form the parser actually accepts...
     expect(remediation).toContain("[@name](agent://<agent-id>)");
     // ...and rules out the form that sent PEN-2394 in circles.
