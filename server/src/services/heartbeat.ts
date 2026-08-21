@@ -981,7 +981,29 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
+// Error codes `finalizeAgentStatus` treats as recoverable: the agent is parked
+// `idle` rather than flipped to `error`, and the quota-exhausted hook fires.
+//
+// INVARIANT (BLO-28924): every code here MUST resolve to a non-null family via
+// `readHeartbeatRunErrorFamily`. "Recoverable" is only half a contract — staying
+// `idle` keeps the dashboard honest, but the retry that actually resumes the work
+// is keyed on the *family*, not the code (see
+// `readTransientRecoveryContractFromRun` -> `shouldScheduleAutomaticRunRetry`).
+// A code that is recoverable-but-unmapped therefore gets no scheduled retry and,
+// since #1407, no recovery wake either: an agent with a heartbeat interval limps
+// to its next timer tick, and an interval-less event-driven agent never recovers.
+// `heartbeat-recoverable-error-family.test.ts` asserts this set-wide, so adding a
+// code here without a mapping below fails CI.
+export const RECOVERABLE_AGENT_STATUS_ERROR_CODES = [
+  // Emitted by the first-party `claude-local` adapter (execute.ts) alongside a
+  // provider-supplied `retryNotBefore`; also reachable from pluggable adapters.
+  "provider_quota_exhausted",
+  // Set by isRateLimitExhausted() on 429 / 401-cap / "you've hit your limit".
+  "rate_limit_exhausted",
+  "provider_quota",
+] as const;
+
+export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
@@ -991,7 +1013,13 @@ function readHeartbeatRunErrorFamily(
   if (run.errorCode === "rate_limit_exhausted") {
     return "rate_limit_exhausted";
   }
-  if (run.errorCode === "provider_quota") {
+  // BLO-28924: `provider_quota_exhausted` shares `provider_quota`'s contract —
+  // a billing/session boundary carrying an authoritative reset instant, not a
+  // capacity estimate — so it inherits that family rather than getting its own.
+  // That keeps it out of `clampTransientHorizon` (which deliberately excludes
+  // `provider_quota`), so the adapter's `retryNotBefore` is honoured verbatim
+  // instead of being clamped to a per-attempt capacity ceiling.
+  if (run.errorCode === "provider_quota" || run.errorCode === "provider_quota_exhausted") {
     return "provider_quota";
   }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
@@ -1042,7 +1070,7 @@ type TransientRecoveryContract =
       retryNotBefore: Date | null;
     };
 
-function readTransientRecoveryContractFromRun(
+export function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ): TransientRecoveryContract | null {
   const family = readHeartbeatRunErrorFamily(run);
@@ -17406,17 +17434,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // doesn't show a spurious error AND fire the on-limit hook so
     // ccrotate gets a chance to rotate to a base-tier account.
     //
-    // Both error codes route here:
-    //  - `provider_quota_exhausted`: legacy/pluggable adapter signal.
-    //  - `rate_limit_exhausted`: set by isRateLimitExhausted() when the
-    //    run hits 429, 401-cap, or "you've hit your limit" cap text.
-    //    Without unifying these, rate-limit-flagged runs flipped agents
-    //    to error and the on-limit hook never fired (cluster sat silent
-    //    until the cap window rolled — observed 2026-05-05 16:08-17:30Z).
-    const recoverable =
-      options?.errorCode === "provider_quota_exhausted" ||
-      options?.errorCode === "rate_limit_exhausted" ||
-      options?.errorCode === "provider_quota";
+    // The codes routed here live in RECOVERABLE_AGENT_STATUS_ERROR_CODES, which
+    // is also what the BLO-28924 invariant test iterates: each one must map to a
+    // transient-retry family, or the agent stays idle with nothing scheduled to
+    // resume it. Without unifying these, rate-limit-flagged runs flipped agents
+    // to error and the on-limit hook never fired (cluster sat silent until the
+    // cap window rolled — observed 2026-05-05 16:08-17:30Z).
+    const recoverable = (RECOVERABLE_AGENT_STATUS_ERROR_CODES as readonly string[]).includes(
+      options?.errorCode ?? "",
+    );
     const nextStatus =
       runningCount > 0
         ? "running"
