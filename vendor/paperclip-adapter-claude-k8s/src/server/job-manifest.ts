@@ -379,10 +379,12 @@ export interface PromptSecret {
   data: Record<string, string>;
 }
 
-/** Non-null when one or more env vars matched the sensitive-name pattern
- *  (see isSensitiveEnvName). Their values are moved out of the Job's
- *  env[].value into this Secret and referenced via secretKeyRef instead, so
- *  a read-only `GET Pod` on the Job never returns them (BLO-17980/BLO-17973).
+/** Non-null when one or more env vars must not carry a literal Pod value:
+ *  every operator-set `adapterConfig.env` key (default-deny, BLO-22546) plus
+ *  any platform-computed name matching the sensitive pattern (see
+ *  isSensitiveEnvName). Their values are moved out of the Job's env[].value
+ *  into this Secret and referenced via secretKeyRef instead, so a read-only
+ *  `GET Pod` on the Job never returns them (BLO-17980/BLO-17973).
  *  Same lifecycle as promptSecret: the caller creates it before the Job and
  *  cleans it up after. */
 export interface EnvSecret {
@@ -421,17 +423,34 @@ export function isSensitiveEnvName(name: string): boolean {
 }
 
 /**
- * Defense-in-depth: return the names of any container env entries with a
- * sensitive-looking name that still carry a literal `value`. buildEnvVars()
- * never produces these, but this runs unconditionally in buildJobManifest
- * (after every push onto the env array, including ones added later for
- * sidecar wiring) so a future code path that appends a literal env var
- * can't silently reintroduce the leak — buildJobManifest throws instead of
+ * Defense-in-depth: return the names of any container env entries that still
+ * carry a literal `value` when they should have been routed to the env Secret.
+ * buildEnvVars() never produces these, but this runs unconditionally in
+ * buildJobManifest (after every push onto the env array, including ones added
+ * later for sidecar wiring) so a future code path that appends a literal env
+ * var can't silently reintroduce the leak — buildJobManifest throws instead of
  * returning a Pod spec that would expose it via `GET Pod`.
+ *
+ * `operatorEnvNames` carries the adapterConfig.env keys so this guard enforces
+ * the same default-deny rule buildEnvVars applies (BLO-22546 AC-3), rather
+ * than only the sensitive-name pattern. Without it the backstop would be keyed
+ * on the very predicate the default-deny rule exists to stop relying on, and
+ * an operator key named `GCP_SA_JSON` could reach the Pod spec unflagged.
+ * Defaults to empty so callers that only have an env array — the pattern-only
+ * check — keep working unchanged.
  */
-export function findLiteralSensitiveEnvVars(env: k8s.V1EnvVar[]): string[] {
+export function findLiteralSensitiveEnvVars(
+  env: k8s.V1EnvVar[],
+  operatorEnvNames: ReadonlySet<string> = new Set<string>(),
+): string[] {
   return env
-    .filter((e) => e.name && isSensitiveEnvName(e.name) && typeof e.value === "string" && e.value.length > 0)
+    .filter(
+      (e) =>
+        e.name &&
+        (operatorEnvNames.has(e.name) || isSensitiveEnvName(e.name)) &&
+        typeof e.value === "string" &&
+        e.value.length > 0,
+    )
     .map((e) => e.name);
 }
 
@@ -446,14 +465,17 @@ export function findLiteralSensitiveEnvVars(env: k8s.V1EnvVar[]): string[] {
  *
  * Returns `container/ENV_NAME` so the failure names the offending container.
  */
-export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+export function findLiteralSensitiveEnvVarsInPodSpec(
+  podSpec: k8s.V1PodSpec,
+  operatorEnvNames: ReadonlySet<string> = new Set<string>(),
+): string[] {
   const containers: k8s.V1Container[] = [
     ...(podSpec.initContainers ?? []),
     ...(podSpec.containers ?? []),
     ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
   ];
   return containers.flatMap((c) =>
-    findLiteralSensitiveEnvVars(c.env ?? []).map((name) => `${c.name || "<unnamed>"}/${name}`),
+    findLiteralSensitiveEnvVars(c.env ?? [], operatorEnvNames).map((name) => `${c.name || "<unnamed>"}/${name}`),
   );
 }
 
@@ -563,7 +585,7 @@ function buildEnvVars(
   config: Record<string, unknown>,
   isolation: JobIsolation,
   envSecretName: string,
-): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string> } {
+): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string>; operatorEnvNames: Set<string> } {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
 
@@ -698,14 +720,31 @@ function buildEnvVars(
     if (!userEnvKeys.has(key)) merged[key] = value;
   }
 
-  // Convert literal env to V1EnvVar array. Names matching the sensitive
-  // pattern (isSensitiveEnvName) are routed to a Secret referenced via
-  // secretKeyRef instead of an inline literal `value`, so a read-only
-  // `GET Pod` on the Job never returns their contents (BLO-17980/BLO-17973).
+  // Convert literal env to V1EnvVar array. Two rules decide whether a value may
+  // stay an inline literal, and the operator-controlled half fails toward the
+  // Secret:
+  //
+  //  - Operator-set keys (adapterConfig.env, layer 4) are ALWAYS routed to the
+  //    Secret, whatever they are named. This is the default-deny rule
+  //    (BLO-22546 AC-3): that surface is open-ended, so an unrecognized key is
+  //    treated as credential material rather than assumed benign. A name
+  //    pattern cannot govern it — VERCEL_BEARER, GCP_SA_JSON, PGPASSFILE and
+  //    every *_PAT form are ordinary names for real credentials that match no
+  //    sensitive-name regex, so an allowlist silently re-opens this the next
+  //    time someone adds a key, with no error and no failing test.
+  //  - Platform-computed keys (layers 1-3: PAPERCLIP_* run context, inherited
+  //    Deployment env, cache/isolation paths) are a closed set defined in this
+  //    file, so the name pattern still governs them. Keeping HOME, TMPDIR and
+  //    PAPERCLIP_RUN_ID readable via `GET Pod` is worth real debuggability, and
+  //    none of them carries credential material.
+  //
+  // Everything routed here is referenced via secretKeyRef instead of an inline
+  // `value`, so a read-only `GET Pod` on the Job never returns its contents
+  // (BLO-17980/BLO-17973/BLO-22546).
   const sensitiveEnvData: Record<string, string> = {};
   const envVars: k8s.V1EnvVar[] = [];
   for (const [name, value] of Object.entries(merged)) {
-    if (isSensitiveEnvName(name) && value) {
+    if (value && (userEnvKeys.has(name) || isSensitiveEnvName(name))) {
       sensitiveEnvData[name] = value;
       envVars.push({ name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } });
     } else {
@@ -723,7 +762,7 @@ function buildEnvVars(
     }
   }
 
-  return { envVars, sensitiveEnvData };
+  return { envVars, sensitiveEnvData, operatorEnvNames: userEnvKeys };
 }
 
 /**
@@ -966,7 +1005,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Build env vars. envSecretName is computed from jobName (already resolved
   // above) so sensitive-named vars can be wired to secretKeyRef in one pass.
   const envSecretName = `${jobName}-env`;
-  const { envVars, sensitiveEnvData } = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
+  const { envVars, sensitiveEnvData, operatorEnvNames } = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
   const envSecret: EnvSecret | null =
     Object.keys(sensitiveEnvData).length > 0 ? { name: envSecretName, namespace, data: sensitiveEnvData } : null;
 
@@ -1548,17 +1587,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  // Defense-in-depth (BLO-17980/BLO-17973): fail the build rather than ship a
-  // Pod spec that would expose a credential-shaped env var via `GET Pod`.
+  // Defense-in-depth (BLO-17980/BLO-17973/BLO-22546): fail the build rather
+  // than ship a Pod spec that would expose a credential via `GET Pod`.
   // Deliberately checked against the assembled pod spec, not against the
   // envVars/initEnv locals: the pod also carries the DinD sidecar container,
   // whose env is built inside buildDindSidecar() and never passed through
   // those locals. Reading the containers back off the spec means any container
   // added later is covered automatically instead of silently bypassing this.
-  const literalSensitiveNames = findLiteralSensitiveEnvVarsInPodSpec(job.spec!.template.spec!);
+  // operatorEnvNames is passed so the guard enforces default-deny over the
+  // adapterConfig.env surface, not just the sensitive-name pattern.
+  const literalSensitiveNames = findLiteralSensitiveEnvVarsInPodSpec(job.spec!.template.spec!, operatorEnvNames);
   if (literalSensitiveNames.length > 0) {
     throw new Error(
-      `claude_k8s: refusing to build Job manifest — sensitive-named env var(s) would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
+      `claude_k8s: refusing to build Job manifest — env var(s) that must be Secret-backed would be injected as a literal value instead of secretKeyRef: ${literalSensitiveNames.join(", ")}`,
     );
   }
 
