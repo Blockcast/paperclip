@@ -1701,13 +1701,22 @@ export async function startServer(): Promise<StartedServer> {
   // silently dead — that is exactly how `quotaExhaustedCmd` spent 44+ days
   // firing MODULE_NOT_FOUND across 11 agents. Non-fatal and post-listen: a
   // dead hook must not stop the instance serving, it must stop being silent.
-  void auditConfiguredHookCommandsOnBoot({
-    db: db as any,
-    getGeneral: () => instanceSettingsService(db).getGeneral(),
-    listCompanyIds: () => instanceSettingsService(db).listCompanyIds(),
-  }).catch((err) => {
-    logger.warn({ err }, "lifecycle hook command audit failed (non-fatal)");
-  });
+  //
+  // Workers tier only, matching every other boot reconciler here. Two reasons
+  // (BLO-28872 review): the worker is the tier that actually spawns the hook, so
+  // its filesystem view is the authoritative one for a volume-mounted path; and
+  // running on every replica of every tier multiplied the per-company activity
+  // writes by the replica count on every boot — flooding, on a crashloop, the
+  // exact operator surface this audit exists to make legible.
+  if (config.paperclipNodeRole !== "api") {
+    void auditConfiguredHookCommandsOnBoot({
+      db: db as any,
+      getGeneral: () => instanceSettingsService(db).getGeneral(),
+      listCompanyIds: () => instanceSettingsService(db).listCompanyIds(),
+    }).catch((err) => {
+      logger.warn({ err }, "lifecycle hook command audit failed (non-fatal)");
+    });
+  }
 
   // Auto-install bundled plugins (idempotent — skips if already installed).
   // Skipped on the API tier: /api/plugins/install hits pluginWorkerManager

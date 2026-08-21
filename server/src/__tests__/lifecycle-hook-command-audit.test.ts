@@ -28,6 +28,24 @@ afterEach(() => {
 });
 
 describe("findMissingHookCommandPaths", () => {
+  it("bounds the number of filesystem stats regardless of command length", () => {
+    // `fileExists` is a *synchronous* stat and the write path runs this inline
+    // in an HTTP handler, so token count is a direct multiplier on how long the
+    // API event loop blocks. Before the cap, a 10 MB body measured ~4 s of
+    // blocking (BLO-28872 review). Assert the ceiling, not just "it returns".
+    const calls: string[] = [];
+    const command = Array.from({ length: 5000 }, (_, i) => `/x${i}.sh`).join(" ");
+    findMissingHookCommandPaths(command, {
+      fileExists: (p) => {
+        calls.push(p);
+        return false;
+      },
+    });
+    expect(calls.length).toBeLessThanOrEqual(64);
+    // Non-vacuous: without the cap this would be 5000.
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
   it("flags the exact BLO-28782 production command", () => {
     // The literal string that was stored in instance_settings.general and
     // produced 500/500 MODULE_NOT_FOUND fires between 2026-07-05 and

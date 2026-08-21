@@ -693,6 +693,30 @@ describe("instance settings routes", () => {
     ]);
   });
 
+  it("rejects an oversized hook command before it reaches the filesystem", async () => {
+    // The audit stats every script-like token synchronously, inline in this
+    // handler. Uncapped, a 10 MB body measured ~4 s of blocked event loop, which
+    // stalls health probes and every in-flight request (BLO-28872 review). The
+    // validator is the bound; assert the write never happens.
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const oversized = Array.from({ length: 4000 }, (_, i) => `/x${i}.sh`).join(" ");
+    expect(oversized.length).toBeGreaterThan(4096);
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: oversized });
+
+    expect(res.status).toBe(400);
+    expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
   it("accepts a hook command whose script exists with no warning", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hook-audit-"));
     const script = join(dir, "relogin.sh");
