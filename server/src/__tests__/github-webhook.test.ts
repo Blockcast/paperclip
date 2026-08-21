@@ -7355,11 +7355,37 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // repo having the feature switched off.
     expect(description).toContain("Resource not accessible by integration");
     expect(description).toContain("You are not authorized to perform this operation.");
+
+    // BLO-28884 (Ally, Important): the section above must not claim the whole
+    // of branches 2 and 3 needs the permission. Branch 3's receipt disjunct is
+    // pushed to us by the verified delivery, so it needs no credential -- an
+    // agent holding a receipt that reads "you lack the permission" concludes
+    // its own valid evidence is inadmissible and escalates instead of closing.
+    // That is a false-NEGATIVE, the mirror of the false-zero this PR fixes.
+    expect(description).not.toContain("Branches 2 and 3 both require observing terminal alert state");
+    expect(description).toContain(
+      "**A terminal dismissal webhook receipt already on this issue is sufficient evidence on its own.**",
+    );
+    expect(description).toContain("needs no permission, no token and no API call");
+    expect(description).toContain("you must NOT escalate on the grounds that you lack a permission");
+
     // AC2: the non-agent escalation path is named, with the SBOM read that
     // still works when the alerts API does not.
     expect(description).toContain("## When branch 1 is unsatisfiable (phantom alerts)");
     expect(description).toContain("dependency-graph/sbom");
     expect(description).toContain("Escalate to a repository admin");
+
+    // BLO-28884: the SBOM is built from the same dependency graph as the
+    // alerts, so it cannot rule a phantom in. Two ways to misread it, both
+    // measured on Blockcast/magma 2026-08-21: summarising 2,366 packages hid a
+    // single grpc entry inside the vulnerable range, and no SBOM metadata field
+    // distinguishes it (`filesAnalyzed` is false for all 2,366).
+    expect(description).toContain("same GitHub dependency graph that generates these alerts");
+    expect(description).toContain(
+      "Use it to establish that a patched version is present; never to establish that a vulnerable one is real.",
+    );
+    expect(description).toContain("Compare the **minimum** resolved version across every entry");
+    expect(description).toContain("neither field discriminates");
 
     // Preserve the operational prohibition verbatim while changing closure criteria.
     expect(description).toContain(
