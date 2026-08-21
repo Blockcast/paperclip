@@ -31,21 +31,30 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
   const deployJob = getDeployJobBlock();
   const jobTimeoutMatch = deployJob.match(/^    timeout-minutes:\s*(\d+)\s*$/m);
   const helmTimeoutMatch = deployJob.match(/--wait --timeout\s+(\d+)m\b/);
-  const rolloutTimeoutMatch = deployJob.match(
-    /rollout status deployment\/paperclip-api --timeout=(\d+)m\b/,
-  );
+  // BLO-29008 added a second `rollout status` (statefulset/paperclip). Matching
+  // only the api wait made this assertion blind to exactly the drift it exists
+  // to catch: a new serial tier wait could push the worst case past the job
+  // timeout while this test stayed green. Sum every wait instead, so any future
+  // tier is covered by construction.
+  const rolloutTimeouts = [
+    ...deployJob.matchAll(/rollout status \S+ --timeout=(\d+)m\b/g),
+  ].map((match) => Number(match[1]));
 
   assert.ok(jobTimeoutMatch, "deploy job must declare timeout-minutes");
   assert.ok(helmTimeoutMatch, "deploy job must set helm upgrade --wait --timeout");
-  assert.ok(rolloutTimeoutMatch, "deploy job must bound the post-reconcile rollout wait");
+  assert.ok(rolloutTimeouts.length > 0, "deploy job must bound the post-reconcile rollout wait");
+  assert.ok(
+    rolloutTimeouts.length >= 2,
+    "deploy job must wait on BOTH tiers (api Deployment and worker StatefulSet) — BLO-29008",
+  );
 
   const jobTimeoutMinutes = Number(jobTimeoutMatch[1]);
   const helmTimeoutMinutes = Number(helmTimeoutMatch[1]);
-  const rolloutTimeoutMinutes = Number(rolloutTimeoutMatch[1]);
+  const rolloutTimeoutMinutes = rolloutTimeouts.reduce((sum, minutes) => sum + minutes, 0);
 
   assert.ok(
     jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + 10,
-    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollout (${rolloutTimeoutMinutes}m) + 10m margin`,
+    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + 10m margin`,
   );
 });
 

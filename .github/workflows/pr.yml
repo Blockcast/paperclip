@@ -86,6 +86,13 @@ jobs:
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
 
+      # BLO-29008: executes the two-tier convergence gate's shell against
+      # recorded cluster states. The gate fails OPEN if its string accumulation
+      # breaks, so a render-level test cannot cover it — the negative cases here
+      # are the whole point.
+      - name: Test two-tier deploy convergence gate (BLO-29008)
+        run: node --test ./scripts/check-docker-two-tier-convergence.test.js
+
       - name: Test approval admissibility-probe backoff (BLO-28471)
         run: node --test ./scripts/approve-paperclip-api-digest.test.js
 
