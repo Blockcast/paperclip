@@ -5723,6 +5723,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  // The other side of that boundary, and the reason the gate is keyed on
+  // `recoveryOwnerAgentId` rather than on status. `previousStatus !== "in_review"` was a
+  // proxy for "is this a review-participant escalation", and it was broader than that:
+  // three assignee-lane sites forward `previousStatus: issue.status`, and `in_review` is a
+  // member of STRANDED_ASSIGNED_ISSUE_STATUSES, so an `in_review` issue whose execution
+  // state is *not* pending reached the accepted-continuation non_retryable escalation and
+  // was exempted — escalating into exactly the empty-blocker-set `blocked` state this gate
+  // exists to prevent, which is the measured 24/24 outcome.
+  //
+  // Nothing is lost by suppressing here: that branch `continue`s before the
+  // review-participant block, so it never had a participant recovery path to preserve.
+  // Only the five participant sites pass `recoveryOwnerAgentId`, so it separates the two
+  // populations exactly where the status proxy could not.
+  it("does not escalate an assignee-lane dependency-blocked continuation on an in_review issue (BLO-27463)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      runErrorCode: "issue_dependencies_blocked",
+      retryReason: "issue_continuation_needed",
+      runError:
+        "Latest retry failure: provider rate-limit/quota window — the provider advertised " +
+        "availability no earlier than 2026-08-13T01:17:00.262Z (surfaced as `issue_dependencies_blocked`).",
+    });
+    const interactionId = randomUUID();
+    const resolvedAt = new Date("2026-03-18T23:59:00.000Z");
+
+    // `in_review` with the execution state left non-pending is what routes the issue into
+    // the assignee lane instead of the participant block.
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: { version: 1, prompt: "Approve the plan?" },
+      result: { outcome: "accepted" },
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+        mutation: "interaction",
+        interactionId,
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    // Exact statuses, not `not.toBe("blocked")`: the claim is that the issue is left where
+    // it was, still owned by its assignee, with no recovery action minted.
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.status).toBe("in_review");
+    expect(after.assigneeAgentId).toBe(agentId);
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+  });
+
   it.each(["added", "reopened"] as const)(
     "does not escalate a dependency-blocked continuation when a blocker is %s after readiness preflight",
     async (change) => {
