@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   CAPACITY_ESCALATION_AFTER_MS,
   CCROTATE_CAPACITY_MAX_PARK_MS,
+  CCROTATE_CAPACITY_MIN_PARK_MS,
   CCROTATE_CAPACITY_PARK_JITTER_RATIO,
   CCROTATE_CAPACITY_RESULT_KEYS,
   LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS,
@@ -97,6 +98,41 @@ describe("resolveCcrotateCapacityRetry", () => {
       expect(plan.retryAt.getTime()).toBe(NOW.getTime() + DEFAULT_RETRY_DELAY_MS);
       expect(plan.advertisedDelaySeconds).toBeNull();
     }
+  });
+
+  it("floors an implausibly near advertised reset, so hop COUNT stays bounded (BLO-28919)", () => {
+    // The attempt cap was retired because `attempts x cadence` couples two
+    // independent concerns — but it was also the only bound on how many times
+    // one chain hops. A provider answering `Retry-After: 1` while still
+    // exhausted resolved to a ~1s park, leaving only the promotion sweep's 10s
+    // floor to pace it: ~67k hops across the 187.2h horizon, and ~48 row
+    // updates/sec for the 484-row cohort this ticket was filed against.
+    const plan = resolveCcrotateCapacityRetry({
+      resumeAt: new Date(NOW.getTime() + 1000),
+      now: NOW,
+      defaultRetryDelayMs: DEFAULT_RETRY_DELAY_MS,
+      random: fixedRandom(0),
+    });
+    expect(plan.retryAt.getTime()).toBe(NOW.getTime() + CCROTATE_CAPACITY_MIN_PARK_MS);
+    // Still recorded verbatim: the floor changes when we re-probe, not what the
+    // provider claimed. `clampedFromIso` stays null — nothing was declined for
+    // being too FAR out, which is the only thing that field reports.
+    expect(plan.advertisedDelaySeconds).toBe(1);
+    expect(plan.clampedFromIso).toBeNull();
+  });
+
+  it("keeps the ceiling stronger than the floor when a caller passes a short maxParkMs", () => {
+    // Callers (and the tests above) may pass a `maxParkMs` below the floor.
+    // `resolvedMs <= ceilingMs` is the older, stronger guarantee and must
+    // survive the floor being added rather than being inverted by it.
+    const plan = resolveCcrotateCapacityRetry({
+      resumeAt: new Date(NOW.getTime() + 1000),
+      now: NOW,
+      defaultRetryDelayMs: DEFAULT_RETRY_DELAY_MS,
+      maxParkMs: 30_000,
+      random: fixedRandom(0),
+    });
+    expect(plan.retryAt.getTime()).toBe(NOW.getTime() + 30_000);
   });
 
   it("spreads a cohort denied against one reset instead of releasing it in lockstep", () => {
@@ -335,6 +371,29 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
     ).toBeLessThan(LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS);
   });
 
+  it("bounds hop COUNT as well as chain lifetime, which the retired cap did silently", () => {
+    // The horizon bounds how long a chain lives; the floor is what bounds how
+    // much work it does while living. Asserted as a relationship so the two
+    // constants can be tuned independently — the whole point of the decoupling —
+    // without either silently unbounding the other.
+    const maxHops = CAPACITY_ESCALATION_AFTER_MS / CCROTATE_CAPACITY_MIN_PARK_MS;
+    // Expressed as the thing that actually hurts: sustained writes to
+    // `heartbeat_runs` for the cohort size this ticket measured (484 parked
+    // runs). Unbounded, a 1s advertised reset paced only by the 10s promotion
+    // sweep gives ~48/sec for the length of an outage.
+    const measuredCohortSize = 484;
+    const worstCaseWritesPerSec = measuredCohortSize / (CCROTATE_CAPACITY_MIN_PARK_MS / 1000);
+    expect(
+      worstCaseWritesPerSec,
+      `a ${measuredCohortSize}-row cohort hopping at the floor sustains ` +
+        `${worstCaseWritesPerSec.toFixed(1)} row-writes/sec (${Math.ceil(maxHops)} hops per chain); ` +
+        `unbounded hop count was what dropping the attempt cap left behind`,
+    ).toBeLessThan(10);
+    // And the floor must stay under the cadence ceiling, or it would silently
+    // become the cadence and this module would have two names for one knob.
+    expect(CCROTATE_CAPACITY_MIN_PARK_MS).toBeLessThan(CCROTATE_CAPACITY_MAX_PARK_MS);
+  });
+
   describe("capacity escalation horizon (BLO-28919)", () => {
     it("does not escalate while the pool has been down less than the horizon", () => {
       const plan = resolveCapacityEscalation({
@@ -440,6 +499,43 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
         ).toBe(NOW.toISOString());
       }
     });
+
+    it("replaces a stored origin in the FUTURE, so the resolver's skew fail-open actually persists", () => {
+      // The mirror image of the corrupt case above, and the one a round-trip
+      // check admits: a valid ISO instant that is simply ahead of `now`.
+      // `resolveCapacityEscalation` already treats this as clock skew and
+      // restarts at `now` — but that verdict only means anything if the writer
+      // stores it. Preferring `previous` unconditionally wrote the future
+      // instant back on every hop, so `elapsedMs` was recomputed as 0 forever
+      // and the chain could not escalate until wall clock caught up: the
+      // park-forever outcome the origin key's docblock exists to prevent.
+      const future = new Date(NOW.getTime() + 60 * 60 * 1000).toISOString();
+      const resolved = resolveCapacityEscalation({ firstDeferredAtIso: future, now: NOW });
+      expect(resolved.firstDeferredAtIso, "resolver restarts the clock").toBe(NOW.toISOString());
+
+      const persisted = applyCcrotateCapacityDecision(
+        { penstockCapacityFirstDeferredAt: future },
+        {
+          retryAtIso: new Date(NOW.getTime() + 60_000).toISOString(),
+          advertisedResumeAtIso: null,
+          clampedFromIso: null,
+          firstDeferredAtIso: resolved.firstDeferredAtIso,
+        },
+      );
+      expect(
+        persisted.penstockCapacityFirstDeferredAt,
+        "the writer must not discard the resolver's corrected origin",
+      ).toBe(NOW.toISOString());
+
+      // End-to-end: feeding what was persisted back in must make progress.
+      // Under the old writer this re-read the future instant and stalled at 0.
+      const nextHop = new Date(NOW.getTime() + 30 * 60 * 1000);
+      const second = resolveCapacityEscalation({
+        firstDeferredAtIso: persisted.penstockCapacityFirstDeferredAt,
+        now: nextHop,
+      });
+      expect(second.elapsedMs, "elapsed time must grow across hops").toBe(30 * 60 * 1000);
+    });
   });
 
   it("only ever shortens a park, so a stale or near floor is never pushed out", () => {
@@ -448,7 +544,13 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
     // poll delay for an absent/stale/unparseable instant, which would otherwise
     // delay a run whose floor already passed — the one way this fix could have
     // made a park worse rather than better.
-    for (const advertisedMs of [1_000, 30_000, 60_000, 5 * 60_000]) {
+    //
+    // Every value here sits at or above CCROTATE_CAPACITY_MIN_PARK_MS, which is
+    // the band where "never pushed out" still holds unconditionally. Below the
+    // floor the guarantee is deliberately weaker (BLO-28919) and is asserted
+    // separately by the floor test above; 90s is retained here because it is the
+    // documented genuine-short-window case that the floor must NOT disturb.
+    for (const advertisedMs of [60_000, 90_000, 2 * 60_000, 5 * 60_000]) {
       const advertised = new Date(NOW.getTime() + advertisedMs);
       const plan = resolveCcrotateCapacityRetry({
         resumeAt: advertised,
