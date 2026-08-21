@@ -401,9 +401,12 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
-    # Covers the sequential 30m Helm wait and 30m post-reconcile rollout wait,
-    # plus checkout, approval, final verification, and cleanup margin.
-    timeout-minutes: 70
+    # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
+    # rollout wait (BLO-29008), plus checkout, approval, final verification, and
+    # cleanup margin. scripts/check-docker-deploy-timeout.test.js sums EVERY
+    # `rollout status --timeout=` in this job, so adding a third tier wait
+    # without raising this fails CI rather than silently overrunning the job.
+    timeout-minutes: 85
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -943,7 +946,19 @@ jobs:
           # behind has shipped nothing for every heartbeat-path fix. Waiting on
           # it here is what makes the job's `success` mean "both tiers are on
           # this build" instead of "the HTTP tier is".
-          kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=30m
+          #
+          # 15m, not the api's 30m, and the tighter bound is deliberate: this
+          # wait is serial with the two above it, and
+          # .github/scripts/guard-pending-deploy.sh blocks on ANY non-terminal
+          # docker.yml run -- so a worker that will never converge would hold a
+          # fleet-wide deploy freeze for the whole window. 15m is still clear of
+          # the worst-case cold start: the seed init container runs up to 13
+          # `timeout 45s` plugin-seed calls (~9m45s) and the startup probe budget
+          # is failureThreshold 30 x periodSeconds 10 (5m). Raise this only
+          # alongside that arithmetic, and keep the deploy job's timeout-minutes
+          # covering helm + api + worker + 10m (pinned by
+          # scripts/check-docker-deploy-timeout.test.js).
+          kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=15m
 
           # Use the approver's canonical projection verbatim. Comparing the live
           # object with the handed-off server plan proves the lock can be retired
@@ -981,9 +996,14 @@ jobs:
           #
           # This block is the assertion that makes a partial roll a FAILURE
           # rather than a green run. It reads the live objects (not the render),
-          # so it also catches a tier moved out-of-band by a hand-run
-          # `kubectl set image` / `helm upgrade` -- which is exactly how the
-          # BLO-28920 split arose, with no docker.yml deploy job involved at all.
+          # so it also catches a tier left behind by an out-of-band change --
+          # which is exactly how the BLO-28920 split arose, with no docker.yml
+          # deploy job involved at all.
+          #
+          # It verifies CONVERGENCE, not provenance: a tier that someone
+          # hand-rolled to the correct digest outside Helm passes this gate,
+          # leaving live state right and the Helm release state stale. A green
+          # gate is therefore not proof the release is Helm-consistent.
           expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
           commit_path='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/deployed-commit}'
           api_image="$(kubectl -n "${NS}" get deployment paperclip-api \
