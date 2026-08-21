@@ -7506,7 +7506,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
   // the previous cycle never travelled with the alert, so the same conclusion
   // was re-derived every cycle at ~8 agent runs a time.
   it("reopens the adjudicated issue instead of refiling when a closed alert re-fires", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
     await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
@@ -7727,9 +7727,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(refireComment!.body).toContain("adjudicated before");
   });
 
-  // GitHub 200-acks mean it will not retry, but manual replays and re-scans do
-  // redeliver. A replayed re-fire must not stack duplicate notices on the row.
-  it("dedupes a replayed re-fire delivery against the reopened issue", async () => {
+  // A replayed delivery never reaches the reopen path at all: the wake
+  // pre-check in the dependabot handler keys on
+  // `${taskKey}:${action}:${deliveryId}` and short-circuits before
+  // resolveDependabotAlertIssue runs. That is the outermost of the two dedupe
+  // layers, and this pins it: the replay is dropped whole, so the row is left
+  // exactly as the *previous* delivery left it -- still closed. The
+  // comment-level guard is a separate layer, exercised by the next test.
+  it("short-circuits a replayed re-fire delivery at the wake pre-check", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });
 
@@ -7739,13 +7744,24 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     // Close it again, then replay the exact same re-fire delivery id.
     await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed-2");
-    await postDependabot(app, dependabotPayload("critical", "reintroduced"), "delivery-refire-4");
+    const replay = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-4",
+    );
+
+    // The replay was dropped at the wake gate, so no wake fired...
+    expect(replay.body).toMatchObject({ dependabotWakeFired: false });
 
     const alertIssues = await db
       .select()
       .from(issues)
       .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
     expect(alertIssues).toHaveLength(1);
+    // ...and the reopen never ran, so the row is still where delivery-fixed-2
+    // left it. Asserting the status is what separates "deduped" from "silently
+    // processed twice"; the row count alone cannot tell those apart.
+    expect(alertIssues[0]!.status).toBe("done");
 
     const refireComments = await db
       .select()
@@ -7756,7 +7772,132 @@ describeEmbeddedPostgres("github-webhook route", () => {
           sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
         ),
       );
+    // Exactly the one written by the first (non-replayed) re-fire.
     expect(refireComments).toHaveLength(1);
+  });
+
+  // The inner layer: a delivery that gets PAST the wake pre-check but carries a
+  // delivery id already seen by the reopen path. `reintroduced` and `reopened`
+  // produce distinct wake idempotency keys for the same delivery id, so the
+  // second one runs the reopen for real -- and the refire comment's externalKey
+  // (`${originId}:refire:${deliveryId}`) collides, so onConflictDoNothing is the
+  // only thing preventing a duplicate notice. Unlike the test above, the row IS
+  // re-queued here, which is what proves the guard suppressed the comment
+  // rather than the whole delivery.
+  it("dedupes a re-fire comment on delivery id when the reopen path runs twice", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    const first = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-shared",
+    );
+    expect(first.body).toMatchObject({ dependabotWakeFired: true });
+
+    // Close it, then re-fire under a DIFFERENT action with the SAME delivery
+    // id: distinct wake key, identical comment externalKey.
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed-3");
+    const second = await postDependabot(
+      app,
+      dependabotPayload("critical", "reopened"),
+      "delivery-refire-shared",
+    );
+    expect(second.body).toMatchObject({ dependabotWakeFired: true });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(1);
+    // The reopen DID run this time -- the row came back out of `done`.
+    expect(alertIssues[0]!.status).toBe("todo");
+    expect(alertIssues[0]!.assigneeAgentId).toBe(agentId);
+
+    // ...but the notice was not stacked.
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, alertIssues[0]!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(1);
+    // The surviving comment is the first delivery's, not the second's.
+    expect(refireComments[0]!.body).toContain("Action: `reintroduced`");
+  });
+
+  // BLO-28981 / BLO-28864: cancelling an alert issue is a deliberate "stop
+  // re-adjudicating this" decision, and it is the only suppression lever the
+  // intake has. Reopening a cancelled row would null out `cancelledAt` and
+  // re-queue the alert on every subsequent re-fire forever, leaving no way to
+  // silence a phantom alert at all.
+  it("suppresses a re-fire against a cancelled alert issue instead of reopening it", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const [originalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+
+    // A human cancels it: this alert is not worth re-adjudicating.
+    const cancelledAt = new Date("2026-08-19T00:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt })
+      .where(eq(issues.id, originalIssue!.id));
+
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-cancelled",
+    );
+    expect(refire.status).toBe(200);
+    // No agent was woken -- that cost is exactly what cancelling stops.
+    expect(refire.body).toMatchObject({ dependabotWakeFired: false });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    // Still no new row, AND the cancellation survived intact.
+    expect(alertIssues).toHaveLength(1);
+    expect(alertIssues[0]!.status).toBe("cancelled");
+    expect(alertIssues[0]!.cancelledAt).toEqual(cancelledAt);
+
+    // The suppressed delivery is auditable rather than silently dropped.
+    const suppressed = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, originalIssue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire_suppressed'`,
+        ),
+      );
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]!.body).toContain("not** re-queued");
+    expect(suppressed[0]!.body).toContain("GitHub delivery: `delivery-refire-cancelled`");
+    expect(suppressed[0]!.body).toContain(cancelledAt.toISOString());
+
+    // And it was not reopened by the other path.
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, originalIssue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(0);
   });
 
   it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {
