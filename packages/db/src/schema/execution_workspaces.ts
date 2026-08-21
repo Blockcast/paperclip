@@ -60,6 +60,11 @@ export const executionWorkspaces = pgTable(
       table.companyId,
       table.lastUsedAt,
     ),
+    cleanupEligibleIdx: index("execution_workspaces_cleanup_eligible_idx").on(
+      table.companyId,
+      table.cleanupEligibleAt,
+      table.id,
+    ),
     companyBranchIdx: index("execution_workspaces_company_branch_idx").on(
       table.companyId,
       table.branchName,
