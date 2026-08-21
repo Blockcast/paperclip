@@ -29,7 +29,14 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issueComments } from "@paperclipai/db";
-import { APPROVAL_UNDECIDED_STATUSES, parseApprovalGate, type ApprovalGate, type IssueCommentMetadata } from "@paperclipai/shared";
+import {
+  APPROVAL_TYPES,
+  APPROVAL_UNDECIDED_STATUSES,
+  parseApprovalGate,
+  type ApprovalGate,
+  type ApprovalType,
+  type IssueCommentMetadata,
+} from "@paperclipai/shared";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { githubGetWorkflowRun, type WorkflowRunLookup } from "./github-app-auth.js";
@@ -87,12 +94,24 @@ const SUCCESS_CONCLUSION = "success";
  * such a card from being filed; this predicate is the only guard.
  *
  * The three types below were each checked to have no terminal-transition cascade.
+ *
+ * Declared as a total map rather than a bare list so that adding an `APPROVAL_TYPE`
+ * fails the typecheck here until someone classifies it. A list alone still fails
+ * safe — a new type is simply never reconciled — but it fails *silently*, which is
+ * the same shape of defect this sweep exists to remove. The map makes the omission
+ * a compile error instead of an invisible coverage gap.
  */
-const RECONCILABLE_APPROVAL_TYPES = [
-  "approve_ceo_strategy",
-  "budget_override_required",
-  "request_board_approval",
-] as const;
+const RECONCILABLE_BY_APPROVAL_TYPE: Record<ApprovalType, boolean> = {
+  // Cascade-bearing: closing this card must also terminate the bound pending agent.
+  hire_agent: false,
+  approve_ceo_strategy: true,
+  budget_override_required: true,
+  request_board_approval: true,
+};
+
+const RECONCILABLE_APPROVAL_TYPES = APPROVAL_TYPES.filter(
+  (type) => RECONCILABLE_BY_APPROVAL_TYPE[type],
+);
 
 export interface ApprovalGateReconcileResult {
   /** Cards examined against GitHub. */
@@ -239,6 +258,16 @@ function announcementBody(input: {
 const RECONCILED_CARD_LABEL = "Reconciled approval card";
 
 /**
+ * Dedupe key for an announcement, unique per (issue, approval).
+ *
+ * Backed by `issue_comments_issue_system_idempotency_idx`, so this is enforced by
+ * the database rather than checked by a preceding read.
+ */
+function announcementIdempotencyKey(approvalId: string): string {
+  return `approval-gate-reconciler:${approvalId}`;
+}
+
+/**
  * Provenance for one announcement, in the only shape the comment contract accepts.
  *
  * Typed as `IssueCommentMetadata` on purpose: the column is
@@ -355,41 +384,36 @@ async function closeAndAnnounce(
 
     let announced = 0;
     for (const link of links) {
-      const existing = toRows<{ id: string }>(
+      // Dedupe in the database rather than by probing first. `idempotencyKey` is
+      // covered by `issue_comments_issue_system_idempotency_idx`, a partial UNIQUE
+      // index over exactly the rows written here (`author_agent_id IS NULL AND
+      // author_user_id IS NULL AND deleted_at IS NULL`), so at-most-once is enforced
+      // rather than checked. That is strictly stronger than the select-then-insert
+      // this replaced, which two concurrent sweeps could both pass before either
+      // wrote, and it needs no jsonb containment match to stay correct.
+      //
+      // The status write above is still the primary guarantee — only one transaction
+      // can win it, and `cancelled` is terminal — but this keeps a future path back
+      // to undecided from silently double-posting.
+      const insertedComment = toRows<{ id: string }>(
         await txDb
-          .select({ id: issueComments.id })
-          .from(issueComments)
-          .where(and(
-            eq(issueComments.issueId, link.issueId),
-            // Containment against the schema-legal provenance row (see
-            // RECONCILED_CARD_LABEL). Belt-and-braces: the primary guarantee is the
-            // status write above, which only one transaction can win, plus the fact
-            // that `cancelled` is terminal — `resubmit` only accepts
-            // `revision_requested`, so a closed card can never re-enter the
-            // candidate set. This probe is kept so that a future path back to
-            // undecided cannot start double-posting silently.
-            sql`${issueComments.metadata} @> ${JSON.stringify({
-              sections: [
-                { rows: [{ type: "key_value", label: RECONCILED_CARD_LABEL, value: candidate.id }] },
-              ],
-            })}::jsonb`,
-          ))
-          .limit(1),
+          .insert(issueComments)
+          .values({
+            companyId: link.companyId,
+            issueId: link.issueId,
+            authorType: "system",
+            idempotencyKey: announcementIdempotencyKey(candidate.id),
+            body: announcementBody({ gate, disposition, approvalTitle }),
+            metadata: announcementMetadata({
+              approvalId: candidate.id,
+              gate,
+              satisfied: disposition.satisfied,
+            }),
+          })
+          .onConflictDoNothing()
+          .returning({ id: issueComments.id }),
       )[0];
-      if (existing) continue;
-
-      await txDb.insert(issueComments).values({
-        companyId: link.companyId,
-        issueId: link.issueId,
-        authorType: "system",
-        body: announcementBody({ gate, disposition, approvalTitle }),
-        metadata: announcementMetadata({
-          approvalId: candidate.id,
-          gate,
-          satisfied: disposition.satisfied,
-        }),
-      });
-      announced += 1;
+      if (insertedComment) announced += 1;
     }
 
     await logActivity(txDb, {

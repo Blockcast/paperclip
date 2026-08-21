@@ -158,7 +158,11 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
 
   async function commentsFor(issueId: string) {
     return db
-      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .select({
+        body: issueComments.body,
+        metadata: issueComments.metadata,
+        idempotencyKey: issueComments.idempotencyKey,
+      })
       .from(issueComments)
       .where(eq(issueComments.issueId, issueId));
   }
@@ -232,6 +236,9 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
         { type: "key_value", label: "Gate satisfied", value: "no" },
       ]),
     );
+    // The dedupe key is what the partial unique index enforces at-most-once on, so
+    // pin it: if it stops being written, dedupe silently degrades to "never matches".
+    expect(comments[0]?.idempotencyKey).toBe(`approval-gate-reconciler:${approvalId}`);
 
     const activity = await db
       .select({ action: activityLog.action, entityId: activityLog.entityId })
@@ -430,28 +437,18 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     const issueId = await insertIssue(companyId, "AGRD-1");
     const approvalId = await insertApproval({ companyId, agentId, gate: gateFor(11), issueId });
 
-    // Drives the jsonb-containment dedupe directly. The across-sweeps test above
-    // cannot reach it: once a card is closed it leaves the undecided candidate set,
-    // so the second sweep never evaluates the predicate at all. Seeding the comment
-    // against a still-pending card is the only way to prove the containment SQL is
-    // both valid and actually matches the shape the reconciler writes — if the two
-    // ever drift apart, `announced` goes back to 1 here.
+    // Drives the idempotency-key dedupe directly. The across-sweeps test above cannot
+    // reach it: once a card is closed it leaves the undecided candidate set, so the
+    // second sweep never re-inserts at all. Seeding a row that collides on
+    // `issue_comments_issue_system_idempotency_idx` against a still-pending card is
+    // the only way to prove the key the reconciler writes actually conflicts with an
+    // existing announcement — if the two ever drift apart, `announced` goes back to 1.
     await db.insert(issueComments).values({
       companyId,
       issueId,
       authorType: "system",
+      idempotencyKey: `approval-gate-reconciler:${approvalId}`,
       body: "pre-existing announcement",
-      metadata: {
-        version: 1,
-        sections: [
-          {
-            title: "Approval gate",
-            rows: [
-              { type: "key_value", label: "Reconciled approval card", value: approvalId },
-            ],
-          },
-        ],
-      },
     });
 
     const result = await reconcileApprovalGates(db, {
