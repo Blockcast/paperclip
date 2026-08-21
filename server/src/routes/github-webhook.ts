@@ -1410,10 +1410,47 @@ function buildDependabotRefireComment(input: {
     `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
     `- Action: \`${input.alert.action}\``,
     `- Severity: ${input.alert.severity}`,
+    // The reopened row keeps the PREVIOUS cycle's title and description, so if
+    // the advisory moved between cycles those quote stale values. Carrying the
+    // current range/patched version here is what corrects them.
+    `- Vulnerable range: ${input.alert.vulnerableRange ?? "not provided in the webhook payload"}`,
+    `- Patched version: ${input.alert.patchedVersion ?? "not provided in the webhook payload"}`,
     `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
     ...priorLines,
     "",
     "If the earlier adjudication still holds, close this issue again citing it — do not repeat the investigation. If the dependency genuinely regressed, remediate as normal.",
+  ].join("\n");
+}
+
+// BLO-28981: a re-fire arriving for an alert whose newest row was `cancelled`.
+// Cancelling an alert issue is a deliberate human act meaning "stop
+// re-adjudicating this" -- the exact lever BLO-28864's phantom `fbinternal`
+// alerts need. So the row is left cancelled and NOT re-queued; this comment is
+// the audit trail that the re-fire arrived and was deliberately suppressed,
+// rather than lost.
+function buildDependabotSuppressedRefireComment(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+  cancelledAt: Date | null;
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const cancelledAt = input.cancelledAt ? input.cancelledAt.toISOString() : "cancel time not recorded";
+  return [
+    `[github-dependabot-refire-suppressed] GitHub re-fired this alert (\`${input.alert.action}\`), and it was **not** re-queued.`,
+    "",
+    `This issue was cancelled (${cancelledAt}), which this intake treats as a standing decision to stop re-adjudicating this alert. No new issue was filed and no agent was woken.`,
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- Severity: ${input.alert.severity}`,
+    `- Vulnerable range: ${input.alert.vulnerableRange ?? "not provided in the webhook payload"}`,
+    `- Patched version: ${input.alert.patchedVersion ?? "not provided in the webhook payload"}`,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    "",
+    "To start taking this alert again, move this issue out of `cancelled` (or close it as `done` instead) — the next re-fire will then reopen it normally.",
   ].join("\n");
 }
 
@@ -1435,6 +1472,9 @@ function buildDependabotRefireComment(input: {
 // cold. The wake still fires against the returned issue id, so a dependency
 // that was genuinely fixed and then regressed still reaches an assignee; this
 // changes which row the signal lands on, never whether it lands.
+//
+// `cancelled` is treated differently from `done`: see the suppression branch
+// below.
 async function resolveDependabotAlertIssue(
   db: Db,
   input: {
@@ -1445,12 +1485,54 @@ async function resolveDependabotAlertIssue(
     alert: DependabotAlertContext;
     deliveryId: string | null;
   },
-): Promise<{ id: string; identifier: string | null; reused: boolean; reopened: boolean }> {
+): Promise<{
+  id: string;
+  identifier: string | null;
+  reused: boolean;
+  reopened: boolean;
+  suppressed: boolean;
+}> {
   const existing = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-  if (existing) return { id: existing.id, identifier: existing.identifier, reused: true, reopened: false };
+  if (existing)
+    return {
+      id: existing.id,
+      identifier: existing.identifier,
+      reused: true,
+      reopened: false,
+      suppressed: false,
+    };
 
   const priorTerminal = await findTerminalDependabotAlertIssues(db, input.companyId, input.originId);
-  const reopenTarget = priorTerminal[0] ?? null;
+  const newestTerminal = priorTerminal[0] ?? null;
+
+  // A cancelled newest row is a standing "stop re-adjudicating this" decision,
+  // so honour it instead of resurrecting the row. Reopening a cancelled issue
+  // would also null out `cancelledAt`, destroying the only field-level record
+  // that the cancellation ever happened -- and since the row is then reused
+  // forever, there would be no suppression lever left anywhere in the intake.
+  // The re-fire is still recorded on the row so a suppressed delivery is
+  // auditable rather than silently dropped. Note this makes `cancelled` load
+  // bearing: anything that auto-cancels an alert issue silences that alert
+  // until a human moves it out of `cancelled`.
+  if (newestTerminal?.status === "cancelled") {
+    await recordSuppressedDependabotRefire(db, {
+      companyId: input.companyId,
+      originId: input.originId,
+      repoFullName: input.repoFullName,
+      alert: input.alert,
+      deliveryId: input.deliveryId,
+      target: newestTerminal,
+    });
+    return {
+      id: newestTerminal.id,
+      identifier: newestTerminal.identifier,
+      reused: true,
+      reopened: false,
+      suppressed: true,
+    };
+  }
+
+  const reopenTarget = newestTerminal;
   if (reopenTarget) {
     const reopened = await reopenTerminalDependabotAlertIssue(db, {
       ...input,
@@ -1463,7 +1545,8 @@ async function resolveDependabotAlertIssue(
     // left an open row behind; reuse it rather than falling through to create
     // a duplicate.
     const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false };
+    if (raced)
+      return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false, suppressed: false };
   }
 
   const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
@@ -1482,13 +1565,57 @@ async function resolveDependabotAlertIssue(
       originId: input.originId,
       originFingerprint: input.originId,
     });
-    return { id: created.id, identifier: created.identifier, reused: false, reopened: false };
+    return { id: created.id, identifier: created.identifier, reused: false, reopened: false, suppressed: false };
   } catch (error) {
     if (!isUniqueDependabotAlertConflict(error)) throw error;
     const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false };
+    if (raced)
+      return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false, suppressed: false };
     throw error;
   }
+}
+
+// Records a suppressed re-fire on an already-cancelled alert row. No UPDATE:
+// the row stays cancelled, keeps its `cancelledAt`, and stays out of the
+// queue. Idempotent on the delivery id via the same
+// `issue_comments_issue_system_idempotency_idx` the reopen notice uses, so a
+// replay does not stack notices.
+async function recordSuppressedDependabotRefire(
+  db: Db,
+  input: {
+    companyId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+    target: { id: string; cancelledAt: Date | null };
+  },
+): Promise<void> {
+  const externalKey = `${input.originId}:refire-suppressed:${input.deliveryId ?? input.alert.action}`;
+  await db
+    .insert(issueComments)
+    .values({
+      companyId: input.companyId,
+      issueId: input.target.id,
+      authorType: "system",
+      idempotencyKey: externalKey,
+      body: buildDependabotSuppressedRefireComment({
+        repoFullName: input.repoFullName,
+        alert: input.alert,
+        deliveryId: input.deliveryId,
+        cancelledAt: input.target.cancelledAt,
+      }),
+      metadata: {
+        kind: "github_dependabot_refire_suppressed",
+        source: "github",
+        externalKey,
+        repoFullName: input.repoFullName,
+        alertNumber: input.alert.alertNumber,
+        action: input.alert.action,
+        deliveryId: input.deliveryId,
+      } as never,
+    })
+    .onConflictDoNothing();
 }
 
 // Reopens a closed Dependabot alert row and records why, atomically. Returns
@@ -1496,7 +1623,15 @@ async function resolveDependabotAlertIssue(
 // WHERE re-checks the status against the latest row version, so a concurrent
 // delivery that already reopened it cannot be double-applied (the same
 // optimistic-concurrency shape reopenInReviewIssueForActionablePrFeedback uses
-// for its `in_review` guard).
+// for its `in_review` guard). Also returns null on a unique-constraint loss:
+// the UPDATE moves the row INTO `issues_active_dependabot_alert_uq`'s scope,
+// so if a concurrent writer made a different row active in the read→write
+// window, Postgres raises rather than updating zero rows. Both losses land on
+// the caller's `findOpenDependabotAlertIssue` fallback, which is the same
+// idiom the create path at the bottom of resolveDependabotAlertIssue uses.
+//
+// `done` only, never `cancelled`: see the suppression branch in
+// resolveDependabotAlertIssue.
 async function reopenTerminalDependabotAlertIssue(
   db: Db,
   input: {
@@ -1509,7 +1644,13 @@ async function reopenTerminalDependabotAlertIssue(
     target: { id: string; identifier: string | null; status: string };
     priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
   },
-): Promise<{ id: string; identifier: string | null; reused: boolean; reopened: boolean } | null> {
+): Promise<{
+  id: string;
+  identifier: string | null;
+  reused: boolean;
+  reopened: boolean;
+  suppressed: boolean;
+} | null> {
   const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
   const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
   const now = new Date();
@@ -1522,29 +1663,42 @@ async function reopenTerminalDependabotAlertIssue(
     priorAdjudications: input.priorAdjudications,
   });
 
-  return db.transaction(async (tx) => {
-    const updated = await tx
-      .update(issues)
-      .set({
-        status: "todo",
-        priority,
-        assigneeAgentId,
-        assigneeUserId: null,
-        // The row is being handed back to the queue: any execution lock left
-        // over from the run that closed it would otherwise make the reopened
-        // issue look checked-out by a run that has long since finished.
-        checkoutRunId: null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        completedAt: null,
-        cancelledAt: null,
-        updatedAt: now,
-      })
-      .where(and(eq(issues.id, input.target.id), inArray(issues.status, ["done", "cancelled"])))
-      .returning({ id: issues.id, identifier: issues.identifier })
-      .then((rows) => rows[0] ?? null);
-    if (!updated) return null;
+  return db
+    .transaction(async (tx) => {
+      const updated = await tx
+        .update(issues)
+        .set({
+          status: "todo",
+          priority,
+          assigneeAgentId,
+          assigneeUserId: null,
+          // The row is being handed back to the queue: any execution lock left
+          // over from the run that closed it would otherwise make the reopened
+          // issue look checked-out by a run that has long since finished.
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: null,
+          // `cancelledAt` is deliberately NOT cleared here: this UPDATE only
+          // ever matches `done` rows, so there is nothing to clear, and a
+          // cancelled row must keep its timestamp (see the suppression branch).
+          //
+          // `executionState` is likewise left alone, unlike the
+          // reopenInReviewIssueForActionablePrFeedback precedent this borrows
+          // its concurrency shape from. That path recomputes it via
+          // markExecutionStateChangesRequested because it reopens issues that
+          // are mid-review-stage; alert issues are created with no
+          // `executionPolicy`, so there is no stage progress to reset. If
+          // stages are ever attached to alert issues, this needs to reset them
+          // or the prior cycle's progress carries into the new one
+          // pre-satisfied.
+          updatedAt: now,
+        })
+        .where(and(eq(issues.id, input.target.id), eq(issues.status, "done")))
+        .returning({ id: issues.id, identifier: issues.identifier })
+        .then((rows) => rows[0] ?? null);
+      if (!updated) return null;
 
     // Idempotent on the delivery id, so a GitHub replay of the same re-fire
     // does not stack duplicate notices on the reopened row.
@@ -1570,8 +1724,18 @@ async function reopenTerminalDependabotAlertIssue(
       })
       .onConflictDoNothing();
 
-    return { id: updated.id, identifier: updated.identifier, reused: true, reopened: true };
-  });
+      return { id: updated.id, identifier: updated.identifier, reused: true, reopened: true, suppressed: false };
+    })
+    .catch((error) => {
+      // The UPDATE moves this row into `issues_active_dependabot_alert_uq`'s
+      // scope. A concurrent writer that made a different row active in the
+      // read→write window makes Postgres raise here rather than update zero
+      // rows, so a raced delivery would otherwise unwind to the outer handler
+      // and be dropped with only a log. Fall back the same way a zero-row
+      // update does: the caller re-reads the open row.
+      if (!isUniqueDependabotAlertConflict(error)) throw error;
+      return null;
+    });
 }
 
 function buildDependabotTerminalReceipt(input: {
@@ -3865,6 +4029,25 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           deliveryId,
         });
 
+        // BLO-28981: the alert's newest row was cancelled, which this intake
+        // reads as a standing decision to stop re-adjudicating it. The re-fire
+        // is already recorded on that row; waking an agent here is exactly the
+        // cost cancelling was meant to stop.
+        if (issue.suppressed) {
+          logger.info(
+            {
+              event: eventName,
+              deliveryId,
+              taskKey,
+              issueId: issue.id,
+              alertNumber: alert.alertNumber,
+              repoFullName: alertRepoFullName,
+            },
+            "github webhook dependabot re-fire suppressed: alert issue is cancelled",
+          );
+          return false;
+        }
+
         const heartbeat = heartbeatService(db, {
           pluginWorkerManager: config.pluginWorkerManager,
           ...config.heartbeatOptions,
@@ -3885,6 +4068,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           contextSnapshot: {
             taskKey,
             issueId: issue.id,
+            // BLO-28981: true when this landed on a previously-adjudicated row
+            // that was reopened rather than a fresh one. The woken run can see
+            // it is handling a repeat without first reading the comment thread.
+            dependabotReopened: issue.reopened,
             wakeReason: "github_dependabot_alert",
             wakeSource: "automation",
             wakeTriggerDetail: "system",
