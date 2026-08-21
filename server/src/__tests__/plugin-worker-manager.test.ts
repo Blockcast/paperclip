@@ -399,6 +399,88 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("scopes runJob invocations per company stamped on job.companyId, for a plugin with more than one configured company (BLO-20957)", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null } | null },
+    ) => ({
+      id: params.companyId,
+      scopedCompanyId: context?.invocationScope?.companyId ?? null,
+    }));
+    // No `bootstrapCompanyId` — this reproduces a plugin configured by more
+    // than one company, where `plugin-loader.ts` deliberately leaves the
+    // legacy bootstrap scope undefined (`listConfigCompanyIds().length > 1`).
+    // Before BLO-20957, every runJob dispatch on a worker started this way
+    // got an empty `{}` invocation scope no matter which company the
+    // scheduler meant to run the job for, so this nested `companies.get`
+    // call would be denied with "company context is required" for both
+    // dispatches below.
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": companiesGet as never,
+      },
+    });
+
+    try {
+      await handle.start();
+
+      // Company A's dispatch must resolve to company A's scope...
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "check-alert-escalations",
+          runId: "run-a",
+          trigger: "schedule",
+          scheduledAt: "2026-08-07T00:00:00.000Z",
+          companyId: "company-a",
+          mode: "echo",
+          requestedCompanyId: "company-a",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-a",
+        scopedCompanyId: "company-a",
+      });
+
+      // ...and company B's independent dispatch must resolve to company B's
+      // scope, never company A's — proving the fan-out is per-company, not a
+      // single process-wide scope shared across dispatches.
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "check-alert-escalations",
+          runId: "run-b",
+          trigger: "schedule",
+          scheduledAt: "2026-08-07T00:00:00.000Z",
+          companyId: "company-b",
+          mode: "echo",
+          requestedCompanyId: "company-b",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-b",
+        scopedCompanyId: "company-b",
+      });
+
+      expect(companiesGet).toHaveBeenNthCalledWith(
+        1,
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      );
+      expect(companiesGet).toHaveBeenNthCalledWith(
+        2,
+        { companyId: "company-b" },
+        { invocationScope: { companyId: "company-b" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects performAction nested host calls that omit the invocation id", async () => {
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",
@@ -637,6 +719,82 @@ describe("plugin host company context guards", () => {
 
       expect(configGet).not.toHaveBeenCalled();
       expect(secretsResolve).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("forwards a host error's machine-readable code to the worker as JSON-RPC data", async () => {
+    // BLO-20738. Host services discriminate their failures with
+    // `HttpError.details.code` (`secret_verifier_unsupported`,
+    // `binding_ambiguous`, …), but until this fix only `message` and a numeric
+    // JSON-RPC code crossed to the worker — and since `HttpError` carries
+    // `status` rather than a numeric `code`, every one of them arrived as a
+    // bare INTERNAL_ERROR. A plugin could only tell two host failures apart by
+    // substring-matching English prose, so alertmanager could not distinguish
+    // "this secret cannot be verified at all" (a permanent misconfiguration,
+    // which must fail loudly and be retried) from "wrong bearer" (a routine
+    // 401). This asserts the code now survives the round trip.
+    const verifierUnsupported = Object.assign(
+      new Error("Secret verifier is unavailable: external provider reference"),
+      { status: 422, details: { code: "secret_verifier_unsupported", internalQuery: "SELECT 1" } },
+    );
+    const secretsResolve = vi.fn(async () => {
+      throw verifierUnsupported;
+    });
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: vi.fn(async () => ({})) },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+
+      const rejection = await handle.call("performAction", {
+        key: "probe",
+        params: {
+          mode: "echo",
+          hostMethod: "secrets.resolve",
+          requestedCompanyId: "company-a",
+        },
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-a",
+        },
+        renderEnvironment: null,
+      }).then(
+        () => { throw new Error("expected the host handler failure to reject"); },
+        (err: unknown) => err,
+      );
+
+      expect(secretsResolve).toHaveBeenCalledTimes(1);
+      expect(rejection).toMatchObject({
+        data: { code: "secret_verifier_unsupported" },
+      });
+      // Only the code is projected. `details` is free-form and a worker is a
+      // lower-trust process, so forwarding it verbatim would turn this into an
+      // exfiltration channel the first time a call site attaches a query or a
+      // row to one.
+      expect((rejection as { data?: Record<string, unknown> }).data)
+        .toEqual({ code: "secret_verifier_unsupported" });
     } finally {
       await handle.stop().catch(() => undefined);
     }

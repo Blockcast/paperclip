@@ -18,6 +18,8 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  issueWorkProducts,
+  POSTGRES_POOL_MAX,
 } from "@paperclipai/db";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
@@ -31,6 +33,7 @@ import {
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
+  __test_isClaudeCodeReviewServiceNotice,
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_hasPrReviewerRequestMention,
@@ -40,12 +43,15 @@ import {
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_recordWorkflowRunSighting,
+  __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
   __resetWorkflowRunSupersessionTrackingForTest,
+  derivePrReviewerWakeMaxConcurrency,
   githubWebhookRoutes,
+  reconcileContendedPrReviewerWakes,
   type GithubWebhookConfig,
 } from "../routes/github-webhook.js";
 import {
@@ -58,6 +64,11 @@ import {
   __resetMetricsForTest,
   getMetricsRegistry,
 } from "../services/metrics.js";
+import {
+  resolveLinkSourceForIdentifier,
+  resolveOwningPaperclipIdentifiers,
+} from "../services/paperclip-identifiers.js";
+import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "../services/pull-request-work-products.js";
 import { issueService } from "../services/issues.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -121,6 +132,618 @@ describe("github-webhook pure helpers", () => {
     expect(__test_extractPaperclipIdentifiers("frontend-X-44")).toEqual([]);
     // Punctuation around match is fine.
     expect(__test_extractPaperclipIdentifiers("(BLO-3182): work")).toEqual(["BLO-3182"]);
+  });
+
+  it("resolves the PR's OWNING identifier as title > labeled Fixes:/Closes:/Refs: body line > branch, never a bare Related: mention (BLO-20886)", () => {
+    // Title outranks everything else.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/BLO-9-stale-branch",
+        title: "fix BLO-1 thing",
+        body: "Refs: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // No title ref: a labeled body line outranks the branch. This ordering is
+    // load-bearing -- branches get repurposed, so a branch ref goes stale
+    // while the curated title/body stays current (observed: #909's branch says
+    // blo-20049 while both its title and body name BLO-20467, the issue it
+    // actually fixes). Ranking the branch above them would reintroduce this
+    // ticket's own defect.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-20049-stale-branch",
+        title: "fix(alertmanager-plugin): resolve webhook token per delivery",
+        body: "- Fixes: BLO-20467",
+      }),
+    ).toEqual({ owning: ["BLO-20467"] });
+
+    // Branch is the LAST resort, and matches case-insensitively so that a
+    // conventional lowercase branch resolves at all -- the identifier pattern
+    // is uppercase-only, which left the branch tier inert and failed 24 of 175
+    // recent PRs closed to `no_owning_reference`, dropping author wakes that
+    // should have been delivered.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886-pr-review-wake-routing" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "qa/blo-21079-master-artifact" }),
+    ).toEqual({ owning: ["BLO-21079"] });
+    // ...but only when nothing curated resolved: a `Related:`-only body still
+    // does not promote a Related: entry, and the branch answers instead.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-1-thing",
+        body: "Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // No branch/title: a Fixes:/Closes:/Resolves:/Refs: labeled line counts,
+    // colon optional -- this repo's own PR bodies use both "Closes: BLO-1"
+    // and the natural-language "Closes BLO-1 and BLO-2" (multiple owners).
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Fixes: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Closes BLO-1 and BLO-2" }),
+    ).toEqual({ owning: ["BLO-1", "BLO-2"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "closed: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] }); // case-insensitive, closing-keyword variant
+
+    // The exact incident shape: Refs: wins, Related: never counts as owning.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Refs:    BLO-19132\nRelated: BLO-20810, BLO-20129, BLO-19079\n",
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+
+    // A bare Related: list with no owning line at all resolves to nothing --
+    // not to the first (or any) Related: entry.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Related: BLO-20810, BLO-20129" }),
+    ).toEqual({ owning: [] });
+
+    // Nothing anywhere.
+    expect(resolveOwningPaperclipIdentifiers({})).toEqual({ owning: [] });
+  });
+
+  it("treats a markdown-bulleted owning reference as owning -- the PR template's own house style (BLO-20886)", () => {
+    // .github/PULL_REQUEST_TEMPLATE.md renders "## Linked Issues or Issue
+    // Description" as a bullet list, so real PR bodies in this repo write
+    // `- Refs: BLO-1`, not a bare `Refs: BLO-1` line. An earlier revision of
+    // this rule anchored the keyword to the start of the line and therefore
+    // matched nothing on the majority of real bodies, failing every such PR
+    // closed to `no_owning_reference` and dropping an author wake that should
+    // have been delivered. Each of these is a real formatting shape.
+    for (const body of [
+      "- Refs: BLO-1",
+      "* Refs: BLO-1",
+      "+ Fixes: BLO-1",
+      "1. Closes: BLO-1",
+      "  - Resolves: BLO-1", // indented sub-bullet
+      "- Refs: [BLO-1](https://paperclip.blockcast.net/BLO/issues/BLO-1)", // markdown link
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ body })).toEqual({ owning: ["BLO-1"] });
+    }
+
+    // A bulleted Related: is still never owning -- the list marker must not
+    // become a way to smuggle an informational mention into the owning tier.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "- Related: BLO-2, BLO-3" }),
+    ).toEqual({ owning: [] });
+
+    // PR #953's body verbatim (trimmed to the section that matters): a
+    // bulleted `Refs:` owner alongside a bulleted `Related:` list. This is the
+    // shape the live misroute actually had -- the pre-existing test above uses
+    // a synthesized bare-line form that does not reproduce it.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: [
+          "## Linked Issues or Issue Description",
+          "",
+          "- Refs: [BLO-19132](https://paperclip.blockcast.net/BLO/issues/BLO-19132)",
+          "- Supersedes: #945",
+          "- Related: [BLO-20810](https://paperclip.blockcast.net/BLO/issues/BLO-20810), [BLO-20129](https://paperclip.blockcast.net/BLO/issues/BLO-20129), [BLO-19079](https://paperclip.blockcast.net/BLO/issues/BLO-19079)",
+        ].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
+  it("ignores owning-looking Markdown code and trailing non-owning labels (BLO-20886)", () => {
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: [
+          "```md",
+          "Refs: BLO-2",
+          "```",
+          "~~~",
+          "Fixes: BLO-3",
+          "~~~~",
+          "    Closes: BLO-4",
+          "\tResolves: BLO-5",
+          "Refs: BLO-1; Related: BLO-6",
+        ].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "```\nRefs: BLO-2\n```\n    Fixes: BLO-3",
+      }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not let a list-prefixed pseudo-closer reopen a fence (BLO-20886)", () => {
+    // A closing fence admits only the marker run and whitespace. The OPENING
+    // grammar tolerates a list marker (a fence nested in a list item is
+    // ordinary Markdown), and reusing it to detect the close meant a `- ``` `
+    // line -- which CommonMark renders as fenced CONTENT -- ended the block
+    // early and exposed the following example as an ownership claim.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "- ```", "Refs: BLO-777", "```"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // Same for a numbered-list prefix, and for a tilde fence.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["~~~", "1. ~~~", "Fixes: BLO-778", "~~~"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // The genuine closer still closes: an owning line AFTER a real fence is
+    // owning, so this did not simply wedge every fence open.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "Refs: BLO-2", "```", "Refs: BLO-1"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("closes a fence indented by its list container, without loosening a root fence (BLO-20886)", () => {
+    // CommonMark measures a closing fence's three-space allowance from the
+    // fence's CONTAINER, not from column zero. Bounding it at three raw spaces
+    // meant a fence opened inside a list item never closed: the scanner
+    // swallowed the rest of the body and suppressed every genuinely visible
+    // owning line after it, dropping a wake that should have been delivered.
+    //
+    // Every expectation here was checked against a real CommonMark
+    // implementation (marked 16.4.2) rather than read off the spec.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- outer", "  - inner:", "", "  ```md", "  Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-555"] });
+
+    // A fence opened on its own list-marker line closes at the item's content
+    // indent.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- ```md", "  Refs: BLO-999", "  ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-555"] });
+
+    // The counter-case that keeps this from becoming a leak: with NO list
+    // container, a four-space `` ``` `` is fenced content, not a closer, so the
+    // fence stays open and everything after it stays unowning. marked agrees --
+    // it renders BLO-555 inside the code block. This is the fail-closed
+    // direction and must not regress into an early close.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```md", "Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // Same when the opener carries its own 1-3 spaces but no container: the
+    // allowance does not grow with the opener's own indent, only with the
+    // container's.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["   ```md", "   Refs: BLO-999", "    ```", "", "Refs: BLO-555"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("treats mixed space-tab indentation as code by expanded columns (BLO-20886)", () => {
+    // CommonMark expands tabs to 4-column stops, so ` \t`, `  \t` and `   \t`
+    // are all four columns of indent -- an indented code block, exactly like
+    // `    `. Matching only the two literal prefixes `\t` and `    ` left the
+    // mixed forms eligible to declare an owner from inside a code example.
+    for (const indent of [" \t", "  \t", "   \t", "\t", "    ", "     "]) {
+      expect(
+        resolveOwningPaperclipIdentifiers({ body: `${indent}Refs: BLO-888` }),
+      ).toEqual({ owning: [] });
+    }
+
+    // Up to three columns is still a normal line, not code.
+    for (const indent of ["", " ", "  ", "   "]) {
+      expect(
+        resolveOwningPaperclipIdentifiers({ body: `${indent}Refs: BLO-1` }),
+      ).toEqual({ owning: ["BLO-1"] });
+    }
+  });
+
+  it("hides house-reference labels inside code, comments and indents (BLO-21312/BLO-20886)", () => {
+    // The house tier was added last and scanned the RAW body, so it skipped
+    // the fence/comment/indent filtering the closing-keyword tier already had.
+    // An `Issue:` line that renders as nothing -- or as a quoted example --
+    // could therefore route an author-directed "push a follow-up commit" wake
+    // to an issue no reader of the PR would call its owner.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["```", "Issue: BLO-111", "```"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-222", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "    Paperclip task: BLO-333" }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "  \tPaperclip issue: BLO-334" }),
+    ).toEqual({ owning: [] });
+
+    // A fenced example does not suppress a real house label elsewhere.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "Issue: BLO-111", "```", "Issue: BLO-1"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("measures the indented-code threshold from the list container (BLO-23893)", () => {
+    // The four-column code threshold is relative to the enclosing CONTAINER,
+    // exactly as the closing-fence allowance already was. A list continuation
+    // expands to four RAW columns while sitting only two columns inside the
+    // item's content, so measuring from column zero threw away an ordinary
+    // visible paragraph as "code" and lost the owner it declared. marked 16.4.2
+    // renders this as `<li>item\n   Refs: BLO-1</li>` -- a paragraph, no <pre>.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "- item\n \tRefs: BLO-1" }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // The counter-cases that keep this from becoming a leak. Four columns PAST
+    // the container is still code, at root and at depth -- marked renders both
+    // inside <pre><code>. This is the direction that matters: the relative
+    // measurement must not make genuinely-fenced-off text eligible to own.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["- item", "", "      Refs: BLO-999"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- a", "  - b", "", "        Refs: BLO-999"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // With no container at all the threshold is unchanged from column zero, so
+    // the BLO-20886 mixed space-tab case above does not regress.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "  \tRefs: BLO-999" }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not open an HTML comment from an indented-code delimiter (BLO-23893)", () => {
+    // Comment state used to advance before the indented-code early-out, so a
+    // `    <!--` -- which CommonMark renders literally, escaped, inside
+    // <pre><code> -- opened a comment that then swallowed every following
+    // VISIBLE line up to the next `-->`, suppressing an owner a reader of the
+    // PR can plainly see. Fail-closed, but still a dropped wake.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["    <!--", "Issue: BLO-1"].join("\n") }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["    <!--", "Refs: BLO-2"].join("\n") }),
+    ).toEqual({ owning: ["BLO-2"] });
+
+    // The converse must hold too: indentation does not create a code block
+    // INSIDE an open HTML block, so an indented `-->` still closes the comment
+    // rather than wedging it open forever. marked closes it here.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!--", "    hidden -->", "Issue: BLO-3"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-3"] });
+
+    // And the fail-closed guarantees are untouched: a real comment still hides
+    // its body, an unterminated one still swallows the rest, and a comment
+    // opened on a fence-opener line still hides its own body.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-999", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Issue: BLO-999"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```x <!--", "```", "Issue: BLO-999", "-->"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+  });
+
+  it("does not manufacture a branch owner from a version number (BLO-20886)", () => {
+    // Uppercasing a whole branch to match the uppercase-only identifier
+    // pattern also turns ordinary words-followed-by-a-number into
+    // "identifiers". Measured over the 200 most recently-updated PRs in this
+    // repo, that invented UNDICI-7, URI-3, ADDRESS-10, PR-870, FOLD-977 and
+    // EXPANSION-5. A spurious owner is not harmless: it hands an
+    // author-directed "push a follow-up commit" wake to whoever is assigned
+    // the same-named issue, which is this ticket's own defect.
+    for (const branch of [
+      "blo-21612-undici-7.29.0",
+      "blo-21611-fast-uri-3.1.5",
+      "blo-21613-ip-address-10.3.1",
+      "blo-21610-brace-expansion-5.0.9",
+      "sre/blo-20867-fold-977-metrics",
+    ]) {
+      const { owning } = resolveOwningPaperclipIdentifiers({ branch });
+      expect(owning).toHaveLength(1);
+      expect(owning[0]).toMatch(/^BLO-\d+$/);
+    }
+
+    // A branch carrying no ref at all still resolves nothing, rather than
+    // coining one from a trailing digit.
+    expect(resolveOwningPaperclipIdentifiers({ branch: "relay-wave-0" })).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "migration-members-page" }),
+    ).toEqual({ owning: [] });
+
+    // The real ref still resolves, at the branch start or after any `/`.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886-pr-review-wake-routing" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(resolveOwningPaperclipIdentifiers({ branch: "blo-21610-thing" })).toEqual({
+      owning: ["BLO-21610"],
+    });
+  });
+
+  it("does not manufacture a branch owner from a Dependabot path (BLO-20886 round 6)", () => {
+    // The segment anchor alone only discriminates when the package name sits
+    // MID-segment (`blo-21612-undici-7.29.0`). Dependabot puts it at the START
+    // of a segment, so `undici-7` clears the anchor and the following `.`
+    // supplies the word boundary -- the leak the anchor was believed to close.
+    // Each of these manufactured an owner before the version-continuation
+    // guard, and each would route a dependency PR's author wake to whoever is
+    // assigned the same-named issue.
+    for (const branch of [
+      "dependabot/npm_and_yarn/undici-7.29.0",
+      "dependabot/npm_and_yarn/types/node-20.11.5",
+      "dependabot/github_actions/actions/checkout-4.2.0",
+      "dependabot/npm_and_yarn/fast-uri-3.1.5",
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // The guard keys on `.` + any word character, which never occurs inside a
+    // real ref. Real refs continue with `-`, `/` or end, so no shape regresses.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "cto/blo-20886-round5-ownership-leaks" }),
+    ).toEqual({ owning: ["BLO-20886"] });
+    expect(resolveOwningPaperclipIdentifiers({ branch: "sre/blo-20886" })).toEqual({
+      owning: ["BLO-20886"],
+    });
+  });
+
+  it("does not manufacture a branch owner from a wildcard version or a bot namespace (BLO-20886 round 7)", () => {
+    // A `.<digit>` guard left WILDCARD versions live. A dependency PR names no
+    // issue in its title or body, so the branch tier is the only one consulted
+    // and a manufactured token would be the PR's SOLE owner.
+    for (const branch of ["renovate/node-20.x", "renovate/undici-7.x", "bump-undici-7.29.0"]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // A version guard cannot be the whole answer, and this is the measurement
+    // that shows it: these carry NO version suffix for the guard to key on, yet
+    // still manufactured `NODE-20` / `UNDICI-7`. Skipping the two reserved bot
+    // namespaces is what closes them -- a dependency bot names its branch after
+    // the package it bumps, so nothing in one is an ownership claim.
+    for (const branch of [
+      "renovate/node-20",
+      "dependabot/npm_and_yarn/undici-7",
+      "renovate/blo-1-not-an-owner",
+    ]) {
+      expect(resolveOwningPaperclipIdentifiers({ branch })).toEqual({ owning: [] });
+    }
+
+    // Ordinary branches keep their refs, including the sub-issue `/` form.
+    expect(resolveOwningPaperclipIdentifiers({ branch: "kkroo/blo-19132-approval-dedupe-v2" })).toEqual({
+      owning: ["BLO-19132"],
+    });
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "blo-21610-brace-expansion-5.0.9" }),
+    ).toEqual({ owning: ["BLO-21610"] });
+  });
+
+  it("classifies a lowercase branch-only owner as branch_ref, not body_ref (BLO-20886 round 6)", () => {
+    // Ownership accepts a lowercase branch case-insensitively, but link-source
+    // classification used the uppercase-only broad extractor, so the very shape
+    // branchTemplate produces resolved to nothing here and fell through to
+    // `body_ref`. With a related issue also named in the body, both candidates
+    // then carried equal strength and insertion order decided which one a
+    // merged PR was persisted against -- losing the authoritative branch owner
+    // to a bare `Related:` mention.
+    const fields = {
+      branch: "cto/blo-20886-round5-ownership-leaks",
+      title: "fix(github-webhook): close ownership-parsing leaks",
+      body: "Refs: BLO-20886\nRelated: BLO-19132",
+    };
+    expect(resolveLinkSourceForIdentifier("BLO-20886", fields)).toBe("branch_ref");
+    // The related-only identifier is still body-sourced, and the branch tier
+    // does not start claiming identifiers it does not carry.
+    expect(resolveLinkSourceForIdentifier("BLO-19132", fields)).toBe("body_ref");
+    // An uppercase branch keeps working, and a Dependabot branch stays unowned.
+    expect(resolveLinkSourceForIdentifier("BLO-20886", { branch: "CTO/BLO-20886-x" })).toBe(
+      "branch_ref",
+    );
+    expect(
+      resolveLinkSourceForIdentifier("UNDICI-7", {
+        branch: "dependabot/npm_and_yarn/undici-7.29.0",
+      }),
+    ).toBeNull();
+  });
+
+  it("falls back to a non-closing house-reference body line when title/keyword/branch all resolve nothing (BLO-21312)", () => {
+    // `github_pr_review_requested` arrives via `issue_comment`, whose payload
+    // carries no `pull_request.head.ref` -- `branch` is never populated on
+    // that path, so the case-insensitive branch tier (BLO-20886) is
+    // structurally unreachable there. These are the real house-label shapes
+    // observed on Blockcast/paperclip#931, #963, #976, #916.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue: https://paperclip.blockcast.net/BLO/issues/BLO-20172",
+      }),
+    ).toEqual({ owning: ["BLO-20172"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "- Paperclip task: [BLO-20396](https://paperclip.blockcast.net/BLO/issues/BLO-20396)",
+      }),
+    ).toEqual({ owning: ["BLO-20396"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip QA task: https://paperclip.blockcast.net/BLO/issues/BLO-21079",
+      }),
+    ).toEqual({ owning: ["BLO-21079"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip issue: https://paperclip.blockcast.net/BLO/issues/BLO-19771",
+      }),
+    ).toEqual({ owning: ["BLO-19771"] });
+
+    // Still never widens far enough to make a bare `Related:` mention owning,
+    // even alongside a house label elsewhere in the same body -- the
+    // BLO-20886 guarantee holds unchanged.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Related: BLO-1, BLO-2\nIssue: BLO-3\n",
+      }),
+    ).toEqual({ owning: ["BLO-3"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: "Related: BLO-1, BLO-2\n" }),
+    ).toEqual({ owning: [] });
+
+    // Ranked below the closing-keyword tier: a Fixes:/Closes:/Refs: line
+    // still wins over a house label in the same body.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Fixes: BLO-1\nPaperclip issue: BLO-2\n",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // Ranked below the branch tier too: on a `pull_request` event (branch
+    // populated), the measured branch answer still wins over an unmeasured
+    // house label in the same body.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        branch: "fix/blo-1-thing",
+        body: "Paperclip issue: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // Title still outranks a house label.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        title: "fix BLO-1 thing",
+        body: "Paperclip issue: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+
+    // The colon is mandatory for this weaker tier (unlike the closing-keyword
+    // tier, where "Closes BLO-1" is unambiguous natural language). "Issue" is
+    // an ordinary noun that also starts ordinary sentences, so an optional
+    // colon here would treat prose as an ownership claim. Neither of these is
+    // a house label -- both must resolve to nothing.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue filed a related bug, see BLO-1",
+      }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue description for BLO-2",
+      }),
+    ).toEqual({ owning: [] });
+
+    // A house-reference line carrying a second, explicitly different label on
+    // the SAME line must resolve only the house label's own direct value --
+    // the semicolon-separated Related: mention must not become owning just
+    // because it shares a line with a real house label (BLO-20886's
+    // guarantee applied to this new tier).
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Issue: BLO-1; Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: "Paperclip issue: BLO-1, Related: BLO-2",
+      }),
+    ).toEqual({ owning: ["BLO-1"] });
+  });
+
+  it("keeps owning-looking text unreachable inside list-nested fences and unclosed fences (BLO-20886)", () => {
+    // A fence nested in a list item is ordinary Markdown -- it is how a bullet
+    // quotes an example PR body -- but its opening line starts with the list
+    // marker. A root-level-only fence scanner never opened a fence here, so the
+    // indented `Refs:` line inside the example declared an owner and could
+    // capture an author-directed "push a follow-up commit" wake.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["- ```md", "  Refs: BLO-999", "  ```"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["1. ~~~", "   Closes: BLO-998", "   ~~~"].join("\n") }),
+    ).toEqual({ owning: [] });
+
+    // CommonMark allows only whitespace after a CLOSING fence's marker run, so
+    // ``` js inside an open fence is content. Treating it as the close reopened
+    // the remainder of the block to the ownership scan.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["```", "example:", "``` js", "Refs: BLO-997", "```"].join("\n"),
+      }),
+    ).toEqual({ owning: [] });
+
+    // An unterminated fence swallows the rest of the body rather than falling
+    // back to matching -- ambiguity fails closed, never toward a guessed owner.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["```", "Refs: BLO-996"].join("\n") }),
+    ).toEqual({ owning: [] });
+
+    // The fence rules must not swallow the real thing: a closed fence releases
+    // the lines after it, and the repo's bulleted house style still owns.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["- ```md", "  Refs: BLO-999", "  ```", "- Refs: BLO-19132"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
+  });
+
+  it("never lets an HTML comment declare an owner (BLO-20886)", () => {
+    // A comment renders as nothing, so an owner declared inside one is
+    // invisible to every human reading the PR -- an unexplainable misroute.
+    // The opener and its `-->` sit on different lines in the repo's own
+    // PULL_REQUEST_TEMPLATE.md, so the state has to cross the line loop.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Refs: BLO-888", "-->"].join("\n") }),
+    ).toEqual({ owning: [] });
+    expect(resolveOwningPaperclipIdentifiers({ body: "<!-- Refs: BLO-887 -->" })).toEqual({
+      owning: [],
+    });
+    // A comment cannot hide the fence that would otherwise contain it, either.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!-- ```", "-->", "Refs: BLO-886"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-886"] });
+    // Unterminated: the rest of the body stays commented out, failing closed.
+    expect(
+      resolveOwningPaperclipIdentifiers({ body: ["<!--", "Refs: BLO-885"].join("\n") }),
+    ).toEqual({ owning: [] });
+    // A visible owner beside a commented decoy resolves to the visible one only.
+    expect(
+      resolveOwningPaperclipIdentifiers({
+        body: ["<!-- Fixes: BLO-884 -->", "Refs: BLO-19132"].join("\n"),
+      }),
+    ).toEqual({ owning: ["BLO-19132"] });
   });
 
   it("rejects payloads with bad signatures and accepts ones with good signatures", () => {
@@ -1006,6 +1629,33 @@ describe("github-webhook pure helpers", () => {
     expect(ctx ? __test_shouldFirePrReviewerWake(ctx) : true).toBe(false);
   });
 
+  it("keeps a lowercase branch-only owner in the candidate identifiers (BLO-20886)", () => {
+    // The owning tiers uppercase the branch (real branches are lowercase and
+    // PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only); the broad `identifiers`
+    // extraction does not. A PR whose ONLY ref is a lowercase branch therefore
+    // resolved an owner while `identifiers` came back empty -- and the route
+    // drops such a delivery at the `no_paperclip_identifier` gate before the
+    // owner is ever consulted. Past that gate it is still unreachable, because
+    // author wakes are `matched.filter(m => owning.includes(m.identifier))`
+    // and `matched` derives from `identifiers`. Either way the wake this
+    // module exists to deliver is lost, so the owner must appear in both.
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 962,
+        title: "tidy up the webhook",
+        body: "No issue reference in this body at all.",
+        head: { ref: "fix/blo-20886-only", sha: "deadbeef" },
+        user: { login: "kkroo" },
+      },
+      review: { state: "changes_requested", body: "please fix", user: { login: "ally" } },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    expect(ctx?.owningIdentifiers).toEqual(["BLO-20886"]);
+    expect(ctx?.identifiers).toContain("BLO-20886");
+  });
+
   it("extracts review body / state / author from pull_request_review.submitted so the assignee wake can render it inline (BLO-6300)", () => {
     const ctx = __test_resolveEventContext("pull_request_review", {
       action: "submitted",
@@ -1038,6 +1688,34 @@ describe("github-webhook pure helpers", () => {
       headSha: "feedface",
     });
     expect(__test_shouldFirePrReviewerWake(ctx)).toBe(true);
+  });
+
+  // Review finding (PR #1125): the reviewed-head provenance must be the
+  // review's own immutable `commit_id`, not `pull_request.head.sha` -- the
+  // latter reflects whatever the branch is at NOW, which can have advanced
+  // past what the review actually looked at by the time this webhook is
+  // processed.
+  it("prefers review.commit_id over pull_request.head.sha for headSha when the branch has since advanced (PR #1125 review finding)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 953,
+        title: "feat(cdn): BLO-5269 aggregator",
+        body: null,
+        html_url: "https://github.com/Blockcast/magma/pull/953",
+        // The branch has advanced past what this review actually reviewed.
+        head: { ref: "feat/BLO-5269", sha: "advanced-after-review" },
+      },
+      review: {
+        body: "Critical: PushExtCDNCacheHitRates POSTs to a read-only serializer.",
+        state: "commented",
+        html_url: "https://github.com/Blockcast/magma/pull/953#pullrequestreview-99",
+        user: { login: "ally" },
+        commit_id: "reviewed-this-commit",
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    expect(ctx).toMatchObject({ headSha: "reviewed-this-commit" });
   });
 
   it("flags the reviewer's own pull_request_review.submitted as a self-echo (BLO-15799)", () => {
@@ -1332,6 +2010,89 @@ describe("workflow_run supersession classification (BLO-21078 AC3)", () => {
   });
 });
 
+describe("comment-review gate webhook trigger", () => {
+  const repo = "Blockcast/paperclip";
+  const head = "1234567890abcdef1234567890abcdef12345678";
+  const reviewer = "allyblockcast[bot]";
+
+  function issueCommentPayload(author = reviewer, body = "## Ally — Consolidated PR Review\n### Important Issues (0)") {
+    return {
+      action: "created",
+      repository: { full_name: repo },
+      issue: {
+        number: 1049,
+        html_url: `https://github.com/${repo}/pull/1049`,
+        pull_request: { url: `https://api.github.com/repos/${repo}/pulls/1049` },
+      },
+      comment: { user: { login: author }, body },
+    };
+  }
+
+  it("triggers for a trusted Ally PR comment even with no Paperclip identifier", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload(),
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("rejects a same-shaped human comment and a prose mention of the heading", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload("allyblockcast"),
+        reviewer,
+      ),
+    ).toBeNull();
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "issue_comment",
+        issueCommentPayload(reviewer, "Please revisit your Ally — Consolidated PR Review."),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+
+  it.each(["opened", "reopened", "synchronize"])("starts a fresh status check on pull_request.%s", (action) => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request",
+        {
+          action,
+          repository: { full_name: repo },
+          pull_request: { number: 1049, html_url: `https://github.com/${repo}/pull/1049`, head: { sha: head } },
+        },
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      headSha: head,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("does not run on unrelated PR lifecycle actions", () => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request",
+        {
+          action: "closed",
+          repository: { full_name: repo },
+          pull_request: { number: 1049, head: { sha: head } },
+        },
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+});
+
 describeEmbeddedPostgres("github-webhook route", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -1366,7 +2127,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -1376,6 +2137,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     app.use("/api/webhooks/github", githubWebhookRoutes(db, {
       webhookSecret,
       ...config,
+      runPrCommentReviewGateCheck: config.runPrCommentReviewGateCheck ?? (async () => ({
+        posted: false as const,
+        reason: "not_configured" as const,
+      })),
       heartbeatOptions: {
         penstockAvailabilityGate: allowPenstockGate,
         skipQueuedRunDispatch: true,
@@ -1544,6 +2309,57 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body).toMatchObject({ ignored: "no_matching_issue", identifiers: ["UNKNOWN-1234"] });
   });
 
+  it("runs the comment-review gate for a trusted Ally comment without a Paperclip identifier", async () => {
+    const calls: Array<{
+      repoFullName: string;
+      prNumber: number;
+      headSha?: string | null;
+      prUrl?: string | null;
+    }> = [];
+    let markCalled!: () => void;
+    const called = new Promise<void>((resolve) => {
+      markCalled = resolve;
+    });
+    const app = buildApp({
+      prReviewerBotLogin: "allyblockcast[bot]",
+      runPrCommentReviewGateCheck: async (input) => {
+        calls.push(input);
+        markCalled();
+        return { posted: true, verdict: { state: "success", reason: "test" } };
+      },
+    });
+    const payload = {
+      action: "created",
+      repository: { full_name: "Blockcast/paperclip" },
+      issue: {
+        number: 1049,
+        title: "No tracker reference here",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1049" },
+      },
+      comment: {
+        user: { login: "allyblockcast[bot]" },
+        body: "## Ally — Consolidated PR Review\n### Important Issues (0)",
+      },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const response = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("content-type", "application/json")
+      .send(body);
+    await called;
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ ignored: "no_paperclip_identifier" });
+    expect(calls).toEqual([{
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1049,
+      prUrl: "https://github.com/Blockcast/paperclip/pull/1049",
+    }]);
+  });
+
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({
@@ -1581,6 +2397,695 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("queued");
+  });
+
+  // BLO-19566 AC4. Before this, nothing wrote a `pull_request` work product,
+  // so productivity/liveness accounting -- whose own verdict criteria ask for
+  // "a non-stale PR/MR link in the source issue's evidence" -- could never find
+  // one, and an assignee pushing commits to an open PR read as zero progress.
+  describe("pull_request work products", () => {
+    function prPayload(opts: {
+      action: string;
+      identifier: string;
+      number?: number;
+      title?: string | null;
+      draft?: boolean;
+      merged?: boolean;
+      beforeSha?: string | null;
+      headSha?: string;
+      updatedAt?: string;
+    }) {
+      const defaultUpdatedAtByAction: Record<string, string> = {
+        opened: "2026-04-30T10:00:00Z",
+        synchronize: "2026-04-30T10:05:00Z",
+        ready_for_review: "2026-04-30T10:10:00Z",
+        converted_to_draft: "2026-04-30T10:10:00Z",
+        closed: "2026-04-30T10:15:00Z",
+        reopened: "2026-04-30T10:20:00Z",
+      };
+      return {
+        action: opts.action,
+        ...(opts.beforeSha ? { before: opts.beforeSha } : {}),
+        pull_request: {
+          number: opts.number ?? 4242,
+          title: opts.title === undefined ? `Fix ${opts.identifier}` : opts.title,
+          body: null,
+          html_url: `https://github.com/Blockcast/paperclip/pull/${opts.number ?? 4242}`,
+          updated_at: opts.updatedAt ?? defaultUpdatedAtByAction[opts.action] ?? "2026-04-30T10:00:00Z",
+          draft: opts.draft ?? false,
+          merged: opts.merged ?? false,
+          head: { ref: `fix/${opts.identifier.toLowerCase()}`, sha: opts.headSha ?? "head-one" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+    }
+
+    async function postPr(
+      app: express.Express,
+      payload: Record<string, unknown>,
+      deliveryId: string,
+    ) {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    it("creates a pull_request work product on the referenced issue", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40001");
+      const app = buildApp();
+
+      const res = await postPr(app, prPayload({ action: "opened", identifier: "BLO-40001" }), "wp-opened");
+      expect(res.status).toBe(200);
+
+      const rows = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#4242",
+        url: "https://github.com/Blockcast/paperclip/pull/4242",
+        status: "ready_for_review",
+        title: "Fix BLO-40001",
+      });
+      expect(rows[0]?.metadata).toMatchObject({
+        source: "github_pull_request_webhook",
+        sourceEventOrder: 10,
+        sourceEventActionOrder: 10,
+        sourceEventTimestamp: "2026-04-30T10:00:00.000Z",
+      });
+      expect(rows[0]?.sourceTrust).toMatchObject({
+        preset: "standard",
+        disposition: "promoted",
+        promotedByActorType: "system",
+        promotedByActorId: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+      });
+    });
+
+    it("updates the same row on a later push instead of appending one per event", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40002");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40002", number: 4243 }), "wp-seq-1");
+      const afterOpen = await db
+        .select({ id: issueWorkProducts.id, updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(afterOpen).toHaveLength(1);
+
+      await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "BLO-40002",
+          number: 4243,
+          headSha: "head-two",
+          updatedAt: "2026-04-30T10:15:00Z",
+        }),
+        "wp-seq-2",
+      );
+
+      const afterPush = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      // One PR, one row -- the identity excludes the head SHA on purpose.
+      expect(afterPush).toHaveLength(1);
+      expect(afterPush[0]?.id).toBe(afterOpen[0]?.id);
+      expect(afterPush[0]?.metadata).toMatchObject({ headSha: "head-two", lastEventAction: "synchronize" });
+      // updatedAt is what liveness reads as "the PR moved"; it must advance.
+      expect(afterPush[0]!.updatedAt.getTime()).toBeGreaterThanOrEqual(afterOpen[0]!.updatedAt.getTime());
+    });
+
+    it("records the terminal state when the PR merges", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40003");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40003", number: 4244 }), "wp-merge-1");
+      await postPr(
+        app,
+        prPayload({ action: "closed", identifier: "BLO-40003", number: 4244, merged: true }),
+        "wp-merge-2",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+    });
+
+    it("does not let a stale synchronize event overwrite a terminal merge state", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40006");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40006", number: 4247 }), "wp-order-1");
+      await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "BLO-40006",
+          number: 4247,
+          merged: true,
+          headSha: "merge-head",
+          updatedAt: "2026-04-30T10:20:00Z",
+        }),
+        "wp-order-2",
+      );
+      const afterMerge = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+      await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "BLO-40006",
+          number: 4247,
+          headSha: "stale-sync-head",
+          updatedAt: "2026-04-30T10:10:00Z",
+        }),
+        "wp-order-3",
+      );
+
+      const rows = await db
+        .select({
+          status: issueWorkProducts.status,
+          metadata: issueWorkProducts.metadata,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "merge-head",
+        lastEventAction: "closed",
+        sourceEventOrder: 30,
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterMerge?.updatedAt.getTime());
+    });
+
+    it("accepts a newer reopened event after a closed PR", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40008");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40008",
+        number: 4249,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-reopen-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40008",
+        number: 4249,
+        merged: false,
+        updatedAt: "2026-04-30T10:10:00Z",
+      }), "wp-reopen-2");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40008",
+        number: 4249,
+        headSha: "reopened-head",
+        updatedAt: "2026-04-30T10:20:00Z",
+      }), "wp-reopen-3");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "reopened-head",
+        lastEventAction: "reopened",
+        sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
+      });
+    });
+
+    // GitHub's `pull_request.updated_at` is second-granular, so a rapid
+    // close/reopen pair carries an identical timestamp and the two true source
+    // orders are indistinguishable. Action rank can only satisfy one of them, so
+    // the tie resolves toward the terminal state: keeping an open state on a
+    // truly-closed PR is permanent (a closed PR emits nothing further), whereas
+    // keeping a closed state on a truly-open PR is corrected by the next event.
+    // Both orders are covered here, plus the self-correction that pays for the
+    // one we deliberately get wrong.
+    it("keeps closed for a same-second reopened event after a closed PR", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40020");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40020",
+        number: 4260,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reopen-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40020",
+        number: 4260,
+        headSha: "same-second-reopen-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reopen-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("closed");
+      expect(rows[0]?.metadata).toMatchObject({ lastEventAction: "closed" });
+    });
+
+    it("restores a genuinely reopened PR on the next strictly-later event", async () => {
+      // The cost of resolving the ambiguous tie toward `closed` is bounded: a PR
+      // that really is open emits further events, and the first one carrying a
+      // later `updated_at` is accepted outright.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40023");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40023",
+        number: 4263,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-selfheal-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40023",
+        number: 4263,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-selfheal-2");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40023",
+        number: 4263,
+        headSha: "selfheal-head",
+        updatedAt: "2026-04-30T10:00:01Z",
+      }), "wp-same-second-selfheal-3");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "selfheal-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("applies a distinct same-second push instead of retaining stale head metadata", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40021");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40021",
+        number: 4261,
+        headSha: "first-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-push-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40021",
+        number: 4261,
+        headSha: "second-head",
+        beforeSha: "first-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-push-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "second-head",
+        previousHeadSha: "first-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("keeps closed when a same-second close follows a reopen, whether delayed or genuine", async () => {
+      // This used to assert the reopen survives, on the reading that such a
+      // close must be a delayed redelivery. That reading is not available from
+      // the payloads: a genuinely stale close carries the *old* close's
+      // `updated_at` and is already rejected on timestamp before reaching the
+      // tie-break (covered below), so everything that gets here is same-second
+      // and genuinely ambiguous -- byte-identical whether the close came first
+      // or second. It is also the order rank alone gets wrong: the incoming
+      // close ranks 30 below the stored reopen's 40, so a pure rank tie-break
+      // would leave this PR `ready_for_review` and progress-eligible forever.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40024");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40024",
+        number: 4264,
+        headSha: "same-second-reopened-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-reopen-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40024",
+        number: 4264,
+        merged: false,
+        headSha: "same-second-closed-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-reopen-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("closed");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "same-second-closed-head",
+        lastEventAction: "closed",
+      });
+    });
+
+    it("still rejects a genuinely older close on timestamp, not on rank", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40025");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40025",
+        number: 4265,
+        headSha: "older-close-reopened-head",
+        updatedAt: "2026-04-30T10:05:00Z",
+      }), "wp-older-close-1");
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40025",
+        number: 4265,
+        merged: false,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-older-close-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "older-close-reopened-head",
+        lastEventAction: "reopened",
+      });
+    });
+
+    it("keeps the newest same-second push when deliveries arrive newest first", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40024");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40024",
+        number: 4264,
+        beforeSha: "second-head",
+        headSha: "third-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-push-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40024",
+        number: 4264,
+        beforeSha: "first-head",
+        headSha: "second-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-reverse-push-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "third-head",
+        previousHeadSha: "second-head",
+        lastEventAction: "synchronize",
+      });
+    });
+
+    it("does not let a same-second stray event un-merge a merged PR", async () => {
+      // `merged` is absorbing: the same-second reopen allowance must not become
+      // a path for demoting a terminal merge.
+      const { issueId } = await seedIssueWithIdentifier("BLO-40022");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "closed",
+        identifier: "BLO-40022",
+        number: 4262,
+        merged: true,
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-merged-1");
+      await postPr(app, prPayload({
+        action: "reopened",
+        identifier: "BLO-40022",
+        number: 4262,
+        headSha: "post-merge-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-same-second-merged-2");
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+    });
+
+    it("ignores delayed equal-rank deliveries instead of refreshing PR liveness", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40009");
+      const app = buildApp();
+
+      await postPr(app, prPayload({
+        action: "opened",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "opened-head",
+        updatedAt: "2026-04-30T10:00:00Z",
+      }), "wp-equal-rank-1");
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "newer-sync-head",
+        updatedAt: "2026-04-30T10:20:00Z",
+      }), "wp-equal-rank-2");
+      const afterNewerSync = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+
+      await postPr(app, prPayload({
+        action: "synchronize",
+        identifier: "BLO-40009",
+        number: 4250,
+        headSha: "stale-sync-head",
+        updatedAt: "2026-04-30T10:05:00Z",
+      }), "wp-equal-rank-3");
+
+      const rows = await db
+        .select({
+          metadata: issueWorkProducts.metadata,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "newer-sync-head",
+        lastEventAction: "synchronize",
+        sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterNewerSync?.updatedAt.getTime());
+    });
+
+    it("does not refresh updatedAt for an exact webhook redelivery", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40010");
+      const app = buildApp();
+      const payload = prPayload({
+        action: "synchronize",
+        identifier: "BLO-40010",
+        number: 4251,
+        headSha: "same-head",
+        updatedAt: "2026-04-30T10:30:00Z",
+      });
+
+      await postPr(app, payload, "wp-redelivery-1");
+      const afterFirst = await db
+        .select({ updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId))
+        .then((rows) => rows[0]);
+
+      await postPr(app, payload, "wp-redelivery-2");
+
+      const rows = await db
+        .select({ metadata: issueWorkProducts.metadata, updatedAt: issueWorkProducts.updatedAt })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "same-head",
+        sourceEventTimestamp: "2026-04-30T10:30:00.000Z",
+      });
+      expect(rows[0]?.updatedAt.getTime()).toBe(afterFirst?.updatedAt.getTime());
+    });
+
+    it("keeps updating a previously linked PR row after the identifier is removed", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40007");
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40007", number: 4248 }), "wp-link-1");
+      const syncWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "no-ticket",
+          number: 4248,
+          title: "Retitled without paperclip id",
+          headSha: "head-without-id",
+        }),
+        "wp-link-2",
+      );
+      expect(syncWithoutIdentifier.status).toBe(200);
+      expect(syncWithoutIdentifier.body).toMatchObject({ ignored: "no_matching_issue" });
+
+      let rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("ready_for_review");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "head-without-id",
+        lastEventAction: "synchronize",
+      });
+
+      const closeWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "no-ticket",
+          number: 4248,
+          title: "Retitled without paperclip id",
+          merged: true,
+          headSha: "merge-without-id",
+        }),
+        "wp-link-3",
+      );
+      expect(closeWithoutIdentifier.status).toBe(200);
+      expect(closeWithoutIdentifier.body).toMatchObject({ ignored: "no_matching_issue" });
+
+      rows = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("merged");
+      expect(rows[0]?.metadata).toMatchObject({
+        headSha: "merge-without-id",
+        lastEventAction: "closed",
+        sourceEventOrder: 30,
+      });
+    });
+
+    it("does not treat actor-created PR rows as previous webhook links", async () => {
+      const { companyId, issueId } = await seedIssueWithIdentifier("BLO-40011");
+      const app = buildApp();
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/paperclip#4252",
+        title: "Actor-authored PR claim",
+        url: "https://github.com/Blockcast/paperclip/pull/4252",
+        status: "ready_for_review",
+        metadata: { source: "manual", headSha: "manual-head" },
+        sourceTrust: null,
+      });
+
+      const res = await postPr(
+        app,
+        prPayload({
+          action: "synchronize",
+          identifier: "no-ticket",
+          number: 4252,
+          title: "Retitled without paperclip id",
+          headSha: "webhook-head",
+          updatedAt: "2026-04-30T10:45:00Z",
+        }),
+        "wp-manual-link-1",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ignored: "no_paperclip_identifier" });
+      const rows = await db
+        .select({
+          metadata: issueWorkProducts.metadata,
+          sourceTrust: issueWorkProducts.sourceTrust,
+          updatedAt: issueWorkProducts.updatedAt,
+        })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toEqual({ source: "manual", headSha: "manual-head" });
+      expect(rows[0]?.sourceTrust).toBeNull();
+    });
+
+    it("records a draft PR as draft rather than ready_for_review", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40004");
+      const app = buildApp();
+
+      await postPr(
+        app,
+        prPayload({ action: "opened", identifier: "BLO-40004", number: 4245, draft: true }),
+        "wp-draft",
+      );
+
+      const rows = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows[0]?.status).toBe("draft");
+    });
+
+    it("writes a row for an unassigned issue (evidence about the PR, not a wake)", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40005", { assignee: false });
+      const app = buildApp();
+
+      await postPr(app, prPayload({ action: "opened", identifier: "BLO-40005", number: 4246 }), "wp-unassigned");
+
+      const rows = await db
+        .select({ id: issueWorkProducts.id })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+    });
   });
 
   it("does not coalesce reviewer PR wakes into a thin null-scope automation run (BLO-7457)", async () => {
@@ -1911,7 +3416,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs).toHaveLength(1);
   });
 
-  it("returns a retryable error instead of bypassing an issue-create PR lock", async () => {
+  it("records a durable retry instead of bypassing an issue-create PR lock", async () => {
     const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({ prReviewerAgentIds: [reviewerId] });
     const taskKey = "pr_review:blockcast/paperclip:20526";
@@ -1963,10 +3468,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .set("content-type", "application/json")
         .send(body);
 
-      expect(contended.status).toBe(503);
-      expect(contended.body).toMatchObject({
-        code: "pr_reviewer_dispatch_contended",
-      });
+      // The invariant this test exists for: the webhook must never dispatch
+      // outside the lock while issue-create holds the PR scope. That is
+      // asserted by the zero-runs check below and is unchanged.
+      //
+      // What changed (BLO-21995): losing the scope no longer costs the wake, so
+      // the response is no longer a 503 asking GitHub to redeliver. It is a 200
+      // plus a durable retry record the reconciler owns. Answering 503 here now
+      // would be worse than useless — GitHub does not auto-redeliver, and a
+      // manual redelivery would race our own replay.
+      expect(contended.status).toBe(200);
+      expect(contended.body.reviewerWakeFired).toBe(false);
+      expect(await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended")))
+        .toHaveLength(1);
       expect(await db
         .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
         .from(heartbeatRuns)
@@ -2007,7 +3524,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
         number: 18859,
         title: "Delivery funnel counters",
         body: null,
-        head: { ref: "platform/blo-18859-github-delivery-metrics" },
+        // Deliberately carries no Paperclip ref in branch, title or body: this
+        // test is about the reviewer-wake delivery counters, and needs the
+        // route to stop at `no_paperclip_identifier` so nothing else runs. The
+        // branch used to read `platform/blo-18859-...`, which only stayed
+        // inert because a lowercase branch-only ref was silently dropped
+        // before routing (BLO-20886) -- scaffolding that stopped being inert
+        // once that was fixed.
+        head: { ref: "platform/github-delivery-metrics" },
       },
       repository: { full_name: "Blockcast/paperclip" },
     };
@@ -2044,6 +3568,505 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(await deliveryCount("queued")).toBe(1);
   });
 
+  // BLO-21995: a sanctioned review request that loses the PR-scope advisory
+  // lock used to be dropped silently — the route answered 200 with
+  // reviewerWakeFired:false and wrote nothing, and GitHub only redelivers what
+  // it recorded as failed. These pin the durable-retry path that replaces it.
+  describe("contended PR-reviewer wake durable retry (BLO-21995)", () => {
+    const REPO = "Blockcast/paperclip";
+
+    function reviewerConfig(reviewerId: string): GithubWebhookConfig {
+      return {
+        webhookSecret,
+        prReviewerAgentIds: [reviewerId],
+        heartbeatOptions: {
+          penstockAvailabilityGate: allowPenstockGate,
+          skipQueuedRunDispatch: true,
+        },
+      };
+    }
+
+    async function runsForTask(taskKey: string) {
+      return await db
+        .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.contextTaskKey, taskKey));
+    }
+
+    function openedPayload(prNumber: number) {
+      return {
+        action: "opened",
+        pull_request: {
+          number: prNumber,
+          title: "Durable retry for contended reviewer wakes",
+          body: null,
+          head: { ref: "cto/blo-21995-durable-pr-review-retry" },
+        },
+        repository: { full_name: REPO },
+      };
+    }
+
+    it("persists a durable record when the PR scope is contended, then dispatches exactly one wake", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21995;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      // Hold the PR scope in a competing transaction for longer than
+      // PR_REVIEWER_TASK_LOCK_TIMEOUT_MS (2s) so the delivery provably loses
+      // the race rather than merely racing it.
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      // Let the holder actually acquire before the delivery arrives.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-contended")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(res.status).toBe(200);
+      // Not fired *yet* — the response must never claim a run that only the
+      // reconciler will enqueue.
+      expect(res.body.reviewerWakeFired).toBe(false);
+      // Nothing reached heartbeat while the scope was held.
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      // ...but the delivery is durably recorded rather than lost.
+      const contended = await db
+        .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(contended).toHaveLength(1);
+      expect(await deliveryCount("received")).toBe(1);
+      expect(await deliveryCount("deferred")).toBe(1);
+      expect(await deliveryCount("queued")).toBe(0);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // Drive the worker with a clock past the first backoff so the record is due.
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      expect(reconciled.recovered).toBe(1);
+      expect(reconciled.exhausted).toBe(0);
+
+      const runs = await runsForTask(taskKey);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.agentId).toBe(reviewerId);
+
+      // Funnel arithmetic stays balanced across the deferral: each *attempt* is
+      // one intent-to-wake that ends in exactly one terminal arm, so the
+      // contended attempt lands on `deferred` and the replay on `queued` —
+      // received(2) == queued(1) + deferred(1). Nothing is dead-lettered.
+      expect(await deliveryCount("received")).toBe(2);
+      expect(await deliveryCount("deferred")).toBe(1);
+      expect(await deliveryCount("queued")).toBe(1);
+      expect(await deliveryCount("retried")).toBe(1);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    it("keeps a redelivered contended event to exactly one wake", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21996;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const send = () =>
+        request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", "delivery-blo-21995-redelivered")
+          .set("content-type", "application/json")
+          .send(body);
+
+      // GitHub redelivers the same delivery id while the scope is still held.
+      // Concurrently, not sequentially: a sequential pair is satisfied by a
+      // plain select-then-insert and would not catch the race where both
+      // arrivals observe no row and both write one.
+      await Promise.all([send(), send()]);
+
+      // One retry record per delivery id, not one per arrival.
+      const contended = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(contended).toHaveLength(1);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // Two reconciler passes must not double-wake either.
+      await reconcileContendedPrReviewerWakes(db, reviewerConfig(reviewerId), new Date(Date.now() + 10_000));
+      await reconcileContendedPrReviewerWakes(db, reviewerConfig(reviewerId), new Date(Date.now() + 20_000));
+
+      expect(await runsForTask(taskKey)).toHaveLength(1);
+      expect(await deliveryCount("queued")).toBe(1);
+    }, 40_000);
+
+    it("records a contended wake even when the reviewer is paused at persistence time", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21997;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      // The reviewer is configured but not invokable right now — a config push,
+      // a restart, a transient pause. This must NOT make the contended delivery
+      // unrecordable: availability is transient and the durable record exists
+      // precisely to outlive it.
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-paused-at-persist")
+        .set("content-type", "application/json")
+        .send(body);
+
+      // 200, not 503: the delivery is durable, so GitHub must not also hold it
+      // for manual redelivery.
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      const contended = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(contended).toHaveLength(1);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // The reviewer comes back, and the recorded wake is still dispatchable.
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      expect(reconciled.recovered).toBe(1);
+
+      const runs = await runsForTask(taskKey);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.agentId).toBe(reviewerId);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 40_000);
+
+    it("re-arms rather than retiring when the reviewer is paused at reconcile time", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 21998;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseScope: (() => void) | null = null;
+      const scopeReleased = new Promise<void>((resolve) => {
+        releaseScope = resolve;
+      });
+      const scopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await scopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-paused-at-reconcile")
+        .set("content-type", "application/json")
+        .send(body);
+
+      releaseScope!();
+      await scopeHolder;
+
+      // The reviewer goes down between persistence and the first retry.
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const firstPass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      // The critical assertion: a transiently unavailable reviewer must not
+      // retire the record. Retiring here would drop a sanctioned review request
+      // because the reviewer happened to be down for the seconds this pass ran.
+      expect(firstPass.recovered).toBe(0);
+      expect(firstPass.superseded).toBe(0);
+      expect(firstPass.exhausted).toBe(0);
+      expect(firstPass.stillContended).toBe(1);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+      const stillArmed = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(stillArmed).toHaveLength(1);
+
+      // It comes back, and the next due pass dispatches exactly one wake.
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const secondPass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 60_000),
+      );
+      expect(secondPass.recovered).toBe(1);
+
+      const runs = await runsForTask(taskKey);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.agentId).toBe(reviewerId);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 40_000);
+
+    // Ally's review of this PR: the bound was hardcoded to 4 and reasoned from
+    // postgres.js's *default* pool size in prose, so a deployment that shrank
+    // the pool below 9 would silently reintroduce the hard deadlock. Pinning
+    // the invariant on the derivation covers pool sizes no integration test
+    // could practically stand up.
+    it("derives the wake concurrency bound from the pool size, leaving a spare connection", () => {
+      // Each winner needs 2 connections (its lock transaction + the enqueue),
+      // so the bound must leave at least one connection over for the retry
+      // poller and the rest of the API tier on the same pool.
+      for (const poolMax of [4, 6, 9, 10, 16, 20, 50]) {
+        const bound = derivePrReviewerWakeMaxConcurrency(poolMax);
+        expect(bound).toBeGreaterThanOrEqual(1);
+        expect(bound * 2).toBeLessThan(poolMax);
+      }
+      // Never zero, even on a pathologically small pool: one winner at a time
+      // still makes progress, where zero would wedge the path entirely.
+      for (const poolMax of [1, 2, 3]) {
+        expect(derivePrReviewerWakeMaxConcurrency(poolMax)).toBe(1);
+      }
+      // The shipped pool keeps the previously-hardcoded value, so this is a
+      // refactor of *how* the bound is obtained, not a behaviour change.
+      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX)).toBe(4);
+    });
+
+    // Ally's review of this PR: `no_reviewer` re-armed on the *contention*
+    // budget (~380s over 4 attempts), sized for a competing delivery holding a
+    // lock. A rolling restart or a paused agent routinely exceeds that, so the
+    // ordinary act of deploying the reviewer would dead-letter a sanctioned
+    // review request — the exact loss this PR exists to prevent.
+    it("outlives a reviewer outage longer than the whole lock-contention budget", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 22001;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseLongOutageScope: (() => void) | null = null;
+      const longOutageScopeReleased = new Promise<void>((resolve) => {
+        releaseLongOutageScope = resolve;
+      });
+      const longOutageScopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await longOutageScopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-long-outage")
+        .set("content-type", "application/json")
+        .send(body);
+
+      releaseLongOutageScope!();
+      await longOutageScopeHolder;
+
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+
+      // Six passes spanning 45 minutes — comfortably more attempts *and* more
+      // wall-clock than the contention ladder's 4 attempts / ~380s total.
+      const base = Date.now();
+      for (const offsetMs of [10_000, 60_000, 300_000, 600_000, 1_500_000, 2_700_000]) {
+        const pass = await reconcileContendedPrReviewerWakes(
+          db,
+          reviewerConfig(reviewerId),
+          new Date(base + offsetMs),
+        );
+        expect(pass.exhausted).toBe(0);
+        expect(pass.superseded).toBe(0);
+        expect(pass.recovered).toBe(0);
+      }
+      // Still armed, and crucially never dead-lettered: availability spent its
+      // own wall-clock budget, not the contention attempt budget.
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      // The availability ladder must actually escalate. Indexing it with the
+      // (deliberately frozen) contention `attempts` would pin every re-arm to
+      // the 30s rung and poll ~720 times across a 6h outage; the separate
+      // counter is what makes the backoff grow.
+      const armed = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(armed).toHaveLength(1);
+      const armedReplay = (armed[0]!.payload as Record<string, any>).prReviewerContendedRetry;
+      expect(armedReplay.availabilityAttempts).toBe(6);
+      // The contention budget is untouched — that is the whole point.
+      expect(armedReplay.attempts).toBe(0);
+      expect(typeof armedReplay.unavailableSince).toBe("string");
+      // Last re-arm sat on the ladder's tail (15 min), not its head (30s).
+      expect(
+        new Date(armedReplay.nextAttemptAt).getTime() - (base + 2_700_000),
+      ).toBe(900_000);
+
+      // The reviewer returns after the outage and the request is still there.
+      // Clock is past the last re-arm's due time (base + 2_700_000 + 900_000).
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const recoveryPass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(base + 3_700_000),
+      );
+      expect(recoveryPass.recovered).toBe(1);
+      const outageRuns = await runsForTask(taskKey);
+      expect(outageRuns).toHaveLength(1);
+      expect(outageRuns[0]!.agentId).toBe(reviewerId);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 60_000);
+
+    // Ally's review of this PR: the due-ness filter cast `nextAttemptAt` to
+    // timestamptz for every candidate row, so one malformed record would throw
+    // and fail the whole batch — stranding every other due retry behind it.
+    it("drains a malformed retry record without poisoning the rest of the batch", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 22002;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      let releaseMalformedScope: (() => void) | null = null;
+      const malformedScopeReleased = new Promise<void>((resolve) => {
+        releaseMalformedScope = resolve;
+      });
+      const malformedScopeHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${taskKey}, 0))`);
+        await malformedScopeReleased;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-alongside-malformed")
+        .set("content-type", "application/json")
+        .send(body);
+
+      releaseMalformedScope!();
+      await malformedScopeHolder;
+
+      const healthyRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(healthyRows).toHaveLength(1);
+      const healthy = healthyRows[0]!;
+      const healthyPayload = (healthy.payload ?? {}) as Record<string, unknown>;
+      const healthyReplay = healthyPayload.prReviewerContendedRetry as Record<string, unknown>;
+
+      // A sibling record whose nextAttemptAt is not timestamp-castable. Written
+      // by hand because no current code path produces one — the point is that a
+      // future one, or a partially-rolled-out deploy, must not take the whole
+      // reconciler down with it.
+      await db.insert(agentWakeupRequests).values({
+        ...healthy,
+        id: randomUUID(),
+        idempotencyKey: `${healthy.idempotencyKey}-malformed`,
+        payload: {
+          ...healthyPayload,
+          prReviewerContendedRetry: { ...healthyReplay, nextAttemptAt: "not-a-timestamp" },
+        },
+      });
+
+      // One pass must both retire the garbage and dispatch the healthy record.
+      const pass = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 10_000),
+      );
+      expect(pass.recovered).toBe(1);
+      expect(pass.superseded).toBe(1);
+
+      const malformedRuns = await runsForTask(taskKey);
+      expect(malformedRuns).toHaveLength(1);
+      expect(malformedRuns[0]!.agentId).toBe(reviewerId);
+    }, 40_000);
+
+    it("completes rather than deadlocking when concurrent distinct-PR deliveries saturate the pool", async () => {
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+
+      // createDb's pool defaults to 10 connections. Each lock winner holds one
+      // for its lock-owning transaction while heartbeat's enqueue checks out a
+      // second, so >pool/2 concurrent winners on *distinct* scopes (which never
+      // block each other on the advisory lock) is the saturation shape.
+      const deliveries = Array.from({ length: 12 }, (_, index) => {
+        const prNumber = 21_100 + index;
+        const { body, signature } = signedRequest(openedPayload(prNumber));
+        return request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "pull_request")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", `delivery-blo-21995-pool-${prNumber}`)
+          .set("content-type", "application/json")
+          .send(body);
+      });
+
+      const responses = await Promise.all(deliveries);
+      for (const res of responses) {
+        expect(res.status).toBe(200);
+      }
+      // Every distinct scope is uncontended, so each delivery must produce its
+      // own wake — none may be lost to pool starvation.
+      expect(responses.filter((res) => res.body.reviewerWakeFired === true)).toHaveLength(12);
+    }, 60_000);
+  });
+
   it("counts a scheduling-gate-declined wake as suppressed, not queued, and does not claim reviewerWakeFired (BLO-18859)", async () => {
     __resetMetricsForTest();
     // A paused company makes enqueueWakeup take its `company.inactive` branch:
@@ -2063,7 +4086,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
         number: 18860,
         title: "Suppressed delivery",
         body: null,
-        head: { ref: "platform/blo-18859-suppressed" },
+        // No Paperclip ref anywhere, for the same reason as above.
+        head: { ref: "platform/suppressed-delivery" },
       },
       repository: { full_name: "Blockcast/paperclip" },
     };
@@ -3458,6 +5482,275 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  it("routes an author wake to the PR's owning Refs: issue, never an unrelated Related: backlink assignee (BLO-20886)", async () => {
+    // Reproduces the live incident (Blockcast/paperclip#953): the PR body
+    // carried `Refs: BLO-19132` (the owning issue) plus
+    // `Related: BLO-20810, BLO-20129, BLO-19079` -- three bare informational
+    // mentions. Before this fix, the author-wake loop treated every matched
+    // identifier as equally-weighted and woke BLO-20129's assignee (the
+    // THIRD Related: entry) with a "push a follow-up commit" directive for a
+    // PR that agent had no relationship to at all.
+    //
+    // All four identifiers share the BLO prefix (as in the real incident),
+    // so they're seeded as four issues under ONE company/agent set --
+    // seedIssueWithIdentifier creates a fresh company per call and company
+    // issue_prefix is unique, so four BLO- calls would collide.
+    const { companyId } = await seedCompanyAndAgent();
+    async function seedBloIssue(identifier: string) {
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${identifier}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: Number(identifier.split("-")[1]),
+        identifier,
+      });
+      return { agentId, issueId };
+    }
+    const refsIssue = await seedBloIssue("BLO-19132");
+    const relatedB = await seedBloIssue("BLO-20810");
+    const relatedC = await seedBloIssue("BLO-20129");
+    const relatedD = await seedBloIssue("BLO-19079");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 953,
+        title: "approval dedupe v2",
+        body: "Refs:    BLO-19132\nRelated: BLO-20810, BLO-20129, BLO-19079\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/953",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/953" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328634,
+        body: "@ally review exact head d9f28c1e0e6595ce8de9515bf0158b04d136a204",
+        html_url: "https://github.com/Blockcast/paperclip/pull/953#issuecomment-5156328634",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-19132", agentId: refsIssue.agentId }]);
+
+    const allWakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [
+        refsIssue.agentId,
+        relatedB.agentId,
+        relatedC.agentId,
+        relatedD.agentId,
+      ]));
+    // Only the Refs: owner was ever woken -- not one of the three Related:
+    // assignees, and specifically never BLO-20129's (relatedC), the one that
+    // fired live.
+    expect(allWakes.map((w) => w.agentId)).toEqual([refsIssue.agentId]);
+  });
+
+  it("suppresses the author wake with a logged reason when a PR carries only Related: mentions and no owning reference (BLO-20886)", async () => {
+    // No Refs:/Fixes:/Closes:/Resolves: line and no branch/title ref -- the
+    // PR names issues but doesn't claim ownership of any of them. Acceptance
+    // criterion: this must drop with a suppressionReason, not fall through to
+    // an arbitrary Related: assignee.
+    const relatedOnly = await seedIssueWithIdentifier("BLO-20811");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 954,
+        title: "misc cleanup",
+        body: "Related: BLO-20811\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/954",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/954" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328700,
+        body: "@ally review please",
+        html_url: "https://github.com/Blockcast/paperclip/pull/954#issuecomment-5156328700",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886-no-owner")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([]);
+    expect(res.body.skipped).toContainEqual({
+      issueIdentifier: null,
+      reason: "no_owning_reference",
+    });
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, relatedOnly.agentId));
+    expect(wakes).toHaveLength(0);
+  });
+
+  it("routes an issue_comment @ally-review author wake to a PR's owning issue named only by a house-reference label, not a Related: mention (BLO-21312)", async () => {
+    // github_pr_review_requested arrives via issue_comment, whose payload
+    // carries no pull_request.head.ref -- BLO-20886's branch-tier recovery
+    // can never reach this path. This PR's title and body carry no
+    // Fixes:/Closes:/Resolves:/Refs: line, only a "Paperclip issue:" house
+    // label (the real shape observed on Blockcast/paperclip#916) plus an
+    // unrelated Related: mention -- reproducing the gap and its guardrail in
+    // one payload. Both issues share the BLO prefix (as in the real PR body),
+    // so they're seeded under one company -- seedIssueWithIdentifier creates
+    // a fresh company per call and company issue_prefix is unique, so two
+    // BLO- calls would collide.
+    const { companyId } = await seedCompanyAndAgent();
+    async function seedBloIssue(identifier: string) {
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: `Agent-${identifier}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: Number(identifier.split("-")[1]),
+        identifier,
+      });
+      return { agentId, issueId };
+    }
+    const owner = await seedBloIssue("BLO-19771");
+    const relatedOnly = await seedBloIssue("BLO-20811");
+    const app = buildApp();
+    const payload = {
+      action: "created",
+      issue: {
+        number: 916,
+        title: "fix(pipelines): retire exited stage automation issues",
+        body: "## Linked Issues or Issue Description\n\nPaperclip issue: https://paperclip.blockcast.net/BLO/issues/BLO-19771\nRelated: BLO-20811\n",
+        html_url: "https://github.com/Blockcast/paperclip/pull/916",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/916" },
+        user: { login: "kkroo" },
+      },
+      comment: {
+        id: 5156328800,
+        body: "@ally review please",
+        html_url: "https://github.com/Blockcast/paperclip/pull/916#issuecomment-5156328800",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-21312-house-label")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-19771", agentId: owner.agentId }]);
+    expect(res.body.skipped).not.toContainEqual(
+      expect.objectContaining({ reason: "no_owning_reference" }),
+    );
+
+    const allWakes = await db
+      .select({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.agentId, [owner.agentId, relatedOnly.agentId]));
+    // Only the house-label owner was woken -- never the Related: mention.
+    expect(allWakes.map((w) => w.agentId)).toEqual([owner.agentId]);
+  });
+
+  it("delivers a lowercase branch-only author wake end-to-end (BLO-20886)", async () => {
+    // Route-level companion to the pure-helper test above. The owning tiers
+    // match the branch case-insensitively but the broad `identifiers`
+    // extraction is uppercase-only, so a PR whose ONLY ref is a lowercase
+    // branch resolved an owner and then died at the `no_paperclip_identifier`
+    // gate before that owner was ever consulted -- a dropped author wake that
+    // no test covered, because every existing branch fixture also carries the
+    // ref in its title or body.
+    const owner = await seedIssueWithIdentifier("BLO-20886");
+    const app = buildApp();
+    const payload = {
+      action: "submitted",
+      pull_request: {
+        number: 962,
+        title: "fix(github-webhook): tidy the receiver",
+        body: "No issue reference anywhere in this body.",
+        html_url: "https://github.com/Blockcast/paperclip/pull/962",
+        head: { ref: "sre/blo-20886-pr-review-wake-routing", sha: "17532d7f" },
+        user: { login: "kkroo" },
+      },
+      review: {
+        state: "changes_requested",
+        body: "one nit",
+        html_url: "https://github.com/Blockcast/paperclip/pull/962#pullrequestreview-1",
+        user: { login: "someone-else" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request_review")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-blo-20886-lowercase-branch")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    // Specifically NOT dropped as `no_paperclip_identifier`.
+    expect(res.body.ignored).toBeUndefined();
+    expect(res.body.wakes).toEqual([
+      { issueIdentifier: "BLO-20886", agentId: owner.agentId },
+    ]);
+  });
+
   it("dedupes an @ally comment redelivery on the author wake after it completed or was cancelled (BLO-18953)", async () => {
     // Route-level companion to the reviewer redelivery test above. BLO-18953's
     // final pass made terminal-status dedup depend on the key's SCOPE, and the
@@ -4152,6 +6445,746 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(authorWakes).toEqual([]);
   });
 
+  // BLO-19497: second and later Ally reviews on the same PR must still
+  // produce a Changes-Requested comment. Before this fix,
+  // reopenInReviewIssueForActionablePrFeedback short-circuited the ENTIRE
+  // write -- comment included -- unless `issue.status === "in_review"`.
+  // Review #1 flips status to `in_progress` as part of handing the PR back to
+  // its author, so review #2+ on the same PR always found a non-`in_review`
+  // status and silently produced zero comment, forever.
+  function reviewSubmittedFeedbackPayload(input: {
+    prNumber: number;
+    reviewId: number;
+    state: string;
+    headSha: string;
+    identifier: string;
+    reviewAuthorLogin?: string;
+    body?: string;
+  }) {
+    return {
+      action: "submitted",
+      pull_request: {
+        number: input.prNumber,
+        title: `Fix hosted vault onboarding (${input.identifier})`,
+        body: null,
+        html_url: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
+        head: { ref: "codex/fix-vault", sha: input.headSha },
+        user: { login: "codex-bot" },
+      },
+      review: {
+        id: input.reviewId,
+        body: input.body ?? "Please fix before merge.",
+        state: input.state,
+        html_url: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}#pullrequestreview-${input.reviewId}`,
+        user: { login: input.reviewAuthorLogin ?? "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+  }
+
+  async function sendReviewSubmitted(
+    app: ReturnType<typeof buildApp>,
+    payload: Record<string, unknown>,
+    deliveryId: string,
+  ) {
+    const { body, signature } = signedRequest(payload);
+    return request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request_review")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", deliveryId)
+      .set("content-type", "application/json")
+      .send(body);
+  }
+
+  it("emits a Changes-Requested comment for every distinct review on a PR, not just the first, and dedupes redelivery of one review id (BLO-19497)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+    const review1 = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 111,
+      state: "changes_requested",
+      headSha: "sha-one",
+      identifier: "PEN-1126",
+    });
+    const res1 = await sendReviewSubmitted(app, review1, "delivery-review-1");
+    expect(res1.status).toBe(200);
+    expect(res1.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+
+    const [afterFirst] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(afterFirst?.status).toBe("in_progress");
+
+    // Review #2: a genuinely new review (distinct review id, distinct head
+    // sha) lands while the issue is still `in_progress` -- nothing moved it
+    // back to `in_review` between the two reviews, which is the normal case
+    // when the author hasn't resubmitted for review yet.
+    const review2 = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 222,
+      state: "changes_requested",
+      headSha: "sha-two",
+      identifier: "PEN-1126",
+    });
+    const res2 = await sendReviewSubmitted(app, review2, "delivery-review-2");
+    expect(res2.status).toBe(200);
+    expect(res2.body.reopened).toEqual([]);
+    expect(res2.body.skipped).not.toContainEqual(
+      expect.objectContaining({ issueIdentifier: "PEN-1126" }),
+    );
+
+    const comments = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackComments = comments.filter(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackComments).toHaveLength(2);
+    expect(feedbackComments.some((c) => c.body.includes("Reviewed head SHA: `sha-one`"))).toBe(true);
+    expect(feedbackComments.some((c) => c.body.includes("Reviewed head SHA: `sha-two`"))).toBe(true);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(2);
+
+    // Redelivery of the exact same review id must still dedupe to one comment.
+    const res1Replay = await sendReviewSubmitted(app, review1, "delivery-review-1-replay");
+    expect(res1Replay.status).toBe(200);
+    const commentsAfterReplay = await db
+      .select({ id: issueComments.id, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterReplay.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+      ),
+    ).toHaveLength(2);
+  });
+
+  // BLO-23267: real-world reproduction of the same defect via the
+  // COMMENT-shaped path (issue_comment, not pull_request_review.submitted) --
+  // the shape Ally's consolidated review actually takes. Payload bodies and
+  // comment ids are taken verbatim from Blockcast/paperclip#1123: round 1
+  // (5211484248) posted "## Changes Requested" 2s later; round 2 (5221029179,
+  // ~16.5h later) re-reported the same unresolved finding as still-present
+  // under a "### Prior Findings Dispositioned" heading, alongside its own
+  // non-zero "### Important Issues (1)" bucket, and produced nothing before
+  // this fix -- BLO-20775 sat unattended for 13h46m as a result.
+  it("wakes the author again on a second comment-shaped Ally review that re-reports an unresolved finding as still-present (BLO-23267 / #1123)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const issuePayload = {
+      number: 269,
+      title: "Fix hosted vault onboarding",
+      body: "Closes PEN-1126",
+      html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+      pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+      user: { login: "codex-bot" },
+    };
+
+    const round1Payload = {
+      action: "created",
+      issue: issuePayload,
+      comment: {
+        id: 5211484248,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: eb12af73f34d0d9735148505d2f338dfe5de42a2",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          "- **[tests/code]** The asserted stale-useful/fresh-output state is not produced by the current running-output path.",
+          "",
+          "### Recommended Action",
+          "1. Address the Important issue this cycle before merge.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5211484248",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const round1 = signedRequest(round1Payload);
+    const round1Res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", round1.signature)
+      .set("x-github-delivery", "delivery-blo23267-round1")
+      .set("content-type", "application/json")
+      .send(round1.body);
+    expect(round1Res.status).toBe(200);
+    expect(round1Res.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+    expect(round1Res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const [afterRound1] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(afterRound1?.status).toBe("in_progress");
+
+    const round2Payload = {
+      action: "created",
+      issue: issuePayload,
+      comment: {
+        id: 5221029179,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: ed97d2530c67a12a3c2e8bd9c33cb73eb2b8acbc",
+          "",
+          "### Prior Findings Dispositioned (1)",
+          "- **prior:eb12af7 important 1** — still-present — the replacement reachability rationale is still not valid.",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          "- **[prior:eb12af7 important 1]** The source comment and external-Job test still imply an unreachable claim.",
+          "",
+          "### Recommended Action",
+          "1. Correct the remaining cross-adapter reachability claim before merge.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5221029179",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const round2 = signedRequest(round2Payload);
+    const round2Res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", round2.signature)
+      .set("x-github-delivery", "delivery-blo23267-round2")
+      .set("content-type", "application/json")
+      .send(round2.body);
+
+    expect(round2Res.status).toBe(200);
+    expect(round2Res.body.skipped ?? []).not.toContainEqual(
+      expect.objectContaining({ issueIdentifier: "PEN-1126" }),
+    );
+    expect(round2Res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const commentsAfterRound2 = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackCommentsAfterRound2 = commentsAfterRound2.filter(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackCommentsAfterRound2).toHaveLength(2);
+    expect(feedbackCommentsAfterRound2.some((c) => c.body.includes("issuecomment-5211484248"))).toBe(true);
+    expect(feedbackCommentsAfterRound2.some((c) => c.body.includes("issuecomment-5221029179"))).toBe(true);
+
+    const wakesAfterRound2 = await db
+      .select({ id: agentWakeupRequests.id, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterRound2).toHaveLength(2);
+    expect(wakesAfterRound2.some((w) => w.reason === "github_pr_review_feedback")).toBe(true);
+  });
+
+  // BLO-23267 (CEO follow-up, #1125 live specimen): an issue identifier that
+  // appears ONLY in the review's narrative prose -- not in the reviewed PR's
+  // own title/body -- must not attribute a Changes-Requested wake to that
+  // issue. Live case: a comment-shaped Ally review on Blockcast/paperclip#1125
+  // (which is actually bound to BLO-20775's sibling PEN-1126) narrated the
+  // unrelated BLO-20775 stall as motivation; the substring match alone fired
+  // a wake on BLO-20775 within 246ms even though #1125 has no relationship
+  // to it -- its own PR was #1123 (a different PR entirely). ACM-9099 here
+  // stands in for that unrelated issue: it exists (different company/prefix
+  // so it can't collide with PEN-1126 in the seed helper), it is bound to a
+  // DIFFERENT PR, and its identifier shows up only inside this review's prose.
+  it("does not wake an issue whose identifier appears only in the review's narrative prose, not the reviewed PR's own title/body (BLO-23267 / #1125)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const { agentId: unrelatedAgentId, issueId: unrelatedIssueId } = await seedIssueWithIdentifier("ACM-9099", {
+      status: "in_review",
+    });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+    const payload = {
+      action: "created",
+      issue: {
+        number: 269,
+        title: "Fix hosted vault onboarding",
+        // The PR's own binding -- this is the only issue this review should
+        // be able to affect.
+        body: "Closes PEN-1126",
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+        user: { login: "codex-bot" },
+      },
+      comment: {
+        id: 5231388259,
+        body: [
+          "## Ally — Consolidated PR Review",
+          "",
+          "Reviewed head: 3cb288e711d900283d3562b3adc9431f1a206a5f",
+          "",
+          "### Critical Issues (0)",
+          "",
+          "### Important Issues (1)",
+          // ACM-9099 appears here ONLY as background narrative about a
+          // different incident -- never in this PR's own title/body.
+          "- **[docs]** Note: this fix is motivated by the ACM-9099 stall this cycle, which sat unattended for hours.",
+          "",
+          "### Recommended Action",
+          "1. Tighten the wording of the motivation paragraph.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-5231388259",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+    const signed = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signed.signature)
+      .set("x-github-delivery", "delivery-blo23267-prose-mention")
+      .set("content-type", "application/json")
+      .send(signed.body);
+
+    expect(res.status).toBe(200);
+    // The PR's own bound issue still gets its legitimate wake...
+    expect(res.body.reopened).toEqual([{ issueIdentifier: "PEN-1126", commentId: expect.any(String) }]);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+    // ...but the issue mentioned only in prose must not appear anywhere in
+    // the response: not reopened, not woken, not even "skipped" (skipped
+    // implies it was matched and then deliberately passed over -- it must
+    // never have been matched at all).
+    expect(res.body.reopened).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+    expect(res.body.wakes).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+    expect(res.body.skipped ?? []).not.toContainEqual(expect.objectContaining({ issueIdentifier: "ACM-9099" }));
+
+    const unrelatedComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, unrelatedIssueId));
+    expect(unrelatedComments).toEqual([]);
+
+    const unrelatedWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, unrelatedAgentId));
+    expect(unrelatedWakes).toEqual([]);
+  });
+
+  it("still emits the review-feedback comment and escalates to the manager when the assignee's monitor is triggered with no scheduled re-check (BLO-19497 AC #5)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Monitor left `triggered` -- no scheduled nextCheckAt, but it has fired
+    // before -- exactly the wedge BLO-19497 describes: nothing re-arms it but
+    // the assignee, and the assignee isn't awake to do so.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 333,
+      state: "changes_requested",
+      headSha: "sha-triggered",
+      identifier: "PEN-1126",
+    });
+    const res = await sendReviewSubmitted(app, blockingReview, "delivery-monitor-triggered");
+
+    expect(res.status).toBe(200);
+    expect(res.body.reopened).toEqual([]);
+    expect(res.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    const comments = await db
+      .select({ body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const feedbackComment = comments.find(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+    );
+    expect(feedbackComment?.body).toContain("Reviewed head SHA: `sha-triggered`");
+    const escalationComment = comments.find(
+      (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+    );
+    expect(escalationComment).toBeTruthy();
+    expect(escalationComment?.body).toContain("Manager");
+
+    const managerWakes = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toEqual([{ reason: "unseen_blocking_review_feedback" }]);
+
+    // A non-blocking review (formal state "commented", but with body
+    // findings that still make it actionable) landing on the same wedged
+    // monitor must not escalate -- AC #5 is scoped to blocking severity
+    // (`changes_requested`), not every actionable review.
+    const nonBlockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 334,
+      state: "commented",
+      headSha: "sha-triggered-2",
+      identifier: "PEN-1126",
+      body: "### Important Issues (1)\n\nWorth a look when convenient, not blocking.",
+    });
+    const res2 = await sendReviewSubmitted(app, nonBlockingReview, "delivery-monitor-triggered-non-blocking");
+    expect(res2.status).toBe(200);
+    expect(res2.body.escalated).toBeUndefined();
+
+    const commentsAfterNonBlocking = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterNonBlocking.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+      ),
+    ).toHaveLength(2);
+    expect(
+      commentsAfterNonBlocking.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+      ),
+    ).toHaveLength(1);
+  });
+
+  // Review finding (PR #1125): isIssueMonitorTriggered used to infer
+  // "triggered" from the historical columns alone (monitorLastTriggeredAt /
+  // monitorAttemptCount), which stay populated forever once a monitor has
+  // ever fired -- even after it was later explicitly cleared. A cleared
+  // monitor has a live wake path again (whatever cleared it re-armed or
+  // resolved the issue's execution), so escalating past it is a false
+  // escalation, exactly the noise AC #5's manager-wake exists to avoid
+  // manufacturing.
+  it("does not escalate when the assignee's monitor was explicitly cleared, even though historical trigger columns are still set (PR #1125 review finding)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      // Historical columns still carry a prior trigger -- exactly as they
+      // would right after a monitor was cleared, since nothing zeroes them.
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+      executionState: { monitor: { status: "cleared", clearedAt: new Date().toISOString(), clearReason: "resolved" } },
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 335,
+      state: "changes_requested",
+      headSha: "sha-cleared",
+      identifier: "PEN-1126",
+    });
+    const res = await sendReviewSubmitted(app, blockingReview, "delivery-monitor-cleared");
+
+    expect(res.status).toBe(200);
+    expect(res.body.escalated ?? []).toEqual([]);
+
+    const commentsAfterCleared = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      commentsAfterCleared.filter(
+        (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation",
+      ),
+    ).toHaveLength(0);
+
+    const managerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toEqual([]);
+  });
+
+  // Review finding (PR #1125): escalation used to be gated on the outer
+  // caller's reopen.commentInserted, so once the feedback comment for a
+  // review existed (including from a first, otherwise-successful delivery),
+  // no later redelivery could ever retry a failed escalation -- a transient
+  // failure between the escalation comment write and the manager wakeup
+  // permanently dropped the manager wake. This reproduces that exact window:
+  // the escalation comment exists but the manager was never woken (the
+  // simulated failure point), then a redelivery of the same review must
+  // complete the wake without double-posting the escalation comment.
+  it("retries a stalled manager escalation on redelivery without duplicating the escalation comment (PR #1125 review finding)", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1126,
+      identifier: "PEN-1126",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 850,
+      reviewId: 336,
+      state: "changes_requested",
+      headSha: "sha-stalled",
+      identifier: "PEN-1126",
+    });
+    const firstRes = await sendReviewSubmitted(app, blockingReview, "delivery-escalation-stall-1");
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    // Simulate the failure window this finding is about: the escalation
+    // comment landed, but the manager wake did not (e.g. heartbeat.wakeup
+    // threw after the comment insert committed). Mutate the recorded wake's
+    // idempotency key rather than deleting the row -- a heartbeat run FKs to
+    // it -- so the retry's idempotency lookup finds nothing, exactly as it
+    // would if the wake had never been recorded.
+    await db
+      .update(agentWakeupRequests)
+      .set({ idempotencyKey: "consumed-by-test-simulated-failure" })
+      .where(eq(agentWakeupRequests.agentId, managerId));
+
+    // GitHub redelivers the identical review (new delivery id, same review
+    // id -- the feedback comment already exists and dedupes).
+    const secondRes = await sendReviewSubmitted(app, blockingReview, "delivery-escalation-stall-2");
+    expect(secondRes.status).toBe(200);
+    expect(secondRes.body.escalated).toEqual([
+      { issueIdentifier: "PEN-1126", ownerAgentId: managerId, ownerType: "agent", cycles: 0 },
+    ]);
+
+    const escalationOnly = (
+      await db
+        .select({ metadata: issueComments.metadata })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId))
+    ).filter((r) => (r.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback_escalation");
+    // The comment was NOT duplicated even though escalation ran twice.
+    expect(escalationOnly).toHaveLength(1);
+
+
+    // The wake, however, was successfully redriven on retry: the original
+    // (idempotency-key-mutated) row is still there, plus a fresh one from
+    // the retry with the real idempotency key restored.
+    const managerWakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, managerId));
+    expect(managerWakes).toHaveLength(2);
+    expect(managerWakes.some((w) => w.idempotencyKey === "consumed-by-test-simulated-failure")).toBe(true);
+    expect(
+      managerWakes.some(
+        (w) => w.idempotencyKey?.startsWith("unseen_blocking_review_escalation:") && w.idempotencyKey !== "consumed-by-test-simulated-failure",
+      ),
+    ).toBe(true);
+  });
+
+  // Ally review on PR #1125: escalateUnseenBlockingReviewFeedback's comment
+  // write was a read-then-insert (SELECT by metadata.externalKey, then
+  // INSERT if none found) -- the same check-then-write race BLO-19037 fixed
+  // for the dependabot receipt path above. Two concurrent redeliveries of the
+  // identical review can both observe "no existing escalation comment"
+  // before either commits, double-posting the escalation. Firing both
+  // requests through `Promise.all` interleaves them at the same await
+  // boundaries a second paperclip-api replica would race across.
+  it("dedupes concurrent redeliveries of the same blocking review to a single escalation comment", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test",
+      issuePrefix: "PEN",
+      defaultResponsibleUserId: "test-board-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TestAgent",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1127,
+      identifier: "PEN-1127",
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(),
+      monitorAttemptCount: 1,
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const blockingReview = reviewSubmittedFeedbackPayload({
+      prNumber: 851,
+      reviewId: 337,
+      state: "changes_requested",
+      headSha: "sha-race",
+      identifier: "PEN-1127",
+    });
+
+    // Warm the connection pool to >=2 physical connections before racing --
+    // see the dependabot concurrency test above for why this is necessary.
+    await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select 1`)));
+
+    const [first, second] = await Promise.all([
+      sendReviewSubmitted(app, blockingReview, "delivery-escalation-race"),
+      sendReviewSubmitted(app, blockingReview, "delivery-escalation-race"),
+    ]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const escalationComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback_escalation'`,
+        ),
+      );
+    expect(escalationComments).toHaveLength(1);
+  });
+
   function dependabotPayload(severity: string, action = "created", alertNumber = 58) {
     return {
       action,
@@ -4351,6 +7384,35 @@ describeEmbeddedPostgres("github-webhook route", () => {
       ignored: "no_paperclip_identifier",
       dependabotWakeFired: false,
     });
+  });
+
+  // BLO-26613: the Dependabot alert route has exactly one configured owner
+  // and no fallback. A paused (or otherwise uninvokable) configured agent
+  // must not receive the new alert issue silently -- it should file
+  // unassigned so `allow_company_agent` lets any agent pick it up. The wake
+  // to the paused agent itself still fails (heartbeat.wakeup rejects a
+  // paused target and the error is caught/logged a few lines below) --
+  // that is a pre-existing, separate mechanism this change does not touch.
+  // The point of this test is that the ISSUE doesn't silently inherit the
+  // paused assignee merely because the wake attempt happened to fail too.
+  it("files a new dependabot alert issue unassigned when the configured agent is paused", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const res = await postDependabot(app, dependabotPayload("critical"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ dependabotWakeFired: false });
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_alert")));
+    expect(issue).toBeTruthy();
+    expect(issue!.assigneeAgentId).toBeNull();
+    expect(issue!.assigneeUserId).toBeNull();
+    expect(issue!.status).toBe("todo");
   });
 
   it("dedupes a redelivered dependabot created alert via the idempotency key", async () => {
@@ -4950,6 +8012,9 @@ describe("PR review feedback comment heading (BLO-19067)", () => {
     expect(comment).toContain("## Changes Requested");
     expect(comment).toContain("requires another implementation pass");
     expect(comment).not.toContain("Review Approved");
+    // BLO-19497 AC: the reviewed head SHA is recorded so a reader can tell a
+    // stale review from a current one.
+    expect(comment).toContain("Reviewed head SHA: `1db166824d532cda20e321ebb26c6e4702e0dd32`");
   });
 
   it("distinguishes a COMMENTED review from both other states", () => {
@@ -5103,5 +8168,196 @@ describe("self-review non-convergence detection (BLO-13353)", () => {
     expect(__test_isSelfReviewedPr(ctx(null), "allyblockcast[bot]")).toBe(false);
     expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null)).toBe(false);
     expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "")).toBe(false);
+  });
+});
+
+// BLO-23059: Claude Code Review's "paused" org-settings notice arrives as a
+// FORMAL pull_request_review (state COMMENTED, commit_id = current head), so
+// BLO-21489's existence + non-staleness check passes it and both wakes fire —
+// the reviewer counter-review pass and the PR-author wake whose directive claims
+// "a reviewer just posted findings on YOUR pull request".
+describe("claude[bot] Code Review service notice suppression (BLO-23059)", () => {
+  // Verbatim body of review 4887250738 on Blockcast/Network-Operator-Portal#657,
+  // read from the GitHub API on 2026-08-10. Do not paraphrase: the whole point of
+  // the filter is that it keys on this exact notice rather than on the absence of
+  // findings.
+  const PAUSED_NOTICE_BODY = [
+    "## Claude Code Review",
+    "",
+    "**Claude Code Review is paused for this repository.** To reconnect it, an admin of this " +
+      "repository's GitHub organization (or the account owner, for personal repositories) who can " +
+      "also manage your Claude organization's Code Review settings needs to re-link GitHub in " +
+      "[Code Review settings](https://claude.ai/admin-settings/claude-code). This is a one-time step.",
+    "",
+    "<sub>Tip: disable this comment in your organization's " +
+      "[Code Review settings](https://claude.ai/admin-settings/claude-code).</sub>",
+  ].join("\n");
+
+  const reviewPayload = (
+    overrides: { body?: string; state?: string; login?: string; type?: string | null } = {},
+  ) => ({
+    action: "submitted",
+    pull_request: {
+      number: 657,
+      title: "cdnplus-a8: pin the measured tint population",
+      head: { ref: "feat/cdnplus-a8", sha: "3ff9b6390000000000000000000000000000000a" },
+      user: { login: "allyblockcast[bot]" },
+    },
+    review: {
+      body: overrides.body ?? PAUSED_NOTICE_BODY,
+      state: overrides.state ?? "commented",
+      html_url:
+        "https://github.com/Blockcast/Network-Operator-Portal/pull/657#pullrequestreview-4887250738",
+      user: {
+        login: overrides.login ?? "claude[bot]",
+        // GitHub's own account classification. "type" in overrides is honoured
+        // even when explicitly null, so the absent-field case is testable.
+        type: "type" in overrides ? overrides.type : "Bot",
+      },
+    },
+    repository: { full_name: "Blockcast/Network-Operator-Portal" },
+  });
+
+  const resolve = (
+    payload: ReturnType<typeof reviewPayload>,
+    onSuppressedReviewSubmission?: (info: unknown) => void,
+  ) =>
+    __test_resolveEventContext("pull_request_review", payload, {
+      prReviewerBotLogin: "allyblockcast[bot]",
+      ...(onSuppressedReviewSubmission ? { onSuppressedReviewSubmission } : {}),
+    });
+
+  it("drops the paused notice at the event, killing both wakes", () => {
+    const ctx = resolve(reviewPayload());
+    // null context is the common ancestor of BOTH wake sites: the reviewer wake
+    // (shouldFirePrReviewerWake) and the PR-author wake (the `isPrWake` fallback,
+    // which fires for any github_pr_* reason with a prNumber regardless of
+    // isActionableReviewFeedbackContext).
+    expect(ctx).toBeNull();
+    expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
+  });
+
+  it("reports the suppression with review-shaped provenance", () => {
+    const seen: unknown[] = [];
+    expect(resolve(reviewPayload(), (info) => seen.push(info))).toBeNull();
+    expect(seen).toEqual([
+      {
+        repoFullName: "Blockcast/Network-Operator-Portal",
+        prNumber: 657,
+        reviewAuthorLogin: "claude[bot]",
+        reviewState: "commented",
+        reviewUrl:
+          "https://github.com/Blockcast/Network-Operator-Portal/pull/657#pullrequestreview-4887250738",
+      },
+    ]);
+  });
+
+  it("does not suppress a terse but genuine review — the false-suppression case", () => {
+    // The named objection to filtering at the webhook. A findings-free rule would
+    // eat these; a named-instance rule cannot, because neither carries the notice.
+    for (const body of ["LGTM", "One nit inline, otherwise good.", ""]) {
+      const ctx = resolve(reviewPayload({ body }));
+      expect(ctx, `terse body ${JSON.stringify(body)} must survive`).not.toBeNull();
+      expect(ctx?.wakeReason).toBe("github_pr_review_submitted");
+    }
+  });
+
+  it("does not suppress a human or a non-Claude bot quoting the notice", () => {
+    // Someone discussing THIS issue in a review must still reach the author.
+    for (const login of ["kkroo", "allyblockcast[bot]", "dependabot[bot]"]) {
+      const ctx = resolve(reviewPayload({ login }));
+      expect(ctx, `login ${login} must survive`).not.toBeNull();
+    }
+  });
+
+  it("does not suppress the bare `claude` / `claude-code` USER accounts", () => {
+    // Ally review on #1255: the login matcher originally made the `[bot]` suffix
+    // optional, so these two — ordinary registerable GitHub logins, not the App —
+    // matched. A person on either account reviewing a PR that quotes the notice
+    // (this repo's own PRs do) would have had BOTH their wakes silently dropped.
+    // Suffix required + type gate, so each of the three shapes below fails alone.
+    for (const [login, type] of [
+      ["claude", "User"],
+      ["claude-code", "User"],
+      // Right login shape, but GitHub does not call it a Bot — fail open.
+      ["claude[bot]", "User"],
+    ] as const) {
+      const ctx = resolve(reviewPayload({ login, type }));
+      expect(ctx, `${login} (${type}) must survive`).not.toBeNull();
+      expect(ctx?.wakeReason).toBe("github_pr_review_submitted");
+    }
+  });
+
+  it("fails open when the payload carries no user type at all", () => {
+    // Absent `type` must not be read as Bot: an unrecognised payload shape
+    // regresses to today's behaviour rather than dropping a real review.
+    const ctx = resolve(reviewPayload({ type: null }));
+    expect(ctx).not.toBeNull();
+  });
+
+  it("does not suppress a claude[bot] review that carries the notice AND findings", () => {
+    const ctx = resolve(
+      reviewPayload({ body: `${PAUSED_NOTICE_BODY}\n\n### Critical Issues (1)\n- auth bypass.` }),
+    );
+    expect(ctx).not.toBeNull();
+    expect(__test_hasActionablePrReviewFeedback(ctx?.reviewBody, ctx?.reviewState)).toBe(true);
+  });
+
+  it("does not suppress a merge-gate review state", () => {
+    // APPROVED / CHANGES_REQUESTED carry a gate signal regardless of body text.
+    for (const state of ["approved", "changes_requested", "dismissed"]) {
+      expect(resolve(reviewPayload({ state })), `state ${state} must survive`).not.toBeNull();
+    }
+  });
+
+  describe("isClaudeCodeReviewServiceNotice — predicate", () => {
+    const notice = (body: string, state = "commented", login = "claude[bot]", type = "Bot") =>
+      __test_isClaudeCodeReviewServiceNotice(body, state, login, type);
+
+    it("matches the paused and disabled variants under any heading depth", () => {
+      expect(notice(PAUSED_NOTICE_BODY)).toBe(true);
+      expect(
+        notice("### Claude Code Review\n\nClaude Code Review is disabled for this repository."),
+      ).toBe(true);
+    });
+
+    it("requires the heading, the sentence, and a Claude author together", () => {
+      // Sentence without the heading.
+      expect(notice("Claude Code Review is paused for this repository.")).toBe(false);
+      // Heading without the sentence.
+      expect(notice("## Claude Code Review\n\nTwo findings below.")).toBe(false);
+      // Both, wrong author.
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "kkroo")).toBe(false);
+      // A heading that merely mentions the phrase mid-line is not the notice heading.
+      expect(
+        notice("## Notes on Claude Code Review\n\nClaude Code Review is paused for this repository."),
+      ).toBe(false);
+    });
+
+    it("requires the [bot] suffix AND a Bot user type", () => {
+      // The two halves of the Ally-#1255 narrowing, pinned independently so
+      // neither can be dropped without reddening a test.
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude")).toBe(false);
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude-code")).toBe(false);
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude[bot]", "User")).toBe(false);
+      expect(notice(PAUSED_NOTICE_BODY, "commented", "claude-code[bot]", "Bot")).toBe(true);
+    });
+
+    it("rejects absent author or body rather than throwing", () => {
+      expect(notice(PAUSED_NOTICE_BODY, "commented", null as unknown as string)).toBe(false);
+      expect(notice(null as unknown as string)).toBe(false);
+      expect(
+        __test_isClaudeCodeReviewServiceNotice(PAUSED_NOTICE_BODY, null, "claude[bot]", "Bot"),
+      ).toBe(false);
+      // Absent user type => fail open.
+      expect(
+        __test_isClaudeCodeReviewServiceNotice(
+          PAUSED_NOTICE_BODY,
+          "commented",
+          "claude[bot]",
+          null,
+        ),
+      ).toBe(false);
+    });
   });
 });

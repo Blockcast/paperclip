@@ -18,9 +18,11 @@ import {
   mintAppJwt,
   getInstallationToken,
   getInstallationTokenResult,
+  githubFetchPrHeadSha,
   githubGetPullRequestGate,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
+  githubListIssueCommentsWithTimestamps,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
   githubReviewerAppSlug,
@@ -201,6 +203,21 @@ describe("githubGetPullRequestGate", () => {
   });
 });
 
+describe("githubFetchPrHeadSha", () => {
+  it("uses the installation token to resolve the complete current head", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      const value = String(url);
+      if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      expect(value).toContain("/repos/Blockcast/paperclip/pulls/1049");
+      return jsonResponse({ head: { sha: "ABCDEF1234567890ABCDEF1234567890ABCDEF12" } });
+    }));
+
+    await expect(githubFetchPrHeadSha({ repoFullName: "Blockcast/paperclip", prNumber: 1049 }))
+      .resolves.toBe("abcdef1234567890abcdef1234567890abcdef12");
+  });
+});
+
 describe("githubHasReviewerEvidenceForPr", () => {
   const repoFullName = "Blockcast/trafficcontrol";
   const prNumber = 752;
@@ -274,14 +291,20 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("does not let an exact-head COMMENTED App review satisfy the formal App lane", async () => {
+  // BLO-28920: an exact-head COMMENTED review from the App IS valid run-output
+  // attestation. Requiring APPROVED here was structurally unsatisfiable —
+  // GitHub bars a PR author from approving its own PR, and agent PRs are
+  // App-authored — so reviewer runs that had genuinely posted were failed
+  // `pr_review_output_missing` and retried in a paid loop.
+  it("accepts an exact-head COMMENTED App review as reviewer evidence", async () => {
     setCreds();
     stubGithub({
       reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: headSha, state: "COMMENTED" }],
     });
 
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
-      found: false,
+      found: true,
+      via: "review",
     });
   });
 
@@ -313,7 +336,10 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("does not let a canonical App issue comment satisfy the App gate", async () => {
+  // BLO-28920: Ally posts on either surface and each is individually blind to
+  // the other — a comment-shaped review files no review object at all, so a PR
+  // it demonstrably reviewed reports zero formal reviews.
+  it("accepts a canonical exact-head App issue comment as reviewer evidence", async () => {
     setCreds();
     stubGithub({
       reviews: [],
@@ -323,6 +349,34 @@ describe("githubHasReviewerEvidenceForPr", () => {
           body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
         },
       ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "comment",
+    });
+  });
+
+  it("rejects a canonical App issue comment attesting to a different head", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: "## Ally — Consolidated PR Review\n\nReviewed head: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n\nNo findings.",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("rejects an App comment that merely quotes the head without the canonical heading", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [],
+      comments: [{ user: { login: "allyblockcast[bot]" }, body: `@ally please review at head ${headSha}` }],
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       found: false,
@@ -409,6 +463,143 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
       error: "reviews_rate_limited",
+    });
+  });
+
+  // BLO-28920 replay: the exact GitHub state of run f3a02829-6322-4632-b684-
+  // 564e96bc14f3 (task pr_review:Blockcast/linux-amt:178), which was failed
+  // `pr_review_output_missing` 37s after the App posted a valid exact-head
+  // review. Captured from the live API on 2026-08-19. The four cases below are
+  // the acceptance matrix: only (a) may pass.
+  describe("BLO-28920 replay — Blockcast/linux-amt#178", () => {
+    const AMT_REPO = "Blockcast/linux-amt";
+    const AMT_PR = 178;
+    const AMT_HEAD = "31559035ce8297a2a33a0e541288e198d19fb166";
+    const AMT_STALE_HEAD = "b599c8f3aa1f4a0f9d2b6c7e8a5d4c3b2a1f0e9d";
+
+    it("(a) accepts the Bot COMMENTED review at the exact head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [
+          { user: { login: "allyblockcast[bot]" }, commit_id: AMT_STALE_HEAD, state: "COMMENTED" },
+          { user: { login: "allyblockcast[bot]" }, commit_id: AMT_HEAD, state: "COMMENTED" },
+        ],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: true, via: "review" });
+    });
+
+    it("(b) rejects a Bot COMMENTED review only at a stale head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: AMT_STALE_HEAD, state: "COMMENTED" }],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: false });
+    });
+
+    it("(c) rejects a User-hat review from the same slug at the exact head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [
+          {
+            user: { login: "allyblockcast" },
+            commit_id: AMT_HEAD,
+            state: "APPROVED",
+            body: `## Ally — Consolidated PR Review\n\nReviewed head: ${AMT_HEAD}\n`,
+          },
+        ],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: false });
+    });
+
+    it("(d) rejects a PR with no review on either surface", async () => {
+      setCreds();
+      stubGithub({ reviews: [], comments: [] });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: false });
+    });
+
+    // (e) A PENDING review is an unsubmitted draft, returned by GitHub only to
+    // the identity that created it — this App — and it already carries a
+    // commit_id. The MCP flow is `create pending` -> `add comments` -> `submit`,
+    // so a run that dies mid-flow leaves exactly this shape. Accepting it would
+    // let that run self-attest and defeat (d) on the one path that matters.
+    it("(e) rejects a PENDING (unsubmitted draft) Bot review at the exact head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: AMT_HEAD, state: "PENDING" }],
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: false });
+    });
+
+    // A DISMISSED review still happened; it was only disposed of afterwards. It
+    // is real run output and must keep attesting, so the PENDING guard above
+    // must not be widened into a general "only these states" allowlist.
+    it("(e2) still accepts a DISMISSED Bot review at the exact head", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: AMT_HEAD, state: "DISMISSED" }],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: true, via: "review" });
+    });
+
+    // (f) Exhausting the page cap must surface an error, never a truncated
+    // `{found:false}`. A silent truncation would re-raise
+    // pr_review_output_missing and post a false "reviewer never finished"
+    // status — reproducing BLO-28920, gated on thread length instead of state.
+    it("(f) errors rather than reporting a truncated negative when reviews paginate past the cap", async () => {
+      setCreds();
+      const fullPage = Array.from({ length: 100 }, () => ({
+        user: { login: "someone-else" },
+        commit_id: AMT_STALE_HEAD,
+        state: "COMMENTED",
+      }));
+      stubGithub({ reviews: fullPage, comments: [] });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_pagination_exhausted" });
+    });
+
+    it("(f2) errors rather than reporting a truncated negative when comments paginate past the cap", async () => {
+      setCreds();
+      const fullPage = Array.from({ length: 100 }, () => ({
+        user: { login: "someone-else" },
+        body: "not a review",
+      }));
+      stubGithub({ reviews: [], comments: fullPage });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "comments_pagination_exhausted" });
+    });
+
+    // Ally emits the bare 40-hex form today, but AGENTS.md documents a
+    // backticked variant; tolerate both so a formatting change cannot make
+    // comment-mode reviews silently invisible.
+    it("(g) accepts a backticked `Reviewed head:` attestation", async () => {
+      setCreds();
+      stubGithub({
+        reviews: [],
+        comments: [
+          {
+            user: { login: "allyblockcast[bot]" },
+            body: `## Ally — Consolidated PR Review\n\nReviewed head: \`${AMT_HEAD}\`\n`,
+          },
+        ],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ found: true, via: "comment" });
     });
   });
 });
@@ -598,5 +789,52 @@ describe("githubPostCommitStatus (BLO-17456)", () => {
     await expect(
       githubPostCommitStatus({ repoFullName, sha, context, state: "failure" }),
     ).resolves.toBe(false);
+  });
+});
+
+describe("githubListIssueCommentsWithTimestamps", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1049;
+
+  function commentPage(count: number, label: string) {
+    return Array.from({ length: count }, (_, index) => ({
+      user: { login: "allyblockcast[bot]" },
+      body: `${label}-${index}`,
+      created_at: "2026-08-04T20:09:19Z",
+    }));
+  }
+
+  it("reads beyond the historical ten-page limit", async () => {
+    setCreds();
+    const pages = [
+      ...Array.from({ length: 12 }, (_, index) => commentPage(100, `page-${index + 1}`)),
+      commentPage(37, "page-13"),
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const value = String(url);
+        if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        const page = Number(value.match(/[?&]page=(\d+)/)?.[1] ?? "1");
+        return jsonResponse(pages[page - 1] ?? []);
+      }),
+    );
+
+    await expect(githubListIssueCommentsWithTimestamps({ repoFullName, prNumber })).resolves.toHaveLength(1237);
+  });
+
+  it("fails closed rather than returning a partial history at the safety backstop", async () => {
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        if (String(url).includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        return jsonResponse(commentPage(100, "full"));
+      }),
+    );
+
+    await expect(githubListIssueCommentsWithTimestamps({ repoFullName, prNumber })).resolves.toBeNull();
   });
 });

@@ -1152,6 +1152,56 @@ describe("approval routes idempotent retries", () => {
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   });
 
+  // BLO-25878. `resumeRequiresNormalModel: true` states a real requirement, but read alone it
+  // promises a normal-model retry that a recovery-pinned issue never gets: the cheap profile comes
+  // from the `source_scoped_recovery_action` wake class, and only a recorded disposition clears the
+  // recovery action. Three consecutive runs waited on that promise and filed nothing. The refusal
+  // has to name an exit the refused run can actually take.
+  it("tells a refused status-only run that no normal-model retry is coming, and names the exits", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({ title: "Hire an SRE" });
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: { title: "Hire an SRE" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    // The requirement is still stated...
+    expect(res.body.details.resumeRequiresNormalModel).toBe(true);
+    // ...but it is explicitly not a promise that one will be dispatched.
+    expect(res.body.details.normalModelResumeIsAutomatic).toBe(false);
+    // And both reachable exits are named, so waiting is never the only reading.
+    expect(res.body.details.resumeGuidance).toContain("record a valid issue disposition");
+    expect(res.body.details.resumeGuidance).toContain("request_board_approval");
+  });
+
+  it("does not offer status-only resume guidance to a planning-only run", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: {
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Not part of a planning deliverable" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.resumeRequiresNormalModel).toBe(false);
+    expect(res.body.details).not.toHaveProperty("normalModelResumeIsAutomatic");
+    expect(res.body.details).not.toHaveProperty("resumeGuidance");
+  });
+
   it("blocks planning-only recovery from creating even board-escalation approvals", async () => {
     const res = await request(await createAgentApp({
       contextSnapshot: {

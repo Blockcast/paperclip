@@ -65,6 +65,15 @@ function classifyReviewerEvidenceError(error: string): { retryable: boolean; rea
       ? { retryable: true, reason: "github_app_token_unavailable" }
       : { retryable: false, reason: "missing_github_app_credentials" };
   }
+  // BLO-28920: the comments surface is consulted only AFTER the reviews surface
+  // has been read conclusively, so a permission/404 blip there is not evidence
+  // about this PR at all. Classifying it by HTTP status would send a transient
+  // 403/404 to failPermanentDelivery, permanently dropping the gate-status
+  // delivery so the required context is never posted — a silent death on the
+  // incident path. Retry instead; the reviews half is already known to be clean.
+  if (error.startsWith("comments_")) {
+    return { retryable: true, reason: `reviewer_evidence_${error}` };
+  }
   const status = Number(error.match(/_(\d{3})$/)?.[1]);
   if (Number.isInteger(status)) {
     return {

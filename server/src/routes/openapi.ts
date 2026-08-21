@@ -841,15 +841,37 @@ const AUTHENTICATED_OPERATIONS = new Set([
   "GET /api/plugins/rag-health",
 ]);
 
+// Every operation whose handler enforces instance admin. `BOARD_ONLY_PREFIXES`
+// would otherwise classify most of these as plain `board`, understating the
+// privilege boundary for spec-driven consumers. The openapi-routes suite walks
+// the route sources and fails if a handler calls `assertInstanceAdmin` without a
+// matching entry here, so keep this in sync with the routes rather than by hand.
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
-  "POST /api/plugins/install",
   "POST /api/instance/reset",
   "POST /api/instance/database-backups",
+  "GET /api/instance/scheduler-heartbeats",
   "POST /api/service-account-tokens",
+  "GET /api/admin/users",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
+  "GET /api/admin/users/{userId}/company-access",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/adapters/install",
+  "PATCH /api/adapters/{type}",
+  "PATCH /api/adapters/{type}/override",
+  "DELETE /api/adapters/{type}",
+  "POST /api/adapters/{type}/reload",
+  "POST /api/adapters/{type}/reinstall",
+  "POST /api/plugins/install",
+  "DELETE /api/plugins/{pluginId}",
+  "POST /api/plugins/{pluginId}/enable",
+  "POST /api/plugins/{pluginId}/disable",
+  "POST /api/plugins/{pluginId}/upgrade",
+  "GET /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config/test",
+  "POST /api/plugins/{pluginId}/jobs/{jobId}/trigger",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -5543,6 +5565,11 @@ for (const route of [
   ["get", "/api/companies/{companyId}/search", "Search company data"],
   ["get", "/api/companies/{companyId}/search/extract", "Extract company search matches"],
   ["get", "/api/companies/{companyId}/issues/count", "Count issues in a company"],
+  [
+    "get",
+    "/api/companies/{companyId}/issues/open-assignment-census",
+    "Authoritative per-agent open-assignment census (single snapshot, not paginated)",
+  ],
 ] as const) {
   registerCurrentRoute({
     method: route[0],

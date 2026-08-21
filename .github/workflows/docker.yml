@@ -305,10 +305,100 @@ jobs:
             echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:${{ steps.image_tag.outputs.value }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
-    needs: build-and-push
+  # BLO-26972: GitHub allows only ONE run to sit *pending* per concurrency
+  # group. `deploy`'s group is keyed on the release/namespace, not on this
+  # run, so a second workflow_dispatch that reaches the group while an
+  # earlier one is still parked on the paperclip-production reviewer gate
+  # does not queue behind it — GitHub cancels the earlier, already-waiting
+  # approval outright. `cancel-in-progress: false` does not prevent this: it
+  # only stops a later run from cancelling an earlier run's *in-progress*
+  # job, and a run stuck on environment-approval review is not in progress.
+  # Three consecutive production deploys died this way, unapproved, each
+  # evicted within minutes of the next dispatch.
+  #
+  # This fast pre-check catches the common case in seconds, without waiting
+  # on build-and-push. It is NOT sufficient on its own: it runs ~5 minutes
+  # before `deploy` would enter the concurrency group, so two dispatches
+  # launched inside that build window can both see blocked=false here and
+  # then race at the group gate. guard-pending-deploy-final below is the
+  # authoritative re-check that closes that window.
+  guard-pending-deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' }}
     runs-on: arc-deploy
-    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' }}
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Check for an existing pending production approval
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: .github/scripts/guard-pending-deploy.sh
+
+  # Re-runs the same check immediately before `deploy` enters the
+  # paperclip-production concurrency group, closing the race window the fast
+  # guard above cannot: a sibling dispatch that started its own pending
+  # approval sometime during this run's build-and-push. Costs no extra wall
+  # time — `deploy` already waits out build-and-push, so this rides the same
+  # ~5 minutes rather than adding to it. Skipped (not run) once the fast
+  # guard has already found blocked=true, since re-checking can't change
+  # that outcome.
+  guard-pending-deploy-final:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' }}
+    needs: [build-and-push, guard-pending-deploy]
+    runs-on: arc-deploy
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Re-check for a pending production approval right before deploy
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: .github/scripts/guard-pending-deploy.sh
+
+  deploy:
+    # Both guard results are required (not just their `blocked` outputs) so
+    # a failed/errored guard check — e.g. a GitHub API hiccup — fails closed
+    # into skipping this deploy, rather than silently proceeding with an
+    # unknown pending-approval state. guard-pending-deploy-final is the one
+    # that actually closes the eviction window; guard-pending-deploy alone
+    # only short-circuits the common case fast.
+    needs: [build-and-push, guard-pending-deploy, guard-pending-deploy-final]
+    runs-on: arc-deploy
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
     # Covers the sequential 30m Helm wait and 30m post-reconcile rollout wait,

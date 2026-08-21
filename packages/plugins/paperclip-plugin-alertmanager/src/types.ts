@@ -64,16 +64,14 @@ export interface AlertmanagerPluginConfig {
   /** Company that receives alerts when no company-routing label is present. */
   defaultCompanyId: string;
   /**
-   * Secret reference to the static bearer token Alertmanager uses when posting
-   * webhooks. The worker intentionally fails closed when this is configured
-   * until the host can verify it before invoking public webhook code.
+    * Secret reference to the static bearer token Alertmanager uses when posting
+    * webhooks. The host compares credentials without returning the secret value
+    * to the worker.
    */
   webhookTokenRef?: string;
   /**
-   * Inline bearer token accepted by the worker-side webhook path. This is the
-   * only enabled token mechanism until `webhookTokenRef` has host-side
-   * verification that does not spend secret-resolution quota on invalid public
-   * requests.
+   * Inline bearer token accepted by the worker-side webhook path. Prefer
+   * `webhookTokenRef` for production deployments.
    */
   webhookToken?: string;
   /**
@@ -97,10 +95,35 @@ export interface AlertmanagerPluginConfig {
    */
   ownerMap?: OwnerMap;
   /**
+   * Exact agent name assigned when neither owner resolution nor an issue route
+   * produces an assignee. Required in practice: an instance whose
+   * `fallbackAgentName` is missing, unmatched, or ambiguous fails closed and
+   * creates no issue, because an ownerless alert issue is never actioned and
+   * auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438).
+   */
+  fallbackAgentName?: string;
+  /**
    * Per-instance issue route map. Matches alert labels and applies project,
    * goal, status, and queue defaults to created issues.
    */
   issueRouteMap?: IssueRouteMap;
+  /**
+   * How long (hours) an operator-closed issue suppresses re-fires of its
+   * fingerprint before the plugin re-opens it anyway (BLO-24234).
+   *
+   * Closing an alert issue by hand means "stop nagging me about this", so the
+   * plugin honours it — but only for a bounded window. Without an expiry the
+   * suppression is permanent and silent: the fingerprint is muted forever, and
+   * because Alertmanager fingerprints are `hash(sorted(labels))`, a
+   * provider-agnostic alert re-uses one fingerprint across every future root
+   * cause. One operator closing a noisy issue would mute an unrelated outage
+   * months later.
+   *
+   * Defaults to `DEFAULT_OPERATOR_SUPPRESSION_HOURS`. Set to `0` to suppress
+   * indefinitely (the pre-BLO-24234 behaviour) — only safe for alerts you are
+   * willing to never hear from again.
+   */
+  operatorSuppressionHours?: number;
   escalationDeadlineMinutes?: Record<string, number>;
   /**
    * Width (minutes) of the board-cover dedup window (BLO-15982). Concurrent
@@ -175,6 +198,17 @@ export interface AlertStateRecord {
   firstSeenAt: string;
   lastFiredAt: string;
   resolvedAt: string | null;
+  /**
+   * When the plugin FIRST saw this fingerprint re-fire against an issue that
+   * an operator (not the plugin) had closed — i.e. terminal status with no
+   * `resolvedAt` (BLO-24234). Anchors the `operatorSuppressionHours` window.
+   *
+   * Cleared whenever the issue is observed open again, so a close/re-open
+   * cycle restarts the window rather than carrying a stale anchor forward.
+   * Optional: rows written before BLO-24234 do not have it, and `undefined`
+   * is treated as "suppression starts now".
+   */
+  operatorSuppressedAt?: string | null;
   nextEscalationAt?: string | null;
   escalationAttempt?: number;
   escalationComplete?: boolean;

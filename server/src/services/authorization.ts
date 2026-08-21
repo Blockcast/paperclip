@@ -27,6 +27,8 @@ import {
   isIssueWithinLowTrustBoundary,
   resolveCoreTrustPreset,
   type TrustPresetResolution,
+  type TrustPresetDenyReason,
+  type TrustPresetPolicySource,
 } from "./trust-preset-resolver.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
@@ -72,6 +74,7 @@ export type AuthorizationAction =
   | "issue:mutate"
   | "issue:read"
   | "project:read"
+  | "run:recover_stranded"
   | "runtime:manage"
   | "secrets:read";
 
@@ -106,6 +109,11 @@ export type AuthorizationDecision = {
   explanation: string;
   inboxPolicyMode?: InboxAgentPolicyMode | "grant_override";
   code?: "RESPONSIBLE_USER_UNAUTHORIZED" | "RESPONSIBLE_USER_UNAVAILABLE";
+  policyResolution?: {
+    reason: TrustPresetDenyReason;
+    source: TrustPresetPolicySource | null;
+    detail: string;
+  };
   reason:
     | "allow_low_trust_boundary"
     | "allow_local_board"
@@ -175,6 +183,15 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   // the dedicated branch also requires the actor to manage the issue assignee.
   // Mapping it here would silently drop that second half of the check.
   if (action === "issue:coordination_metadata") return null;
+  // BLO-21947: stranded-run recovery is unmapped for the same reason as
+  // coordination-metadata above. It requires the actor to manage the stalled
+  // agent *in addition to* holding `tasks:assign`, and is further gated by an
+  // auditable precondition enforced at the route (the run never dispatched).
+  // Mapping it here would let the generic `permissionKey` fallback satisfy it
+  // on the grant alone, silently dropping the manager-chain half and — because
+  // the route only consults the precondition after the decision allows —
+  // leaving the widening far broader than intended.
+  if (action === "run:recover_stranded") return null;
   return action;
 }
 
@@ -538,9 +555,17 @@ function activeResponsibleUserCanAuthorizeIssueAction(
     // action and the agent-side decision would never be reached. It is a
     // strict subset of issue:mutate, so it cannot be gated more loosely by
     // sharing that action's active-non-viewer bar.
+    // BLO-21947: stranded-run recovery joins for the same reason. It has no
+    // board permission mapping, so without this the responsible-user
+    // intersection returns `deny_unsupported_action` and the agent-side
+    // decision — which is where the manager-chain check lives — is never
+    // consulted. It is strictly narrower than `issue:mutate` (it cancels a run
+    // that never started), so sharing that action's active-non-viewer bar
+    // cannot gate it more loosely.
     (action === "issue:comment"
       || action === "issue:mutate"
-      || action === "issue:coordination_metadata")
+      || action === "issue:coordination_metadata"
+      || action === "run:recover_stranded")
   );
 }
 
@@ -573,6 +598,7 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
     ...(decision.code ? { code: decision.code } : {}),
     reason: decision.reason,
     boundary: authorizationBoundaryLabel(decision.reason),
+    ...(decision.policyResolution ? { resolution: decision.policyResolution } : {}),
   };
 }
 
@@ -847,7 +873,7 @@ export function authorizationService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
+  async function loadProject(companyId: string, projectId: string): Promise<ProjectAuthorizationRow | null> {
     return db
       .select({
         id: projects.id,
@@ -855,7 +881,7 @@ export function authorizationService(db: Db) {
         executionWorkspacePolicy: projects.executionWorkspacePolicy,
       })
       .from(projects)
-      .where(eq(projects.id, projectId))
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
   }
 
@@ -923,7 +949,7 @@ export function authorizationService(db: Db) {
         : resource.type === "project"
           ? resource.projectId ?? null
           : null;
-    const project = projectId ? await loadProject(projectId) : null;
+    const project = projectId ? await loadProject(resource.companyId, projectId) : null;
     return { issue, project };
   }
 
@@ -1031,6 +1057,11 @@ export function authorizationService(db: Db) {
         action: input.action,
         reason: "deny_policy_restricted",
         explanation: input.resolution.detail,
+        policyResolution: {
+          reason: input.resolution.reason,
+          source: input.resolution.source,
+          detail: input.resolution.detail,
+        },
       });
     }
 
@@ -2263,6 +2294,47 @@ export function authorizationService(db: Db) {
     //
     // Callers must still enforce the FIELD allowlist; this decides only
     // "may this actor touch coordination metadata on this issue at all".
+    // BLO-21947: recovery authority over a run belonging to an agent this
+    // actor manages. Deliberately mirrors `issue:coordination_metadata`
+    // below — manager-chain AND an explicit `tasks:assign` grant — for the
+    // same reason: the grant is held unscoped by nearly every agent, so the
+    // grant alone would let any agent cancel any other agent's runs.
+    //
+    // This decides only "may this actor recover executions owned by that
+    // agent at all". The *precondition* that makes the cancel non-destructive
+    // (the run never dispatched: `startedAt === null`, so no process, no
+    // tokens, no side effects) is enforced by the route, exactly as the field
+    // allowlist is for coordination-metadata. A `running` run stays board-only.
+    if (input.action === "run:recover_stranded") {
+      const resource = input.resource.type === "agent" ? input.resource : null;
+      const targetAgentId = resource?.agentId ?? null;
+      if (!targetAgentId) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Stranded-run recovery requires the run's owning agent as the resource.",
+        });
+      }
+      if (targetAgentId === actorAgentId) {
+        // An agent recovering its own run needs no widening: it is the
+        // assignee, and this action exists purely for the cross-agent case
+        // that the assignee's own broken wake path cannot serve.
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Stranded-run recovery authority applies only to runs owned by another agent.",
+        });
+      }
+      if (!(await isManagerOf(companyId, actorAgentId, targetAgentId))) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Actor does not manage the run's owning agent in the reporting chain.",
+        });
+      }
+      return decideWithTaskAssignmentGrants("agent", actorAgentId);
+    }
+
     if (input.action === "issue:coordination_metadata") {
       const resource = input.resource.type === "issue" ? input.resource : null;
       const assigneeAgentId = resource?.assigneeAgentId ?? null;

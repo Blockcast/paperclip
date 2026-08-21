@@ -147,6 +147,20 @@ env:
   # -- Extra environment variables merged verbatim into the container spec.
   # Example: `[{name: NODE_OPTIONS, value: --max-old-space-size=3072}]`.
   extra: []
+  # Deployment requirement, not a default this chart can safely set:
+  # the bundled `claude_k8s` adapter resolves its Job pod ServiceAccount from
+  # the per-agent `serviceAccountName` config field, then from
+  # PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME, and then *refuses to build the Job
+  # manifest* rather than falling through to the namespace `default`
+  # ServiceAccount, which has no cluster-scoped read (BLO-21499/BLO-21812).
+  # So if you run `claude_k8s` agents that have no per-agent value, add to
+  # `env.extra` above:
+  #   - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
+  #     value: <a ServiceAccount that exists in the release namespace>
+  # Left unset here deliberately: the correct account name is cluster-specific
+  # and a wrong-but-present default would fail at pod admission instead of at
+  # Job build, which is the harder failure to read. See
+  # values.blockcast.yaml for the Blockcast overlay that sets it.
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
 # plugins or runtime helpers read from disk (for example Authbot service keys).
@@ -199,6 +213,11 @@ githubApp:
   # chain silently wedges the PR. Empty (default) -> the server posts no status.
   # Requires the App to hold `statuses: write` on the target repos.
   prReviewGateStatusContext: ""
+  # -- Commit-status context for Ally's comment-shaped consolidated reviews.
+  # Empty (default) leaves this fully inert. When set, mark the same context
+  # required in branch protection so Critical/Important comment findings block
+  # the head they explicitly attest to. Requires `statuses: write`.
+  prCommentReviewGateStatusContext: ""
 
 # -- Pod spec knobs.
 pod:
@@ -450,10 +469,10 @@ prometheusRule:
   zeroTokenFor: 2m
   # -- Regex for Kubernetes Job names owned by Paperclip agents.
   agentJobNameRegex: "ac-.*"
-  # -- Rate window for BackoffLimitExceeded Job failures.
-  backoffLimitExceededWindow: 5m
-  # -- How long the BackoffLimitExceeded rate condition must persist before firing.
-  backoffLimitExceededFor: 2m
+  # -- Fire PaperclipAgentHeartbeatStale when an agent's lastHeartbeatAt age exceeds this multiple of its own configured heartbeat.intervalSec (BLO-23413).
+  agentHeartbeatStaleMultiplier: 3
+  # -- How long the stale-heartbeat condition must persist before firing (scrape-flap tolerance only; the ageing lives in the multiplier threshold).
+  agentHeartbeatStaleFor: 2m
   # -- Warn when process_lost reaps exceed this many per rolling 24h (BLO-16184 numerator).
   processLostWarnPerDay: 20
   # -- How long the elevated process_lost daily count must persist before warning.
@@ -486,6 +505,14 @@ prometheusRule:
   wakeTerminalFailedFor: 5m
   # -- Runbook for the terminal-failed wake alert, linked from its annotation.
   wakeTerminalFailedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/agent-wakeup-terminal-failed.md"
+  # -- How long an agent's oldest `queued` heartbeat_runs row may sit before firing (BLO-21116). Expressed in SECONDS and compared against paperclip_queued_run_oldest_age_seconds, which carries the real per-agent age -- see wakeTerminalFailedAgeSeconds above for why this is a threshold on an age gauge rather than a `for:` duration over a count. Matches this issue's own AC ("alert firing before the age exceeds ~30m"). Set to 1440 (24m), not 1800 (30m): `for:` below stacks its 5m hold on top of the threshold, so a bare 1800 would not fire until 2100s (35m) of real age -- past the AC. 1440 + 300 = 1740s (29m), same headroom as the matching `Blockcast/onprem-k8s#2013` fix for the rule that actually deploys.
+  queuedRunStrandedAgeSeconds: 1440
+  # -- Scrape-flap tolerance only (BLO-21116). The ageing lives in queuedRunStrandedAgeSeconds above; it stacks on top of that threshold rather than testing independently, which is why the threshold is 1440 and not 1800.
+  queuedRunStrandedFor: 5m
+  # -- Alert only after sustained failed refreshes; a one-off failed scrape is logged and retried on the next scrape.
+  queuedRunAgeMetricsRefreshFailureFor: 5m
+  # -- Runbook for the queued-run-stranded and metric-freshness alerts, linked from their annotations.
+  queuedRunStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- Additional PrometheusRule groups appended verbatim.

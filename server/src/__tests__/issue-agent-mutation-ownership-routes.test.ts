@@ -15,6 +15,7 @@ const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  assertPendingReviewRunOwnership: vi.fn(),
   checkout: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
@@ -30,6 +31,7 @@ const mockIssueService = vi.hoisted(() => ({
   listAttachments: vi.fn(),
   listComments: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  release: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
@@ -641,6 +643,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.assertPendingReviewRunOwnership.mockReset();
     mockIssueService.checkout.mockReset();
     mockIssueService.checkout.mockResolvedValue(makeIssue({
       status: "in_progress",
@@ -663,6 +666,13 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listComments.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.release.mockReset();
+    mockIssueService.release.mockResolvedValue(makeIssue({
+      status: "todo",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    }));
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockReset();
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument.mockReset();
@@ -774,6 +784,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.assertPendingReviewRunOwnership.mockResolvedValue({ owned: true, fenced: false });
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -1046,6 +1057,33 @@ describe("agent issue mutation checkout ownership", () => {
         actorAgentId: peerAgentId,
       }),
     );
+  });
+
+  // BLO-22909: the scoped-recovery-owner restore reaches the same
+  // `blockedByIssueIds: []` clear as the delegate-recovery unpark, but through a
+  // body that carries a third key (`comment`), so `isCreatorOrManagerChainRecoveryPatch`
+  // — which requires exactly two — returns false and the delegate-only pins do not
+  // apply. Its readiness pre-check is still route-level and pre-write, so without a
+  // write-time re-assertion a blocker committed in between is silently deleted.
+  it("pins the write-time blocker guard on a source-scoped recovery owner restore", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction() as never);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "todo",
+        blockedByIssueIds: [],
+        comment: "Restoring the original owner after stale recovery block cleared.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(patch.expectedNoUnresolvedBlockers).toBe(true);
+    // Delegate-only: this is not the 2-key manager-chain shape, so the
+    // authorization-snapshot pins must not be imposed here.
+    expect(patch.expectedCurrentStatus).toBeUndefined();
+    expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
   });
 
   it("rejects source-scoped recovery owner blocker clearing when blockers remain unresolved", async () => {
@@ -1414,6 +1452,468 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  // BLO-24149: the exact stranded shape a productivity review exists to
+  // catch — in_progress, monitor triggered, nextCheckAt null, and genuinely
+  // no active run (checkoutRunId/executionRunId both null, not merely a run
+  // still `queued`). Distinct from BLO-22860's dispatch-lapse sweep, which
+  // only re-arms a monitor whose run is still queued-but-undispatched; this
+  // asserts the review owner can restore the timer directly even when there
+  // is no run at all to wait on, matching the ticket's literal verifying
+  // signal.
+  it("lets a productivity-review owner restore a scheduled execution path on a fully stranded issue (BLO-24149)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-08-07T17:46:55.000Z",
+          attemptCount: 1,
+          notes: "wake consumed, never re-armed",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-12T18:00:00.000Z",
+            notes: "restored by productivity review continue verdict",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({
+            nextCheckAt: "2026-08-12T18:00:00.000Z",
+            notes: "restored by productivity review continue verdict",
+          }),
+        }),
+      }),
+    );
+    expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+  });
+
+  it("lets a manager-chain agent re-arm a report's triggered monitor without broader mutation access", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-08-07T12:00:00.000Z",
+          attemptCount: 1,
+          notes: "wake run did not dispatch",
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "issue:comment") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Actor manages the assignee.",
+        };
+      }
+      if (input.action === "runtime:manage" || input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No general issue mutation grant.",
+      };
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "manager restored lapsed monitor",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "manager restored lapsed monitor" }),
+        }),
+      }),
+    );
+  });
+
+  // BLO-21947. The BLO-18294 convergence guard stops re-arming after N
+  // re-checks against an unchanged gate set and deliberately bars the assignee
+  // from granting itself a fresh budget — "a non-assignee actor must make that
+  // re-arm decision". `issue-execution-policy.ts` implements exactly that
+  // (`resetConvergenceAfterStalledClear` + `sameAssigneeResetAfterPriorStall`),
+  // but the route gate only admitted `status: "triggered"`, so no non-assignee
+  // could reach it and the escape hatch had no executor.
+  const convergenceStalledMonitorState = (overrides: Record<string, unknown> = {}) => ({
+    status: "idle",
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    returnAssignee: null,
+    reviewRequest: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+    monitor: {
+      status: "cleared",
+      nextCheckAt: null,
+      lastTriggeredAt: "2026-08-07T12:00:00.000Z",
+      attemptCount: 3,
+      notes: "pr:#1229:review unchanged",
+      scheduledBy: "assignee",
+      clearedAt: "2026-08-07T12:30:00.000Z",
+      clearReason: "convergence_stalled",
+      ...(overrides as Record<string, unknown>),
+    },
+  });
+
+  const managerChainDecide = async (input: { action: string }) => {
+    if (input.action === "issue:comment") {
+      return {
+        allowed: true,
+        action: input.action,
+        reason: "allow_manager_chain",
+        explanation: "Actor manages the assignee.",
+      };
+    }
+    if (input.action === "runtime:manage" || input.action === "issue:read") {
+      return {
+        allowed: true,
+        action: input.action,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by test grant.",
+      };
+    }
+    return {
+      allowed: false,
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "No general issue mutation grant.",
+    };
+  };
+
+  it("lets a manager-chain agent re-arm a monitor the convergence guard cleared (BLO-21947)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      executionState: convergenceStalledMonitorState(),
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(managerChainDecide);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "manager granted a fresh convergence budget",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({
+            notes: "manager granted a fresh convergence budget",
+          }),
+        }),
+      }),
+    );
+  });
+
+  // Scope guard: the branch admits ONE additional clear reason, not every
+  // cleared monitor. A monitor cleared because the issue went terminal or lost
+  // a valid assignee is not a stalled-recovery case and must stay refused,
+  // otherwise this becomes a general cross-assignee policy write.
+  it.each(["done", "invalid_status", "invalid_assignee", "bounds_exhausted"])(
+    "still refuses a manager-chain re-arm of a monitor cleared for %s",
+    async (clearReason) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+        executionState: convergenceStalledMonitorState({ clearReason }),
+        monitorNextCheckAt: null,
+      }));
+      mockAccessService.decide.mockImplementation(managerChainDecide);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: {
+              nextCheckAt: "2026-08-07T14:00:00.000Z",
+              notes: "should not be admitted",
+              scheduledBy: "assignee",
+            },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  // No general widening: the same convergence-stalled shape from an actor with
+  // neither manager-chain nor assignment over the issue still fails closed.
+  it("keeps a convergence-stalled re-arm closed to an actor without manager-chain (BLO-21947)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: null,
+      executionState: convergenceStalledMonitorState(),
+      monitorNextCheckAt: null,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "runtime:manage" || input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "Unrelated actor.",
+      };
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "unrelated actor",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // BLO-22860 (Ally review on #1187). The manager-chain re-arm deliberately
+  // skips the ordinary mutation boundary, so its gate has to be keyed on the
+  // *policy* being a monitor re-arm, not merely on the request body having a
+  // single `executionPolicy` key. `executionPolicy` is a whole-policy replace:
+  // if a policy carrying a monitor alongside `stages` or `authorizationPolicy`
+  // were accepted, a manager could rewrite a report's workflow and
+  // authorization configuration with no general mutation grant.
+  const lapsedMonitorState = {
+    status: "idle",
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    returnAssignee: null,
+    reviewRequest: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+    monitor: {
+      status: "triggered",
+      nextCheckAt: null,
+      lastTriggeredAt: "2026-08-07T12:00:00.000Z",
+      attemptCount: 1,
+      notes: "wake run did not dispatch",
+      scheduledBy: "assignee",
+      clearedAt: null,
+      clearReason: null,
+    },
+  };
+
+  function mockManagerChainOverReport() {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "issue:comment") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Actor manages the assignee.",
+        };
+      }
+      if (input.action === "runtime:manage" || input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No general issue mutation grant.",
+      };
+    });
+  }
+
+  it.each([
+    [
+      "stages",
+      {
+        monitor: {
+          nextCheckAt: "2026-08-07T14:00:00.000Z",
+          notes: "re-arm",
+          scheduledBy: "assignee",
+        },
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: staleAgentId }] },
+        ],
+      },
+    ],
+    [
+      "authorizationPolicy",
+      {
+        monitor: {
+          nextCheckAt: "2026-08-07T14:00:00.000Z",
+          notes: "re-arm",
+          scheduledBy: "assignee",
+        },
+        authorizationPolicy: { trustPreset: "low_trust_review" },
+      },
+    ],
+  ])(
+    "refuses a manager-chain monitor re-arm whose policy also carries %s",
+    async (_label, executionPolicy) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+        executionState: lapsedMonitorState,
+        monitorNextCheckAt: null,
+      }));
+      mockManagerChainOverReport();
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves a report's stages and authorizationPolicy when a manager re-arms the monitor", async () => {
+    // The gate above keeps `stages` out of the *request*; this keeps the write
+    // itself non-destructive. `executionPolicy` replaces wholesale, so without
+    // a merge a legitimate monitor-only re-arm would still drop the assignee's
+    // stages and authorization policy as a side effect of restoring a timer.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: staleAgentId }] },
+        ],
+        authorizationPolicy: { trustPreset: "low_trust_review" },
+      },
+      executionState: lapsedMonitorState,
+      monitorNextCheckAt: null,
+    }));
+    mockManagerChainOverReport();
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-08-07T14:00:00.000Z",
+            notes: "manager restored lapsed monitor",
+            scheduledBy: "assignee",
+          },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+      executionPolicy: {
+        monitor: { notes: string };
+        stages: { participants: { agentId: string }[] }[];
+        authorizationPolicy?: { trustPreset: string };
+      };
+    };
+    expect(written.executionPolicy.monitor.notes).toBe("manager restored lapsed monitor");
+    expect(written.executionPolicy.stages).toHaveLength(1);
+    expect(written.executionPolicy.stages[0].participants[0].agentId).toBe(staleAgentId);
+    expect(written.executionPolicy.authorizationPolicy?.trustPreset).toBe("low_trust_review");
+  });
+
   it("keeps the monitor gate closed to a productivity-review owner outside PATCH /issues/:id", async () => {
     // The forced-wake route shares the same helper but never passes the
     // reviewer-authorized option, so it must stay closed even though PATCH
@@ -1545,6 +2045,114 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
     expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+  });
+
+  // BLO-24421: consolidated regression coverage for all four acceptance
+  // criteria, so CI carries one case that fails if the BLO-24191 fix (above)
+  // regresses. The DB-level half of AC #3 — a `done`/`cancelled` review no
+  // longer satisfying `agentHasProductivityReviewGrantOnIssue` — is covered
+  // in authorization-service.test.ts ("does not let a productivity review
+  // grant access once it reaches a terminal status"); this suite mocks the
+  // access service directly, so it re-asserts the route-scoping half instead.
+  describe("BLO-24421: monitor guard admits the review grant regardless of match order", () => {
+    it("AC1: lets an open review's owner re-arm the monitor via PATCH /issues/:id", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC1" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({
+            monitor: expect.objectContaining({
+              nextCheckAt: "2026-08-17T00:00:00.000Z",
+              notes: "BLO-24421 AC1",
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("AC2: still 403s an actor with no qualifying relation to the issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No agent permission mapping exists for this action.",
+      }));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC2" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(productivitySourceMutationAuditCalls()).toHaveLength(0);
+    });
+
+    it("AC3: keeps the forced-wake route closed to a review owner even though PATCH now honours the grant", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithRuntimeManage);
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/monitor/check-now`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Only the assignee agent or a board user can manage issue monitors");
+    });
+
+    it("AC4: admits the review-grant holder even when a broader allow-path (manager chain) also matches", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+      }));
+      mockAccessService.decide.mockImplementation(productivityReviewDecideWithCheckoutOverride);
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            monitor: { nextCheckAt: "2026-08-17T00:00:00.000Z", notes: "BLO-24421 AC4" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          executionPolicy: expect.objectContaining({
+            monitor: expect.objectContaining({ notes: "BLO-24421 AC4" }),
+          }),
+        }),
+      );
+      expect(productivitySourceMutationAuditCalls()).toHaveLength(1);
+    });
   });
 
   // The comment route's current-execution-run short-circuit returns a bare
@@ -2286,7 +2894,7 @@ describe("agent issue mutation checkout ownership", () => {
       peerAgentId,
       ["blocked"],
       actor.runId,
-      { allowSourceScopedRecoveryOwner: false, recoveryActionId: null, recoveryActionStatus: null },
+      { allowSourceScopedRecoveryOwner: false, allowExecutionStageParticipantClaim: false, recoveryActionId: null, recoveryActionStatus: null },
     );
   });
 
@@ -2329,7 +2937,7 @@ describe("agent issue mutation checkout ownership", () => {
         peerAgentId,
         ["blocked"],
         actor.runId,
-        { allowSourceScopedRecoveryOwner: true, recoveryActionId, recoveryActionStatus: status },
+        { allowSourceScopedRecoveryOwner: true, allowExecutionStageParticipantClaim: false, recoveryActionId, recoveryActionStatus: status },
       );
     },
   );
@@ -2351,6 +2959,105 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Missing assignment grant.");
     expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  // BLO-22856: checkout was the one issue-mutating route that never consulted
+  // the `issue:mutate` boundary — it gated on `tasks:assign`, and only in the
+  // cross-assignee case. The two admit different actor sets, so an actor could
+  // clear checkout, move the row to `in_progress` and take the run lock, then
+  // be denied by every endpoint that could undo it (upsert-document, PATCH,
+  // release all run the boundary checkout skipped). The row stranded
+  // `in_progress` until an out-of-band recovery action cleared it.
+  it("fails a checkout closed when the issue:mutate boundary denies, leaving status and run locks untouched", async () => {
+    const issueRow = makeIssue({
+      status: "blocked",
+      assigneeAgentId: ownerAgentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+    mockIssueService.getById.mockResolvedValue(issueRow);
+    // This mock IS the divergence under test: the gate checkout used to rely
+    // on (`tasks:assign`) admits the actor, while the boundary every undo
+    // endpoint enforces (`issue:mutate`) denies it.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action !== "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_explicit_grant",
+      explanation:
+        input.action === "issue:mutate" ? "Missing permission: issue:mutate." : "Allowed by test default.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["blocked"] });
+
+    // Same denial shape `PATCH /issues/:id` returns for this actor/issue pair.
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary (grant)");
+    expect(res.body.details).toMatchObject({ reason: "deny_missing_grant" });
+    // Fail closed: the service was never reached, so status, checkoutRunId,
+    // executionRunId and executionLockedAt all keep their pre-request values.
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+    expect(issueRow).toMatchObject({
+      status: "blocked",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it("still checks out an issue assigned to the actor when the boundary allows", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+
+    const actor = peerActor();
+    const res = await request(await createApp(actor))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["blocked"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issueId,
+      peerAgentId,
+      ["blocked"],
+      actor.runId,
+      {
+        allowSourceScopedRecoveryOwner: false,
+        allowExecutionStageParticipantClaim: false,
+        recoveryActionId: null,
+        recoveryActionStatus: null,
+      },
+    );
+  });
+
+  // The invariant the fix exists to protect: a checkout that returns 2xx is
+  // always undoable by the actor that made it.
+  it("lets the same actor release a checkout it was allowed to take", async () => {
+    const actor = peerActor();
+    const afterCheckout = makeIssue({
+      status: "in_progress",
+      assigneeAgentId: peerAgentId,
+      checkoutRunId: actor.runId,
+      executionRunId: actor.runId,
+    });
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "blocked", assigneeAgentId: peerAgentId, checkoutRunId: null, executionRunId: null }),
+    );
+    mockIssueService.checkout.mockResolvedValue(afterCheckout);
+    mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+
+    const app = await createApp(actor);
+    const checkoutRes = await request(app)
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["blocked"] });
+    expect(checkoutRes.status, JSON.stringify(checkoutRes.body)).toBe(200);
+
+    // Reads after the checkout observe the row it produced.
+    mockIssueService.getById.mockResolvedValue(afterCheckout);
+    const releaseRes = await request(app).post(`/api/issues/${issueId}/release`).send({});
+
+    expect(releaseRes.status, JSON.stringify(releaseRes.body)).toBe(200);
+    expect(mockIssueService.release).toHaveBeenCalledWith(issueId, peerAgentId, actor.runId);
   });
 
   it("denies cross-company agents before comment authorization is evaluated", async () => {
@@ -3314,7 +4021,12 @@ describe("agent issue mutation checkout ownership", () => {
       expect.any(Object),
     );
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
-    expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", { title: "Updated product" });
+    // `sourceTrust: null` is the actor-write provenance restamp (BLO-19566): an
+    // actor edit never inherits the system trust a webhook-written row carries.
+    expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", {
+      title: "Updated product",
+      sourceTrust: null,
+    });
   });
 
   it("preserves board mutations on active checkouts", async () => {
@@ -3720,6 +4432,11 @@ describe("agent issue mutation checkout ownership", () => {
         status: "todo",
         expectedCurrentStatus: "blocked",
         expectedCurrentAssigneeAgentId: ownerAgentId,
+        // BLO-22909: the blocker set is pinned too. Status and assignee are
+        // column equalities the UPDATE's WHERE can re-check; "no live blockers"
+        // is not, so it is re-evaluated inside the update transaction. Without
+        // this flag reaching the service the write-time guard never runs.
+        expectedNoUnresolvedBlockers: true,
       });
       expect(patch.blockedByIssueIds).toEqual([]);
     },
@@ -3799,6 +4516,10 @@ describe("agent issue mutation checkout ownership", () => {
     const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
     expect(patch.expectedCurrentStatus).toBeUndefined();
     expect(patch.expectedCurrentAssigneeAgentId).toBeUndefined();
+    // BLO-22909: the assignee patching their own issue is not the
+    // delegate-recovery path, so it must not acquire the extra write-time
+    // blocker guard either — the flag forces a company-scoped advisory lock.
+    expect(patch.expectedNoUnresolvedBlockers).toBeUndefined();
   });
 
   it.each([
@@ -3962,6 +4683,220 @@ describe("agent issue mutation checkout ownership", () => {
     const [, patch] = mockIssueService.update.mock.calls.at(-1) as [string, Record<string, unknown>];
     expect(patch.executionState).toMatchObject({
       reviewRequest: { instructions: "Review the ownership guard." },
+    });
+  });
+
+  // BLO-22666 AC2. The fixture that matters is `assigneeAgentId: ownerAgentId`
+  // with the lock held by ownerRunId: the actor is the issue's OWN assignee, so
+  // it clears every ordinary boundary, but it is a second run of that agent and
+  // must not decide the stage run A is sitting on (BLO-18858).
+  //
+  // Reverting the fence in `ensureAgentCheckoutOwnership` makes this fail: the
+  // PATCH short-circuits at the participant-decision early return and
+  // assertPendingReviewRunOwnership is never called.
+  describe("pending in_review run ownership (BLO-22666)", () => {
+    function lockedPendingReviewForOwner(overrides: Record<string, unknown> = {}) {
+      return makePendingReviewIssueForAgent(ownerAgentId, {
+        assigneeAgentId: ownerAgentId,
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+        ...overrides,
+      });
+    }
+
+    function allowCommentDecide() {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: input.action === "issue:comment" ? "allow_self" : "allow_company_agent",
+        explanation: "Allowed by test boundary.",
+      }));
+    }
+
+    it("fences a second run of the assignee off a live-locked pending in_review PATCH", async () => {
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(mockIssueService.assertPendingReviewRunOwnership).toHaveBeenCalledWith(
+        issueId,
+        ownerAgentId,
+        "88888888-8888-4888-8888-888888888888",
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it("surfaces the service conflict as a 409 and refuses the write", async () => {
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      mockIssueService.assertPendingReviewRunOwnership.mockRejectedValue(
+        conflict("Issue run ownership conflict", {
+          issueId,
+          reason: "pending_review_stage_locked_by_another_run",
+        }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not fence the run that actually holds the lock", async () => {
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    // The regression this fence must never cause. A peer reviewer holds no
+    // checkout by construction, so widening the predicate past
+    // `assigneeAgentId === actor` would deadlock every review stage.
+    it("does not fence a non-assignee reviewer that holds no checkout", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, {
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: ownerRunId,
+          executionRunId: ownerRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    // An unlocked assigned in_review row is exactly what #1117 made checkoutable.
+    it("does not fence an unlocked pending in_review row", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await lockedPendingReviewForOwner({ checkoutRunId: null, executionRunId: null }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage decision." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    it("refuses an approval-shaped comment from a second run of the assignee", async () => {
+      const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      const reviewBody = "## Review: APPROVED";
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      allowCommentDecide();
+      mockIssueService.assertPendingReviewRunOwnership.mockRejectedValue(
+        conflict("Issue run ownership conflict", { issueId }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      // Neither the comment nor the `done` transition lands.
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // The fence is scoped to the auto-approval branch, not to commenting: a
+    // losing run must still be able to leave its findings on the thread.
+    it("still accepts an ordinary comment from a second run of the assignee", async () => {
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      allowCommentDecide();
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-handoff",
+        issueId,
+        companyId,
+        body: "Run B handing off.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: ownerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Run B handing off." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    it("lets the lock-holding run resolve its own stage by approval comment", async () => {
+      const reviewBody = "## Review: APPROVED";
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+      allowCommentDecide();
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-owner-approval",
+        issueId,
+        companyId,
+        body: reviewBody,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: ownerAgentId,
+        authorUserId: null,
+      });
+
+      const res = await request(await createApp(ownerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: reviewBody });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    // BLO-22666 AC3: the stage is pinned to an agent that is NOT the assignee, so
+    // the ordinary checkout predicate can never match it. Reverting the route
+    // flag drops `allowExecutionStageParticipantClaim` and the claim never
+    // reaches the service.
+    it("passes the participant-claim flag for a drifted currentParticipant", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(peerAgentId, { assigneeAgentId: ownerAgentId }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["in_review"] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.checkout).toHaveBeenCalledWith(
+        issueId,
+        peerAgentId,
+        ["in_review"],
+        expect.any(String),
+        expect.objectContaining({ allowExecutionStageParticipantClaim: true }),
+      );
+    });
+
+    it("does not offer the participant claim to an agent the stage is not pinned to", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        await makePendingReviewIssueForAgent(staleAgentId, { assigneeAgentId: ownerAgentId }),
+      );
+
+      await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["in_review"] });
+
+      expect(mockIssueService.checkout).toHaveBeenCalledWith(
+        issueId,
+        peerAgentId,
+        ["in_review"],
+        expect.any(String),
+        expect.objectContaining({ allowExecutionStageParticipantClaim: false }),
+      );
     });
   });
 
@@ -4255,6 +5190,27 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("createdByRunId must match the authenticated agent run");
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
+  });
+
+  it("clears webhook provenance when an actor updates a work product (BLO-19566)", async () => {
+    // Productivity review treats a PR row carrying system webhook source-trust
+    // as progress-eligible evidence, keyed on `updatedAt`. Conditionally
+    // spreading the actor's resolved trust left that system stamp in place on
+    // an actor edit while the update refreshed `updatedAt`, so an assignee
+    // could PATCH a stale webhook row into fresh, trusted evidence about their
+    // own issue. An actor write now always restamps provenance.
+    const app = await createApp(ownerActor());
+
+    const res = await request(app).patch("/api/work-products/product-1").send({
+      status: "merged",
+      url: "https://github.com/Blockcast/paperclip/pull/999",
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWorkProductService.update).toHaveBeenCalledWith(
+      "product-1",
+      expect.objectContaining({ sourceTrust: null }),
+    );
   });
 
   it("rejects board-created work products with a foreign-company run id", async () => {
@@ -4709,6 +5665,71 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    // BLO-22856: checkout ran no watchdog gate at all, so a watchdog run could
+    // take the lock on an issue outside the watched subtree and then be refused
+    // by release, which does run the gate. No race and no third actor required —
+    // here the run IS the assignee, so `tasks:assign` is never even consulted
+    // and checkout was previously authorized by nothing but company access.
+    it("denies a watchdog run checking out an issue outside the watched subtree", async () => {
+      denyBaseBoundary();
+      const issueRow = makeIssue({
+        status: "blocked",
+        assigneeAgentId: peerAgentId,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+      });
+      mockIssueService.getById.mockResolvedValue(issueRow);
+
+      const outsideWatched = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeef";
+      const app = await createApp(
+        watchdogActor(),
+        createWatchdogDb({ watchedIssueId: outsideWatched, ancestryParentId: null }),
+      );
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["blocked"] });
+
+      // Same 403 release returns for this run/issue pair.
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Task-watchdog runs can only mutate the watched issue subtree.");
+      expect(mockIssueService.checkout).not.toHaveBeenCalled();
+      expect(issueRow).toMatchObject({
+        status: "blocked",
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+      });
+    });
+
+    // The other half of the gate: an in-subtree watchdog scope widens past the
+    // ordinary boundary (denied here by `denyBaseBoundary`) exactly as it does
+    // on release, so checkout must still succeed.
+    it("still allows a watchdog run to check out an issue inside the watched subtree", async () => {
+      denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+
+      const actor = watchdogActor();
+      const app = await createApp(actor, createWatchdogDb());
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId: peerAgentId, expectedStatuses: ["blocked"] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.checkout).toHaveBeenCalledWith(
+        issueId,
+        peerAgentId,
+        ["blocked"],
+        actor.runId,
+        {
+          allowSourceScopedRecoveryOwner: false,
+          allowExecutionStageParticipantClaim: false,
+          recoveryActionId: null,
+          recoveryActionStatus: null,
+        },
+      );
+    });
+
     it("still enforces normal assignment guards for watchdog reassignment", async () => {
       // Base boundary denied AND tasks:assign denied: the watchdog grant lets the
       // mutation past the ownership boundary, but the assignment guard must still bite.
@@ -5102,6 +6123,142 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.remove).not.toHaveBeenCalled();
     });
 
+    // BLO-19912. A refused coordination attempt used to fall through to the
+    // ordinary boundary and leave no trace of the coordination path at all, so
+    // a rebind attempted against a live run — the thing an operator reviewing
+    // this authority most wants to see — was invisible.
+    describe("refusal records", () => {
+      function refusalRecords() {
+        return mockLogActivity.mock.calls
+          .map(([, entry]) => entry as { action?: string; details?: Record<string, unknown> })
+          .filter((entry) => entry.action === "issue.coordination_metadata_refused");
+      }
+
+      it("records an execution-lock refusal with the actor, issue, fields, and holding run", async () => {
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId }),
+        );
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+        await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ projectWorkspaceId: "99999999-9999-4999-8999-999999999999" });
+
+        expect(mockLogActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: "issue.coordination_metadata_refused",
+            entityId: issueId,
+            agentId: peerAgentId,
+            details: expect.objectContaining({
+              path: "coordination_metadata_allowlist",
+              outcome: "refused",
+              refusalReason: "execution_lock",
+              fields: ["projectWorkspaceId"],
+              blockedFields: ["projectWorkspaceId"],
+              executionRunId: ownerRunId,
+              assigneeAgentId: ownerAgentId,
+            }),
+          }),
+          // Written inside the advisory-lock transaction, so publication has to
+          // be handed back and fired after commit rather than inline.
+          { deferPublish: true },
+        );
+      });
+
+      // The two refusals have different remedies — wait for the run to finish
+      // versus grant the actor tasks:assign — so an operator must be able to
+      // tell them apart from the record alone.
+      it("distinguishes an authorization denial from an execution-lock refusal", async () => {
+        mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(false));
+
+        await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ blockedByIssueIds: [] });
+
+        // `boundaryReason`, not `authorizationReason`: this assertion sees the
+        // argument handed to a mocked `logActivity`, so it passed happily while
+        // the real sanitizer replaced the value with `***REDACTED***` on the way
+        // to the row. The persisted value is pinned in
+        // `issue-coordination-metadata-refusal-persistence.test.ts`, which is
+        // the only level at which that bug is visible.
+        expect(refusalRecords()).toEqual([
+          expect.objectContaining({
+            details: expect.objectContaining({
+              refusalReason: "authorization_denied",
+              boundaryReason: "deny_missing_grant",
+              fields: ["blockedByIssueIds"],
+            }),
+          }),
+        ]);
+        expect(refusalRecords()[0]?.details).not.toHaveProperty("executionRunId");
+      });
+
+      // The gate was never reached: the assignee already holds ordinary
+      // mutation authority, so there is no coordination attempt to record and
+      // logging one would drown the real signal.
+      it("does not record a refusal when the actor is the assignee", async () => {
+        mockIssueService.getById.mockResolvedValue(
+          makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, executionRunId: null }),
+        );
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(false));
+
+        await request(await createApp(ownerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ priority: "low" });
+
+        expect(refusalRecords()).toEqual([]);
+      });
+
+      it("records no refusal when the coordination path is allowed", async () => {
+        mockIssueService.getById.mockResolvedValue(otherAgentsParkedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+
+        await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ blockedByIssueIds: [] })
+          .expect(200);
+
+        expect(refusalRecords()).toEqual([]);
+        expect(mockLogActivity).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ action: "issue.coordination_metadata_updated" }),
+        );
+      });
+
+      // Observability must never become a failure mode of the thing it
+      // observes: the refusal itself is an authorization decision that has
+      // already been made, so a logging fault leaves the outcome unchanged.
+      //
+      // Ally review of be5cd310d: asserting "some 4xx" would pass even if the
+      // denial contract drifted, so pin it against the status and body the same
+      // refusal produces with logging healthy.
+      it("still refuses the write when recording the refusal fails", async () => {
+        const lockedIssue = () =>
+          makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: ownerRunId });
+        const rebind = { projectWorkspaceId: "99999999-9999-4999-8999-999999999999" };
+
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+        const healthy = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send(rebind);
+
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+        mockAccessService.decide.mockImplementation(coordinationHolderDecide(true));
+        mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
+        const withLoggingFault = await request(await createApp(peerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send(rebind);
+
+        expect(healthy.status, JSON.stringify(healthy.body)).toBe(403);
+        expect(withLoggingFault.status, JSON.stringify(withLoggingFault.body)).toBe(healthy.status);
+        expect(withLoggingFault.body).toEqual(healthy.body);
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+      });
+    });
+
     // BLO-19951 (Ally's finding on PR #795, transferred to #870). The
     // recovery-action guard used to run unconditionally, so an
     // allowlist-confined patch still 403'd whenever the issue carried a
@@ -5244,6 +6401,21 @@ describe("agent issue mutation checkout ownership", () => {
       // (issues.ts:4560) without granting recovery authority. Deliberately not
       // the checkout-management override: that one satisfies both gates, so it
       // could never show the contrast.
+      //
+      // BLO-19951 follow-up — read these two cases for what they are. The stub
+      // below returns issue:coordination_metadata=allow while leaving
+      // tasks:manage_active_checkouts denied, and the real authorization
+      // service CANNOT emit that pair: coordination metadata allows solely via
+      // isManagerOf(actor, assignee), and that same relation allows
+      // manage_active_checkouts, which assertRecoveryActionAuthority accepts
+      // before it can 403. So no live actor reaches the guard holding a
+      // coordination decision, and the carve-out is presently unreachable —
+      // these cases document the wiring and the intended behaviour if the two
+      // authorities are ever decoupled, not a state production can exhibit.
+      // The coupling that makes them hypothetical is pinned against the real
+      // service in authorization-service.test.ts ("couples coordination-metadata
+      // authority to active-checkout management"); if that test fails, these
+      // stop being hypothetical and the carve-out needs re-review.
       describe("actor that reaches the recovery guard", () => {
         const reviewOwnerWithCoordinationDecide = async (input: { action: string }) => ({
           allowed: input.action === "issue:read"
@@ -5274,7 +6446,9 @@ describe("agent issue mutation checkout ownership", () => {
         });
 
         // Same actor, same issue, same open recovery action — only the patch
-        // shape differs. This pair is the carve-out's whole contract.
+        // shape differs. This pair is the carve-out's contract as written, but
+        // see the note above: the actor shape it needs is one the real service
+        // cannot produce today.
         it("lets the same actor through for an allowlisted blocker edit", async () => {
           const res = await request(await createApp(peerActor()))
             .patch(`/api/issues/${issueId}`)

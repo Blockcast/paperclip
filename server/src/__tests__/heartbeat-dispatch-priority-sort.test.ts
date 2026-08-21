@@ -11,7 +11,8 @@
  *
  * Fix #1 (stale-run exclusion): verifies that a stale/silent running run does
  * not hold a dispatch slot hostage. A run is stale when its most-recent signal
- * (lastUsefulActionAt > lastOutputAt > startedAt) is older than
+ * — the NEWEST of lastUsefulActionAt / lastOutputAt / startedAt (BLO-20775; it
+ * was a first-non-null priority chain before) — is older than
  * EXTERNAL_LIFECYCLE_STALE_MS (15 min). Before the fix, stale runs counted as
  * "running" and blocked all dispatch for external-lifecycle agents via the hard
  * early-return gate — even when the k8s Job was already gone.
@@ -117,6 +118,13 @@ async function waitForRunToSettle(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
+}
+
+function buildQueuedRetryContext(index: number) {
+  const retryAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  return index % 2 === 0
+    ? { paperclipK8sIsolationRetryAt: retryAt }
+    : { paperclipBranchClaimRetryAt: retryAt };
 }
 
 describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
@@ -956,6 +964,162 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       .where(eq(heartbeatRuns.id, todoRunId))
       .then((rows) => rows[0] ?? null);
     expect(todoRun?.status).not.toBe("queued");
+  });
+
+  it("counts a running run with a stale useful-action stamp but fresh output toward the slot gate (BLO-20775)", async () => {
+    // BLO-20775. Scope honestly: a CHARACTERIZATION test of the slot gate's
+    // selection expression, not a reproduction of a production incident. It
+    // manufactures the divergent stamp state directly, because no production
+    // writer produces it on a running row — flushOutputProgress writes
+    // lastOutputAt and lastUsefulActionAt to the same value in one .set() (pinned
+    // by the coupling guard in heartbeat-process-recovery.test.ts). The old gate
+    // coalesced the stamps by priority (lastUsefulActionAt ? ... : lastOutputAt
+    // ? ...), which assumed an ordering nothing enforces; this takes the newest.
+    //
+    // The state IS real on terminal rows, and — unlike the external-lifecycle
+    // reaper path — it genuinely reaches this gate: listRunningRunsForAgent filters
+    // on agentId + status with no adapter predicate, so it returns sessioned-local
+    // rows, and a terminal local row is resurrected to `running` by the unguarded
+    // setRunStatus(id, "running") in reapOrphanedRuns (gated on processPidAlive →
+    // isTrackedLocalChildProcessAdapter, which is why codex_local below is the
+    // right fixture and not an arbitrary choice). Such a row genuinely occupies a
+    // slot, so it must count — otherwise the agent's only slot looks free and a
+    // second run dispatches on top of a live one.
+    //
+    // This is the exact inverse of the Fix #1 test above: there a genuinely silent
+    // run must NOT hold a slot; here a live one MUST. Both directions are needed —
+    // a max-based gate that simply never excluded anything would pass this test
+    // and fail the one above.
+    //
+    // codex_local for the same reason as above: reapOrphanedRuns is not called
+    // inside startNextQueuedRunForAgent for non-external-lifecycle adapters, so
+    // the running row stays untouched and isolates the slot-gate logic.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const liveIssueId = randomUUID();
+    const queuedIssueId = randomUUID();
+    const issuePrefix = `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "LiveOutputCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "LiveOutputAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: liveIssueId,
+        companyId,
+        title: "Long-running live work",
+        status: "in_progress",
+        priority: "low",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: new Date(),
+      },
+      {
+        id: queuedIssueId,
+        companyId,
+        title: "Queued contender",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+
+    // Useful-action stamp 60 min old (well past EXTERNAL_LIFECYCLE_STALE_MS =
+    // 15 min), output streaming right now. Constructed directly — see the scope
+    // note above for why no production writer emits this on a running row.
+    const lastUsefulActionAt = new Date(Date.now() - 60 * 60 * 1000);
+    const freshOutputAt = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "heartbeat",
+      triggerDetail: "timer",
+      status: "running",
+      contextSnapshot: { issueId: liveIssueId, wakeReason: "heartbeat_timer" },
+      startedAt: lastUsefulActionAt,
+      lastUsefulActionAt,
+      lastOutputAt: freshOutputAt,
+      createdAt: lastUsefulActionAt,
+      updatedAt: freshOutputAt,
+    });
+
+    const queuedWakeId = randomUUID();
+    const queuedRunId = randomUUID();
+    const queuedTime = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: queuedIssueId },
+      status: "queued",
+      runId: queuedRunId,
+      requestedAt: queuedTime,
+      updatedAt: queuedTime,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeId,
+      contextSnapshot: { issueId: queuedIssueId, wakeReason: "issue_assigned" },
+      createdAt: queuedTime,
+      updatedAt: queuedTime,
+    });
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    // REGRESSION GUARD (BLO-20775): the live run holds the agent's single slot,
+    // so nothing must dispatch. Under the old priority chain this asserted the
+    // opposite behaviour — the queued run dispatched onto an occupied slot.
+    expect(dispatchedRunIds).toHaveLength(0);
+
+    const queuedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedRun?.status).toBe("queued");
   });
 
   it("suppresses a queued same-issue retry even when the running row is stale", async () => {
@@ -2992,6 +3156,167 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     }
   }, 300_000);
 
+  it("does not let an aged isolation-retry-deferred critical row strand a fresh critical arrival via a false-ready absolute-floor rank (BLO-22091)", async () => {
+    // `dispatchRank`'s own `ready` computation previously called
+    // `isEffectivelyDependencyReadyForDispatch` alone, which screens only
+    // dependency-readiness. An isolation-retry-deferred row that IS
+    // dependency-ready therefore read `ready: true` there even though
+    // `claimQueuedRun` refuses it unconditionally at the top of the function
+    // (`isK8sIsolationRetryDeferred`) — the lanes above already knew to
+    // exclude such a row, but this one site never re-derived that screen.
+    //
+    // Once such a row ages past the absolute floor it ranked
+    // `ABSOLUTE_STARVATION_DISPATCH_RANK` — the very front of the queue.
+    // Because it is critical-priority, lane A had already marked it as
+    // emergency-lane work, so the claim loop's refusal handler,
+    // `scheduleEmergencyContinuationForStillQueuedRun`, aborted the whole pass
+    // on its refusal rather than falling through to `freshRunId` ranked right
+    // behind it, and scheduled a "resume_critical_lane" detached retry.
+    //
+    // That retry is self-healing — `dispatchDeferredRunIdsByAgent` excludes
+    // the refused row from the next scan, so `freshRunId` dispatches a moment
+    // later even pre-fix. Asserting only the EVENTUAL outcome would therefore
+    // pass on both sides of the fix and miss the regression entirely. What
+    // must not happen, and is what actually distinguishes pre-fix from
+    // post-fix, is the reschedule itself: post-fix `freshRunId` outranks the
+    // deferred row directly, so the claim loop claims it on the FIRST attempt
+    // of the FIRST pass and never even reaches the deferred row — no refusal,
+    // no reschedule. `onQueuedDispatchScheduledForTest` fires synchronously
+    // the instant a reschedule is requested (see `scheduleDetachedDispatchPass`),
+    // so this is observable without polling or racing detached execution.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const deferredIssueId = randomUUID();
+    const freshIssueId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    const criticalLaneReschedules: Array<{ agentId: string; reason: string }> = [];
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      onQueuedDispatchScheduledForTest: (event) => {
+        if (event.reason === "resume_critical_lane") {
+          criticalLaneReschedules.push({ agentId: event.agentId, reason: event.reason });
+        }
+      },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "IsolationDeferredAbsoluteFloorCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IsolationDeferredAbsoluteFloorAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: deferredIssueId,
+        companyId,
+        title: "Critical work whose run is deferred for a k8s isolation retry",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: freshIssueId,
+        companyId,
+        title: "Fresh critical arrival that must not be stranded behind it",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+
+    const deferredRunId = randomUUID();
+    const freshRunId = randomUUID();
+    // 7h > STARVATION_ABSOLUTE_ESCALATION_MS (6h): aged past the absolute
+    // floor, exactly the age at which the false-`ready` bug promoted this row
+    // to the very front of the queue.
+    const deferredCreatedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: deferredRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {
+          issueId: deferredIssueId,
+          wakeReason: "issue_assigned",
+          // An hour out - genuinely unclaimable for the whole test, by design.
+          paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+        },
+        createdAt: deferredCreatedAt,
+        updatedAt: deferredCreatedAt,
+      },
+      {
+        id: freshRunId,
+        companyId,
+        agentId,
+        invocationSource: "heartbeat",
+        triggerDetail: "timer",
+        status: "queued",
+        contextSnapshot: { issueId: freshIssueId, wakeReason: "issue_assigned" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    try {
+      await boundedHeartbeat.resumeQueuedRuns();
+
+      // The regression, checked at the point it actually happens: the first
+      // pass must not have needed to abort and reschedule at all.
+      expect(criticalLaneReschedules).toHaveLength(0);
+
+      await waitForRunToSettle(boundedHeartbeat, freshRunId);
+
+      // Sanity check on the harness, not the regression itself (see above):
+      // the row does need to actually dispatch, just without the detour.
+      expect(dispatchedRunIds).toContain(freshRunId);
+      // The deferred row must still not dispatch - ranking it correctly must
+      // not make it disappear or dispatch early; it stays queued until its
+      // own retry timestamp arrives.
+      expect(dispatchedRunIds).not.toContain(deferredRunId);
+      expect((await boundedHeartbeat.getRun(deferredRunId))?.status).toBe("queued");
+    } finally {
+      await boundedHeartbeat.drainInFlightExecutions(60_000);
+    }
+  });
+
   it("dispatches critical issue work before an aged issue-less run without starving routine issue work (BLO-19337)", async () => {
     // Regression for BLO-18995: dispatchRank returned a flat `10` for any run
     // without an issueId *above* the STARVATION_* aging escalation, so that
@@ -3884,8 +4209,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           issueId,
           taskId: issueId,
           wakeReason: "issue_assigned",
-          ...(deferredCriticalIssueIds.includes(issueId)
-            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+          ...(deferredCriticalIssueIds.indexOf(issueId) >= 0
+            ? buildQueuedRetryContext(deferredCriticalIssueIds.indexOf(issueId))
             : {}),
         },
         createdAt,
@@ -4079,8 +4404,8 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
           wakeReason: "source_scoped_recovery_action",
           source: "issue_recovery_action",
           recoveryActionId,
-          ...(deferredIssueIds.includes(issueId)
-            ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+          ...(deferredIssueIds.indexOf(issueId) >= 0
+            ? buildQueuedRetryContext(deferredIssueIds.indexOf(issueId))
             : {}),
         },
         createdAt,

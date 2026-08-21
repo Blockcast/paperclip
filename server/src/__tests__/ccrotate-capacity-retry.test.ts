@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   CCROTATE_CAPACITY_MAX_PARK_MS,
   CCROTATE_CAPACITY_PARK_JITTER_RATIO,
+  LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS,
   MAX_TRANSIENT_RETRY_HORIZON_MS,
+  TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
   clampTransientRetryHorizon,
   resolveCcrotateCapacityRetry,
 } from "../services/ccrotate-capacity-retry.js";
@@ -178,5 +180,57 @@ describe("clampTransientRetryHorizon", () => {
       const result = clampTransientRetryHorizon({ retryNotBefore: floor, now: NOW });
       expect(result.dueAt.getTime()).toBeLessThanOrEqual(floor.getTime());
     }
+  });
+});
+
+/**
+ * BLO-23525. `clampTransientRetryHorizon` caps a floor-carrying run at
+ * MAX_TRANSIENT_RETRY_HORIZON_MS per attempt, but a cap without a matching
+ * attempt ceiling just relocates BLO-23438's exhaustion trap: the generic
+ * `transient_upstream` family's ordinary ceiling (4 attempts, sized for
+ * hintless exponential backoff) covers only 96h once every attempt is capped
+ * at 24h — short of the 124.8h outage recorded on BLO-22844.
+ * TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS is the attempt count
+ * scheduleBoundedRetryForRun raises a clamped family's ceiling to, and it
+ * must be *derived* from the cap and the recorded worst case, not hand-picked
+ * — this suite is what would catch a future edit to either constant that
+ * silently reopens the gap.
+ */
+describe("TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS coverage invariant (BLO-23525)", () => {
+  it("is derived, not hand-picked: ceil(longest recorded outage / horizon cap)", () => {
+    expect(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS).toBe(
+      Math.ceil(LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS / MAX_TRANSIENT_RETRY_HORIZON_MS),
+    );
+  });
+
+  it("covers the longest recorded provider-capacity outage (BLO-22844, 124.8h)", () => {
+    const coveredMs = TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS * MAX_TRANSIENT_RETRY_HORIZON_MS;
+    const coveredHours = coveredMs / (60 * 60 * 1000);
+    const worstCaseHours = LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS / (60 * 60 * 1000);
+    const shortfallHours = worstCaseHours - coveredHours;
+    expect(
+      coveredMs,
+      `${TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS} attempts * ${MAX_TRANSIENT_RETRY_HORIZON_MS / (60 * 60 * 1000)}h cap ` +
+        `covers ${coveredHours.toFixed(1)}h, ${shortfallHours > 0 ? `short ${shortfallHours.toFixed(1)}h of` : "meeting"} ` +
+        `the ${worstCaseHours.toFixed(1)}h window seen on BLO-22844`,
+    ).toBeGreaterThanOrEqual(LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS);
+  });
+
+  it("documents the shortfall the old hintless ceiling (4 attempts) would have left", () => {
+    // BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS pre-BLO-23525 — the
+    // ceiling a clamped transient_upstream run was left at before this fix
+    // gave clamped families their own, derived ceiling.
+    const OLD_HINTLESS_CEILING_ATTEMPTS = 4;
+    const coveredMs = OLD_HINTLESS_CEILING_ATTEMPTS * MAX_TRANSIENT_RETRY_HORIZON_MS;
+    const coveredHours = coveredMs / (60 * 60 * 1000);
+    const worstCaseHours = LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS / (60 * 60 * 1000);
+    const shortfallHours = worstCaseHours - coveredHours;
+    expect(
+      shortfallHours,
+      `${OLD_HINTLESS_CEILING_ATTEMPTS} attempts * ${MAX_TRANSIENT_RETRY_HORIZON_MS / (60 * 60 * 1000)}h cap ` +
+        `covers only ${coveredHours.toFixed(1)}h, short ${shortfallHours.toFixed(1)}h of the ${worstCaseHours.toFixed(1)}h window seen on BLO-22844`,
+    ).toBeGreaterThan(0);
+    // The raised, derived ceiling must actually close that gap.
+    expect(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS).toBeGreaterThan(OLD_HINTLESS_CEILING_ATTEMPTS);
   });
 });

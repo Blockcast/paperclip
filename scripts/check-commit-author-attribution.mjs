@@ -41,11 +41,12 @@
  *
  * Both modes are read-only: this script never posts, comments, or writes.
  *
- * ## Grandfathered pre-cutoff commits are SHA-pinned, not date-cut (BLO-23894)
+ * ## Grandfathered pre-cutoff commits use patch-id plus author, not raw SHA (BLO-23894)
  *
  * The local-range gate (mode 1, the one that actually blocks a PR) clears a
- * commit if its full SHA is in `GRANDFATHERED_OFFENSE_SHAS` — an explicit,
- * enumerated allowlist of the specific pre-existing App-attributed commits
+ * commit if its stable patch-id and exact author email are in
+ * `GRANDFATHERED_OFFENSE_SHAS` — an explicit, enumerated allowlist of the
+ * specific pre-existing App-attributed commits
  * that predate the gate itself (`e7162b906` / `3fa6e41d8`, landed
  * `ATTRIBUTION_GATE_CUTOFF`). Those commits cannot be brought into
  * compliance: the App stamp already erased the acting agent's identity, so
@@ -61,23 +62,17 @@
  * gate also has to police (see AGENTS.md §9 — 11-of-71 sampled checkouts
  * already carry a misconfigured local identity), so a date cutoff can be
  * defeated by backdating a brand-new, otherwise-non-compliant commit straight
- * past the gate. A commit's SHA is not caller-choosable in the same way — it
- * is a hash of the commit's own content, parent, and metadata — so pinning by
- * SHA is immune to that forgery. The allowlist is finite and was built by
+ * past the gate. A patch-id is derived from the patch content, not its parent,
+ * so it survives a queue rebase while remaining finite and enumerated. The
+ * allowlist was built by
  * enumerating every commit meeting the App-identity/non-merge/pre-cutoff
  * predicate across every open `Blockcast/paperclip` PR as of the audit below;
  * it is not a standing exemption; it does not grow.
  *
- * Trade-off, stated rather than hidden: an ordinary GitHub "Update branch"
- * (a merge, which is what this repo's queue uses — verified via PR #1265's
- * own `mergeStateStatus`) leaves the original commit's SHA untouched, so a
- * grandfathered PR stays clear across it. An explicit local `git rebase`
- * instead *rewrites* the commit (new parent → new commit hash even if the
- * diff is byte-identical), which would drop it off the allowlist and re-trip
- * the gate. That failure mode is fail-closed (blocks, doesn't silently pass)
- * and the fix is cheap and forgery-free: add the new SHA to the allowlist.
- * It was accepted over keeping any date-keyed fallback, which would
- * reopen the exact backdating hole this change closes.
+ * The master queue's ruleset 20487141 sets `merge_queue.merge_method: REBASE`.
+ * The queue therefore rewrites the SHA but preserves patch-id and author email,
+ * so the grandfathered PR stays clear across queue staging without any
+ * date-keyed fallback that would reopen the backdating hole.
  *
  * `--audit-merged` mode deliberately does NOT apply this allowlist — it is
  * advisory only (never blocks a merge) and stays a complete historical
@@ -123,8 +118,8 @@ export const COMMITS_API_MAX = 250;
  * `3fa6e41d8` landed on master (committer date of the latter — both were
  * merged in the same rebase-merge). Retained for provenance and as the
  * predicate used to build `GRANDFATHERED_OFFENSE_SHAS` below — it is no
- * longer read at enforcement time (see "Grandfathered pre-cutoff commits are
- * SHA-pinned, not date-cut" in the module docblock, BLO-23894).
+ * longer read at enforcement time (see "Grandfathered pre-cutoff commits use
+ * patch-id plus author" in the module docblock, BLO-23894).
  */
 export const ATTRIBUTION_GATE_CUTOFF = "2026-08-09T01:38:20Z";
 export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
@@ -146,43 +141,29 @@ export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
  *
  * This list only ever needs new entries for commits that predate the cutoff
  * above (a closed, non-growing condition) or for a grandfathered commit
- * whose SHA changed because it was rebased rather than merge-updated (see
+ * whose SHA changed because it was rebased (see
  * the docblock trade-off) — never for an ordinary new PR.
  */
 export const GRANDFATHERED_OFFENSE_SHAS = new Set([
-  // #927
-  "28291ce01869d6b523d79fd63a4a57eb408c8bb0",
-  "eb9e6f9ea1f0c3f2a01c98ae5157edeb274788ad",
-  "ead90a12af947358733d788113043f7df9354827",
-  "863da8a2b9ce15e42391f7e9e17e931c60e74e98",
-  // #962
-  "7c689686ac5a365f3282ef4b33859ff15cf99282",
-  "17532d7f1f62c8823c18091e3b617f9cebcd4a51",
-  // #1019
-  "ef6251ee65fdc6e05a171c0b30f4dccf2d1ce4ab",
-  // #1036
-  "8fc0eb49261df104755c502224444d70e1ccae74",
-  // #1049
-  "42bfd84996c855f153b669d903053a3cd13d9668",
-  "3345ee7829130ef8c7a167a4a106a655f426c42b",
-  // #1091
-  "d0cd0fb16ef8cc9ab25710c521833733dae291ea",
-  // #1126
-  "cb120b0e334ebb8d2d318d0a3d7cf37a161fce97",
-  // #1133 and #1148 share this commit (stacked branches)
-  "96203de637f5c7b33807b09a27e4cf7b8d00d6e5",
-  // #1138
-  "ef139fad81017ff0d1c595e2096ad6ec84ee94f1",
-  // #1148
-  "447fd5e91c1ab8112b6f986c340bc1ca4c23cdb9",
-  // #1155
-  "dd81c36c96528d60f40e19e426a922e4299d8214",
-  "96985884ec0772b84390517a567f0e770ce49038",
-  // #1161
-  "b54c3bc2635b5b8e5836c4959734d854a24cae88",
-  // #1165
-  "d3e6ea9fc7ed472ff3c4cb9448b3144298827fc2",
-]);
+  "b22bed3ac5812f8ba9b335b597accc2dbd59b9c8",
+  "63b58b5df729db30d26325d3cb3349d6d07750ef",
+  "87724aca1ceecc93d9a430029dd92362171650f0",
+  "73661f1e600a5f4b71e993cb2933cea97564009e",
+  "03734ab59c8e39175e3b48894516410bc358253b",
+  "47dabdd37f43a48532e94e79d7e9ba2d174e59f2",
+  "df1cfbe845b065af254d850764c16cc9b4609815",
+  "ac25b54d4cba6a44781c7dcacb3a4b7d083180cc",
+  "3ea4c9dd6345d45b507de15ec005ed3927f314f4",
+  "970a912cae282b129222fa524497f520a4c2fa0e",
+  "11d7a79790aa8fc658cb164ce2f2b372e98bce07",
+  "5d1fb094eb82d0f83fcd1f7d47a615936b68f273",
+  "e6e8c25ae37b161b062ae67c95970c958f89198a",
+  "437abe8653d01a0dbbae17e8a2ed88477df9d46e",
+  "8b7e81fde79203be6342c70c010928f154b1e2a0",
+].map((sha) => `${sha}|${APP_NOREPLY_EMAIL}`));
+// BLO-26647's matcher case is retained under the same patch-id key shape;
+// its bare bot identity is intentionally not an offense in this gate.
+GRANDFATHERED_OFFENSE_SHAS.add("3203ee89e7bbeef3cc7d34bc3fa0a84e26788387|allyblockcast[bot]@users.noreply.github.com");
 
 const UNIT_SEPARATOR = "\u001f";
 const RECORD_SEPARATOR = "\u001e";
@@ -195,12 +176,9 @@ const RECORD_SEPARATOR = "\u001e";
  * scope, independent of which mode produced the record (defensive — mode 1
  * already excludes these via `--no-merges`).
  *
- * `allowlist`, if given (a `Set` of full 40-char lowercase SHAs), additionally
- * clears any commit whose `sha` is a member — BLO-23894's grandfather clause,
- * SHA-pinned rather than date-keyed so it cannot be defeated by a caller
- * backdating `authorDate`. `sha` is matched case-insensitively (lowercased
- * before comparison) since callers may not normalize case; a missing `sha`
- * cannot match and stays an offense. Omitting `allowlist` preserves the
+ * `allowlist`, if given (a `Set` of `${patchId}|${authorEmail}` keys), clears
+ * only an enumerated patch and author pair — BLO-23894's grandfather clause.
+ * A missing patch-id cannot match and stays an offense. Omitting `allowlist` preserves the
  * historical, unfiltered assertion; `--audit-merged` relies on that default
  * so it keeps reporting pre-cutoff violations as advisory record.
  */
@@ -209,7 +187,8 @@ export function findAttributionOffenses(commits, { allowlist } = {}) {
     if ((commit.parentCount ?? 1) > 1) return false;
     if (commit.authorEmail !== APP_NOREPLY_EMAIL) return false;
     if (allowlist === undefined) return true;
-    return !allowlist.has(String(commit.sha ?? "").toLowerCase());
+    const key = `${String(commit.patchId ?? "").toLowerCase()}|${commit.authorEmail}`;
+    return !allowlist.has(key);
   });
 }
 
@@ -222,6 +201,19 @@ function parseLocalGitLog(rawOutput) {
       const [sha, authorEmail, authorDate, subject] = record.split(UNIT_SEPARATOR);
       return { sha, authorEmail, authorDate, parentCount: 1, message: subject ?? "" };
     });
+}
+
+function patchIdForCommit(repoRoot, sha, execFile = execFileSync) {
+  const patch = execFile("git", ["show", "--format=", "--no-ext-diff", "--no-renames", sha], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return execFile("git", ["patch-id", "--stable"], {
+    cwd: repoRoot,
+    input: patch,
+    encoding: "utf8",
+  }).trim().split(/\s+/)[0] ?? "";
 }
 
 /**
@@ -245,7 +237,10 @@ export function findLocalRangeOffenses({
     ["log", "--no-merges", `--format=${format}`, `${base}..${head}`],
     { cwd: repoRoot, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
   );
-  const commits = parseLocalGitLog(rawOutput);
+  const commits = parseLocalGitLog(rawOutput).map((commit) => ({
+    ...commit,
+    patchId: patchIdForCommit(repoRoot, commit.sha, execFile),
+  }));
   return findAttributionOffenses(commits, { allowlist });
 }
 

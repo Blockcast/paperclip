@@ -69,6 +69,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -77,9 +78,11 @@ import {
   restoreCheckoutPromotedStatus,
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
+import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
@@ -99,10 +102,10 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
-  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -113,6 +116,11 @@ import {
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
+import {
+  evaluateIssueRepoBinding,
+  formatIssueRepoBindingComment,
+  issueRepoBindingCommentIdempotencyKey,
+} from "./issue-repo-binding-guard.js";
 import { getRunLogStore } from "./run-log-store.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getDefaultCompanyGoal } from "./goals.js";
@@ -134,10 +142,22 @@ import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
+import {
+  ROUTINE_EXECUTION_ORIGIN_KIND,
+  postRoutineSchedulerFailureHeartbeat,
+  type RoutineSchedulerHeartbeatIssue,
+  type SchedulerHeartbeatAddComment,
+} from "./recovery/routine-scheduler-heartbeat.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+
+/** BLO-27572: a routine-execution cancellation observed under the row lock, held
+ * until the transaction commits so the receipt is posted outside it. */
+type PendingRoutineCancellationReceipt =
+  | { issue: RoutineSchedulerHeartbeatIssue; previousStatus: string }
+  | null;
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
@@ -145,6 +165,19 @@ const ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH = 256;
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
+/**
+ * Non-terminal issue statuses. This is the population an "open assignment"
+ * census covers; `done` and `cancelled` are excluded.
+ */
+export const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+/**
+ * Safety bound on the number of per-agent groups a single census may return.
+ * A company has tens of agents, so this never fires in practice — but the
+ * contract must be able to *say* it was truncated rather than silently
+ * returning a prefix, which is exactly the failure mode this census exists to
+ * remove (`limit=10000` silently clamped to 1000 with no completion signal).
+ */
+export const OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS = 5000;
 const BLOCKED_PROMOTION_AWAITING_USER_EVENT = "sweep_blocked_promotion_skipped_awaiting_user";
 const BLOCKED_PROMOTION_AWAITING_USER_COUNTER = "sweep.blocked_promotion_skipped_awaiting_user";
 export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
@@ -166,6 +199,22 @@ function preserveInReviewExecutionStageCheckoutCondition() {
     ${issues.status} = 'in_review'
     AND ${issues.executionState} ->> 'status' = 'pending'
     AND coalesce(${issues.executionState} -> 'currentParticipant', 'null'::jsonb) <> 'null'::jsonb
+  )`;
+}
+
+// BLO-22666 AC3: the row-level half of the `currentParticipant` claim — the
+// stage is still pending AND pinned to this agent. Written as a SQL predicate so
+// it can be re-asserted inside the claiming UPDATE, making the claim a genuine
+// compare-and-swap against a stage that may advance underneath it.
+//
+// Mirrors the null-safety of preserveInReviewExecutionStageCheckoutCondition:
+// `->>` on a JSONB `null` yields SQL NULL, and `NULL = <agentId>` is NULL rather
+// than true, so an absent or user-typed participant can never match.
+function pendingExecutionStageAgentParticipantCondition(agentId: string) {
+  return sql`(
+    ${issues.executionState} ->> 'status' = 'pending'
+    AND ${issues.executionState} -> 'currentParticipant' ->> 'type' = 'agent'
+    AND ${issues.executionState} -> 'currentParticipant' ->> 'agentId' = ${agentId}
   )`;
 }
 
@@ -748,8 +797,77 @@ export interface IssueFilters {
   sortDir?: "asc" | "desc";
 }
 
-type IssueRow = typeof issues.$inferSelect;
-type IssueLabelRow = typeof labels.$inferSelect;
+/**
+ * Filters accepted by the open-assignment census. Deliberately a small subset
+ * of {@link IssueFilters}: the census is an authoritative company-wide
+ * aggregate, so it takes only the knobs that change which issues are "open
+ * work" and none of the pagination/sort knobs that would make it partial.
+ */
+export interface OpenAssignmentCensusFilters {
+  /** Statuses treated as open. Defaults to {@link OPEN_ISSUE_STATUSES}. */
+  status?: string | readonly string[];
+  includeRoutineExecutions?: boolean;
+  includePluginOperations?: boolean;
+  lowTrustBoundary?: LowTrustBoundary & { companyId: string };
+}
+
+export interface OpenAssignmentCensusIssueIdentity {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OpenAssignmentCensusAgentRow {
+  assigneeAgentId: string;
+  openCount: number;
+  highestPriority: string;
+  highestPriorityIssue: OpenAssignmentCensusIssueIdentity;
+  countsByStatus: Record<string, number>;
+  countsByPriority: Record<string, number>;
+}
+
+export interface OpenAssignmentCensus {
+  companyId: string;
+  censusAt: string;
+  /** Statuses the census counted, echoed so a consumer never has to guess. */
+  openStatuses: string[];
+  /**
+   * `true` when the returned `agents` array is the entire per-agent grouping.
+   * The only way this is `false` is the {@link OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS}
+   * safety bound; there is no silent row cap.
+   *
+   * Gates the reconstruction invariant: `sum(agents[].openCount)` equals
+   * `totals.openAssignedToAgents` only while this is `true`. When it is
+   * `false` the sum is a strict lower bound — `totals` stays company-wide and
+   * exact, but the tail of the grouping is absent.
+   */
+  complete: boolean;
+  truncated: boolean;
+  /**
+   * The true number of agents with open work, counted before the group bound
+   * is applied — so `agentGroupCount - agents.length` is exactly how many
+   * groups truncation dropped.
+   */
+  agentGroupCount: number;
+  /**
+   * Company-wide and exact whatever `complete` says: these are counted over
+   * the whole open population, not over the returned groups.
+   */
+  totals: {
+    open: number;
+    openAssignedToAgents: number;
+    openAssignedToUsers: number;
+    openUnassigned: number;
+    agentsWithOpenWork: number;
+  };
+  agents: OpenAssignmentCensusAgentRow[];
+}
+
+type IssueRow = typeof issues.$inferSelect;type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
   id: string;
@@ -2338,13 +2456,22 @@ async function watchdogMapForIssues(dbOrTx: any, rows: IssueRow[]): Promise<Map<
   return map;
 }
 
-// BLO-19749: the set of statuses whose runs hold an issue's execution lock, so
-// `activeRun` reports exactly what `checkout()` would 409 on. This used to be a
-// local ["queued", "running"] literal, which silently omitted `scheduled_retry`
-// and made `GET /issues/{id}` return `activeRun: null` for an issue whose
-// checkout simultaneously 409'd naming the parked retry run. See
-// `issue-execution-lock.ts` for the full drift table.
-const ACTIVE_RUN_STATUSES = [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES];
+// BLO-25410: NOT a lock predicate, and deliberately narrower than the terminal
+// complement used by the `activeRun` hydration in `activeRunMapForIssues`. A run
+// listed here marks its issue "covered" — actively being worked, so the
+// blocker-attention signal is suppressed. `scheduled_retry` is excluded on
+// purpose: a run parked on the retry ladder holds the lock but is not making
+// progress, and treating it as coverage would hide exactly the stalled blocker
+// this computation exists to surface.
+//
+// Enumeration is therefore the correct form here, because the two predicates
+// must fail in OPPOSITE directions. The lock predicate fails toward "held" (an
+// unknown status defers, and being wrong costs one deferral instead of two runs
+// in one worktree). This one fails toward "not covered" (an unknown status
+// raises attention, and being wrong costs a spurious nudge instead of silently
+// swallowing a stuck issue). Converting it to `notInArray(TERMINAL)` would flip
+// that safety direction and make every future non-terminal status suppress
+// attention by default.
 const BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES = ["queued", "running"];
 const BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution"];
 const BLOCKER_ATTENTION_PENDING_INTERACTION_STATUSES = ["pending"];
@@ -2486,7 +2613,27 @@ async function activeRunMapForIssues(
         and(
           inArray(heartbeatRuns.id, runIdChunk),
           inArray(heartbeatRuns.companyId, companyIds),
-          inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
+          // BLO-19749 / BLO-25410: `activeRun` must report exactly what
+          // `checkout()` would 409 on, which is the complement of terminal — so
+          // express it AS the terminal complement, not as an enumeration of the
+          // holding statuses.
+          //
+          // `inArray(status, [...ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES])`
+          // looks equivalent and is not. That constant is built by filtering
+          // `HEARTBEAT_RUN_STATUSES`, so it can only ever list statuses inside
+          // the canonical union, while `heartbeat_runs.status` is a plain `text`
+          // column with no enum or check constraint — `issue-execution-lock.ts`
+          // records that `error` and `adapter_failed` already occur in it
+          // without being in the union. A future out-of-union status that is
+          // *non-terminal* would be absent from the enumeration while
+          // `runStatusHoldsIssueExecutionLock` (`!TERMINAL.has(status)`) still
+          // counted it as holding, reopening the exact defect BLO-19749 closed:
+          // `GET /issues/{id}` reporting `activeRun: null` on an issue whose
+          // `POST /checkout` simultaneously 409s naming that run.
+          //
+          // The two forms agree on every status in the union, so this is a no-op
+          // today and a guard against the next status added to the column.
+          notInArray(heartbeatRuns.status, TERMINAL_HEARTBEAT_RUN_STATUS_VALUES),
         ),
       );
 
@@ -4005,6 +4152,11 @@ export async function listBlockedDependentIssueIds(
 }
 
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;
+// BLO-25410: NOT a lock predicate. Same reasoning as
+// BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES — a run here suppresses the blocked-inbox
+// entry as "someone is on it", so `scheduled_retry` is excluded on purpose and
+// enumeration is the safe form: an unknown status leaves the entry visible
+// rather than silently hiding it. Do not convert to the terminal complement.
 const BLOCKED_INBOX_ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const BLOCKED_INBOX_ACTIVE_WAKE_STATUSES = SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES;
 const BLOCKED_INBOX_PENDING_INTERACTION_STATUSES = ["pending"] as const;
@@ -4196,6 +4348,11 @@ async function listSuccessfulRunHandoffMapForIssues(
     }
   }
 
+  // Before liveness: a handoff on a closed issue is moot regardless of whether
+  // this caller wants liveness hydrated (BLO-16074). Unconditional here because
+  // every caller of this helper is a read path; the route-side twin takes a
+  // `foldTerminal` opt-out because one of its callers gates an activity-row write.
+  await resolveSuccessfulRunHandoffForTerminalIssues(dbOrTx, companyId, states);
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
@@ -6731,7 +6888,15 @@ export function issueService(db: Db) {
     });
   }
 
-  return {
+  // BLO-27572: `update` needs `addComment` to post the routine cancellation
+  // receipt, but both are properties of the same object literal below, so
+  // `update` cannot name it directly without making the literal
+  // self-referential (which defeats TypeScript's inference for it). Bound
+  // immediately after the literal is constructed and read only from inside
+  // `update`, which cannot run until the factory has returned.
+  let addCommentPort!: SchedulerHeartbeatAddComment;
+
+  const service = {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
 
@@ -7035,6 +7200,180 @@ export function issueService(db: Db) {
       return Number(row?.count ?? 0);
     },
 
+    /**
+     * Authoritative per-agent open-assignment census for one company.
+     *
+     * Why this exists: `GET /companies/:id/issues` silently clamps `limit` to
+     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array — no total, no
+     * cursor — so a caller cannot distinguish "1000 rows is everything" from
+     * "1000 rows is a truncated prefix", and offset paging over a mutating
+     * collection duplicates and drops rows. Callers that need exact counts must
+     * not derive them from that population.
+     *
+     * The completeness guarantee is structural, not advisory: the whole census
+     * is computed by ONE SQL statement. Postgres evaluates a statement against
+     * a single MVCC snapshot, so concurrent inserts, status changes, and
+     * re-assignments either land wholly inside the census or wholly outside it.
+     * There is no window in which an issue can be counted twice or missed.
+     * Keep it one statement — splitting the totals and the per-agent grouping
+     * into two round trips reintroduces exactly the tearing this removes.
+     *
+     * `highestPriorityIssue` is deterministic: priority rank ascending, then
+     * `createdAt` ascending, then `id` ascending. A stable tiebreak matters
+     * because the agent-health fingerprint hashes this identity.
+     */
+    openAssignmentCensus: async (
+      companyId: string,
+      filters?: OpenAssignmentCensusFilters,
+    ): Promise<OpenAssignmentCensus> => {
+      const requestedStatuses = parseStatusFilter(filters?.status);
+      const openStatuses = requestedStatuses.length > 0
+        ? requestedStatuses
+        : [...OPEN_ISSUE_STATUSES];
+
+      const conditions: SQL[] = [
+        eq(issues.companyId, companyId),
+        visibleIssueCondition(),
+        inArray(issues.status, openStatuses),
+      ];
+      if (!filters?.includePluginOperations) conditions.push(nonPluginOperationIssueCondition());
+      if (!filters?.includeRoutineExecutions) conditions.push(nonRoutineExecutionIssueCondition());
+      const lowTrustCondition = lowTrustBoundaryIssueCondition(companyId, filters?.lowTrustBoundary);
+      if (lowTrustCondition) conditions.push(lowTrustCondition);
+
+      const priorityRank = sql`CASE ${issues.priority}
+        WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
+      // One extra group is fetched so `truncated` reflects reality rather than
+      // "we happened to return exactly the cap".
+      const groupFetchLimit = OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS + 1;
+
+      const result = await db.execute(sql`
+        WITH scope AS (
+          SELECT
+            ${issues.id} AS id,
+            ${issues.identifier} AS identifier,
+            ${issues.title} AS title,
+            ${issues.status} AS status,
+            ${issues.priority} AS priority,
+            ${issues.assigneeAgentId} AS assignee_agent_id,
+            ${issues.assigneeUserId} AS assignee_user_id,
+            ${issues.createdAt} AS created_at,
+            ${issues.updatedAt} AS updated_at,
+            ${priorityRank} AS priority_rank
+          FROM ${issues}
+          WHERE ${and(...conditions)}
+        ),
+        agent_scope AS (
+          SELECT * FROM scope WHERE assignee_agent_id IS NOT NULL
+        ),
+        per_agent AS (
+          SELECT
+            assignee_agent_id,
+            -- sum(), not count(): the inner query is already grouped by status,
+            -- so count(*) here would return the number of distinct statuses.
+            sum(status_count)::int AS open_count,
+            jsonb_object_agg(status_key, status_count) AS counts_by_status
+          FROM (
+            SELECT assignee_agent_id, status AS status_key, count(*)::int AS status_count
+            FROM agent_scope
+            GROUP BY assignee_agent_id, status
+          ) AS by_status
+          GROUP BY assignee_agent_id
+        ),
+        per_agent_priority AS (
+          SELECT assignee_agent_id, jsonb_object_agg(priority, priority_count) AS counts_by_priority
+          FROM (
+            SELECT assignee_agent_id, priority, count(*)::int AS priority_count
+            FROM agent_scope
+            GROUP BY assignee_agent_id, priority
+          ) AS by_priority
+          GROUP BY assignee_agent_id
+        ),
+        top_issue AS (
+          SELECT DISTINCT ON (assignee_agent_id)
+            assignee_agent_id, id, identifier, title, status, priority, created_at, updated_at
+          FROM agent_scope
+          ORDER BY assignee_agent_id, priority_rank ASC, created_at ASC, id ASC
+        ),
+        agent_rows AS (
+          SELECT
+            p.assignee_agent_id,
+            p.open_count,
+            t.priority AS highest_priority,
+            jsonb_build_object(
+              'id', t.id,
+              'identifier', t.identifier,
+              'title', t.title,
+              'status', t.status,
+              'priority', t.priority,
+              'createdAt', to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+              'updatedAt', to_char(t.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+            ) AS highest_priority_issue,
+            p.counts_by_status,
+            COALESCE(pp.counts_by_priority, '{}'::jsonb) AS counts_by_priority
+          FROM per_agent p
+          JOIN top_issue t ON t.assignee_agent_id = p.assignee_agent_id
+          LEFT JOIN per_agent_priority pp ON pp.assignee_agent_id = p.assignee_agent_id
+          ORDER BY p.open_count DESC, p.assignee_agent_id ASC
+          LIMIT ${groupFetchLimit}
+        )
+        SELECT jsonb_build_object(
+          'censusAt', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'agentGroupCount', (SELECT count(*)::int FROM per_agent),
+          'totals', jsonb_build_object(
+            'open', (SELECT count(*)::int FROM scope),
+            'openAssignedToAgents', (SELECT count(*)::int FROM agent_scope),
+            'openAssignedToUsers', (
+              SELECT count(*)::int FROM scope
+              WHERE assignee_agent_id IS NULL AND assignee_user_id IS NOT NULL
+            ),
+            'openUnassigned', (
+              SELECT count(*)::int FROM scope
+              WHERE assignee_agent_id IS NULL AND assignee_user_id IS NULL
+            ),
+            'agentsWithOpenWork', (SELECT count(*)::int FROM per_agent)
+          ),
+          'agents', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'assigneeAgentId', assignee_agent_id,
+              'openCount', open_count,
+              'highestPriority', highest_priority,
+              'highestPriorityIssue', highest_priority_issue,
+              'countsByStatus', counts_by_status,
+              'countsByPriority', counts_by_priority
+            )) FROM agent_rows
+          ), '[]'::jsonb)
+        ) AS census
+      `);
+
+      const resultRows = (result as unknown as { rows?: Array<{ census?: unknown }> }).rows
+        ?? (result as unknown as Array<{ census?: unknown }>);
+      const payload = (Array.isArray(resultRows) ? resultRows[0]?.census : undefined) as
+        | (Omit<OpenAssignmentCensus, "companyId" | "openStatuses" | "complete" | "truncated">
+          & { totals?: Partial<OpenAssignmentCensus["totals"]> })
+        | undefined;
+
+      const agents = (payload?.agents ?? []) as OpenAssignmentCensusAgentRow[];
+      const truncated = agents.length > OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS;
+
+      return {
+        companyId,
+        censusAt: payload?.censusAt ?? new Date().toISOString(),
+        openStatuses,
+        complete: !truncated,
+        truncated,
+        agentGroupCount: Number(payload?.agentGroupCount ?? 0),
+        totals: {
+          open: Number(payload?.totals?.open ?? 0),
+          openAssignedToAgents: Number(payload?.totals?.openAssignedToAgents ?? 0),
+          openAssignedToUsers: Number(payload?.totals?.openAssignedToUsers ?? 0),
+          openUnassigned: Number(payload?.totals?.openUnassigned ?? 0),
+          agentsWithOpenWork: Number(payload?.totals?.agentsWithOpenWork ?? 0),
+        },
+        agents: truncated ? agents.slice(0, OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS) : agents,
+      };
+    },
+
     countUnreadTouchedByUser: async (
       companyId: string,
       userId: string,
@@ -7189,7 +7528,7 @@ export function issueService(db: Db) {
      * Null covers "no run recorded", "the recorded run belongs to another
      * company", and "the recorded run has already
      * terminalized" — `activeRunMapForIssues` only returns rows whose status is
-     * in ACTIVE_RUN_STATUSES. That is the distinction a caller needs: a stale
+     * non-terminal. That is the distinction a caller needs: a stale
      * `executionRunId` left behind by a finished run reads as not-held, while a
      * live sibling run reads as present. A queued or `scheduled_retry` run is
      * present but does not yet hold a worktree; callers should use
@@ -8699,8 +9038,13 @@ export function issueService(db: Db) {
       // sync. Cleanup errors are logged-and-swallowed to avoid masking the
       // original failure that triggered the rollback.
       let createdLinearIssueId: string | null = null;
+      // BLO-20341: the repo-binding advisory must not fire for a create that
+      // was deduplicated into an existing issue — that issue already got (or
+      // correctly declined) its comment when it was really created.
+      let deduplicatedIntoExistingIssue = false;
+      let createdIssue;
       try {
-        return await db.transaction(async (tx) => {
+        createdIssue = await db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (issueData.assigneeAgentId) {
@@ -8777,6 +9121,7 @@ export function issueService(db: Db) {
               .onConflictDoNothing();
           }
           if (deduplicationReason) onDeduplicated?.(deduplicationReason);
+          deduplicatedIntoExistingIssue = true;
           const [enriched] = await withIssueLabels(tx, [existingIssue]);
           const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
           return withRelations;
@@ -8961,6 +9306,7 @@ export function issueService(db: Db) {
             issueData.projectId = ledProjects[0].id;
           }
         }
+        await assertValidIssueProject(companyId, issueData.projectId, tx);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
         // default-settings block and the assignee-environment-promotion block
@@ -9197,6 +9543,49 @@ export function issueService(db: Db) {
         }
         throw err;
       }
+
+      // BLO-20341: advisory repo-binding check. Deliberately runs *after* the
+      // create tx has committed, so a failure here cannot roll back the issue,
+      // and every error is swallowed — an advisory comment must never be able
+      // to fail an issue create. Skipped for dedup replays, whose target issue
+      // was already evaluated when it was really created.
+      if (!deduplicatedIntoExistingIssue && createdIssue?.id) {
+        try {
+          const signal = await evaluateIssueRepoBinding({
+            db,
+            companyId,
+            description: createdIssue.description,
+            parentId: createdIssue.parentId,
+            projectId: createdIssue.projectId,
+            projectWorkspaceId: createdIssue.projectWorkspaceId,
+            executionWorkspaceId: createdIssue.executionWorkspaceId,
+          });
+          if (signal) {
+            await db
+              .insert(issueComments)
+              .values({
+                companyId,
+                issueId: createdIssue.id,
+                authorType: "system",
+                idempotencyKey: issueRepoBindingCommentIdempotencyKey(createdIssue.id),
+                body: formatIssueRepoBindingComment(signal),
+                presentation: {
+                  kind: "system_notice",
+                  tone: "warning",
+                  title: "Possible repo binding mismatch",
+                  detailsDefaultOpen: false,
+                },
+              })
+              .onConflictDoNothing();
+          }
+        } catch (guardErr) {
+          logger.warn(
+            { err: guardErr, issueId: createdIssue.id, companyId },
+            "issue repo binding guard failed",
+          );
+        }
+      }
+      return createdIssue;
     },
 
     update: async (
@@ -9232,6 +9621,37 @@ export function issueService(db: Db) {
          */
         expectedCurrentAssigneeAgentId?: string | null;
         /**
+         * BLO-22909: refuse the write if the issue still has unresolved
+         * blockers *at write time*.
+         *
+         * Unlike the two `expectedCurrent*` guards above this is not a column
+         * equality, so it cannot ride along in the UPDATE's WHERE clause — the
+         * predicate lives in `issue_relations` joined to the blockers' own
+         * statuses. It is instead re-evaluated inside `runUpdate`'s transaction
+         * *after* the locks below, which is what makes it atomic with the
+         * `syncBlockedByIssueIds` clear that follows:
+         *
+         *   - `lockIssueParentMutationCompany` is a company-scoped advisory
+         *     xact lock taken on every `blockedByIssueIds` write, so any
+         *     concurrent transaction adding a blocker edge through this same
+         *     service is serialized against us rather than interleaving.
+         *   - `SELECT … FOR UPDATE` then pins the issue row itself.
+         *
+         * Callers that authorized a mutation *because* the row had no live
+         * blockers must pass this. The delegate-recovery unpark
+         * (`blocked` -> `todo` + `blockedByIssueIds: []`) is the motivating
+         * case: its patch shape mandates the empty array and then applies it,
+         * so a blocker inserted after the route's readiness read but before
+         * this write would be silently deleted — the same data-loss class as
+         * BLO-20385, narrowed to an interleaving. Neither `expectedCurrentStatus`
+         * nor `expectedCurrentAssigneeAgentId` catches it, because adding an
+         * edge changes neither status nor assignee.
+         *
+         * Forces the company graph lock on its own, so the guard stays atomic
+         * even for a caller that sets it without `blockedByIssueIds`.
+         */
+        expectedNoUnresolvedBlockers?: boolean;
+        /**
          * BLO-22876 review: the manager-chain reroute grant is conditioned on the
          * current assignee being *non-invokable*. Unlike the guard above, that
          * fact lives in `agents`, not `issues`, so no WHERE clause on the target
@@ -9262,6 +9682,21 @@ export function issueService(db: Db) {
         expectedCurrentExecutionState?: Record<string, unknown> | null;
         /** Pins the policy from which an execution-stage transition was derived. */
         expectedCurrentExecutionPolicy?: Record<string, unknown> | null;
+        /**
+         * BLO-27572: suppress the scheduler-side failure heartbeat that a
+         * routine-execution cancellation otherwise leaves on the routine's alert
+         * surface. Set by exactly one caller —
+         * `cancelDuplicateSuppressedRoutineExecutionIssue` — where the window is
+         * NOT dark: the issue was cancelled because another open execution issue
+         * already owns the dispatch lock and is doing the work. A receipt there
+         * would manufacture a false dark-window alarm.
+         *
+         * Explicit rather than inferred, matching the per-branch suppression the
+         * strand-time path already uses: silence is the dangerous default in this
+         * subsystem, so every instance of it should be a decision someone wrote
+         * down, not a fall-through.
+         */
+        suppressRoutineSchedulerFailureHeartbeat?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -9279,13 +9714,24 @@ export function issueService(db: Db) {
         actorUserId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
+        expectedNoUnresolvedBlockers,
         expectedCurrentAssigneeAgentNonInvokable,
         expectedCurrentCheckoutRunId,
         expectedCurrentExecutionRunId,
         expectedCurrentExecutionState,
         expectedCurrentExecutionPolicy,
+        suppressRoutineSchedulerFailureHeartbeat,
         ...issueData
       } = data;
+
+      // BLO-27572: set inside `runUpdate` under the row lock, consumed after the
+      // transaction commits. Declared out here so the deferred post can see it.
+      // Read through the accessor rather than directly: the variable is only ever
+      // assigned from inside `runUpdate`, so control-flow analysis still has it
+      // narrowed to `null` at the read site and would type its fields as `never`.
+      let pendingRoutineCancellationReceipt: PendingRoutineCancellationReceipt = null;
+      const readPendingRoutineCancellationReceipt = (): PendingRoutineCancellationReceipt =>
+        pendingRoutineCancellationReceipt;
 
       if (expectedCurrentStatus !== undefined && existing.status !== expectedCurrentStatus) {
         throw conflict("Issue status changed before the update could be applied", {
@@ -9573,7 +10019,7 @@ export function issueService(db: Db) {
         // Parent and blocker edges share issue rows. Take one company-scoped graph
         // lock before either path starts row-level locks, so combined parent/blocker
         // patches cannot invert against blocker-only patches.
-        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined) {
+        if (issueData.parentId !== undefined || blockedByIssueIds !== undefined || expectedNoUnresolvedBlockers) {
           await lockIssueParentMutationCompany(existing.companyId, tx);
         }
         if (blockedByIssueIds !== undefined) {
@@ -9608,6 +10054,40 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!lockedExisting) return null;
+
+        // BLO-22909: the unresolved-blocker precondition. Deliberately here —
+        // after the company advisory lock and the row `FOR UPDATE` above, and
+        // in the same transaction as the `syncBlockedByIssueIds` clear further
+        // down — so the readiness the caller authorized against and the edges
+        // this write deletes are the same snapshot.
+        //
+        // The route-level pre-check (BLO-20385) reads readiness on its own
+        // connection well before this point and cannot be made atomic there;
+        // it stays as a cheap fast-path that fails the common case early with
+        // the same `reason`. This is the authoritative one. Both emit the
+        // settled `delegate_recovery_unresolved_blockers` shape, so a caller
+        // cannot tell which arm refused and does not need to.
+        //
+        // Terminal blockers stay resolved: `listIssueDependencyReadinessMap`
+        // counts a `done` blocker as resolved (subject to the workspace-finalize
+        // barrier) and a `cancelled` one as unresolved, and clearing genuinely
+        // stale `done` edges is the whole point of the recovery patch, so it
+        // must keep succeeding.
+        if (expectedNoUnresolvedBlockers) {
+          const readinessMap = await listIssueDependencyReadinessMap(tx, lockedExisting.companyId, [id]);
+          const readiness = readinessMap.get(id) ?? createIssueDependencyReadiness(id);
+          if (readiness.unresolvedBlockerCount > 0) {
+            throw conflict(
+              "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+              {
+                issueId: id,
+                reason: "delegate_recovery_unresolved_blockers",
+                unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+              },
+            );
+          }
+        }
 
         // BLO-22876 review: close the invokability time-of-check/time-of-use gap.
         // The caller's authorization rested on the assignee being non-invokable,
@@ -9777,8 +10257,14 @@ export function issueService(db: Db) {
             })
           ) {
             throw unprocessable(
-              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient.",
-              { reason: "no_execution_run_and_no_pr_evidence", issueId: id },
+              "Issue cannot be marked done without execution evidence (no execution run, no pr-link evidence, and no run-attributed durable artifact). " +
+                "Attach a PR link, or write the deliverable to an issue document (PUT /api/issues/:id/documents/:key) before closing — a comment body is not sufficient. " +
+                `A cheap status-only recovery run, which may not author deliverables, records its verdict at PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY} instead.`,
+              {
+                reason: "no_execution_run_and_no_pr_evidence",
+                issueId: id,
+                statusOnlyDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+              },
             );
           }
         }
@@ -9940,10 +10426,50 @@ export function issueService(db: Db) {
               );
           }
         }
+        // BLO-27572: a routine-execution issue retired to `cancelled` by an agent
+        // or a human is a correct call, but the window it owned still produced no
+        // runbook emission. Record the transition here, under the row lock, and
+        // post the receipt after commit (below) — never inside this transaction.
+        if (
+          issueData.status === "cancelled" &&
+          lockedExisting.status !== "cancelled" &&
+          lockedExisting.originKind === ROUTINE_EXECUTION_ORIGIN_KIND &&
+          !suppressRoutineSchedulerFailureHeartbeat
+        ) {
+          pendingRoutineCancellationReceipt = {
+            issue: lockedExisting,
+            previousStatus: lockedExisting.status,
+          };
+        }
         return enriched;
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      const updateResult = dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
+
+      // BLO-27572: deliberately after the write, on `db` rather than `dbOrTx`, and
+      // last — mirroring the strand-time call site in `recovery/service.ts`. This
+      // writes a comment to a *different* issue (the routine's alert surface), so
+      // inside the transaction a failed post would roll back a cancellation that
+      // is otherwise correct and already decided. The helper swallows its own
+      // errors for the same reason.
+      //
+      // It shares the `scheduler-heartbeat:<routineId>:<windowKey>` idempotency
+      // key with the strand-time receipt, so a window that stranded and was then
+      // cancelled keeps exactly one row.
+      const cancellationReceipt = readPendingRoutineCancellationReceipt();
+      if (cancellationReceipt) {
+        const { issue: cancelledIssue, previousStatus } = cancellationReceipt;
+        await postRoutineSchedulerFailureHeartbeat(
+          { db, addComment: addCommentPort, logger },
+          {
+            issue: cancelledIssue,
+            disposition: { kind: "cancelled", previousStatus },
+            prefix: cancelledIssue.identifier?.split("-")[0] || "PAP",
+          },
+        );
+      }
+
+      return updateResult;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
@@ -9981,6 +10507,20 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        // Deletion mutates the same parent edges update/create protect: the
+        // `parentId = null` sweep below row-locks every child, then the delete
+        // row-locks the parent. Without the company graph lock as the outermost
+        // acquisition here, a concurrent reparent that takes it first can lock
+        // those rows in the opposite order and deadlock (40P01 -> 500).
+        // Read the company with a plain select so we take no row lock before it.
+        const owningCompanyId = await tx
+          .select({ companyId: issues.companyId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows: Array<{ companyId: string }>) => rows[0]?.companyId ?? null);
+        if (!owningCompanyId) return null;
+        await lockIssueParentMutationCompany(owningCompanyId, tx);
+
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -10028,6 +10568,7 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
       options: {
         allowSourceScopedRecoveryOwner?: boolean;
+        allowExecutionStageParticipantClaim?: boolean;
         recoveryActionId?: string | null;
         recoveryActionStatus?: string | null;
       } = {},
@@ -10159,6 +10700,61 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      // BLO-22666 AC3: a pending review/approval stage can be pinned to a
+      // `currentParticipant` whose id has drifted off `assigneeAgentId` — a prior
+      // reassignment, or a stage routed to a reviewer that was never the
+      // assignee. `routes/issues.ts` already authorizes that participant to
+      // DECIDE the stage, but the checkout predicate above ORs only
+      // unassigned / same-run-assignee / recovery-owner, so the participant could
+      // never take the lock and its decision raced whoever else held it.
+      //
+      // This claim is deliberately NOT the ordinary checkout: it writes the lock
+      // columns and nothing else. `assigneeAgentId`, `assigneeUserId`, `status`
+      // and `startedAt` are all left alone, so claiming a stage cannot be used as
+      // a back door to general issue ownership — the participant gets exactly the
+      // atomicity it needs to decide, and the row still belongs to its assignee
+      // once the stage resolves.
+      if (
+        options.allowExecutionStageParticipantClaim &&
+        current.status === "in_review" &&
+        current.assigneeAgentId !== agentId
+      ) {
+        const claimed = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (
+          tx,
+          checkoutExecutionPatch,
+        ) =>
+          tx
+            .update(issues)
+            .set({
+              checkoutRunId,
+              ...checkoutExecutionPatch,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.status, "in_review"),
+                // Re-assert the participant pin inside the UPDATE rather than
+                // trusting the row read above: the stage can advance between the
+                // read and the write, and a claim on an already-decided stage
+                // would pin the lock to an agent with nothing left to decide.
+                pendingExecutionStageAgentParticipantCondition(agentId),
+                // Never steal a live lock — free-or-ours only.
+                checkoutRunId
+                  ? or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId))
+                  : isNull(issues.checkoutRunId),
+                executionLockCondition,
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null)
+        );
+        if (claimed) {
+          const [enrichedClaim] = await withIssueLabels(db, [claimed]);
+          return enrichedClaim;
+        }
+      }
 
       if (options.allowSourceScopedRecoveryOwner && current.assigneeAgentId !== agentId) {
         throw conflict("Issue checkout failed — authorization or status mismatch", {
@@ -10681,6 +11277,75 @@ export function issueService(db: Db) {
         executionRunId: latest.executionRunId,
         actorAgentId,
         actorRunId,
+      });
+    },
+
+    // BLO-22666: the `in_review` counterpart of assertCheckoutOwner, kept as a
+    // separate entry point rather than widening that one. assertCheckoutOwner is
+    // keyed on `in_progress` in eight places and owns the whole stale-lock
+    // adoption ladder; teaching it a second status would put the two-runs-of-one
+    // -agent fence and the adoption ladder in the same blast radius, and this
+    // predicate has already produced four Criticals.
+    //
+    // Only ever called for the same-agent case (the caller establishes
+    // `assigneeAgentId === actorAgentId`), so it can be a plain ownership
+    // question with no adoption: it clears locks held by TERMINAL runs first —
+    // otherwise a dead run A would fence its own agent's run B forever — then
+    // re-reads and fences only if a live foreign run still holds the row.
+    assertPendingReviewRunOwnership: async (
+      id: string,
+      actorAgentId: string,
+      actorRunId: string | null,
+    ) => {
+      await clearExecutionRunIfTerminal(id);
+      await clearCheckoutRunIfTerminal(id);
+      const current = await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!current) throw notFound("Issue not found");
+
+      // Re-derive the fenced shape from the freshly-read row. The caller decided
+      // to fence off a snapshot; if the row has since left `in_review`, lost its
+      // pending stage, changed hands, or been released, there is nothing to
+      // fence and the ordinary boundary decision stands.
+      const executionState = parseIssueExecutionState(current.executionState);
+      const fenced =
+        current.status === "in_review" &&
+        current.assigneeAgentId === actorAgentId &&
+        executionState?.status === "pending" &&
+        (current.checkoutRunId != null || current.executionRunId != null);
+      if (!fenced) return { owned: true as const, fenced: false as const };
+
+      // Same run-identity test as isCurrentIssueExecutionRun: hold every lock
+      // column that is set, so a run owning only one of a divergent pair does
+      // not read as the owner.
+      const ownsCheckout = current.checkoutRunId === actorRunId;
+      const ownsExecution = current.executionRunId === actorRunId;
+      const owned =
+        actorRunId != null &&
+        (ownsCheckout || ownsExecution) &&
+        (current.checkoutRunId == null || ownsCheckout) &&
+        (current.executionRunId == null || ownsExecution);
+      if (owned) return { owned: true as const, fenced: true as const };
+
+      throw conflict("Issue run ownership conflict", {
+        issueId: current.id,
+        status: current.status,
+        assigneeAgentId: current.assigneeAgentId,
+        checkoutRunId: current.checkoutRunId,
+        executionRunId: current.executionRunId,
+        actorAgentId,
+        actorRunId,
+        reason: "pending_review_stage_locked_by_another_run",
       });
     },
 
@@ -11499,7 +12164,13 @@ export function issueService(db: Db) {
             createdAt: workspace.createdAt,
             updatedAt: workspace.updatedAt,
           }));
-          const primaryWorkspace = workspaces.find((workspace) => workspace.isPrimary) ?? workspaces[0] ?? null;
+          const explicitPrimaryWorkspace = workspaces.find((workspace) => workspace.isPrimary) ?? null;
+          const primaryWorkspace = explicitPrimaryWorkspace ?? workspaces[0] ?? null;
+          // BLO-26184: same silent-guess shape as projects.ts's pickPrimaryWorkspace —
+          // surface it on the same fallback counter/log rather than a second blind spot.
+          if (!explicitPrimaryWorkspace && workspaces.length > 1) {
+            recordProjectPrimaryWorkspaceFallback(r.id);
+          }
           projectMap.set(r.id, {
             ...r,
             workspaces,
@@ -11525,4 +12196,7 @@ export function issueService(db: Db) {
       }));
     },
   };
+
+  addCommentPort = service.addComment as SchedulerHeartbeatAddComment;
+  return service;
 }
