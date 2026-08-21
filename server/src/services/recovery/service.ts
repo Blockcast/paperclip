@@ -5715,6 +5715,12 @@ export function recoveryService(
   // `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading an
   // out-param through every caller. Diagnostic only: two overlapping sweeps would split
   // the delta between them, which does not affect any control-flow decision.
+  //
+  // Invariant the snapshot/diff accounting depends on: every
+  // `escalateStrandedAssignedIssue` call site is lexically inside
+  // `reconcileStrandedAssignedIssues`. If a caller is ever added outside that sweep, its
+  // increments land in whichever sweep happens to be open and the delta silently
+  // misattributes — thread an explicit counter at that point instead of widening this one.
   let dependencyWaitEscalationSuppressedTotal = 0;
 
   async function escalateStrandedAssignedIssue(input: {
@@ -5837,10 +5843,10 @@ export function recoveryService(
       // in a dispatchable status for the normal scheduler, and a still-blocked one
       // retains its edge-triggered dependency-resolved wake.
       //
-      // `previousStatus === "in_review"` is deliberately excluded, because neither of
-      // those safety arguments holds for a review-stage strand. Four of the five
-      // review-participant call sites below reach here with a *terminal participant
-      // run*, and because DEPENDENCY_BLOCKED_ERROR_CODE is a member of
+      // Review-participant strands are deliberately excluded, because neither of
+      // those safety arguments holds for them. Four of the five review-participant
+      // call sites below reach here with a *terminal participant run*, and because
+      // DEPENDENCY_BLOCKED_ERROR_CODE is a member of
       // NON_RETRYABLE_CONTINUATION_ERROR_CODES the non-retryable branch catches it
       // first. An `in_review` issue with a pending stage is not re-dispatched by the
       // normal scheduler; and when its blockers have already cleared there is no
@@ -5853,7 +5859,19 @@ export function recoveryService(
       // participant wakes included. The measurement above covers the
       // assignee-execution population only; whether an `in_review` dependency wait
       // should also stop escalating is a separate question that needs its own evidence.
-      if (input.previousStatus !== "in_review" && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+      //
+      // `recoveryOwnerAgentId == null` is that exclusion stated exactly, and it is
+      // narrower than the `previousStatus !== "in_review"` proxy it replaces. All five
+      // review-participant sites pass `recoveryOwnerAgentId: participantAgentId`, which
+      // the guard at the top of the `issue.status === "in_review"` block has already
+      // narrowed to a non-null string — so every one of them still escalates. No
+      // assignee-lane site passes the field at all. The status proxy also exempted the
+      // three assignee-lane sites that forward `previousStatus: issue.status`, and
+      // `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so an `in_review`
+      // issue with a non-pending execution state reaching the non_retryable branch was
+      // still escalating into the empty-blocker-set `blocked` state this gate exists to
+      // prevent — the measured 24/24 outcome, on the population the measurement covers.
+      if (input.recoveryOwnerAgentId == null && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
         // Diagnostic only, but worth the lock-held round-trip: `isDependencyReady`
         // is what separates a still-blocked wait from the defect-shaped
         // "dependency-blocked with nothing blocking it" arm, and that distinction is
