@@ -5100,7 +5100,6 @@ export function recoveryService(
     if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
     if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
     if (!input.action.ownerAgentId) return;
-    if (strandedRecoveryWakeAttemptsExhausted(input.action)) return;
     // BLO-18996 (review follow-up): the attempt this wake spends was already committed.
     // `recoveryActionsSvc` runs on the outer `db`, not on `escalateStrandedAssignedIssue`'s
     // transaction, so `upsertSourceScoped`'s `attemptCount` increment is durable before we
@@ -5124,7 +5123,10 @@ export function recoveryService(
     // unproductive wakes; the horizon bounds wall-clock regardless of delivery.
     const reservedOwnerAgentId = input.action.ownerAgentId;
     const reservedAttemptCount = input.action.attemptCount;
-    const refundUnspentWakeAttempt = async (cause: "enqueue_threw" | "enqueue_not_delivered", error?: unknown) => {
+    const refundUnspentWakeAttempt = async (
+      cause: "enqueue_threw" | "enqueue_not_delivered" | "attempts_exhausted",
+      error?: unknown,
+    ) => {
       const release = () =>
         recoveryActionsSvc.releaseWakeAttempt({
           companyId: input.issue.companyId,
@@ -5164,6 +5166,23 @@ export function recoveryService(
         }
       }
     };
+    // BLO-19124: the exhaustion gate must refund too, and it has to sit BELOW the closure
+    // above so it can reach it. The reserve at `issue-recovery-actions.ts:508` is
+    // unconditional — every sweep of an already-exhausted row commits `attemptCount + 1` —
+    // while this gate returns without spending a wake. Before this refund the two were
+    // asymmetric, so an exhausted row gained +1 per sweep forever: monotonic, unbounded, and
+    // the reason a live row read `attemptCount: 30` against `maxAttempts: 5` (~30 sweeps, of
+    // which only 5 ever woke anyone). Refunding makes reserve-then-return net zero, so the
+    // counter FREEZES at the number of wakes actually delivered instead of counting sweeps.
+    //
+    // This cannot un-exhaust the row or leak an extra wake. The refund lands on
+    // `maxAttempts` and the next sweep's reserve puts it back at `maxAttempts + 1`, which
+    // re-trips this same gate before any enqueue — so the delivered-wake ceiling is unchanged
+    // at exactly `maxAttempts`, and `timeoutAt` still bounds wall-clock independently.
+    if (strandedRecoveryWakeAttemptsExhausted(input.action)) {
+      await refundUnspentWakeAttempt("attempts_exhausted");
+      return;
+    }
     const enqueueOrRefundAttempt: typeof deps.enqueueWakeup = async (agentId, opts) => {
       let queued: Awaited<ReturnType<typeof deps.enqueueWakeup>>;
       try {
