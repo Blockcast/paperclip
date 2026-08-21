@@ -2543,7 +2543,31 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(exhaustedAction).toMatchObject({ status: "active", ownerAgentId: managerId });
-    expect(exhaustedAction!.attemptCount).toBeGreaterThan(defaultRecoveryActionMaxAttempts);
+    // BLO-19124: the counter FREEZES at the delivered-wake count. It used to read
+    // `toBeGreaterThan(maxAttempts)` because the exhaustion gate returned without refunding
+    // the unconditional reserve, so every post-exhaustion sweep added +1 forever — after
+    // these `maxAttempts + 2` sweeps it read 7, and a live row reached 30. Now reserve and
+    // return net zero, so it settles on exactly the number of wakes that were delivered.
+    expect(exhaustedAction!.attemptCount).toBe(defaultRecoveryActionMaxAttempts);
+
+    // 1b. And it STAYS there. This is the assertion the suite was missing: it asserted the
+    //     gate reports `true`, never that the counter stops moving once it does. Sweeping
+    //     again must deliver no further wakes AND leave the counter untouched — the pair is
+    //     what makes an `attemptCount`/`maxAttempts` dimension safe to publish (AC6).
+    for (let extra = 0; extra < 3; extra += 1) {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: { ...baseRun, id: randomUUID() },
+        comment: "Automatic continuation recovery failed.",
+      });
+      const [frozen] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(frozen!.attemptCount).toBe(defaultRecoveryActionMaxAttempts);
+      expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
+    }
 
     // 2. Hand the work to the other reporting line, then sweep again through the real path.
     await db
