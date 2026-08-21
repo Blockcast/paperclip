@@ -105,6 +105,48 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
     return row?.status ?? null;
   }
 
+  // The PATCH route runs its eager recompute inside a fire-and-forget
+  // `void (async () => …)()` block, so a request that is *supposed* to leave an
+  // issue `blocked` gives the test nothing to await. Sleeping a fixed 250ms and
+  // then asserting is two separate bets: that the pass finished, and that the
+  // wiring was live enough to have flipped the row had it been eligible. A
+  // green test could mean either "correctly left blocked" or "recompute never
+  // ran at all".
+  //
+  // So drive a control through the same machinery instead: close an unrelated
+  // blocker whose dependent IS eligible and wait for that flip. The wait is a
+  // positive signal, so it settles both bets — it proves the recompute path is
+  // armed and working, and because the control request is issued strictly after
+  // the request under test, its completion is a real happens-after barrier
+  // rather than a guess at a safe duration.
+  async function expectStillBlockedAfterLiveRecompute(
+    app: express.Express,
+    companyId: string,
+    prefix: string,
+    controlIssueNumber: number,
+    issueId: string,
+  ) {
+    const controlBlocker = await seedIssue(companyId, prefix, controlIssueNumber, "Control blocker");
+    const controlDependent = await seedIssue(
+      companyId,
+      prefix,
+      controlIssueNumber + 1,
+      "Control dependent",
+      { status: "blocked" },
+    );
+    await db
+      .insert(issueRelations)
+      .values({ companyId, issueId: controlBlocker, relatedIssueId: controlDependent, type: "blocks" });
+
+    const closed = await request(app).patch(`/api/issues/${controlBlocker}`).send({ status: "done" });
+    expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+    await vi.waitFor(async () => {
+      expect(await statusOf(controlDependent)).toBe("todo");
+    });
+
+    expect(await statusOf(issueId)).toBe("blocked");
+  }
+
   it("persists blockedByIssueIds set via PATCH and surfaces both sides", async () => {
     const { companyId, prefix } = await seedCompany();
     const blockedId = await seedIssue(companyId, prefix, 1, "Blocked issue");
@@ -256,12 +298,10 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
     const cancelled = await request(app).patch(`/api/issues/${blockerA}`).send({ status: "cancelled" });
     expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
 
-    // Give the fire-and-forget wake/recompute path a beat to run, then assert
-    // it stayed blocked — there is no positive signal to wait on here, so
-    // this polls the negative for a short, bounded window instead of
-    // asserting immediately after the response.
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(await statusOf(dependentId)).toBe("blocked");
+    // `becameDone` is false for a cancel, so no recompute is scheduled for this
+    // dependent at all — the control is what proves that silence is the gate
+    // holding rather than the machinery being dead.
+    await expectStillBlockedAfterLiveRecompute(app, companyId, prefix, 62, dependentId);
   });
 
   // BLO-21523 phase 2 regression guard. The eager recompute must fire only on
@@ -282,8 +322,7 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
     expect(blocked.status, JSON.stringify(blocked.body)).toBe(200);
     expect(blocked.body.status).toBe("blocked");
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(await statusOf(issueId)).toBe("blocked");
+    await expectStillBlockedAfterLiveRecompute(app, companyId, prefix, 71, issueId);
   });
 
   it("reassigning a blocked issue that has an unresolved blocker leaves it blocked", async () => {
@@ -301,8 +340,77 @@ describeEmbeddedPostgres("issue PATCH blockedByIssueIds persistence", () => {
       .send({ assigneeAgentId: null });
     expect(reassigned.status, JSON.stringify(reassigned.body)).toBe(200);
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(await statusOf(dependentId)).toBe("blocked");
+    await expectStillBlockedAfterLiveRecompute(app, companyId, prefix, 82, dependentId);
+  });
+
+  // BLO-21523 phase 2. PATCH is not the only route that closes a blocker: an
+  // approval-shaped comment on a pending execution-policy review stage moves
+  // the issue to `done` through POST /issues/:id/comments, which carries its
+  // own becameDone fan-out. Covering it end-to-end here — real db, real
+  // recompute, no stubs — is what proves the dependent actually becomes
+  // dispatchable rather than merely that the fan-out was called.
+  it("a blocker closed by an approval comment flips its dependent from blocked to todo", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const stageId = randomUUID();
+    const participant = { type: "user" as const, userId: "cloud-user-1", agentId: null };
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      issueNumber: 90,
+      identifier: `${prefix}-90`,
+      title: "Blocker awaiting approval",
+      status: "in_review",
+      priority: "medium",
+      createdByUserId: "cloud-user-1",
+      assigneeUserId: "cloud-user-1",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: stageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), ...participant }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: participant,
+        returnAssignee: participant,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    });
+    // Unassigned on purpose: no wake can reach this row, so only the status
+    // recompute can make it dispatchable again.
+    const dependentId = await seedIssue(companyId, prefix, 91, "Dependent issue", {
+      status: "blocked",
+      assigneeAgentId: null,
+    });
+    const app = createApp(companyId);
+
+    await db
+      .insert(issueRelations)
+      .values({ companyId, issueId: blockerId, relatedIssueId: dependentId, type: "blocks" });
+
+    const approved = await request(app)
+      .post(`/api/issues/${blockerId}/comments`)
+      .send({ body: "## Review: APPROVED\n\nShip it." });
+    expect(approved.status, JSON.stringify(approved.body)).toBe(201);
+    expect(await statusOf(blockerId)).toBe("done");
+
+    await vi.waitFor(async () => {
+      expect(await statusOf(dependentId)).toBe("todo");
+    });
   });
 });
 
