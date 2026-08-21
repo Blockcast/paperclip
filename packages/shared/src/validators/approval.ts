@@ -25,7 +25,19 @@ export const approvalGateSchema = z.object({
   repoFullName: z
     .string()
     .trim()
-    .regex(/^[^/\s]+\/[^/\s]+$/, "gate.repoFullName must be in owner/repo form"),
+    // GitHub's real charset, not just "no slashes or spaces". The looser
+    // `[^/\s]+/[^/\s]+` accepted `.` and `..` as segments, and this value is
+    // interpolated into an authenticated API URL (`github-app-auth.ts`), so a
+    // traversal-shaped repo name should not be expressible in the first place.
+    .regex(
+      /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/,
+      "gate.repoFullName must be in owner/repo form",
+    )
+    // The repo half legitimately allows dots, so `.`/`..` still need an explicit reject.
+    .refine(
+      (value) => !value.split("/").some((segment) => segment === "." || segment === ".."),
+      "gate.repoFullName must not contain `.` or `..` path segments",
+    ),
   runId: z.number().int().positive(),
   url: z.string().trim().url().optional(),
 });

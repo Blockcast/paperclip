@@ -29,7 +29,7 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issueComments } from "@paperclipai/db";
-import { APPROVAL_UNDECIDED_STATUSES, parseApprovalGate, type ApprovalGate } from "@paperclipai/shared";
+import { APPROVAL_UNDECIDED_STATUSES, parseApprovalGate, type ApprovalGate, type IssueCommentMetadata } from "@paperclipai/shared";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { githubGetWorkflowRun, type WorkflowRunLookup } from "./github-app-auth.js";
@@ -68,6 +68,32 @@ const TERMINAL_RUN_STATES = new Set([
 /** Conclusion that means the gate was satisfied rather than lost. */
 const SUCCESS_CONCLUSION = "success";
 
+/**
+ * Approval types this sweep is allowed to close.
+ *
+ * An allow-list rather than a deny-list: a newly added approval type is excluded
+ * until someone has checked it against the rule below, because the failure mode of
+ * guessing wrong is silent and permanent.
+ *
+ * `hire_agent` is why this exists. It parks a real agent in `pending_approval`, and
+ * *both* terminal transitions in the approvals service cascade to that agent —
+ * `reject` and `withdraw` each call `agentService.terminate(boundPendingAgent.id)`,
+ * the latter under an explicit comment that skipping it strands the agent "frozen
+ * with no remaining approval to decide it". This reconciler writes `cancelled`
+ * straight through drizzle and deliberately runs no cascade, so closing a gated
+ * `hire_agent` card would strand its agent permanently — with the card that could
+ * have decided it now gone. `payload.gate` is accepted on every type (one shared
+ * `approvalPayloadSchema` serves all of `APPROVAL_TYPES`), so nothing upstream stops
+ * such a card from being filed; this predicate is the only guard.
+ *
+ * The three types below were each checked to have no terminal-transition cascade.
+ */
+const RECONCILABLE_APPROVAL_TYPES = [
+  "approve_ceo_strategy",
+  "budget_override_required",
+  "request_board_approval",
+] as const;
+
 export interface ApprovalGateReconcileResult {
   /** Cards examined against GitHub. */
   examined: number;
@@ -79,6 +105,12 @@ export interface ApprovalGateReconcileResult {
   live: number;
   /** Cards left alone because GitHub could not be read. */
   deferred: number;
+  /**
+   * Cards whose close transaction threw. They stay undecided and are retried on the
+   * next sweep; a number that stays non-zero across sweeps means one card is stuck
+   * rather than the queue being drained.
+   */
+  failed: number;
   /** True when the lookup budget cut the sweep short. */
   truncated: boolean;
 }
@@ -139,7 +171,13 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
   if (!TERMINAL_RUN_STATES.has(lookup.status)) {
     return { kind: "live" };
   }
-  const satisfied = lookup.conclusion === SUCCESS_CONCLUSION;
+  // Derived from both halves for the same reason TERMINAL_RUN_STATES carries
+  // conclusion-shaped values: GitHub overloads `status`, so a finished run can
+  // arrive as `status: "success", conclusion: null`. Reading `conclusion` alone
+  // would announce that satisfied gate as "died undecided" — the one case the
+  // terminal set was widened to anticipate.
+  const satisfied =
+    lookup.status === SUCCESS_CONCLUSION || lookup.conclusion === SUCCESS_CONCLUSION;
   const conclusion = lookup.conclusion ?? "none";
   return {
     kind: "terminal",
@@ -187,6 +225,50 @@ function announcementBody(input: {
   ].join("\n");
 }
 
+/**
+ * Label of the metadata row that records which card an announcement belongs to.
+ *
+ * This is load-bearing, not decoration. `issueCommentMetadataSchema` is `.strict()`
+ * and permits only `version` / `sourceRunId` / `sections`, so the provenance cannot
+ * live in ad-hoc top-level keys: a blob shaped that way is rejected on read by
+ * `issueCommentMetadataSchema.nullable().catch(null)`, which means every API consumer
+ * silently sees `metadata: null` and the audit trail this sweep exists to produce is
+ * lost. Keeping the card identity inside a schema-legal `key_value` row is what lets
+ * the idempotency probe stay an indexable jsonb containment match.
+ */
+const RECONCILED_CARD_LABEL = "Reconciled approval card";
+
+/**
+ * Provenance for one announcement, in the only shape the comment contract accepts.
+ *
+ * Typed as `IssueCommentMetadata` on purpose: the column is
+ * `jsonb().$type<IssueCommentMetadata | null>()`, so a non-conforming blob is a
+ * compile error here rather than a silent `null` at the read path.
+ */
+function announcementMetadata(input: {
+  approvalId: string;
+  gate: ApprovalGate;
+  satisfied: boolean;
+}): IssueCommentMetadata {
+  return {
+    version: 1,
+    sections: [
+      {
+        title: "Approval gate",
+        rows: [
+          { type: "key_value", label: RECONCILED_CARD_LABEL, value: input.approvalId },
+          {
+            type: "key_value",
+            label: "GitHub run",
+            value: `${input.gate.repoFullName} run ${input.gate.runId}`,
+          },
+          { type: "key_value", label: "Gate satisfied", value: input.satisfied ? "yes" : "no" },
+        ],
+      },
+    ],
+  };
+}
+
 async function listCandidateApprovals(
   db: Db,
   batchSize: number,
@@ -194,6 +276,9 @@ async function listCandidateApprovals(
 ): Promise<CandidateRow[]> {
   const conditions = [
     inArray(approvals.status, [...APPROVAL_UNDECIDED_STATUSES]),
+    // Cascade-bearing types are excluded here, not downstream: see
+    // RECONCILABLE_APPROVAL_TYPES. A gated `hire_agent` card must stay pending.
+    inArray(approvals.type, [...RECONCILABLE_APPROVAL_TYPES]),
     sql`${approvals.payload}->'gate'->>'kind' = 'github_actions_run'`,
   ];
   if (cursor) {
@@ -225,8 +310,8 @@ async function listCandidateApprovals(
  *
  * The status write requires the row to still be undecided, so a human decision that
  * lands mid-sweep wins and no announcement is posted for a card we did not close.
- * Announcements are keyed on `metadata.approvalId` so a retried or overlapping sweep
- * cannot double-post.
+ * Announcements additionally carry the card id in a `key_value` metadata row, so a
+ * retried or overlapping sweep cannot double-post.
  */
 async function closeAndAnnounce(
   db: Db,
@@ -276,8 +361,18 @@ async function closeAndAnnounce(
           .from(issueComments)
           .where(and(
             eq(issueComments.issueId, link.issueId),
-            sql`${issueComments.metadata}->>'kind' = 'approval-gate-reconciler'`,
-            sql`${issueComments.metadata}->>'approvalId' = ${candidate.id}`,
+            // Containment against the schema-legal provenance row (see
+            // RECONCILED_CARD_LABEL). Belt-and-braces: the primary guarantee is the
+            // status write above, which only one transaction can win, plus the fact
+            // that `cancelled` is terminal — `resubmit` only accepts
+            // `revision_requested`, so a closed card can never re-enter the
+            // candidate set. This probe is kept so that a future path back to
+            // undecided cannot start double-posting silently.
+            sql`${issueComments.metadata} @> ${JSON.stringify({
+              sections: [
+                { rows: [{ type: "key_value", label: RECONCILED_CARD_LABEL, value: candidate.id }] },
+              ],
+            })}::jsonb`,
           ))
           .limit(1),
       )[0];
@@ -288,13 +383,11 @@ async function closeAndAnnounce(
         issueId: link.issueId,
         authorType: "system",
         body: announcementBody({ gate, disposition, approvalTitle }),
-        metadata: {
-          kind: "approval-gate-reconciler",
+        metadata: announcementMetadata({
           approvalId: candidate.id,
-          repoFullName: gate.repoFullName,
-          runId: gate.runId,
-          gateSatisfied: disposition.satisfied,
-        } as never,
+          gate,
+          satisfied: disposition.satisfied,
+        }),
       });
       announced += 1;
     }
@@ -344,6 +437,7 @@ export async function reconcileApprovalGates(
     announced: 0,
     live: 0,
     deferred: 0,
+    failed: 0,
     truncated: false,
   };
   const closedSamples: string[] = [];
@@ -407,7 +501,25 @@ export async function reconcileApprovalGates(
         continue;
       }
 
-      const outcome = await closeAndAnnounce(db, { candidate, gate, disposition, now: now() });
+      let outcome: { closed: boolean; announced: number };
+      try {
+        outcome = await closeAndAnnounce(db, { candidate, gate, disposition, now: now() });
+      } catch (err) {
+        // Symmetric with the guarded `fetchRun` above, and for a sharper reason: an
+        // unguarded throw here (deadlock, an FK violation on the comment insert, an
+        // outbox failure in logActivity) propagates out of the sweep and is swallowed
+        // by the caller's `.catch`. Because every sweep restarts at `cursor = null`
+        // ordered by `(createdAt, id)`, the same early card would be re-encountered
+        // first on every tick and would starve every card behind it indefinitely —
+        // the silent-cap failure the `truncated` counter exists to prevent, arriving
+        // through a different door.
+        result.failed += 1;
+        log.error(
+          { err, approvalId: candidate.id, repoFullName: gate.repoFullName, runId: gate.runId },
+          "approval-gate reconciler could not close a card; left it pending and continued (BLO-29359)",
+        );
+        continue;
+      }
       if (!outcome.closed) continue;
       result.closed += 1;
       result.announced += outcome.announced;
@@ -423,6 +535,13 @@ export async function reconcileApprovalGates(
   // lands exactly on a batch boundary, and reporting the second as the first is
   // the silent cap this counter exists to prevent — so probe for one more row
   // rather than inferring it.
+  //
+  // The probe shares the candidate predicate, which cannot express "has a *valid*
+  // gate" (validation is `parseApprovalGate`, in JS). So a tail consisting only of
+  // malformed-gate rows reports `truncated: true` when nothing reconcilable was
+  // actually skipped. That over-reports rather than under-reports, which is the
+  // fail-safe direction for this counter and consistent with unknown-means-live
+  // above: a spurious "check again" costs one probe, a missed cap hides work.
   if (budgetExhausted) {
     result.truncated = (await listCandidateApprovals(db, 1, cursor)).length > 0;
   }
@@ -431,6 +550,12 @@ export async function reconcileApprovalGates(
     log.info(
       { ...result, sample: closedSamples },
       "approval-gate reconciler closed approval cards whose GitHub gate had terminated (BLO-29359)",
+    );
+  }
+  if (result.failed > 0) {
+    log.warn(
+      { ...result },
+      "approval-gate reconciler left cards pending after close failures; they retry next sweep (BLO-29359)",
     );
   }
   if (result.truncated) {

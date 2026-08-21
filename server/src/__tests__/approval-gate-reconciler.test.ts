@@ -11,6 +11,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
+import { issueCommentMetadataSchema } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -110,6 +111,8 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     issueId?: string;
     title?: string;
     createdAt?: Date;
+    type?: string;
+    linkedAgentId?: string;
   }) {
     const id = randomUUID();
     const payload: Record<string, unknown> = { title: input.title ?? "Deploy paperclip" };
@@ -117,10 +120,11 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     await db.insert(approvals).values({
       id,
       companyId: input.companyId,
-      type: "request_board_approval",
+      type: (input.type ?? "request_board_approval") as never,
       requestedByAgentId: input.agentId,
       status: input.status ?? "pending",
       payload: payload as never,
+      ...(input.linkedAgentId ? { linkedAgentId: input.linkedAgentId } : {}),
       ...(input.createdAt ? { createdAt: input.createdAt } : {}),
     });
     if (input.issueId) {
@@ -214,18 +218,90 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     expect(comments[0]?.body).toContain("actions/runs/32338832082");
     // It must say the card can no longer be approved, or a reader will keep waiting.
     expect(comments[0]?.body).toContain("can no");
-    expect(comments[0]?.metadata).toMatchObject({
-      kind: "approval-gate-reconciler",
-      approvalId,
-      runId: 32338832082,
-      gateSatisfied: false,
-    });
+    // Assert through the contract, not just the stored shape. The column is
+    // `jsonb().$type<IssueCommentMetadata>` and the API read path is
+    // `issueCommentMetadataSchema.nullable().catch(null)`, so a blob that fails this
+    // parse reads back as `metadata: null` for every consumer — silently, which is
+    // how the previous ad-hoc shape passed a DB-level assertion while delivering
+    // nothing. Parsing here is what makes that failure visible to the suite.
+    const parsed = issueCommentMetadataSchema.parse(comments[0]?.metadata);
+    expect(parsed.sections[0]?.rows).toEqual(
+      expect.arrayContaining([
+        { type: "key_value", label: "Reconciled approval card", value: approvalId },
+        { type: "key_value", label: "GitHub run", value: "Blockcast/paperclip run 32338832082" },
+        { type: "key_value", label: "Gate satisfied", value: "no" },
+      ]),
+    );
 
     const activity = await db
       .select({ action: activityLog.action, entityId: activityLog.entityId })
       .from(activityLog)
       .where(eq(activityLog.entityId, approvalId));
     expect(activity).toEqual([{ action: "approval.cancelled", entityId: approvalId }]);
+  });
+
+  it("never closes a gated hire_agent card: cancelling it would strand the bound agent", async () => {
+    const { companyId, agentId } = await createCompany("AGRH");
+    const issueId = await insertIssue(companyId, "AGRH-1");
+    // A hire card parks a real agent in `pending_approval`. Both terminal transitions
+    // in the approvals service (`reject`, `withdraw`) terminate that agent; this sweep
+    // writes `cancelled` straight through drizzle and runs no cascade. Closing the card
+    // here would therefore freeze the agent forever, with the one approval that could
+    // have decided it now gone. `payload.gate` is accepted on every approval type, so
+    // only the candidate predicate stands between that card and this sweep.
+    const pendingHireId = randomUUID();
+    await db.insert(agents).values({
+      id: pendingHireId,
+      companyId,
+      name: "Pending Hire",
+      role: "engineer",
+      status: "pending_approval",
+    });
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      type: "hire_agent",
+      gate: gateFor(32372156837),
+      issueId,
+      linkedAgentId: pendingHireId,
+      title: "Hire a release engineer",
+    });
+
+    const fetchRun = vi.fn(async () => found("completed", "cancelled"));
+    const result = await reconcileApprovalGates(db, { fetchRun, logger: silentLogger });
+
+    // Excluded at the predicate, so it is not merely left open — it never reaches
+    // GitHub and costs no lookup budget.
+    expect(fetchRun).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ examined: 0, closed: 0, announced: 0 });
+    expect((await approvalRow(approvalId))?.status).toBe("pending");
+    expect(await commentsFor(issueId)).toHaveLength(0);
+
+    const hire = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, pendingHireId));
+    expect(hire[0]?.status).toBe("pending_approval");
+  });
+
+  it("still reconciles the other cascade-free approval types", async () => {
+    const { companyId, agentId } = await createCompany("AGRT");
+    const issueId = await insertIssue(companyId, "AGRT-1");
+    const budgetCard = await insertApproval({
+      companyId,
+      agentId,
+      type: "budget_override_required",
+      gate: gateFor(77),
+      issueId,
+    });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchRun: async () => found("completed", "cancelled"),
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 1, closed: 1 });
+    expect((await approvalRow(budgetCard))?.status).toBe("cancelled");
   });
 
   it("distinguishes a gate that completed successfully from one that died", async () => {
@@ -243,7 +319,9 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     const comments = await commentsFor(issueId);
     expect(comments[0]?.body).toContain("has already completed");
     expect(comments[0]?.body).not.toContain("died undecided");
-    expect(comments[0]?.metadata).toMatchObject({ gateSatisfied: true });
+    expect(issueCommentMetadataSchema.parse(comments[0]?.metadata).sections[0]?.rows).toEqual(
+      expect.arrayContaining([{ type: "key_value", label: "Gate satisfied", value: "yes" }]),
+    );
   });
 
   it("closes a card whose run has been deleted (404 is positive evidence)", async () => {
@@ -345,6 +423,93 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     // The card is no longer undecided, so it is not even a candidate any more.
     expect(second).toMatchObject({ examined: 0, closed: 0, announced: 0 });
     expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("does not re-announce when a matching announcement already exists on the issue", async () => {
+    const { companyId, agentId } = await createCompany("AGRD");
+    const issueId = await insertIssue(companyId, "AGRD-1");
+    const approvalId = await insertApproval({ companyId, agentId, gate: gateFor(11), issueId });
+
+    // Drives the jsonb-containment dedupe directly. The across-sweeps test above
+    // cannot reach it: once a card is closed it leaves the undecided candidate set,
+    // so the second sweep never evaluates the predicate at all. Seeding the comment
+    // against a still-pending card is the only way to prove the containment SQL is
+    // both valid and actually matches the shape the reconciler writes — if the two
+    // ever drift apart, `announced` goes back to 1 here.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorType: "system",
+      body: "pre-existing announcement",
+      metadata: {
+        version: 1,
+        sections: [
+          {
+            title: "Approval gate",
+            rows: [
+              { type: "key_value", label: "Reconciled approval card", value: approvalId },
+            ],
+          },
+        ],
+      },
+    });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchRun: async () => found("completed", "cancelled"),
+      logger: silentLogger,
+    });
+
+    // The card still closes — only the duplicate comment is suppressed.
+    expect(result).toMatchObject({ examined: 1, closed: 1, announced: 0 });
+    expect((await approvalRow(approvalId))?.status).toBe("cancelled");
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("keeps sweeping when one card cannot be closed, instead of starving the queue", async () => {
+    const { companyId, agentId } = await createCompany("AGRF");
+    const issueId = await insertIssue(companyId, "AGRF-1");
+    // The earliest card is the one that fails. Every sweep restarts at `cursor = null`
+    // ordered by `(createdAt, id)`, so an unguarded throw here would re-block this same
+    // card first on every tick and no later card would ever be reached again.
+    const doomed = await insertApproval({
+      companyId,
+      agentId,
+      gate: gateFor(1),
+      issueId,
+      createdAt: new Date("2026-08-01T00:00:00Z"),
+    });
+    const later = await insertApproval({
+      companyId,
+      agentId,
+      gate: gateFor(2),
+      issueId,
+      createdAt: new Date("2026-08-02T00:00:00Z"),
+    });
+
+    // Break the close for the first card only. `now()` is evaluated inside the same
+    // `try` that wraps `closeAndAnnounce`, which makes it the one injectable seam for
+    // "the close transaction threw" — the real causes (deadlock, an FK violation on
+    // the comment insert, a logActivity outbox failure) have no test seam, but they
+    // land on exactly this path.
+    let closeAttempts = 0;
+    const now = () => {
+      closeAttempts += 1;
+      if (closeAttempts === 1) throw new Error("simulated close failure");
+      return new Date("2026-08-21T00:00:00Z");
+    };
+
+    const result = await reconcileApprovalGates(db, {
+      fetchRun: async () => found("completed", "cancelled"),
+      logger: silentLogger,
+      now,
+    });
+
+    expect(closeAttempts).toBe(2);
+    expect(result.failed).toBe(1);
+    // The later card was still reached and closed in the same sweep.
+    expect(result.closed).toBe(1);
+    expect((await approvalRow(doomed))?.status).toBe("pending");
+    expect((await approvalRow(later))?.status).toBe("cancelled");
   });
 
   it("ignores cards with no gate, and skips a malformed gate without spending a lookup", async () => {
@@ -507,6 +672,21 @@ describe("classifyGateLookup", () => {
       satisfied: true,
     });
     expect(classifyGateLookup(found("completed", "cancelled"))).toMatchObject({
+      kind: "terminal",
+      satisfied: false,
+    });
+  });
+
+  it("treats an overloaded `status: success` with no conclusion as satisfied", () => {
+    // This is the exact case TERMINAL_RUN_STATES was widened to absorb: GitHub
+    // overloads `status` with conclusion-shaped values. Deriving satisfaction from
+    // `conclusion` alone announced such a run as "died undecided" — telling an
+    // approver their successful deploy gate had been lost.
+    expect(classifyGateLookup(found("success", null))).toMatchObject({
+      kind: "terminal",
+      satisfied: true,
+    });
+    expect(classifyGateLookup(found("neutral", null))).toMatchObject({
       kind: "terminal",
       satisfied: false,
     });
