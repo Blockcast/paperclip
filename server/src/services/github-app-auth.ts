@@ -249,11 +249,60 @@ export async function githubGetPullRequestGate(input: {
  * (the run is gone), `error` explicitly is NOT — a rate-limited or 5xx lookup must
  * leave the card alone and retry, or a throttled GitHub would silently retire live
  * gates.
+ *
+ * A raw 404 is *not* by itself that positive evidence: GitHub returns it for an
+ * inaccessible repository as readily as for a deleted run. `not_found` is therefore
+ * only returned once the repository has been confirmed readable — see
+ * `classifyWorkflowRunNotFound`.
  */
 export type WorkflowRunLookup =
   | { outcome: "found"; status: string; conclusion: string | null; htmlUrl: string | null }
   | { outcome: "not_found" }
   | { outcome: "error"; retryable: boolean; reason: string };
+
+/**
+ * Disambiguate a 404 on a workflow-run lookup.
+ *
+ * GitHub returns 404 both for a run that has genuinely been deleted *and* for a
+ * repository the installation token cannot see — an App that was never installed on
+ * it, had its access revoked, or a private repo outside the installation. Those are
+ * opposite facts with opposite consequences: `not_found` is the single outcome that
+ * closes an approval card, so treating an access failure as a deleted run would
+ * irreversibly cancel every live gate in that repository, which is exactly the bulk
+ * retirement `githubGetWorkflowRun`'s contract forbids.
+ *
+ * So probe the repository itself. A readable repo makes the run's absence positive
+ * evidence; anything else is ambiguous and must defer instead of closing.
+ */
+async function classifyWorkflowRunNotFound(input: {
+  apiBase: string;
+  repoFullName: string;
+  token: string;
+}): Promise<WorkflowRunLookup> {
+  let res: Response;
+  try {
+    res = await ghFetch(`${input.apiBase}/repos/${input.repoFullName}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${input.token}` },
+    });
+  } catch {
+    return { outcome: "error", retryable: true, reason: "workflow_run_repo_probe_failed" };
+  }
+  // The repo is readable, so the run really is gone.
+  if (res.ok) return { outcome: "not_found" };
+  if (res.status === 404 || res.status === 403 || res.status === 401) {
+    // Not retryable in the sense that waiting will not fix it — it needs an
+    // installation or permission change. Deferring (never closing) is the safe
+    // direction: a stale card costs a queue row, a wrongly-cancelled one costs a
+    // production deploy gate that cannot be un-cancelled.
+    return {
+      outcome: "error",
+      retryable: false,
+      reason: `workflow_run_repo_inaccessible_${res.status}`,
+    };
+  }
+  const classified = await classifyGithubHttpFailure("workflow_run_repo", res);
+  return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+}
 
 export async function githubGetWorkflowRun(input: {
   repoFullName: string;
@@ -273,7 +322,13 @@ export async function githubGetWorkflowRun(input: {
   } catch {
     return { outcome: "error", retryable: true, reason: "workflow_run_fetch_failed" };
   }
-  if (res.status === 404) return { outcome: "not_found" };
+  if (res.status === 404) {
+    return await classifyWorkflowRunNotFound({
+      apiBase,
+      repoFullName: input.repoFullName,
+      token: tokenResult.token,
+    });
+  }
   if (!res.ok) {
     const classified = await classifyGithubHttpFailure("workflow_run", res);
     return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
