@@ -346,6 +346,29 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     expect((await commentsFor(issueId))[0]?.body).toContain("no longer exists");
   });
 
+  // A repository the App cannot see answers 404 exactly like a deleted run does.
+  // `githubGetWorkflowRun` resolves that ambiguity to `error`; this pins the
+  // consequence at the reconciler level — the card must survive, because cancelling a
+  // live production deploy gate cannot be undone.
+  it("leaves the card pending when a 404 came from an inaccessible repository", async () => {
+    const { companyId, agentId } = await createCompany();
+    const issueId = await insertIssue(companyId, "AGR-4B");
+    const approvalId = await insertApproval({ companyId, agentId, gate: gateFor(44), issueId });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchRun: async () => ({
+        outcome: "error",
+        retryable: false,
+        reason: "workflow_run_repo_inaccessible_404",
+      }),
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 1, closed: 0, deferred: 1, announced: 0 });
+    expect(await approvalRow(approvalId)).toMatchObject({ status: "pending", decidedAt: null });
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
   it("defers rather than closing when GitHub cannot be read", async () => {
     const { companyId, agentId } = await createCompany();
     const issueId = await insertIssue(companyId, "AGR-5");

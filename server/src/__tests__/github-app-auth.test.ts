@@ -20,6 +20,7 @@ import {
   getInstallationTokenResult,
   githubFetchPrHeadSha,
   githubGetPullRequestGate,
+  githubGetWorkflowRun,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
   githubListIssueCommentsWithTimestamps,
@@ -200,6 +201,70 @@ describe("githubGetPullRequestGate", () => {
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
     })).resolves.toEqual({ error: "pull_request_http_503" });
+  });
+});
+
+// `not_found` is the single lookup outcome that CLOSES an approval card, and closing
+// is irreversible. GitHub answers 404 both for a deleted run and for a repository the
+// installation cannot see, so the two must be told apart before that outcome is
+// returned — otherwise revoking the App's access to a repo silently cancels every
+// live deploy gate in it.
+describe("githubGetWorkflowRun 404 disambiguation", () => {
+  const stubFetch = (runStatus: number, repoStatus: number, repoBody: unknown = {}) => {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      if (u.includes("/actions/runs/")) {
+        return jsonResponse({ message: "Not Found" }, false, runStatus);
+      }
+      return jsonResponse(repoBody, repoStatus >= 200 && repoStatus < 300, repoStatus);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("reports not_found only once the repository is confirmed readable", async () => {
+    setCreds();
+    const fetchMock = stubFetch(404, 200, { full_name: "Blockcast/paperclip" });
+
+    await expect(githubGetWorkflowRun({
+      repoFullName: "Blockcast/paperclip",
+      runId: 32372156837,
+    })).resolves.toEqual({ outcome: "not_found" });
+
+    // The repo probe is what makes the run's absence positive evidence.
+    expect(fetchMock.mock.calls.some(([url]) => /\/repos\/Blockcast\/paperclip$/.test(String(url))))
+      .toBe(true);
+  });
+
+  it.each([404, 403, 401])(
+    "defers instead of closing when the repository answers %i",
+    async (repoStatus) => {
+      setCreds();
+      stubFetch(404, repoStatus);
+
+      await expect(githubGetWorkflowRun({
+        repoFullName: "Blockcast/private-repo",
+        runId: 1,
+      })).resolves.toEqual({
+        outcome: "error",
+        retryable: false,
+        reason: `workflow_run_repo_inaccessible_${repoStatus}`,
+      });
+    },
+  );
+
+  it("defers when the repository probe itself fails transiently", async () => {
+    setCreds();
+    stubFetch(404, 503);
+
+    const result = await githubGetWorkflowRun({
+      repoFullName: "Blockcast/paperclip",
+      runId: 1,
+    });
+    expect(result).toMatchObject({ outcome: "error", retryable: true });
   });
 });
 
