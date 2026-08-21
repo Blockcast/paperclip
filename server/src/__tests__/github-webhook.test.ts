@@ -7900,6 +7900,76 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(refireComments).toHaveLength(0);
   });
 
+  // The suppression lever above has to survive the alert's OWN lifecycle, not
+  // just a re-fire. `recordDependabotTerminalReceipt` resolves its target with a
+  // fallback query that has no status filter, so a later terminal delivery
+  // (`fixed`, or any dismissal) lands on the cancelled row -- and moving it to
+  // `done` would null `cancelledAt` and hand every subsequent re-fire back to
+  // the reopen path, defeating the suppression through a different door.
+  it("does not un-cancel an alert issue when a later terminal delivery arrives", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const [originalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+
+    const cancelledAt = new Date("2026-08-19T00:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt })
+      .where(eq(issues.id, originalIssue!.id));
+
+    // `fixed` sets hasCompleteTerminalEvidence unconditionally -- the ordinary
+    // way this arrives, not a contrived payload.
+    const terminal = await postDependabot(
+      app,
+      dependabotPayload("critical", "fixed"),
+      "delivery-terminal-after-cancel",
+    );
+    expect(terminal.status).toBe(200);
+
+    const afterTerminal = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(afterTerminal).toHaveLength(1);
+    expect(afterTerminal[0]!.status).toBe("cancelled");
+    expect(afterTerminal[0]!.cancelledAt).toEqual(cancelledAt);
+
+    // The terminal delivery is still recorded, so nothing is silently dropped.
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, originalIssue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+
+    // The proof that matters: the lever still works afterwards. A re-fire is
+    // still suppressed rather than reopening a now-`done` row.
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-after-terminal",
+    );
+    expect(refire.status).toBe(200);
+    expect(refire.body).toMatchObject({ dependabotWakeFired: false });
+
+    const afterRefire = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(afterRefire).toHaveLength(1);
+    expect(afterRefire[0]!.status).toBe("cancelled");
+    expect(afterRefire[0]!.cancelledAt).toEqual(cancelledAt);
+  });
+
   it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     const app = buildApp({ dependabotAgentId: agentId });

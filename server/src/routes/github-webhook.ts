@@ -1891,7 +1891,17 @@ async function recordDependabotTerminalReceipt(
       .onConflictDoNothing();
   }
 
-  if (hasCompleteTerminalEvidence && issue.status !== "done") {
+  // `cancelled` is excluded, not just `done`. The fallback lookup above has no
+  // status filter, so it can resolve a deliberately-cancelled row -- and
+  // `cancelled` -> `done` is a lateral move between two terminal states that
+  // buys nothing while nulling `cancelledAt` (services/issues.ts clears it on
+  // any status change away from `cancelled`). That would defeat the suppression
+  // branch in resolveDependabotAlertIssue through a different door: once the
+  // row reads `done`, every later re-fire takes the reopen path and wakes an
+  // assignee again, with no field-level record the alert was ever cancelled.
+  // The receipt comment above still lands on the row, so the terminal delivery
+  // stays auditable.
+  if (hasCompleteTerminalEvidence && issue.status !== "done" && issue.status !== "cancelled") {
     await issueService(db).update(issue.id, { status: "done" });
   }
 }
