@@ -817,6 +817,153 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  // The agent adapterConfig sync is one of three binding write paths in
+  // secretService. Classifying only there left the omit-the-label bypass open
+  // on the other two, so each gets its own DB-backed assertion on the stored
+  // row rather than on a service return value.
+  it("derives class-3 lease metadata server-side in createBinding", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `slack-create-binding-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "slack-test-token",
+    });
+    const agentId = await seedAgentRow(companyId, {
+      name: "Slack Direct Binding",
+      adapterType: "codex_local",
+      runtimeConfig: {},
+    });
+
+    // No projectionClass declared at all — the pre-fix path stored
+    // "unclassified" here, and the runtime re-check then returned early for the
+    // same reason, so the class-3 restriction never applied to the slot.
+    const binding = await secrets.createBinding({
+      companyId,
+      secretId: secret.id,
+      targetType: "agent",
+      targetId: agentId,
+      configPath: "env.SLACK_BOT_TOKEN",
+    });
+
+    const stored = await db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.id, binding.id));
+    expect(stored[0]).toMatchObject({
+      projectionClass: "class_3_static_lease",
+      projectionAllowlistKey: "slack.bot_token",
+    });
+  });
+
+  it("rejects a class-3 declaration at a non-allowlisted slot in createBinding", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `github-create-binding-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "github-test-token",
+    });
+    const agentId = await seedAgentRow(companyId, {
+      name: "Unlisted Direct Binding",
+      adapterType: "codex_local",
+      runtimeConfig: {},
+    });
+
+    await expect(
+      secrets.createBinding({
+        companyId,
+        secretId: secret.id,
+        targetType: "agent",
+        targetId: agentId,
+        configPath: "env.GITHUB_TOKEN",
+        projectionClass: "class_3_static_lease",
+        projectionAllowlistKey: "github.token",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "class_3_static_lease_not_allowed" },
+    });
+
+    const stored = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetId, agentId),
+      ));
+    expect(stored).toHaveLength(0);
+  });
+
+  it("derives class-3 lease metadata server-side in syncEnvBindingsForTarget", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `slack-sync-env-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "slack-test-token",
+    });
+    const agentId = await seedAgentRow(companyId, {
+      name: "Slack Env Sync",
+      adapterType: "codex_local",
+      runtimeConfig: {},
+    });
+
+    await secrets.syncEnvBindingsForTarget(
+      companyId,
+      { targetType: "agent", targetId: agentId },
+      { SLACK_BOT_TOKEN: { type: "secret_ref", secretId: secret.id, version: "latest" } },
+    );
+
+    const stored = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetId, agentId),
+      ));
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({
+      configPath: "env.SLACK_BOT_TOKEN",
+      projectionClass: "class_3_static_lease",
+      projectionAllowlistKey: "slack.bot_token",
+    });
+  });
+
+  it("rejects a class-3 declaration at a non-allowlisted slot in syncEnvBindingsForTarget", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `github-sync-env-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "github-test-token",
+    });
+    const agentId = await seedAgentRow(companyId, {
+      name: "Unlisted Env Sync",
+      adapterType: "codex_local",
+      runtimeConfig: {},
+    });
+
+    await expect(
+      secrets.syncEnvBindingsForTarget(
+        companyId,
+        { targetType: "agent", targetId: agentId },
+        {
+          GITHUB_TOKEN: {
+            type: "secret_ref",
+            secretId: secret.id,
+            version: "latest",
+            projectionClass: "class_3_static_lease",
+            projectionAllowlistKey: "github.token",
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "class_3_static_lease_not_allowed" },
+    });
+  });
+
   it("rejects class-3 env lease bindings outside the enumerated allowlist", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

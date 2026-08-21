@@ -569,6 +569,19 @@ function assertClass3StaticLeaseAllowed(input: {
  * Note the allowlist's `key` is a capability key (`slack.bot_token`), not the
  * secret's own `companySecrets.key` — those are unrelated, so classification
  * cannot be derived by matching the secret record.
+ *
+ * This is the single classification point for all three binding write paths
+ * (`createBinding`, `syncSecretRefsForTarget`, `syncEnvBindingsForTarget`);
+ * classifying at only one of them would leave the omit-the-label bypass open on
+ * the others. `assertClass3StaticLeaseAllowed` survives as the runtime check in
+ * `assertBindingContext`, where it reads the *stored* row rather than a caller's
+ * declaration and so is no longer self-satisfying.
+ *
+ * Migration note: a row already stored `unclassified` at an allowlisted slot is
+ * upgraded to `class_3_static_lease` the next time anything re-syncs that
+ * target, without a backfill. That is the intended direction — the allowlist is
+ * what the slot is *meant* to carry, and the previous value only recorded what
+ * the caller happened to declare.
  */
 function resolveProjectionClassification(input: {
   targetType: SecretBindingTargetType;
@@ -3560,11 +3573,10 @@ export function secretService(db: Db) {
       projectionAllowlistKey?: string | null;
     }) => {
       await assertSecretInCompany(input.companyId, input.secretId);
-      assertClass3StaticLeaseAllowed({
+      const { projectionClass, projectionAllowlistKey } = resolveProjectionClassification({
         targetType: input.targetType,
         configPath: input.configPath,
-        projectionClass: input.projectionClass,
-        projectionAllowlistKey: input.projectionAllowlistKey,
+        declaredProjectionClass: input.projectionClass,
       });
       const existing = await db
         .select()
@@ -3590,8 +3602,8 @@ export function secretService(db: Db) {
           versionSelector: String(input.versionSelector ?? "latest"),
           required: input.required ?? true,
           label: input.label ?? null,
-          projectionClass: input.projectionClass ?? "unclassified",
-          projectionAllowlistKey: input.projectionAllowlistKey ?? null,
+          projectionClass,
+          projectionAllowlistKey,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -3626,12 +3638,6 @@ export function secretService(db: Db) {
           targetType: target.targetType,
           configPath: ref.configPath,
           declaredProjectionClass: ref.projectionClass,
-        });
-        assertClass3StaticLeaseAllowed({
-          targetType: target.targetType,
-          configPath: ref.configPath,
-          projectionClass,
-          projectionAllowlistKey,
         });
         normalizedRefs.push({
           secretId: ref.secretId,
@@ -3760,18 +3766,17 @@ export function secretService(db: Db) {
         if (binding.type !== "secret_ref") continue;
         await assertSecretInCompany(companyId, binding.secretId, bindingDb);
         const configPath = `${pathPrefix}.${key}`;
-        assertClass3StaticLeaseAllowed({
+        const { projectionClass, projectionAllowlistKey } = resolveProjectionClassification({
           targetType: target.targetType,
           configPath,
-          projectionClass: binding.projectionClass,
-          projectionAllowlistKey: binding.projectionAllowlistKey,
+          declaredProjectionClass: binding.projectionClass,
         });
         refs.push({
           secretId: binding.secretId,
           configPath,
           versionSelector: binding.version,
-          projectionClass: binding.projectionClass,
-          projectionAllowlistKey: binding.projectionAllowlistKey,
+          projectionClass,
+          projectionAllowlistKey,
         });
       }
 

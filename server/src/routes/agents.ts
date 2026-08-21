@@ -3,7 +3,7 @@ import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
-import { collectAgentAdapterSecretBindingPaths } from "../services/agent-secret-bindings.js";
+import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -1417,9 +1417,29 @@ export function agentRoutes(
     return entries;
   }
 
-  function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+  /**
+   * A model profile's adapterConfig is not synced to `company_secret_bindings`
+   * — only the agent's top-level `adapterConfig` is (`syncAgentSecretBindings`)
+   * — so a binding declared here creates no row and fails closed at runtime on
+   * `binding_missing`. The guard runs anyway as defence in depth against a
+   * future sync, and pairs each profile with its stored counterpart so an
+   * unchanged round-trip is not refused. Removal is deliberately not checked:
+   * there is no row for it to delete.
+   */
+  function assertNoAgentRuntimeConfigAdapterConfigMutation(
+    req: Request,
+    runtimeConfig: unknown,
+    existingRuntimeConfig?: unknown,
+  ) {
+    const existingByProfileKey = new Map(
+      listRuntimeModelProfileAdapterConfigs(existingRuntimeConfig).map((entry) =>
+        [entry.profileKey, entry.adapterConfig] as const,
+      ),
+    );
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
-      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
+      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path, {
+        existingAdapterConfig: existingByProfileKey.get(entry.profileKey) ?? null,
+      });
     }
   }
 
@@ -1754,7 +1774,8 @@ export function agentRoutes(
   }
 
   /**
-   * An agent must not be able to bind a company secret to itself (BLO-27991).
+   * An agent must not be able to create, modify, or remove its own secret
+   * bindings (BLO-27991).
    *
    * `PATCH /agents/:id` carrying only `adapterConfig` takes the weak
    * authorization branch (`allow_self`, no change grant), and the sync path it
@@ -1764,34 +1785,104 @@ export function agentRoutes(
    * company secret and have it projected into its own pod, because the runtime
    * re-check (`assertBindingContext`) validates against that very row.
    *
-   * Refusing outright is safe: GET redacts every binding to the `***` sentinel
-   * and `stripRedactedEnvBindingsFromAdapterConfig` restores it from stored
-   * state, so an honest agent round-trip never carries a literal binding. Board
-   * and system actors are unaffected, as are the service-internal callers
-   * (company-package import, built-in agent reconciler) that bypass this route.
+   * This compares the bindings the write would persist against the bindings
+   * already stored, and refuses only a difference. A blanket refusal of any
+   * request *carrying* a binding is wrong in both directions:
+   *
+   *  - It 403s the honest round-trip. An agent-facing GET masks only the
+   *    top-level `env` map to `***`; a `secret_ref` outside `env`, and every
+   *    binding from `redactAgentConfiguration`, comes back as a readable
+   *    pointer by design (`redaction.ts`). So read-modify-write does echo
+   *    literal bindings, and `stripRedactedEnvBindingsFromAdapterConfig`
+   *    restores sentinels only — never a literal pointer.
+   *  - It misses removal. `syncSecretRefsForTarget` runs `replaceAll: true`,
+   *    so dropping a key deletes its row; the only way past a blanket refusal
+   *    is to drop the key, which is itself an unauthorized mutation.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every binding is therefore a creation. Board and system
+   * actors are unaffected, as are the service-internal callers (company-package
+   * import, built-in agent reconciler) that bypass this route.
    */
   function assertNoAgentSecretBindingMutation(
     req: Request,
-    adapterConfig: Record<string, unknown>,
+    adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
   ) {
-    if (req.actor.type !== "agent" || !adapterConfig) return;
-    const bindingPaths = collectAgentAdapterSecretBindingPaths(adapterConfig);
-    if (bindingPaths.length === 0) return;
+    if (req.actor.type !== "agent") return;
+    const changedPaths = diffAgentAdapterSecretBindings(
+      existingAdapterConfig ?? null,
+      adapterConfig ?? null,
+    );
+    if (changedPaths.length === 0) return;
     throw forbidden(
-      "Agent-authenticated callers cannot create or modify secret bindings "
-        + `(${bindingPaths.map((bindingPath) => `${path}.${bindingPath}`).join(", ")}). `
+      "Agent-authenticated callers cannot create, modify, or remove secret bindings "
+        + `(${changedPaths.map((bindingPath) => `${path}.${bindingPath}`).join(", ")}). `
         + "Secret bindings must be configured by a board actor.",
     );
+  }
+
+  /**
+   * The adapterConfig a `PATCH /agents/:id` would persist, before server-side
+   * normalization: sentinel env values already restored from stored state by
+   * the caller, shallow-merged onto the stored config unless the request asked
+   * to replace it, then adapter-agnostic and instructions-bundle keys carried
+   * over when the adapter type changes.
+   *
+   * Shared by the agent secret-binding guard and the persistence path so the
+   * two cannot drift. A guard that models the merge differently from the writer
+   * either refuses honest requests — every omitted key reads as a removal — or
+   * misses real ones.
+   */
+  function resolveRawEffectiveAdapterConfigForPatch(input: {
+    existingAdapterConfig: Record<string, unknown>;
+    requestedAdapterConfig: Record<string, unknown> | null;
+    replaceAdapterConfig: boolean;
+    changingAdapterType: boolean;
+  }): Record<string, unknown> {
+    const { existingAdapterConfig, requestedAdapterConfig } = input;
+    let effective = requestedAdapterConfig ?? existingAdapterConfig;
+    if (requestedAdapterConfig && !input.changingAdapterType && !input.replaceAdapterConfig) {
+      effective = { ...existingAdapterConfig, ...requestedAdapterConfig };
+    }
+    if (input.changingAdapterType) {
+      // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
+      // when the adapter type changes. Without this, a PATCH that includes
+      // adapterConfig but omits these keys would silently drop them.
+      for (const key of ADAPTER_AGNOSTIC_KEYS) {
+        if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
+        if (effective[key] === undefined && existingAdapterConfig[key] !== undefined) {
+          effective = { ...effective, [key]: existingAdapterConfig[key] };
+        }
+      }
+      effective = preserveInstructionsBundleConfig(existingAdapterConfig, effective);
+    }
+    return effective;
   }
 
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
+    options?: {
+      /** Stored config the binding diff is taken against. Omit on create/hire. */
+      existingAdapterConfig?: Record<string, unknown> | null;
+      /**
+       * Config that will actually be persisted, when it differs from the raw
+       * request body — a PATCH shallow-merges onto the stored config, so the
+       * request alone understates what survives and overstates what is removed.
+       */
+      effectiveAdapterConfig?: Record<string, unknown> | null;
+    },
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
-    assertNoAgentSecretBindingMutation(req, adapterConfig, path);
+    assertNoAgentSecretBindingMutation(
+      req,
+      options?.effectiveAdapterConfig ?? adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
@@ -3415,7 +3506,28 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      const existingAdapterConfigForGuard = asRecord(existing.adapterConfig) ?? {};
+      assertNoAgentAdapterConfigMutation(req, adapterConfig, "adapterConfig", {
+        existingAdapterConfig: existingAdapterConfigForGuard,
+        // The binding diff has to be taken against what will actually be
+        // persisted, via the same helper the writer uses below: read from the
+        // request body alone, every key this PATCH merely omits would read as a
+        // binding removal.
+        //
+        // Deliberately pre-normalization: `normalizeAdapterConfigForPersistence`
+        // can itself mint a `secret_ref` from a plain value (mediated secrets),
+        // and that is the server's own write, not the caller's.
+        effectiveAdapterConfig: resolveRawEffectiveAdapterConfigForPatch({
+          existingAdapterConfig: existingAdapterConfigForGuard,
+          requestedAdapterConfig: stripRedactedEnvBindingsFromAdapterConfig(
+            adapterConfig,
+            existingAdapterConfigForGuard,
+          ),
+          replaceAdapterConfig,
+          changingAdapterType:
+            typeof patchData.adapterType === "string" && patchData.adapterType !== existing.adapterType,
+        }),
+      });
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
@@ -3437,7 +3549,7 @@ export function agentRoutes(
         existing.runtimeConfig,
         runtimeConfig,
       );
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig, existing.runtimeConfig);
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
@@ -3461,25 +3573,12 @@ export function agentRoutes(
       ) {
         await assertCanManageInstructionsPath(req, existing);
       }
-      let rawEffectiveAdapterConfig = requestedAdapterConfig ?? existingAdapterConfig;
-      if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
-        rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
-      }
-      if (changingAdapterType) {
-        // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
-        // when the adapter type changes. Without this, a PATCH that includes
-        // adapterConfig but omits these keys would silently drop them.
-        for (const key of ADAPTER_AGNOSTIC_KEYS) {
-          if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
-          if (rawEffectiveAdapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
-            rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingAdapterConfig[key] };
-          }
-        }
-        rawEffectiveAdapterConfig = preserveInstructionsBundleConfig(
-          existingAdapterConfig,
-          rawEffectiveAdapterConfig,
-        );
-      }
+      let rawEffectiveAdapterConfig = resolveRawEffectiveAdapterConfigForPatch({
+        existingAdapterConfig,
+        requestedAdapterConfig,
+        replaceAdapterConfig,
+        changingAdapterType,
+      });
       const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
         existing.companyId,
         existing.id,
