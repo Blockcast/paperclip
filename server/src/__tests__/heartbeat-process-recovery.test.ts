@@ -5530,16 +5530,25 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // the suppression counter instead of through an escalation nobody can action.
     expect(result.dependencyWaitEscalationSuppressed).toBe(1);
     expect(result.escalated).toBe(0);
+    // `issueIds` is what callers read to decide what the sweep acted on, so a
+    // suppressed issue must not appear in it.
+    expect(result.issueIds).not.toContain(issueId);
 
     const recoveryActions = await db
       .select()
       .from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
     expect(recoveryActions).toHaveLength(0);
+
+    // AC#1: ownership does not move and the issue is left where the scheduler can
+    // still pick it up, rather than parked in `blocked` with an empty blocker set.
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.assigneeAgentId).toBe(agentId);
+    expect(after.status).toBe("in_progress");
   });
 
   it("keeps a dependency-blocked continuation with nothing blocking it visible without escalating it (BLO-27463)", async () => {
-    const { companyId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "cancelled",
       retryReason: "issue_continuation_needed",
@@ -5580,11 +5589,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.dependencyWaitSkipped).toBe(0);
     expect(result.dependencyWaitEscalationSuppressed).toBe(1);
     expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
 
     // The issue must remain dispatchable: escalation is what used to park it in
     // `blocked` with no blockers, which no scheduler pass can ever pick up again.
+    // Asserted as the exact expected status — `not.toBe("blocked")` also passes for
+    // `cancelled`/`done`, which are not dispatchable either.
     const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(after.status).not.toBe("blocked");
+    expect(after.status).toBe("in_progress");
+    expect(after.assigneeAgentId).toBe(agentId);
     const suppressedActions = await db
       .select()
       .from(issueRecoveryActions)
@@ -5628,6 +5641,86 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(after.assigneeAgentId).toBe(agentId);
     expect(after.status).toBe("todo");
+  });
+
+  // Boundary for the gate above. `issue_dependencies_blocked` is a member of
+  // NON_RETRYABLE_CONTINUATION_ERROR_CODES, so an `in_review` participant run carrying it
+  // reaches the review-participant escalation — and it is reachable in production through
+  // the same provider-capacity mislabelling, since `claimQueuedRun`'s dependency gate
+  // cancels *any* queued run for the issue, participant wakes included.
+  //
+  // Suppressing there would be strictly worse than the escalation BLO-27463 removes:
+  // an `in_review` issue with a pending stage is not re-dispatched by the normal
+  // scheduler, and with the blockers already cleared there is no dependency wake left to
+  // retain — the wait is on the participant, not on a dependency. So the review-stage
+  // strand must still escalate and acquire a recovery owner.
+  it("still escalates an in_review participant run carrying the dependency-blocked error code (BLO-27463)", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const sourceAssigneeAgentId = randomUUID();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+
+    await db.insert(agents).values({
+      id: sourceAssigneeAgentId,
+      companyId,
+      name: "CodexImplementor",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({
+      assigneeAgentId: sourceAssigneeAgentId,
+      executionRunId: null,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId, userId: null },
+        returnAssignee: { type: "agent", agentId: sourceAssigneeAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    // Deliberately no issueRelations row: readiness is true and the blocker set is empty,
+    // which is exactly the shape the transactional gate suppresses for the assignee lane.
+    await db.update(heartbeatRuns).set({
+      status: "cancelled",
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+      errorCode: "issue_dependencies_blocked",
+      error:
+        "Latest retry failure: provider rate-limit/quota window — the provider advertised " +
+        "availability no earlier than 2026-08-13T01:17:00.262Z (surfaced as `issue_dependencies_blocked`).",
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "cancelled",
+      claimedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+      error: "provider rate-limit/quota window (surfaced as `issue_dependencies_blocked`)",
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(0);
+    expect(result.escalated).toBe(1);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(action).toMatchObject({
+      cause: "execution_review_participant_recovery",
+      ownerAgentId: agentId,
+      returnOwnerAgentId: sourceAssigneeAgentId,
+    });
   });
 
   it.each(["added", "reopened"] as const)(
