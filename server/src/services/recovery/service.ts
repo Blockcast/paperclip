@@ -5710,6 +5710,13 @@ export function recoveryService(
     });
   }
 
+  // BLO-27463: incremented by the dependency-wait gate inside
+  // `escalateStrandedAssignedIssue`, which has 20 call sites and no `result` in scope.
+  // `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading an
+  // out-param through every caller. Diagnostic only: two overlapping sweeps would split
+  // the delta between them, which does not affect any control-flow decision.
+  let dependencyWaitEscalationSuppressedTotal = 0;
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -5807,16 +5814,45 @@ export function recoveryService(
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
       const mutationDb = input.expectedReviewStage ? tx : db;
-      // The sweep's preflight readiness check can be invalidated by a blocker
-      // that is added or reopened while this escalation waits for its per-issue
-      // advisory lock. Re-read through this transaction immediately before the
-      // first recovery side effect so a now-blocked dependent stays with its
-      // assignee for the normal dependency wake path.
+      // BLO-27463: a terminal `issue_dependencies_blocked` run is a *wait state*,
+      // never a stranded execution path (see DEPENDENCY_BLOCKED_ERROR_CODE), so it
+      // must not open a stranded_assigned_issue action or move ownership up the org
+      // chain — regardless of whether the blockers have since cleared.
+      //
+      // This previously only refused escalation while the issue was *still* not
+      // dependency-ready. That predicate cannot fire on the population that actually
+      // escalates: heartbeat.ts restores the issue to its pre-checkout status when the
+      // dep-blocked retry budget exhausts, so by the time the sweep sees it the
+      // blockers have resolved or never existed, and the readiness re-check passes.
+      // Measured against the CEO inbox 2026-08-18, of the 24 escalations opened since
+      // the readiness guards landed on 2026-08-09: 24/24 had zero unresolved blockers,
+      // 23/24 were reassigned up the org chain, and 24/24 came to rest in `blocked`
+      // with an empty blocker set — permanently undispatchable per BLO-21523.
+      //
+      // 14 of those 24 were provider rate-limit/quota parks carrying this error code
+      // ("surfaced as `issue_dependencies_blocked`"), which BLO-19889 AC#2 classes as
+      // infra-class and equally non-escalating. Refusing on the error code covers both
+      // populations at the single gate every escalation caller passes through.
+      //
+      // Skipping is safe for the dependency-ready case because the issue is left in a
+      // dispatchable status for the normal scheduler, and for the still-blocked case
+      // because it retains its edge-triggered dependency-resolved wake.
       if (input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
         const readiness = await issuesSvc
           .listDependencyReadiness(fresh.companyId, [fresh.id], tx)
           .then((rows) => rows.get(fresh.id));
-        if (readiness && !readiness.isDependencyReady) return null;
+        dependencyWaitEscalationSuppressedTotal += 1;
+        logger.info(
+          {
+            issueId: fresh.id,
+            issueStatus: fresh.status,
+            latestRunId: input.latestRun?.id ?? null,
+            isDependencyReady: readiness?.isDependencyReady ?? null,
+            unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? null,
+          },
+          "skipping stranded escalation for dependency-wait terminal run",
+        );
+        return null;
       }
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
@@ -6557,6 +6593,7 @@ export function recoveryService(
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const candidates = await db
       .select()
       .from(issues)
@@ -6594,6 +6631,12 @@ export function recoveryService(
       zeroTokenSessionResetRetried: 0,
       waitingOnReviewResolved: 0,
       dependencyWaitSkipped: 0,
+      // BLO-27463: dependency-wait terminal runs whose escalation was refused at the
+      // transactional gate. Counted separately from `dependencyWaitSkipped` (the sweep
+      // preflight) because a non-zero value here means the issue reported
+      // `issue_dependencies_blocked` with its blockers already resolved — a real defect
+      // that must stay observable without being escalated up the org chain.
+      dependencyWaitEscalationSuppressed: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
@@ -7803,6 +7846,9 @@ export function recoveryService(
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
+
+    result.dependencyWaitEscalationSuppressed =
+      dependencyWaitEscalationSuppressedTotal - dependencyWaitEscalationSuppressedAtSweepStart;
 
     return result;
   }

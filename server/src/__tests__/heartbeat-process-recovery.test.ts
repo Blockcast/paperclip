@@ -5819,7 +5819,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(recoveryActions).toHaveLength(0);
   });
 
-  it("escalates a dependency-blocked continuation after its historical blockers-resolved wake completed without progress", async () => {
+  it("does not escalate a dependency-blocked continuation after its historical blockers-resolved wake completed without progress, but keeps it countable (BLO-27463)", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "cancelled",
@@ -5867,17 +5867,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
     expect(result.dependencyWaitSkipped).toBe(0);
-    expect(result.escalated).toBe(1);
-    expect(result.issueIds).toEqual([issueId]);
+    // BLO-27463: a dependency-wait terminal run is never a stranded execution path, so
+    // it must not open a recovery action or move ownership. It stays countable through
+    // the suppression counter instead of through an escalation nobody can action.
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
 
     const recoveryActions = await db
       .select()
       .from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
-    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions).toHaveLength(0);
   });
 
-  it("still escalates a dependency-blocked continuation when nothing is actually blocking it", async () => {
+  it("keeps a dependency-blocked continuation with nothing blocking it visible without escalating it (BLO-27463)", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "cancelled",
@@ -5891,7 +5894,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     // A blocker that has since completed: readiness is restored, so the issue reports
     // "dependency-blocked" with nothing blocking it. That is a genuine defect and must
-    // stay visible rather than being swallowed by the new guard.
+    // stay visible — but escalation is the wrong way to surface it. Measured against the
+    // CEO inbox 2026-08-18, all 24 escalations opened this way since the readiness guards
+    // landed came to rest `blocked` with an empty blocker set (undispatchable per
+    // BLO-21523), 23/24 reassigned up the org chain, all at attemptCount 0. Visibility now
+    // comes from the suppression counter, which does not strand the issue.
     await db.insert(issues).values({
       id: doneBlockerId,
       companyId,
@@ -5913,8 +5920,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
     expect(result.dependencyWaitSkipped).toBe(0);
-    expect(result.escalated).toBe(1);
-    expect(result.issueIds).toEqual([issueId]);
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
+
+    // The issue must remain dispatchable: escalation is what used to park it in
+    // `blocked` with no blockers, which no scheduler pass can ever pick up again.
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.status).not.toBe("blocked");
+    const suppressedActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(suppressedActions).toHaveLength(0);
+  });
+
+  // Regression for the leak measured on the CEO inbox 2026-08-18. Provider rate-limit /
+  // quota parks are finalized carrying errorCode `issue_dependencies_blocked` (their own
+  // failureSummary reads "surfaced as `issue_dependencies_blocked`"), on issues that never
+  // had a blocker at all. Both readiness guards therefore passed — the issue is genuinely
+  // dependency-ready — and 14 of the 24 post-guard escalations came through this shape.
+  // BLO-19889 AC#2 classes provider-capacity terminations as infra-class and equally
+  // non-escalating, so refusing on the error code has to cover this case too.
+  it("does not escalate a provider-capacity park carrying the dependency-blocked error code (BLO-27463)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "cancelled",
+      retryReason: "assignment_recovery",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Latest retry failure: provider rate-limit/quota window — the provider advertised " +
+        "availability no earlier than 2026-08-13T01:17:00.262Z (surfaced as `issue_dependencies_blocked`).",
+    });
+
+    // Deliberately no issueRelations row: nothing has ever blocked this issue.
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
+
+    // AC#1/AC#2: no recovery action opened, no org-chain reassignment, and the issue is
+    // left dispatchable rather than parked in `blocked` with an empty blocker set.
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.assigneeAgentId).toBe(agentId);
+    expect(after.status).toBe("todo");
   });
 
   it.each(["added", "reopened"] as const)(
