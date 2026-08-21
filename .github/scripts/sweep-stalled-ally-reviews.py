@@ -184,11 +184,30 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # least one automated re-fire + its cooldown should have resolved it, the
 # sweep fails its own CI check -- turning silence into a persistently red
 # scheduled run, rather than a status nobody is watching. Deliberately >
-# STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS by a margin, so this
-# alarms on "the re-fire didn't work either", not on the same signal that
-# just triggered a re-fire.
+# STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS by a margin.
+#
+# What this alarm does and does not claim: it fires on "this head has been
+# awaiting review past the alarm threshold", WHATEVER the cause. It does not
+# check that a re-fire was actually attempted first -- `is_alarming` reads
+# only `is_draft` and `pending_since`, never `existing_marker_epochs`. The
+# margin makes "the re-fire didn't work either" the *typical* cause once the
+# sweep has been running continuously, but that is not guaranteed on cold
+# start, after a schedule gap, or for a PR repeatedly deferred past
+# MAX_REFIRES_PER_RUN. Gating the alarm on a prior marker was considered and
+# rejected: it would silence the alarm on exactly the runs where the sweep
+# itself was not working, which is the wrong direction to fail.
+#
+# The margin is STALL + COOLDOWN + 2h, one hour wider than trafficcontrol's
+# +1h, because this repo's sweep runs HOURLY rather than every 30 minutes
+# (see review-gate-sweep.yml for the rate-limit arithmetic behind that). The
+# extra hour is the polling granularity: worst case a head goes stale just
+# after a run, so its first re-fire lands at 90m+60m=150m and its cooldown
+# expires at 270m, making the next re-fire opportunity 300m. Alarming at
+# 270m would fire in the same window as that second re-fire; 330m (5.5h)
+# keeps "at least one full re-fire and its cooldown have come and gone"
+# true at the coarser cadence.
 ALARM_THRESHOLD_SECONDS = int(
-    os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 60 * 60)
+    os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 2 * 60 * 60)
 )
 
 MARKER = "<!-- paperclip:review-request -->"
@@ -202,6 +221,42 @@ SWEEP_ERROR_REASON_PREFIX = "skip: error"
 # MAX_REFIRES_PER_RUN. Distinct from a clean skip so main() can report it.
 DEFERRED_REASON_PREFIX = "skip: deferred"
 
+# Rate-limit exhaustion is recorded under SWEEP_ERROR_REASON_PREFIX (it IS a
+# failure to evaluate, and must count as one for the degraded-run exit below),
+# but carries this distinguishing token so main() can name the actual cause
+# instead of reporting N indistinguishable per-PR errors.
+RATE_LIMIT_TOKEN = "RateLimitExhausted"
+
+# Every API call is bounded. urlopen's default timeout is None -- block
+# forever -- and this script never calls socket.setdefaulttimeout(), so a
+# single stalled TCP connection would otherwise hang the job to the Actions
+# 6-hour ceiling. With `concurrency.cancel-in-progress: false` every
+# subsequent scheduled run then queues behind it: a multi-hour reconciler
+# outage from one bad socket, on the job whose entire purpose is to not fail
+# silently. The job-level `timeout-minutes` in the workflow is the outer
+# bound; this is the inner one that lets a single slow call fail and the
+# sweep continue.
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS") or 30)
+
+# Exit codes. Both are non-zero (both turn the scheduled job red), but they
+# are distinct so a red run can be read without opening the log: a stranded
+# PR needs a human to go review it, whereas a degraded sweep means the
+# reconciler itself did not run and the PR list is unknown. Conflating them
+# would mean "red because it worked and found something" and "red because it
+# could not look" are the same signal -- which is the failure class this
+# reconciler exists to remove.
+EXIT_ALARM = 1
+EXIT_SWEEP_DEGRADED = 2
+
+
+class RateLimitExhausted(RuntimeError):
+    """The token's request budget is spent, so every remaining call will fail.
+
+    Raised instead of a bare HTTPError so sweep() can abort the loop rather
+    than grinding out one identical failure per remaining PR: continuing
+    cannot evaluate anything and only deepens the exhaustion.
+    """
+
 
 def _request(url, token, method="GET", payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -211,9 +266,36 @@ def _request(url, token, method="GET", payload=None):
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req) as response:
-        body = response.read()
-        return json.loads(body) if body else None
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            body = response.read()
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as error:
+        if is_rate_limit_error(error):
+            raise RateLimitExhausted(
+                "GitHub API rate limit exhausted (HTTP %s) on %s" % (error.code, url)
+            ) from error
+        raise
+
+
+def is_rate_limit_error(error):
+    """True when an HTTPError is budget exhaustion rather than a real 403.
+
+    A 403 is overloaded on this API: it is also "resource not accessible by
+    integration", a permissions fault that retrying will never fix and that
+    must NOT be reported as a rate limit. The discriminator is the header
+    pair, not the status code -- `x-ratelimit-remaining: 0` (primary limit)
+    or a `retry-after` on a 403/429 (secondary/abuse limit).
+    """
+    if getattr(error, "code", None) not in (403, 429):
+        return False
+    headers = getattr(error, "headers", None)
+    if headers is None:
+        return False
+    remaining = headers.get("x-ratelimit-remaining")
+    if remaining is not None and str(remaining).strip() == "0":
+        return True
+    return headers.get("retry-after") is not None
 
 
 def _fetch_paginated(api_base_url, path, token):
@@ -325,6 +407,34 @@ def should_refire(pr, now):
         if since_last < REFIRE_COOLDOWN_SECONDS:
             return False, "re-asked %ds ago < cooldown %ds" % (int(since_last), REFIRE_COOLDOWN_SECONDS)
     return True, "pending %ds >= threshold %ds" % (int(age), STALL_THRESHOLD_SECONDS)
+
+
+def sweep_is_degraded(failed_count, considered_count):
+    """Pure decision: did this run fail so widely that its "nothing alarming"
+    verdict cannot be trusted?
+
+    A per-PR failure is isolated so one bad PR cannot strand the rest -- but
+    that isolation records the failure as `pending_since=None`, and
+    `is_alarming` reads None as "not alarming". So without this check, a run
+    where EVERY PR raised would print `alarming=0` and exit 0: a totally
+    broken sweep and a healthy one produce the identical green tick. That is
+    precisely the "silent failure that reads as health" defect this
+    reconciler exists to eliminate, reintroduced in the reconciler itself.
+
+    Keyed on a proportion rather than `failed_count > 0`, because one
+    transient 5xx against one PR is normal and should not turn the schedule
+    red for everyone. The floor of 3 keeps a short PR list from tripping on a
+    single error (with 5 open PRs, 10% is 0.5, so one failure would otherwise
+    read as "systematic").
+
+    Ordering makes this matter more than the ratio suggests: GitHub returns
+    `/pulls?state=open` newest-first, so when calls start failing partway
+    through, the PRs dropped are the OLDEST -- exactly the population most
+    likely to be stranded, and the population this alarm exists for.
+    """
+    if failed_count <= 0:
+        return False
+    return failed_count >= max(3, 0.1 * considered_count)
 
 
 def is_alarming(pr, now):
@@ -524,7 +634,7 @@ def request_review(owner, repo, number, token, api_base_url, login=ALLY_REQUEST_
         return False
 
 
-def unreviewed_since(pr_payload, head_commit_payload):
+def unreviewed_since(pr_payload, head_commit_payload, now=None):
     """Epoch seconds from which this head has been awaiting review, for
     `status-free` mode. Pure -- the caller does the two fetches.
 
@@ -545,24 +655,72 @@ def unreviewed_since(pr_payload, head_commit_payload):
     revision would inherit the old revision's accumulated age and be re-fired
     immediately, ignoring the cooldown's intent.
 
+    Each candidate is clamped to `now` before the max. `commit.committer.date`
+    is client-settable and carries no guarantee of being in the past: a
+    skewed clock or a rewritten date yields a FUTURE timestamp, hence a
+    negative age, which can never reach STALL_THRESHOLD_SECONDS *or*
+    ALARM_THRESHOLD_SECONDS -- the PR would become permanently invisible to
+    both the re-fire and the alarm. That is the suppression direction this
+    module's predicate bias explicitly refuses: a false "not awaiting review"
+    hides a stranded PR forever, while a false "awaiting review" costs one
+    redundant request. Clamping makes a future-dated head start its clock at
+    `now` and become eligible normally.
+
     Returns None if neither timestamp can be parsed, which the caller treats
     as "not awaiting review" -- fail closed toward not spamming.
     """
+    now = now if now is not None else time.time()
     candidates = []
     created_at = (pr_payload or {}).get("created_at")
     if created_at:
         try:
-            candidates.append(_parse_iso(created_at))
+            candidates.append(min(_parse_iso(created_at), now))
         except (ValueError, TypeError):
             pass
     commit = (head_commit_payload or {}).get("commit") or {}
     committer_date = (commit.get("committer") or {}).get("date")
     if committer_date:
         try:
-            candidates.append(_parse_iso(committer_date))
+            candidates.append(min(_parse_iso(committer_date), now))
         except (ValueError, TypeError):
             pass
     return max(candidates) if candidates else None
+
+
+def too_young_to_be_stranded(pr_payload, now):
+    """True when the PR list payload ALONE proves this PR cannot be stranded,
+    so none of its per-PR fetches need to be issued.
+
+    Call volume is the binding constraint on this job, not correctness: in
+    `status-free` mode every non-draft PR costs at least three requests (head
+    commit + comments page + reviews page). Measured on this repo, 108
+    non-draft open PRs is ~346 requests per run, and at `9,39 * * * *` that is
+    ~700 requests/hour from this job alone against `github.token`'s documented
+    budget of 1,000/hour/repository -- shared with every other workflow here.
+    Exhaustion would not be an edge case, it would be the steady state.
+
+    The cheap proof: `unreviewed_since` returns `max(created_at,
+    committer_date)` (each clamped to `now`), so `pending_since >=
+    created_at` always. Therefore `now - pending_since <= now - created_at`,
+    and a PR younger than STALL_THRESHOLD_SECONDS cannot clear the stall
+    threshold, let alone the strictly larger alarm threshold. No fetch can
+    change that verdict.
+
+    Deliberately restricted to `status-free` mode. In `status` mode
+    `pending_since` comes from a commit status, which is not bounded below by
+    the PR's creation date, so the same inequality does not hold and the
+    filter would be unsound.
+    """
+    if PREDICATE_MODE == "status":
+        return False
+    created_at = (pr_payload or {}).get("created_at")
+    if not created_at:
+        return False
+    try:
+        created = _parse_iso(created_at)
+    except (ValueError, TypeError):
+        return False
+    return (now - created) < STALL_THRESHOLD_SECONDS
 
 
 def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry_run=False):
@@ -585,6 +743,12 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
     head_sha = pr["head"]["sha"]
     pending_since = None
     marker_epochs = []
+    if not is_draft and too_young_to_be_stranded(pr, now):
+        # Proven not stranded from the list payload alone -- see
+        # too_young_to_be_stranded. Reported rather than dropped, so the
+        # accounting still names every PR the sweep looked at.
+        age = int(now - _parse_iso(pr["created_at"]))
+        return (pr, head_sha, None, False, "skip: opened %ds ago < threshold %ds" % (age, STALL_THRESHOLD_SECONDS))
     if not is_draft:
         if PREDICATE_MODE == "status":
             statuses = _fetch_paginated(
@@ -598,7 +762,22 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
             head_commit = _request(
                 "%s/repos/%s/%s/commits/%s" % (api_base_url.rstrip("/"), owner, repo, head_sha), token
             )
-            pending_since = unreviewed_since(pr, head_commit)
+            pending_since = unreviewed_since(pr, head_commit, now=now)
+        if pending_since is not None and (now - pending_since) < STALL_THRESHOLD_SECONDS:
+            # Below the stall threshold, so should_refire is False and
+            # is_alarming is False (its threshold is strictly larger) no
+            # matter what the review surfaces say. The two paginated fetches
+            # below cannot change the verdict, only the wording of the
+            # reason, so they are not worth ~2 requests per young head
+            # against a 1,000/hour budget. This is the same argument as
+            # too_young_to_be_stranded, applied one step later where the
+            # real `pending_since` is known -- and unlike that filter it is
+            # sound in BOTH modes, because it tests the computed value
+            # rather than a lower bound on it.
+            return (
+                pr, head_sha, pending_since, False,
+                "pending %ds < threshold %ds" % (int(now - pending_since), STALL_THRESHOLD_SECONDS),
+            )
         if pending_since is not None:
             comments = _fetch_paginated(
                 api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, number), token
@@ -642,6 +821,7 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
         body = build_comment_body(
             number, head_sha, now - pending_since,
             requested_login=ALLY_REQUEST_REVIEWER_LOGIN if requested else None,
+            mode=PREDICATE_MODE,
         )
         _request(
             "%s/repos/%s/%s/issues/%d/comments" % (api_base_url.rstrip("/"), owner, repo, number),
@@ -672,7 +852,7 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
     prs = _fetch_paginated(api_base_url, "/repos/%s/%s/pulls?state=open" % (owner, repo), token)
     results = []
     refires_left = MAX_REFIRES_PER_RUN
-    for pr in prs:
+    for index, pr in enumerate(prs):
         head_sha = pr.get("head", {}).get("sha", "")
         if pr.get("locked"):
             # A locked conversation is a deliberate operator signal to stop
@@ -695,6 +875,25 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
                 # live run would really do, cap included.
                 refires_left -= 1
             results.append(outcome)
+        except RateLimitExhausted as error:
+            # Not isolated per-PR like the errors below: the budget is spent,
+            # so every remaining PR would raise the identical error. Grinding
+            # through them would deepen the exhaustion, hide the real cause
+            # behind N indistinguishable per-PR failures, and delay the run's
+            # end for no information. Abort, but keep the partial results and
+            # record the unevaluated remainder as failures -- they feed
+            # sweep_is_degraded, so this run exits non-zero rather than
+            # reporting `alarming=0` off a list it never finished reading.
+            print("rate limit exhausted at PR #%d: %s" % (pr.get("number", -1), error), file=sys.stderr)
+            for unevaluated in prs[index:]:
+                results.append((
+                    unevaluated,
+                    unevaluated.get("head", {}).get("sha", ""),
+                    None,
+                    False,
+                    "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, RATE_LIMIT_TOKEN),
+                ))
+            return results
         except Exception as error:  # noqa: BLE001 -- deliberate per-PR isolation
             print(
                 "PR #%d: sweep failed (%s: %s) -- continuing with the remaining PRs"
@@ -740,10 +939,17 @@ def main(argv=None):
     refired = [r for r in results if r[3]]
     alarming = [
         r for r in results
-        if is_alarming({"is_draft": False, "pending_since": r[2]}, now)
+        # `is_draft` is read back off the PR payload rather than hardcoded
+        # False. Passing a literal was correct only because _consider_pr
+        # leaves `pending_since` None for drafts -- an invariant held in a
+        # different function, so the guard would have stopped guarding
+        # silently if that ever changed. Keep the safety local to the check.
+        if is_alarming({"is_draft": bool(r[0].get("draft")), "pending_since": r[2]}, now)
     ]
     failed = [r for r in results if str(r[4]).startswith(SWEEP_ERROR_REASON_PREFIX)]
+    rate_limited = [r for r in failed if RATE_LIMIT_TOKEN in str(r[4])]
     deferred = [r for r in results if str(r[4]).startswith(DEFERRED_REASON_PREFIX)]
+    degraded = sweep_is_degraded(len(failed), len(results))
     for pr, head_sha, pending_since, refire, reason in results:
         marker = "RE-FIRED" if refire else "skip"
         print("PR #%d (%s): %s -- %s" % (pr["number"], head_sha[:7], marker, reason))
@@ -765,6 +971,20 @@ def main(argv=None):
                     "\n### :warning: %d PR(s) could not be evaluated this run "
                     "(isolated so the rest still swept)\n\n" % len(failed)
                 )
+                if rate_limited:
+                    handle.write(
+                        "%d of them were never attempted: the API rate limit was exhausted "
+                        "mid-sweep and the run aborted rather than grinding out one identical "
+                        "failure per remaining PR.\n\n" % len(rate_limited)
+                    )
+                if degraded:
+                    handle.write(
+                        "**This run is DEGRADED** (%d of %d failed). Its `alarming=%d` "
+                        "count is not trustworthy -- a PR that could not be read cannot be "
+                        "shown to be un-stranded, and GitHub lists open PRs newest-first, so "
+                        "the ones dropped are the oldest.\n\n"
+                        % (len(failed), len(results), len(alarming))
+                    )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in failed:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
@@ -805,18 +1025,47 @@ def main(argv=None):
             % (len(alarming), ALARM_THRESHOLD_SECONDS / 3600.0),
             file=sys.stderr,
         )
-        sys.exit(1)
+        sys.exit(EXIT_ALARM)
+    if degraded:
+        # Distinct from the alarm above, and checked second so a genuine
+        # stranded PR still reports as a stranded PR. `alarming=0` off a run
+        # that could not evaluate most of its PRs is not a clean bill of
+        # health -- it is an unread list. Exiting green here would make a
+        # systematically broken sweep indistinguishable from a working one,
+        # which is the exact defect class this reconciler exists to remove.
+        print(
+            "SWEEP DEGRADED: %d of %d PR(s) could not be evaluated%s -- "
+            "review-gate-sweep failing because the sweep itself did not run, NOT because a PR "
+            "is stranded. `alarming=%d` is not a clean bill of health on this run."
+            % (
+                len(failed),
+                len(results),
+                " (API rate limit exhausted mid-sweep)" if rate_limited else "",
+                len(alarming),
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_SWEEP_DEGRADED)
 
 
 if __name__ == "__main__":
+    # Every arm here exits EXIT_SWEEP_DEGRADED, never EXIT_ALARM: reaching
+    # this handler means the sweep aborted outright (typically on the initial
+    # open-PR list, before any PR was evaluated), so nothing is known about
+    # whether a PR is stranded. Reporting that as the stranded-PR alarm would
+    # send a human looking for a PR to review when the actual fault is that
+    # the reconciler could not talk to GitHub.
     try:
         main()
+    except RateLimitExhausted as error:
+        print("GitHub API rate limit exhausted before the sweep could run: %s" % error, file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
     except urllib.error.HTTPError as error:
         print("GitHub API request failed: %s %s" % (error.code, error.read()), file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_SWEEP_DEGRADED)
     except urllib.error.URLError as error:
         # Transport failure (DNS, TLS, connection reset, timeout). HTTPError is
         # a subclass of URLError, so this arm must come second or it would
         # shadow the status-code message above.
         print("GitHub API request failed (transport): %s" % error.reason, file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_SWEEP_DEGRADED)

@@ -6,7 +6,9 @@ is_alarming(), and ally_has_reviewed_head() are pure functions.
 Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 import unittest
 import urllib.error
@@ -513,6 +515,249 @@ class TestSweepIsolation(unittest.TestCase):
         self.assertIsNone(results[0][2], "an unevaluated PR has no pending_since to alarm on")
         self.assertFalse(results[0][3])
 
+    def test_rate_limit_aborts_the_loop_but_still_accounts_for_every_pr(self):
+        """Budget exhaustion is not isolated per-PR -- but it is not silent either.
+
+        Every remaining call would raise the identical error, so grinding
+        through them only deepens the exhaustion. The unevaluated remainder
+        must still appear in the results (as failures), or the run would
+        report a short list it never finished reading.
+        """
+        self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
+        attempted = []
+
+        def limited(owner, repo, pr, token, api_base_url, now, **kwargs):
+            attempted.append(pr["number"])
+            if pr["number"] == 2:
+                raise sweep.RateLimitExhausted("budget spent")
+            return (pr, pr["head"]["sha"], None, False, "skip: not pending")
+
+        sweep._consider_pr = limited
+
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2], "must stop calling once the budget is spent")
+        self.assertEqual([res[0]["number"] for res in results], [1, 2, 3, 4])
+        unevaluated = [res for res in results if sweep.RATE_LIMIT_TOKEN in res[4]]
+        self.assertEqual(
+            [res[0]["number"] for res in unevaluated], [2, 3, 4],
+            "the PR that hit the limit and every one after it are unevaluated",
+        )
+        for res in unevaluated:
+            self.assertTrue(res[4].startswith(sweep.SWEEP_ERROR_REASON_PREFIX),
+                            "rate-limited PRs must count as failures, or the run exits green")
+
+
+class TestSweepIsDegraded(unittest.TestCase):
+    """A run that could not evaluate its PRs must not report `alarming=0` green.
+
+    Per-PR isolation records a failure as pending_since=None, and is_alarming
+    reads None as not-alarming, so without this predicate a totally broken
+    sweep and a healthy one produce the identical green tick -- the exact
+    "silent failure that reads as health" defect being reconciled.
+    """
+
+    def test_no_failures_is_not_degraded(self):
+        self.assertFalse(sweep.sweep_is_degraded(0, 30))
+        self.assertFalse(sweep.sweep_is_degraded(0, 0))
+
+    def test_one_transient_failure_does_not_turn_the_schedule_red(self):
+        # Deliberately NOT `failed > 0`: a single 5xx against one PR is normal
+        # and must not page anyone.
+        self.assertFalse(sweep.sweep_is_degraded(1, 30))
+        self.assertFalse(sweep.sweep_is_degraded(2, 30))
+
+    def test_every_pr_failing_is_degraded(self):
+        self.assertTrue(sweep.sweep_is_degraded(30, 30))
+
+    def test_the_floor_protects_a_short_pr_list(self):
+        # With 5 open PRs, 10% is 0.5 -- one failure would read as
+        # "systematic" without the floor of 3.
+        self.assertFalse(sweep.sweep_is_degraded(1, 5))
+        self.assertFalse(sweep.sweep_is_degraded(2, 5))
+        self.assertTrue(sweep.sweep_is_degraded(3, 5))
+
+    def test_the_proportion_governs_a_long_pr_list(self):
+        self.assertFalse(sweep.sweep_is_degraded(10, 200), "10 of 200 is under the 10% bar")
+        self.assertTrue(sweep.sweep_is_degraded(20, 200))
+
+
+class TestIsRateLimitError(unittest.TestCase):
+    """403 is overloaded: budget exhaustion vs a permissions fault.
+
+    Reporting a permissions 403 as a rate limit would abort the whole sweep
+    on a fault that retrying can never fix, and would name the wrong cause in
+    the step summary.
+    """
+
+    @staticmethod
+    def _err(code, headers):
+        return urllib.error.HTTPError("https://api.github.com/x", code, "nope", headers, None)
+
+    def test_403_with_remaining_zero_is_a_rate_limit(self):
+        self.assertTrue(sweep.is_rate_limit_error(self._err(403, {"x-ratelimit-remaining": "0"})))
+
+    def test_429_with_retry_after_is_a_rate_limit(self):
+        self.assertTrue(sweep.is_rate_limit_error(self._err(429, {"retry-after": "60"})))
+
+    def test_403_permissions_fault_is_not_a_rate_limit(self):
+        # "Resource not accessible by integration" carries budget headroom.
+        self.assertFalse(sweep.is_rate_limit_error(self._err(403, {"x-ratelimit-remaining": "4821"})))
+
+    def test_403_with_no_rate_headers_at_all_is_not_a_rate_limit(self):
+        self.assertFalse(sweep.is_rate_limit_error(self._err(403, {})))
+
+    def test_404_is_never_a_rate_limit(self):
+        self.assertFalse(sweep.is_rate_limit_error(self._err(404, {"x-ratelimit-remaining": "0"})))
+
+
+class TestRequestBoundsAndClassifies(unittest.TestCase):
+    """_request is the only place every call passes through.
+
+    Two properties are pinned here because both are invisible in normal
+    operation and only bite in the failure the reconciler must survive.
+    """
+
+    def setUp(self):
+        self._real_urlopen = sweep.urllib.request.urlopen
+
+    def tearDown(self):
+        sweep.urllib.request.urlopen = self._real_urlopen
+
+    def test_every_request_carries_an_explicit_timeout(self):
+        """urlopen's default is None -- block forever.
+
+        With `cancel-in-progress: false` on the workflow, one stalled socket
+        would hang the job to the Actions 6-hour ceiling and queue every
+        subsequent 30-minute run behind it.
+        """
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise urllib.error.URLError("stop here -- we only need the kwarg")
+
+        sweep.urllib.request.urlopen = fake_urlopen
+        with self.assertRaises(urllib.error.URLError):
+            sweep._request("https://api.github.com/x", "tok")
+
+        self.assertIsNotNone(seen["timeout"], "urlopen must not be called with the default (infinite) timeout")
+        self.assertEqual(seen["timeout"], sweep.REQUEST_TIMEOUT_SECONDS)
+        self.assertGreater(seen["timeout"], 0)
+
+    def test_a_rate_limited_response_is_raised_as_rate_limit_exhausted(self):
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                "https://api.github.com/x", 403, "rate limit", {"x-ratelimit-remaining": "0"}, None
+            )
+
+        sweep.urllib.request.urlopen = fake_urlopen
+        with self.assertRaises(sweep.RateLimitExhausted):
+            sweep._request("https://api.github.com/x", "tok")
+
+    def test_a_permissions_403_stays_an_http_error(self):
+        """Aborting the whole sweep on a permissions fault would be wrong --
+        it is not transient and it is not the budget."""
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                "https://api.github.com/x", 403, "not accessible", {"x-ratelimit-remaining": "4999"}, None
+            )
+
+        sweep.urllib.request.urlopen = fake_urlopen
+        with self.assertRaises(urllib.error.HTTPError):
+            sweep._request("https://api.github.com/x", "tok")
+
+
+class TestMainExitCode(unittest.TestCase):
+    """The exit code IS the deliverable (BLO-22892 AC4).
+
+    A stranded PR and a sweep that could not run are both red, but they are
+    different reds and must not be conflated: one needs a human to review a
+    PR, the other means the PR list was never read.
+    """
+
+    def setUp(self):
+        self._real_sweep = sweep.sweep
+        self._env = {k: os.environ.get(k) for k in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_STEP_SUMMARY")}
+        os.environ["GITHUB_REPOSITORY"] = "Blockcast/paperclip"
+        os.environ["GITHUB_TOKEN"] = "t"
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+
+    def tearDown(self):
+        sweep.sweep = self._real_sweep
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _run_main_with(self, results):
+        sweep.sweep = lambda *a, **k: results
+        return self._run_main()
+
+    def _run_main(self):
+        # main() prints one line per PR; swallowed so a 30-PR fixture does not
+        # bury the real unittest output (and so a fixture's summary line
+        # cannot be misread as a real sweep's in the CI log).
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sweep.main([])
+        except SystemExit as exit_error:
+            return exit_error.code
+        return 0
+
+    def test_all_prs_failing_exits_degraded_not_green(self):
+        """The regression this class exists for.
+
+        Before: failed=30 alarming=0 exited 0, so a systematically broken
+        sweep was indistinguishable from a healthy one on the Actions tab.
+        """
+        failed = [
+            (_pr(n), "%040x" % n, None, False, "%s -- HTTPError" % sweep.SWEEP_ERROR_REASON_PREFIX)
+            for n in range(1, 31)
+        ]
+        self.assertEqual(self._run_main_with(failed), sweep.EXIT_SWEEP_DEGRADED)
+
+    def test_a_clean_sweep_exits_zero(self):
+        clean = [(_pr(n), "%040x" % n, None, False, "skip: not pending") for n in range(1, 31)]
+        self.assertEqual(self._run_main_with(clean), 0)
+
+    def test_one_transient_failure_still_exits_zero(self):
+        results = [(_pr(n), "%040x" % n, None, False, "skip: not pending") for n in range(1, 31)]
+        results[0] = (_pr(1), "%040x" % 1, None, False, "%s -- URLError" % sweep.SWEEP_ERROR_REASON_PREFIX)
+        self.assertEqual(self._run_main_with(results), 0)
+
+    def test_a_stranded_pr_exits_with_the_alarm_code(self):
+        now = 1_000_000.0
+        stranded = [(_pr(1), "%040x" % 1, now - sweep.ALARM_THRESHOLD_SECONDS - 60, False, "pending")]
+        sweep.sweep = lambda *a, **k: stranded
+        # main() computes `now` itself; the pending_since above is far enough
+        # in the past that any nearby `now` still clears the threshold.
+        stranded[0] = (_pr(1), "%040x" % 1, 0.0, False, "pending")
+        self.assertEqual(self._run_main(), sweep.EXIT_ALARM)
+
+    def test_a_stranded_pr_outranks_a_degraded_run(self):
+        """Both conditions at once must report the stranded PR.
+
+        A human can act on 'go review #N'; 'the sweep is broken' is the
+        weaker instruction when a specific PR is known to be stranded.
+        """
+        results = [
+            (_pr(n), "%040x" % n, None, False, "%s -- HTTPError" % sweep.SWEEP_ERROR_REASON_PREFIX)
+            for n in range(1, 31)
+        ]
+        results.append((_pr(99), "%040x" % 99, 0.0, False, "pending"))
+        self.assertEqual(self._run_main_with(results), sweep.EXIT_ALARM)
+
+    def test_a_draft_pr_never_alarms_even_if_its_pending_since_is_ancient(self):
+        """is_alarming reads is_draft off the payload, not a hardcoded False.
+
+        The literal was safe only via an invariant held in _consider_pr; this
+        pins the guard locally so it cannot stop guarding silently.
+        """
+        results = [(_pr(1, draft=True), "%040x" % 1, 0.0, False, "draft")]
+        self.assertEqual(self._run_main_with(results), 0)
+
 
 class TestUnreviewedSince(unittest.TestCase):
     """status-free mode dates the wait from the later of PR-open / head-commit.
@@ -550,6 +795,100 @@ class TestUnreviewedSince(unittest.TestCase):
         """Fail closed: an undateable PR must not be re-fired, not re-fired forever."""
         self.assertIsNone(sweep.unreviewed_since({}, {}))
         self.assertIsNone(sweep.unreviewed_since({"created_at": "not-a-date"}, {}))
+
+    def test_a_future_dated_head_commit_is_clamped_to_now(self):
+        """`commit.committer.date` is client-settable and may be in the future.
+
+        Unclamped, a skewed or rewritten date yields a NEGATIVE age that can
+        never reach the stall OR alarm threshold -- the PR goes permanently
+        invisible to both. That is the suppression direction this module's
+        predicate bias explicitly refuses.
+        """
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        pr = {"created_at": "2026-08-01T00:00:00Z"}
+        skewed = {"commit": {"committer": {"date": "2027-01-01T00:00:00Z"}}}
+
+        result = sweep.unreviewed_since(pr, skewed, now=now)
+
+        self.assertEqual(result, now)
+        self.assertGreaterEqual(now - result, 0, "age must never be negative")
+
+    def test_a_future_dated_head_becomes_eligible_after_the_threshold_elapses(self):
+        """Clamping suppresses nothing -- it only restarts the clock at now."""
+        opened = sweep._parse_iso("2026-08-01T00:00:00Z")
+        skewed = {"commit": {"committer": {"date": "2027-01-01T00:00:00Z"}}}
+        first_seen = sweep._parse_iso("2026-08-10T00:00:00Z")
+
+        pending_since = sweep.unreviewed_since({"created_at": "2026-08-01T00:00:00Z"}, skewed, now=first_seen)
+        later = first_seen + sweep.STALL_THRESHOLD_SECONDS + 1
+        refire, _reason = sweep.should_refire(
+            {"number": 1, "is_draft": False, "pending_since": pending_since, "existing_marker_epochs": []},
+            later,
+        )
+
+        self.assertLess(opened, first_seen)
+        self.assertTrue(refire, "a future-dated head must still become eligible with real elapsed time")
+
+    def test_a_future_dated_pr_creation_is_clamped_too(self):
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        self.assertEqual(sweep.unreviewed_since({"created_at": "2027-01-01T00:00:00Z"}, {}, now=now), now)
+
+
+class TestTooYoungToBeStranded(unittest.TestCase):
+    """The list payload alone can prove a PR needs no per-PR fetches.
+
+    This is a call-volume guard, not a correctness one: at ~3 requests per
+    non-draft PR and 108 of them, the sweep runs at ~700 requests/hour
+    against github.token's 1,000/hour/repository budget, shared with every
+    other workflow. It must never change a verdict, only skip work that
+    cannot change one.
+    """
+
+    def setUp(self):
+        self._real_mode = sweep.PREDICATE_MODE
+        sweep.PREDICATE_MODE = "status-free"
+
+    def tearDown(self):
+        sweep.PREDICATE_MODE = self._real_mode
+
+    def test_a_pr_opened_within_the_threshold_is_too_young(self):
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        pr = {"created_at": "2026-08-09T23:30:00Z"}  # 30 minutes < 90m stall
+        self.assertTrue(sweep.too_young_to_be_stranded(pr, now))
+
+    def test_an_older_pr_must_still_be_fetched(self):
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        pr = {"created_at": "2026-08-01T00:00:00Z"}
+        self.assertFalse(sweep.too_young_to_be_stranded(pr, now))
+
+    def test_the_filter_is_sound_because_pending_since_is_bounded_below_by_created_at(self):
+        """The proof the shortcut rests on, pinned as a test.
+
+        unreviewed_since returns max(created_at, committer_date) clamped to
+        now, so pending_since >= created_at for every input -- hence
+        now - pending_since <= now - created_at, and a PR younger than the
+        stall threshold cannot clear it however old its head commit claims
+        to be.
+        """
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        pr = {"created_at": "2026-08-09T23:30:00Z"}
+        for commit_date in ("2020-01-01T00:00:00Z", "2026-08-09T23:59:00Z", "2027-01-01T00:00:00Z"):
+            pending_since = sweep.unreviewed_since(pr, {"commit": {"committer": {"date": commit_date}}}, now=now)
+            self.assertGreaterEqual(pending_since, sweep._parse_iso(pr["created_at"]))
+            self.assertLess(now - pending_since, sweep.STALL_THRESHOLD_SECONDS)
+
+    def test_status_mode_never_uses_the_shortcut(self):
+        """In status mode pending_since comes from a commit status, which is
+        NOT bounded below by the PR's creation date, so the inequality the
+        filter rests on does not hold and it would be unsound."""
+        sweep.PREDICATE_MODE = "status"
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        self.assertFalse(sweep.too_young_to_be_stranded({"created_at": "2026-08-09T23:59:00Z"}, now))
+
+    def test_an_unparseable_creation_date_is_never_shortcut(self):
+        now = sweep._parse_iso("2026-08-10T00:00:00Z")
+        self.assertFalse(sweep.too_young_to_be_stranded({"created_at": "not-a-date"}, now))
+        self.assertFalse(sweep.too_young_to_be_stranded({}, now))
 
 
 class TestRefireBudget(unittest.TestCase):

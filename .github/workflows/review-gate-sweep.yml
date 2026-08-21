@@ -35,11 +35,28 @@ name: review-gate-sweep
 
 on:
   schedule:
-    # Every 30 minutes. Off the hour/half-hour to avoid clustering with every
-    # other cron in the org hitting the runner pool at :00/:30. Offset from
-    # trafficcontrol (7,37) and pim-multicast-gateway (8,38) so the three
-    # repos' sweeps do not fire their reviewer re-requests at Ally at once.
-    - cron: '9,39 * * * *'
+    # Hourly, NOT every 30 minutes, and that is a rate-limit decision.
+    #
+    # In status-free mode each non-draft PR costs 3 requests (head commit +
+    # comments page + reviews page). Measured 2026-08-21 on this repo: 147
+    # open PRs, 119 non-draft and unlocked -> ~359 requests per run. At
+    # `9,39` that is ~718/hour from this job alone, against `github.token`'s
+    # documented 1,000/hour/repository budget shared with the 26 other
+    # workflows here -- exhaustion would be the steady state, not an edge
+    # case. Hourly halves it to ~359/hour and leaves real headroom.
+    #
+    # The cheap predicate-level cut (skipping PRs younger than the stall
+    # threshold, which cannot be stranded) was measured too and saves only
+    # 3 of those 359 calls on this repo -- almost every open PR here is
+    # older than 90 minutes. It is kept because it is free and correct, but
+    # cadence is the lever that actually moves the number.
+    #
+    # ALARM_THRESHOLD_SECONDS is raised to 5.5h in the script to absorb the
+    # coarser polling granularity -- see the comment on that constant. Off
+    # the hour to avoid clustering with every other cron in the org, and
+    # offset from trafficcontrol (7,37) and pim-multicast-gateway (8,38) so
+    # the repos' sweeps do not fire their re-requests at Ally at once.
+    - cron: '9 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -58,6 +75,14 @@ jobs:
   sweep:
     name: Sweep stalled Ally reviews
     runs-on: default
+    # Bounded so one hung API call cannot hold the job to the Actions 6-hour
+    # ceiling. That matters more here than on a normal job: with
+    # `cancel-in-progress: false` above, every subsequent 30-minute run queues
+    # behind a hung one, so a single stalled socket becomes a multi-hour
+    # reconciler outage. Matches the sibling `ally-review-consistency.yml`
+    # (10m); slightly higher because this sweep makes one request per open PR.
+    # The script also bounds each individual request (REQUEST_TIMEOUT_SECONDS).
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v5
