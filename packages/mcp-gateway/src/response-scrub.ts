@@ -289,9 +289,23 @@ const COMMENT_LINE = /^\s*#/;
  * Keys that may pass through an env block untouched: the variable's `name` (the
  * diagnostic the grant exists for) and `valueFrom`, which names a source
  * without carrying it.
+ *
+ * Declared once, exact-case, and consumed by *both* scanners — the YAML
+ * patterns immediately below are built from these literals, and the JSON
+ * `scrubEnvVarObject` compares against them directly. A shared constant matched
+ * under two different rules (one case-sensitive regex, one `toLowerCase()`
+ * comparison) is still two rules, and the laxer one becomes the fail-open.
  */
-const NAME_KEY = /^(\s*)(-\s+)?(["']?)name\3:(.*)$/;
-const VALUE_FROM_KEY = /^(\s*)(-\s+)?(["']?)valueFrom\3:(.*)$/;
+const ENV_NAME_KEY = "name";
+const ENV_VALUE_FROM_KEY = "valueFrom";
+
+/** Build the YAML in-block pattern for a pass-through key, exact-case. */
+function envBlockKeyPattern(key: string): RegExp {
+  return new RegExp(`^(\\s*)(-\\s+)?(["']?)${key}\\3:(.*)$`);
+}
+
+const NAME_KEY = envBlockKeyPattern(ENV_NAME_KEY);
+const VALUE_FROM_KEY = envBlockKeyPattern(ENV_VALUE_FROM_KEY);
 /**
  * The keys a `valueFrom` subtree may legally contain — the four `EnvVarSource`
  * selectors and their scalar leaves. Enumerating them is not the denylist this
@@ -829,11 +843,20 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
 /**
  * Redact one `EnvVar` object on the JSON path, default-deny.
  *
- * THE RULE: `name` passes, `valueFrom` is classified by `scrubEnvVarSource`,
- * and **every other key is redacted** — including `value`, whatever its case or
- * spelling. This mirrors the YAML in-block scanner exactly, which is the point:
- * the two paths must agree on the *default direction*, not merely on a list of
- * recognized keys.
+ * THE RULE: exact-case `name` passes, exact-case `valueFrom` is classified by
+ * `scrubEnvVarSource`, and **every other key is redacted** — including `value`,
+ * and including any other case or spelling of the two that do pass. This mirrors
+ * the YAML in-block scanner exactly, which is the point: the two paths must
+ * agree on the *default direction*, not merely on a list of recognized keys.
+ *
+ * The comparison is exact-case because the YAML `NAME_KEY`/`VALUE_FROM_KEY`
+ * patterns are. Matching case-INsensitively here reopened this very
+ * disagreement one key over: `{"name":"X","Name":"<secret>"}` took the
+ * pass-through branch on JSON and the in-block default-deny on YAML. `EnvVar` is
+ * closed by the schema to exact-case `name`/`value`/`valueFrom`, so a wrong-case
+ * key is an upstream shape change or smuggling — the case that must fail closed.
+ * Widening the three YAML patterns with `i` would also remove the disagreement,
+ * but by growing the pass-through set rather than shrinking it.
  *
  * What this replaced was `if (!("value" in envVar)) return envVar` — an
  * exact-spelling, exact-case membership test whose miss branch was
@@ -854,12 +877,11 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
 function scrubEnvVarObject(envVar: Record<string, unknown>, ctx: ScrubContext): unknown {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(envVar)) {
-    const lowered = key.toLowerCase();
-    if (lowered === "name") {
+    if (key === ENV_NAME_KEY) {
       result[key] = value;
       continue;
     }
-    if (lowered === "valuefrom" && value && typeof value === "object") {
+    if (key === ENV_VALUE_FROM_KEY && value && typeof value === "object") {
       result[key] = scrubEnvVarSource(value, ctx);
       continue;
     }
@@ -885,7 +907,10 @@ function scrubEnvVarSource(node: unknown, ctx: ScrubContext): unknown {
   if (!node || typeof node !== "object") return node;
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    const allowed = ENV_VAR_SOURCE_KEYS.some((k) => k.toLowerCase() === key.toLowerCase());
+    // Exact-case, matching `REF_SUBTREE_KEY` on the YAML path. Comparing
+    // case-insensitively here preserved `valueFrom: { SecretKeyRef: … }` whole
+    // on JSON — carrying whatever sat on its leaves — while YAML redacted it.
+    const allowed = (ENV_VAR_SOURCE_KEYS as readonly string[]).includes(key);
     if (!allowed) {
       result[key] = REDACTED;
       ctx.changed = true;
@@ -996,11 +1021,13 @@ function scrubJsonValueTracked(
       result[key] = Object.fromEntries(
         entries.map(([name, inner]) => [
           name,
-          // A nested object here is a `valueFrom`-shaped reference, which names a
-          // source without carrying it; anything scalar is the material itself.
-          inner && typeof inner === "object"
-            ? scrubJsonValueTracked(inner, ctx, nowSecret, inContainers)
-            : REDACTED,
+          // A nested object here is a `valueFrom`-shaped reference — which is a
+          // claim to CHECK, not to trust. Routing it through the same
+          // `scrubEnvVarSource` the list branch uses keeps this branch
+          // default-deny too; handing it to the generic recursion instead left
+          // the mapping branch default-ALLOW, so `{"env":{"K":{"sneak":"…"}}}`
+          // came back verbatim. Anything scalar is the material itself.
+          inner && typeof inner === "object" ? scrubEnvVarSource(inner, ctx) : REDACTED,
         ]),
       );
       if (entries.some(([, inner]) => !inner || typeof inner !== "object")) ctx.changed = true;

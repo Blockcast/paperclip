@@ -1406,6 +1406,115 @@ describe("the two paths must agree on what an env ENTRY is", () => {
     expect(out).toContain('"resource":"limits.cpu"');
     expect(out).toContain('"optional":true');
   });
+
+  /**
+   * The same disagreement, one key over.
+   *
+   * The loop above varies only the *value*-key spelling, so it proves the two
+   * paths agree about `value` — not that they agree about what an env entry
+   * *is*, which is what this block claims. They did not: the JSON path matched
+   * `name`/`valueFrom` case-INsensitively (`key.toLowerCase() === "name"`) while
+   * the YAML `NAME_KEY`/`VALUE_FROM_KEY` patterns carried no `i` flag. So a
+   * wrong-case `Name` took the JSON pass-through branch and was emitted in the
+   * clear, while the YAML in-block default-deny redacted it.
+   *
+   * `EnvVar` is closed by the schema to exact-case `name`/`value`/`valueFrom`,
+   * so a wrong-case key is an upstream shape change or an attempt to smuggle
+   * material past the scanner — by this module's own argument, the case that
+   * must fail CLOSED. Fixed by comparing exact-case on the JSON path, which
+   * narrows the pass-through set rather than widening it.
+   */
+  for (const key of ["Name", "NAME"]) {
+    it(`redacts an env entry whose extra key is ${JSON.stringify(key)} — JSON path`, () => {
+      // The canonical `name` is present and carries the diagnostic; the
+      // wrong-case sibling is the smuggled one.
+      const out = JSON.stringify(scrubJsonValue({ env: [{ name: "OPENAI_API_KEY", [key]: LEAK }] }));
+
+      expectNoLeak(out);
+      expect(out).toContain("OPENAI_API_KEY");
+    });
+
+    it(`redacts an env entry whose extra key is ${JSON.stringify(key)} — YAML path`, () => {
+      const out = scrubYamlText(
+        `    env:\n    - name: OPENAI_API_KEY\n      ${key}: ${LEAK}\n`,
+      );
+
+      expectNoLeak(out);
+      expect(out).toContain("OPENAI_API_KEY");
+    });
+  }
+
+  it("does not accept a wrong-case ValueFrom as a reference — both paths", () => {
+    // A wrong-case `ValueFrom` was routed into the selector allowlist by the
+    // JSON path, so material parked on an allowlisted leaf (`key`) survived;
+    // the YAML path never matched `VALUE_FROM_KEY` and default-denied the block.
+    const json = JSON.stringify(
+      scrubJsonValue({ env: [{ name: "A", ValueFrom: { secretKeyRef: { name: "s", key: LEAK } } }] }),
+    );
+    const yaml = scrubYamlText(
+      `    env:\n    - name: A\n      ValueFrom:\n        secretKeyRef:\n          name: s\n          key: ${LEAK}\n`,
+    );
+
+    expectNoLeak(json);
+    expectNoLeak(yaml);
+  });
+
+  it("classifies a valueFrom subtree case-sensitively — both paths", () => {
+    // One level down, the same split: `scrubEnvVarSource` compared
+    // `k.toLowerCase() === key.toLowerCase()` while `REF_SUBTREE_KEY` was
+    // case-sensitive, so `SecretKeyRef` was preserved whole on JSON — carrying
+    // whatever sat on its leaves — and redacted on YAML.
+    const json = JSON.stringify(
+      scrubJsonValue({ env: [{ name: "A", valueFrom: { SecretKeyRef: { name: "s", key: LEAK } } }] }),
+    );
+    const yaml = scrubYamlText(
+      `    env:\n    - name: A\n      valueFrom:\n        SecretKeyRef:\n          name: s\n          key: ${LEAK}\n`,
+    );
+
+    expectNoLeak(json);
+    expectNoLeak(yaml);
+  });
+
+  /**
+   * The env-as-MAPPING branch was still default-allow for nested objects.
+   *
+   * The list branch routes each entry through `scrubEnvVarObject`, but its
+   * sibling mapping branch handed a nested object to the generic
+   * `scrubJsonValueTracked` recursion — which carries no "inside an env block"
+   * state. Its own comment asserted "a nested object here is a `valueFrom`-shaped
+   * reference", which is exactly the claim `scrubEnvVarSource` exists to CHECK
+   * rather than assume. So the JSON env path was not uniformly default-deny
+   * after the entry-level fix: one branch of it still trusted the shape.
+   */
+  it("classifies a nested object in an env MAPPING rather than trusting it", () => {
+    const out = JSON.stringify(scrubJsonValue({ env: { OPENAI_API_KEY: { sneak: LEAK } } }));
+
+    expectNoLeak(out);
+    expect(out).toContain("OPENAI_API_KEY");
+  });
+
+  it("keeps a legitimate reference in an env MAPPING — no over-redaction", () => {
+    // The mirror: the mapping branch must classify, not blanket-redact, or the
+    // fix trades a fail-open for a lost diagnostic.
+    const out = JSON.stringify(
+      scrubJsonValue({ env: { FROM_SECRET: { secretKeyRef: { name: "app-credentials", key: "token" } } } }),
+    );
+
+    expect(out).toContain('"name":"app-credentials"');
+    expect(out).toContain('"key":"token"');
+    expect(out).not.toContain(REDACTED);
+  });
+
+  it("redacts a scalar valueFrom — the object guard's fail-closed edge", () => {
+    // `valueFrom` passes only when it is an object to classify; a scalar one is
+    // material wearing a reference's name, and falls through to redaction. That
+    // is already correct — this asserts it, because it is a fail-closed edge a
+    // future refactor could silently invert (nothing else covers it).
+    const out = JSON.stringify(scrubJsonValue({ env: [{ name: "A", valueFrom: LEAK }] }));
+
+    expectNoLeak(out);
+    expect(out).toContain('"name":"A"');
+  });
 });
 
 /**
