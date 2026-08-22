@@ -240,10 +240,11 @@ export function evaluateCommentReviewGate(input: {
  * A green status published under a `review/`-prefixed context reads as "this
  * head was reviewed and was clean". For the `not_evaluated` outcome that
  * reading is false, and no state can fix it: `pending`/`failure` on absence
- * would deadlock every formally-reviewed PR. The only remedy is to publish
- * outside the `review/` namespace, which is a branch-protection-coupled
- * change. Until then this predicate names the condition so it can be asserted
- * against and logged rather than silently shipped (BLO-29711).
+ * would deadlock every formally-reviewed PR. The remedy is to publish outside
+ * the `review/` namespace — done for the Blockcast deployment, whose live
+ * context is now `gate/ally-comment-findings`. This predicate stays as the
+ * assertion point so a future config change cannot silently move the gate back
+ * under `review/` (BLO-29711).
  */
 export function commentReviewGateVerdictIsMisreadable(
   verdict: CommentReviewGateVerdict,
@@ -254,6 +255,52 @@ export function commentReviewGateVerdictIsMisreadable(
     verdict.state === "success" &&
     context.trim().toLowerCase().startsWith("review/")
   );
+}
+
+/**
+ * Contexts to supersede with a retirement pointer, given the live context.
+ *
+ * The live context is excluded even if an operator also lists it as retired:
+ * writing a retirement pointer over the verdict we just published would
+ * replace a real `failure` with a green, which is the exact fail-open this
+ * issue exists to remove.
+ */
+export function retiredCommentReviewGateContexts(
+  retired: readonly string[] | null | undefined,
+  liveContext: string,
+): string[] {
+  const live = liveContext.trim().toLowerCase();
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of retired ?? []) {
+    const context = raw?.trim();
+    if (!context) continue;
+    const key = context.toLowerCase();
+    if (key === live || seen.has(key)) continue;
+    seen.add(key);
+    result.push(context);
+  }
+  return result;
+}
+
+// GitHub truncates commit-status descriptions at 140 characters. The pointer to
+// the live context is the entire value of a retirement write, so fall back to a
+// shorter phrasing rather than letting the context name be cut in half.
+const MAX_COMMIT_STATUS_DESCRIPTION = 140;
+
+/**
+ * Description for a superseded context. Deliberately carries no claim about
+ * whether anything reviewed the head — that claim under a `review/`-prefixed
+ * green is the defect (BLO-29711) — only a pointer to where the verdict now
+ * lives. `scripts/check-comment-review-gate-census.mjs` flags a green `review/`
+ * status whose description admits nothing was evaluated; this text must not
+ * match that pattern.
+ */
+export function commentReviewGateRetirementDescription(liveContext: string): string {
+  const target = liveContext.trim();
+  const full = `Retired. Comment-shaped review findings now publish to "${target}".`;
+  if (full.length <= MAX_COMMIT_STATUS_DESCRIPTION) return full;
+  return `Retired. Findings now publish to "${target}".`.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
 }
 
 export type PrCommentReviewGateCheckResult =
@@ -392,5 +439,69 @@ async function executeCommentReviewGateCheck(
   );
   if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
 
+  await supersedeRetiredContexts(input, headSha, context, config);
+
   return { posted: true, verdict };
+}
+
+/**
+ * Overwrite each retired context with a pointer to the live one.
+ *
+ * Why this is code in the gate rather than a one-shot sweep. GitHub's Commit
+ * Statuses API has create and list but no delete, so renaming the context
+ * cannot retract what was already written under the old name: every head that
+ * carries the old fail-open green keeps carrying it. Measured 2026-08-22, 42 of
+ * 43 open PRs in Blockcast/penstock-llm-proxy-core were in exactly that state.
+ * Only the credential that wrote those rows can overwrite them — the App's own
+ * installation token, the one used here — so an operator script cannot do it.
+ * Riding the gate's existing evaluations reaches each PR the next time it is
+ * evaluated, with no sweep and no human chore.
+ *
+ * State stays `success`. `failure`/`error` would paint every affected PR red on
+ * a context that is no longer the real signal, and `pending` would leave a
+ * permanent yellow; both are misleading about a context that is merely retired.
+ * Only the description changes, and it makes no claim about review. Continuing
+ * to write the old context also means the rename cannot deadlock a repo that
+ * still requires it.
+ *
+ * Best-effort by construction: the live verdict is already published, and
+ * failing the check over cleanup of a superseded row would let a retired
+ * context break the live one.
+ */
+async function supersedeRetiredContexts(
+  input: PrCommentReviewGateCheckInput,
+  headSha: string,
+  liveContext: string,
+  config: ReturnType<typeof loadConfig>,
+): Promise<void> {
+  const retiredContexts = retiredCommentReviewGateContexts(
+    config.prCommentReviewGateRetiredStatusContexts,
+    liveContext,
+  );
+  if (retiredContexts.length === 0) return;
+
+  const description = commentReviewGateRetirementDescription(liveContext);
+  await Promise.all(
+    retiredContexts.map(async (retiredContext) => {
+      const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
+        () =>
+          githubPostCommitStatusDetailed({
+            repoFullName: input.repoFullName,
+            sha: headSha,
+            context: retiredContext,
+            state: "success",
+            description,
+            targetUrl: input.prUrl ?? null,
+          }),
+        (attempt) => !attempt.ok && attempt.retryable,
+      );
+      if (!result.ok) {
+        console.warn(
+          `[pr-comment-review-gate] Could not supersede retired context "${retiredContext}" on ` +
+            `${input.repoFullName}@${headSha.slice(0, 7)}: ${result.reason}. The stale row stands; ` +
+            "the live verdict was published and is unaffected.",
+        );
+      }
+    }),
+  );
 }

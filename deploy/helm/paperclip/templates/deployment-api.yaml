@@ -266,6 +266,10 @@ spec:
             - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT
               value: {{ . | quote }}
             {{- end }}
+            {{- with ((.Values.githubApp).prCommentReviewGateRetiredStatusContexts) }}
+            - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.env.extra }}
             {{- toYaml . | nindent 12 }}

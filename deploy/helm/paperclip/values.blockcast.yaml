@@ -413,7 +413,23 @@ githubApp:
   # contexts it has observed recently, and this repo has never carried a commit
   # status, so the context has to be posted at least once before a human can
   # select it. Until then this is observe-only.
-  prCommentReviewGateStatusContext: "review/ally-comment"
+  #
+  # Deliberately NOT under `review/` (BLO-29711). This gate reads only the
+  # comment-shaped surface, so "nothing attests this head" is a legitimate and
+  # common outcome for a formally-reviewed PR, and it must stay green there or
+  # every such PR deadlocks. A green under `review/` reads as review evidence,
+  # which this gate cannot supply — so the fail-open and the namespace cannot
+  # coexist. Moving the namespace is the half that is safe to change.
+  # Verified before renaming: `review/ally-comment` was not a required check on
+  # paperclip `master` (required: `verify`) nor on penstock-llm-proxy-core
+  # `main` (required: validate-and-build, secret-scan, redaction-tests,
+  # secrets-controls-static-check, review/ally-complete), so this drops nothing.
+  prCommentReviewGateStatusContext: "gate/ally-comment-findings"
+  # Supersede the pre-rename context in place. Commit statuses have no delete,
+  # so every head already stamped `review/ally-comment` keeps showing that green
+  # forever — 42 of 43 open penstock PRs as of 2026-08-22. Listing it here makes
+  # the gate overwrite it with a retirement pointer on each evaluation.
+  prCommentReviewGateRetiredStatusContexts: "review/ally-comment"
   # NOTE: `prReviewGateStatusContext` is intentionally left unset here. Its only
   # writer posts state=failure (reviewer chain exhausted / ended ambiguously) —
   # nothing in the server ever posts success for it, and no workflow or script
