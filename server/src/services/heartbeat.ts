@@ -11404,7 +11404,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           entityId: claimed.id,
           details: {
             identifier: claimed.identifier,
+            // Two distinct timelines, and the clamp above is exactly what pulls
+            // them apart on the coalesce path: `nextCheckAt` is when this
+            // MONITOR next checks, while `parkRetryAt` is when the parked run is
+            // actually due. An operator reading only the clamped value cannot
+            // tell when the work resumes, and the pre-clamp value is what makes
+            // a past-instant re-arm visible in the log rather than only in the DB.
             nextCheckAt: retryAt.toISOString(),
+            parkRetryAt: rawDeferredRetryAt?.toISOString() ?? null,
             previousCheckAt: scheduledAtIso,
             monitorAttemptCount: nextAttemptCount,
             ...monitorMetadata,

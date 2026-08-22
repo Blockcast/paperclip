@@ -821,7 +821,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // comment claims boundedness. Master terminated here (the triggered patch nulls
   // the column), so deferring unconditionally would be a REGRESSION, not a fix.
   it("terminates instead of deferring when the monitor policy has drifted away (BLO-22048)", async () => {
-    const { companyId, issueId, nextCheckAt } = await seedFixture();
+    const { companyId, issueId } = await seedFixture();
 
     // Drift the row: keep the column armed, drop the policy monitor. This is the
     // shape a whole-object executionPolicy overwrite leaves behind.
@@ -846,9 +846,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // Forward progress is the property under test: the row must not be left
     // re-claimable at the SAME past instant with the SAME attempt count, because
     // that combination is what cannot terminate. Consuming the column is how this
-    // drift state has always terminated.
+    // drift state has always terminated. Both halves are asserted — the attempt
+    // count matters independently, since a frozen count is what starves
+    // `exhaustedMonitorClearReason` even once the column has been cleared.
     expect(drifted.monitorNextCheckAt).toBeNull();
-    expect(drifted.monitorNextCheckAt?.toISOString()).not.toBe(nextCheckAt.toISOString());
+    expect(drifted.monitorAttemptCount).toBe(1);
   });
 
   // BLO-22048 (boundary, pre-fix history): before the fix the monitor was
