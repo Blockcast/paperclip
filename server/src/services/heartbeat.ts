@@ -797,8 +797,30 @@ export const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
 // Lineage-stable origin for the age ceiling. `createdAt` is NOT usable on its own:
 // the churn path inserts a brand-new row, so a per-row createdAt resets alongside the
 // attempt counter. The first park stamps `depBlockedFirstParkedAt` into the context
-// snapshot and every subsequent re-park carries it forward; rows predating this field
-// fall back to their own createdAt, which is correct for a row that has never churned.
+// snapshot; rows predating this field fall back to their own createdAt. Note what that
+// means on the deploy that ships this: the cohort it was written for (measured
+// 2026-08-20: 87 of 112 rows at attempt > 20) has ALREADY churned, so each one has a
+// createdAt from its most recent re-park and gets up to a fresh full age budget rather
+// than terminating promptly. A one-time cost, but do not read the resulting slow start
+// on `dep_blocked_age_expired` as evidence there is no churn leak.
+//
+// HOW FAR THE CARRY ACTUALLY REACHES — read this before relying on the bound:
+//   - blocker-SET churn (`enqueueWakeup`, the `!setsMatch` branch): carried. The origin
+//     is read before `cancelDepBlockedScheduledRetry` and re-stamped on the replacement.
+//   - `blockedInteractionWake` (`enqueueWakeup`, ~L28204): NOT carried. That branch
+//     cancels the park inline and clears `issues.executionRunId`, and the re-park is
+//     suppressed in the same call by `&& !blockedInteractionWake`. On a later wake both
+//     `activeExecutionRun` and the in-memory carry are null, so a fresh origin is
+//     stamped. An issue taking interaction wakes more often than
+//     DEP_BLOCKED_MAX_PARK_AGE_MS therefore keeps this ceiling out of reach.
+//   - `cancelStaleScheduledRetry`: NOT carried, and that is arguably correct — a
+//     reassignment ends the episode. Left deliberately unchanged.
+//
+// So this bound closes the churn leak but is not unconditional. Closing the interaction
+// -wake hole needs state that survives across calls (the origin does survive on the
+// CANCELLED run's contextSnapshot, so it is recoverable without a migration); tracked
+// separately rather than asserted away here. Corollary for anyone reading the metric:
+// `dep_blocked_age_expired == 0` does NOT mean no unbounded parks exist.
 export function readDepBlockedFirstParkedAt(run: {
   contextSnapshot: unknown;
   createdAt: Date;
@@ -14946,8 +14968,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
           // Age ceiling is evaluated BEFORE the attempt ceiling and independently of
           // it (BLO-29055). A blocker-set change resets `scheduledRetryAttempt` to 0,
-          // so an attempt-only bound can be evaded indefinitely by churn; the age is
-          // carried across those re-parks and cannot be.
+          // so an attempt-only bound can be evaded indefinitely by churn; the age
+          // origin is carried across those re-parks, so churn cannot reset it.
+          // It is NOT carried across the `blockedInteractionWake` cancel — see the
+          // carry-reach notes on readDepBlockedFirstParkedAt. This bound closes the
+          // churn leak; it is not unconditional.
           const firstParkedAt = readDepBlockedFirstParkedAt(dueRun);
           const parkAgeMs = now.getTime() - firstParkedAt.getTime();
           if (parkAgeMs > DEP_BLOCKED_MAX_PARK_AGE_MS) {
