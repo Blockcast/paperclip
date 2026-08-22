@@ -527,6 +527,9 @@ const QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS = 1_000;
  * convention used by execution-workspaces / issue-tree-control / routines.
  */
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+const PIPELINE_STAGE_EXIT_ERROR_CODE = "pipeline_stage_exited";
+const PIPELINE_STAGE_EXIT_CANCELLATION_REASON =
+  "Cancelled because the pipeline case left the automation issue's originating stage";
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -9357,6 +9360,54 @@ export function normalizeSessionParams(params: Record<string, unknown> | null | 
 
 type RunSessionOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
+type PersistedRunTerminalDecision = {
+  outcome: RunSessionOutcome;
+  wakeupStatus: "completed" | RunSessionOutcome;
+  error: string | null;
+  errorCode: string | null;
+  pipelineStageExited: boolean;
+};
+
+function isPersistedPipelineStageExitRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "errorCode" | "resultJson"> | null | undefined,
+) {
+  if (!run) return false;
+  if (run.errorCode === PIPELINE_STAGE_EXIT_ERROR_CODE) return true;
+  return typeof parseObject(run.resultJson).pipelineStageExitCancellationRequestedAt === "string";
+}
+
+function persistedRunTerminalDecision(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "error" | "errorCode" | "resultJson"> | null | undefined,
+  fallback: RunSessionOutcome,
+): PersistedRunTerminalDecision {
+  const pipelineStageExited = isPersistedPipelineStageExitRun(run);
+  if (pipelineStageExited) {
+    return {
+      outcome: "cancelled",
+      wakeupStatus: "cancelled",
+      error: run?.error ?? PIPELINE_STAGE_EXIT_CANCELLATION_REASON,
+      errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE,
+      pipelineStageExited: true,
+    };
+  }
+  const persistedStatus = run?.status;
+  const outcome: RunSessionOutcome =
+    persistedStatus === "succeeded" ||
+    persistedStatus === "interrupted" ||
+    persistedStatus === "failed" ||
+    persistedStatus === "cancelled" ||
+    persistedStatus === "timed_out"
+      ? persistedStatus
+      : fallback;
+  return {
+    outcome,
+    wakeupStatus: outcome === "succeeded" ? "completed" : outcome,
+    error: run?.error ?? null,
+    errorCode: run?.errorCode ?? null,
+    pipelineStageExited: false,
+  };
+}
+
 export function isConfirmedAdapterTimeout(
   result: Pick<AdapterExecutionResult, "timedOut" | "exitCode">,
 ): boolean {
@@ -12693,6 +12744,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
   ) {
+    // Pipeline retirement records cancellation intent while holding the issue
+    // lock. A natural adapter completion may race that marker; terminalization
+    // must give the persisted stage-exit decision precedence rather than erase
+    // it with adapter output.
+    const hasResultJsonPatch = Object.prototype.hasOwnProperty.call(patch ?? {}, "resultJson");
+    const resultJsonPatchParam = hasResultJsonPatch
+      ? JSON.stringify(patch?.resultJson ?? null)
+      : null;
+    const normalResultJson = hasResultJsonPatch
+      ? sql`${resultJsonPatchParam}::jsonb`
+      : sql`${heartbeatRuns.resultJson}`;
+    const stageExitResultJson = hasResultJsonPatch
+      ? sql`coalesce(${resultJsonPatchParam}::jsonb, '{}'::jsonb)`
+      : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)`;
+    const statusPatch =
+      expectedStatus === "running"
+        ? {
+            status: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then 'cancelled'
+              else ${status}
+            end`,
+            ...patch,
+            error: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then ${PIPELINE_STAGE_EXIT_CANCELLATION_REASON}
+              else ${patch?.error ?? null}
+            end`,
+            errorCode: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then ${PIPELINE_STAGE_EXIT_ERROR_CODE}
+              else ${patch?.errorCode ?? null}
+            end`,
+            resultJson: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then ${stageExitResultJson} || jsonb_build_object(
+                  'pipelineStageExitCancellationRequestedAt',
+                  ${heartbeatRuns.resultJson} -> 'pipelineStageExitCancellationRequestedAt',
+                  'stopReason', 'cancelled',
+                  'timeoutFired', false
+                )
+              else ${normalResultJson}
+            end`,
+          }
+        : { status, ...patch };
     // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
     // finalize UPDATE is idempotent (status set-by-id, gated on the expected
     // current status) so replaying it on a transient failure is safe.
@@ -12703,7 +12799,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         () =>
           db
             .update(heartbeatRuns)
-            .set({ status, ...patch, updatedAt: new Date() })
+            .set({ ...statusPatch, updatedAt: new Date() })
             .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
             .returning()
             .then((rows) => rows[0] ?? null),
@@ -13820,27 +13916,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
-    const existingRetry = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
-      .orderBy(asc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (existingRetry) {
+    if (isPersistedPipelineStageExitRun(run)) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        message: "Process-loss retry suppressed because pipeline stage exit already cancelled this run",
         payload: {
-          retryRunId: existingRetry.id,
-          retryRunStatus: existingRetry.status,
+          errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE,
         },
       });
-      return existingRetry;
+      return null;
     }
-
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -13860,6 +13947,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because the run has no open issue",
+      });
+      return null;
+    }
+    if (!UUID_PATTERN.test(issueId)) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because the run issue id is malformed",
+      });
+      return null;
+    }
     const retryReason = readNonEmptyString(contextSnapshot.wakeReason) === "issue_monitor_due"
       ? "issue_continuation_needed"
       : "process_lost";
@@ -13873,20 +13978,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
-    const queued = await db.transaction(async (tx) => {
-      // Transactions touching both ownership rows always lock issue before run.
-      if (issueId) {
-        await tx
-          .select({ id: issues.id })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
-          .for("update");
-      }
-      await tx
-        .select({ id: heartbeatRuns.id })
+    const claim = await db.transaction(async (tx) => {
+      // Keep the issue-before-run locking order used by the dispatcher. Once
+      // both ownership rows are locked, stage exit cannot race a retry claim.
+      const issue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .limit(1)
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const sourceRun = await tx
+        .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
-        .for("update");
+        .limit(1)
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!sourceRun || isPersistedPipelineStageExitRun(sourceRun)) {
+        return { kind: "pipeline_stage_exited" as const };
+      }
+      if (
+        !issue ||
+        TERMINAL_ISSUE_STATUSES.has(issue.status) ||
+        issue.executionRunId !== sourceRun.id
+      ) {
+        return {
+          kind: "issue_not_open" as const,
+          issueStatus: issue?.status ?? null,
+          executionRunId: issue?.executionRunId ?? null,
+        };
+      }
+
+      const existingRetry = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, sourceRun.id)))
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existingRetry) return { kind: "existing" as const, retryRun: existingRetry };
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -13920,8 +14055,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: retryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: sessionBefore,
-          retryOfRunId: run.id,
-          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          retryOfRunId: sourceRun.id,
+          processLossRetryCount: (sourceRun.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
         })
         .returning()
@@ -13938,26 +14073,70 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx
         .update(heartbeatRuns)
         .set({
-          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          processLossRetryCount: (sourceRun.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
         })
-        .where(eq(heartbeatRuns.id, run.id));
+        .where(eq(heartbeatRuns.id, sourceRun.id));
 
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({
-            checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
-      }
+      // Queued retries do not own the execution lock; the dispatcher claims it
+      // when the retry actually starts. This also releases the exiting run's
+      // ownership without letting it be repointed after the stage-exit check.
+      await tx
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issues.id, issueId),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, sourceRun.id),
+        ));
 
-      return retryRun;
+      return { kind: "queued" as const, retryRun };
     });
+
+    if (claim.kind === "pipeline_stage_exited") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because pipeline stage exit won the terminal transition",
+        payload: { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE },
+      });
+      return null;
+    }
+    if (claim.kind === "issue_not_open") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because the source issue is no longer open and owned by this run",
+        payload: {
+          issueId,
+          issueStatus: claim.issueStatus,
+          executionRunId: claim.executionRunId,
+        },
+      });
+      return null;
+    }
+    if (claim.kind === "existing") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        payload: {
+          retryRunId: claim.retryRun.id,
+          retryRunStatus: claim.retryRun.status,
+        },
+      });
+      return claim.retryRun;
+    }
+    const queued = claim.retryRun;
 
     publishLiveEvent({
       companyId: queued.companyId,
@@ -14311,9 +14490,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (!interruptedStatus.updated || !interruptedStatus.run) continue;
       let interrupted = interruptedStatus.run;
+      const terminalDecision = persistedRunTerminalDecision(interrupted, "interrupted");
+      const terminalMessage = terminalDecision.error ?? message;
+      // The shutdown-consumed wake is not the retry's execution result. The
+      // retry receives a new wake request, so always cancel the original one;
+      // preserve the stage-exit reason when that path already won the race.
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: now,
-        error: null,
+        error: terminalDecision.pipelineStageExited ? terminalDecision.error : null,
       });
       interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
 
@@ -14325,7 +14509,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+      const retry = terminalDecision.pipelineStageExited
+        ? null
+        : await enqueueProcessLossRetry(interrupted, agent, now);
       if (!retry) {
         await releaseIssueExecutionAndPromote(interrupted);
       } else {
@@ -14336,17 +14522,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message,
+        message: terminalDecision.pipelineStageExited
+          ? "Pipeline stage exit was already persisted during shutdown; restart recovery was suppressed"
+          : message,
         payload: {
           signal,
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+          ...(terminalDecision.pipelineStageExited ? { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE } : {}),
           ...(retry ? { retryRunId: retry.id } : {}),
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message);
-      interruptedRunIds.push(interrupted.id);
+      await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
+        errorCode: terminalDecision.errorCode,
+        runId: interrupted.id,
+      });
+      if (!terminalDecision.pipelineStageExited) interruptedRunIds.push(interrupted.id);
     }
 
     if (interruptedRunIds.length > 0) {
@@ -18028,7 +18220,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             error: prReviewIncompleteOverride.errorMessage,
           }
         : baseTerminalOutcome;
-    if (!terminalOutcome) return false;
+    if (!terminalOutcome) return null;
 
     const adapterInvocationStarted =
         baseTerminalOutcome?.errorCode === "job_failed" || baseTerminalOutcome?.errorCode === "job_missing"
@@ -18161,13 +18353,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
     }
-    await setWakeupStatus(input.run.wakeupRequestId, terminalOutcome.wakeupStatus, {
+    const persistedDecision = persistedRunTerminalDecision(finalizedRun, terminalOutcome.status);
+    await setWakeupStatus(input.run.wakeupRequestId, persistedDecision.wakeupStatus, {
       finishedAt: input.now,
-      error: terminalOutcome.error,
+      error: persistedDecision.error,
     });
 
     if (!finalizedRun) finalizedRun = await getRun(input.run.id);
-    if (!finalizedRun) return true;
+    if (!finalizedRun) {
+      return { pipelineStageExited: persistedDecision.pipelineStageExited };
+    }
 
     // BLO-20815: additive-only telemetry, no behavioral effect. Uses the same
     // signal precedence as the dispatcher's own staleness filter (see
@@ -18192,7 +18387,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // fires for these reconciler-finalized failures as well. Non-pr / non-retryable
     // codes return false from the predicate and stay terminal (BLO-7913 leak guard).
     if (
-      terminalOutcome.status === "failed" &&
+      persistedDecision.outcome === "failed" &&
+      !persistedDecision.pipelineStageExited &&
       adapterInvocationStarted !== true &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
@@ -18215,15 +18411,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (terminalJobQuiesced) {
       await releaseExternalRuntimeReservation(db, {
         runId: finalizedRun.id,
-        reason: terminalOutcome.errorCode ?? terminalOutcome.status,
+        reason: persistedDecision.errorCode ?? persistedDecision.outcome,
       });
     }
-    // BLO-19085: pass the reason we already computed. Omitting it latched the
-    // agent into `error` with `errorReason: null` while the very same
-    // `terminalOutcome` (e.g. "External lifecycle Job is missing while heartbeat
-    // run is still running" / job_missing) sat on the run record one frame away.
-    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status, terminalOutcome.error, {
-      errorCode: terminalOutcome.errorCode,
+    await finalizeAgentStatus(input.run.agentId, persistedDecision.outcome, persistedDecision.error, {
+      errorCode: persistedDecision.errorCode,
       runId: input.run.id,
     });
     const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
@@ -18232,10 +18424,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
       deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
     });
-    const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+    let livenessContinuationOwnsCheckout = false;
     let successfulHandoffOwnsCheckout = false;
-    if (finalizationAgent) {
-      successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    if (!persistedDecision.pipelineStageExited) {
+      livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+      if (finalizationAgent) {
+        successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+      }
     }
     if (
       deferredCheckoutRestoreIssueId &&
@@ -18251,10 +18446,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
       stream: "system",
-      level: terminalOutcome.status === "succeeded" ? "info" : "error",
-      message: terminalOutcome.error ?? "External lifecycle Job completed",
+      level: persistedDecision.outcome === "succeeded"
+        ? "info"
+        : persistedDecision.outcome === "cancelled"
+          ? "warn"
+          : "error",
+      message: persistedDecision.error ?? "External lifecycle Job completed",
       payload: {
         externalLifecycleRecovery: true,
+        attemptedStatus: terminalOutcome.status,
+        persistedStatus: persistedDecision.outcome,
+        persistedErrorCode: persistedDecision.errorCode,
         jobPhase: terminalOutcome.jobPhase,
         jobReason: terminalOutcome.jobReason,
         jobMessage: terminalOutcome.jobMessage,
@@ -18267,10 +18469,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     activeRunExecutions.delete(input.run.id);
     await environmentsSvc.releaseLeasesForRun(
       input.run.id,
-      terminalOutcome.status === "succeeded" ? "released" : "failed",
+      persistedDecision.outcome === "succeeded" || persistedDecision.outcome === "cancelled" ? "released" : "failed",
     );
 
-    return true;
+    return { pipelineStageExited: persistedDecision.pipelineStageExited };
   }
 
   function runTimestampMs(value: Date | string | null | undefined): number {
@@ -19213,7 +19415,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               staleKill: true,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19268,7 +19470,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               now,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19298,7 +19500,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               now,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19320,7 +19522,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               staleKill: true,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19360,7 +19562,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 staleKill: true,
               });
               if (finalized) {
-                reaped.push(run.id);
+                if (!finalized.pipelineStageExited) reaped.push(run.id);
                 continue;
               }
             }
@@ -19556,37 +19758,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
       let finalizedRun = finalizedRunWrite.run;
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
+      const terminalDecision = persistedRunTerminalDecision(finalizedRun, "failed");
+      const terminalMessage = terminalDecision.error ?? baseMessage;
+      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: terminalDecision.error,
       });
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
-      recordProcessLost({
-        adapter: adapterType,
-        errorString: baseMessage,
-        classification: processLossCapture.classification,
-      });
+      if (!terminalDecision.pipelineStageExited) {
+        recordProcessLost({
+          adapter: adapterType,
+          errorString: baseMessage,
+          classification: processLossCapture.classification,
+        });
+      }
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       // PCL-2571: cancel any open stale_active_run_evaluation review for
       // this run now that the silence is explained by process_lost. The
       // detector and the reaper race on the suspicion threshold (~1h);
       // without this cleanup, reviews accreted indefinitely on the CTO
       // inbox (11 stuck reviews in 5 days observed 2026-05-25).
-      try {
-        await recovery.dismissStaleEvaluationOnRunTerminated({
-          companyId: finalizedRun.companyId,
-          runId: finalizedRun.id,
-          agentId: finalizedRun.agentId,
-          terminalStatus: "failed",
-          errorCode: "process_lost",
-          errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        });
-      } catch (err) {
-        logger.warn(
-          { err, runId: finalizedRun.id, companyId: finalizedRun.companyId },
-          "failed to dismiss stale active run evaluation during process_lost cleanup",
-        );
+      if (!terminalDecision.pipelineStageExited) {
+        try {
+          await recovery.dismissStaleEvaluationOnRunTerminated({
+            companyId: finalizedRun.companyId,
+            runId: finalizedRun.id,
+            agentId: finalizedRun.agentId,
+            terminalStatus: "failed",
+            errorCode: "process_lost",
+            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: finalizedRun.id, companyId: finalizedRun.companyId },
+            "failed to dismiss stale active run evaluation during process_lost cleanup",
+          );
+        }
       }
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
@@ -19595,22 +19803,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      // BLO-19085: `baseMessage` is the process_lost diagnosis already written
-      // to the run record; pass it through so the agent record carries it too
-      // instead of latching into `error` with a null reason.
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
-        errorCode: "process_lost",
+      await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
+        errorCode: terminalDecision.errorCode,
         runId: run.id,
       });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let promotedRunDispatched = false;
       const retryAgent = await getAgent(run.agentId);
-      if (shouldRetry) {
+      if (!terminalDecision.pipelineStageExited && shouldRetry) {
         if (retryAgent) {
           retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
         }
-      } else if (retryAgent) {
+      } else if (!terminalDecision.pipelineStageExited && retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
@@ -19625,8 +19830,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
         stream: "system",
-        level: "error",
-        message: shouldRetry
+        level: terminalDecision.pipelineStageExited ? "warn" : "error",
+        message: terminalDecision.pipelineStageExited
+          ? "Pipeline stage exit was already persisted; orphan process-loss recovery was suppressed"
+          : shouldRetry
           ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
           : baseMessage,
         payload: {
@@ -19634,6 +19841,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(externalLifecyclePreAdapter ? { externalLifecyclePreAdapter: true } : {}),
+          ...(terminalDecision.pipelineStageExited ? { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
         },
       });
@@ -19648,8 +19856,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // environment isn't permanently checked out (ported from upstream
       // v513). Marks lease as `failed` rather than `released` to preserve
       // forensic signal for stuck-lease audits.
-      await environmentsSvc.releaseLeasesForRun(run.id, "failed");
-      reaped.push(run.id);
+      await environmentsSvc.releaseLeasesForRun(
+        run.id,
+        terminalDecision.pipelineStageExited ? "released" : "failed",
+      );
+      if (!terminalDecision.pipelineStageExited) reaped.push(run.id);
 
     }
 
@@ -20047,6 +20258,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
+    // The issue lock is deliberately retained until an active adapter is
+    // interrupted. If the immediate post-commit cancellation fails, discover
+    // the durable marker from the run itself—not only through the issue's
+    // pointer, which stale-lock cleanup may later clear.
+    const pendingStageExitCancellations = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "running"),
+        sql`${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null`,
+      ));
+    for (const run of pendingStageExitCancellations) {
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pipeline case left the automation issue's originating stage",
+        {
+          errorCode: "pipeline_stage_exited",
+          eventMessage: "run cancelled after pipeline stage exit",
+        },
+      ).catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "failed to reconcile pending pipeline stage-exit cancellation");
+      });
+    }
     return recovery.sweepStaleIssueLocks();
   }
 
@@ -24904,7 +25138,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let outcome: RunSessionOutcome;
       let silentFailureMessage: string | null = null;
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+      const stageExitCancellationRequested = isPersistedPipelineStageExitRun(latestRun);
+      if (stageExitCancellationRequested) {
+        outcome = "cancelled";
+      } else if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
       } else if (isConfirmedAdapterTimeout(adapterResult)) {
         outcome = "timed_out";
@@ -25154,7 +25391,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : emptyResultOverride
                 ? "Agent exited successfully but produced no result"
                 : outcome === "cancelled"
-                  ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+                  ? (stageExitCancellationRequested
+                      ? PIPELINE_STAGE_EXIT_CANCELLATION_REASON
+                      : latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
                   : outcome === "succeeded"
                     ? null
                     : redactCurrentUserText(
@@ -25183,7 +25422,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 : outcome === "timed_out"
                   ? "timeout"
                   : outcome === "cancelled"
-                    ? (latestRun?.errorCode ?? "cancelled")
+                    ? (stageExitCancellationRequested
+                        ? "pipeline_stage_exited"
+                        : latestRun?.errorCode ?? "cancelled")
                     : outcome === "failed"
                       ? (silentFailureMessage
                           ? "silent_failure"
@@ -25361,26 +25602,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return;
       }
+      // The conditional write above may have converted a natural completion
+      // into the durable stage-exit cancellation. Every downstream side effect
+      // must now follow that persisted outcome, especially retry scheduling.
+      const persistedDecision = persistedRunTerminalDecision(persistedRunWrite.run, outcome);
+      outcome = persistedDecision.outcome;
 
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
-        persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
+        persistedRun = await classifyAndPersistRunLiveness(
+          persistedRun,
+          parseObject(persistedRun.resultJson),
+        ) ?? persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+      const finalizedRun = persistedRun ?? (await getRun(run.id));
+      const terminalDecision = persistedRunTerminalDecision(finalizedRun, persistedDecision.outcome);
+      outcome = terminalDecision.outcome;
+      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: new Date(),
-        error: runErrorMessage,
+        error: terminalDecision.error,
       });
 
-      const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
+          level: outcome === "succeeded" ? "info" : outcome === "cancelled" ? "warn" : "error",
+          message: terminalDecision.pipelineStageExited
+            ? terminalDecision.error ?? "Pipeline stage exit cancelled this run"
+            : `run ${outcome}`,
           payload: {
-            status,
+            status: terminalDecision.outcome,
+            errorCode: terminalDecision.errorCode,
             exitCode: adapterResult.exitCode,
           },
         });
@@ -25390,7 +25644,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId,
             issueWorkMode: issueRef?.workMode ?? null,
             outcome,
-            error: runErrorMessage,
+            error: terminalDecision.error,
           });
         } catch (err) {
           logger.warn(
@@ -25403,9 +25657,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
         const livenessRun = finalizedRun;
-        await refreshContinuationSummaryForRun(livenessRun, agent);
+        if (!terminalDecision.pipelineStageExited) {
+          await refreshContinuationSummaryForRun(livenessRun, agent);
+        }
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
-        if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
+        if (issueId && !terminalDecision.pipelineStageExited && outcome === "succeeded" && !skipRunIssueComment) {
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
             if (!existingRunComment) {
@@ -25431,7 +25687,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         await recordZeroTokenCompletedRunStreak(agent);
         let suppressImmediateRecovery = false;
-        if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+        if (!terminalDecision.pipelineStageExited && outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
             await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -25452,7 +25708,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
           }
-        } else if (outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
+        } else if (!terminalDecision.pipelineStageExited && outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
           const automaticRetryResult = await scheduleBoundedRetryForRun(
             livenessRun,
             agent,
@@ -25465,7 +25721,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             suppressImmediateRecovery = true;
           }
         }
-        const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
+        const issueCommentPolicyResult = terminalDecision.pipelineStageExited
+          ? { outcome: "not_applicable" as const, queuedRun: null }
+          : await finalizeIssueCommentPolicy(livenessRun, agent);
         const deferredCheckoutRestoreIssueId = livenessRun.status === "succeeded"
           ? issueIdFromRunContext(livenessRun.contextSnapshot) ?? null
           : null;
@@ -25473,16 +25731,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           suppressImmediateRecovery,
           deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
         });
-        const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
-        const successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
-          issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
-            ? {
-              ...livenessRun,
-              issueCommentStatus: issueCommentPolicyResult.outcome,
-            }
-            : livenessRun,
-          agent,
-        );
+        let livenessContinuationOwnsCheckout = false;
+        let successfulHandoffOwnsCheckout = false;
+        if (!terminalDecision.pipelineStageExited) {
+          livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
+          successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
+            issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
+              ? {
+                ...livenessRun,
+                issueCommentStatus: issueCommentPolicyResult.outcome,
+              }
+              : livenessRun,
+            agent,
+          );
+        }
         if (
           deferredCheckoutRestoreIssueId &&
           !promotedRunDispatched &&
@@ -25500,7 +25762,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // workspace finalization or merged into this run. Reuse the level-triggered
         // dependency backstop so finalize and periodic recovery share idempotency,
         // readiness, active-path, and observability rules.
-        if (issueId && finalizedRun) {
+        if (issueId && finalizedRun && !terminalDecision.pipelineStageExited) {
           try {
             const blockerIssueStatus = await db
               .select({ status: issues.status })
@@ -25525,10 +25787,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       if (finalizedRun) {
-        await updateRuntimeState(agent, finalizedRun, adapterResult, {
+        // The adapter may have returned useful usage even though pipeline
+        // retirement won the terminal CAS. Keep that accounting, but never
+        // let the superseded adapter result become the runtime state's last
+        // error/result for a cancelled stage-owned run.
+        const runtimeResult = terminalDecision.pipelineStageExited
+          ? {
+              ...adapterResult,
+              errorCode: terminalDecision.errorCode ?? adapterResult.errorCode,
+              errorMessage: terminalDecision.error,
+            }
+          : adapterResult;
+        await updateRuntimeState(agent, finalizedRun, runtimeResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
-        if (taskKey) {
+        // A stale adapter completion must not overwrite the task session after
+        // the stage that owned it exited. The next stage gets to establish its
+        // own session boundary instead.
+        if (taskKey && !terminalDecision.pipelineStageExited) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
@@ -25569,16 +25845,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(
         agent.id,
         outcome,
-        outcome === "succeeded" ? null : runErrorMessage,
+        outcome === "succeeded" ? null : terminalDecision.error,
         {
           keepIdleOnFailure:
             outcome === "failed" &&
             (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
-          errorCode: runErrorCode,
+          errorCode: terminalDecision.errorCode ?? runErrorCode,
           retryNotBefore:
-            adapterRetryNotBefore && !Number.isNaN(adapterRetryNotBefore.getTime())
+            !terminalDecision.pipelineStageExited && adapterRetryNotBefore && !Number.isNaN(adapterRetryNotBefore.getTime())
               ? adapterRetryNotBefore
               : null,
+          runId: finalizedRun?.id ?? run.id,
         },
       );
     } catch (err) {
@@ -25650,27 +25927,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return;
       }
 
-      const failedRun = failedRunWrite.run;
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
+      let terminalDecision = persistedRunTerminalDecision(failedRunWrite.run, "failed");
+      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: new Date(),
-        error: message,
+        error: terminalDecision.error,
       });
 
-      if (failedRun) {
-        await appendRunEvent(failedRun, seq++, {
-          eventType: "error",
+      if (failedRunWrite.run) {
+        const livenessRun = await classifyAndPersistRunLiveness(failedRunWrite.run) ?? failedRunWrite.run;
+        terminalDecision = persistedRunTerminalDecision(livenessRun, terminalDecision.outcome);
+        await appendRunEvent(livenessRun, seq++, {
+          eventType: terminalDecision.pipelineStageExited ? "lifecycle" : "error",
           stream: "system",
-          level: "error",
-          message,
+          level: terminalDecision.pipelineStageExited ? "warn" : "error",
+          message: terminalDecision.error ?? message,
+          payload: {
+            status: terminalDecision.outcome,
+            errorCode: terminalDecision.errorCode,
+          },
         });
-        const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         try {
           await completeSkillTestRunForHeartbeatOutcome({
             run: livenessRun,
             issueId,
             issueWorkMode: issueRef?.workMode ?? null,
-            outcome: "failed",
-            error: message,
+            outcome: terminalDecision.outcome,
+            error: terminalDecision.error,
           });
         } catch (err) {
           logger.warn(
@@ -25678,24 +25960,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed to complete skill test run after heartbeat adapter failure",
           );
         }
-        await refreshContinuationSummaryForRun(livenessRun, agent);
-        if (!isWorkspaceValidationFailedRun(livenessRun) && !isConfigurationIncompleteFailedRun(livenessRun)) {
+        if (!terminalDecision.pipelineStageExited) {
+          await refreshContinuationSummaryForRun(livenessRun, agent);
+        }
+        if (
+          !terminalDecision.pipelineStageExited &&
+          !isWorkspaceValidationFailedRun(livenessRun) &&
+          !isConfigurationIncompleteFailedRun(livenessRun)
+        ) {
           await finalizeIssueCommentPolicy(livenessRun, agent);
         }
-        await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        if (!terminalDecision.pipelineStageExited) {
+          await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        }
         await releaseIssueExecutionAndPromote(livenessRun);
 
         await updateRuntimeState(agent, livenessRun, {
           exitCode: null,
           signal: null,
           timedOut: false,
-          errorMessage: message,
+          errorCode: terminalDecision.errorCode ?? failureErrorCode,
+          errorMessage: terminalDecision.error ?? message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
         });
         await recordZeroTokenCompletedRunStreak(agent);
 
-        if (taskKey && !isolationSessionMismatch && (runtimeSessionParams || previousSessionDisplayId || taskSession)) {
+        if (
+          taskKey &&
+          !terminalDecision.pipelineStageExited &&
+          !isolationSessionMismatch &&
+          (runtimeSessionParams || previousSessionDisplayId || taskSession)
+        ) {
           // Persist the current run's scoped params so failure-path resumes keep the isolation key.
           await upsertTaskSession({
             companyId: agent.companyId,
@@ -25708,13 +26004,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sessionConfigMetadata,
             ),
             sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
+            lastRunId: livenessRun.id,
+            lastError: terminalDecision.error ?? message,
           });
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      await finalizeAgentStatus(agent.id, terminalDecision.outcome, terminalDecision.error, {
+        errorCode: terminalDecision.errorCode ?? failureErrorCode,
+        runId: failedRunWrite.run?.id ?? run.id,
+      });
     }
     } catch (outerErr) {
           if (outerErr instanceof BranchClaimConflictError) {
@@ -25795,6 +26094,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }),
             } : {}),
           }).catch(() => ({ run: null, updated: false as const }));
+          let terminalDecision: PersistedRunTerminalDecision | null = null;
           if (!setupFailureWrite.updated) {
             logger.info(
               {
@@ -25805,29 +26105,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               "skipping late setup failure finalization because the run already left running state",
             );
           } else {
-            await setWakeupStatus(run.wakeupRequestId, "failed", {
+            terminalDecision = persistedRunTerminalDecision(setupFailureWrite.run, "failed");
+            await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
               finishedAt: new Date(),
-              error: message,
+              error: terminalDecision.error,
             }).catch(() => undefined);
           }
-          const failedRun = await getRun(runId).catch(() => null);
-          if (setupFailureWrite.updated && failedRun) {
+          const failedRun = setupFailureWrite.updated
+            ? setupFailureWrite.run ?? await getRun(runId).catch(() => null)
+            : null;
+          if (setupFailureWrite.updated && failedRun && terminalDecision) {
+            const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
+            terminalDecision = persistedRunTerminalDecision(livenessRun, terminalDecision.outcome);
             // Emit a run-log event so the failure is visible in the run timeline,
             // consistent with what the inner catch block does for adapter failures.
-            await appendRunEvent(failedRun, await nextRunEventSeq(failedRun.id), {
-              eventType: "error",
+            await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
+              eventType: terminalDecision.pipelineStageExited ? "lifecycle" : "error",
               stream: "system",
-              level: "error",
-              message,
+              level: terminalDecision.pipelineStageExited ? "warn" : "error",
+              message: terminalDecision.error ?? message,
+              payload: {
+                status: terminalDecision.outcome,
+                errorCode: terminalDecision.errorCode,
+              },
             }).catch(() => undefined);
-            const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
             const setupFailureIssueId = readNonEmptyString(parseObject(livenessRun.contextSnapshot).issueId);
             if (setupFailureIssueId) {
               await completeSkillTestRunForHeartbeatOutcome({
                 run: livenessRun,
                 issueId: setupFailureIssueId,
-                outcome: "failed",
-                error: message,
+                outcome: terminalDecision.outcome,
+                error: terminalDecision.error,
               }).catch((completionErr) => {
                 logger.warn(
                   { err: completionErr, runId: livenessRun.id, issueId: setupFailureIssueId },
@@ -25837,16 +26145,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
-              await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
-              if (!isWorkspaceValidationFailedRun(livenessRun) && !isConfigurationIncompleteFailedRun(livenessRun)) {
+              if (!terminalDecision.pipelineStageExited) {
+                await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
+              }
+              if (
+                !terminalDecision.pipelineStageExited &&
+                !isWorkspaceValidationFailedRun(livenessRun) &&
+                !isConfigurationIncompleteFailedRun(livenessRun)
+              ) {
                 await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
               }
-              await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent).catch((retryError) => {
-                logger.warn(
-                  { err: retryError, runId: livenessRun.id },
-                  "failed to schedule interaction continuation retry after setup failure",
-                );
-              });
+              if (!terminalDecision.pipelineStageExited) {
+                await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent).catch((retryError) => {
+                  logger.warn(
+                    { err: retryError, runId: livenessRun.id },
+                    "failed to schedule interaction continuation retry after setup failure",
+                  );
+                });
+              }
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch((releaseError) => {
               logger.error(
@@ -25858,8 +26174,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Ensure the agent is not left stuck in "running" if the setup-failure
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
-          if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+          if (setupFailureWrite.updated && terminalDecision) {
+            await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalDecision.error, {
+              errorCode: terminalDecision.errorCode ?? setupErrorCode,
+              runId: failedRun?.id ?? run.id,
+            }).catch(() => undefined);
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
@@ -26145,6 +26464,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       deferPrimaryCheckoutRestoration?: boolean;
     } = {},
   ): Promise<boolean> {
+    // A pipeline-stage exit made this run obsolete, not failed. Release its
+    // execution lock, but never turn that cancellation into generic automatic
+    // issue recovery (which would recreate the work the stage exit retired).
+    const suppressImmediateRecovery =
+      options.suppressImmediateRecovery || isPersistedPipelineStageExitRun(run);
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = issueIdFromRunContext(runContext);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -26901,7 +27225,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
 
       if (!issueNeedsImmediateRecovery) return completePromotion({ kind: "released" as const });
-      if (options.suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
+      if (suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
 
       const existingExecutionPath = await findExistingExecutionPath();
       const immediateRecoveryHasReplacementPath = Boolean(existingExecutionPath || issueHasPersistedMonitor);
@@ -28013,6 +28337,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }
             }
           }
+        }
+
+        // A wake that was already waiting on the issue lock when pipeline
+        // retirement committed must not become a new deferred wake. Preserve a
+        // durable skipped record so its caller has an auditable terminal answer
+        // while the marked running generation is being interrupted.
+        if (
+          issue.status === "cancelled" &&
+          activeExecutionRun?.status === "running" &&
+          readNonEmptyString(parseObject(activeExecutionRun.resultJson).pipelineStageExitCancellationRequestedAt)
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "pipeline_stage_exit_cancellation_pending",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          if (suppression) suppression.durableSkipReason = "pipeline_stage_exit_cancellation_pending";
+          return { kind: "skipped" as const };
         }
 
         const dependencyReadiness = await issuesSvc.listDependencyReadiness(
