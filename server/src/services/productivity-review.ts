@@ -3349,8 +3349,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
     }
     if (noComment) {
+      // BLO-29535 (Ally suggestion on a38c12fe2): NOT "additional". Per
+      // `isNeverInvokedRun`'s own note, this population is mostly a *subset* of
+      // `isNeverExecutedRun`, so these runs are usually already inside the
+      // non-executing count the evidence block reports. The evidence block
+      // disambiguates via `nonExecutingAlsoNeverInvokedCount`; this prose reason
+      // carries no such field, so it has to say the overlap out loud or a reader
+      // summing the two counts double-counts every run that satisfies both.
       const neverInvokedNote = neverInvokedRunCount > 0
-        ? ` (${neverInvokedRunCount} additional run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak)`
+        ? ` (${neverInvokedRunCount} run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak; these mostly overlap the non-executing runs reported separately, so the two counts do not sum)`
         : "";
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
     }
@@ -3620,8 +3627,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
-      `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
-      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, counted toward the streak — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
+      `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
+      // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
+      // walk", NOT "counted toward the streak". This count is taken over every
+      // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
+      // prefix of that list before the first commented run — so the two numbers
+      // legitimately differ, and the old label invited a manager to read the
+      // larger one as the streak length.
+      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
       ...(evidence.nonExecutingRunCount > 0
         ? [
             // BLO-22436 (Ally suggestion on 37c1bd65): one parenthetical group,
@@ -3740,7 +3753,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (no adapter created): ${evidence.neverInvokedRunCount}`,
-      `- Comment-policy-exempt runs that DID execute (counted): ${evidence.commentExemptExecutedRunCount}`,
+      // BLO-29535: same wording fix as the description's evidence block — this
+      // count is every streak-eligible exempt run, not the streak prefix, and
+      // a bare "(counted)" sitting under "No-comment streak" read as "counted
+      // into that streak". The comment must tell the same story as the
+      // description it summarises.
+      `- Comment-policy-exempt runs that DID execute (not excluded from the streak walk): ${evidence.commentExemptExecutedRunCount}`,
       // BLO-22436 (Ally suggestion on 37c1bd65): the never-invoked count is
       // ambiguous on its own — it says nothing about *why* those runs could not
       // comment. Carry the non-executing count and its overlap here too, so the
