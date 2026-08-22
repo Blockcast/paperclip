@@ -1482,3 +1482,129 @@ describe("argv redaction — the fail-opens Ally's review found (PEN-2431 door #
     expect(out).toContain("name: OPENAI_API_KEY");
   });
 });
+
+describe("argv redaction in the production-shaped pod (Ally 9d6470b)", () => {
+  // Ally's review of 9d6470b reported the Critical as still-present, on the
+  // grounds that `continuesBlock(line, 2)` returns false on `image:` and so the
+  // container block closes before `command:` is reached. That mechanism does not
+  // hold: the container block is anchored at the `containers:` KEY indent (2),
+  // not at the container item's field indent (4), so `image:` is deeper than the
+  // block and `indent > blockIndent` keeps it open.
+  //
+  // The finding was not reproducible — but the coverage criticism behind it was
+  // correct, and these are the tests it asked for. Every case below leaks at
+  // 6827796 and passes here, which is what makes them regression tests rather
+  // than restatements.
+
+  it("redacts a block scalar that follows ordinary container fields", () => {
+    const pod = [
+      "spec:",
+      "  containers:",
+      "  - name: c",
+      "    image: x",
+      "    command:",
+      "    - |",
+      `      TOKEN=${LEAK}`,
+    ].join("\n");
+
+    const out = scrubResponseBody(
+      Buffer.from(
+        JSON.stringify({ result: { content: [{ type: "text", text: pod }] } }),
+      ),
+      "application/json",
+    ).toString("utf8");
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("redacts a folded scalar that follows ordinary container fields", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    image: x",
+        "    args:",
+        "    - >",
+        `      TOKEN=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("redacts argv in the indented-list serialization style too", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "    - name: c",
+        "      image: x",
+        "      command:",
+        "      - |",
+        `        TOKEN=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("keeps the flag name after several ordinary fields", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    image: x",
+        "    imagePullPolicy: IfNotPresent",
+        "    restartCount: 3",
+        "    args:",
+        `    - --token=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("--token=");
+    expect(out).toContain(REDACTED);
+  });
+
+  it("redacts a post-comment argv token in the full mapping shape", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    image: x",
+        "    args:",
+        "    # note",
+        `    - --token=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("scrubs the second container in the list, not just the first", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: a",
+        "    image: x",
+        "    args:",
+        "    - --one=ok",
+        "  - name: b",
+        "    image: y",
+        "    args:",
+        `    - --token=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("name: b");
+  });
+});
