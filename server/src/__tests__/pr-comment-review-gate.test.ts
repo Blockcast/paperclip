@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { evaluateCommentReviewGate } from "../services/pr-comment-review-gate.js";
+import {
+  commentReviewGateVerdictIsMisreadable,
+  evaluateCommentReviewGate,
+} from "../services/pr-comment-review-gate.js";
 
 const OLD_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CURRENT_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -53,14 +56,62 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "success" });
   });
 
-  it("does not carry a finding across a replacement head", () => {
+  it("carries an undispositioned finding forward across a replacement head", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
     });
 
-    expect(verdict).toMatchObject({ state: "success" });
-    expect(verdict.reason).toMatch(/no Ally consolidated-review comment/i);
+    // Replacing the head does not disposition the finding, so the gate must not
+    // go green on it (BLO-29711).
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
+  });
+
+  it("clears a carried finding once Ally attests the replacement head", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("does not carry forward when the newest attestation of an earlier head is clean", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(cleanReview(OLD_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("reports not_evaluated rather than clean when nothing attests the head", () => {
+    const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
+
+    // A green status must not be mistakable for review evidence. Under a
+    // review/-prefixed context that reading is false (BLO-29711).
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    expect(commentReviewGateVerdictIsMisreadable(verdict, "review/ally-comment")).toBe(true);
+    expect(commentReviewGateVerdictIsMisreadable(verdict, "gate/ally-comment-findings")).toBe(false);
+  });
+
+  it("distinguishes a reviewed-and-clean head from a not-evaluated one", () => {
+    const clean = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(clean).toMatchObject({ state: "success", outcome: "clean" });
+    expect(commentReviewGateVerdictIsMisreadable(clean, "review/ally-comment")).toBe(false);
   });
 
   it("requires the configured GitHub App identity, not a same-shaped contributor comment", () => {
@@ -75,7 +126,7 @@ describe("evaluateCommentReviewGate", () => {
       ],
     });
 
-    expect(verdict).toMatchObject({ state: "success" });
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
   });
 
   it("requires one unambiguous exact-head attestation", () => {
@@ -94,7 +145,9 @@ describe("evaluateCommentReviewGate", () => {
       ],
     });
 
-    expect(verdict).toMatchObject({ state: "success" });
+    // An ambiguous attestation cannot be tied to any head, so it neither
+    // establishes a review nor carries forward.
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
   });
 
   it("uses comment chronology rather than contributor-controlled commit metadata", () => {
