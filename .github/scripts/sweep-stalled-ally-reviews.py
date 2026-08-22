@@ -1069,3 +1069,14 @@ if __name__ == "__main__":
         # shadow the status-code message above.
         print("GitHub API request failed (transport): %s" % error.reason, file=sys.stderr)
         sys.exit(EXIT_SWEEP_DEGRADED)
+    except OSError as error:
+        # A REQUEST_TIMEOUT_SECONDS expiry during the response *read* raises a
+        # bare TimeoutError (== socket.timeout), which is an OSError but NOT a
+        # URLError -- only the connect phase gets wrapped by urllib. Without
+        # this arm it escapes as an uncaught traceback, and CPython exits 1 --
+        # which is EXIT_ALARM. The timeout added to bound a hung request would
+        # then report itself as "a PR is stranded, go review it", sending a
+        # human to look for work that does not exist. Caught last: URLError is
+        # itself an OSError, so the arms above still take precedence.
+        print("GitHub API request failed (socket): %r" % error, file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
