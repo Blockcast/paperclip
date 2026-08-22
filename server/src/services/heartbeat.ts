@@ -966,22 +966,29 @@ export const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
 // on `dep_blocked_age_expired` as evidence there is no churn leak.
 //
 // HOW FAR THE CARRY ACTUALLY REACHES — read this before relying on the bound:
-//   - blocker-SET churn (`enqueueWakeup`, the `!setsMatch` branch): carried. The origin
-//     is read before `cancelDepBlockedScheduledRetry` and re-stamped on the replacement.
-//   - `blockedInteractionWake` (`enqueueWakeup`, ~L28204): NOT carried. That branch
-//     cancels the park inline and clears `issues.executionRunId`, and the re-park is
-//     suppressed in the same call by `&& !blockedInteractionWake`. On a later wake both
-//     `activeExecutionRun` and the in-memory carry are null, so a fresh origin is
-//     stamped. An issue taking interaction wakes more often than
-//     DEP_BLOCKED_MAX_PARK_AGE_MS therefore keeps this ceiling out of reach.
-//   - `cancelStaleScheduledRetry`: NOT carried, and that is arguably correct — a
-//     reassignment ends the episode. Left deliberately unchanged.
+//   - blocker-SET churn (`enqueueWakeup`, the `!setsMatch` branch): carried in memory.
+//     The origin is read before `cancelDepBlockedScheduledRetry` and re-stamped on the
+//     replacement, which is inserted in the SAME call.
+//   - `blockedInteractionWake` (`enqueueWakeup`): carried ACROSS CALLS since BLO-29729,
+//     which is what makes this bound hold under interaction traffic. That branch cancels
+//     the park inline and clears `issues.executionRunId`, and the re-park is suppressed
+//     in the same call by `&& !blockedInteractionWake` — so the replacement is inserted
+//     on a LATER call, by which time `activeExecutionRun` and the in-memory carry are
+//     both null. The origin survives on the cancelled row's contextSnapshot (that cancel
+//     writes only status/finishedAt/error/errorCode/updatedAt), so the re-park recovers
+//     it by query — see `recoverDepBlockedParkOriginAcrossInteractionWake`. No migration.
+//   - `cancelStaleScheduledRetry`: NOT carried, deliberately. A reassignment ends the
+//     episode: the park belonged to the previous assignee's wait, and the new assignee
+//     has not waited at all. Recovery declines it too, because the most recent terminal
+//     park for the issue then carries a different errorCode (see the helper's ordering
+//     rule), so the reset is consistent whichever path observes it.
 //
-// So this bound closes the churn leak but is not unconditional. Closing the interaction
-// -wake hole needs state that survives across calls (the origin does survive on the
-// CANCELLED run's contextSnapshot, so it is recoverable without a migration); tracked
-// separately rather than asserted away here. Corollary for anyone reading the metric:
-// `dep_blocked_age_expired == 0` does NOT mean no unbounded parks exist.
+// The residual, stated rather than asserted away: recovery is bounded by
+// DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS, so an episode that goes longer than that with
+// NO park row pending starts a fresh age budget. That gap is idle time, not park time —
+// nothing is parked during it — so it is outside what this ceiling measures. Corollary
+// for anyone reading the metric: `dep_blocked_age_expired == 0` still does not prove
+// there are no unbounded parks; pair it with the parked-agents measurement.
 export function readDepBlockedFirstParkedAt(run: {
   contextSnapshot: unknown;
   createdAt: Date;
@@ -993,6 +1000,108 @@ export function readDepBlockedFirstParkedAt(run: {
   }
   return run.createdAt;
 }
+
+// errorCode stamped by the inline cancel in the `blockedInteractionWake` branch. Named
+// because origin recovery matches on it: it is the one terminal reason that means "this
+// park was interrupted mid-wait", as opposed to ended.
+export const DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE = "dep_blocked_interaction_wake";
+
+// How long a gap between an interaction-wake cancel and the next re-park may be before
+// the recovered origin is treated as belonging to a dead episode (BLO-29729).
+//
+// The quantity bounded here is the GAP (cancel.finishedAt → re-park), NOT the origin's
+// own age. That choice is the whole design and it is deliberate: bounding the origin's
+// age — the `2 x DEP_BLOCKED_MAX_PARK_AGE_MS` shape originally floated on the issue —
+// declines precisely the LONGEST-RUNNING episodes, which are exactly the ones this
+// ceiling exists to terminate. An issue continuously blocked for 30h, briefly
+// interrupted by a comment, would have its 30h origin refused as "too old" and be handed
+// a fresh 12h budget: self-defeating. A 30h origin whose cancel was 1h ago, by contrast,
+// is obviously the same wait, and the gap bound carries it.
+//
+// Value: DEP_BLOCKED_MAX_PARK_AGE_MS itself, not a multiple of it, so there is no second
+// tunable to drift out of sync. The error cases are asymmetric and this picks the safer
+// side:
+//   - too loose → a genuinely new episode (blockers resolved, re-added later) inherits a
+//     dead origin and age-expires on contact. That misfire is silent, and it REPEATS on
+//     every re-park for as long as the stale candidate stays inside the window.
+//   - too tight → one extra age budget is granted after a long idle gap. Bounded at one
+//     ceiling per gap, and the resulting park is still visible in
+//     `paperclipListParkedAgents`, so it is observable rather than silent.
+// A repeating silent misfire is worse than a bounded observable one, so the bound is the
+// tighter of the two candidates.
+export const DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS = DEP_BLOCKED_MAX_PARK_AGE_MS;
+
+/**
+ * Recover the age origin for a dep-blocked re-park whose predecessor was cancelled by
+ * the `blockedInteractionWake` branch on an EARLIER call (BLO-29729).
+ *
+ * Returns null when there is nothing safe to carry, in which case the caller stamps a
+ * fresh origin.
+ *
+ * Two independent guards, because neither is sufficient alone:
+ *
+ *  1. **Most-recent-terminal-park ordering.** We fetch the single most recently created
+ *     cancelled dep-blocked park for this issue+agent and carry its origin ONLY if its
+ *     errorCode is the interaction-wake cancel. Parks for one issue are serial (the
+ *     issue holds one `executionRunId` at a time), so most-recently-created is the
+ *     immediate lineage predecessor. This is what stops the origin outliving an episode
+ *     that genuinely ENDED: a `dep_blockers_resolved` cancel, a reassignment reset, or —
+ *     critically — an `issue_dependencies_blocked` termination. Without the ordering
+ *     rule, an already-age-expired episode would keep re-terminating every subsequent
+ *     re-park in a tight loop, since its older interaction-wake cancel would still match.
+ *
+ *  2. **Staleness bound** (DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS). Guard 1 cannot catch
+ *     the case this fix is actually about: after an interaction-wake cancel there is no
+ *     park pending, so if the blockers resolve during that window NOTHING writes a
+ *     `dep_blockers_resolved` row. The episode ends leaving no terminal marker at all,
+ *     and the interaction-wake cancel stays the most recent terminal park forever. Only
+ *     elapsed time separates "still the same wait" from "blockers came back weeks later".
+ *
+ * Indexed by migration 0104 `(company_id, agent_id, context_issue_id, created_at DESC,
+ * id DESC) WHERE context_issue_id IS NOT NULL`, so this is an index seek, not a scan.
+ * That index is why the zero-migration query beats a persisted column here: the column
+ * would be more robust against the guard-2 residual, but costs a migration to buy
+ * robustness against a window we are already bounding.
+ */
+async function recoverDepBlockedParkOriginAcrossInteractionWake(
+  dbOrTx: Pick<Db, "select">,
+  params: { companyId: string; agentId: string; issueId: string; now: Date },
+): Promise<Date | null> {
+  const previous = await dbOrTx
+    .select({
+      errorCode: heartbeatRuns.errorCode,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      createdAt: heartbeatRuns.createdAt,
+      finishedAt: heartbeatRuns.finishedAt,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, params.companyId),
+        eq(heartbeatRuns.agentId, params.agentId),
+        eq(heartbeatRuns.contextIssueId, params.issueId),
+        eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        eq(heartbeatRuns.status, "cancelled"),
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  // Guard 1: only the immediate predecessor counts, and only if it was interrupted
+  // rather than ended.
+  if (!previous || previous.errorCode !== DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE) return null;
+
+  // Guard 2: `finishedAt` is what the inline cancel stamps; coalesce to createdAt so a
+  // row missing it degrades to declining rather than to an unbounded carry.
+  const cancelledAt = previous.finishedAt ?? previous.createdAt;
+  if (params.now.getTime() - cancelledAt.getTime() > DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS) {
+    return null;
+  }
+
+  return readDepBlockedFirstParkedAt(previous);
+}
+
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -17425,10 +17534,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Age ceiling is evaluated BEFORE the attempt ceiling and independently of
           // it (BLO-29055). A blocker-set change resets `scheduledRetryAttempt` to 0,
           // so an attempt-only bound can be evaded indefinitely by churn; the age
-          // origin is carried across those re-parks, so churn cannot reset it.
-          // It is NOT carried across the `blockedInteractionWake` cancel — see the
-          // carry-reach notes on readDepBlockedFirstParkedAt. This bound closes the
-          // churn leak; it is not unconditional.
+          // origin is carried across those re-parks, so churn cannot reset it. Since
+          // BLO-29729 it is also carried across the `blockedInteractionWake` cancel,
+          // which happens on a different call — see the carry-reach notes on
+          // readDepBlockedFirstParkedAt for which paths carry and which reset.
           const firstParkedAt = readDepBlockedFirstParkedAt(dueRun);
           const parkAgeMs = now.getTime() - firstParkedAt.getTime();
           if (parkAgeMs > DEP_BLOCKED_MAX_PARK_AGE_MS) {
@@ -31194,6 +31303,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         };
 
+        // Fires on reassignment or issue cancellation. The dep-blocked age origin RESETS
+        // BY DESIGN here — it is not carried, and that is the intended third case, not an
+        // oversight (BLO-29729). A reassignment ends the episode: the accumulated wait
+        // belonged to the previous assignee, and charging the new one for time they never
+        // waited would age-expire their first park on contact. Issue cancellation ends it
+        // outright. Note the reset needs no code to enforce: this sets errorCode to
+        // `issue_reassigned` / `issue_cancelled`, so the most-recent-terminal-park rule in
+        // recoverDepBlockedParkOriginAcrossInteractionWake declines the lineage on its
+        // own. If you ever change that errorCode, re-check the recovery guard.
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
           if (
@@ -31284,8 +31402,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null)
           : null;
 
-        // Set when a dep-blocked park is cancelled for blocker-set churn, so the
-        // replacement park inherits the original park instant (BLO-29055).
+        // Set when a dep-blocked park is cancelled earlier in THIS call — for
+        // blocker-set churn (BLO-29055) or by the interaction-wake branch (BLO-29729) —
+        // so the replacement park inherits the original park instant. A cancel on an
+        // earlier call is recovered by query instead; see
+        // recoverDepBlockedParkOriginAcrossInteractionWake.
         let carriedDepBlockedFirstParkedAt: Date | null = null;
 
         if (
@@ -31588,13 +31709,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON
         ) {
           const now = new Date();
+          // Capture the lineage origin BEFORE cancelling (BLO-29729). The re-park is
+          // suppressed later in THIS call by `&& !blockedInteractionWake`, so this
+          // in-memory carry is normally unused — the surviving path is the cancelled
+          // row's own contextSnapshot, recovered on a later call. Set it anyway so the
+          // invariant "a dep-blocked cancel hands its origin forward" holds locally and
+          // does not depend on that suppression guard staying in place.
+          const interruptedFirstParkedAt = readDepBlockedFirstParkedAt(activeExecutionRun);
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
               error: "Cancelled because an interaction wake must run while dependencies remain blocked",
-              errorCode: "dep_blocked_interaction_wake",
+              errorCode: DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE,
               updatedAt: now,
             })
             .where(
@@ -31632,6 +31760,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ),
               );
             activeExecutionRun = null;
+            carriedDepBlockedFirstParkedAt = interruptedFirstParkedAt;
           }
         }
 
@@ -31696,13 +31825,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
           const now = new Date();
           const scheduledRetryAt = new Date(now.getTime() + DEP_BLOCKED_BASE_DELAY_MS);
+          // No in-memory carry means this call did not itself cancel a predecessor. That
+          // is the shape the interaction-wake evasion takes (BLO-29729): the cancel
+          // happened on an earlier call and cleared `issues.executionRunId`, so
+          // `activeExecutionRun` is null here and nothing local remembers the origin.
+          // Recover it from the cancelled row before falling back to `now`.
+          const recoveredFirstParkedAt = carriedDepBlockedFirstParkedAt
+            ? null
+            : await recoverDepBlockedParkOriginAcrossInteractionWake(tx, {
+                companyId: agent.companyId,
+                agentId,
+                issueId: issue.id,
+                now,
+              });
+          if (recoveredFirstParkedAt) incrementDepBlockedMetric("dep_blocked_origin_recovered");
           const depBlockedSnapshot = {
             ...enrichedContextSnapshot,
             unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: dependencyReadiness.unresolvedBlockerCount,
-            // A first park stamps `now`; a re-park after blocker churn inherits the
-            // original instant so the age ceiling measures the whole wait (BLO-29055).
-            depBlockedFirstParkedAt: (carriedDepBlockedFirstParkedAt ?? now).toISOString(),
+            // A first park stamps `now`. A re-park inherits the original instant so the
+            // age ceiling measures the whole wait: from the in-memory carry after
+            // blocker-set churn in this call (BLO-29055), or recovered from the
+            // predecessor row after an interaction-wake cancel on an earlier one
+            // (BLO-29729).
+            depBlockedFirstParkedAt: (
+              carriedDepBlockedFirstParkedAt ?? recoveredFirstParkedAt ?? now
+            ).toISOString(),
           };
           const wakeupRequest = await tx
             .insert(agentWakeupRequests)

@@ -1983,6 +1983,378 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     ).toBe((firstRun!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt);
   });
 
+  it("carries the park age across the interaction-wake cancel so comment traffic cannot reset the ceiling", async () => {
+    // The regression this pins (BLO-29729): the `blockedInteractionWake` branch cancels
+    // a dep-blocked park INLINE and clears issues.executionRunId, and the re-park is
+    // suppressed in that same call. So the replacement is inserted on a LATER call, by
+    // which time nothing in memory remembers the original park instant. Without the
+    // recovery, the replacement stamps a fresh origin and the 12h ceiling is unreachable
+    // for exactly the issues under active discussion — the ones being commented on.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    // 1. First park. This is the instant the ceiling must keep measuring from.
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const firstPark = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(firstPark).not.toBeNull();
+    // Backdate the first park so its origin is ALREADY past the ceiling while the
+    // replacement below is created ~now. This is what makes the behavioural assertion
+    // discriminating rather than incidental: at the promotion instant chosen below, the
+    // carried origin is over the ceiling and the replacement's own instant is nowhere
+    // near it, so "terminated" can only mean the carry worked. Without the backdating
+    // both origins sit milliseconds apart and master terminates too, for the wrong
+    // reason.
+    const originAt = new Date(Date.now() - 13 * 60 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: originAt,
+        contextSnapshot: {
+          ...(firstPark!.contextSnapshot as Record<string, unknown>),
+          depBlockedFirstParkedAt: originAt.toISOString(),
+        },
+      })
+      .where(eq(heartbeatRuns.id, firstPark!.id));
+    const backdatedPark = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, firstPark!.id))
+      .then((rows) => rows[0]!);
+
+    // 2. A comment arrives while the blocker is STILL unresolved. This is the
+    //    interaction wake: it cancels the park inline rather than via
+    //    cancelDepBlockedScheduledRetry, and does not re-park.
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: blockedIssueId,
+      authorUserId: "board-user",
+      body: "Any progress while this waits?",
+    });
+    const interactionRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: blockedIssueId, commentId },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        commentId,
+        wakeCommentId: commentId,
+        wakeReason: "issue_commented",
+        source: "issue.comment",
+      },
+    });
+    // Pin that the inline cancel path is the one that ran. If this errorCode ever
+    // changes, origin recovery stops matching and this test is why you found out.
+    const cancelledPark = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, firstPark!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(cancelledPark?.status).toBe("cancelled");
+    expect(cancelledPark?.errorCode).toBe("dep_blocked_interaction_wake");
+
+    // 3. The interaction run finishes, releasing the lock — the real-world precondition
+    //    for the re-park. A terminal run is not an adoption candidate, so the next wake
+    //    sees no active execution run at all.
+    if (interactionRun) {
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, interactionRun.id));
+    }
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, blockedIssueId));
+
+    // 4. A later NON-interaction wake with the blocker still unresolved → re-park.
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const replacement = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(replacement).not.toBeNull();
+    expect(replacement!.id).not.toBe(firstPark!.id);
+    // The attempt budget reset, exactly as it does on the churn path. So the age ceiling
+    // is the ONLY bound that can terminate this row — nothing here is near attempt 12.
+    expect(replacement!.scheduledRetryAttempt).toBeLessThan(DEP_BLOCKED_MAX_RETRY_ATTEMPTS);
+    // Sanity-check the discriminator itself: the replacement's own instant must be far
+    // from the carried origin, or the behavioural assertion below proves nothing.
+    expect(replacement!.createdAt.getTime() - originAt.getTime()).toBeGreaterThan(
+      12 * 60 * 60 * 1000,
+    );
+
+    // The behavioural assertion. This instant is past the replacement's own due time
+    // (origin + 5 min backoff) and past `originAt + ceiling`, but only ~1h past the
+    // replacement's OWN creation instant. So a build that stamps a fresh origin
+    // re-defers here, and only the carry can produce a termination.
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 60 * 60 * 1000));
+    const expired = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, replacement!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(expired?.status).toBe("cancelled");
+    expect(expired?.errorCode).toBe("issue_dependencies_blocked");
+    expect(expired?.error).toContain("maximum age");
+    expect(getDepBlockedMetric("dep_blocked_age_expired")).toBe(1);
+
+    // And the mechanism that made it possible: the origin came from the park the
+    // interaction wake cancelled, not from the replacement's own creation instant.
+    expect(
+      (replacement!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt,
+    ).toBe((backdatedPark.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt);
+  });
+
+  it("ignores a recovered park origin whose interaction-wake cancel is older than the staleness bound", async () => {
+    // The hazard the bound exists for (BLO-29729): blockers resolve while no park is
+    // pending — so nothing writes a `dep_blockers_resolved` marker — and are re-added
+    // much later. The old interaction-wake cancel is still the most recent terminal park
+    // for the issue, so the errorCode guard alone would happily resurrect its origin and
+    // age-expire the fresh park on contact, repeatedly. Only elapsed time separates the
+    // two cases.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const firstPark = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(firstPark).not.toBeNull();
+
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: blockedIssueId,
+      authorUserId: "board-user",
+      body: "Checking in.",
+    });
+    const interactionRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: blockedIssueId, commentId },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        commentId,
+        wakeCommentId: commentId,
+        wakeReason: "issue_commented",
+        source: "issue.comment",
+      },
+    });
+    expect(
+      await db
+        .select({ errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, firstPark!.id))
+        .then((rows) => rows[0]?.errorCode ?? null),
+    ).toBe("dep_blocked_interaction_wake");
+
+    // Age the cancelled park past the recovery window: its origin, and the cancel that
+    // ended it, both belong to an episode that is over. The gap bound is defined as
+    // DEP_BLOCKED_MAX_PARK_AGE_MS — see DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS in the
+    // service. Restated rather than imported for the same reason as the ceiling above:
+    // this file must still LOAD on a build without the recovery.
+    const staleOrigin = new Date(Date.now() - (DEP_BLOCKED_MAX_PARK_AGE_MS + 2 * 60 * 60 * 1000));
+    const staleCancelledAt = new Date(Date.now() - (DEP_BLOCKED_MAX_PARK_AGE_MS + 60 * 60 * 1000));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: staleOrigin,
+        finishedAt: staleCancelledAt,
+        contextSnapshot: {
+          ...(firstPark!.contextSnapshot as Record<string, unknown>),
+          depBlockedFirstParkedAt: staleOrigin.toISOString(),
+        },
+      })
+      .where(eq(heartbeatRuns.id, firstPark!.id));
+
+    if (interactionRun) {
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, interactionRun.id));
+    }
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, blockedIssueId));
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const replacement = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(replacement).not.toBeNull();
+    expect(replacement!.id).not.toBe(firstPark!.id);
+
+    // The stale origin was declined: the fresh park starts its own budget.
+    expect(
+      (replacement!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt,
+    ).not.toBe(staleOrigin.toISOString());
+
+    // Behavioural check. This instant is past the park's own due time and past
+    // staleOrigin + ceiling, but well inside the fresh origin + ceiling. A build that
+    // resurrected the stale origin terminates here; correct behaviour re-defers.
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 60 * 60 * 1000));
+    const stillParked = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, replacement!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(stillParked?.status).toBe("scheduled_retry");
+    expect(getDepBlockedMetric("dep_blocked_age_expired")).toBe(0);
+  });
+
   it("runs immediately when the final blocker resolves while a dep-blocked retry exists", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
