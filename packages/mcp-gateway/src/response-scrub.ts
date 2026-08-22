@@ -215,12 +215,7 @@ function continuesBlock(line: string, blockIndent: number): boolean {
   const indent = leadingIndent(line);
   if (indent > blockIndent) return true;
   if (indent < blockIndent) return false;
-  // At exactly the block indent a sequence entry continues the block — and so
-  // does a comment. Treating a comment as a sibling key closed the block before
-  // the in-block scanner ran, so every entry after it fell through to the final
-  // `emit(line)`: `args:` / `# note` / `- --token=SECRET` printed the token in
-  // the clear. A comment carries nothing itself, so continuing on it is free.
-  return line.slice(indent).startsWith("- ") || COMMENT_LINE.test(line);
+  return line.slice(indent).startsWith("- ");
 }
 
 /**
@@ -571,32 +566,9 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         );
         // A wrapped or block scalar continues on deeper-indented lines; the
         // same reasoning as `value:` applies, so drop them.
-        //
-        // The threshold is the entry's OWN indent, not `indent + dash.length`.
-        // A sequence entry's scalar content sits at *exactly* the column after
-        // the dash, never deeper, so `> indent + dash.length` was false on the
-        // very first continuation line and printed the plaintext directly
-        // beneath its own `"<redacted>"` marker — worse than not scrubbing,
-        // because the marker manufactures false assurance. The identical
-        // formula is correct for `value:` below only because a *mapping key's*
-        // content must be strictly deeper than the key; a sequence entry is not
-        // that shape. A sibling entry sits at exactly `indent`, so `> indent`
-        // still lets it through.
-        swallowDeeperThan = indent;
+        swallowDeeperThan = indent + dash.length;
         continue;
       }
-
-      // Unrecognized inside an argv block: fail closed, exactly as the env
-      // block does at its own fall-through. Without this arm a line that was
-      // neither blank, a comment, nor a sequence entry fell out of this `if`
-      // and reached the final `emit(line)` — so a scalar written directly under
-      // `command:` (no dash, hence no swallow ever armed) was emitted verbatim.
-      // argv has no schema-closed key set to allowlist, so there is nothing
-      // here that can legally be passed through.
-      const indent = leadingIndent(line);
-      redact(`${" ".repeat(indent)}"${REDACTED}"`, index);
-      swallowDeeperThan = indent;
-      continue;
     }
 
     // Inside a `valueFrom:` subtree. Its keys are references, but the subtree
@@ -651,37 +623,12 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
     // Open a container list. The key itself carries nothing, so it is emitted
     // as-is; only the flag is set. Not `continue`d past the env branch below,
     // because a `containers:` line is never also an `env:` line.
-    //
-    // Guarded on `envBlockIndent === null`: this branch is tested BEFORE the env
-    // in-block scanner, so without the guard a `containers:` key *inside* an env
-    // block was exempted from that scanner's default-deny and emitted verbatim —
-    // a measured regression against base `ada8117`, where the same line was
-    // redacted. The env block's argument is that an unrecognized key in there is
-    // an upstream shape change or smuggling; three key spellings must not be
-    // carved out of it.
-    const containersKey =
-      envBlockIndent === null ? CONTAINERS_KEY.exec(line) : null;
+    const containersKey = CONTAINERS_KEY.exec(line);
     if (containersKey) {
-      const [, indent, dash = "", quote, key, suffix] = containersKey;
-      const ownIndent = indent!.length + dash.length;
-      // Classify the suffix the way ENV_KEY and ARGV_KEY do. Emitting the line
-      // unconditionally passed a flow-style list through whole —
-      // `containers: [{name: c, args: ["--token=x"]}]` — which is the same shape
-      // this scanner already fails closed on one level down at `args: [...]`.
-      const rest = suffix!.trim().replace(NODE_PROPERTIES, "").trim();
-      if (rest === "" || rest.startsWith("#")) {
-        containersBlockIndent = ownIndent;
-        argvBlockIndent = null;
-        emit(line, index);
-        continue;
-      }
-      // Anything else on the same line sits inside a construct this scanner does
-      // not parse. Fail closed on the whole value, and open the block so that
-      // any content which does follow is guarded rather than emitted.
-      redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
-      swallowDeeperThan = ownIndent;
-      containersBlockIndent = ownIndent;
+      const [, indent, dash = ""] = containersKey;
+      containersBlockIndent = indent!.length + dash.length;
       argvBlockIndent = null;
+      emit(line, index);
       continue;
     }
 
