@@ -57,6 +57,10 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   readAgentJobRunStatusByName: vi.fn(async () => null),
   deleteAgentJobsForRun: vi.fn(async () => 1),
   hasActiveJobForAgent: vi.fn(async () => false),
+  // BLO-20251: exhaustive stub (no `...actual` spread) — a new export the
+  // reaper calls must be listed here or it arrives as `undefined` and throws.
+  // "unknown" is the fail-closed branch, i.e. pre-BLO-20251 reaper behaviour.
+  probeAgentPodActivity: vi.fn(async () => "unknown" as const),
 }));
 
 vi.mock("../telemetry.ts", () => ({
