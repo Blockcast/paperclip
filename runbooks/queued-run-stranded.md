@@ -164,10 +164,13 @@ be confirmed separately.
 Source: `server/src/services/queued-run-age-metrics.ts`
 (`refreshOverdueScheduledRetryAgeMetrics`), `server/src/services/metrics.ts`
 (`OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC`,
-`setOverdueScheduledRetryAgeMetrics`)
+`setOverdueScheduledRetryAgeMetrics`,
+`OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC`)
 Trigger: alert `PaperclipOverdueScheduledRetry` —
-`max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`
+`max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds and on(instance) (paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 1)) > 5400`
 for 5m
+Companion: alert `PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed` —
+`paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 0` for 5m
 Owner: Platform / SRE (BLO-22094)
 
 ### The invariant, and why it needed a second alert rather than reusing the one above
@@ -247,6 +250,45 @@ dead scheduler.
   exception specific to this row (e.g. a promotion attempt repeatedly
   throwing before it can `UPDATE`) rather than a fleet-wide scheduler fault.
 
+### When the overdue refresh-failure alert fires
+
+`PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed` means the scrape-time
+database refresh behind this gauge threw. It does **not** mean no row is
+overdue — it means nobody knows.
+
+Read it as a **detector outage, not an all-clear.** The refresh only
+reset-then-sets on its success path, so a throw leaves the previous per-agent
+values frozen in the registry while `/metrics` keeps returning `200` (the
+rejection is swallowed into a `logger.warn` at `server/src/app.ts`). The frozen
+value is almost always `0` — the *healthy* reading — so an ungated
+`PaperclipOverdueScheduledRetry` would sit silently green on top of a dead
+detector. That is why the alert above carries the
+`and on(instance) (... == 1)` gate, and why this alert exists to page when the
+gate closes.
+
+Note this fires **independently of** `PaperclipQueuedRunAgeMetricsRefreshFailed`.
+The two refreshes run different aggregates behind different indexes (`0217`
+covers `status='queued'`; `0224` covers the overdue-parked predicate), so a
+statement timeout or plan regression can hit one and not the other. A healthy
+`paperclip_queued_run_age_metrics_refresh_success` does **not** vouch for this
+one — check this series by name.
+
+1. Check Paperclip server logs for `failed to refresh
+   overdue-scheduled-retry-age metrics before scrape`; the `err` field carries
+   the database error.
+2. Check database connectivity and statement timeouts. If only this refresh is
+   failing while the sibling is healthy, suspect the `0224` partial index —
+   confirm `heartbeat_runs_overdue_scheduled_retry_idx` is `valid` in
+   `pg_index`, since an invalid index left behind by a failed
+   `CREATE INDEX CONCURRENTLY` makes the planner fall back to a sequential
+   scan over ~219k rows.
+3. Recovery is automatic on the next successful scrape — the gauge returns to
+   `paperclip_overdue_scheduled_retry_age_metrics_refresh_success 1`.
+
+Do not silence this to quiet the page: silencing it while the gate is closed
+leaves the overdue detector dead *and* mute, which is the exact failure this
+whole section exists to prevent.
+
 ### Silencing
 
 `severity: warning`. As with `PaperclipQueuedRunStranded`, silence on the
@@ -262,12 +304,17 @@ it margins off the worst single day's max rather than the aggregate p99).
 
 ```
 paperclip_overdue_scheduled_retry_oldest_age_seconds
+paperclip_overdue_scheduled_retry_age_metrics_refresh_success
 ```
 
 Zero-initialized per known agent on every `/metrics` scrape (reset-then-set,
 see `setOverdueScheduledRetryAgeMetrics`), same contract as
 `paperclip_queued_run_oldest_age_seconds` above — a healthy fleet renders **0**
 per agent, not "No data".
+
+Read the two together, exactly as with the queued pair above: the age series is
+only meaningful while the refresh series reads `1`. A `0` age under a `0`
+refresh is a stale snapshot, not an idle fleet.
 
 Same onprem-k8s lockstep caveat as the section above applies here too: the
 chart copy at `deploy/helm/paperclip/templates/prometheusrule.yaml` does not

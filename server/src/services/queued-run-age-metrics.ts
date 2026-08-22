@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import {
   setOverdueScheduledRetryAgeMetrics,
+  setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setQueuedRunOldestAgeMetrics,
 } from "./metrics.js";
@@ -89,27 +90,45 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
  * Same "query every agent id, reset-then-set" shape as
  * {@link refreshQueuedRunAgeMetrics} so an agent with no overdue parked row
  * reads back an explicit 0 rather than an absent series.
+ *
+ * Failure handling mirrors the sibling, and matters more here (Ally review,
+ * #1184): the reset-then-set only runs on the success path, so a throw leaves
+ * the previous per-agent values frozen while `/metrics` still returns 200.
+ * The frozen value is almost always `0` -- the healthy reading -- so without
+ * the companion freshness gauge a dead refresh is indistinguishable from a
+ * quiet fleet, which is the exact invisible-failure mode this detector exists
+ * to eliminate.
  */
 export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new Date()): Promise<void> {
-  const [agentRows, oldestByAgent] = await Promise.all([
-    db.select({ id: agents.id }).from(agents),
-    db
-      .select({
-        agentId: heartbeatRuns.agentId,
-        oldestDueAt: sql<Date | string | null>`min(${heartbeatRuns.scheduledRetryAt})`,
-      })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lt(heartbeatRuns.scheduledRetryAt, now)))
-      .groupBy(heartbeatRuns.agentId),
-  ]);
+  try {
+    const [agentRows, oldestByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          oldestDueAt: sql<Date | string | null>`min(${heartbeatRuns.scheduledRetryAt})`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lt(heartbeatRuns.scheduledRetryAt, now)))
+        .groupBy(heartbeatRuns.agentId),
+    ]);
 
-  const knownAgentIds = new Set(agentRows.map((row) => row.id));
-  const entries = oldestByAgent
-    .filter((row) => row.agentId !== null && row.oldestDueAt)
-    .map((row) => ({
-      agentId: row.agentId,
-      ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestDueAt as Date | string).getTime()) / 1000),
-    }));
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    const entries = oldestByAgent
+      .filter((row) => row.agentId !== null && row.oldestDueAt)
+      .map((row) => ({
+        agentId: row.agentId,
+        ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestDueAt as Date | string).getTime()) / 1000),
+      }));
 
-  setOverdueScheduledRetryAgeMetrics(entries, knownAgentIds);
+    setOverdueScheduledRetryAgeMetrics(entries, knownAgentIds);
+    setOverdueScheduledRetryAgeMetricsRefreshSuccess(true);
+  } catch (error) {
+    // Do not zero the gauge here: synthetic zeros would read as "no overdue
+    // parked rows", the healthy state, and hide a real wedge. Leave the last
+    // snapshot in place and let the freshness gauge disqualify it -- the alert
+    // is gated on that gauge, and its own refresh-failed alert pages instead.
+    setOverdueScheduledRetryAgeMetricsRefreshSuccess(false);
+    throw error;
+  }
 }
