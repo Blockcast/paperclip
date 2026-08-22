@@ -556,6 +556,8 @@ async function listIssueLinkedCases(db: Db, companyId: string, issueId: string) 
     .where(and(
       eq(pipelineCaseIssueLinks.companyId, companyId),
       eq(pipelineCaseIssueLinks.issueId, issueId),
+      isNull(pipelineCaseIssueLinks.retiredAt),
+      eq(pipelineCaseIssueLinks.attachmentState, "attached"),
       eq(pipelineCases.companyId, companyId),
       eq(pipelines.companyId, companyId),
     ));
