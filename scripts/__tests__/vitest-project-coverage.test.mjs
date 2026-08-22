@@ -134,8 +134,17 @@ test("every driver project name resolves to a real workspace package", () => {
 // the bug. A package in NEITHER list is invisible to it, because the sweep only
 // ever iterates over vitest.config.ts. That is the exact shape BLO-20076 was
 // filed for ("packages/mcp-server sat in neither list") and the exact shape
-// that recurred: packages/mcp-gateway shipped 6 suites / 269 tests, including
-// the k8s MCP secret scrubber's, and no CI lane ran a single one of them.
+// that recurred: packages/mcp-gateway sat in neither list, so no CI lane ran a
+// single one of the 4 suites / 106 tests it owns on this tree (circuit-breaker,
+// server, session-keepalive, upstreams -- verified executing as of this commit).
+//
+// The k8s MCP secret scrubber's own suite is NOT among them: response-scrub.ts
+// and its test land with #1449 and are not on master yet. Wiring the package
+// here is precisely what makes that suite execute the moment it merges, rather
+// than arriving into the same silence. Do not read this test as evidence the
+// scrubber is currently covered -- it is not, and PEN-2491 stays open for the
+// separate reason that pr.yml is `pull_request: branches: [master]`, so #1449
+// itself still merges into its stack branch with no package tests run at all.
 //
 // So the authority for "does this package need to be executed?" cannot be
 // either list. It has to be the filesystem: a package that owns test files is
@@ -278,9 +287,11 @@ test("every workspace package that owns test files is executed by a CI lane", ()
 
 test("packages/mcp-gateway is wired into both lists", () => {
   // Regression lock for PEN-2491, mirroring the BLO-20076 lock above. The
-  // gateway is the agent-facing k8s MCP proxy: response-scrub.test.ts is the
-  // test for a secret-redaction control, so "green but never executed" is a
-  // security signal failure, not just a coverage gap.
+  // gateway is the agent-facing k8s MCP proxy, and the incoming
+  // response-scrub.test.ts (#1449) will test a secret-redaction control, so
+  // "green but never executed" is a security signal failure here, not just a
+  // coverage gap. This lock keeps the package wired so that suite runs on
+  // arrival.
   assert.ok(
     readConfiguredProjectDirs().includes("packages/mcp-gateway"),
     "packages/mcp-gateway must stay in the vitest.config.ts projects array",
