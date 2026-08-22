@@ -187,6 +187,11 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   listManagedAgentJobs: mockListManagedAgentJobs,
   listManagedAgentPods: mockListManagedAgentPods,
   deleteAgentPodExact: mockDeleteAgentPodExact,
+  // BLO-20251: this mock is an exhaustive stub (no `...actual` spread), so any
+  // new export the reaper calls must be listed or it arrives as `undefined` and
+  // the call throws. "unknown" = no pod-CPU evidence, which is the fail-closed
+  // branch that keeps the hard-stale kill these tests assert on.
+  probeAgentPodActivity: vi.fn(async () => "unknown" as const),
   indexUniqueAgentJobRunStatuses: (jobs: Array<{
     runId: string | null;
     name: string;
