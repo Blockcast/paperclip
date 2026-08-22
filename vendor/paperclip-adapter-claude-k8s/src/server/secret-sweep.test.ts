@@ -3,8 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ADAPTER_TYPE_LABEL,
   createSweepGate,
+  DEFAULT_LAUNCH_LEASE_SEC,
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   deriveOwningJobName,
+  LAUNCH_LEASE_ANNOTATION,
+  launchLeaseExpiry,
   MANAGED_BY_LABEL,
   RUN_ID_LABEL,
   sweepOrphanedRunSecrets,
@@ -22,6 +25,8 @@ function secret(
     owned?: boolean;
     deleting?: boolean;
     creationTimestamp?: Date | string;
+    /** Value for the launch-lease annotation; omit for a pre-lease Secret. */
+    lease?: string;
   } = {},
 ): { metadata: SecretSweepObjectMeta } {
   const labels: Record<string, string> = {
@@ -30,6 +35,9 @@ function secret(
   };
   if (opts.runId !== null) labels[RUN_ID_LABEL] = opts.runId ?? "run-abc";
   const metadata: SecretSweepObjectMeta = { name, labels };
+  if (opts.lease !== undefined) {
+    metadata.annotations = { [LAUNCH_LEASE_ANNOTATION]: opts.lease };
+  }
   if (opts.owned) {
     metadata.ownerReferences = [{ apiVersion: "batch/v1", kind: "Job", name: "ac-x", uid: "u1" }];
   }
@@ -50,15 +58,28 @@ function job(name: string, runId?: string | null): { metadata: SecretSweepObject
   return { metadata: { name, labels } };
 }
 
+/** What the API server returns for a Job that is not there. */
+function notFound(): Error & { code: number } {
+  return Object.assign(new Error("jobs.batch \"x\" not found"), { code: 404 });
+}
+
 function harness(
   secrets: { metadata: SecretSweepObjectMeta }[],
   jobs: { metadata: SecretSweepObjectMeta }[] = [],
   deleteImpl?: (req: { name: string; namespace: string }) => Promise<unknown>,
+  readImpl?: (req: { name: string; namespace: string }) => Promise<unknown>,
 ) {
   const deleted: string[] = [];
   const logs: { stream: string; message: string }[] = [];
   const listNamespacedSecret = vi.fn(async () => ({ items: secrets }));
   const listNamespacedJob = vi.fn(async () => ({ items: jobs }));
+  // Default: agree with the list snapshot, so the pre-delete re-read confirms
+  // absence for anything the snapshot did not show.
+  const readNamespacedJob = vi.fn(async (req: { name: string; namespace: string }) => {
+    if (readImpl) return readImpl(req);
+    if (jobs.some((j) => j.metadata.name === req.name)) return {};
+    throw notFound();
+  });
   const deleteNamespacedSecret = vi.fn(async (req: { name: string; namespace: string }) => {
     if (deleteImpl) return deleteImpl(req);
     deleted.push(req.name);
@@ -69,11 +90,12 @@ function harness(
     logs,
     listNamespacedSecret,
     listNamespacedJob,
+    readNamespacedJob,
     deleteNamespacedSecret,
     opts: {
       namespace: "paperclip",
       coreApi: { listNamespacedSecret, deleteNamespacedSecret },
-      batchApi: { listNamespacedJob },
+      batchApi: { listNamespacedJob, readNamespacedJob },
       onLog: (stream: string, message: string) => {
         logs.push({ stream, message });
       },
@@ -114,6 +136,114 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
     // No candidates => the Job list is never even fetched.
     expect(h.listNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  // BLO-21857 review follow-up (PR #1459, allyblockcast[bot]): the age floor
+  // does not bound the launch window, and a single Job-list snapshot can be
+  // stale by the time the delete runs. Both are live-credential-loss paths, so
+  // both get a test.
+  it("does not collect a Secret whose launch lease has not expired, however old it is", async () => {
+    // A launch wedged well past the age floor — a slow or retrying K8s API call
+    // between createNamespacedSecret and createNamespacedJob. Nothing in
+    // execute.ts bounds that gap, so age alone must not authorise a delete.
+    const h = harness([
+      secret("ac-agent-run-slow-prompt", {
+        runId: "run-slow",
+        ageSec: 600,
+        lease: new Date(NOW + 300_000).toISOString(),
+      }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([
+      { name: "ac-agent-run-slow-prompt", reason: "launch_in_flight" },
+    ]);
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  it("collects a Secret whose launch lease has expired", async () => {
+    // Same Secret, lease now in the past: the launch that claimed it is gone.
+    const h = harness([
+      secret("ac-agent-run-dead-prompt", {
+        runId: "run-dead",
+        ageSec: 3600,
+        lease: new Date(NOW - 1_000).toISOString(),
+      }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual(["ac-agent-run-dead-prompt"]);
+  });
+
+  it("treats an unparseable launch lease as a live launch rather than ignoring it", async () => {
+    const h = harness([
+      secret("ac-agent-run-junk-prompt", { runId: "run-junk", ageSec: 3600, lease: "not-a-date" }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([
+      { name: "ac-agent-run-junk-prompt", reason: "launch_in_flight" },
+    ]);
+  });
+
+  it("re-reads the Job before deleting, so one created after the list snapshot is honoured", async () => {
+    // The cross-replica race: replica A's createNamespacedJob lands between this
+    // sweep's Job list and its delete. The snapshot says no Job; the point read
+    // says otherwise, and the point read wins.
+    const h = harness(
+      [secret("ac-agent-run-racy-prompt", { runId: "run-racy", ageSec: 3600 })],
+      [],
+      undefined,
+      async () => ({ metadata: { name: "ac-agent-run-racy" } }),
+    );
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([{ name: "ac-agent-run-racy-prompt", reason: "unverifiable" }]);
+    expect(h.readNamespacedJob).toHaveBeenCalledWith({
+      name: "ac-agent-run-racy",
+      namespace: "paperclip",
+    });
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  it("keeps the Secret when the pre-delete re-read fails for any reason but 404", async () => {
+    // Throttling, a timeout, an RBAC change. We do not know the Job is gone, and
+    // not knowing is not grounds for deleting a credential.
+    const h = harness(
+      [secret("ac-agent-run-throttled-prompt", { runId: "run-throttled", ageSec: 3600 })],
+      [],
+      undefined,
+      async () => {
+        throw Object.assign(new Error("too many requests"), { code: 429 });
+      },
+    );
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([
+      { name: "ac-agent-run-throttled-prompt", reason: "unverifiable" },
+    ]);
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  it("retains a run Secret whose name yields no Job to re-read", async () => {
+    // No derivable Job name means absence can never be proven, so the snapshot
+    // alone must not authorise a delete.
+    const h = harness([secret("ac-agent-run-oddname", { runId: "run-odd", ageSec: 3600 })]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([{ name: "ac-agent-run-oddname", reason: "unverifiable" }]);
+    expect(h.readNamespacedJob).not.toHaveBeenCalled();
   });
 
   it("leaves a Secret alone while a Job with its run-id still exists", async () => {
@@ -235,8 +365,21 @@ describe("sweepOrphanedRunSecrets", () => {
   });
 });
 
-describe("deriveOwningJobName", () => {
-  it("strips each known run-Secret suffix", () => {
+describe("launchLeaseExpiry", () => {
+  it("stamps a lease the sweep reads back as still in flight", async () => {
+    const lease = launchLeaseExpiry(NOW);
+    expect(Date.parse(lease)).toBe(NOW + DEFAULT_LAUNCH_LEASE_SEC * 1000);
+
+    // Round-trip: a Secret stamped by execute.ts at NOW, judged by a sweep one
+    // age-floor later, is still protected.
+    const h = harness([secret("ac-agent-run-rt-prompt", { runId: "run-rt", lease })]);
+    const result = await sweepOrphanedRunSecrets({ ...h.opts, now: NOW + AGE_FLOOR_MS + 1 });
+
+    expect(result.retained).toEqual([{ name: "ac-agent-run-rt-prompt", reason: "launch_in_flight" }]);
+  });
+});
+
+describe("deriveOwningJobName", () => {  it("strips each known run-Secret suffix", () => {
     expect(deriveOwningJobName("ac-agent-run-abc-prompt")).toBe("ac-agent-run-abc");
     expect(deriveOwningJobName("ac-agent-run-abc-env")).toBe("ac-agent-run-abc");
     expect(deriveOwningJobName("ac-agent-run-abc-mcp")).toBe("ac-agent-run-abc");

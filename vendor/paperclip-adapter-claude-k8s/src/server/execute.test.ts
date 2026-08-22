@@ -1496,6 +1496,11 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
     mockBatchListJobs.mockResolvedValue({ items: [] });
+    // Default for this block: the API server confirms the derived Job is gone,
+    // which is what lets the sweep act. Individual tests override.
+    mockBatchReadJob.mockRejectedValue(
+      Object.assign(new Error("jobs.batch not found"), { code: 404 }),
+    );
     mockCoreDeleteSecret.mockResolvedValue({});
   });
 
@@ -1526,7 +1531,44 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
       labelSelector:
         "app.kubernetes.io/managed-by=paperclip,paperclip.io/adapter-type=claude_k8s,paperclip.io/run-id",
     });
+    // The pre-delete point read is what authorises the delete: the list snapshot
+    // alone is never enough (PR #1459 review).
+    expect(mockBatchReadJob).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan",
+      namespace: "paperclip",
+    });
     expect(mockCoreDeleteSecret).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan-prompt",
+      namespace: "paperclip",
+    });
+  });
+
+  it("does not collect an ownerless run Secret whose Job the API server still reports", async () => {
+    // Same Secret, but the point read finds the Job — a launch that created it
+    // after the sweep's list snapshot. Deleting here would strip a live run's
+    // credentials.
+    vi.resetModules();
+    mockCoreListSecrets.mockResolvedValue({
+      items: [
+        {
+          metadata: {
+            name: "ac-agent-run-orphan-prompt",
+            labels: {
+              "app.kubernetes.io/managed-by": "paperclip",
+              "paperclip.io/adapter-type": "claude_k8s",
+              "paperclip.io/run-id": "run-orphan",
+            },
+            creationTimestamp: new Date(Date.now() - 3_600_000),
+          },
+        },
+      ],
+    });
+    mockBatchReadJob.mockResolvedValue({ metadata: { name: "ac-agent-run-orphan" } });
+
+    const { execute: freshExecute } = await import("./execute.js");
+    await freshExecute(makeCtx()).catch(() => {});
+
+    expect(mockCoreDeleteSecret).not.toHaveBeenCalledWith({
       name: "ac-agent-run-orphan-prompt",
       namespace: "paperclip",
     });

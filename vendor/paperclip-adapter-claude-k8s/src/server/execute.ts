@@ -14,8 +14,11 @@ import {
   ADAPTER_TYPE,
   ADAPTER_TYPE_LABEL,
   createSweepGate,
+  DEFAULT_LAUNCH_LEASE_SEC,
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   DEFAULT_SWEEP_INTERVAL_SEC,
+  LAUNCH_LEASE_ANNOTATION,
+  launchLeaseExpiry,
   MANAGED_BY_LABEL,
   RUN_ID_LABEL,
 } from "./secret-sweep.js";
@@ -1479,6 +1482,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     envSecret = built.envSecret;
     mcpConfigSecret = built.mcpConfigSecret;
     podLogPath = built.podLogPath;
+    // Stamped on every run Secret below, so the orphan sweep — in this replica
+    // or any other — can tell a launch in flight from one that died before it
+    // could set an ownerReference (BLO-21857).  Taken once so all three Secrets
+    // share a deadline.
+    const launchLease = launchLeaseExpiry(
+      Date.now(),
+      Math.max(0, asNumber(config.orphanSecretLaunchLeaseSec, DEFAULT_LAUNCH_LEASE_SEC)) * 1000,
+    );
     await onLog("stdout", `[paperclip] Resolved ServiceAccount: ${built.serviceAccountName}\n`);
     if (built.skippedLabels.length > 0) {
       await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
@@ -1521,6 +1532,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE,
                 [RUN_ID_LABEL]: runId,
               },
+              annotations: { [LAUNCH_LEASE_ANNOTATION]: launchLease },
             },
             stringData: promptSecret.data,
           },
@@ -1558,6 +1570,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE,
                 [RUN_ID_LABEL]: runId,
               },
+              annotations: { [LAUNCH_LEASE_ANNOTATION]: launchLease },
             },
             stringData: envSecret.data,
           },
@@ -1598,6 +1611,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE,
                 [RUN_ID_LABEL]: runId,
               },
+              annotations: { [LAUNCH_LEASE_ANNOTATION]: launchLease },
             },
             stringData: mcpConfigSecret.data,
           },

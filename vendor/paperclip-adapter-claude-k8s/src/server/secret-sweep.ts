@@ -18,13 +18,29 @@
  *   1. It is labelled as ours (`managed-by=paperclip`, `adapter-type=claude_k8s`)
  *      and carries a non-empty `paperclip.io/run-id`.
  *   2. It has zero `ownerReferences` — an owned Secret is normal GC's business.
- *   3. It is older than the age floor, so a Secret created moments before its
- *      Job can never be collected mid-launch.
- *   4. No Job appears to own it, by *either* of two independent checks — the
+ *   3. Its launch lease (`paperclip.io/launch-expires-at`) has expired, so a
+ *      launch still in flight can never have its credentials collected out from
+ *      under it.
+ *   4. It is older than the age floor.  Redundant for any Secret this adapter
+ *      creates — the lease in 3 already covers those — but load-bearing for
+ *      Secrets written before the lease existed, which carry no annotation.
+ *   5. No Job appears to own it, by *either* of two independent checks — the
  *      run-id label, or the `<jobName>-<suffix>` name convention.  Only one has
- *      to say "a Job exists" for the Secret to be left alone.
+ *      to say "a Job exists" for the Secret to be left alone.  The name-derived
+ *      Job is then re-read directly from the API server immediately before the
+ *      delete, so a Job created after the list snapshot still saves its Secret.
  *
- * Check 4 is doubled on purpose.  The Secret's run-id label is the *raw* runId
+ * Checks 3 and 5 are what make this safe under concurrency, and they are
+ * deliberately of different kinds.  5 asks "is there a Job?", which is only ever
+ * a snapshot — between any observation and the delete that follows it, a launch
+ * can create the Job we just failed to see.  Re-reading narrows that window but
+ * cannot close it.  3 instead asks the *launching* replica to say, on the Secret
+ * itself, how long it intends to be launching; until that deadline passes no
+ * observer may collect the Secret no matter what the Job list says.  Because the
+ * claim rides on the object, it holds across control-plane replicas, which a
+ * process-local interval gate cannot do.
+ *
+ * Check 5 is doubled on purpose.  The Secret's run-id label is the *raw* runId
  * (execute.ts), while the Job's is `sanitizeLabelValue(runId)`, which strips
  * characters outside `[a-zA-Z0-9._-]`, truncates to 63 chars, and is omitted
  * entirely when that yields nothing.  Those agree for every Secret that can
@@ -41,16 +57,45 @@ export const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
 export const ADAPTER_TYPE_LABEL = "paperclip.io/adapter-type";
 export const ADAPTER_TYPE = "claude_k8s";
 
+/**
+ * Set at Secret creation to an RFC 3339 instant by which the launching replica
+ * expects to have created the Job and patched the owner reference.  The sweep
+ * treats a Secret whose lease has not yet expired as belonging to a live
+ * launch.  Riding on the object is the point: it is visible to every replica,
+ * needs no shared state, and cannot be invalidated by a stale list snapshot.
+ */
+export const LAUNCH_LEASE_ANNOTATION = "paperclip.io/launch-expires-at";
+
 /** Suffixes appended to `jobName` to name each run Secret (job-manifest.ts). */
 export const RUN_SECRET_SUFFIXES = ["-prompt", "-env", "-mcp"] as const;
 
 export const DEFAULT_SWEEP_INTERVAL_SEC = 300;
 /**
- * Secret-create and Job-create are adjacent awaits in one call path; the only
- * intervening I/O is the K8s API calls themselves, each bounded by the 15s
- * concurrency-guard timeout.  120s is a wide margin over that worst case.
+ * How long a launch may hold its Secrets before the sweep is allowed to judge
+ * them abandoned.  Sized as a bound on "no longer plausibly launching", not on
+ * the happy path: the three Secret creates and the Job create are bare awaits
+ * on the K8s API, so nothing in the code bounds the gap between them — an
+ * earlier revision of this file claimed the 15s concurrency-guard timeout did,
+ * but that guard wraps only the pre-launch Job lookup (execute.ts), not these
+ * calls.  A launch that has not produced a Job in 15 minutes is wedged, not
+ * slow, and its Pod would have been declared unschedulable long before.
+ */
+export const DEFAULT_LAUNCH_LEASE_SEC = 900;
+/**
+ * Floor on Secret age, independent of the lease.  Only reachable for Secrets
+ * created before `LAUNCH_LEASE_ANNOTATION` existed (which carry no lease and
+ * would otherwise be judged on the Job check alone) — for anything this adapter
+ * writes now, the longer lease always dominates.
  */
 export const DEFAULT_SWEEP_AGE_FLOOR_SEC = 120;
+
+/**
+ * The lease instant to stamp on a Secret created at `now`.  Exported so
+ * execute.ts and the sweep cannot disagree about the annotation's format.
+ */
+export function launchLeaseExpiry(now: number, leaseMs?: number): string {
+  return new Date(now + (leaseMs ?? DEFAULT_LAUNCH_LEASE_SEC * 1000)).toISOString();
+}
 
 type LogStream = "stdout" | "stderr";
 type LogFn = (stream: LogStream, message: string) => void | Promise<void>;
@@ -62,6 +107,7 @@ type LogFn = (stream: LogStream, message: string) => void | Promise<void>;
 export interface SecretSweepObjectMeta {
   name?: string;
   labels?: { [key: string]: string };
+  annotations?: { [key: string]: string };
   ownerReferences?: unknown[];
   creationTimestamp?: Date | string;
   deletionTimestamp?: Date | string;
@@ -78,6 +124,12 @@ export interface SecretSweepBatchApi {
   listNamespacedJob(req: { namespace: string; labelSelector?: string }): Promise<{
     items: { metadata?: SecretSweepObjectMeta }[];
   }>;
+  /**
+   * Point read used to re-confirm absence immediately before a delete.  Rejects
+   * when the Job does not exist; the sweep treats *any* rejection as "cannot
+   * prove it is gone" and keeps the Secret.
+   */
+  readNamespacedJob(req: { name: string; namespace: string }): Promise<unknown>;
 }
 
 export interface SweepOptions {
@@ -99,7 +151,10 @@ export interface SweepResult {
   /** Names of Secrets successfully deleted. */
   swept: string[];
   /** Names of Secrets examined but deliberately left alone, with the reason. */
-  retained: { name: string; reason: "owned" | "too_young" | "job_exists" | "no_run_id" }[];
+  retained: {
+    name: string;
+    reason: "owned" | "too_young" | "launch_in_flight" | "job_exists" | "no_run_id" | "unverifiable";
+  }[];
   /** Names of Secrets we tried and failed to delete (non-fatal). */
   failed: { name: string; error: string }[];
 }
@@ -122,6 +177,43 @@ function toMillis(value: Date | string | undefined): number | null {
   if (!value) return null;
   const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
   return Number.isFinite(ms) ? ms : null;
+}
+
+/** HTTP status carried by a rejected `@kubernetes/client-node` request, if any. */
+function errorStatusCode(err: unknown): number | null {
+  if (typeof err !== "object" || err === null) return null;
+  for (const key of ["code", "statusCode", "status"] as const) {
+    const value = (err as Record<string, unknown>)[key];
+    if (typeof value === "number") return value;
+  }
+  const body = (err as { body?: unknown }).body;
+  if (typeof body === "object" && body !== null) {
+    const code = (body as { code?: unknown }).code;
+    if (typeof code === "number") return code;
+  }
+  return null;
+}
+
+/**
+ * True only when the API server positively reports the Job as gone (404).  A
+ * successful read means it is back and its Secret must be kept; any other error
+ * — throttling, timeout, RBAC, a client that predates `readNamespacedJob` —
+ * means we do not know, and not knowing is not grounds for deleting a
+ * credential.  Both of those return false.
+ */
+async function confirmJobAbsent(args: {
+  batchApi: SecretSweepBatchApi;
+  namespace: string;
+  name: string;
+}): Promise<boolean> {
+  const { batchApi, namespace, name } = args;
+  if (typeof batchApi.readNamespacedJob !== "function") return false;
+  try {
+    await batchApi.readNamespacedJob({ name, namespace });
+    return false;
+  } catch (err) {
+    return errorStatusCode(err) === 404;
+  }
 }
 
 /**
@@ -167,6 +259,20 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
       result.retained.push({ name, reason: "too_young" });
       continue;
     }
+    // A lease still in the future means a replica — possibly not this one — is
+    // mid-launch and expects to own this Secret shortly.  An unparseable lease
+    // is honoured as "in flight" rather than ignored: the failure mode of
+    // waiting is a delayed cleanup, the failure mode of guessing is deleting a
+    // live credential.  A missing lease falls through to the Job checks, which
+    // is how pre-lease orphans still get collected.
+    const lease = secret.metadata?.annotations?.[LAUNCH_LEASE_ANNOTATION];
+    if (lease !== undefined) {
+      const leaseMs = toMillis(lease);
+      if (leaseMs === null || now < leaseMs) {
+        result.retained.push({ name, reason: "launch_in_flight" });
+        continue;
+      }
+    }
     candidates.push({ name, runId, ageMs: now - createdMs });
   }
 
@@ -195,6 +301,26 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
       (owningJobName !== null && liveJobNames.has(owningJobName))
     ) {
       result.retained.push({ name: candidate.name, reason: "job_exists" });
+      continue;
+    }
+    // The list above is a snapshot; a Job created since is exactly the case we
+    // must not delete through.  Re-read the one Job this Secret names, so the
+    // extra call is paid once per actual orphan rather than per Secret.  A read
+    // that resolves *or* fails for any reason other than a definite 404 leaves
+    // the Secret alone — absence has to be proven, not assumed.  A name we
+    // cannot map to a Job at all is unprovable by construction, so it is
+    // retained and left to the dashboard rather than deleted on the snapshot.
+    if (owningJobName === null) {
+      result.retained.push({ name: candidate.name, reason: "unverifiable" });
+      continue;
+    }
+    const stillAbsent = await confirmJobAbsent({
+      batchApi,
+      namespace,
+      name: owningJobName,
+    });
+    if (!stillAbsent) {
+      result.retained.push({ name: candidate.name, reason: "unverifiable" });
       continue;
     }
     try {
