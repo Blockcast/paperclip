@@ -39,6 +39,7 @@ const nonServerProjects = [
   "@paperclipai/create-paperclip-plugin",
   "@paperclipai/mcp-external",
   "@paperclipai/mcp-server",
+  "@paperclipai/mcp-gateway",
   "@paperclipai/ui",
   "paperclipai",
 ];
