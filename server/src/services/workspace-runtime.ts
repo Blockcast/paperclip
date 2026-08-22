@@ -4344,6 +4344,27 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     projectWorkspaceCwd: input.projectWorkspace?.cwd ?? null,
   });
   const createdByRuntime = input.workspace.metadata?.createdByRuntime === true;
+  const inspectDirtyWorktree = async () => {
+    if (input.workspace.providerType !== "git_worktree" || !workspacePath || !(await directoryExists(workspacePath))) {
+      return null;
+    }
+    if (!repoRoot) {
+      return `Refusing to clean up git worktree "${workspacePath}": its repository root could not be resolved.`;
+    }
+    try {
+      const status = await runGit(["status", "--porcelain", "--untracked-files=all"], workspacePath);
+      if (status.trim()) {
+        return `Refusing to clean up git worktree "${workspacePath}": it contains uncommitted changes.`;
+      }
+    } catch (error) {
+      return `Refusing to clean up git worktree "${workspacePath}": cleanliness could not be verified (${error instanceof Error ? error.message : String(error)}).`;
+    }
+    return null;
+  };
+  const initialDirtyWarning = await inspectDirtyWorktree();
+  if (initialDirtyWarning) {
+    return { cleanedPath: workspacePath, cleaned: false, warnings: [initialDirtyWarning] };
+  }
   const cleanupCommands = [
     input.cleanupCommand ?? null,
     input.projectWorkspace?.cleanupCommand ?? null,
@@ -4376,6 +4397,15 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     } catch (err) {
       warnings.push(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  if (warnings.length > 0) {
+    return { cleanedPath: workspacePath, cleaned: false, warnings };
+  }
+
+  const finalDirtyWarning = await inspectDirtyWorktree();
+  if (finalDirtyWarning) {
+    return { cleanedPath: workspacePath, cleaned: false, warnings: [finalDirtyWarning] };
   }
 
   if (input.workspace.providerType === "git_worktree" && workspacePath) {

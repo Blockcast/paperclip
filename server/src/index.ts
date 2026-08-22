@@ -56,6 +56,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { collectDueExecutionWorkspaces } from "./services/execution-workspace-cleanup.js";
 import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
@@ -1268,6 +1269,15 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup stale-lock sweeper failed");
         }
 
+        try {
+          const swept = await collectDueExecutionWorkspaces({ db });
+          if (swept.claimed > 0 || swept.failed > 0) {
+            logger.warn({ ...swept }, "startup execution-workspace cleanup sweep processed due workspaces");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup execution-workspace cleanup sweep failed");
+        }
+
         // BLO-21621: terminalize queued runs whose issue lock has already
         // moved on or gone empty, so a detached run cannot sit invisible to
         // every other recovery sweep indefinitely.
@@ -1370,6 +1380,22 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+          // Destructive: removes worktrees from disk. Must stay inside the suppression
+          // gate alongside every other destructive sweep in this tick. A seeded worktree
+          // dev instance copies `execution_workspaces` verbatim, with cwd/providerRef
+          // still pointing at the source instance's live worktrees on the same
+          // filesystem, and the ownership tokens match — so suppression is the only
+          // thing standing between this sweep and a clone deleting live trees.
+          trackHeartbeatSchedulerWork(collectDueExecutionWorkspaces({ db })
+            .then((swept) => {
+              if (swept.claimed > 0 || swept.failed > 0) {
+                logger.warn({ ...swept }, "periodic execution-workspace cleanup sweep processed due workspaces");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic execution-workspace cleanup sweep failed");
+            }));
+
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {

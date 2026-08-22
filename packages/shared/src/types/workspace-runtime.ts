@@ -30,6 +30,7 @@ export type ExecutionWorkspaceStatus =
   | "active"
   | "idle"
   | "in_review"
+  | "cleanup_pending"
   | "archived"
   | "cleanup_failed";
 
