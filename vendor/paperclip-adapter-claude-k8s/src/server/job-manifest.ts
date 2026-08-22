@@ -458,6 +458,56 @@ export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): st
 }
 
 /**
+ * Env var names the adapter deliberately re-asserts as literals *after*
+ * buildEnvVars() has returned (currently only the DinD sidecar's DOCKER_HOST
+ * wiring). They are adapter-owned values, not operator secrets, so they are
+ * excluded from operator-owned classification below — otherwise an operator
+ * who set the same key in adapterConfig.env would get both a secretKeyRef and
+ * a literal for one name, and the fail-closed guard would fire on the
+ * adapter's own write.
+ */
+const ADAPTER_REASSERTED_ENV_NAMES = new Set(["DOCKER_HOST"]);
+
+/**
+ * Default-deny guard for operator-supplied env (BLO-22546).
+ *
+ * `findLiteralSensitiveEnvVarsInPodSpec` only knows the *name pattern*, so it
+ * cannot see a leak through a key the pattern does not match — `PENSTOCK_BOARD`,
+ * `GH_PAT` and `FOO_BAR` all sail past it. Everything in `adapterConfig.env` is
+ * operator-supplied and is overwhelmingly credential material, so at that layer
+ * the classification is default-deny regardless of key name: any operator key
+ * still carrying a literal `value` on the assembled spec is a build failure.
+ *
+ * `operatorKeys` must be the set that actually survived the merge (see
+ * buildEnvVars) — adapter-owned overrides of the same key stay literal and are
+ * intentionally not flagged here.
+ *
+ * Returns `container/ENV_NAME` so the failure names the offending container.
+ */
+export function findLiteralOperatorEnvVarsInPodSpec(
+  podSpec: k8s.V1PodSpec,
+  operatorKeys: ReadonlySet<string>,
+): string[] {
+  if (operatorKeys.size === 0) return [];
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((c) =>
+    (c.env ?? [])
+      .filter(
+        (e) =>
+          e.name &&
+          operatorKeys.has(e.name) &&
+          typeof e.value === "string" &&
+          e.value.length > 0,
+      )
+      .map((e) => `${c.name || "<unnamed>"}/${e.name}`),
+  );
+}
+
+/**
  * Defense-in-depth backstop for the inheritance allowlist (BLO-22514).
  *
  * The primary control is in `getSelfPodInfo()`, which filters the server pod's
@@ -563,7 +613,7 @@ function buildEnvVars(
   config: Record<string, unknown>,
   isolation: JobIsolation,
   envSecretName: string,
-): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string> } {
+): { envVars: k8s.V1EnvVar[]; sensitiveEnvData: Record<string, string>; operatorOwnedKeys: Set<string> } {
   const { runId, agent, context } = ctx;
   const envConfig = parseObject(config.env);
 
@@ -698,14 +748,42 @@ function buildEnvVars(
     if (!userEnvKeys.has(key)) merged[key] = value;
   }
 
-  // Convert literal env to V1EnvVar array. Names matching the sensitive
-  // pattern (isSensitiveEnvName) are routed to a Secret referenced via
-  // secretKeyRef instead of an inline literal `value`, so a read-only
-  // `GET Pod` on the Job never returns their contents (BLO-17980/BLO-17973).
+  // Operator-supplied keys whose value actually SURVIVED the merge above.
+  // Layer 4 is applied before the session-header, HOME/isolation and cache
+  // blocks, several of which overwrite unconditionally — so "the operator set
+  // this key" is not the same as "the operator's value is what ships". Only the
+  // latter is operator-owned; where the adapter won, the shipped value is the
+  // adapter's own non-secret path and stays a literal.
+  const operatorOwnedKeys = new Set(
+    Object.keys(envConfig).filter(
+      (key) =>
+        !ADAPTER_REASSERTED_ENV_NAMES.has(key) &&
+        typeof envConfig[key] === "string" &&
+        merged[key] === envConfig[key] &&
+        merged[key] !== "",
+    ),
+  );
+
+  // Convert literal env to V1EnvVar array. Two independent reasons to route a
+  // value into the Secret instead of an inline literal `value`, so a read-only
+  // `GET Pod` on the Job never returns it (BLO-17980/BLO-17973/BLO-22546):
+  //
+  //   1. the name matches the broad sensitive pattern (isSensitiveEnvName) —
+  //      applied to every layer, including inherited Deployment env; or
+  //   2. the value is operator-supplied via adapterConfig.env — default-deny
+  //      at that layer REGARDLESS of key name, because the name pattern cannot
+  //      recognise `PENSTOCK_BOARD`/`GH_PAT`/`FOO_BAR` and operator env is
+  //      almost entirely credentials. A false positive costs one secretKeyRef
+  //      indirection; a false negative is the BLO-22546 defect.
+  //
+  // The `&& value` guard is load-bearing in both branches: an empty value must
+  // stay a literal, or we would emit a secretKeyRef to a key that
+  // sensitiveEnvData never receives and the pod would fail to start with
+  // CreateContainerConfigError.
   const sensitiveEnvData: Record<string, string> = {};
   const envVars: k8s.V1EnvVar[] = [];
   for (const [name, value] of Object.entries(merged)) {
-    if (isSensitiveEnvName(name) && value) {
+    if ((isSensitiveEnvName(name) || operatorOwnedKeys.has(name)) && value) {
       sensitiveEnvData[name] = value;
       envVars.push({ name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } });
     } else {
@@ -723,7 +801,7 @@ function buildEnvVars(
     }
   }
 
-  return { envVars, sensitiveEnvData };
+  return { envVars, sensitiveEnvData, operatorOwnedKeys };
 }
 
 /**
@@ -966,7 +1044,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Build env vars. envSecretName is computed from jobName (already resolved
   // above) so sensitive-named vars can be wired to secretKeyRef in one pass.
   const envSecretName = `${jobName}-env`;
-  const { envVars, sensitiveEnvData } = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
+  const { envVars, sensitiveEnvData, operatorOwnedKeys } = buildEnvVars(ctx, selfPod, config, isolation, envSecretName);
   const envSecret: EnvSecret | null =
     Object.keys(sensitiveEnvData).length > 0 ? { name: envSecretName, namespace, data: sensitiveEnvData } : null;
 
@@ -1571,6 +1649,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   if (serverOnlyNames.length > 0) {
     throw new Error(
       `claude_k8s: refusing to build Job manifest — server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
+    );
+  }
+
+  // Fail-closed backstop for operator-supplied env (BLO-22546). The guard above
+  // only knows the sensitive NAME pattern, so it cannot catch a leak through an
+  // operator key the pattern does not match. Checked on the assembled spec for
+  // the same reason as the guards above: it covers every container, including
+  // ones added later. This is what makes the Layer-4 default-deny
+  // non-regressable rather than a convention a future edit can quietly undo.
+  const literalOperatorNames = findLiteralOperatorEnvVarsInPodSpec(job.spec!.template.spec!, operatorOwnedKeys);
+  if (literalOperatorNames.length > 0) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — operator-supplied adapterConfig.env var(s) would be injected as a literal value instead of secretKeyRef: ${literalOperatorNames.join(", ")}`,
     );
   }
 
