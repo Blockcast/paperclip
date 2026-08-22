@@ -151,6 +151,31 @@ jobs:
             ./.github/scripts/tests/check-production-environment-protection.test.mjs \
             ./.github/scripts/tests/post-environment-protection-alert.test.mjs
 
+      # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
+      # ONLY inside the scheduled `review-gate-sweep` job, where a non-zero exit
+      # is the deliberate stranded-PR alarm (EXIT_ALARM=1). That conflates two
+      # unrelated signals -- a test regression would read as "a PR is stranded"
+      # -- and lets a change to the reconciler merge without its 1013-line suite
+      # ever running at PR time. Running it here separates "the code under
+      # review is broken" from "a PR needs a human".
+      #
+      # `setup-python` explicitly rather than a bare `python3`: this job runs on
+      # `arc-merge-queue` for merge_group events, that scale set is currently
+      # at zero replicas, and its image's python is therefore unverifiable --
+      # on a job every PR and every merge-queue candidate depends on, an
+      # unproven `command not found` would be worse than the gap it closes.
+      # setup-python is image-independent and is this repo's own pattern for
+      # python (docker-figma-bot.yml / docker-webflow-bot.yml), verified green
+      # on the ARC fleet. 3.10 matches those two; the suite uses no 3.11+
+      # constructs.
+      - name: Set up Python for the review-gate sweep suite
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Test stalled-Ally-review sweep decision logic (BLO-28203)
+        run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
+
       - name: Validate Designer fast-uri security floor
         run: node ./scripts/designer-fast-uri-security.test.js
 
