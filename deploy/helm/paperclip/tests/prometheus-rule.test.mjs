@@ -39,7 +39,6 @@ test("Blockcast values do not render a PrometheusRule (paperclip-ci-deploy has n
     "values.blockcast.yaml must keep prometheusRule.enabled=false until paperclip-ci-deploy is granted RBAC on prometheusrules.monitoring.coreos.com",
   );
 });
-
 test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains usable once RBAC exists)", () => {
   const rendered = execFileSync(
     "helm",
@@ -553,4 +552,3 @@ test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-2
       `'max by (agent_id) (...)':\n  ${unaggregated.join("\n  ")}`,
   );
 });
-

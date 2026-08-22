@@ -300,6 +300,7 @@ export function pipelineCaseOutputsService(db: Db) {
           eq(pipelineCaseIssueLinks.companyId, companyId),
           eq(pipelineCaseIssueLinks.caseId, caseId),
           isNull(pipelineCaseIssueLinks.retiredAt),
+          eq(pipelineCaseIssueLinks.attachmentState, "attached"),
           eq(issues.companyId, companyId),
           visibleIssueCondition(),
           isNull(issues.cancelledAt),
