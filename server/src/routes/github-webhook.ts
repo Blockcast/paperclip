@@ -40,6 +40,10 @@ import {
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
+import {
+  evaluateAgentInvokability,
+  type AgentOrgRow,
+} from "../services/agent-invokability.js";
 import { issueService } from "../services/issues.js";
 import {
   GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
@@ -126,7 +130,7 @@ export interface GithubWebhookConfig {
   pluginWorkerManager?: PluginWorkerManager;
   /**
    * Agent IDs that receive additional wakes on PR-shaped events. New reviews
-   * are assigned to the least-loaded active reviewer. The singular option is
+   * are assigned to the least-loaded invokable reviewer. The singular option is
    * retained for callers that have not migrated to the pool configuration.
    *
    * Review-driving events are
@@ -2077,7 +2081,7 @@ function buildPrReviewerWakeIdempotencyKey(
 }
 
 // Deliberately PR-scoped, with no head sha: this key also scopes the reviewer
-// affinity lookup (findActivePrReviewerForTask), the withPrReviewerTaskLock
+// affinity lookup (findInvokablePrReviewerForTask), the withPrReviewerTaskLock
 // serialization, and the cancel-queued-runs-on-close sweep, all of which must
 // stay stable across heads for one PR. Head-awareness for review requests lives
 // in heartbeat's coalescing decision instead (BLO-18953).
@@ -2184,30 +2188,17 @@ function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
 
 async function selectPrReviewerAgentId(
   db: PrReviewerSelectionDb,
-  configuredAgentIds: readonly string[],
+  invokableAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
-  if (configuredAgentIds.length === 0) return null;
-
-  const activeRows = await db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(
-      and(
-        inArray(agents.id, [...configuredAgentIds]),
-        inArray(agents.status, ["idle", "running"]),
-      ),
-    );
-  const activeSet = new Set(activeRows.map((row) => row.id));
-  const activeAgentIds = configuredAgentIds.filter((agentId) => activeSet.has(agentId));
-  if (activeAgentIds.length === 0) return null;
+  if (invokableAgentIds.length === 0) return null;
 
   const loadRows = await db
     .select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` })
     .from(heartbeatRuns)
     .where(
       and(
-        inArray(heartbeatRuns.agentId, activeAgentIds),
+        inArray(heartbeatRuns.agentId, [...invokableAgentIds]),
         inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
       ),
     )
@@ -2216,9 +2207,9 @@ async function selectPrReviewerAgentId(
     loadRows.map((row) => [row.agentId, Number(row.count)]),
   );
   const minimumLoad = Math.min(
-    ...activeAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
+    ...invokableAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
   );
-  const leastLoadedAgentIds = activeAgentIds.filter(
+  const leastLoadedAgentIds = invokableAgentIds.filter(
     (agentId) => (loadByAgent.get(agentId) ?? 0) === minimumLoad,
   );
 
@@ -2230,28 +2221,105 @@ async function selectPrReviewerAgentId(
   return leastLoadedAgentIds[tieBreak % leastLoadedAgentIds.length] ?? null;
 }
 
-async function findActivePrReviewerForTask(
+async function findInvokablePrReviewerForTask(
   db: PrReviewerSelectionDb,
-  configuredAgentIds: readonly string[],
+  invokableAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
-  if (configuredAgentIds.length === 0) return null;
+  if (invokableAgentIds.length === 0) return null;
 
   return db
     .select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns)
-    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
     .where(
       and(
-        inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
+        inArray(heartbeatRuns.agentId, [...invokableAgentIds]),
         inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
-        inArray(agents.status, ["idle", "running"]),
         matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
     .limit(1)
     .then((rows) => rows[0]?.agentId ?? null);
+}
+
+interface PrReviewerEligibility {
+  invokableAgentIds: string[];
+  transientlyUnavailable: boolean;
+}
+
+/**
+ * Keep reviewer routing on the same invokability contract as ordinary
+ * heartbeat dispatch. In particular, `error` is still invokable when the
+ * reporting chain is healthy; paused/terminated/pending agents and invalid
+ * chains remain excluded. A healthy paused reviewer is tracked separately as
+ * transiently unavailable so the request can use the bounded availability
+ * retry without turning terminal configuration errors into six hours of
+ * polling. The webhook runs this under its PR lock, so a single company-scoped
+ * snapshot is sufficient for the selection decision.
+ */
+async function resolvePrReviewerEligibility(
+  db: PrReviewerSelectionDb,
+  configuredAgentIds: readonly string[],
+): Promise<PrReviewerEligibility> {
+  if (configuredAgentIds.length === 0) {
+    return { invokableAgentIds: [], transientlyUnavailable: false };
+  }
+
+  const configuredRows: AgentOrgRow[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(inArray(agents.id, [...configuredAgentIds]));
+  if (configuredRows.length === 0) {
+    return { invokableAgentIds: [], transientlyUnavailable: false };
+  }
+
+  const companyIds = [...new Set(configuredRows.map((row) => row.companyId))];
+  const companyRows: AgentOrgRow[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(inArray(agents.companyId, companyIds));
+  const rowsByCompany = new Map<string, AgentOrgRow[]>();
+  for (const row of companyRows) {
+    const rows = rowsByCompany.get(row.companyId) ?? [];
+    rows.push(row);
+    rowsByCompany.set(row.companyId, rows);
+  }
+  const configuredById = new Map(configuredRows.map((row) => [row.id, row]));
+  let transientlyUnavailable = false;
+  const invokableAgentIds = configuredAgentIds.filter((agentId) => {
+    const agent = configuredById.get(agentId);
+    if (!agent) return false;
+    const invokability = evaluateAgentInvokability(
+      agent,
+      rowsByCompany.get(agent.companyId) ?? [],
+    );
+    if (invokability.invokable) return true;
+    const orgChainHealth = getAgentOrgChainHealth({
+      agent,
+      agents: rowsByCompany.get(agent.companyId) ?? [],
+    });
+    if (
+      invokability.reason === "paused" &&
+      orgChainHealth?.status === "healthy"
+    ) {
+      transientlyUnavailable = true;
+    }
+    return false;
+  });
+  return { invokableAgentIds, transientlyUnavailable };
 }
 
 async function withPrReviewerTaskLock<T>(
@@ -2449,9 +2517,18 @@ async function attemptPrReviewerWake(params: {
         return "duplicate";
       }
 
+      const reviewerEligibility = await resolvePrReviewerEligibility(tx, reviewerAgentIds);
       const reviewerAgentId =
-        (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
-        (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
+        (await findInvokablePrReviewerForTask(
+          tx,
+          reviewerEligibility.invokableAgentIds,
+          reviewerTaskKey,
+        )) ??
+        (await selectPrReviewerAgentId(
+          tx,
+          reviewerEligibility.invokableAgentIds,
+          reviewerTaskKey,
+        ));
       if (!reviewerAgentId) {
         logger.warn(
           {
@@ -2459,9 +2536,13 @@ async function attemptPrReviewerWake(params: {
             event: eventName,
             prNumber: context.prNumber,
             repoFullName: context.repoFullName,
+            transientlyUnavailable: reviewerEligibility.transientlyUnavailable,
           },
-          "github webhook reviewer wake skipped: no configured reviewer is active",
+          "github webhook reviewer wake skipped: no configured reviewer is invokable",
         );
+        if (reviewerEligibility.transientlyUnavailable) {
+          throw new PrReviewerUnavailableError();
+        }
         return "no_reviewer";
       }
 
@@ -2606,6 +2687,8 @@ interface ContendedPrReviewerReplay {
   context: ResolvedEventContext & { prNumber: number };
 }
 
+type PrReviewerRetryCause = "contention" | "unavailable";
+
 /**
  * Persist a PR-reviewer wake that lost its scope lock, so a worker can replay
  * it (BLO-21995).
@@ -2637,17 +2720,35 @@ async function persistContendedPrReviewerWake(params: {
   deliveryId: string | null;
   reviewerAgentIds: readonly string[];
   taskKey: string;
+  cause?: PrReviewerRetryCause;
 }): Promise<boolean> {
-  const { db, context, eventName, deliveryId, reviewerAgentIds, taskKey } = params;
+  const {
+    db,
+    context,
+    eventName,
+    deliveryId,
+    reviewerAgentIds,
+    taskKey,
+    cause = "contention",
+  } = params;
   const wakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
   const idempotencyKey = wakeupOptions.idempotencyKey;
 
   // Prefer a reviewer that is actually invokable so the provisional pick is
   // usually the one the replay lands on anyway, but fall back to any
   // *configured* reviewer row: the column is an FK anchor, not a decision.
+  const reviewerEligibility = await resolvePrReviewerEligibility(db, reviewerAgentIds);
   const provisionalAgentId =
-    (await findActivePrReviewerForTask(db, reviewerAgentIds, taskKey)) ??
-    (await selectPrReviewerAgentId(db, reviewerAgentIds, taskKey)) ??
+    (await findInvokablePrReviewerForTask(
+      db,
+      reviewerEligibility.invokableAgentIds,
+      taskKey,
+    )) ??
+    (await selectPrReviewerAgentId(
+      db,
+      reviewerEligibility.invokableAgentIds,
+      taskKey,
+    )) ??
     (await db
       .select({ id: agents.id })
       .from(agents)
@@ -2674,14 +2775,20 @@ async function persistContendedPrReviewerWake(params: {
 
   const replay: ContendedPrReviewerReplay = {
     attempts: 0,
-    // Null until a replay actually finds the reviewer gone; the availability
-    // clock starts then, not at contention time.
-    unavailableSince: null,
-    availabilityAttempts: 0,
+    // An initial no-reviewer outcome is already an availability observation,
+    // so start its wall clock and ladder here. Contention records keep the
+    // clock dormant until a replay first observes the reviewer unavailable.
+    unavailableSince: cause === "unavailable" ? new Date().toISOString() : null,
+    availabilityAttempts: cause === "unavailable" ? 1 : 0,
     // Never null: a record the due-ness filter can't select is stranded
     // silently, the failure mode the provider-capacity path guards with its
     // own default delay.
-    nextAttemptAt: new Date(Date.now() + PR_REVIEWER_CONTENDED_BACKOFF_MS[0]).toISOString(),
+    nextAttemptAt: new Date(
+      Date.now() +
+        (cause === "unavailable"
+          ? PR_REVIEWER_UNAVAILABLE_BACKOFF_MS[0]
+          : PR_REVIEWER_CONTENDED_BACKOFF_MS[0]),
+    ).toISOString(),
     eventName,
     deliveryId,
     taskKey,
@@ -2738,7 +2845,7 @@ async function persistContendedPrReviewerWake(params: {
     // Still durable, so the caller must not 503 and invite a third replay.
     logger.info(
       { taskKey, deliveryId, event: eventName, idempotencyKey },
-      "contended PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
+      "deferred PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
     );
     return true;
   }
@@ -2760,8 +2867,11 @@ async function persistContendedPrReviewerWake(params: {
       idempotencyKey,
       provisionalAgentId,
       nextAttemptAt: replay.nextAttemptAt,
+      retryCause: cause,
     },
-    "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
+    cause === "unavailable"
+      ? "github webhook reviewer wake deferred: configured reviewer temporarily unavailable, durable retry recorded"
+      : "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
   );
   return true;
 }
@@ -2800,6 +2910,30 @@ function parseContendedReplay(payload: unknown): ContendedPrReviewerReplay | nul
   // non-castable value as NULL (= due), so a row that got here with garbage
   // would otherwise replay on every pass forever instead of being retired.
   if (Number.isNaN(Date.parse(candidate.nextAttemptAt))) return null;
+  if (
+    candidate.unavailableSince !== null &&
+    candidate.unavailableSince !== undefined &&
+    (typeof candidate.unavailableSince !== "string" ||
+      Number.isNaN(Date.parse(candidate.unavailableSince)))
+  ) {
+    return null;
+  }
+  if (
+    candidate.attempts !== undefined &&
+    (typeof candidate.attempts !== "number" ||
+      !Number.isFinite(candidate.attempts) ||
+      candidate.attempts < 0)
+  ) {
+    return null;
+  }
+  if (
+    candidate.availabilityAttempts !== undefined &&
+    (typeof candidate.availabilityAttempts !== "number" ||
+      !Number.isFinite(candidate.availabilityAttempts) ||
+      candidate.availabilityAttempts < 0)
+  ) {
+    return null;
+  }
   return {
     attempts: typeof candidate.attempts === "number" ? candidate.attempts : 0,
     unavailableSince:
@@ -2898,14 +3032,21 @@ export async function reconcileContendedPrReviewerWakes(
         continue;
       }
       if (outcome === "no_reviewer") {
-        // NOT terminal. Reviewer availability is transient — paused for a
-        // config push, mid-restart, momentarily between runs — and the whole
-        // point of a durable record is to outlive exactly that. Retiring here
-        // would drop a sanctioned review request because the reviewer happened
-        // to be down for the seconds this pass ran. Re-armed below on the
-        // dedicated availability ladder, bounded by wall-clock rather than by
-        // the lock-contention attempt budget.
-        throw new PrReviewerUnavailableError();
+        // `attemptPrReviewerWake` throws PrReviewerUnavailableError itself
+        // when it sees a healthy paused reviewer. Reaching this branch means
+        // every configured reviewer is in a terminal policy/configuration
+        // state (terminated, pending approval, invalid chain, unknown status,
+        // or missing), so retrying cannot change the answer. Retire the
+        // contention record without emitting a dead-letter alert for a request
+        // the configured policy has deliberately refused.
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          "no configured reviewer is invokable",
+        );
+        result.superseded += 1;
+        continue;
       }
       // duplicate / declined are terminal for this delivery: replaying cannot
       // change either. `duplicate` is the expected outcome when the delivery
@@ -3863,6 +4004,44 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         });
         return outcome === "queued";
       } catch (err) {
+        if (err instanceof PrReviewerUnavailableError) {
+          let recorded = false;
+          try {
+            recorded = await persistContendedPrReviewerWake({
+              db,
+              context,
+              eventName,
+              deliveryId,
+              reviewerAgentIds,
+              taskKey: buildPrReviewerWakeupOptions(context, eventName, deliveryId).payload.taskKey,
+              cause: "unavailable",
+            });
+          } catch (persistErr) {
+            logger.error(
+              {
+                err: persistErr,
+                agentIds: reviewerAgentIds,
+                event: eventName,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer availability retry persistence failed",
+            );
+          }
+          if (recorded) return false;
+          logger.error(
+            {
+              agentIds: reviewerAgentIds,
+              event: eventName,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "github webhook reviewer was temporarily unavailable and no durable retry could be recorded",
+          );
+          throw new HttpError(503, "PR reviewer is temporarily unavailable", {
+            code: "pr_reviewer_unavailable",
+          });
+        }
         if (err instanceof PrReviewerTaskLockTimeoutError) {
           // BLO-21995: a concurrent delivery for this same PR held the scope for
           // the whole timeout. Nothing reached heartbeat, so there is no partial
