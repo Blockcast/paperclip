@@ -50,7 +50,10 @@ platform cannot resolve automatically. Each runbook should be:
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is
   systematically failing this row, and (unlike the alert above) the row never
-  even reached `queued`. Trigger: alert `PaperclipOverdueScheduledRetry`, or
+  even reached `queued`. Also covers the case where that row's age snapshot
+  cannot be refreshed safely — read a stale snapshot as a detector outage, not
+  an all-clear. Trigger: alert `PaperclipOverdueScheduledRetry`,
+  `PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed`, or
   `max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`.
 - [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
   — you are adjudicating an open productivity review and the reviewed issue's
