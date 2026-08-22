@@ -1340,3 +1340,145 @@ describe("argv redaction inside a container list (PEN-2431 door #5)", () => {
     expect(out).not.toContain(REDACTED);
   });
 });
+
+describe("argv redaction — the fail-opens Ally's review found (PEN-2431 door #5)", () => {
+  // All six reproduced against 6827796 before the fix. Reverting only
+  // `response-scrub.ts` fails exactly these six and nothing else.
+
+  it("does not print a block-scalar argv token beneath its own redaction marker", () => {
+    // The Critical. A sequence entry's block-scalar content sits at *exactly*
+    // the column after the dash, so a `> indent + dash.length` threshold was
+    // false on the first continuation line: `- "<redacted>"` was emitted and the
+    // plaintext printed directly under it. `command: ["/bin/sh","-c",<script>]`
+    // is both the most common credential-bearing argv shape and the one
+    // kubectl's serializer renders as a block scalar.
+    const pod = [
+      "spec:",
+      "  containers:",
+      "  - name: c",
+      "    command:",
+      "    - /bin/sh",
+      "    - -c",
+      "    - |",
+      `      export TOKEN=${LEAK}`,
+    ].join("\n");
+
+    const out = scrubResponseBody(
+      Buffer.from(
+        JSON.stringify({ result: { content: [{ type: "text", text: pod }] } }),
+      ),
+      "application/json",
+    ).toString("utf8");
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("swallows a folded-scalar argv entry too, not just a literal one", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    args:",
+        "    - >",
+        `      export TOKEN=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+  });
+
+  it("fails closed on a scalar written directly under command:, where no dash arms the swallow", () => {
+    // The argv in-block scanner had no default-deny arm, so a line that was
+    // neither blank, a comment, nor a sequence entry fell out of the branch and
+    // reached the final `emit(line)`. No dash means no swallow was ever set, so
+    // the swallow fix alone does not cover this one.
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    command:",
+        `      export TOKEN=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+  });
+
+  it("does not let a containers: key inside an env block escape the env default-deny", () => {
+    // Regression against base ada8117, where this line was redacted: the
+    // CONTAINERS_KEY branch is tested before the env in-block scanner, so three
+    // key spellings were carved out of that scanner's default-deny.
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    env:",
+        "    - name: A",
+        `      containers: ${LEAK}`,
+        "      value: keepme",
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("name: A");
+  });
+
+  it("fails closed on a flow-style container list instead of passing it through whole", () => {
+    // `args: [...]` already fails closed one level down; the container list
+    // above it emitted its suffix unclassified, so the same shape was
+    // fail-closed inside and fail-open outside.
+    const out = scrubYamlText(
+      ["spec:", `  containers: [{name: c, args: ["--token=${LEAK}"]}]`].join(
+        "\n",
+      ),
+    );
+
+    expectNoLeak(out);
+  });
+
+  it("keeps the argv block open across a comment at the block's own indent", () => {
+    // `continuesBlock` treated a same-indent comment as a sibling key, closing
+    // the block before the scanner ran, so every entry after the comment
+    // reached the final `emit(line)`.
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: c",
+        "    args:",
+        "    # note",
+        `    - --token=${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("--token=");
+  });
+
+  it("still preserves the diagnostic fields the read-only grant exists for", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: server",
+        "    image: harbor/app:v1",
+        "    restartCount: 3",
+        "    command:",
+        "    - /bin/sh",
+        "    env:",
+        "    - name: OPENAI_API_KEY",
+        `      value: ${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("name: server");
+    expect(out).toContain("image: harbor/app:v1");
+    expect(out).toContain("restartCount: 3");
+    expect(out).toContain("name: OPENAI_API_KEY");
+  });
+});
