@@ -6,6 +6,7 @@ import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-ga
 
 import {
   commentReviewGateRetirementDescription,
+  commentReviewGateRetirementStatus,
   commentReviewGateVerdictIsMisreadable,
   evaluateCommentReviewGate,
   retiredCommentReviewGateContexts,
@@ -288,6 +289,37 @@ describe("retired context supersede", () => {
     expect(admitsNothingEvaluated(description)).toBe(false);
   });
 
+  // The retired context may still be a *required* check on a deployment that
+  // has not yet switched the requirement to the live context — BLO-26602 is
+  // that migration, and this code cannot read branch protection to find out.
+  // A fixed green here would satisfy the required legacy check while the live
+  // context reports a blocking finding, letting a PR merge with unresolved
+  // Critical/Important findings: the fail-open of this very issue, restored
+  // through the cleanup path.
+  it("never writes a green retirement row while the live verdict is blocking", () => {
+    for (const verdict of [
+      { state: "failure", outcome: "blocking_finding" },
+      { state: "failure", outcome: "carried_finding" },
+    ] as const) {
+      const retirement = commentReviewGateRetirementStatus(LIVE, verdict);
+
+      expect(retirement.state).toBe("failure");
+      expect(retirement.description).toContain(LIVE);
+      // Still a pointer, and still no not-evaluated claim under the retired
+      // `review/`-prefixed name.
+      expect(admitsNothingEvaluated(retirement.description)).toBe(false);
+    }
+  });
+
+  it("mirrors a clean live verdict rather than inventing a state", () => {
+    for (const outcome of ["clean", "not_evaluated"] as const) {
+      const retirement = commentReviewGateRetirementStatus(LIVE, { state: "success", outcome });
+
+      expect(retirement.state).toBe("success");
+      expect(admitsNothingEvaluated(retirement.description)).toBe(false);
+    }
+  });
+
   it("keeps the pointer intact within GitHub's 140-character description limit", () => {
     // GitHub truncates at 140. The context name is the whole point of the
     // pointer, so it must survive rather than being cut mid-name.
@@ -295,5 +327,9 @@ describe("retired context supersede", () => {
 
     expect(commentReviewGateRetirementDescription(LIVE).length).toBeLessThanOrEqual(140);
     expect(commentReviewGateRetirementDescription(longContext).length).toBeLessThanOrEqual(140);
+    expect(commentReviewGateRetirementDescription(LIVE, "failure").length).toBeLessThanOrEqual(140);
+    expect(
+      commentReviewGateRetirementDescription(longContext, "failure").length,
+    ).toBeLessThanOrEqual(140);
   });
 });
