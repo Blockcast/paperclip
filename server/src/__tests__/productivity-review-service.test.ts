@@ -960,7 +960,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // Proves the invocation predicate is live against the production row shape:
     // a predicate that short-circuits on non-null `livenessState` reports 0.
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 25",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 25",
     );
   });
 
@@ -1014,10 +1014,10 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
     // The label must not claim these were never invoked — they were.
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 0",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 0",
     );
     expect(reviews[0]?.description).toContain(
-      `Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, counted toward the streak — BLO-26165): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+      `Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
     );
   });
 
@@ -1042,7 +1042,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 0",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 0",
     );
   });
 
@@ -1087,7 +1087,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 5",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 5",
     );
   });
 
@@ -1563,7 +1563,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` 0, BLO-26165): 3",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 3",
     );
     // BLO-22436 (Ally follow-up): all 3 non-executing runs are also counted
     // above as never-invoked — the evidence block must say so rather than
