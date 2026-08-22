@@ -28,9 +28,44 @@ export interface CommentReviewGateComment {
   createdAt: string | Date;
 }
 
+/**
+ * Why the verdict carries an `outcome` alongside `state` (BLO-29711).
+ *
+ * Three distinct situations previously collapsed into a bare `state: "success"`:
+ * a head that was reviewed and found clean, a head nothing attests at all, and
+ * a head whose review could not be established (unrecognized author, ambiguous
+ * attestation). Only the first is evidence of review. Callers — and the tests
+ * that pin this behavior — need to tell them apart without pattern-matching on
+ * the human-readable `reason` string.
+ *
+ * The fail-open on "nothing attests this head" is deliberate and load-bearing:
+ * this gate only observes the comment-shaped review surface, so a PR reviewed
+ * via a formal `pull_request_review` legitimately has no comment to find.
+ * Reporting `pending`/`failure` there would deadlock every formally-reviewed
+ * PR. Proof-of-review is a separate control; this gate only makes
+ * comment-shaped findings merge-visible.
+ */
+export type CommentReviewGateOutcome =
+  /** An Ally comment attests this exact head and reports no unresolved finding. */
+  | "clean"
+  /** An Ally comment attests this exact head and carries an unresolved finding. */
+  | "blocking_finding"
+  /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
+  | "carried_finding"
+  /** Nothing established a comment-shaped review of this head. Not evidence of review. */
+  | "not_evaluated";
+
 export type CommentReviewGateVerdict =
-  | { state: "success"; reason: string }
-  | { state: "failure"; reason: string; commentCreatedAt: string };
+  | { state: "success"; outcome: "clean"; reason: string }
+  | { state: "success"; outcome: "not_evaluated"; reason: string }
+  | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
+  | {
+      state: "failure";
+      outcome: "carried_finding";
+      reason: string;
+      commentCreatedAt: string;
+      carriedFromHeadSha: string;
+    };
 
 function toEpochMs(value: string | Date): number {
   return value instanceof Date ? value.getTime() : Date.parse(value);
@@ -48,25 +83,37 @@ function isAllyConsolidatedReviewComment(
   );
 }
 
-function latestAllyCommentForHead(
+interface AttestingComment {
+  comment: CommentReviewGateComment;
+  attestedHeadSha: string;
+}
+
+/**
+ * Latest Ally consolidated-review comment carrying exactly one head
+ * attestation, optionally restricted to one head. Comments with an absent or
+ * ambiguous attestation are skipped: a required check must not be set from a
+ * guess about which head was examined.
+ */
+function latestAttestingAllyComment(
   comments: CommentReviewGateComment[],
-  headSha: string,
   reviewerBotLogin: string,
-): CommentReviewGateComment | null {
-  const normalizedHead = headSha.trim().toLowerCase();
-  let latest: CommentReviewGateComment | null = null;
+  matchHeadSha: string | null,
+): AttestingComment | null {
+  let latest: AttestingComment | null = null;
   let latestTime = -Infinity;
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
-    if (extractAllyReviewedHeadSha(comment.body) !== normalizedHead) continue;
+    const attestedHeadSha = extractAllyReviewedHeadSha(comment.body);
+    if (!attestedHeadSha) continue;
+    if (matchHeadSha !== null && attestedHeadSha !== matchHeadSha) continue;
 
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
     // GitHub's issue-comment endpoint is chronological. Prefer the later item
     // when two comments share its second-resolution created_at timestamp.
     if (commentTime >= latestTime) {
-      latest = comment;
+      latest = { comment, attestedHeadSha };
       latestTime = commentTime;
     }
   }
@@ -84,29 +131,79 @@ export function evaluateCommentReviewGate(input: {
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
-  if (!headSha) return { state: "success", reason: "No head SHA was supplied to evaluate against." };
-
-  const latest = latestAllyCommentForHead(input.comments ?? [], headSha, reviewerBotLogin);
-  if (!latest) {
+  if (!headSha) {
     return {
       state: "success",
-      reason: "No Ally consolidated-review comment attests to reviewing this head.",
+      outcome: "not_evaluated",
+      reason: "No head SHA was supplied to evaluate against.",
     };
   }
 
-  if (hasActionablePrReviewFeedback(latest.body)) {
+  const comments = input.comments ?? [];
+  const normalizedHead = headSha.toLowerCase();
+  const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
+
+  if (forHead) {
+    if (hasActionablePrReviewFeedback(forHead.comment.body)) {
+      return {
+        state: "failure",
+        outcome: "blocking_finding",
+        reason:
+          "Ally's most recent consolidated-review comment for this head carries an unresolved finding.",
+        commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
+      };
+    }
+    return {
+      state: "success",
+      outcome: "clean",
+      reason:
+        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+    };
+  }
+
+  // Nothing attests this head. A finding raised against an earlier head is not
+  // dispositioned by replacing that head, so it carries forward rather than
+  // going green (BLO-29711). It clears the moment Ally attests the current head
+  // — which the push that produced this head already triggers — so this cannot
+  // wedge a PR that keeps being reviewed on the same surface.
+  const latestAttestation = latestAttestingAllyComment(comments, reviewerBotLogin, null);
+  if (latestAttestation && hasActionablePrReviewFeedback(latestAttestation.comment.body)) {
     return {
       state: "failure",
+      outcome: "carried_finding",
       reason:
-        "Ally's most recent consolidated-review comment for this head carries an unresolved finding.",
-      commentCreatedAt: new Date(toEpochMs(latest.createdAt)).toISOString(),
+        `An unresolved finding from Ally's review of ${latestAttestation.attestedHeadSha.slice(0, 7)} ` +
+        "is still undispositioned; no comment attests the current head.",
+      commentCreatedAt: new Date(toEpochMs(latestAttestation.comment.createdAt)).toISOString(),
+      carriedFromHeadSha: latestAttestation.attestedHeadSha,
     };
   }
 
   return {
     state: "success",
-    reason: "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+    outcome: "not_evaluated",
+    reason: "No Ally consolidated-review comment attests to reviewing this head.",
   };
+}
+
+/**
+ * A green status published under a `review/`-prefixed context reads as "this
+ * head was reviewed and was clean". For the `not_evaluated` outcome that
+ * reading is false, and no state can fix it: `pending`/`failure` on absence
+ * would deadlock every formally-reviewed PR. The only remedy is to publish
+ * outside the `review/` namespace, which is a branch-protection-coupled
+ * change. Until then this predicate names the condition so it can be asserted
+ * against and logged rather than silently shipped (BLO-29711).
+ */
+export function commentReviewGateVerdictIsMisreadable(
+  verdict: CommentReviewGateVerdict,
+  context: string,
+): boolean {
+  return (
+    verdict.outcome === "not_evaluated" &&
+    verdict.state === "success" &&
+    context.trim().toLowerCase().startsWith("review/")
+  );
 }
 
 export type PrCommentReviewGateCheckResult =
@@ -172,6 +269,19 @@ export async function runPrCommentReviewGateCheck(
   return serializeGateEvaluation(key, () => executeCommentReviewGateCheck(input, context, config));
 }
 
+const misreadableContextWarnings = new Set<string>();
+
+function warnOnceIfMisreadableContext(verdict: CommentReviewGateVerdict, context: string): void {
+  if (!commentReviewGateVerdictIsMisreadable(verdict, context)) return;
+  if (misreadableContextWarnings.has(context)) return;
+  misreadableContextWarnings.add(context);
+  console.warn(
+    `[pr-comment-review-gate] Publishing a green not-evaluated verdict under "${context}". ` +
+      "A review/-prefixed context reads as review evidence, which this fail-open gate cannot " +
+      "provide. Move it outside the review/ namespace once branch protection is updated (BLO-29711).",
+  );
+}
+
 async function executeCommentReviewGateCheck(
   input: PrCommentReviewGateCheckInput,
   context: string,
@@ -201,6 +311,8 @@ async function executeCommentReviewGateCheck(
     headSha,
     reviewerBotLogin,
   });
+
+  warnOnceIfMisreadableContext(verdict, context);
 
   const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
     () =>

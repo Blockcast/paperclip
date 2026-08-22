@@ -185,6 +185,13 @@ jobs:
       - name: Test Ally review-consistency guard
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
 
+      - name: Test comment-review-gate census
+        # The census itself is not run here: it fails on 100% of sampled merges
+        # today across paperclip, penstock, frr and NOP, so gating PRs on it
+        # would block every merge. It becomes a runnable regression gate once
+        # the gate context moves out of the review/ namespace (BLO-29711).
+        run: node --test ./scripts/check-comment-review-gate-census.test.mjs
+
       - name: Test CODEOWNERS guard
         run: node --test ./scripts/check-codeowners.test.mjs
 
