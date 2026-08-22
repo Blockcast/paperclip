@@ -253,6 +253,71 @@ export function clampTransientRetryHorizon(input: {
 }
 
 /**
+ * p95 of `startedAt - scheduledRetryAt` for this fleet, used only to derive
+ * {@link MIN_USEFUL_RETRY_MARGIN_MS} below. Re-derive that constant rather than
+ * editing this one in isolation — decoupling a cap from the measurement it was
+ * sized against is BLO-23525's failure mode, repeated.
+ *
+ * Measured 2026-08-19T23:06-23:22Z over a fixed 5.4h span, 13 agents (BLO-28863
+ * findings). Two statistics were available and they disagree, so the choice
+ * matters:
+ *
+ * - Rows carrying both `scheduledRetryAt` and `startedAt` (n=197): median
+ *   `4m30s`, p95 **`42m04s`**, max `2h39m32s`, 44% late by >10m.
+ * - Rows still parked and overdue at the snapshot (`paperclipListParkedAgents`,
+ *   40/40 overdue): `overdueMs` spanning **55-71 min**, all with `retryInMs: 0`.
+ *
+ * The first is survivor-biased *downward*: it can only measure retries that
+ * eventually dispatched, and every row still stuck in the queue is excluded
+ * precisely because it is the latest. The second is right-censored — those rows
+ * had already waited 55-71 min and had not started, so their eventual lateness
+ * is a lower bound, not a value. Taking the survivor p95 (42m) would therefore
+ * under-size the margin against the failure mode that matters, so this uses the
+ * top of the censored band. Sizing this too small strands the retry after the
+ * window, which is the BLO-28785 loss this whole change exists to prevent.
+ */
+export const DISPATCH_LATENESS_P95_MS = 71 * 60 * 1000;
+
+/**
+ * Median heartbeat run duration over the same 2026-08-19 sample (p95 `26m49s`).
+ * A retry has to do more than *start* before the window closes — it has to have
+ * time to finish the window's work — so the margin carries one median run on top
+ * of the lateness it must survive.
+ */
+export const MEDIAN_HEARTBEAT_RUN_DURATION_MS = (7 * 60 + 41) * 1000;
+
+/**
+ * Lead time subtracted from a windowed retry's deadline before it is considered
+ * useful (BLO-28863, CTO ruling on PR #1434).
+ *
+ * Derived, not hand-picked, following this file's precedent for
+ * {@link TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS}: a retry is worth scheduling only
+ * if it can be expected to *start* despite this fleet's dispatch lateness and
+ * still have time to do the window's work. At the 2026-08-19 measurement that
+ * is `71m + 7m41s = 78m41s`.
+ *
+ * This is re-tunable and expected to shrink: it is a function of how late the
+ * fleet dispatches, not a policy preference. Once BLO-28863 defect 1 meets its
+ * acceptance criterion of p95 <= 5 min, the same formula yields ~12m40s. Do not
+ * edit the total directly — re-measure the two inputs above.
+ *
+ * Be clear-eyed about the consequence at today's value: a 6h routine that fails
+ * inside the last ~79 min of a window will *always* abandon. That is the
+ * intended contract — the routine's next scheduled fire owns that work — but it
+ * does mean the `clamp` branch is mostly an abandon-machine until defect 1
+ * lands, and it is strictly better than today's behaviour of scheduling the
+ * retry anyway, stranding it, and burning a run slot and an attempt en route.
+ */
+export const MIN_USEFUL_RETRY_MARGIN_MS =
+  DISPATCH_LATENESS_P95_MS + MEDIAN_HEARTBEAT_RUN_DURATION_MS;
+
+/** ISO-8601 for a Date, or null when it is not a valid instant. */
+function finiteIsoOrNull(value: Date): string | null {
+  const ms = value.getTime();
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/**
  * Decide a retry due time for work owned by a *periodic* routine (BLO-28863).
  *
  * {@link clampTransientRetryHorizon} bounds the pathological multi-day park, but
@@ -270,12 +335,43 @@ export function clampTransientRetryHorizon(input: {
  * owning agent's `maxConcurrentRuns` slots and one attempt, delaying every
  * other queued retry behind it. So the contract here is deliberately
  * abandon-rather-than-strand: if the due time cannot land inside the owning
- * period, report `abandon` and let the routine's next scheduled fire own the
- * work.
+ * period with {@link MIN_USEFUL_RETRY_MARGIN_MS} to spare, report `abandon` and
+ * let the routine's next scheduled fire own the work.
+ *
+ * ## Why the deadline instant itself is not a valid target
+ *
+ * The first cut of this function clamped to the deadline exactly, which made
+ * `abandon` unreachable for the only case it existed to serve: `marginMs` was
+ * measured as `deadline - failedAt`, so it was positive for every failure
+ * inside an open window, and the clamped target's own usable margin was zero by
+ * construction. Reproduced over every failure minute of an open 6h window,
+ * 360/360 cases clamped to the close and none abandoned. This fleet dispatches
+ * late by design-relevant amounts (see {@link DISPATCH_LATENESS_P95_MS}), and
+ * BLO-28785 was lost by a retry that dispatched **39.7s** after its window shut,
+ * so a wake scheduled *at* the close is not marginal — it is guaranteed late.
+ * The lead time is what makes `abandon` reachable and the `clamp` target real.
+ *
+ * ## Clamping below a provider-advertised floor is intended
+ *
+ * `dueAt` is frequently `penstockAdvertisedResumeAt` — a floor the provider
+ * asked us to respect — and a clamp can land before it. That is the same trade
+ * {@link clampTransientRetryHorizon} already makes and documents: clamping only
+ * ever shortens a wait, so the worst case is an early re-probe that defers
+ * again, which is a single cached GET. Crucially it converges rather than
+ * looping: each re-probe re-enters this decision against a window that has less
+ * margin left, so the sequence terminates in `abandon` rather than in a strand.
  *
  * Returns a decision rather than a Date so the caller must handle `abandon`
  * explicitly; silently substituting a clamped Date is how a stranded retry
- * would come back as a same-shaped bug.
+ * would come back as a same-shaped bug. `abandon` deliberately reports
+ * `rejectedDueAtIso` rather than `clampedFromIso` so a uniform logger cannot
+ * report a clamp that never happened.
+ *
+ * Takes no `now`: the dispatch-path caller has a fresh `failedAt` by
+ * construction, since it is scheduling the retry for the failure it just
+ * finalized. Widening the signature for a caller that does not exist would be
+ * speculative — revisit if a re-decide path ever needs to re-evaluate an
+ * already-parked row, where `failedAt` and `now` genuinely diverge.
  */
 export function resolveRoutineScopedRetry(input: {
   /** Provider-advertised or backoff-computed due time under consideration. */
@@ -290,36 +386,71 @@ export function resolveRoutineScopedRetry(input: {
    * case — a failure 5h into a 6h window has 1h of budget, not 6h.
    */
   windowClosesAt?: Date | null;
+  /**
+   * Override for {@link MIN_USEFUL_RETRY_MARGIN_MS}. Exists so tests can pin a
+   * decision boundary without re-writing when the measured constant is re-tuned.
+   */
+  minUsefulMarginMs?: number;
 }):
   | { decision: "honour"; dueAt: Date; clampedFromIso: null }
   | { decision: "clamp"; dueAt: Date; clampedFromIso: string }
-  | { decision: "abandon"; dueAt: null; clampedFromIso: string; reason: string } {
-  const periodMs = Math.max(1, input.routinePeriodMs);
-  const periodDeadlineMs = input.failedAt.getTime() + periodMs;
-  const deadlineMs = input.windowClosesAt
-    ? Math.min(periodDeadlineMs, input.windowClosesAt.getTime())
-    : periodDeadlineMs;
+  | { decision: "abandon"; dueAt: null; rejectedDueAtIso: string | null; reason: string } {
+  const dueAtMs = input.dueAt.getTime();
+  const failedAtMs = input.failedAt.getTime();
+  const windowClosesAtMs = input.windowClosesAt ? input.windowClosesAt.getTime() : null;
+  const marginMs = input.minUsefulMarginMs ?? MIN_USEFUL_RETRY_MARGIN_MS;
 
-  if (input.dueAt.getTime() <= deadlineMs) {
-    return { decision: "honour", dueAt: input.dueAt, clampedFromIso: null };
-  }
-
-  // Past the deadline. Retrying at the deadline itself is pointless — the
-  // window is closed at that instant — so only clamp when there is real margin
-  // left to land in, and abandon otherwise.
-  const marginMs = deadlineMs - input.failedAt.getTime();
-  if (marginMs <= 0) {
+  // Fail closed on anything non-finite. `Math.max(1, NaN)` is `NaN`, not 1, and
+  // every comparison against `NaN` is false — so an unguarded non-finite period
+  // fell past both branches below and returned a `clamp` decision carrying an
+  // `Invalid Date`, which a caller trusting the discriminant would persist
+  // straight into `scheduledRetryAt`. The period arrives from routine config
+  // rather than from this module, so it is not ours to assume well-formed.
+  // `resolveCcrotateCapacityRetry` above already guards this shape.
+  if (
+    !Number.isFinite(dueAtMs) ||
+    !Number.isFinite(failedAtMs) ||
+    !Number.isFinite(input.routinePeriodMs) ||
+    input.routinePeriodMs <= 0 ||
+    !Number.isFinite(marginMs) ||
+    marginMs < 0 ||
+    (windowClosesAtMs !== null && !Number.isFinite(windowClosesAtMs))
+  ) {
     return {
       decision: "abandon",
       dueAt: null,
-      clampedFromIso: input.dueAt.toISOString(),
-      reason: "owning window had already closed at the failure instant",
+      rejectedDueAtIso: finiteIsoOrNull(input.dueAt),
+      reason: "retry inputs were not finite, so no due time could be trusted",
     };
+  }
+
+  const periodDeadlineMs = failedAtMs + input.routinePeriodMs;
+  const deadlineMs =
+    windowClosesAtMs !== null ? Math.min(periodDeadlineMs, windowClosesAtMs) : periodDeadlineMs;
+
+  // The latest instant a retry can be due and still be expected to start, and
+  // finish, before the deadline.
+  const targetMs = deadlineMs - marginMs;
+
+  if (targetMs <= failedAtMs) {
+    return {
+      decision: "abandon",
+      dueAt: null,
+      rejectedDueAtIso: input.dueAt.toISOString(),
+      reason:
+        deadlineMs <= failedAtMs
+          ? "owning window had already closed at the failure instant"
+          : "too little of the owning window remained to dispatch a useful retry",
+    };
+  }
+
+  if (dueAtMs <= targetMs) {
+    return { decision: "honour", dueAt: input.dueAt, clampedFromIso: null };
   }
 
   return {
     decision: "clamp",
-    dueAt: new Date(deadlineMs),
+    dueAt: new Date(targetMs),
     clampedFromIso: input.dueAt.toISOString(),
   };
 }
