@@ -27,6 +27,7 @@ const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
 const mockCorePatchSecret = vi.fn();
 const mockCoreDeleteSecret = vi.fn();
+const mockCoreListSecrets = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
 // (which runs at hoist time) and the test body (which calls mockResolvedValue).
 // A plain const would be re-assigned at its original position, leaving the
@@ -51,6 +52,7 @@ vi.mock("./k8s-client.js", () => ({
     createNamespacedSecret: mockCoreCreateSecret,
     patchNamespacedSecret: mockCorePatchSecret,
     deleteNamespacedSecret: mockCoreDeleteSecret,
+    listNamespacedSecret: mockCoreListSecrets,
   }),
   getAuthzApi: () => ({}),
   getSelfPodInfo: mockGetSelfPodInfo,
@@ -120,6 +122,10 @@ function makeJob(opts: {
 // job-manifest.test.ts and manage this env var themselves.
 beforeEach(() => {
   process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+  // The BLO-21857 orphan-secret sweep runs on the execute() path. Without a
+  // default here it would reject inside its own best-effort catch, so every
+  // test in this file would pass while never exercising the wire-up at all.
+  mockCoreListSecrets.mockResolvedValue({ items: [] });
 });
 
 afterEach(() => {
@@ -1473,5 +1479,69 @@ describe("execute: per-agent creation mutex prevents TOCTOU race", () => {
     // Let A complete so the promises settle cleanly.
     resolveAgentAList({ items: [] });
     await Promise.allSettled([pA, pB]);
+  });
+});
+
+// ─── execute: orphan-secret sweep wire-up (BLO-21857) ────────────────────────
+
+// The sweep itself is unit-tested in secret-sweep.test.ts. What these two cover
+// is the wire-up: that execute() actually reaches it, with the namespace and the
+// real CoreV1Api, and that a sweep failure cannot fail the run. Both re-import
+// execute.js under vi.resetModules() because the interval gate is module-level
+// state — without a fresh module the first execute() anywhere in this file has
+// already consumed the interval slot.
+describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockCoreDeleteSecret.mockResolvedValue({});
+  });
+
+  it("collects an ownerless run Secret on the execute() path", async () => {
+    vi.resetModules();
+    mockCoreListSecrets.mockResolvedValue({
+      items: [
+        {
+          metadata: {
+            name: "ac-agent-run-orphan-prompt",
+            labels: {
+              "app.kubernetes.io/managed-by": "paperclip",
+              "paperclip.io/adapter-type": "claude_k8s",
+              "paperclip.io/run-id": "run-orphan",
+            },
+            creationTimestamp: new Date(Date.now() - 3_600_000),
+          },
+        },
+      ],
+    });
+
+    const { execute: freshExecute } = await import("./execute.js");
+    // The run itself is irrelevant here — the sweep fires before the job guard.
+    await freshExecute(makeCtx()).catch(() => {});
+
+    expect(mockCoreListSecrets).toHaveBeenCalledWith({
+      namespace: "paperclip",
+      labelSelector:
+        "app.kubernetes.io/managed-by=paperclip,paperclip.io/adapter-type=claude_k8s,paperclip.io/run-id",
+    });
+    expect(mockCoreDeleteSecret).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan-prompt",
+      namespace: "paperclip",
+    });
+  });
+
+  it("does not fail the run when the sweep itself throws", async () => {
+    vi.resetModules();
+    mockCoreListSecrets.mockRejectedValue(new Error("secrets forbidden"));
+
+    const { execute: freshExecute } = await import("./execute.js");
+    const result = await freshExecute(makeCtx());
+
+    expect(mockCoreListSecrets).toHaveBeenCalled();
+    // Whatever this run's outcome is, it must not be attributed to cleanup.
+    expect(result.errorCode ?? "").not.toContain("secret");
+    expect(result.errorMessage ?? "").not.toContain("secrets forbidden");
   });
 });

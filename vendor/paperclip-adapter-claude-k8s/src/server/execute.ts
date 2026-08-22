@@ -11,6 +11,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import {
+  ADAPTER_TYPE,
+  ADAPTER_TYPE_LABEL,
+  createSweepGate,
+  DEFAULT_SWEEP_AGE_FLOOR_SEC,
+  DEFAULT_SWEEP_INTERVAL_SEC,
+  MANAGED_BY_LABEL,
+  RUN_ID_LABEL,
+} from "./secret-sweep.js";
+import {
   parseClaudeStreamJson,
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
@@ -32,7 +41,9 @@ import type * as k8s from "@kubernetes/client-node";
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
-const RUN_ID_LABEL = "paperclip.io/run-id";
+// RUN_ID_LABEL / MANAGED_BY_LABEL / ADAPTER_TYPE_LABEL are imported from
+// secret-sweep.ts so the labels written at Secret creation and the selector the
+// orphan sweep queries with cannot drift apart (BLO-21857).
 const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
 const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
 const TASK_KEY_LABEL = "paperclip.io/task-key";
@@ -41,6 +52,13 @@ const SESSION_ID_LABEL = "paperclip.io/session-id";
 const CONCURRENT_RUN_BLOCKED_PATH = "/api/metrics/claude-k8s/concurrent-run-blocked";
 const ISOLATED_RUN_STARTED_PATH = "/api/metrics/claude-k8s/isolated-run-started";
 const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timeout", "timed_out"]);
+
+/**
+ * Module-level so the interval is shared across every execute() call in this
+ * process. No adapter lifecycle hook exists to attach a real timer to, so the
+ * ownerless-Secret sweep (BLO-21857) piggybacks on execute() instead.
+ */
+const maybeSweepOrphanedSecrets = createSweepGate();
 
 async function withK8sConcurrencyGuardTimeout<T>(operation: Promise<T>): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -1267,6 +1285,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
+  // Best-effort, rate-limited sweep of run Secrets orphaned by a control-plane
+  // crash between Secret creation and the ownerReferences patch (BLO-21857).
+  // Never throws; a cleanup path must not be able to fail a run.
+  await maybeSweepOrphanedSecrets({
+    namespace: guardNamespace,
+    coreApi,
+    batchApi,
+    onLog,
+    intervalMs:
+      Math.max(0, asNumber(config.orphanSecretSweepIntervalSec, DEFAULT_SWEEP_INTERVAL_SEC)) * 1000,
+    ageFloorMs:
+      Math.max(0, asNumber(config.orphanSecretSweepAgeFloorSec, DEFAULT_SWEEP_AGE_FLOOR_SEC)) * 1000,
+  });
   try {
     const existing = await withK8sConcurrencyGuardTimeout(
       batchApi.listNamespacedJob({
@@ -1486,9 +1517,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               name: promptSecret.name,
               namespace: promptSecret.namespace,
               labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
+                [MANAGED_BY_LABEL]: "paperclip",
+                [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE,
+                [RUN_ID_LABEL]: runId,
               },
             },
             stringData: promptSecret.data,
@@ -1523,9 +1554,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               name: envSecret.name,
               namespace: envSecret.namespace,
               labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
+                [MANAGED_BY_LABEL]: "paperclip",
+                [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE,
+                [RUN_ID_LABEL]: runId,
               },
             },
             stringData: envSecret.data,
@@ -1563,9 +1594,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               name: mcpConfigSecret.name,
               namespace: mcpConfigSecret.namespace,
               labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
+                [MANAGED_BY_LABEL]: "paperclip",
+                [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE,
+                [RUN_ID_LABEL]: runId,
               },
             },
             stringData: mcpConfigSecret.data,
