@@ -1379,17 +1379,23 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
-        trackHeartbeatSchedulerWork(collectDueExecutionWorkspaces({ db })
-          .then((swept) => {
-            if (swept.claimed > 0 || swept.failed > 0) {
-              logger.warn({ ...swept }, "periodic execution-workspace cleanup sweep processed due workspaces");
-            }
-          })
-          .catch((err) => {
-            logger.error({ err }, "periodic execution-workspace cleanup sweep failed");
-          }));
-
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+          // Destructive: removes worktrees from disk. Must stay inside the suppression
+          // gate alongside every other destructive sweep in this tick. A seeded worktree
+          // dev instance copies `execution_workspaces` verbatim, with cwd/providerRef
+          // still pointing at the source instance's live worktrees on the same
+          // filesystem, and the ownership tokens match — so suppression is the only
+          // thing standing between this sweep and a clone deleting live trees.
+          trackHeartbeatSchedulerWork(collectDueExecutionWorkspaces({ db })
+            .then((swept) => {
+              if (swept.claimed > 0 || swept.failed > 0) {
+                logger.warn({ ...swept }, "periodic execution-workspace cleanup sweep processed due workspaces");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic execution-workspace cleanup sweep failed");
+            }));
+
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {

@@ -229,6 +229,30 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
     expect(row).toMatchObject({ status: "archived", cleanupEligibleAt: null });
   });
 
+  it("ignores a malformed cleanupOwnerRunId stamp instead of aborting the sweep", async () => {
+    const fixture = await provisionPersistedWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({
+        metadata: { createdByRuntime: true, cleanupOwnerRunId: "not-a-uuid" },
+      })
+      .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+
+    // Comparing the extracted stamp as uuid is what keeps the owner-run lookup on the
+    // primary key index, but it means a non-uuid stamp would raise
+    // `invalid input syntax for type uuid` and take the whole sweep down with it.
+    const result = await collectDueExecutionWorkspaces({ db, companyId: fixture.companyId });
+
+    expect(result).toMatchObject({ selected: 0, claimed: 0, cleaned: 0, failed: 0 });
+    // Positive control: the tree really was realized, so `selected: 0` reflects the
+    // skipped stamp rather than a workspace that never existed.
+    await expect(fs.access(fixture.realized.cwd)).resolves.toBeUndefined();
+    const row = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({ status: "active", cleanupEligibleAt: null });
+  });
+
   it("holds the cleanup claim through teardown so an expired timestamp cannot run concurrently", async () => {
     const fixture = await provisionPersistedWorkspace();
     const receiptPath = path.join(fixture.repoRoot, "cleanup-receipt.txt");

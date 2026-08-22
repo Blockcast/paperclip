@@ -17,6 +17,10 @@ import {
 
 const CLEANUP_CLAIM_MS = 5 * 60 * 1000;
 const CLEANUP_RETRY_MS = 60 * 60 * 1000;
+// Bounds the stamped-workspace probe so a pathological backlog cannot turn the
+// eligibility pass into an unbounded read. Successive sweeps drain the remainder.
+const TERMINAL_STAMP_SCAN_LIMIT = 500;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type ExecutionWorkspaceCleanupSweepResult = {
   selected: number;
@@ -52,22 +56,53 @@ export async function markRunScopedExecutionWorkspaceCleanupEligible(input: {
 }
 
 async function markTerminalRunScopedWorkspacesEligible(input: { db: Db; companyId?: string; now: Date }) {
-  const terminalRows = await input.db
-    .select({ id: executionWorkspaces.id })
+  // Driven from the workspace side on purpose. Joining `heartbeat_runs` on
+  // `metadata ->> 'cleanupOwnerRunId' = heartbeat_runs.id::text` casts the uuid PK to
+  // text, which makes the PK index unusable and forces a scan of `heartbeat_runs`
+  // (a table with no production deletion path) on every call — and this function is
+  // awaited unconditionally by `collectDueExecutionWorkspaces`, i.e. on every
+  // scheduler tick and at the end of every terminal run. Selecting the stamped
+  // workspaces first bounds the work by the number of live run-scoped worktrees, then
+  // resolves their owner runs by primary key with real uuids.
+  const stampedRows = await input.db
+    .select({
+      id: executionWorkspaces.id,
+      cleanupOwnerRunId: sql<string | null>`${executionWorkspaces.metadata} ->> 'cleanupOwnerRunId'`,
+    })
     .from(executionWorkspaces)
-    .innerJoin(
-      heartbeatRuns,
-      sql`${executionWorkspaces.metadata} ->> 'cleanupOwnerRunId' = ${heartbeatRuns.id}::text`,
-    )
     .where(and(
       ...(input.companyId ? [eq(executionWorkspaces.companyId, input.companyId)] : []),
       isNull(executionWorkspaces.cleanupEligibleAt),
       isNull(executionWorkspaces.closedAt),
       inArray(executionWorkspaces.status, ["active", "idle"]),
+      sql`${executionWorkspaces.metadata} ->> 'cleanupOwnerRunId' is not null`,
+    ))
+    .limit(TERMINAL_STAMP_SCAN_LIMIT);
+  if (stampedRows.length === 0) return 0;
+
+  // Only well-formed uuids are compared, so a malformed stamp cannot raise
+  // `invalid input syntax for type uuid` and abort the whole sweep.
+  const ownerRunIds = [...new Set(
+    stampedRows
+      .map((row) => row.cleanupOwnerRunId)
+      .filter((runId): runId is string => typeof runId === "string" && UUID_PATTERN.test(runId)),
+  )];
+  if (ownerRunIds.length === 0) return 0;
+
+  const terminalOwnerRuns = await input.db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(
+      inArray(heartbeatRuns.id, ownerRunIds),
       inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"]),
     ));
-  if (terminalRows.length === 0) return 0;
-  const ids = terminalRows.map((row) => row.id);
+  if (terminalOwnerRuns.length === 0) return 0;
+
+  const terminalOwnerRunIds = new Set(terminalOwnerRuns.map((row) => row.id));
+  const ids = stampedRows
+    .filter((row) => row.cleanupOwnerRunId !== null && terminalOwnerRunIds.has(row.cleanupOwnerRunId))
+    .map((row) => row.id);
+  if (ids.length === 0) return 0;
   const updated = await input.db
     .update(executionWorkspaces)
     .set({ status: "cleanup_pending", cleanupEligibleAt: input.now, updatedAt: input.now })
