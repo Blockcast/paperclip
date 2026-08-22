@@ -201,6 +201,7 @@ import {
   listManagedAgentPods,
   listLiveAgentJobRunIds,
   matchExactAgentJob,
+  probeAgentPodActivity,
   readAgentJobRunStatusByName,
   type AgentJobRunStatus,
   type ManagedAgentPod,
@@ -2033,6 +2034,25 @@ const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // quiet gap (which bumps lastUsefulActionAt) while still reclaiming the slot
 // and node CPU long before the multi-hour manual-reap point.
 const EXTERNAL_LIFECYCLE_HARD_STALE_MS = 45 * 60 * 1000;
+// BLO-20251: absolute ceiling on how long a demonstrably-busy pod may defer its
+// hard-stale kill. Without it, a run wedged in a CPU-burning spin loop would
+// look "busy" forever and hold its agent's dispatch slot indefinitely — the
+// exact starvation BLO-12996 introduced the force-reap to prevent. Four times
+// the hard-stale floor (3h) is comfortably longer than any real dependency
+// install, test suite, or image build we have observed, while still bounding
+// the damage of a busy-looking zombie to one afternoon rather than forever.
+//
+// Parsed defensively: a malformed override must not yield NaN here, because
+// every `silentMs >= NaN` comparison is false — the ceiling would silently
+// vanish and a busy-looking zombie really would hold its slot forever. That is
+// the one direction this file must never fail in, so an unusable value falls
+// back to the default rather than being passed through.
+const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = (() => {
+  const fallback = 4 * EXTERNAL_LIFECYCLE_HARD_STALE_MS;
+  const override = Number(process.env.PAPERCLIP_EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS);
+  if (!Number.isFinite(override) || override <= 0) return fallback;
+  return Math.max(EXTERNAL_LIFECYCLE_HARD_STALE_MS, override);
+})();
 // BLO-18030: bound on confirming a hard-stale-killed Job has actually quiesced
 // before its reviewer-evidence probe is trusted (see
 // confirmStaleKilledJobQuiesced). The Background-propagation delete returns
@@ -21458,6 +21478,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  /**
+   * BLO-20251: should this hard-stale run be spared because its pod is
+   * demonstrably executing a long silent subprocess?
+   *
+   * The reaper's silence signal (externalLifecycleRecentRefTime, above) is fed
+   * by adapter stdout. While the agent sits in a Bash tool call the CLI emits
+   * nothing between tool_use and tool_result, so a legitimate `pnpm install`,
+   * test suite, or image build is byte-for-byte indistinguishable from a wedged
+   * pod. Run cf7f812b on BLO-20088 was force-killed mid-`pnpm install` on
+   * 2026-08-01, destroying ~30 min of completed critical-path work.
+   *
+   * Pod CPU is the corroborating signal (see probeAgentPodActivity for why it
+   * was chosen over workspace mtime, adapter stdout, and a longer grace).
+   *
+   * Deliberately fails CLOSED — anything other than positive "busy" evidence
+   * reaps exactly as it did before BLO-20251, so a cluster without
+   * metrics-server keeps the full BLO-12996 behaviour.
+   */
+  async function shouldDeferHardStaleKillForBusyPod(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
+    >,
+    now: Date,
+  ): Promise<boolean> {
+    const refTime = externalLifecycleRecentRefTime(run);
+    const silentMs = refTime ? now.getTime() - refTime : Number.POSITIVE_INFINITY;
+    // Past the ceiling a busy pod is treated as a CPU-burning zombie and reaped
+    // regardless, so it cannot hold the agent's dispatch slot forever.
+    if (silentMs >= EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS) return false;
+
+    const activity = await probeAgentPodActivity(run.id);
+    if (activity !== "busy") return false;
+
+    logger.info(
+      { runId: run.id, silentMs, activity },
+      "reapOrphanedRuns: deferring hard-stale kill — pod is executing a live subprocess (BLO-20251)",
+    );
+    return true;
+  }
+
   function isExternalLifecycleRunInRecentGrace(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
@@ -22315,6 +22376,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             !preAdapterRefTime ||
             now.getTime() - preAdapterRefTime >= EXTERNAL_LIFECYCLE_HARD_STALE_MS;
           if (preAdapterHardStale) {
+            // BLO-20251: a pre-adapter run is still doing real work during
+            // workspace setup (repo clone, dependency install). Spare it while
+            // its pod is demonstrably busy.
+            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -22422,6 +22487,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // hasActiveJobForAgent gate in startNextQueuedRunForAgent). Force-kill
           // it so newly-queued high-priority work can dispatch.
           if (jobStatus && jobStatus.phase === "active" && isHardStale) {
+            // BLO-20251: silence here may just be a long Bash tool call
+            // (dependency install, test suite, image build). Spare the run
+            // while its pod is demonstrably burning CPU.
+            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -22462,6 +22531,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Below the hard floor we still honor the 2026-05-23 guard and
             // leave a live-but-quiet Job alone.
             if (isHardStale) {
+              // BLO-20251: same deferral as the rich-status path above — the
+              // snapshot says the Job is alive, so a busy pod means a live
+              // subprocess rather than a wedge.
+              if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
               const finalized = await finalizeExternalLifecycleTerminalRun({
                 run,
                 adapterType,
