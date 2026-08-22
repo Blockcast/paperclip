@@ -723,4 +723,80 @@ describe("plugin host company context guards", () => {
       await handle.stop().catch(() => undefined);
     }
   });
+
+  it("forwards a host error's machine-readable code to the worker as JSON-RPC data", async () => {
+    // BLO-20738. Host services discriminate their failures with
+    // `HttpError.details.code` (`secret_verifier_unsupported`,
+    // `binding_ambiguous`, …), but until this fix only `message` and a numeric
+    // JSON-RPC code crossed to the worker — and since `HttpError` carries
+    // `status` rather than a numeric `code`, every one of them arrived as a
+    // bare INTERNAL_ERROR. A plugin could only tell two host failures apart by
+    // substring-matching English prose, so alertmanager could not distinguish
+    // "this secret cannot be verified at all" (a permanent misconfiguration,
+    // which must fail loudly and be retried) from "wrong bearer" (a routine
+    // 401). This asserts the code now survives the round trip.
+    const verifierUnsupported = Object.assign(
+      new Error("Secret verifier is unavailable: external provider reference"),
+      { status: 422, details: { code: "secret_verifier_unsupported", internalQuery: "SELECT 1" } },
+    );
+    const secretsResolve = vi.fn(async () => {
+      throw verifierUnsupported;
+    });
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: vi.fn(async () => ({})) },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+
+      const rejection = await handle.call("performAction", {
+        key: "probe",
+        params: {
+          mode: "echo",
+          hostMethod: "secrets.resolve",
+          requestedCompanyId: "company-a",
+        },
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-a",
+        },
+        renderEnvironment: null,
+      }).then(
+        () => { throw new Error("expected the host handler failure to reject"); },
+        (err: unknown) => err,
+      );
+
+      expect(secretsResolve).toHaveBeenCalledTimes(1);
+      expect(rejection).toMatchObject({
+        data: { code: "secret_verifier_unsupported" },
+      });
+      // Only the code is projected. `details` is free-form and a worker is a
+      // lower-trust process, so forwarding it verbatim would turn this into an
+      // exfiltration channel the first time a call site attaches a query or a
+      // row to one.
+      expect((rejection as { data?: Record<string, unknown> }).data)
+        .toEqual({ code: "secret_verifier_unsupported" });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
 });

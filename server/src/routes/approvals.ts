@@ -22,6 +22,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, 
 import { redactApprovalPayloadForDisplay } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
 
 function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
@@ -147,6 +148,7 @@ export function approvalRoutes(
           ...(statusOnly ? {
             modelProfile: "cheap",
             allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
           } : {}),
           recoveryIntent: planningOnly ? "planning_only" : "status_only",
           resumeRequiresNormalModel: statusOnly,

@@ -14,6 +14,7 @@ control plane.
 | Repository vendored from | <https://github.com/kkroo/paperclip-adapter-claude-k8s> |
 | Package | `paperclip-adapter-claude-k8s` |
 | Version at vendor time | `0.2.5-kkroo.6` |
+| Current version | `0.2.6-blockcast.1` — see [Versioning](#versioning) |
 | Declared license | MIT, in `package.json` only — see the caveat below |
 
 Before this change the image built this package by cloning that repository at a
@@ -91,11 +92,11 @@ applied since.
 
 ### Integrity
 
-A manifest of `sha256(path)` over all 37 in-tree files, sorted by path under
+A manifest of `sha256(path)` over all 39 in-tree files, sorted by path under
 `LC_ALL=C`, itself hashes to:
 
 ```
-fcce97c7744fcd54e3c92c792d4ceaaacc1173c88e353fd4c03838e2b0e2f924
+69286948d2b197e1c8ec25fb3b2820be7ed87232f2215fdb3ebf742f8c7ce030
 ```
 
 Regenerate with:
@@ -159,6 +160,9 @@ upstream**, so they are enumerated here rather than left implicit.
 | `e1b28276f` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Replaced the boundary-regex classifier with a shell-aware normalizer, in both copies. Five prior rounds each closed one boundary bypass; the fifth Ally review found three more (`env >&2`, `e''nv`, `env -S '-u PATH'`). Re-measured against the real spawned pod script the class was wider than reported: 10 of 12 probe payloads classified `allow` while `/bin/sh` emitted a marker variable, including `e"n"v`, `\env`, `'env'`, `env>&2`, `env 2>&1` and `env -S '-0'`. The cause is structural, not a missing character class — a regex matches command *text*, but the shell executes the command after quote removal, escape processing, redirection stripping and GNU `env -S` re-splitting, so the matched string is not the token that runs. The command is now lexed as a shell would and the resulting words are classified, so spelling variants collapse to one word. The hand-maintained second case list for the embedded copy — the mechanism by which the two copies drifted — is replaced by a differential that drives the whole corpus through both. Fifth Ally review pass on Blockcast/paperclip#1092. |
 | `e1b28276f` | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Two fail-closed fixes from the same review. (a) A configured account pool of the wrong *shape* (`accounts: "a@example.test"` rather than a list) was collapsed into the same `null` used for "absent" by `Array.isArray(...) ? ... : null`, so it read as unconfigured and selected unrestricted *global* ccrotate rotation — the same credential-scope widening `3e0244a78` fixed for the all-invalid case, still reachable by the likeliest possible typo. Presence is now tested separately from validity at both `providers.anthropic` and `.accounts` (`parseObject` returns `{}` for any non-object, so both levels shared the defect), an explicitly empty pool counts as configured-but-unusable, and diagnostics report the offending TYPE only — never the value, which sits next to credential material. (b) `workspaceMountPath` could equal a mount this builder already emits (`/tmp/prompt`, `/runtime-cache`, an inherited secret mount); those are shape-valid so `assertSafeAbsolutePath` passed them, and the duplicate mountPath yields a Pod Kubernetes rejects outright. Rejected at construction with a message naming the conflict, plus a per-container invariant assertion that backstops mounts appended later (`/var/run`, `prompt-secret`, `mcp-config-secret`) and the init container's independently-built list. Nested paths stay legal. |
 | [#1368](https://github.com/Blockcast/paperclip/pull/1368) | `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts`, `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Carried the source volume's `items:` key selector through propagation. `getSelfPodInfo()` captured only `secretName`/`mountPath`/`defaultMode`, and the mount site rebuilt the volume without a selector, so a source mount projecting ONE key out of a multi-key Secret was re-expanded into EVERY key of that Secret on the agent Job pod. Measured live: `paperclip-api` projects `gbrain-plugin-service-key` alone out of `authbot-mcp-consumer-service-keys`, while agent pods received all 7 keys — agents held more key material than the container the mount was copied from. `optional: true` stays hardcoded at the mount site by design, so a Secret absent in the agent namespace still cannot hard-fail the Job. Refs [BLO-18927](https://paperclip.blockcast.net/BLO/issues/BLO-18927) AC-3; does **not** close [BLO-22514](https://paperclip.blockcast.net/BLO/issues/BLO-22514), which needs the allowlist. |
+| [#1377](https://github.com/Blockcast/paperclip/pull/1377) | `src/server/inherit-allowlist.ts` (new), `src/server/inherit-allowlist.test.ts` (new), `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts`, `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts`, `src/server/env-guard.ts` | Allowlisted what agent Job pods inherit from the paperclip server pod. `getSelfPodInfo()` snapshotted the server's ENTIRE env — every literal, every `valueFrom` including `secretKeyRef`, every `envFrom` and every mounted secret volume — with no filter, and `job-manifest.ts` replayed all of it onto every agent Job, so each agent container held `PAPERCLIP_AGENT_JWT_SECRET` (mint an API key for ANY agent), `DATABASE_URL` (bypass the API and all of `authorization.ts`) and `GITHUB_APP_PRIVATE_KEY`. Filtered at `getSelfPodInfo()` rather than at the four replay sites, so a future replay site cannot reintroduce the leak by forgetting to filter, plus a fail-closed `findServerOnlyEnvVarsInPodSpec` backstop in `buildJobManifest` because `SelfPodInfo` is a plain object callers can construct unfiltered. Keep-set derived from actual by-name reads plus an agent-pod consumer sweep — not pattern-matched — and both directions unit-tested, since a filter that dropped everything would pass a deny-only suite while breaking every run in the fleet. Measured against the live server env: 54 vars in, 24 inherited, 30 dropped, 0 control-plane credentials remaining. `env-guard.ts` is comment-only: records the BLO-22514 decision to keep that hook fail-OPEN. Closes [BLO-22514](https://paperclip.blockcast.net/BLO/issues/BLO-22514). |
+| [#1411](https://github.com/Blockcast/paperclip/pull/1411) | `src/server/inherit-allowlist.ts`, `src/server/inherit-allowlist.test.ts`, `src/server/k8s-client.test.ts` | Removed `paperclip-github-merge-token` (the `@allyblockcast` USER seat, id 296676656) from `AGENT_SECRET_VOLUME_ALLOWLIST`, so it no longer propagates from the server pod into agent Job pods. That seat's approvals SATISFY required review on repos whose ruleset names the Ally team (onprem-k8s, penstock-llm-proxy-core), so propagating it made "can clear branch protection" a fleet-wide capability — measured live at **108 agent Job pods** mounting it — rather than one service's. It was also unusable from an agent by construction, i.e. exposure with no function: the `gh` wrapper resolves `PAPERCLIP_GITHUB_TOKEN_FILE` (pinned to the App token at `/paperclip/.secrets/github-token/token`, never the seat path), `GH_TOKEN`/`gh auth`/`--with-token` overrides are no-ops because that wrapper re-reads the file per invocation, and shipped skills are forbidden from naming the seat path by `CREDENTIAL_SELECTOR_PATTERNS` in `packages/skills-catalog/src/shipped-catalog.test.ts`. Measured across 240 PRs in onprem-k8s, penstock-llm-proxy-core, paperclip and multicast: the seat authored 0 and pushed 0 (authorship is 100% the App) and merged 11, a path the App already covers. The CONTROL PLANE keeps the mount via `deploy/helm/paperclip/values.blockcast.yaml`, where the dedicated reviewer service that legitimately uses this identity runs — only the agent-Job propagation is removed. Two `k8s-client` tests used the seat as their example of a KEPT volume and were re-pointed at the App token; the base fixture now mounts both, deliberately keeping the seat so the allowlist is exercised against a realistic server pod rather than one curated to contain only inheritable volumes. Companion to the org-side half of [BLO-24056](https://paperclip.blockcast.net/BLO/issues/BLO-24056) (seat dropped to `read` on all 11 in-scope repos). |
+| [BLO-25403](https://paperclip.blockcast.net/BLO/issues/BLO-25403) | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts`, `src/server/config-schema.ts`, `src/server/execute.ts`, `src/server/execute.test.ts`, `src/server/execute-environment.test.ts` | Ported upstream `94c97d01d408155a5c173c43ab42304f688e7ce3` (merged as [kkroo#32](https://github.com/kkroo/paperclip-adapter-claude-k8s/pull/32) `c5d1389f`) — the BLO-21812 fix, which the 2026-08-06 vendoring **stranded**: it was authored against a branch that was not part of the `3ad3370`+`35f1eb2`+`6ddd4b0` composition, so it never entered the build path and `CLAUDE_K8S_REF` was retired out from under it. A new `resolveServiceAccountName()` resolves per-agent config → `PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME` (fleet default) → **throw**, replacing `asString(config.serviceAccountName, "") \|\| undefined`, which omitted the key and let Kubernetes admission silently assign the namespace's bare `default` SA — an identity with no cluster-scoped read, and a full misdiagnosed incident ([BLO-21499](https://paperclip.blockcast.net/BLO/issues/BLO-21499)). The resolved SA is echoed on `JobBuildResult`, into the run log and into invocation metadata so identity is attributable without a cluster read. Ported by hand rather than cherry-picked: 4 of 6 files applied clean, but `execute.ts` and the `buildJobManifest` return had drifted under `551c461ef`/`3e0244a78`/`e1b28276f` (`envSecret`, `mcpConfigSecret`), so those two hunks were reapplied against current code. No RBAC object is created or modified. Two cases beyond upstream's pin the load-bearing `.trim()` on both resolution branches — `serviceAccountName` is a `type: "text"` field, so a whitespace-only value is reachable from the UI form and a bare `\|\|` would emit it as a Job SA name the API server rejects (Ally review suggestion on [#1409](https://github.com/Blockcast/paperclip/pull/1409)). |
 
 The two cherry-picked commits in the composition above remain upstream commits
 authored against the fork, not Blockcast-local patches.
@@ -168,6 +172,27 @@ repository: edit, open a PR, let CI run. There is no longer an external fork to
 push to first, and `CLAUDE_K8S_REF` no longer exists. **Any change here must
 update the integrity hash in the same PR** — CI fails the `vendor_claude_k8s`
 job otherwise, and prints the expected value.
+
+### Versioning
+
+Upstream stopped moving this number: `0.2.5-kkroo.6` is the value at both
+`c5d1389f` and upstream `master` (`1fef67c`), and it is what was deployed. So
+after the first Blockcast change that ships, the version alone could no longer
+tell you which code was running — provenance had to be established by grepping
+`dist/` for a token.
+
+This directory therefore versions itself: **`0.2.6-blockcast.1`**, set in
+`package.json` and `package-lock.json`. The `-blockcast.` prerelease channel
+says plainly that this is our tree, not an upstream release.
+
+The PATCH digit is bumped rather than only the prerelease tag, deliberately.
+Semver compares `major.minor.patch` **before** prerelease identifiers, so
+`0.2.6-blockcast.1` > `0.2.5-kkroo.6`. Had we picked `0.2.5-blockcast.1`, the
+prerelease identifiers would have decided it — and `blockcast` sorts *below*
+`kkroo` alphabetically, making the release read as a downgrade to anything
+comparing versions.
+
+Bump `-blockcast.N` for subsequent changes to this directory.
 
 ### The inert upstream workflow
 

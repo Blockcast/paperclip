@@ -121,14 +121,59 @@ function isExpectedApproval(review, { id, login }, headSha) {
 }
 
 /**
+ * A review body reduced to the form the equality rules below compare.
+ *
+ * Trimming is deliberately the only normalization. The named defect mechanism —
+ * passing one `--body-file` to both `gh pr review` calls — produces
+ * byte-identical bodies, but a stray trailing newline is still one verdict
+ * posted twice, and an exact-equality test would audit that pair as sound. Two
+ * bodies that differ in substance are two write-ups, and deciding when
+ * overlapping prose counts as one verdict is a larger question than these
+ * predicates should answer.
+ *
+ * This exists as one helper because the rule is applied at two sites that must
+ * agree: {@link isRequiredApprovalPair}, which decides whether a pair is the
+ * legitimate two-seat exemption, and {@link duplicateBodyAcrossIdentities},
+ * which decides how the resulting violation is worded. Normalizing in only one
+ * of them is not a partial fix but a silent no-op — the deciding branch runs
+ * first, so a laxer comparison there exempts the pair before the stricter one
+ * is ever consulted. That is precisely how the whitespace case survived its
+ * first fix, with a green unit test asserting on the downstream predicate.
+ *
+ * @param {object} review a review object, possibly bodiless
+ * @returns {string} the body with surrounding whitespace removed; `""` when the
+ *   body is absent, empty, or whitespace-only
+ */
+export function normalizedBody(review) {
+  return String(review?.body ?? "").trim();
+}
+
+/**
  * The only permitted two-review shape: one current-head approval from the
  * required App identity and one from the required User seat. This deliberately
  * inspects the full operative set instead of deduplicating it; a retry, an
  * unexpected identity, or a missing/stale attestation makes the shape fail.
+ *
+ * The two bodies must also differ, compared via {@link normalizedBody}. This
+ * exemption exists for the case where a gate genuinely needs both seats — an
+ * App-authored PR, or a CODEOWNERS/team approver a GitHub App cannot be — and
+ * there the User seat contributes a short, distinct approval linking to the
+ * App's review. Two bodies identical up to surrounding whitespace are not that
+ * case: they are one verdict submitted twice under two credentials, which is
+ * BLO-22916's defect and the mechanism that held this guard red from
+ * 2026-08-02 to 2026-08-16. Ally's instructions now forbid passing the same
+ * `--body-file` to both calls; this is where that is enforced, so a future run
+ * cannot re-derive "submit under both to be safe" and have the audit call it
+ * sound.
+ *
+ * This is the branch that decides the outcome: `findPrViolations` reports I1
+ * only when this returns false, so a pair exempted here is never examined
+ * further.
  */
 export function isRequiredApprovalPair(reviews, headSha) {
   const operative = operativeAllyReviews(reviews, headSha);
   if (operative.length !== 2) return false;
+  if (normalizedBody(operative[0]) === normalizedBody(operative[1])) return false;
 
   return (
     operative.some((review) =>
@@ -149,6 +194,39 @@ export function isRequiredApprovalPair(reviews, headSha) {
 }
 
 /**
+ * True when two operative reviews carry the same body under different user IDs
+ * — AC1's literal wording in BLO-22916, and the fingerprint of one run
+ * submitting its verdict twice rather than two independent passes (two passes
+ * produce two different write-ups).
+ *
+ * Bodies are compared via {@link normalizedBody}, the same helper the deciding
+ * branch in {@link isRequiredApprovalPair} uses, so the two cannot disagree
+ * about what counts as the same body.
+ *
+ * A body that is empty or whitespace-only is excluded. Two bodiless approvals
+ * under two seats compare equal, but they are not one verdict posted twice —
+ * there is no verdict at all. That is Defect 2 (a counting APPROVED with no
+ * review behind it), I2d already reports it, and its remedy is to post a
+ * comment rather than to drop one of the two submissions.
+ *
+ * @param {object[]} operative reviews ALREADY filtered to the operative set for
+ *   one head, as returned by {@link operativeAllyReviews}. Passing a raw
+ *   `pr.reviews` list would compare dismissed and stale-head reviews and so
+ *   answer a different question than the caller intends.
+ * @returns {boolean} true when the duplicate-submission shape is present
+ */
+export function duplicateBodyAcrossIdentities(operative) {
+  const reviews = operative ?? [];
+  const bodies = reviews.map(normalizedBody);
+  return reviews.some((a, i) =>
+    reviews.some(
+      (b, j) =>
+        j > i && bodies[i] !== "" && bodies[i] === bodies[j] && a?.user?.id !== b?.user?.id,
+    ),
+  );
+}
+
+/**
  * @param {{number: number, headSha: string, reviews: object[]}} pr
  * @returns {string[]} human-readable violations; empty when the PR is sound
  */
@@ -160,8 +238,14 @@ export function findPrViolations(pr) {
 
   if (operative.length > 1 && !isRequiredApprovalPair(pr.reviews, head)) {
     const detail = operative.map((r) => `${r.state}/${r.id}`).join(", ");
+    // Name the duplicate-submission shape explicitly. Left as a bare count, an
+    // operator reading the hourly audit cannot tell "one verdict posted twice"
+    // from "two genuinely different reviews", and those have opposite remedies.
+    const reason = duplicateBodyAcrossIdentities(operative)
+      ? "the same body submitted under two credentials — one verdict, posted twice (BLO-22916)"
+      : "expected at most 1 or the exact App/User APPROVED pair";
     violations.push(
-      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — expected at most 1 or the exact App/User APPROVED pair`,
+      `I1 PR #${pr.number} @${short}: ${operative.length} operative Ally reviews (${detail}) — ${reason}`,
     );
   }
 

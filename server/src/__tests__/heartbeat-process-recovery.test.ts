@@ -1680,6 +1680,141 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
   });
 
+  it("keeps a running external Job whose useful-action stamp is stale but whose output is fresh (BLO-20775)", async () => {
+    // BLO-20775. Scope honestly: this is a CHARACTERIZATION test of the selection
+    // expression in externalLifecycleRecentRefTime, not a reproduction of a
+    // production incident. It manufactures the divergent stamp state directly,
+    // because no production writer produces it on a running row — flushOutputProgress
+    // writes lastOutputAt and lastUsefulActionAt to the same value in a single
+    // .set(), which the coupling guard below pins. An earlier revision of this test
+    // claimed "a live run was killed"; that claim was not substantiated and has
+    // been withdrawn.
+    //
+    // What it is worth: the divergent state is real on TERMINAL rows (the
+    // terminal-path classifyAndPersistRunLiveness stamps lastUsefulActionAt to an
+    // often-hours-old evidence time while lastOutputAt stays fresh). But no
+    // currently reachable transition carries such a row back to `running` on THIS
+    // path. An earlier revision of this comment cited the unguarded
+    // setRunStatus(id, "running") in reapOrphanedRuns; that write sits behind
+    // processPidAlive → isTrackedLocalChildProcessAdapter (SESSIONED_LOCAL_ADAPTERS),
+    // while externalLifecycleRecentRefTime is only reached under hasExternalLifecycle
+    // (claude_k8s / opencode_k8s). The sets are disjoint, so that race cannot
+    // manufacture this row here — it applies to the adapter-agnostic dispatcher slot
+    // gate instead, which is covered separately in
+    // heartbeat-dispatch-priority-sort.test.ts. That claim is withdrawn.
+    //
+    // So this test is deliberately FUTURE-PROOFING, not a reachable-race repro: it
+    // pins that if the two stamps are ever decoupled — or an external-lifecycle
+    // transition that preserves terminal stamps is ever added — such a row is still
+    // NOT force-killed. That outcome is what matters, since isHardStale gates a
+    // destructive Job delete.
+    //
+    // The test above passes under both the old and new code (a fresh
+    // lastUsefulActionAt wins either way); only this direction distinguishes them.
+    const stale = new Date(Date.now() - 46 * 60 * 1000);
+    const freshOutput = new Date(Date.now() - 60 * 1000);
+    const jobName = "agent-opencode-fresh-output-stale-action";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      includeIssue: false,
+      externalRunId: jobName,
+      lastOutputAt: freshOutput,
+    });
+    // Every lifecycle stamp except lastOutputAt is past the 45-min hard-stale
+    // ceiling, so only taking the max over all of them keeps this run alive.
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: stale, createdAt: stale, lastUsefulActionAt: stale })
+      .where(eq(heartbeatRuns.id, runId));
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({
+      companyId,
+      agentId,
+      runId,
+      jobName,
+      jobUid: "fresh-output-stale-action-uid",
+    });
+    mockListAgentJobRunStatuses.mockResolvedValueOnce(new Map([[runId, {
+      phase: "active",
+      name: jobName,
+      uid: "fresh-output-stale-action-uid",
+    }]]));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    // REGRESSION GUARD: under the old priority chain this run was reaped with
+    // errorCode "external_lifecycle_stale_killed" and its Job deleted — verified by
+    // reverting the source change with this test in place.
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    expect(mockDeleteAgentJobsForRun).not.toHaveBeenCalled();
+  });
+
+  it("couples lastOutputAt and lastUsefulActionAt on the live output path (BLO-20775 coupling guard)", async () => {
+    // BLO-20775. This is the guard the two characterization tests above depend on,
+    // and it runs through the REAL producer rather than a manufactured row.
+    //
+    // Why it exists: `last_output_at` and `last_useful_action_at` are separate
+    // nullable columns, and their names invite the reading that output advances one
+    // and concrete action advances the other independently. Today that is NOT how a
+    // running run behaves — flushOutputProgress writes BOTH from the same
+    // pendingOutputProgress.at in a single .set(), so on a live row they are always
+    // equal. That coupling is the entire reason a stale-useful/fresh-output row is
+    // unreachable on the normal running path, and until now nothing asserted it.
+    //
+    // If someone later decouples the stamps — a reasonable change, since it is what
+    // the column names already imply, and it would make lastUsefulActionAt mean what
+    // run-liveness.ts computes — this test goes red and points at the two selection
+    // sites (externalLifecycleRecentRefTime and the dispatcher slot gate) that must
+    // stay max-based for that decoupling to be safe. Those sites are already
+    // max-based, so the decoupling is safe to make; this test is the tripwire that
+    // makes the dependency visible instead of implicit.
+    //
+    // Read INSIDE the adapter callback, while the run is still `running`: the
+    // terminal path (classifyAndPersistRunLiveness) rewrites lastUsefulActionAt on
+    // finalize — often to an older evidence timestamp or to null — so reading after
+    // the run settles would observe the terminal write, not the output write.
+    const { runId: coupledRunId } = await seedQueuedIssueRunFixture();
+    let observed: { lastOutputAt: Date | null; lastUsefulActionAt: Date | null } | null = null;
+    mockAdapterExecute.mockImplementationOnce(
+      async (ctx: {
+        runId: string;
+        onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+      }) => {
+        await ctx.onLog("stdout", "streamed adapter output chunk\n");
+        observed = await db
+          .select({
+            lastOutputAt: heartbeatRuns.lastOutputAt,
+            lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, ctx.runId))
+          .then((rows) => rows[0] ?? null);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          resultJson: { exitCode: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    );
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, coupledRunId, 5_000);
+
+    const flushed = observed as { lastOutputAt: Date | null; lastUsefulActionAt: Date | null } | null;
+    expect(flushed).not.toBeNull();
+    // The flush happened at all (the fixture starts both columns null).
+    expect(flushed?.lastOutputAt).toBeInstanceOf(Date);
+    expect(flushed?.lastUsefulActionAt).toBeInstanceOf(Date);
+    // THE INVARIANT: streamed output advances both stamps to the identical value.
+    expect(flushed?.lastUsefulActionAt?.getTime()).toBe(flushed?.lastOutputAt?.getTime());
+  });
+
   it("does not re-adopt an external Job after its PR gate closes", async () => {
     const jobName = "agent-opencode-closed-pr";
     const jobUid = "closed-pr-uid";
@@ -9067,6 +9202,189 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       (item) => item.eventType === "issue.escalation.needs_human_decision" && item.entityId === issueId,
     );
     expect(matchingEvents).toHaveLength(1);
+  });
+
+  it("keeps dependency-blocked work on its non-invokable assignee without creating takeover recovery", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+    });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Unresolved dependency",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `BLOCK-${blockerIssueId.slice(0, 8)}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((wake) => wake.reason === "source_scoped_recovery_action")).toBe(false);
+  });
+
+  it("does not oscillate dependency-ready work when a paused assignee cannot receive a wake", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+    });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Resolved dependency",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `BLOCK-${blockerIssueId.slice(0, 8)}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    for (let index = 0; index < 2; index += 1) {
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.escalated).toBe(0);
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue).toMatchObject({ status: "in_progress", assigneeAgentId: agentId });
+    }
+
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((wake) => wake.status === "queued")).toBe(false);
+  });
+
+  it("requeues dependency-blocked review work to its assignee when its blocker resolves before recovery reconciliation", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+    });
+    const reviewerAgentId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "RecoveryReviewer",
+      role: "reviewer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({
+      status: "in_review",
+      checkoutRunId: null,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Dependency resolved during recovery",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `BLOCK-${blockerIssueId.slice(0, 8)}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "todo", assigneeAgentId: agentId });
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toContainEqual(expect.objectContaining({
+      reason: "issue_blockers_resolved",
+      idempotencyKey: `issue_blockers_resolved:${issueId}:${blockerIssueId}`,
+    }));
+    const reviewerWakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+    expect(reviewerWakes.some((wake) => wake.reason === "issue_blockers_resolved")).toBe(false);
+  });
+
+  it("leaves dependency-ready review work unchanged when its assignee wake is declined", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+    });
+    await db.update(issues).set({ status: "in_review", checkoutRunId: null }).where(eq(issues.id, issueId));
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+    }).where(eq(agents.id, agentId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Resolved dependency whose wake is declined",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `BLOCK-${blockerIssueId.slice(0, 8)}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: agentId });
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((wake) => wake.status === "queued")).toBe(false);
   });
 
   // BLO-1498/BLO-5691: when an in-progress run fails with a non-retryable

@@ -1,0 +1,140 @@
+# Proof that ./.github/actions/setup-pnpm's retry actually fires (BLO-28813).
+#
+# The wrapper's guard test (scripts/__tests__/pnpm-setup-retry.test.mjs) asserts
+# the YAML *text* — that the retry step exists and is gated on
+# `steps.first.outcome == 'failure'`. That cannot detect the failure mode that
+# matters. GitHub documents `continue-on-error` as a composite `runs.steps[*]`
+# key, but does NOT document `steps.*.outcome` availability inside a composite
+# action. If `outcome` does not evaluate there, the `if:` is false, the retry is
+# skipped, the first attempt's failure stays swallowed by `continue-on-error` —
+# and the composite exits **0 with no pnpm installed**. The mitigation would be
+# inert, and nothing would say so until the next registry brownout.
+#
+# Normal CI cannot close that gap: attempt one succeeds, so the branch is never
+# taken. Hence this workflow.
+#
+# It runs on any push that touches the wrapper, NOT only on workflow_dispatch.
+# Two reasons. First, `workflow_dispatch` can only be triggered once the file
+# exists on the default branch, so a dispatch-only proof is un-runnable on the
+# very PR that introduces it — exactly when it is needed. Second, tying it to
+# the wrapper's own paths means it re-proves itself whenever the thing it proves
+# is edited, instead of depending on someone remembering to run it by hand.
+name: Prove pnpm setup retry (BLO-28813)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/actions/setup-pnpm/**"
+      - ".github/workflows/pnpm-setup-retry-proof.yml"
+      - ".github/scripts/flaky-registry-proxy.mjs"
+
+jobs:
+  # The decisive one, and deterministic: no proxy, no timing.
+  #
+  #   retry fires and also fails  -> composite outcome == 'failure'
+  #   retry silently skipped      -> composite outcome == 'success' (no pnpm!)
+  #
+  # So asserting outcome == 'failure' against an unreachable registry proves the
+  # gating works, with no dependency on how fast anything ran.
+  gating_actually_evaluates:
+    runs-on: arc-light
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Record start time
+        id: clock
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm against an unreachable registry
+        id: pnpm
+        continue-on-error: true
+        uses: ./.github/actions/setup-pnpm
+        env:
+          # Port 1 refuses immediately, so both attempts fail fast rather than
+          # burning the 120s deadline twice.
+          npm_config_registry: http://127.0.0.1:1/
+
+      - name: Assert the retry ran, rather than being silently skipped
+        shell: bash
+        env:
+          COMPOSITE_OUTCOME: ${{ steps.pnpm.outcome }}
+          STARTED_AT: ${{ steps.clock.outputs.started }}
+        run: |
+          set -euo pipefail
+          elapsed=$(( $(date +%s) - STARTED_AT ))
+          echo "composite outcome=${COMPOSITE_OUTCOME} elapsed=${elapsed}s"
+
+          if [ "$COMPOSITE_OUTCOME" != "failure" ]; then
+            echo "::error::The wrapper reported '${COMPOSITE_OUTCOME}' against an unreachable registry."
+            echo "::error::Only the retry step can fail this composite — the first attempt"
+            echo "::error::carries continue-on-error. Anything else means the retry was SKIPPED,"
+            echo "::error::i.e. steps.first.outcome did not evaluate inside the composite and"
+            echo "::error::the mitigation is inert. See BLO-28813."
+            exit 1
+          fi
+
+          # Corroborating, not load-bearing: the 10-25s jittered sleep between
+          # attempts means a real two-attempt run cannot finish in a few seconds.
+          if [ "$elapsed" -lt 10 ]; then
+            echo "::warning::Completed in ${elapsed}s, faster than the minimum 10s backoff."
+            echo "::warning::The outcome assertion above still holds; check the log for the"
+            echo "::warning::'pnpm setup failed; retrying once' line."
+          fi
+          echo "Retry gating verified: the composite failed only because attempt two ran and failed."
+
+  # End-to-end: attempt one fails, attempt two succeeds, pnpm ends up on PATH.
+  recovers_on_the_second_attempt:
+    runs-on: arc-light
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Start the flaky registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/flaky-registry.jsonl /tmp/flaky-registry.port
+          node .github/scripts/flaky-registry-proxy.mjs > /tmp/flaky-registry.out 2>&1 &
+          echo $! > /tmp/flaky-registry.pid
+          for _ in $(seq 1 50); do
+            [ -s /tmp/flaky-registry.port ] && break
+            sleep 0.2
+          done
+          port=$(cat /tmp/flaky-registry.port)
+          echo "FLAKY_REGISTRY=http://127.0.0.1:${port}/" >> "$GITHUB_ENV"
+          cat /tmp/flaky-registry.out
+
+      - name: Setup pnpm through the flaky registry
+        uses: ./.github/actions/setup-pnpm
+        env:
+          npm_config_registry: ${{ env.FLAKY_REGISTRY }}
+
+      - name: Assert attempt one was rejected and the pinned pnpm still landed
+        shell: bash
+        run: |
+          set -euo pipefail
+          rejected=$(grep -c '"rejected":true' /tmp/flaky-registry.jsonl || true)
+          served=$(grep -c '"rejected":false' /tmp/flaky-registry.jsonl || true)
+          echo "registry saw rejected=${rejected} served=${served}"
+
+          if [ "${rejected:-0}" -eq 0 ]; then
+            echo "::error::No request was rejected, so attempt one never failed and this run"
+            echo "::error::proves nothing about the retry. Inconclusive, not a pass."
+            exit 1
+          fi
+
+          want=$(node -p "require('./package.json').packageManager.split('@')[1].split('+')[0]")
+          got=$(pnpm --version)
+          echo "pnpm on PATH: ${got} (pinned ${want})"
+          [ "$got" = "$want" ] || { echo "::error::wrong pnpm after recovery"; exit 1; }
+          echo "Recovery verified: rejected attempt one, pinned pnpm ${got} installed on the retry."
+
+      - name: Stop the flaky registry
+        if: always()
+        shell: bash
+        run: kill "$(cat /tmp/flaky-registry.pid)" 2>/dev/null || true

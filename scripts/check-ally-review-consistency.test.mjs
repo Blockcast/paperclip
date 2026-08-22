@@ -11,6 +11,7 @@ import {
   assertHeadSha,
   assertPrListComplete,
   attestedHead,
+  duplicateBodyAcrossIdentities,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -352,6 +353,70 @@ function requiredApprovalPair(app = {}, user = {}) {
   ];
 }
 
+describe("duplicateBodyAcrossIdentities", () => {
+  const at = (id, uid, body) => ({ id, user: { id: uid }, body });
+
+  it("fires on one body under two user IDs", () => {
+    assert.equal(
+      duplicateBodyAcrossIdentities([at(1, 290875700, "same"), at(2, 296676656, "same")]),
+      true,
+    );
+  });
+
+  // One `--body-file` passed to both calls produces byte-identical bodies, but
+  // a stray trailing newline is still one verdict posted twice. Exact equality
+  // would audit these pairs as sound.
+  it("fires when the two bodies differ only in surrounding whitespace", () => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${"a".repeat(40)}`;
+    for (const variant of [`${body}\n`, `${body}  `, `\n${body}`, `\n  ${body}\n\n`]) {
+      assert.equal(
+        duplicateBodyAcrossIdentities([at(1, 290875700, body), at(2, 296676656, variant)]),
+        true,
+        `expected a duplicate-submission finding for variant ${JSON.stringify(variant)}`,
+      );
+    }
+  });
+
+  it("does NOT fire when the bodies differ", () => {
+    assert.equal(
+      duplicateBodyAcrossIdentities([at(1, 290875700, "app"), at(2, 296676656, "user")]),
+      false,
+    );
+  });
+
+  // A repeat under ONE identity is a retry, not a dual-credential submission;
+  // the operative-count check already reports it and the remedy differs.
+  it("does NOT fire when the same identity repeats a body", () => {
+    assert.equal(
+      duplicateBodyAcrossIdentities([at(1, 290875700, "same"), at(2, 290875700, "same")]),
+      false,
+    );
+  });
+
+  it("tolerates empty and single-element sets", () => {
+    assert.equal(duplicateBodyAcrossIdentities([]), false);
+    assert.equal(duplicateBodyAcrossIdentities(undefined), false);
+    assert.equal(duplicateBodyAcrossIdentities([at(1, 290875700, "solo")]), false);
+  });
+
+  // Two bodiless approvals compare equal, but "one verdict, posted twice" is
+  // the wrong diagnosis: there is no verdict. I2d reports the missing
+  // attestation, and its remedy (post a comment) differs from this one's.
+  // A whitespace-only body is bodiless in substance and must land here too.
+  it("does NOT fire on bodiless reviews under two identities", () => {
+    for (const empty of [null, "", undefined, "   ", "\n\n", "\t "]) {
+      assert.equal(
+        duplicateBodyAcrossIdentities([
+          at(1, 290875700, empty),
+          at(2, 296676656, empty),
+        ]),
+        false,
+        `expected no duplicate-submission finding for body ${JSON.stringify(empty)}`,
+      );
+    }
+  });
+});
+
 describe("I1 accepts only the protected-merge approval pair", () => {
   it("accepts exactly one independently attested App/User approval pair", () => {
     const reviews = requiredApprovalPair();
@@ -369,6 +434,86 @@ describe("I1 accepts only the protected-merge approval pair", () => {
 
     assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
     assert.deepEqual(findPrViolations({ number: 1130, headSha: HEAD, reviews }), []);
+  });
+
+  // BLO-22916 AC1. The exemption above exists for a gate that genuinely needs
+  // both seats; it must not launder one verdict submitted twice. Before this
+  // case the fleet's 17 byte-identical App+User pairs all read as SOUND, so the
+  // guard certified as clean the exact defect it was pointed at.
+  it("rejects a byte-identical body submitted under both credentials", () => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)\n`;
+    const reviews = requiredApprovalPair({ body }, { body });
+    const violations = findPrViolations({ number: 1176, headSha: HEAD, reviews });
+
+    assert.equal(reviews[0].body, reviews[1].body);
+    assert.notEqual(reviews[0].user.id, reviews[1].user.id);
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
+    assert.match(
+      violations.find((v) => v.startsWith("I1")) ?? "",
+      /the same body submitted under two credentials/,
+    );
+  });
+
+  // The whitespace case has to be asserted HERE, through findPrViolations, and
+  // not only against duplicateBodyAcrossIdentities. That predicate does not
+  // gate anything — it picks the wording after I1 has already fired, and I1
+  // fires only when isRequiredApprovalPair returns false. A first attempt at
+  // this fix trimmed inside the predicate alone; every variant below still
+  // audited as SOUND because the deciding branch compared raw bodies and
+  // exempted the pair before the predicate was consulted. The whole suite
+  // stayed green throughout, which is exactly why the end-to-end assertion is
+  // the one that matters.
+  it("rejects a body that differs only in surrounding whitespace under both credentials", () => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)\n`;
+
+    for (const variant of [`${body}\n`, `${body}  `, `\n${body}`, `\n  ${body}\n\n`]) {
+      const reviews = requiredApprovalPair({ body }, { body: variant });
+      const context = `variant ${JSON.stringify(variant)}`;
+
+      assert.notEqual(reviews[0].body, reviews[1].body, `${context} must not be byte-identical`);
+      assert.equal(isRequiredApprovalPair(reviews, HEAD), false, context);
+      assert.match(
+        findPrViolations({ number: 1176, headSha: HEAD, reviews }).find((v) =>
+          v.startsWith("I1"),
+        ) ?? "",
+        /one verdict, posted twice/,
+        context,
+      );
+    }
+  });
+
+  // The counterweight: trimming must not collapse two genuinely distinct
+  // write-ups into a "duplicate", or the two-seat exemption stops working.
+  it("still accepts a pair whose bodies differ in substance, not just whitespace", () => {
+    const reviews = requiredApprovalPair(
+      { body: `Reviewed head: ${HEAD}\n\nApp reviewed the implementation.  ` },
+      { body: `\nReviewed head: ${HEAD}\n\nUser seat approval; see the App review above.\n` },
+    );
+
+    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
+    assert.deepEqual(findPrViolations({ number: 1177, headSha: HEAD, reviews }), []);
+  });
+
+  it("names the duplicate shape rather than reporting a bare count", () => {
+    const body = `Reviewed head: ${HEAD}\n\nSame text, two seats.`;
+    const identical = requiredApprovalPair({ body }, { body });
+    const [app, user] = requiredApprovalPair();
+    const distinctButExtra = [app, user, { ...user, id: 13 }];
+
+    assert.match(
+      findPrViolations({ number: 1, headSha: HEAD, reviews: identical }).find((v) =>
+        v.startsWith("I1"),
+      ) ?? "",
+      /one verdict, posted twice/,
+    );
+    // A three-review set is a different failure with a different remedy, and
+    // must not borrow the duplicate-submission wording.
+    assert.match(
+      findPrViolations({ number: 2, headSha: HEAD, reviews: distinctButExtra }).find((v) =>
+        v.startsWith("I1"),
+      ) ?? "",
+      /expected at most 1 or the exact App\/User APPROVED pair/,
+    );
   });
 
   it("rejects an extra operative retry instead of collapsing it", () => {

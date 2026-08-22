@@ -25,7 +25,14 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 5
+    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
+    # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
+    # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
+    # into a job timeout, which ejects a merge-queue candidate just the same but
+    # burns a runner for the full budget first. Worst case here is roughly
+    # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
+    # headroom above it.
+    timeout-minutes: 10
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -61,15 +68,26 @@ jobs:
           fi
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-          run_install: false
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
+
+      - name: Setup actionlint
+        uses: ./.github/actions/setup-actionlint
+
+      - name: Validate workflow files parse (BLO-23511)
+        # Runs before the runner-label check on purpose: that checker scans
+        # these same files line by line, which a structurally broken file
+        # passes happily. An unparseable workflow emits zero jobs, so it
+        # fails nothing and every required check stays green — this is the
+        # step that turns that silence into a red.
+        run: node ./scripts/check-workflows-parse.mjs
+
+      - name: Test workflow-parse gate (BLO-23511)
+        run: node --test ./scripts/check-workflows-parse.test.mjs
 
       - name: Validate ARC runner labels
         run: node ./scripts/check-github-runner-labels.mjs
@@ -81,6 +99,12 @@ jobs:
 
       - name: Validate Docker deploy timeout margin
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
+
+      - name: Test approval admissibility-probe backoff (BLO-28471)
+        run: node --test ./scripts/approve-paperclip-api-digest.test.js
+
+      - name: Test pnpm setup retry wrapper (BLO-28813)
+        run: node --test ./scripts/__tests__/pnpm-setup-retry.test.mjs
 
       - name: Test CI cache and Docker runner routing
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
@@ -135,6 +159,12 @@ jobs:
       - name: Test ffmpeg muxer detection (BLO-23128)
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
 
+      - name: Test production environment protection guard (BLO-22329)
+        run: |
+          node --test \
+            ./.github/scripts/tests/check-production-environment-protection.test.mjs \
+            ./.github/scripts/tests/post-environment-protection-alert.test.mjs
+
       - name: Validate Designer fast-uri security floor
         run: node ./scripts/designer-fast-uri-security.test.js
 
@@ -175,6 +205,9 @@ jobs:
 
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
+
+      - name: Test Playwright install-deps retry/backoff
+        run: node --test ./scripts/__tests__/playwright-install-deps-retry.test.mjs
 
       - name: Test PR server-shard folding
         run: node --test ./scripts/__tests__/pr-ci-shard-folding.test.mjs
@@ -280,9 +313,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -336,9 +367,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -459,9 +488,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -545,9 +572,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -666,9 +691,146 @@ jobs:
         vendor_claude_k8s,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 5
+    # BLO-28999: the failure path below adds checkout + Node setup + up to N+1
+    # API round trips, and it runs precisely when the pool is saturated. At the
+    # previous 5 minutes a slow classify step could time `verify` out and lose
+    # the annotation entirely — the one thing this job exists to emit. The
+    # classify step carries its own tighter bound, so this ceiling only has to
+    # cover the setup around it. Same headroom reasoning as `policy` above.
+    timeout-minutes: 10
+    # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
+    # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a
+    # restricted default-permissions preset every scope is `none`, the API calls
+    # 403, and the classifier degrades silently to the pre-existing wording —
+    # indistinguishable from "nothing was killed", which is the exact bug this
+    # job now exists to fix. Declared explicitly, as `master-health.yml` and
+    # `refresh-lockfile.yml` already do for the same reason.
+    permissions:
+      # A job-level block REPLACES the workflow-level one rather than merging
+      # into it (see the same note in `docker.yml`), so `contents: read` is
+      # listed deliberately — without it `actions/checkout` below loses repo
+      # access and the classify step cannot even find the script.
+      contents: read
+      # `/actions/runs/{id}/jobs` — the per-job detail and step conclusions.
+      actions: read
+      # `/check-runs/{id}/annotations` — a DIFFERENT scope from `actions: read`,
+      # and the source of the runner-loss annotation that is signal 1.
+      checks: read
 
     steps:
+      # BLO-28999: `needs.<lane>.result` cannot distinguish an ARC mid-job
+      # runner kill from a real lane failure — GitHub records both as
+      # `failure`. Go back to the Actions API for the per-job detail the
+      # aggregation step below cannot see, and hand it the subset of failed
+      # lanes that were actually killed.
+      #
+      # All three steps are gated on there being a failure at all, so the
+      # overwhelmingly common all-green run pays nothing: no checkout, no
+      # toolchain setup, no API calls. That also keeps `verify` light enough
+      # not to become a victim of the same pool saturation it now reports on.
+      - name: Checkout repository
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: actions/checkout@v6
+
+      # `arc-light` does not ship a usable Node by default — the `policy` job
+      # on the same pool sets one up explicitly before its `node --test` steps.
+      - name: Setup Node
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Classify failed lanes as infrastructure kills or real failures
+        id: classify_lanes
+        if: ${{ contains(needs.*.result, 'failure') }}
+        # This step decides only which WORDING explains the failure, never
+        # whether `verify` passes. If it errors, the aggregation step below
+        # still runs (`if: always()`) and falls back to the pre-existing
+        # failure wording.
+        continue-on-error: true
+        # Bounded well inside the job ceiling: this step makes N+1 API calls on
+        # a saturated pool, and if it hangs the job timeout would kill `verify`
+        # before the aggregation step could emit any annotation at all.
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
+          TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
+          GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
+          WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
+          OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
+          OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
+        run: |
+          # Keep these three arrays in the same order — scripts/__tests__/
+          # pr-verify-lane-outcome.test.mjs asserts the pairing, and also
+          # asserts each lane_job_names entry matches that job's `name:`.
+          lane_names=(
+            helm_chart
+            typecheck_release_registry
+            general_tests
+            worktree_install
+            opencode_responses_replay
+            opencode_k8s_seed_cold_start
+            build
+            vendor_claude_k8s
+          )
+          lane_results=(
+            "$HELM_CHART_RESULT"
+            "$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            "$GENERAL_TESTS_RESULT"
+            "$WORKTREE_INSTALL_RESULT"
+            "$OPENCODE_RESPONSES_REPLAY_RESULT"
+            "$OPENCODE_K8S_SEED_COLD_START_RESULT"
+            "$BUILD_RESULT"
+            "$VENDOR_CLAUDE_K8S_RESULT"
+          )
+          lane_job_names=(
+            "Helm chart"
+            "Typecheck + Release Registry"
+            "General tests"
+            "Worktree install (NODE_ENV=production)"
+            "OpenCode Responses replay"
+            "k8s-ro seed transport cold start"
+            "Build"
+            "Vendored claude_k8s adapter"
+          )
+
+          # `failed` and `job_names` are built in lockstep so the Nth failed
+          # lane's job name is the Nth entry — the script pairs them by index.
+          # Appending to `job_names` outside this branch would map every lane
+          # onto the wrong job and silently disable the classifier.
+          failed=()
+          job_names=()
+          for i in "${!lane_names[@]}"; do
+            case "${lane_results[$i]}" in
+              success | cancelled | skipped) ;;
+              *)
+                failed+=("${lane_names[$i]}")
+                job_names+=("${lane_job_names[$i]}")
+                ;;
+            esac
+          done
+
+          infra=""
+          if [ "${#failed[@]}" -gt 0 ]; then
+            # The script degrades to an empty set on any error, so a
+            # classification problem can never change the gate — only the
+            # wording the aggregation step picks. That degradation is silent by
+            # design on stdout (which carries the lane list), so surface the
+            # script's stderr as a warning annotation: a 403 from a missing
+            # token scope would otherwise be indistinguishable from a clean
+            # "nothing was killed", and could rot back to silence unnoticed.
+            classify_err="$(mktemp)"
+            infra="$(LANE_JOB_NAMES="$(printf '%s\n' "${job_names[@]}")" \
+              node scripts/classify-lane-failures.mjs "${failed[@]}" 2>"$classify_err" | tail -n 1)"
+            if [ -s "$classify_err" ]; then
+              echo "::warning title=verify: lane classifier degraded::Runner-kill detection did not produce a verdict, so any killed lane below is reported with the ordinary failure wording. Cause: $(tr '\n' ' ' <"$classify_err")"
+            fi
+          fi
+          echo "infra_lanes=$infra" >>"$GITHUB_OUTPUT"
+
       # BLO-20867: an upstream lane can end up `cancelled` or `skipped` rather
       # than `failure`. A plain `test "$X" = "success"` makes every one of
       # these look like an identical failing required check, so authors
@@ -689,8 +851,19 @@ jobs:
       #   - skipped:   the lane never ran because a dependency it needs
       #     (typically `policy`) did not succeed. The defect, if any, is in
       #     that dependency, not in this lane.
+      #   - infrastructure (BLO-28999): the lane's job was killed mid-run by
+      #     the runner pool. GitHub reports this as `failure`, so without the
+      #     classify step above it is indistinguishable from the first case
+      #     and reads as a defect in the diff. Split out here so the killed
+      #     lane gets the "not your diff, re-run it" wording that already
+      #     existed for `cancelled` but could never fire for a kill.
       - name: Fail if any split verify lane failed
+        # Must run even when the classify step above was skipped or errored —
+        # this step IS the gate, and its verdict may never depend on the
+        # classifier being available.
+        if: always()
         env:
+          INFRA_LANES: ${{ steps.classify_lanes.outputs.infra_lanes }}
           HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
@@ -724,13 +897,33 @@ jobs:
           cancelled_lanes=()
           skipped_lanes=()
           failed_lanes=()
+          infra_lanes=()
           for i in "${!lane_names[@]}"; do
             lane="${lane_names[$i]}"
             case "${lane_results[$i]}" in
               success) ;;
               cancelled) cancelled_lanes+=("$lane") ;;
               skipped) skipped_lanes+=("$lane") ;;
-              *) failed_lanes+=("$lane") ;;
+              *)
+                # BLO-28999: a lane the classifier proved was killed mid-job
+                # by the runner pool is reported as infrastructure, not as a
+                # failure. Anything it could not prove stays a failure — the
+                # fallback is the pre-existing wording, so an unavailable or
+                # erroring classifier degrades to today's behaviour rather
+                # than excusing a real defect.
+                is_infra=0
+                for infra_lane in $INFRA_LANES; do
+                  if [ "$infra_lane" = "$lane" ]; then
+                    is_infra=1
+                    break
+                  fi
+                done
+                if [ "$is_infra" -eq 1 ]; then
+                  infra_lanes+=("$lane")
+                else
+                  failed_lanes+=("$lane")
+                fi
+                ;;
             esac
           done
 
@@ -748,6 +941,11 @@ jobs:
 
           if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
             echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
+            any_non_success=1
+          fi
+
+          if [ "${#infra_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane infrastructure kill::Upstream lane(s) were KILLED MID-JOB by the CI runner pool, not failed: ${infra_lanes[*]}. This is not a report of a defect in this PR's diff — the runner hosting the lane was terminated before it could produce a result (see BLO-28999). Re-run the job to get a real result."
             any_non_success=1
           fi
 
@@ -769,9 +967,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -809,9 +1005,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -868,9 +1062,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -902,8 +1094,29 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
 
+      # BLO-27699 (BLO-22675 residue): apt's upstream mirrors (e.g.
+      # security.ubuntu.com) fail with a transient "Mirror sync in progress?"
+      # size mismatch often enough to take out a merge_group run on their own —
+      # run 31107120860 died here and forced PR #1038 to be admin-merged.
+      # Retry with backoff before failing the job.
       - name: Install Playwright system dependencies
-        run: pnpm exec playwright install-deps chromium
+        run: |
+          attempts=3
+          delay="${PLAYWRIGHT_INSTALL_DEPS_RETRY_DELAY_SECONDS:-15}"
+          attempt=1
+          while [ "$attempt" -le "$attempts" ]; do
+            if pnpm exec playwright install-deps chromium; then
+              exit 0
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              echo "Playwright system dependency install failed (attempt $attempt/$attempts); retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+            attempt=$((attempt + 1))
+          done
+          echo "Playwright system dependency install failed after $attempts attempts" >&2
+          exit 1
 
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'

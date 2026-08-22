@@ -1478,6 +1478,34 @@
       "when": 1786682096165,
       "tag": "0218_plugin_install_dir",
       "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1786682097165,
+      "tag": "0219_heartbeat_runs_issue_lock_release_count",
+      "breakpoints": true
+    },
+    {
+      "idx": 220,
+      "version": "7",
+      "when": 1786700946582,
+      "tag": "0220_branch_run_claims",
+      "breakpoints": true
+    },
+    {
+      "idx": 221,
+      "version": "7",
+      "when": 1787054772668,
+      "tag": "0221_repair_cross_company_issue_projects",
+      "breakpoints": true
+    },
+    {
+      "idx": 222,
+      "version": "7",
+      "when": 1787054773668,
+      "tag": "0222_issues_parked_disposition",
+      "breakpoints": true
     }
   ]
 }

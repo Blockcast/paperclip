@@ -64,16 +64,14 @@ export interface AlertmanagerPluginConfig {
   /** Company that receives alerts when no company-routing label is present. */
   defaultCompanyId: string;
   /**
-   * Secret reference to the static bearer token Alertmanager uses when posting
-   * webhooks. The worker intentionally fails closed when this is configured
-   * until the host can verify it before invoking public webhook code.
+    * Secret reference to the static bearer token Alertmanager uses when posting
+    * webhooks. The host compares credentials without returning the secret value
+    * to the worker.
    */
   webhookTokenRef?: string;
   /**
-   * Inline bearer token accepted by the worker-side webhook path. This is the
-   * only enabled token mechanism until `webhookTokenRef` has host-side
-   * verification that does not spend secret-resolution quota on invalid public
-   * requests.
+   * Inline bearer token accepted by the worker-side webhook path. Prefer
+   * `webhookTokenRef` for production deployments.
    */
   webhookToken?: string;
   /**
@@ -96,6 +94,14 @@ export interface AlertmanagerPluginConfig {
    * Per-instance owner map. e.g. `{ team: { platform: "alice@blockcast.net" }}`.
    */
   ownerMap?: OwnerMap;
+  /**
+   * Exact agent name assigned when neither owner resolution nor an issue route
+   * produces an assignee. Required in practice: an instance whose
+   * `fallbackAgentName` is missing, unmatched, or ambiguous fails closed and
+   * creates no issue, because an ownerless alert issue is never actioned and
+   * auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438).
+   */
+  fallbackAgentName?: string;
   /**
    * Per-instance issue route map. Matches alert labels and applies project,
    * goal, status, and queue defaults to created issues.

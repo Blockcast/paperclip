@@ -38,19 +38,25 @@ import {
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
   GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
   GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
   findOpenDependabotAlertIssue,
+  findTerminalDependabotAlertIssues,
   recordDependabotWebhookDiagnostic,
+  resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
-import { extractPaperclipIdentifiers } from "../services/paperclip-identifiers.js";
+import {
+  extractPaperclipIdentifiers,
+  resolveOwningPaperclipIdentifiers,
+  type OwningIdentifierResolution,
+} from "../services/paperclip-identifiers.js";
 import {
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
@@ -71,6 +77,7 @@ import {
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
+import { getAgentOrgChainHealth, type AgentEligibilityAgent } from "@paperclipai/shared";
 import { workProductService } from "../services/work-products.js";
 import {
   buildPullRequestWorkProductFields,
@@ -304,6 +311,85 @@ const PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN =
 
 function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boolean {
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
+}
+
+// BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
+// org-settings notice as a FORMAL pull_request_review (state COMMENTED, commit_id
+// = current head), not as a plain comment. Measured 2026-08-07:
+// `org:Blockcast "Claude Code Review is paused for this repository" type:pr` →
+// 98 hits across Network-Operator-Portal, magma, multicast, trafficcontrol and
+// others, and every sampled one is a review object rather than a comment.
+//
+// A review object with a prNumber drives BOTH wakes in this handler — the
+// reviewer counter-review pass (shouldFirePrReviewerWake) and the PR-author wake
+// (the `isPrWake` fallback, which fires regardless of
+// isActionableReviewFeedbackContext). The author wake renders the prRole:"author"
+// directive, "a reviewer just posted findings on YOUR pull request … push a
+// follow-up commit addressing them". There are no findings: the body is addressed
+// to a GitHub org admin. So the directive asserts something false, and an agent
+// that trusts it over the body is pushed toward inventing a change to "address"
+// or reporting that it addressed feedback it never received.
+//
+// The existing body heuristic does NOT catch this and is not the right tool:
+// hasActionablePrReviewFeedback already returns false here (verified against the
+// verbatim body of review 4887250738 on Network-Operator-Portal#657), which is
+// exactly why only the findings-shaped comment is skipped while both wakes still
+// fire. Suppression has to drop the EVENT, which is what returning null does.
+//
+// Deliberately a NAMED-INSTANCE filter, not a general "findings-free review"
+// heuristic. The obvious risk in suppressing at the webhook is eating a
+// legitimately terse review ("LGTM", "one nit inline"), and a findings-free rule
+// would do precisely that. All three conditions below must hold, so a short
+// human review is never a candidate:
+//
+//   1. The author is a Claude Code Review App identity — BOTH a `[bot]`-suffixed
+//      login AND a GitHub-reported user type of "Bot". A human (or another bot)
+//      quoting the notice text — in a review that discusses this very issue — is
+//      not suppressed.
+//   2. The body carries the notice's own heading AND its paused/disabled
+//      sentence. Matched against the RAW body, before clampReviewBody, so a long
+//      body cannot fail the match by truncation.
+//   3. The body has no actionable findings. Belt-and-braces: if claude[bot] ever
+//      ships a review that both carries the notice and flags something, the
+//      findings win and the event is delivered.
+//
+// Every failure mode of this predicate is fail-OPEN — an unmatched notice simply
+// wakes as it does today. If Anthropic reworks the notice text, we regress to the
+// current behaviour rather than silently dropping real reviews.
+//
+// The `[bot]` suffix is REQUIRED, not optional (Ally review on #1255). GitHub
+// reserves the bracketed suffix for App identities and forbids `[`/`]` in user
+// logins, so requiring it already excludes the `claude` and `claude-code` User
+// accounts — both of which exist as ordinary registerable logins, and either of
+// which could review a PR quoting this notice (this repo's own PRs discuss it).
+// The user-type gate below is the independent second half of that narrowing: it
+// comes from GitHub rather than from our own spelling of the login, so an
+// alternate future service login is only ever suppressed once GitHub itself has
+// confirmed it is Bot-typed.
+const CLAUDE_CODE_REVIEW_BOT_LOGIN_PATTERN = /^claude(?:-code)?\[bot\]$/i;
+const CLAUDE_CODE_REVIEW_NOTICE_HEADING_PATTERN = /^[ \t]*#{1,6}[ \t]*Claude Code Review[ \t]*$/im;
+const CLAUDE_CODE_REVIEW_NOTICE_SENTENCE_PATTERN =
+  /\bClaude Code Review is (?:paused|disabled) for this repository\b/i;
+
+function isClaudeCodeReviewServiceNotice(
+  rawBody: string | null | undefined,
+  state: string | null | undefined,
+  authorLogin: string | null | undefined,
+  authorType: string | null | undefined,
+): boolean {
+  // A service notice is always COMMENTED. An APPROVED or CHANGES_REQUESTED
+  // review carries a merge-gate signal that must reach the author regardless of
+  // what its body says.
+  if (state?.trim().toLowerCase() !== "commented") return false;
+  if (typeof authorLogin !== "string") return false;
+  if (!CLAUDE_CODE_REVIEW_BOT_LOGIN_PATTERN.test(authorLogin.trim())) return false;
+  // GitHub's own classification of the account, independent of how the login is
+  // spelled. Absent or non-Bot => fail open and deliver the event.
+  if (typeof authorType !== "string" || authorType.trim().toLowerCase() !== "bot") return false;
+  if (typeof rawBody !== "string") return false;
+  if (!CLAUDE_CODE_REVIEW_NOTICE_HEADING_PATTERN.test(rawBody)) return false;
+  if (!CLAUDE_CODE_REVIEW_NOTICE_SENTENCE_PATTERN.test(rawBody)) return false;
+  return !hasActionablePrReviewFeedback(rawBody, state);
 }
 
 function isActionablePrReviewComment(
@@ -542,6 +628,12 @@ async function countPrReviewFeedbackCycles(
 
 interface ResolvedEventContext {
   identifiers: string[];
+  // BLO-20886: the identifier(s) that OWN this PR (branch/title/labeled
+  // Fixes:/Closes:/Refs: line), as opposed to `identifiers` which is every
+  // BLO-#### mentioned anywhere, including an informational `Related:` list.
+  // Only wakeReasons that drive an author-directed ("prRole: author") wake
+  // consult this -- see resolveOwningPaperclipIdentifiers for the rule.
+  owningIdentifiers?: string[];
   wakeReason: string;
   prNumber: number | null;
   repoFullName: string | null;
@@ -555,6 +647,10 @@ interface ResolvedEventContext {
   // needing a separate `gh pr view` shellout.
   reviewBody?: string | null;
   reviewState?: string | null;
+  // pull_request_review.submitted only — the numeric GitHub review id.
+  // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
+  // it is a stable, explicit (pr, review_id) pair rather than an opaque URL.
+  reviewId?: number | null;
   reviewAuthorLogin?: string | null;
   reviewUrl?: string | null;
   // BLO-9293: PR author login (pull_request.user.login / issue.user.login on a
@@ -607,7 +703,53 @@ function clampReviewBody(value: string | null | undefined): string | null {
   return `${cut}\n…(truncated)`;
 }
 
+/**
+ * Resolve a webhook payload into the routing context, guaranteeing the
+ * invariant that every resolved OWNER is also a wake candidate.
+ *
+ * `identifiers` (every ref the PR mentions anywhere) and `owningIdentifiers`
+ * (the ones that actually own it) are extracted by different rules, and the
+ * owning tiers are deliberately more permissive in one place: tier 3
+ * uppercases the branch, because real branches are lowercase
+ * (`sre/blo-20886-...`) and PAPERCLIP_IDENTIFIER_PATTERN is uppercase-only.
+ * The broad set does not. So a PR whose ONLY ref is a lowercase branch --
+ * `fix/blo-20886-only`, nothing in title or body -- resolved an owner while
+ * `identifiers` came back empty, and the route then dropped the delivery at
+ * the `no_paperclip_identifier` gate before the owner could be used. Even past
+ * that gate the owner was unreachable: author wakes are computed as
+ * `matched.filter(m => owning.includes(m.identifier))`, and `matched` derives
+ * from `identifiers`, so an owner missing from the broad set silently yields
+ * no candidates. Both failures land on the wake this module exists to deliver.
+ *
+ * The union is taken here, once, rather than in each event branch so the
+ * invariant cannot be missed by a case added later.
+ *
+ * Deliberately NOT fixed by uppercasing the branch inside the broad
+ * extraction: that would also fold stale branch refs into `identifiers` for
+ * PRs whose branch and title disagree (#909's branch says `blo-20049` while
+ * title and body both name BLO-20467, the issue it actually fixes -- 8 such
+ * disagreements across the 175 PRs measured for the tier ordering). Those refs
+ * are exactly what the tier ranking exists to keep OUT of ownership; widening
+ * the broad set with them would spread that noise to every other consumer to
+ * fix a gate problem. Unioning the resolved owners adds the one identifier the
+ * tiers already decided was authoritative, and nothing else.
+ */
 function resolveEventContext(
+  eventName: string,
+  payload: Record<string, unknown>,
+  options: Parameters<typeof resolveEventContextRaw>[2] = {},
+): ResolvedEventContext | null {
+  const context = resolveEventContextRaw(eventName, payload, options);
+  if (!context) return null;
+  const owning = context.owningIdentifiers ?? [];
+  if (owning.length === 0) return context;
+  const identifiers = new Set(context.identifiers);
+  for (const identifier of owning) identifiers.add(identifier);
+  if (identifiers.size === context.identifiers.length) return context;
+  return { ...context, identifiers: Array.from(identifiers) };
+}
+
+function resolveEventContextRaw(
   eventName: string,
   payload: Record<string, unknown>,
   options: {
@@ -631,6 +773,21 @@ function resolveEventContext(
       // silences this genuine request, and until now did so with zero trace.
       reason: "missing_marker" | "marker_disqualified_by_heading";
     }) => void;
+    // BLO-23059: invoked when a pull_request_review.submitted delivery was
+    // dropped as a Claude Code Review service notice. Separate from
+    // onSuppressedReviewRequest because the two describe different objects — a
+    // review has no comment id and its own html_url — and because a dropped
+    // review kills BOTH the reviewer and the author wake, where a dropped
+    // request only ever suppressed the reviewer one. Same rationale for the
+    // callback shape: keeps resolveEventContext pure and lets the suppression be
+    // asserted directly rather than through a log spy.
+    onSuppressedReviewSubmission?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      reviewAuthorLogin: string | null;
+      reviewState: string | null;
+      reviewUrl: string | null;
+    }) => void;
   } = {},
 ): ResolvedEventContext | null {
   const repository = payload.repository as Record<string, unknown> | undefined;
@@ -640,6 +797,7 @@ function resolveEventContext(
     if (!pr) {
       return {
         ids: [] as string[],
+        owning: { owning: [] } as OwningIdentifierResolution,
         number: null as number | null,
         title: null as string | null,
         url: null as string | null,
@@ -659,6 +817,7 @@ function resolveEventContext(
     const user = pr.user as Record<string, unknown> | undefined;
     return {
       ids: extractPaperclipIdentifiers(branch, title, body),
+      owning: resolveOwningPaperclipIdentifiers({ branch, title, body }),
       number,
       title: title ?? null,
       url: githubPrUrl(repoFullName, number, readStringField(pr, "html_url")),
@@ -866,16 +1025,40 @@ function resolveEventContext(
       const prNumber = (issue.number as number | undefined) ?? null;
       const prUrl = githubPrUrl(repoFullName, prNumber, readStringField(issue, "html_url"));
       const commentUrl = readStringField(comment, "html_url");
+      const issueTitle = issue.title as string | undefined;
+      const issueBody = issue.body as string | undefined;
+      // Owning resolution deliberately excludes commentBody: the comment is
+      // the @ally ASK that triggered this event, not an ownership claim about
+      // the PR (see resolveOwningPaperclipIdentifiers). No branch tier here
+      // either -- issue_comment payloads don't carry pull_request.head.ref --
+      // so this path relies on title, a closing-keyword body line, or (BLO-21312)
+      // a non-closing house-reference body line (Issue:/Paperclip task:/etc.).
+      const owning = resolveOwningPaperclipIdentifiers({ title: issueTitle, body: issueBody });
       return {
+        // BLO-23267: identifiers used to MATCH a Paperclip issue must come
+        // only from the PR's own title/body (`issue.title`/`issue.body` here
+        // -- GitHub's issue_comment payload calls the PR "issue"), never from
+        // the free-text comment body. paperclip-identifiers.ts's own operator
+        // guard says PR->issue attribution keys on branch/title/body and
+        // nothing else; commentBody used to be folded in here too, which let
+        // an identifier mentioned only in REVIEW PROSE (e.g. a reviewer
+        // narrating an unrelated incident as background) attribute a
+        // Changes-Requested wake to that unrelated issue. Live case: Ally's
+        // comment on Blockcast/paperclip#1125 narrated the BLO-20775 stall as
+        // motivation, and the substring match alone fired a wake on
+        // BLO-20775 even though #1125 has nothing to do with it -- its own
+        // linked issue (BLO-19497) is carried correctly via issue.body/title.
+        // commentBody is still returned below for display/logging, just not
+        // fed into matching.
         identifiers: extractPaperclipIdentifiers(
           issue.title as string | undefined,
           issue.body as string | undefined,
-          commentBody,
         ),
+        owningIdentifiers: owning.owning,
         wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
         prNumber,
         repoFullName,
-        prTitle: (issue.title as string | undefined) ?? null,
+        prTitle: issueTitle ?? null,
         prUrl,
         eventUrl: commentUrl ?? prUrl,
         commentId: (comment?.id as number | undefined) ?? null,
@@ -893,23 +1076,51 @@ function resolveEventContext(
       const pr = payload.pull_request as Record<string, unknown> | undefined;
       const collected = collectFromPullRequest(pr);
       const review = payload.review as Record<string, unknown> | undefined;
-      const reviewBody = clampReviewBody(review?.body as string | null | undefined);
+      const rawReviewBody = (review?.body as string | null | undefined) ?? null;
+      const reviewBody = clampReviewBody(rawReviewBody);
       const reviewState = (review?.state as string | undefined) ?? null;
       const reviewUser = review?.user as Record<string, unknown> | undefined;
       const reviewAuthorLogin = (reviewUser?.login as string | undefined) ?? null;
+      const reviewAuthorType = (reviewUser?.type as string | undefined) ?? null;
       const reviewUrl = readStringField(review, "html_url");
+      const reviewIdRaw = review?.id;
+      const reviewId = typeof reviewIdRaw === "number" ? reviewIdRaw : null;
+      // Review finding (PR #1125): `review.commit_id` is the exact,
+      // immutable commit this review was submitted against. Falling back to
+      // `pull_request.head.sha` (collected.headSha) is only correct if the
+      // branch hasn't advanced between the review being submitted and this
+      // webhook being processed -- otherwise the "Reviewed head SHA" line
+      // this drives labels feedback against a commit the reviewer never saw,
+      // defeating the stale-review signal it exists to provide.
+      const reviewCommitId = readStringField(review, "commit_id");
+      // BLO-23059: drop the Claude Code Review paused/disabled org-settings
+      // notice before it becomes a wake. See isClaudeCodeReviewServiceNotice for
+      // why this is dropped at the event rather than filtered at either wake
+      // site, and for the three conditions that keep a terse human review safe.
+      if (isClaudeCodeReviewServiceNotice(rawReviewBody, reviewState, reviewAuthorLogin, reviewAuthorType)) {
+        options.onSuppressedReviewSubmission?.({
+          repoFullName,
+          prNumber: collected.number,
+          reviewAuthorLogin,
+          reviewState,
+          reviewUrl,
+        });
+        return null;
+      }
       return {
         identifiers: collected.ids,
+        owningIdentifiers: collected.owning.owning,
         wakeReason: "github_pr_review_submitted",
         prNumber: collected.number,
         repoFullName,
         prTitle: collected.title,
         prUrl: collected.url,
         eventUrl: reviewUrl ?? collected.url,
-        headSha: collected.headSha,
+        headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
         reviewState,
+        reviewId,
         reviewAuthorLogin,
         reviewUrl,
       };
@@ -951,6 +1162,7 @@ function resolveEventContext(
       const merged = pr?.merged === true;
       return {
         identifiers: collected.ids,
+        owningIdentifiers: collected.owning.owning,
         wakeReason: reasonByAction[action] ?? "github_pull_request",
         prNumber: collected.number,
         repoFullName,
@@ -1160,12 +1372,109 @@ function isUniqueDependabotAlertConflict(error: unknown): boolean {
   );
 }
 
+// BLO-28981: a re-fire arriving for an alert whose previous cycle was already
+// adjudicated and closed. The body is deliberately short -- the reopened row
+// already carries the previous cycle's comments and receipts, which is the
+// whole point of reopening rather than filing a fresh row. What it must add is
+// (a) that this is a *repeat*, not a first sighting, (b) which delivery
+// re-fired it, and (c) pointers to any earlier sibling rows that predate the
+// reopen behaviour, so the full adjudication chain is reachable from the one
+// surviving row.
+function buildDependabotRefireComment(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+  reopenedFromStatus: string;
+  priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const priorLines = input.priorAdjudications.length
+    ? [
+        "",
+        `## Earlier rows for this same alert (${input.priorAdjudications.length})`,
+        ...input.priorAdjudications.map((prior) => {
+          const closedAt = prior.completedAt ? prior.completedAt.toISOString() : "close time not recorded";
+          return `- ${prior.identifier ?? "(no identifier)"} — \`${prior.status}\`, ${closedAt}`;
+        }),
+        "",
+        "Read those before re-investigating: this alert has been adjudicated before, and the previous conclusion very likely still applies.",
+      ]
+    : [];
+  return [
+    `[github-dependabot-refire] GitHub re-fired this alert (\`${input.alert.action}\`) after it was closed as \`${input.reopenedFromStatus}\`.`,
+    "",
+    "This issue was **reopened in place** rather than refiled, so every comment above is the prior adjudication of this same alert.",
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- Severity: ${input.alert.severity}`,
+    // The reopened row keeps the PREVIOUS cycle's title and description, so if
+    // the advisory moved between cycles those quote stale values. Carrying the
+    // current range/patched version here is what corrects them.
+    `- Vulnerable range: ${input.alert.vulnerableRange ?? "not provided in the webhook payload"}`,
+    `- Patched version: ${input.alert.patchedVersion ?? "not provided in the webhook payload"}`,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    ...priorLines,
+    "",
+    "If the earlier adjudication still holds, close this issue again citing it — do not repeat the investigation. If the dependency genuinely regressed, remediate as normal.",
+  ].join("\n");
+}
+
+// BLO-28981: a re-fire arriving for an alert whose newest row was `cancelled`.
+// Cancelling an alert issue is a deliberate human act meaning "stop
+// re-adjudicating this" -- the exact lever BLO-28864's phantom `fbinternal`
+// alerts need. So the row is left cancelled and NOT re-queued; this comment is
+// the audit trail that the re-fire arrived and was deliberately suppressed,
+// rather than lost.
+function buildDependabotSuppressedRefireComment(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+  cancelledAt: Date | null;
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const cancelledAt = input.cancelledAt ? input.cancelledAt.toISOString() : "cancel time not recorded";
+  return [
+    `[github-dependabot-refire-suppressed] GitHub re-fired this alert (\`${input.alert.action}\`), and it was **not** re-queued.`,
+    "",
+    `This issue was cancelled (${cancelledAt}), which this intake treats as a standing decision to stop re-adjudicating this alert. No new issue was filed and no agent was woken.`,
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- Severity: ${input.alert.severity}`,
+    `- Vulnerable range: ${input.alert.vulnerableRange ?? "not provided in the webhook payload"}`,
+    `- Patched version: ${input.alert.patchedVersion ?? "not provided in the webhook payload"}`,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    "",
+    "To start taking this alert again, move this issue out of `cancelled` (or close it as `done` instead) — the next re-fire will then reopen it normally.",
+  ].join("\n");
+}
+
 // Finds the open issue for this alert (originId is the stable
 // `github-dependabot:<repo>#<alertNumber>` key), or creates one. A
 // `reintroduced`/`reopened` redelivery for an alert that already has an open
 // issue reuses it rather than spawning a duplicate remediation run — the
 // Release Engineer sees one issue per alert to comment on and dedupe against,
 // per BLO-16319's verifying signal.
+//
+// BLO-28981: when there is no open issue but the same originId has already
+// been adjudicated and closed, reopen the most recent terminal row instead of
+// minting a fresh one. `issues_active_dependabot_alert_uq` only constrains
+// non-terminal rows, so nothing stopped the intake from stacking a new
+// full-weight issue per re-fire cycle (measured: 24 rows across 8 originIds on
+// `Blockcast/magma`). Reopening keeps exactly one row per alert forever and,
+// more importantly, keeps the prior adjudication attached to it — the next
+// agent to pick it up reads why this was closed last time instead of starting
+// cold. The wake still fires against the returned issue id, so a dependency
+// that was genuinely fixed and then regressed still reaches an assignee; this
+// changes which row the signal lands on, never whether it lands.
+//
+// `cancelled` is treated differently from `done`: see the suppression branch
+// below.
 async function resolveDependabotAlertIssue(
   db: Db,
   input: {
@@ -1174,11 +1483,73 @@ async function resolveDependabotAlertIssue(
     originId: string;
     repoFullName: string;
     alert: DependabotAlertContext;
+    deliveryId: string | null;
   },
-): Promise<{ id: string; identifier: string | null; reused: boolean }> {
+): Promise<{
+  id: string;
+  identifier: string | null;
+  reused: boolean;
+  reopened: boolean;
+  suppressed: boolean;
+}> {
   const existing = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-  if (existing) return { id: existing.id, identifier: existing.identifier, reused: true };
+  if (existing)
+    return {
+      id: existing.id,
+      identifier: existing.identifier,
+      reused: true,
+      reopened: false,
+      suppressed: false,
+    };
 
+  const priorTerminal = await findTerminalDependabotAlertIssues(db, input.companyId, input.originId);
+  const newestTerminal = priorTerminal[0] ?? null;
+
+  // A cancelled newest row is a standing "stop re-adjudicating this" decision,
+  // so honour it instead of resurrecting the row. Reopening a cancelled issue
+  // would also null out `cancelledAt`, destroying the only field-level record
+  // that the cancellation ever happened -- and since the row is then reused
+  // forever, there would be no suppression lever left anywhere in the intake.
+  // The re-fire is still recorded on the row so a suppressed delivery is
+  // auditable rather than silently dropped. Note this makes `cancelled` load
+  // bearing: anything that auto-cancels an alert issue silences that alert
+  // until a human moves it out of `cancelled`.
+  if (newestTerminal?.status === "cancelled") {
+    await recordSuppressedDependabotRefire(db, {
+      companyId: input.companyId,
+      originId: input.originId,
+      repoFullName: input.repoFullName,
+      alert: input.alert,
+      deliveryId: input.deliveryId,
+      target: newestTerminal,
+    });
+    return {
+      id: newestTerminal.id,
+      identifier: newestTerminal.identifier,
+      reused: true,
+      reopened: false,
+      suppressed: true,
+    };
+  }
+
+  const reopenTarget = newestTerminal;
+  if (reopenTarget) {
+    const reopened = await reopenTerminalDependabotAlertIssue(db, {
+      ...input,
+      target: reopenTarget,
+      priorAdjudications: priorTerminal.slice(1),
+    });
+    if (reopened) return reopened;
+    // Lost the reopen race to a concurrent delivery (or the row moved out of a
+    // terminal status between the read and the write). Whichever writer won
+    // left an open row behind; reuse it rather than falling through to create
+    // a duplicate.
+    const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
+    if (raced)
+      return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false, suppressed: false };
+  }
+
+  const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
   const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
   const title = `Dependabot ${input.alert.severity} alert: ${input.alert.packageName ?? "unknown package"} in ${input.repoFullName}#${input.alert.alertNumber}`;
   const description = buildDependabotAlertIssueBody({ repoFullName: input.repoFullName, alert: input.alert });
@@ -1189,18 +1560,182 @@ async function resolveDependabotAlertIssue(
       description,
       status: "todo",
       priority,
-      assigneeAgentId: input.assigneeAgentId,
+      assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
       originId: input.originId,
       originFingerprint: input.originId,
     });
-    return { id: created.id, identifier: created.identifier, reused: false };
+    return { id: created.id, identifier: created.identifier, reused: false, reopened: false, suppressed: false };
   } catch (error) {
     if (!isUniqueDependabotAlertConflict(error)) throw error;
     const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true };
+    if (raced)
+      return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false, suppressed: false };
     throw error;
   }
+}
+
+// Records a suppressed re-fire on an already-cancelled alert row. No UPDATE:
+// the row stays cancelled, keeps its `cancelledAt`, and stays out of the
+// queue. Idempotent on the delivery id via the same
+// `issue_comments_issue_system_idempotency_idx` the reopen notice uses, so a
+// replay does not stack notices.
+async function recordSuppressedDependabotRefire(
+  db: Db,
+  input: {
+    companyId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+    target: { id: string; cancelledAt: Date | null };
+  },
+): Promise<void> {
+  const externalKey = `${input.originId}:refire-suppressed:${input.deliveryId ?? input.alert.action}`;
+  await db
+    .insert(issueComments)
+    .values({
+      companyId: input.companyId,
+      issueId: input.target.id,
+      authorType: "system",
+      idempotencyKey: externalKey,
+      body: buildDependabotSuppressedRefireComment({
+        repoFullName: input.repoFullName,
+        alert: input.alert,
+        deliveryId: input.deliveryId,
+        cancelledAt: input.target.cancelledAt,
+      }),
+      metadata: {
+        kind: "github_dependabot_refire_suppressed",
+        source: "github",
+        externalKey,
+        repoFullName: input.repoFullName,
+        alertNumber: input.alert.alertNumber,
+        action: input.alert.action,
+        deliveryId: input.deliveryId,
+      } as never,
+    })
+    .onConflictDoNothing();
+}
+
+// Reopens a closed Dependabot alert row and records why, atomically. Returns
+// null when the row was no longer terminal at write time — the UPDATE's own
+// WHERE re-checks the status against the latest row version, so a concurrent
+// delivery that already reopened it cannot be double-applied (the same
+// optimistic-concurrency shape reopenInReviewIssueForActionablePrFeedback uses
+// for its `in_review` guard). Also returns null on a unique-constraint loss:
+// the UPDATE moves the row INTO `issues_active_dependabot_alert_uq`'s scope,
+// so if a concurrent writer made a different row active in the read→write
+// window, Postgres raises rather than updating zero rows. Both losses land on
+// the caller's `findOpenDependabotAlertIssue` fallback, which is the same
+// idiom the create path at the bottom of resolveDependabotAlertIssue uses.
+//
+// `done` only, never `cancelled`: see the suppression branch in
+// resolveDependabotAlertIssue.
+async function reopenTerminalDependabotAlertIssue(
+  db: Db,
+  input: {
+    companyId: string;
+    assigneeAgentId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+    target: { id: string; identifier: string | null; status: string };
+    priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
+  },
+): Promise<{
+  id: string;
+  identifier: string | null;
+  reused: boolean;
+  reopened: boolean;
+  suppressed: boolean;
+} | null> {
+  const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
+  const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
+  const now = new Date();
+  const externalKey = `${input.originId}:refire:${input.deliveryId ?? input.alert.action}`;
+  const body = buildDependabotRefireComment({
+    repoFullName: input.repoFullName,
+    alert: input.alert,
+    deliveryId: input.deliveryId,
+    reopenedFromStatus: input.target.status,
+    priorAdjudications: input.priorAdjudications,
+  });
+
+  return db
+    .transaction(async (tx) => {
+      const updated = await tx
+        .update(issues)
+        .set({
+          status: "todo",
+          priority,
+          assigneeAgentId,
+          assigneeUserId: null,
+          // The row is being handed back to the queue: any execution lock left
+          // over from the run that closed it would otherwise make the reopened
+          // issue look checked-out by a run that has long since finished.
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: null,
+          // `cancelledAt` is deliberately NOT cleared here: this UPDATE only
+          // ever matches `done` rows, so there is nothing to clear, and a
+          // cancelled row must keep its timestamp (see the suppression branch).
+          //
+          // `executionState` is likewise left alone, unlike the
+          // reopenInReviewIssueForActionablePrFeedback precedent this borrows
+          // its concurrency shape from. That path recomputes it via
+          // markExecutionStateChangesRequested because it reopens issues that
+          // are mid-review-stage; alert issues are created with no
+          // `executionPolicy`, so there is no stage progress to reset. If
+          // stages are ever attached to alert issues, this needs to reset them
+          // or the prior cycle's progress carries into the new one
+          // pre-satisfied.
+          updatedAt: now,
+        })
+        .where(and(eq(issues.id, input.target.id), eq(issues.status, "done")))
+        .returning({ id: issues.id, identifier: issues.identifier })
+        .then((rows) => rows[0] ?? null);
+      if (!updated) return null;
+
+    // Idempotent on the delivery id, so a GitHub replay of the same re-fire
+    // does not stack duplicate notices on the reopened row.
+    await tx
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: input.target.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body,
+        metadata: {
+          kind: "github_dependabot_refire",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          reopenedFromStatus: input.target.status,
+          priorAdjudicationIdentifiers: input.priorAdjudications.map((prior) => prior.identifier),
+        } as never,
+      })
+      .onConflictDoNothing();
+
+      return { id: updated.id, identifier: updated.identifier, reused: true, reopened: true, suppressed: false };
+    })
+    .catch((error) => {
+      // The UPDATE moves this row into `issues_active_dependabot_alert_uq`'s
+      // scope. A concurrent writer that made a different row active in the
+      // read→write window makes Postgres raise here rather than update zero
+      // rows, so a raced delivery would otherwise unwind to the outer handler
+      // and be dropped with only a log. Fall back the same way a zero-row
+      // update does: the caller re-reads the open row.
+      if (!isUniqueDependabotAlertConflict(error)) throw error;
+      return null;
+    });
 }
 
 function buildDependabotTerminalReceipt(input: {
@@ -1278,6 +1813,7 @@ async function recordDependabotTerminalReceipt(
   }
 
   if (!issue) {
+    const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
     issue = await issueService(db).create(input.companyId, {
       title: `Dependabot terminal receipt: ${input.repoFullName}#${input.alert.alertNumber} ${input.alert.action}`,
       description: [
@@ -1293,7 +1829,7 @@ async function recordDependabotTerminalReceipt(
       ].join("\n"),
       status: hasCompleteTerminalEvidence ? "done" : "todo",
       priority: DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium",
-      assigneeAgentId: input.assigneeAgentId,
+      assigneeAgentId,
       originKind: GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
       originId: input.originId,
       originFingerprint: input.originId,
@@ -1355,7 +1891,17 @@ async function recordDependabotTerminalReceipt(
       .onConflictDoNothing();
   }
 
-  if (hasCompleteTerminalEvidence && issue.status !== "done") {
+  // `cancelled` is excluded, not just `done`. The fallback lookup above has no
+  // status filter, so it can resolve a deliberately-cancelled row -- and
+  // `cancelled` -> `done` is a lateral move between two terminal states that
+  // buys nothing while nulling `cancelledAt` (services/issues.ts clears it on
+  // any status change away from `cancelled`). That would defeat the suppression
+  // branch in resolveDependabotAlertIssue through a different door: once the
+  // row reads `done`, every later re-fire takes the reopen path and wakes an
+  // assignee again, with no field-level record the alert was ever cancelled.
+  // The receipt comment above still lands on the row, so the terminal delivery
+  // stays auditable.
+  if (hasCompleteTerminalEvidence && issue.status !== "done" && issue.status !== "cancelled") {
     await issueService(db).update(issue.id, { status: "done" });
   }
 }
@@ -2508,6 +3054,15 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 
 function buildPrFeedbackExternalKey(context: ResolvedEventContext, deliveryId: string | null): string | null {
   if (context.commentId) return `github_issue_comment:${context.commentId}`;
+  // BLO-19497: an explicit (repo, pr, review_id) key rather than the opaque
+  // reviewUrl -- easier to reason about/test, and immune to GitHub ever
+  // reshaping review URLs. Falls back to reviewUrl for older/synthetic
+  // contexts that don't carry a numeric review id.
+  if (context.reviewId !== null && context.reviewId !== undefined) {
+    const repo = context.repoFullName ?? "unknown";
+    const pr = context.prNumber ?? "unknown";
+    return `github_pr_review_id:${repo}:${pr}:${context.reviewId}`;
+  }
   if (context.reviewUrl) return `github_pr_review:${context.reviewUrl}`;
   if (context.eventUrl) return `github_event:${context.eventUrl}`;
   if (deliveryId) return `github_delivery:${deliveryId}`;
@@ -2611,6 +3166,9 @@ function buildPrReviewFeedbackComment(context: ResolvedEventContext): string {
     ...(sourceUrl ? [`- Source: ${sourceUrl}`] : []),
     ...(reviewer ? [`- Reviewer: ${reviewer}`] : []),
     ...(context.reviewState ? [`- State: ${context.reviewState}`] : []),
+    // BLO-19497 AC: record the reviewed head SHA so a reader can tell a
+    // stale review (against an older push) from a current one.
+    ...(context.headSha ? [`- Reviewed head SHA: \`${context.headSha}\``] : []),
   ];
   if (body) {
     lines.push("", "Review body:", "", fencedText(body));
@@ -2625,6 +3183,12 @@ type MatchedGithubIssue = {
   assigneeAgentId: string | null;
   status: string;
   executionState: Record<string, unknown> | null;
+  // BLO-19497: needed to detect a monitor left `triggered` with no scheduled
+  // re-check -- the "assignee has no live wake path" signal AC #5 escalates
+  // on. See isIssueMonitorTriggered.
+  monitorNextCheckAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorAttemptCount: number;
 };
 
 async function hasExistingWakeWithIdempotencyKey(
@@ -2641,37 +3205,98 @@ async function hasExistingWakeWithIdempotencyKey(
   return Boolean(existing);
 }
 
+// BLO-19497: writes the github_pr_review_feedback comment for EVERY distinct
+// actionable review, independent of the issue's current status. Before this
+// fix the whole function -- comment write included -- short-circuited unless
+// `issue.status === "in_review"`. Review #1 flips status to `in_progress` as
+// part of its own reopen (below), so review #2+ on the same PR always found
+// `status !== "in_review"` and produced ZERO comment, forever, regardless of
+// how many more (distinct head_sha, review_id) reviews landed. The comment
+// write must not depend on a status transition that its own predecessor
+// already consumed.
+//
+// The reopen/reassign-to-author behavior (flipping `in_review` -> `in_progress`
+// and handing the issue back to the assignee) is still status-gated -- that
+// part legitimately only applies once, when the issue is parked in `in_review`
+// waiting on this review's outcome. If the issue already moved on (author is
+// back in_progress, or it's blocked/todo/etc.), the comment is still the full
+// notification; there is nothing to "reopen".
 async function reopenInReviewIssueForActionablePrFeedback(
   db: Db,
   issue: MatchedGithubIssue,
   context: ResolvedEventContext,
   deliveryId: string | null,
-): Promise<{ reopened: boolean; commentId: string | null; assigneeAgentId: string | null }> {
+): Promise<{ reopened: boolean; commentId: string | null; commentInserted: boolean; assigneeAgentId: string | null }> {
   const returnAssigneeAgentId = readReturnAssigneeAgentId(issue.executionState);
   const effectiveAssigneeAgentId = returnAssigneeAgentId ?? issue.assigneeAgentId;
-  if (issue.status !== "in_review" || !effectiveAssigneeAgentId) {
-    return { reopened: false, commentId: null, assigneeAgentId: effectiveAssigneeAgentId };
-  }
 
   const externalKey = buildPrFeedbackExternalKey(context, deliveryId);
   const now = new Date();
   const result = await db.transaction(async (tx) => {
-    const existingComment = externalKey
-      ? await tx
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(and(
-          eq(issueComments.issueId, issue.id),
-          sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
-          sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null)
-      : null;
+    // Review finding (PR #1125, discovered while fixing the escalation
+    // comment's own read-then-insert below): this was a SELECT-by-externalKey
+    // then INSERT-if-none-found -- the same check-then-write race. Two
+    // concurrent redeliveries of the same review can both observe "no
+    // existing feedback comment" before either commits, posting the same
+    // review's feedback twice -- and each racer's insert mints its own row
+    // id, so `commentId` (which escalateUnseenBlockingReviewFeedback keys its
+    // own dedup on) is no longer stable across the race either. Set
+    // idempotencyKey on the insert so it rides the partial unique index
+    // (issue_comments_issue_system_idempotency_idx) and use
+    // ON CONFLICT DO NOTHING + a follow-up read to resolve to whichever row
+    // actually won, mirroring the BLO-19037 dependabot-receipt pattern.
+    let commentInserted = false;
+    let commentId: string | null = null;
+    if (externalKey) {
+      const insertedRow = await tx
+        .insert(issueComments)
+        .values({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          authorType: "system",
+          idempotencyKey: externalKey,
+          body: buildPrReviewFeedbackComment(context),
+          metadata: {
+            kind: "github_pr_review_feedback",
+            source: "github",
+            externalKey,
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+            deliveryId,
+          } as never,
+        })
+        .onConflictDoNothing()
+        .returning({ id: issueComments.id })
+        .then((rows) => rows[0] ?? null);
 
-    const commentId: string | null = existingComment
-      ? existingComment.id
-      : await tx
+      if (insertedRow) {
+        commentInserted = true;
+        commentId = insertedRow.id;
+      } else {
+        // Lost the race (or this is a genuine redelivery): find the row that
+        // won, via the idempotencyKey the unique index enforces on. Also
+        // check the legacy metadata-only lookup for feedback comments
+        // written before this dedup existed (no idempotencyKey set).
+        commentId = await tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.issueId, issue.id),
+            or(
+              eq(issueComments.idempotencyKey, externalKey),
+              and(
+                isNull(issueComments.idempotencyKey),
+                sql`${issueComments.metadata}->>'kind' = 'github_pr_review_feedback'`,
+                sql`${issueComments.metadata}->>'externalKey' = ${externalKey}`,
+              ),
+            ),
+          ))
+          .limit(1)
+          .then((rows) => rows[0]?.id ?? null);
+      }
+    } else {
+      commentInserted = true;
+      commentId = await tx
         .insert(issueComments)
         .values({
           companyId: issue.companyId,
@@ -2681,7 +3306,7 @@ async function reopenInReviewIssueForActionablePrFeedback(
           metadata: {
             kind: "github_pr_review_feedback",
             source: "github",
-            externalKey: externalKey ?? null,
+            externalKey: null,
             repoFullName: context.repoFullName,
             prNumber: context.prNumber,
             deliveryId,
@@ -2689,33 +3314,197 @@ async function reopenInReviewIssueForActionablePrFeedback(
         })
         .returning({ id: issueComments.id })
         .then((rows): string | null => rows[0]?.id ?? null);
-
-    const executionState = markExecutionStateChangesRequested(issue.executionState);
-    const patch: Partial<typeof issues.$inferInsert> = {
-      status: "in_progress",
-      assigneeAgentId: effectiveAssigneeAgentId,
-      assigneeUserId: null,
-      checkoutRunId: null,
-      executionRunId: null,
-      executionAgentNameKey: null,
-      executionLockedAt: null,
-      updatedAt: now,
-    };
-    if (executionState) {
-      patch.executionState = executionState;
     }
 
-    const updated = await tx
-      .update(issues)
-      .set(patch)
-      .where(and(eq(issues.id, issue.id), eq(issues.status, "in_review")))
-      .returning({ id: issues.id })
-      .then((rows) => rows[0] ?? null);
+    let reopened = false;
+    if (issue.status === "in_review" && effectiveAssigneeAgentId) {
+      const executionState = markExecutionStateChangesRequested(issue.executionState);
+      const patch: Partial<typeof issues.$inferInsert> = {
+        status: "in_progress",
+        assigneeAgentId: effectiveAssigneeAgentId,
+        assigneeUserId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      };
+      if (executionState) {
+        patch.executionState = executionState;
+      }
 
-    return { reopened: Boolean(updated), commentId, assigneeAgentId: effectiveAssigneeAgentId };
+      const updated = await tx
+        .update(issues)
+        .set(patch)
+        .where(and(eq(issues.id, issue.id), eq(issues.status, "in_review")))
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      reopened = Boolean(updated);
+    }
+
+    return { reopened, commentId, commentInserted, assigneeAgentId: effectiveAssigneeAgentId };
   });
 
   return result;
+}
+
+// A formal "Changes Requested" review state is the blocking signal AC #5
+// escalates on -- distinct from hasActionablePrReviewFeedback's broader body
+// heuristics (which also catch findings embedded in an approved/commented
+// review). Escalation is specifically for the formal blocking state, since
+// that's the shape of the incident this issue describes (a Critical finding
+// under a Changes Requested review).
+function isBlockingReviewState(reviewState: string | null | undefined): boolean {
+  const normalized = reviewState?.trim().toLowerCase().replace(/-/g, "_");
+  return normalized === "changes_requested";
+}
+
+// Mirrors the issue-column-only branch of
+// issue-execution-policy.ts's derivePersistedMonitorState: a monitor with no
+// scheduled nextCheckAt but a prior trigger/attempt is `triggered` -- terminal,
+// nothing re-arms it but the assignee (see BLO-19497 body). The webhook route
+// doesn't load executionPolicy.monitor (the full derivation also needs the
+// policy row, which isn't worth adding to this hot path), but the raw issue
+// columns plus the already-loaded executionState.monitor.status are
+// sufficient to detect this exact wedge, which is the one the incident and
+// AC #5 are both about.
+//
+// Review finding (PR #1125, pullrequestreview-4888198804 / -4891307841):
+// the raw columns alone treat ANY row with a historical
+// monitorLastTriggeredAt/monitorAttemptCount as currently triggered, so a
+// monitor that was explicitly cleared (cancelled, superseded, or resolved
+// through the normal `cleared` transition -- see derivePersistedMonitorState)
+// still reads as triggered here and can spuriously escalate a blocking
+// review to a manager the assignee never needed. `cleared` in
+// executionState.monitor is authoritative and must take precedence over the
+// historical columns, exactly as derivePersistedMonitorState's own
+// `fromState?.status === "cleared"` branch does before its `triggered`
+// branch.
+function isIssueMonitorTriggered(issue: {
+  monitorNextCheckAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorAttemptCount: number;
+  executionState?: Record<string, unknown> | null;
+}): boolean {
+  if (issue.monitorNextCheckAt) return false;
+  const monitor = issue.executionState?.monitor as Record<string, unknown> | null | undefined;
+  if (monitor?.status === "cleared") return false;
+  return Boolean(issue.monitorLastTriggeredAt) || issue.monitorAttemptCount > 0;
+}
+
+// BLO-19497 AC #5: when a blocking review lands while the assignee's monitor
+// is triggered/nextCheckAt-null (no live wake path), escalate to the
+// assignee's manager instead of letting the finding sit unseen. Per CEO
+// disposition on the issue thread: escalate to the assignee's manager via
+// orgChainHealth.fullChain -- the first `running` ancestor, walking up. Not
+// the board -- a missed review comment is an engineering-loop failure, not a
+// governance decision.
+async function escalateUnseenBlockingReviewFeedback(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  input: {
+    issue: MatchedGithubIssue;
+    assigneeAgentId: string;
+    commentId: string | null;
+    context: ResolvedEventContext;
+    deliveryId: string | null;
+  },
+): Promise<{ escalated: boolean; managerAgentId: string | null }> {
+  const companyAgentRows: AgentEligibilityAgent[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      status: agents.status,
+      reportsTo: agents.reportsTo,
+    })
+    .from(agents)
+    .where(eq(agents.companyId, input.issue.companyId));
+
+  const assignee = companyAgentRows.find((agent) => agent.id === input.assigneeAgentId) ?? null;
+  if (!assignee) return { escalated: false, managerAgentId: null };
+
+  const manager = getAgentOrgChainHealth({ agent: assignee, agents: companyAgentRows })
+    .fullChain
+    .find((entry) => entry.relation === "ancestor" && entry.status === "running");
+  if (!manager) return { escalated: false, managerAgentId: null };
+
+  const dedupeToken =
+    input.commentId ?? input.context.reviewUrl ?? input.context.eventUrl ?? input.deliveryId ?? "unknown";
+  const idempotencyKey = `unseen_blocking_review_escalation:${input.issue.id}:${dedupeToken}`;
+  if (await hasExistingWakeWithIdempotencyKey(db, manager.id, idempotencyKey)) {
+    return { escalated: false, managerAgentId: manager.id };
+  }
+
+  // Review finding (PR #1125): a prior read-then-insert (SELECT for an
+  // existing escalation comment by metadata.externalKey, then INSERT if none
+  // was found) is a check-then-write race across paperclip-api's replicas --
+  // two concurrent redeliveries of the same review event can both observe "no
+  // existing comment" before either writes, double-posting the escalation.
+  // Set idempotencyKey on the insert so it rides the already-deployed partial
+  // unique index (issue_comments_issue_system_idempotency_idx on
+  // issueId+idempotencyKey, scoped to system comments) and use
+  // ON CONFLICT DO NOTHING to make the key authoritative in the database
+  // rather than in application logic. No legacy metadata-only rows exist for
+  // this comment kind (github_pr_review_feedback_escalation is new in this
+  // PR), so unlike reopenInReviewIssueForActionablePrFeedback's dependabot
+  // receipt there is no pre-idempotencyKey data to fall back to.
+  const prLine =
+    input.context.repoFullName && input.context.prNumber !== null
+      ? [`- PR: ${input.context.repoFullName}#${input.context.prNumber}`]
+      : [];
+  await db
+    .insert(issueComments)
+    .values({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      authorType: "system",
+      idempotencyKey,
+      body: [
+        "## Blocking review feedback escalated",
+        "",
+        `${assignee.name}'s monitor is \`triggered\` with no scheduled re-check -- no live wake path -- so this ` +
+          "Changes Requested review is being escalated to its manager instead of left unseen.",
+        "",
+        `- Assignee: ${assignee.name}`,
+        `- Escalated to: ${manager.name}`,
+        ...prLine,
+        ...(input.context.headSha ? [`- Reviewed head SHA: \`${input.context.headSha}\``] : []),
+      ].join("\n"),
+      metadata: {
+        kind: "github_pr_review_feedback_escalation",
+        source: "github",
+        externalKey: idempotencyKey,
+        escalatedToAgentId: manager.id,
+        escalatedFromAgentId: assignee.id,
+      } as never,
+    })
+    .onConflictDoNothing();
+
+  await heartbeat.wakeup(manager.id, {
+    source: "automation",
+    triggerDetail: "system",
+    reason: "unseen_blocking_review_feedback",
+    idempotencyKey,
+    payload: {
+      issueId: input.issue.id,
+      sourceAssigneeAgentId: assignee.id,
+      prNumber: input.context.prNumber,
+      repoFullName: input.context.repoFullName,
+      headSha: input.context.headSha,
+    },
+    contextSnapshot: {
+      issueId: input.issue.id,
+      taskId: input.issue.id,
+      wakeReason: "unseen_blocking_review_feedback",
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      sourceAssigneeAgentId: assignee.id,
+    },
+  });
+
+  return { escalated: true, managerAgentId: manager.id };
 }
 
 const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
@@ -2784,6 +3573,10 @@ function githubContextMetadata(context: ResolvedEventContext) {
     ...(context.commentUrl ? { githubCommentUrl: context.commentUrl } : {}),
     ...(context.reviewUrl ? { githubReviewUrl: context.reviewUrl } : {}),
     // BLO-9293: PR author login for the reviewer self-review-skip gate.
+    // BLO-20886 AC3: also gates the author wake's "YOUR pull request"
+    // possessive and its push instruction — owning-issue routing picks the
+    // right ISSUE, but that issue's assignee is not necessarily the PR's
+    // author (a `kkroo/blo-*` branch resolves to an agent's issue).
     ...(context.prAuthorLogin ? { githubPrAuthorLogin: context.prAuthorLogin } : {}),
     ...(context.identifiers.length > 0 ? { githubPaperclipIdentifiers: context.identifiers } : {}),
   };
@@ -2858,6 +3651,29 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
                 : "reviewer_bot_authored_request_missing_marker",
           },
           message,
+        );
+      },
+      // BLO-23059: the paused-notice drop kills two wakes (reviewer counter-review
+      // and PR author), so it is the higher-impact silent drop of the two and
+      // needs the same structured trace. `info` at this level rather than
+      // `warn`: unlike the missing-marker case there is nothing to fix — the
+      // suppression is the intended steady state for as long as Code Review
+      // stays unlinked, and the CEO recorded that decision on BLO-23059.
+      onSuppressedReviewSubmission: (info) => {
+        logger.info(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            reviewAuthorLogin: info.reviewAuthorLogin,
+            reviewState: info.reviewState,
+            reviewUrl: info.reviewUrl,
+            suppressionReason: "claude_code_review_service_notice",
+          },
+          "github webhook wakes skipped: claude[bot] submitted a formal review whose body is the " +
+            "Claude Code Review paused/disabled org-settings notice, not findings (BLO-23059); " +
+            "neither the reviewer counter-review wake nor the PR-author wake was enqueued",
         );
       },
     });
@@ -3220,7 +4036,27 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           originId: taskKey,
           repoFullName: alertRepoFullName,
           alert,
+          deliveryId,
         });
+
+        // BLO-28981: the alert's newest row was cancelled, which this intake
+        // reads as a standing decision to stop re-adjudicating it. The re-fire
+        // is already recorded on that row; waking an agent here is exactly the
+        // cost cancelling was meant to stop.
+        if (issue.suppressed) {
+          logger.info(
+            {
+              event: eventName,
+              deliveryId,
+              taskKey,
+              issueId: issue.id,
+              alertNumber: alert.alertNumber,
+              repoFullName: alertRepoFullName,
+            },
+            "github webhook dependabot re-fire suppressed: alert issue is cancelled",
+          );
+          return false;
+        }
 
         const heartbeat = heartbeatService(db, {
           pluginWorkerManager: config.pluginWorkerManager,
@@ -3242,6 +4078,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           contextSnapshot: {
             taskKey,
             issueId: issue.id,
+            // BLO-28981: true when this landed on a previously-adjudicated row
+            // that was reopened rather than a fresh one. The woken run can see
+            // it is handling a repeat without first reading the comment thread.
+            dependabotReopened: issue.reopened,
             wakeReason: "github_dependabot_alert",
             wakeSource: "automation",
             wakeTriggerDetail: "system",
@@ -3350,6 +4190,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         assigneeAgentId: issues.assigneeAgentId,
         status: issues.status,
         executionState: issues.executionState,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
       })
       .from(issues);
     const matched = matchedIssues.filter(
@@ -3522,6 +4365,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
+        // BLO-23893: `reviewerWakeFired` is computed for EVERY delivery but
+        // used to be reported only on the two `no_paperclip_identifier`
+        // exits. That was invisible until the BLO-20886 owning-union fix
+        // landed: a PR whose only ref is a lowercase branch (the BLO-21995
+        // fixtures) no longer exits at that gate, so it reaches here instead
+        // and the field silently vanished from the response. The reviewer
+        // wake's outcome is a property of the delivery, not of which exit it
+        // happens to take -- report it on every path that has computed it.
+        reviewerWakeFired,
+        reviewerRunsCancelled,
       });
       return;
     }
@@ -3592,7 +4445,50 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       );
     }
 
-    for (const issue of suppressAuthorWake ? [] : matched) {
+    // BLO-20886: an author-directed wake (prRole: "author", set below via
+    // isPrWake) asserts ownership of the PR ("YOUR pull request") and, for
+    // review-shaped reasons, instructs a push. Firing it for every issue in
+    // `matched` -- which includes issues named only via an informational
+    // `Related:` mention -- sent that directive to the assignee of an issue
+    // with no relationship to the PR at all (observed live: PR #953 matched
+    // BLO-19132 via `Refs:` and BLO-20810/BLO-20129/BLO-19079 via `Related:`;
+    // the wake landed on BLO-20129's assignee). Restrict the author-wake loop
+    // to the PR's OWNING issue(s) only -- resolveOwningPaperclipIdentifiers's
+    // branch > title > labeled Fixes:/Closes:/Refs: rule. `matched` keeps its
+    // full breadth for the back-link comment and merged-PR forward-capture
+    // above, which are informational and correctly link every mentioned
+    // issue. When no owning issue resolves (none found), the author wake is
+    // dropped with a logged suppressionReason rather than falling through to
+    // a lower-priority or unlabeled mention.
+    const isPrWake = context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+    let authorWakeCandidates = matched;
+    if (isPrWake) {
+      const owning = context.owningIdentifiers ?? [];
+      if (owning.length === 0) {
+        authorWakeCandidates = [];
+        if (matched.length > 0) {
+          const suppressionReason = "no_owning_reference";
+          skipped.push({ issueIdentifier: null, reason: suppressionReason });
+          logger.info(
+            {
+              deliveryId,
+              event: eventName,
+              wakeReason: context.wakeReason,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+              identifiers: context.identifiers,
+              matchedIdentifiers: matched.map((m) => m.identifier),
+              suppressionReason,
+            },
+            "github webhook suppressed author-directed PR wake: no confidently-resolved owning issue",
+          );
+        }
+      } else {
+        authorWakeCandidates = matched.filter((m) => m.identifier && owning.includes(m.identifier));
+      }
+    }
+
+    for (const issue of suppressAuthorWake ? [] : authorWakeCandidates) {
       // Terminal-status issues don't need to wake -- the assignee
       // shouldn't reopen `done`/`cancelled` work just because a stale
       // CI ping arrived.
@@ -3654,6 +4550,53 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             );
           }
         }
+        // BLO-19497 AC #5: a blocking review landing on an issue whose
+        // assignee has no live wake path (monitor triggered, nextCheckAt
+        // null) must not just sit in a comment nobody will read -- hand it to
+        // the manager.
+        //
+        // Review finding (PR #1125): this used to be gated on
+        // reopen.commentInserted, on the theory that redelivery of the same
+        // review always re-finds commentInserted === false and so is
+        // naturally deduped. That reasoning breaks the moment
+        // escalateUnseenBlockingReviewFeedback itself fails transiently (its
+        // own comment write or the manager wakeup throws) AFTER the feedback
+        // comment above has already landed: every subsequent redelivery of
+        // that same review permanently sees commentInserted === false and
+        // this branch never runs again, so the escalation -- the whole point
+        // of AC #5 -- silently never happens. Attempt escalation on every
+        // delivery that meets the conditions instead, and let
+        // escalateUnseenBlockingReviewFeedback's own idempotency (wake +
+        // comment, both keyed on the same externalKey/idempotencyKey) decide
+        // whether there is anything left to do.
+        if (
+          effectiveAssigneeAgentId &&
+          isBlockingReviewState(context.reviewState) &&
+          isIssueMonitorTriggered(issue)
+        ) {
+          try {
+            const escalation = await escalateUnseenBlockingReviewFeedback(db, heartbeat, {
+              issue,
+              assigneeAgentId: effectiveAssigneeAgentId,
+              commentId: reopen.commentId,
+              context,
+              deliveryId,
+            });
+            if (escalation.escalated) {
+              escalated.push({
+                issueIdentifier: issue.identifier,
+                ownerAgentId: escalation.managerAgentId,
+                ownerType: "agent",
+                cycles: 0,
+              });
+            }
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id, prNumber: context.prNumber },
+              "unseen blocking review feedback escalation failed (non-fatal)",
+            );
+          }
+        }
         if (effectiveAssigneeAgentId) {
           authorWakeIdempotencyKey = buildPrAuthorWakeIdempotencyKey(issue.id, context, deliveryId);
           if (await hasExistingWakeWithIdempotencyKey(db, effectiveAssigneeAgentId, authorWakeIdempotencyKey)) {
@@ -3670,9 +4613,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // PR-shaped wakes carry an `prRole: "author"` marker so the
       // heartbeat directive flips from reviewer-shaped ("review this PR")
       // to author-shaped ("a reviewer just posted findings on YOUR PR").
-      // Non-PR wakes (CI completion, etc.) leave prRole unset.
-      const isPrWake =
-        context.wakeReason.startsWith("github_pr_") && context.prNumber !== null;
+      // Non-PR wakes (CI completion, etc.) leave prRole unset. (isPrWake is
+      // hoisted above this loop -- see the authorWakeCandidates comment.)
 
       // BLO-13247: the actionableReviewFeedback branch above already
       // precheck-and-skips on its own idempotency key before this point, but
@@ -3816,6 +4758,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       wakes,
       skipped,
       reopened,
+      // BLO-23893: see the `no_matching_issue` exit above -- the reviewer
+      // wake's outcome belongs on every response that computed it, not only
+      // on the early-exit paths.
+      reviewerWakeFired,
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
@@ -3844,6 +4790,7 @@ export const __test_buildPrReviewerTaskLockKeys = buildPrReviewerTaskLockKeys;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
+export const __test_isClaudeCodeReviewServiceNotice = isClaudeCodeReviewServiceNotice;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;

@@ -8,7 +8,7 @@ import type {
   IssueGraphLivenessAutoRecoveryPreview,
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { InstanceExperimentalSettings } from "./InstanceExperimentalSettings";
+import { InstanceExperimentalSettings, describeSuppressedFindings } from "./InstanceExperimentalSettings";
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
@@ -102,6 +102,10 @@ function emptyRecoveryPreview(): IssueGraphLivenessAutoRecoveryPreview {
     findings: 0,
     recoverableFindings: 0,
     skippedOutsideLookback: 0,
+    skippedReescalationCooldown: 0,
+    skippedUnchangedTarget: 0,
+    reescalationCooldownMs: 60 * 60 * 1000,
+    unchangedTargetSuppressionMs: 7 * 24 * 60 * 60 * 1000,
     items: [],
   };
 }
@@ -486,6 +490,48 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     expect(toggle?.getAttribute("aria-checked")).toBe("true");
   });
 
+  it("reports suppressed findings instead of promising to create them", async () => {
+    // BLO-27676 review: the confirm button is labelled from
+    // `recoverableFindings`, so a preview that counted suppressed findings
+    // promised rows the run would not create. The steady-state case is every
+    // stale finding suppressed -- which must read as "already reported", not as
+    // "nothing is wrong".
+    mockInstanceSettingsApi.previewIssueGraphLivenessAutoRecovery.mockResolvedValue({
+      ...emptyRecoveryPreview(),
+      findings: 3,
+      recoverableFindings: 0,
+      skippedReescalationCooldown: 3,
+      skippedUnchangedTarget: 2,
+    });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(AUTO_RECOVERY_TOGGLE_SELECTOR)?.click();
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("3 current findings have already been escalated and resolved");
+    expect(document.body.textContent).toContain(
+      "2 of those are held until the target changes or 7d elapses",
+    );
+    // The remainder (3 aggregate - 2 target) is the COOLDOWN subset -- the most
+    // transient population, back within the hour. The prior string left exactly
+    // this group under a bare "will not be re-raised" (BLO-27676 review), so the
+    // regression this pins is the operator reading it as permanent.
+    expect(document.body.textContent).toContain(
+      "The remaining 1 is within the 1h re-escalation cooldown and will re-raise shortly",
+    );
+    // Neither suppressor is permanent, so the unqualified claim must be gone.
+    expect(document.body.textContent).not.toContain("and will not be re-raised.");
+    expect(document.body.textContent).not.toContain("held until the target changes.");
+    // Nothing to create, so the button must not offer a count.
+    const buttonLabels = [...document.body.querySelectorAll<HTMLButtonElement>("button")].map(
+      (button) => button.textContent,
+    );
+    expect(buttonLabels).toContain("Enable");
+    expect(buttonLabels.some((label) => label?.startsWith("Enable and create"))).toBe(false);
+  });
+
   it("removes the auto-recovery confirmation overlay after enabling only", async () => {
     mockInstanceSettingsApi.previewIssueGraphLivenessAutoRecovery.mockResolvedValue(emptyRecoveryPreview());
     await renderPage();
@@ -568,5 +614,94 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     expect(document.body.querySelector('[data-slot="dialog-overlay"]')).toBeNull();
     const enabledToggle = container.querySelector<HTMLButtonElement>(AUTO_RECOVERY_TOGGLE_SELECTOR);
     expect(enabledToggle?.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("describeSuppressedFindings", () => {
+  const WINDOWS = {
+    reescalationCooldownMs: 60 * 60 * 1000,
+    unchangedTargetSuppressionMs: 7 * 24 * 60 * 60 * 1000,
+  };
+
+  it("returns null when nothing is suppressed", () => {
+    expect(
+      describeSuppressedFindings({
+        skippedReescalationCooldown: 0,
+        skippedUnchangedTarget: 0,
+        ...WINDOWS,
+      }),
+    ).toBeNull();
+  });
+
+  it("bounds the target-state subset rather than claiming permanent suppression", () => {
+    // The 7d ceiling exists precisely because permanent suppression was judged a
+    // silent hole in a liveness detector (BLO-27676). A string that says "held
+    // until the target changes" full stop states the behaviour the ceiling was
+    // added to remove, so the ceiling has to appear in the sentence.
+    const text = describeSuppressedFindings({
+      skippedReescalationCooldown: 2,
+      skippedUnchangedTarget: 2,
+      ...WINDOWS,
+    });
+    expect(text).toBe(
+      "2 current findings have already been escalated and resolved, so this run will not re-raise them. "
+        + "All of them are held until the target changes or 7d elapses.",
+    );
+  });
+
+  it("describes the cooldown remainder as transient, not as never re-raised", () => {
+    // `skippedReescalationCooldown` is the aggregate, so the remainder after the
+    // target subset is the cooldown population -- back within the hour. This is
+    // the subset the prior string mislabelled as permanent.
+    const text = describeSuppressedFindings({
+      skippedReescalationCooldown: 5,
+      skippedUnchangedTarget: 3,
+      ...WINDOWS,
+    });
+    expect(text).toContain("3 of those are held until the target changes or 7d elapses.");
+    expect(text).toContain(
+      "The remaining 2 are within the 1h re-escalation cooldown and will re-raise shortly.",
+    );
+  });
+
+  it("derives both bounds from the preview so a tuned window cannot make the string lie", () => {
+    // The windows are configurable (documented rollback lever) and the constants
+    // are tunable. Hardcoding "7 days" in the UI would silently desynchronise the
+    // dialog from the run; these come off the response the preview resolved.
+    const text = describeSuppressedFindings({
+      skippedReescalationCooldown: 4,
+      skippedUnchangedTarget: 1,
+      reescalationCooldownMs: 5 * 60 * 1000,
+      unchangedTargetSuppressionMs: 36 * 60 * 60 * 1000,
+    });
+    expect(text).toContain("held until the target changes or 1d 12h elapses.");
+    expect(text).toContain("within the 5m re-escalation cooldown");
+    expect(text).not.toContain("7d");
+  });
+
+  it("agrees in number with a single suppressed finding", () => {
+    expect(
+      describeSuppressedFindings({
+        skippedReescalationCooldown: 1,
+        skippedUnchangedTarget: 0,
+        ...WINDOWS,
+      }),
+    ).toBe(
+      "1 current finding has already been escalated and resolved, so this run will not re-raise it. "
+        + "It is within the 1h re-escalation cooldown and will re-raise shortly.",
+    );
+  });
+
+  it("does not render a negative remainder if the two counters ever drift apart", () => {
+    // The target count is a subset by construction; the clamp keeps a future
+    // accounting bug from rendering "-1 are within the cooldown" to an operator.
+    const text = describeSuppressedFindings({
+      skippedReescalationCooldown: 1,
+      skippedUnchangedTarget: 3,
+      ...WINDOWS,
+    });
+    expect(text).not.toMatch(/-\d/);
+    expect(text).not.toContain("cooldown");
+    expect(text).toContain("held until the target changes or 7d elapses.");
   });
 });

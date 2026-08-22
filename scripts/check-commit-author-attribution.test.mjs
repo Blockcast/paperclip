@@ -19,6 +19,12 @@ import {
   sortByMergedAtDesc,
 } from "./check-commit-author-attribution.mjs";
 
+function patchKey(repoRoot, sha, email = APP_NOREPLY_EMAIL) {
+  const patch = execFileSync("git", ["show", "--format=", sha], { cwd: repoRoot, encoding: "utf8" });
+  const patchId = execFileSync("git", ["patch-id", "--stable"], { cwd: repoRoot, input: patch, encoding: "utf8" }).trim().split(/\s+/)[0];
+  return `${patchId}|${email}`;
+}
+
 test("findAttributionOffenses flags a non-merge commit stamped with the shared App identity", () => {
   const offenses = findAttributionOffenses([
     { sha: "a", authorEmail: APP_NOREPLY_EMAIL, parentCount: 1, message: "api write" },
@@ -70,18 +76,18 @@ test("findAttributionOffenses defaults an absent parentCount to 1 (non-merge)", 
   assert.equal(offenses.length, 1);
 });
 
-test("findAttributionOffenses with an allowlist clears an App-attributed commit whose sha is a member (BLO-23894)", () => {
+test("findAttributionOffenses with an allowlist clears an App-attributed commit whose patch and author are registered (BLO-23894)", () => {
   const offenses = findAttributionOffenses(
     [
       {
-        sha: "962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        patchId: "962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         authorEmail: APP_NOREPLY_EMAIL,
         authorDate: "2026-08-05T16:46:12Z",
         parentCount: 1,
         message: "pre-cutoff API write",
       },
     ],
-    { allowlist: new Set(["962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) },
+    { allowlist: new Set([`962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|${APP_NOREPLY_EMAIL}`]) },
   );
   assert.deepEqual(offenses, []);
 });
@@ -90,14 +96,14 @@ test("findAttributionOffenses with an allowlist still flags an App-attributed co
   const offenses = findAttributionOffenses(
     [
       {
-        sha: "notpinnedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        patchId: "notpinnedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         authorEmail: APP_NOREPLY_EMAIL,
         authorDate: "2020-01-01T00:00:00Z",
         parentCount: 1,
         message: "old but unenumerated API write",
       },
     ],
-    { allowlist: new Set(["962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]) },
+    { allowlist: new Set([`962aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|${APP_NOREPLY_EMAIL}`]) },
   );
   assert.equal(offenses.length, 1);
 });
@@ -106,7 +112,7 @@ test("findAttributionOffenses with an allowlist is immune to a backdated authorD
   const offenses = findAttributionOffenses(
     [
       {
-        sha: "forgedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        patchId: "forgedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         authorEmail: APP_NOREPLY_EMAIL,
         // Backdated via GIT_AUTHOR_DATE to well before the cutoff, but this
         // sha was never enumerated — the allowlist does not care what the
@@ -124,7 +130,7 @@ test("findAttributionOffenses with an allowlist is immune to a backdated authorD
 test("findAttributionOffenses without an allowlist ignores sha membership entirely (audit mode stays historical)", () => {
   const offenses = findAttributionOffenses([
     {
-      sha: [...GRANDFATHERED_OFFENSE_SHAS][0],
+      patchId: [...GRANDFATHERED_OFFENSE_SHAS][0].split("|")[0],
       authorEmail: APP_NOREPLY_EMAIL,
       authorDate: "2026-08-05T16:46:12Z",
       parentCount: 1,
@@ -145,7 +151,7 @@ test("findAttributionOffenses with an allowlist fails closed on a missing sha", 
 test("GRANDFATHERED_OFFENSE_SHAS is a non-empty set of full 40-char lowercase hex shas", () => {
   assert.ok(GRANDFATHERED_OFFENSE_SHAS.size > 0);
   for (const sha of GRANDFATHERED_OFFENSE_SHAS) {
-    assert.match(sha, /^[0-9a-f]{40}$/, `${sha} is not a full lowercase sha`);
+    assert.match(sha, /^[0-9a-f]{40}\|.+@.+$/, `${sha} is not a patch-id plus author key`);
   }
 });
 
@@ -220,9 +226,8 @@ test("findLocalRangeOffenses grandfathers an App-attributed commit whose sha is 
     });
     const head = git(["rev-parse", "HEAD"]).trim();
 
-    // Real PR #962 shape (BLO-23894): App-stamped author, rebased in by a
-    // human hours later — the offense is unsatisfiable, so its sha is pinned.
-    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set([head]) }), []);
+    // Real PR #962 shape (BLO-23894): register stable patch-id plus author.
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set([patchKey(repoRoot, head)]) }), []);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -256,7 +261,7 @@ test("findLocalRangeOffenses still flags an App-attributed commit whose sha is n
   }
 });
 
-test("findLocalRangeOffenses keeps grandfathering a pinned commit across an ordinary merge-based branch update (PR #1265 review)", () => {
+test("findLocalRangeOffenses keeps grandfathering a registered patch across a merge-based branch update", () => {
   // Pins the trade-off documented on findAttributionOffenses: SHA-pinning
   // survives the "Update branch" merge this repo's queue actually uses
   // (verified via PR #1265's own mergeStateStatus) because a merge leaves
@@ -279,8 +284,7 @@ test("findLocalRangeOffenses keeps grandfathering a pinned commit across an ordi
     });
     const pinnedSha = git(["rev-parse", "HEAD"]).trim();
 
-    // Base moves forward after the cutoff; the feature branch is updated via
-    // a merge (GitHub's default "Update branch"), not a rebase.
+    // Base moves forward after the cutoff; the feature branch is updated via a merge.
     git(["checkout", "-q", "main"]);
     git(["config", "user.email", "base@example.com"]);
     git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
@@ -294,7 +298,7 @@ test("findLocalRangeOffenses keeps grandfathering a pinned commit across an ordi
     assert.ok(shasInRange.includes(pinnedSha));
 
     assert.deepEqual(
-      findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set([pinnedSha]) }).map((o) => o.message),
+      findLocalRangeOffenses({ repoRoot, base, head, allowlist: new Set([patchKey(repoRoot, pinnedSha)]) }).map((o) => o.message),
       [],
     );
   } finally {
@@ -302,7 +306,7 @@ test("findLocalRangeOffenses keeps grandfathering a pinned commit across an ordi
   }
 });
 
-test("findLocalRangeOffenses does NOT carry a pinned grandfather through an explicit git rebase — the rewritten commit needs its new sha added (documented trade-off, BLO-23894)", () => {
+test("findLocalRangeOffenses carries a registered grandfather through a rebase (BLO-27142)", () => {
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-rebase-"));
   try {
     const git = (args, env) =>
@@ -331,16 +335,15 @@ test("findLocalRangeOffenses does NOT carry a pinned grandfather through an expl
     // Rebase rewrites the commit: new sha, even though the diff is identical.
     assert.notEqual(rebasedHead, pinnedSha);
 
-    // The original pin no longer matches — fails closed rather than silently
-    // passing.
+    // Raw SHA matching is deliberately not accepted.
     assert.equal(
       findLocalRangeOffenses({ repoRoot, base, head: rebasedHead, allowlist: new Set([pinnedSha]) }).length,
       1,
     );
 
-    // The fix is cheap and forgery-free: add the new sha.
+    // The stable patch-id survives the queue's rebase.
     assert.deepEqual(
-      findLocalRangeOffenses({ repoRoot, base, head: rebasedHead, allowlist: new Set([rebasedHead]) }),
+      findLocalRangeOffenses({ repoRoot, base, head: rebasedHead, allowlist: new Set([patchKey(repoRoot, rebasedHead)]) }),
       [],
     );
   } finally {

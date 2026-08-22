@@ -1,5 +1,10 @@
 import * as k8s from "@kubernetes/client-node";
 import { readFileSync } from "node:fs";
+import {
+  isAgentInheritableEnvFromRef,
+  isAgentInheritableEnvName,
+  isAgentInheritableSecretVolume,
+} from "./inherit-allowlist.js";
 
 /**
  * Cached self-pod introspection result. Queried once on first execute(),
@@ -34,11 +39,25 @@ export interface SelfPodInfo {
   tolerations: k8s.V1Toleration[];
   pvcClaimName: string | null;
   secretVolumes: SelfPodSecretVolume[];
-  /** Env vars inherited from the Deployment container (literal name/value pairs). */
+  /**
+   * Env vars inherited from the Deployment container (literal name/value pairs).
+   *
+   * Filtered through `isAgentInheritableEnvName` (BLO-22514) — this is NOT the
+   * server's full env, and callers must not assume an arbitrary server var is
+   * present here.
+   */
   inheritedEnv: Record<string, string>;
-  /** Env vars with valueFrom (secretKeyRef, configMapKeyRef, etc.) from the Deployment container. */
+  /**
+   * Env vars with valueFrom (secretKeyRef, configMapKeyRef, etc.) from the
+   * Deployment container. Filtered on the same allowlist as `inheritedEnv`:
+   * a secretKeyRef is hidden from `GET Pod` but is still fully readable by the
+   * agent process, so it gets no exemption.
+   */
   inheritedEnvValueFrom: k8s.V1EnvVar[];
-  /** envFrom sources (secretRef, configMapRef) from the Deployment container. */
+  /**
+   * envFrom sources (secretRef, configMapRef) from the Deployment container.
+   * Allowlisted by referenced object name; empty allowlist by default.
+   */
   inheritedEnvFrom: k8s.V1EnvFromSource[];
 }
 
@@ -168,11 +187,16 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     pvcClaimName = volume?.persistentVolumeClaim?.claimName ?? null;
   }
 
-  // Discover secret volumes mounted on the main container
+  // Discover secret volumes mounted on the main container.
+  //
+  // Allowlisted (BLO-22514): everything collected here is re-mounted onto every
+  // agent Job pod by job-manifest.ts, so an un-allowlisted server mount would
+  // hand its key material to every agent under /paperclip/.secrets/...
   const secretVolumes: SelfPodSecretVolume[] = [];
   for (const vm of mainContainer.volumeMounts ?? []) {
     const vol = spec.volumes?.find((v) => v.name === vm.name);
     if (vol?.secret?.secretName) {
+      if (!isAgentInheritableSecretVolume(vol.secret.secretName)) continue;
       secretVolumes.push({
         volumeName: vm.name,
         secretName: vol.secret.secretName,
@@ -185,10 +209,22 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
 
   // Collect env vars from the pod spec's container definition.
   // Agent config env (set in buildEnvVars) will override these.
+  //
+  // Allowlisted (BLO-22514). This is the single chokepoint for inheritance:
+  // job-manifest.ts replays these onto every agent Job in four separate places,
+  // so filtering here — rather than at each replay site — means a new replay
+  // site cannot reintroduce the leak by forgetting to filter.
+  //
+  // The `valueFrom` branch is filtered on exactly the same basis as the literal
+  // branch. A `secretKeyRef` entry is invisible to a read-only `GET Pod`, which
+  // is why an earlier analysis called those "fine" — but invisibility to the
+  // Kubernetes API is not confidentiality from the agent: the kubelet resolves
+  // it and the value lands in the container's environment either way.
   const inheritedEnv: Record<string, string> = {};
   const inheritedEnvValueFrom: k8s.V1EnvVar[] = [];
   for (const envItem of mainContainer.env ?? []) {
     if (!envItem.name) continue;
+    if (!isAgentInheritableEnvName(envItem.name)) continue;
     if (envItem.valueFrom) {
       // Preserve valueFrom entries (secretKeyRef, configMapKeyRef, fieldRef, etc.)
       inheritedEnvValueFrom.push({ name: envItem.name, valueFrom: envItem.valueFrom });
@@ -198,8 +234,18 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     }
   }
 
-  // Capture envFrom sources (secretRef, configMapRef) from the container spec
-  const inheritedEnvFrom: k8s.V1EnvFromSource[] = mainContainer.envFrom ?? [];
+  // Capture envFrom sources (secretRef, configMapRef) from the container spec.
+  //
+  // Allowlisted (BLO-22514) by referenced object name. envFrom injects every key
+  // of a Secret/ConfigMap under names this filter never observes, so it cannot
+  // be reconciled with a per-name allowlist; the allowlist is empty by default
+  // and no envFrom exists in deploy/helm/paperclip today.
+  const inheritedEnvFrom: k8s.V1EnvFromSource[] = (mainContainer.envFrom ?? []).filter(
+    (src) => {
+      const refName = src.secretRef?.name ?? src.configMapRef?.name;
+      return typeof refName === "string" && isAgentInheritableEnvFromRef(refName);
+    },
+  );
 
   const info: SelfPodInfo = {
     namespace,

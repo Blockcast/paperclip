@@ -19,6 +19,7 @@ import type {
   AdapterExecutionResult,
 } from "@paperclipai/adapter-utils";
 import { heartbeatService } from "../services/heartbeat.js";
+import { logger } from "../middleware/logger.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -1349,5 +1350,151 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .then((rows) => rows[0]);
     expect(jobHolderRunAfter?.status).toBe("running");
     expect(jobHolderRunAfter?.startedAt).not.toBeNull();
+  }, 120_000);
+
+  /**
+   * BLO-20482: the cancel cascade calls deleteExactExternalRuntimeJob for every
+   * external-lifecycle run, and reaches it with NO active reservation by design
+   * (the dispatcher may already have released a terminal run's reservation).
+   * That benign path used to log at error ~13x/26min, all with
+   * reservationId: null, poisoning the API error rate. Downgrading it must not
+   * also silence the genuinely anomalous case, so both directions are pinned.
+   */
+  async function seedCancellableExternalRun(input: {
+    reservation: "none" | "identity_missing";
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const reservationId = randomUUID();
+    const issuePrefix = `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "DeletionRefusalCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "DeletionRefusalAgent",
+      role: "engineer",
+      status: "running",
+      // hasExternalLifecycle(...) is what arms the cancel cascade.
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5, concurrencyEnabled: true } },
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      // Must be in CANCELLABLE_HEARTBEAT_RUN_STATUSES for cancelRun to proceed.
+      status: "running",
+      startedAt: new Date(Date.now() - 60 * 1000),
+      contextSnapshot: {},
+    });
+
+    if (input.reservation === "identity_missing") {
+      // Reservation persisted and unreleased, but the Job identity stamp never
+      // landed -- a Job may be live that we cannot safely target.
+      await db.insert(externalRuntimeReservations).values({
+        id: reservationId,
+        companyId,
+        agentId,
+        runId,
+        slotId: 1,
+        state: "launching",
+        expectedJobName: `agent-claude-${runId.slice(0, 8)}`,
+        jobName: null,
+        jobUid: null,
+        reservedAt: new Date(Date.now() - 60 * 1000),
+        releasedAt: null,
+        isolationMode: "run",
+        isolationKey: `run:${runId}`,
+        isolationBoundAt: new Date(Date.now() - 60 * 1000),
+      });
+    }
+
+    return { companyId, agentId, runId, reservationId };
+  }
+
+  const REFUSAL_MESSAGE = "refusing external-runtime Job deletion without persisted name and UID";
+  const SKIP_MESSAGE = "skipping external-runtime Job deletion: no active reservation to target";
+
+  function callsMatching(spy: ReturnType<typeof vi.spyOn>, needle: string) {
+    return spy.mock.calls.filter(
+      ([, message]) => typeof message === "string" && message.includes(needle),
+    );
+  }
+
+  it("cancels a run with no active reservation without logging at error (BLO-20482)", async () => {
+    const { runId } = await seedCancellableExternalRun({ reservation: "none" });
+
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+    let refusals: unknown[][] = [];
+    let skipped: unknown[][] = [];
+    try {
+      await heartbeat.cancelRun(runId, "cancelled by test");
+      // Snapshot BEFORE restoring: mockRestore() also resets mock.calls, so
+      // reading the spy afterwards silently sees an empty array and every
+      // "was not logged" assertion passes vacuously.
+      refusals = callsMatching(errorSpy, REFUSAL_MESSAGE);
+      skipped = callsMatching(debugSpy, SKIP_MESSAGE);
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+
+    // The load-bearing assertion: this benign path contributes nothing to the
+    // error rate.
+    expect(refusals).toEqual([]);
+
+    // ...but it is still observable at debug, carrying the null reservationId
+    // that identified the condition in production.
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0][0]).toMatchObject({ runId, reservationId: null });
+
+    // Refusal semantics are unchanged: no delete is attempted, so the caller
+    // still treats the result as fail-closed.
+    expect(mockDeleteAgentJobExact).not.toHaveBeenCalled();
+
+    const runAfter = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(runAfter?.status).toBe("cancelled");
+  }, 120_000);
+
+  it("still logs at error when a persisted reservation has no Job identity (BLO-20482)", async () => {
+    const { runId, reservationId } = await seedCancellableExternalRun({
+      reservation: "identity_missing",
+    });
+
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    let refusals: unknown[][] = [];
+    try {
+      await heartbeat.cancelRun(runId, "cancelled by test");
+      // Snapshot before restoring -- see the sibling test.
+      refusals = callsMatching(errorSpy, REFUSAL_MESSAGE);
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    // Guards the downgrade from being over-broad: a reservation we persisted
+    // but never stamped is a real anomaly and must stay loud.
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0][0]).toMatchObject({ runId, reservationId });
+
+    expect(mockDeleteAgentJobExact).not.toHaveBeenCalled();
   }, 120_000);
 });

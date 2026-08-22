@@ -117,6 +117,7 @@ import {
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
+  OPEN_ISSUE_STATUSES,
   issueReferenceService,
   issueService,
   type IssueFilters,
@@ -213,6 +214,7 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -2086,6 +2088,40 @@ function isCurrentIssueExecutionRun(
     (issue.checkoutRunId == null || ownsCheckout) &&
     (issue.executionRunId == null || ownsExecution)
   );
+}
+
+// BLO-22666 / BLO-18858: a pending `in_review` stage that is live-locked belongs
+// to exactly one run. Reports the *second run of the issue's own assignee* — the
+// only actor that both (a) clears every ordinary authorization boundary and (b)
+// has no business mutating or deciding the stage the lock holder is sitting on.
+//
+// Deliberately narrow, and the narrowness is the point: by the time callers reach
+// this, the actor may legitimately be a mention-granted peer reviewer, a
+// manager-chain actor, a recovery owner, a human, or a `currentParticipant` that
+// has drifted off `assigneeAgentId`. None of those hold the checkout and all of
+// them are supposed to be able to approve, so the `assigneeAgentId === actor`
+// term must stay. Widening past it re-breaks the approval-by-comment path this
+// issue exists to protect.
+function isForeignRunOfLockedPendingReview(
+  req: Request,
+  issue: {
+    status: string;
+    assigneeAgentId?: string | null;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+    executionState?: unknown;
+  },
+) {
+  if (req.actor.type !== "agent") return false;
+  const actorAgentId = req.actor.agentId;
+  if (!actorAgentId) return false;
+  if (issue.status !== "in_review") return false;
+  if (issue.assigneeAgentId !== actorAgentId) return false;
+  // An unlocked row is exactly what BLO-22666's checkout half made claimable;
+  // fencing it here would re-close the door #1117 opened.
+  if (issue.checkoutRunId == null && issue.executionRunId == null) return false;
+  if (parseIssueExecutionState(issue.executionState)?.status !== "pending") return false;
+  return !isCurrentIssueExecutionRun(req, issue);
 }
 
 function summarizeIssueMonitor(
@@ -5521,6 +5557,70 @@ export function issueRoutes(
     );
   }
 
+  /**
+   * BLO-27912: is this PATCH exclusively a deliberate-park disposition write?
+   *
+   * Shape-gated to a single key for the same reason `isLapsedMonitorRearmPatch` is: the
+   * capability this unlocks is "state that a row is deliberately not being worked", and
+   * nothing else. A body carrying `parkedDisposition` *alongside* anything else would let a
+   * creator or manager reach `status`, `assigneeAgentId`, `description` or the dependency
+   * edges through a path that deliberately skips the ordinary mutation boundary. The row's
+   * own ACs require the park to change none of those, so admitting them here would break
+   * the acceptance criteria and the authorization boundary in one move.
+   *
+   * Key presence is a sound test here, unlike the monitor case: `parkedDisposition` has no
+   * nested defaults that zod would materialize, so a key is present only if the caller sent
+   * it. `null` (un-park) is as admissible as an object — an actor who can park must be able
+   * to un-park, or the disposition becomes one-way and the AC that un-parking restores
+   * detection would have no reachable executor.
+   */
+  function isParkedDispositionPatch(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const patch = body as Record<string, unknown>;
+    const keys = Object.keys(patch);
+    return keys.length === 1 && keys[0] === "parkedDisposition";
+  }
+
+  /**
+   * BLO-27912: admit a park write from an actor that is NOT the assignee.
+   *
+   * This is the whole point of the row. `hasExplicitWaitingPath` accepted six satisfiers and
+   * every one of them was assignee-reachable only, so a deliberately-parked row — one whose
+   * assignee is by construction not working on it — had no attainable way to say so and the
+   * liveness invariant re-fired against it forever. Measured on BLO-24266: three escalations
+   * with a byte-identical `originFingerprint`, and `POST /issues/:id/interactions` returning
+   * 403 `deny_missing_grant` to an actor holding BOTH creator and manager-chain grants.
+   *
+   * Both of those grants are admitted, which is exactly the set the row's AC names
+   * (`createdByAgentId` or manager-chain). Resolved through the `issue:comment` action
+   * because that is the action those two allow-paths are defined over — BLO-18797 made them
+   * a comment grant deliberately, and this widens it by one narrowly-shaped field rather
+   * than by promoting the grant itself. Everything else the comment grant withholds
+   * (`reopen`, `resume`, status transitions) stays withheld, because the shape gate above
+   * rejects any body that carries them.
+   *
+   * Fails closed: a non-agent actor, a cross-company actor, a differently-shaped body, or
+   * any other decision reason all return null and leave the pre-existing boundary intact.
+   */
+  async function decideParkedDispositionPatch(
+    req: Request,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return null;
+    if (req.actor.companyId !== issue.companyId) return null;
+    if (!isParkedDispositionPatch(req.body)) return null;
+
+    const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (!commentDecision.allowed) return null;
+    if (
+      commentDecision.reason !== "allow_manager_chain" &&
+      commentDecision.reason !== "allow_issue_creator"
+    ) {
+      return null;
+    }
+    return commentDecision;
+  }
+
   function isManagerChainNonInvokableAssigneeReroutePatch(body: unknown) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return false;
     const patch = body as Record<string, unknown>;
@@ -5556,7 +5656,31 @@ export function issueRoutes(
     if (!["in_progress", "in_review"].includes(issue.status) || issue.monitorNextCheckAt) return false;
     if (Object.keys(body).length !== 1 || body.executionPolicy == null) return false;
     const currentMonitor = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
-    if (currentMonitor?.status !== "triggered") return false;
+    // Two monitor shapes leave an issue with no scheduled wake, and both are
+    // recoverable only by someone other than the assignee:
+    //
+    //  - `triggered` — the monitor fired and nobody re-armed it (BLO-24149).
+    //  - `cleared` / `convergence_stalled` — the BLO-18294 guard refused the
+    //    re-arm after N consecutive re-checks failed to narrow the gate set.
+    //
+    // The second shape is what BLO-21947 records as unrecoverable. The service
+    // layer already implements its recovery: `resetConvergenceAfterStalledClear`
+    // grants a fresh convergence budget, and `sameAssigneeResetAfterPriorStall`
+    // throws so the *assignee* still cannot grant itself one — preserving the
+    // guard's stated intent that "a non-assignee actor must make that re-arm
+    // decision". Until now no non-assignee could reach that code, so the
+    // guard's documented escape hatch had no executor at all.
+    //
+    // Note the guard force-sets the issue to `blocked` when it trips, and a
+    // monitor cannot be armed on a `blocked` issue (`issueAllowsMonitor` — the
+    // service throws MONITOR_INVALID_MESSAGE on an explicit update). Admitting
+    // `blocked` here would therefore be unreachable code, so recovery stays a
+    // deliberate two-step: return the issue to active work, then have a
+    // non-assignee re-arm it.
+    const isRecoverableLapsedMonitor =
+      currentMonitor?.status === "triggered" ||
+      (currentMonitor?.status === "cleared" && currentMonitor.clearReason === "convergence_stalled");
+    if (!isRecoverableLapsedMonitor) return false;
     // The capability this unlocks is a monitor re-arm and nothing else. A body
     // carrying only `executionPolicy` is NOT sufficient to establish that:
     // `executionPolicy` is a whole-policy replace, so a policy that merely
@@ -5614,6 +5738,15 @@ export function issueRoutes(
       onManagerChainNonInvokableRerouteAllowed?: () => void;
       allowManagerMonitorRearm?: boolean;
       /**
+       * BLO-27912: PATCH /issues/:id only. Set by the caller after
+       * `decideParkedDispositionPatch` has confirmed BOTH that the body is exclusively a
+       * `parkedDisposition` write AND that the actor holds the creator or manager-chain
+       * grant over this issue. Off by default, and deliberately so — this helper backs ~25
+       * mutation routes including DELETE /issues/:id, so a `return true` reached from any
+       * of them would be a far wider grant than the one narrow field this unlocks.
+       */
+      allowParkedDisposition?: boolean;
+      /**
        * PATCH /issues/:id only: when an execution-stage currentParticipant and
        * issue assignee diverge, the participant must still be able to submit a
        * decision-shaped stage patch. Keep this opt-in and shape-gated because
@@ -5658,6 +5791,11 @@ export function issueRoutes(
       return true;
     }
     if (options.allowManagerMonitorRearm) {
+      return true;
+    }
+    // BLO-27912: same placement rationale as the two flags above — the gate that knows what
+    // is being written lives at the caller, and this only honours its decision.
+    if (options.allowParkedDisposition) {
       return true;
     }
     if (isCurrentIssueExecutionRun(req, issue)) {
@@ -5783,6 +5921,19 @@ export function issueRoutes(
     }
     if (issue.assigneeAgentId === null) {
       return true;
+    }
+    // BLO-22666 AC2: fence the same agent's *other* run off a live-locked pending
+    // `in_review` stage. Placed here on purpose — deliberately AFTER the recovery
+    // -action owner (:isActiveRecoveryActionOwner), creator/manager-chain recovery
+    // and unassigned early-returns above, so none of those rescue paths can be
+    // fenced; and deliberately BEFORE the blocked-correction and
+    // execution-stage-participant early returns below, which are exactly the two
+    // ways run B would otherwise decide run A's stage without ever reaching the
+    // `in_progress`-only checkout assertion at the bottom of this function.
+    if (isForeignRunOfLockedPendingReview(req, issue)) {
+      const reviewRunId = requireAgentRunId(req, res);
+      if (!reviewRunId) return false;
+      await svc.assertPendingReviewRunOwnership(issue.id, actorAgentId, reviewRunId);
     }
     if (options.allowBlockedCorrection && isAgentBlockedCorrectionForActiveExecutionStage(req, issue)) {
       return true;
@@ -6379,6 +6530,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
+        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
       },
     });
     if (issue.id) {
@@ -6431,7 +6583,11 @@ export function issueRoutes(
         issueId: issue.id,
         runId: run.id,
         ...(statusOnly
-          ? { modelProfile: "cheap", allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY }
+          ? {
+            modelProfile: "cheap",
+            allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          }
           : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",
         resumeRequiresNormalModel: statusOnly,
@@ -6460,7 +6616,13 @@ export function issueRoutes(
       details: {
         issueId: issue.id,
         runId: run.id,
-        ...(statusOnly ? { modelProfile: "cheap", allowedApprovalType: "request_board_approval" } : {}),
+        ...(statusOnly
+          ? {
+            modelProfile: "cheap",
+            allowedApprovalType: "request_board_approval",
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          }
+          : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",
         resumeRequiresNormalModel: statusOnly,
       },
@@ -7491,6 +7653,88 @@ export function issueRoutes(
 
     const count = await svc.count(companyId, blockedCountFilters);
     res.json({ count });
+  });
+
+  /**
+   * Authoritative open-assignment census.
+   *
+   * `GET /companies/:id/issues` silently clamps `limit` to ISSUE_LIST_MAX_LIMIT
+   * and returns a bare array with no total and no cursor, so a caller cannot
+   * tell a complete page from a truncated one, and offset paging over a
+   * mutating collection double-counts and drops rows. Consumers that need
+   * exact per-agent open counts (the agent-health sweep) must read them here
+   * instead of reconstructing them from that population.
+   */
+  router.get("/companies/:companyId/issues/open-assignment-census", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (isTaskBridgeKeyActor(req)) {
+      res.status(403).json({ error: "Task bridge keys cannot use company-wide issue census APIs" });
+      return;
+    }
+    if (req.query.limit !== undefined || req.query.offset !== undefined) {
+      res.status(400).json({
+        error: "open-assignment-census is not paginated and does not accept limit or offset",
+      });
+      return;
+    }
+
+    const rawStatus = req.query.status;
+    let status: string[] | undefined;
+    if (rawStatus !== undefined) {
+      const candidates = (Array.isArray(rawStatus) ? rawStatus : [rawStatus])
+        .flatMap((value) => String(value).split(","))
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      const invalid = candidates.filter((value) => !OPEN_ISSUE_STATUSES.includes(
+        value as typeof OPEN_ISSUE_STATUSES[number],
+      ));
+      if (candidates.length === 0 || invalid.length > 0) {
+        res.status(400).json({
+          error: `status must be a subset of ${OPEN_ISSUE_STATUSES.join(",")}`,
+        });
+        return;
+      }
+      status = [...new Set(candidates)];
+    }
+
+    const censusFilters = {
+      status,
+      includeRoutineExecutions:
+        req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
+      includePluginOperations:
+        req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
+    };
+
+    // The census is a company-wide aggregate: it cannot be assembled from a
+    // per-actor visibility filter without losing the single-snapshot property
+    // that makes it authoritative. Actors without company-scope read get an
+    // explicit refusal rather than a silently narrowed census that would look
+    // exact and be wrong.
+    if (!(await actorCanReadCompanyScope(req, companyId))) {
+      const trustResolution = req.actor.type === "agent"
+        ? await resolveAgentTrustForIssue({
+            agentId: req.actor.agentId,
+            runId: req.actor.runId,
+          }, companyId, null)
+        : null;
+      if (trustResolution?.kind === "denied") {
+        throw forbidden(trustResolution.detail);
+      }
+      if (trustResolution?.kind === "low_trust_review") {
+        res.json(await svc.openAssignmentCensus(companyId, {
+          ...censusFilters,
+          lowTrustBoundary: trustResolution.boundary,
+        }));
+        return;
+      }
+      res.status(403).json({
+        error: "open-assignment-census requires company-scope read access",
+      });
+      return;
+    }
+
+    res.json(await svc.openAssignmentCensus(companyId, censusFilters));
   });
 
   router.get("/companies/:companyId/labels", async (req, res) => {
@@ -10304,6 +10548,13 @@ export function issueRoutes(
       managerMonitorRearmDecision &&
       managerMonitorRearmDecision.reason === "allow_manager_chain",
     );
+    // BLO-27912: the park write is the one satisfier on `hasExplicitWaitingPath` that a
+    // non-assignee can set. Resolved here, before the boundary check, for the same reason
+    // the coordination-metadata allowlist is: the boundary returns early on denial, and a
+    // parked-disposition PATCH from a creator or manager is exactly the request the boundary
+    // would otherwise refuse. Null-shaped bodies leave the boundary untouched.
+    const parkedDispositionDecision = await decideParkedDispositionPatch(req, existing);
+    const parkedDispositionAuthorized = parkedDispositionDecision !== null;
     const coordinationMetadataDecision = coordinationMetadataOutcome?.kind === "allowed"
       ? coordinationMetadataOutcome.decision
       : null;
@@ -10339,6 +10590,7 @@ export function issueRoutes(
           managerChainNonInvokableRerouteAllowed = true;
         },
         allowManagerMonitorRearm: managerMonitorRearmAuthorized,
+        allowParkedDisposition: parkedDispositionAuthorized,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -10367,7 +10619,7 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+    let normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
     );
@@ -10536,6 +10788,27 @@ export function issueRoutes(
       });
       return;
     }
+    // BLO-22909: every arm above refuses this patch *because* `blockedIssueReadiness`
+    // — read on this connection, well before the write — reported no live blockers.
+    // Each one can also carry `blockedByIssueIds`, so a blocker committed between
+    // that read and `syncBlockedByIssueIds` is silently deleted. Re-assert the same
+    // predicate inside the update transaction, where the company graph lock and the
+    // row `FOR UPDATE` make it atomic with the clear.
+    //
+    // Deliberately a superset of `delegateRecoveryPatchInFlight`, and kept separate
+    // from it: that flag additionally pins status and assignee, which are
+    // authorization-snapshot fields specific to the `allow_manager_chain` grant and
+    // must not be imposed on the scoped-recovery or resume arms.
+    //
+    // Semantics-preserving by construction — each disjunct already 409s on unresolved
+    // blockers here, so the write-time re-check can only refuse a request the route
+    // would itself have refused had it read the later snapshot. It admits no new
+    // status transition, which BLO-22909 puts out of scope. The readiness re-check
+    // runs before the sync, so a patch that *adds* blockers is unaffected.
+    const unresolvedBlockerWriteGuardInFlight =
+      delegateRecoveryPatchInFlight ||
+      scopedRecoveryOwnerRestoreNeedsDependencyReadiness ||
+      (resumeRequested === true && isBlocked);
     let interruptedRunId: string | null = null;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
@@ -10643,6 +10916,22 @@ export function issueRoutes(
         : previousExecutionPolicy;
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
+    }
+    const automaticRecoveryHandBack =
+      existing.status === "blocked" &&
+      updateFields.status === "todo" &&
+      req.body.assigneeAgentId === undefined &&
+      req.body.assigneeUserId === undefined &&
+      activeRecoveryActionBeforeUpdate?.ownerAgentId != null &&
+      activeRecoveryActionBeforeUpdate?.ownerAgentId === existing.assigneeAgentId &&
+      Boolean(activeRecoveryActionBeforeUpdate.returnOwnerAgentId);
+    if (automaticRecoveryHandBack) {
+      normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+        existing.companyId,
+        activeRecoveryActionBeforeUpdate!.returnOwnerAgentId,
+      );
+      updateFields.assigneeAgentId = normalizedAssigneeAgentId;
+      updateFields.assigneeUserId = null;
     }
     const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
     await assertCanManageIssueMonitor(
@@ -10753,7 +11042,7 @@ export function issueRoutes(
     const isScopedRecoveryOwnerReturnAssignment =
       allowScopedRecoveryOwnerSourceMutation &&
       req.actor.type === "agent" &&
-      req.body.assigneeAgentId !== undefined;
+      (req.body.assigneeAgentId !== undefined || automaticRecoveryHandBack);
     const isCurrentRunMonitorAssigneeRestore =
       req.actor.type === "agent" &&
       isCurrentIssueExecutionRun(req, existing) &&
@@ -10837,6 +11126,16 @@ export function issueRoutes(
                       : {}),
                   }
                 : {}),
+              // BLO-22909: and pin the blocker set. Status and assignee are
+              // column equalities the UPDATE's WHERE can re-evaluate; "has no
+              // live blockers" is not, and adding a blocker edge changes
+              // neither of those columns, so a blocker inserted after the
+              // readiness read slips past both guards and gets deleted by the
+              // `blockedByIssueIds` this patch carries. Re-checked inside the
+              // update transaction. Wider than the pins above — see the flag.
+              ...(unresolvedBlockerWriteGuardInFlight
+                ? { expectedNoUnresolvedBlockers: true }
+                : {}),
             },
             tx,
           );
@@ -10875,6 +11174,12 @@ export function issueRoutes(
                   ? { expectedCurrentAssigneeAgentNonInvokable: true }
                   : {}),
               }
+            : {}),
+          // BLO-22909: see the transactional branch above — the blocker set
+          // needs a write-time re-check because it is not a column the
+          // UPDATE's WHERE clause can pin.
+          ...(unresolvedBlockerWriteGuardInFlight
+            ? { expectedNoUnresolvedBlockers: true }
             : {}),
         });
       }
@@ -11867,7 +12172,33 @@ export function issueRoutes(
       (activeRecoveryActionForCheckout.status === "active" || activeRecoveryActionForCheckout.status === "escalated") &&
       activeRecoveryActionForCheckout.ownerAgentId === req.body.agentId;
 
-    if (issue.assigneeAgentId !== req.body.agentId && !allowSourceScopedRecoveryOwnerCheckout) {
+    // BLO-22666 AC3: the pending stage is pinned to this agent as its
+    // `currentParticipant`, but the issue belongs to somebody else. The stage
+    // decision is already authorized for this actor on `PATCH /issues/:id`; this
+    // lets it take the lock first so that decision is atomic instead of racing.
+    //
+    // It bypasses the `tasks:assign` self-appointment door below because it is
+    // NOT a self-appointment: the service-side claim writes only the lock
+    // columns and leaves `assigneeAgentId` untouched, so nothing here can widen
+    // into general issue ownership. The pin is re-asserted inside the claiming
+    // UPDATE, so this read is a fast path, not the authorization.
+    const allowExecutionStageParticipantClaim =
+      req.actor.type === "agent" &&
+      req.actor.agentId === req.body.agentId &&
+      issue.status === "in_review" &&
+      issue.assigneeAgentId !== req.body.agentId &&
+      (() => {
+        const state = parseIssueExecutionState(issue.executionState);
+        if (state?.status !== "pending") return false;
+        const participant = state.currentParticipant;
+        return participant?.type === "agent" && participant.agentId === req.body.agentId;
+      })();
+
+    if (
+      issue.assigneeAgentId !== req.body.agentId &&
+      !allowSourceScopedRecoveryOwnerCheckout &&
+      !allowExecutionStageParticipantClaim
+    ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
           issueId: issue.id,
@@ -11972,6 +12303,7 @@ export function issueRoutes(
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId, {
       allowSourceScopedRecoveryOwner: allowSourceScopedRecoveryOwnerCheckout,
+      allowExecutionStageParticipantClaim,
       recoveryActionId: activeRecoveryActionForCheckout?.id ?? null,
       recoveryActionStatus: activeRecoveryActionForCheckout?.status ?? null,
     });
@@ -13339,6 +13671,32 @@ export function issueRoutes(
       if (req.body.idempotencyKey && shouldAutoApproveReviewComment) {
         res.status(400).json({ error: "Idempotent comments cannot approve review stages" });
         return;
+      }
+
+      // BLO-22666 AC2: an approval-shaped comment is a state transition — it
+      // moves the issue to `done` and inserts an execution decision. When the
+      // stage is live-locked, only the run holding it may make that transition,
+      // so the same agent's second run is refused here.
+      //
+      // Scoped to the auto-approval branch rather than to commenting: run B
+      // posting an ordinary comment (a handoff note, a finding) is legitimate and
+      // is how a losing run leaves its work behind. And because
+      // isForeignRunOfLockedPendingReview requires `assigneeAgentId === actor`,
+      // the mention-granted peer reviewer, the manager-chain actor, the recovery
+      // owner and a drifted `currentParticipant` all still approve by comment
+      // exactly as before — the path this branch exists to serve.
+      if (shouldAutoApproveReviewComment && isForeignRunOfLockedPendingReview(req, currentIssue)) {
+        // isForeignRunOfLockedPendingReview only returns true for an agent actor
+        // carrying an agentId, so this narrowing always holds; it is written as a
+        // guard rather than an assertion so a future change to that predicate
+        // fails closed here instead of throwing on a non-null assertion.
+        if (req.actor.type === "agent" && req.actor.agentId) {
+          await svc.assertPendingReviewRunOwnership(
+            currentIssue.id,
+            req.actor.agentId,
+            req.actor.runId ?? null,
+          );
+        }
       }
 
       // Persist the comment and the auto-approval state transition atomically when both apply.

@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
+import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -456,6 +457,43 @@ export function findLiteralSensitiveEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): st
   );
 }
 
+/**
+ * Defense-in-depth backstop for the inheritance allowlist (BLO-22514).
+ *
+ * The primary control is in `getSelfPodInfo()`, which filters the server pod's
+ * env before it ever reaches this file. This is the second line: it re-checks
+ * the *assembled* pod spec for server-only credential names and lets
+ * buildJobManifest throw rather than return a manifest that would hand an agent
+ * the JWT signing key or the database URL.
+ *
+ * Worth having as well as the upstream filter for two reasons. The upstream
+ * filter guards one function; this guards the artifact, so a future code path
+ * that reintroduces a server credential by some route other than
+ * `selfPod.inheritedEnv` is still caught. And `SelfPodInfo` is a plain object
+ * that tests and callers can construct directly — as `makeSelfPod()` in the
+ * test suite does — so the type system alone never guarantees the values in it
+ * came through the filter.
+ *
+ * Unlike `findLiteralSensitiveEnvVars`, this flags an entry whatever its
+ * source: a `secretKeyRef` hides the value from `GET Pod` but the kubelet still
+ * resolves it into the container's environment, which is the whole point of
+ * this issue.
+ *
+ * Returns `container/ENV_NAME` so the failure names the offending container.
+ */
+export function findServerOnlyEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  return containers.flatMap((c) =>
+    (c.env ?? [])
+      .filter((e) => e.name && SERVER_ONLY_ENV_DENY.has(e.name))
+      .map((e) => `${c.name || "<unnamed>"}/${e.name}`),
+  );
+}
+
 export interface JobBuildResult {
   job: k8s.V1Job;
   jobName: string;
@@ -477,6 +515,9 @@ export interface JobBuildResult {
   skippedLabels: string[];
   /** Path to the pod log file on the shared PVC. */
   podLogPath: string;
+  /** Resolved ServiceAccount for the Job's pod template — echoed here so
+   *  callers can log/report it without a cluster read (BLO-21812). */
+  serviceAccountName: string;
 }
 
 function sanitizeForK8sName(value: string, maxLen = 16): string {
@@ -744,6 +785,33 @@ const DIND_WAIT_PREAMBLE =
   `i=0; while [ ! -S /var/run/docker.sock ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; ` +
   `if [ ! -S /var/run/docker.sock ]; then echo "dind sidecar socket /var/run/docker.sock never appeared after 30s" >&2; exit 1; fi`;
 
+/**
+ * Resolve the ServiceAccount a Job pod runs as. An unset per-agent
+ * `serviceAccountName` used to be silently admitted as the namespace's bare
+ * `default` ServiceAccount — an identity with no cluster-scoped read. That
+ * silent fallback cost a full misdiagnosed incident (BLO-21499) before the
+ * cause was traced to identity rather than RBAC drift. Binding cluster read
+ * to `default` itself was rejected there: `default` is the ambient identity
+ * every unconfigured pod in the namespace receives, including ad-hoc preview
+ * workloads, so granting it read would be a fail-open grant to all of them.
+ *
+ * Resolution order: per-agent config, then an explicit fleet-wide default
+ * (PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME set on the adapter Deployment, an
+ * opt-in ops action — mirrors PAPERCLIP_NAMESPACE's role in
+ * `readInClusterNamespace()`). If neither resolves, refuse to build the Job
+ * manifest so misprovisioning surfaces at launch as a named, actionable
+ * error instead of a scattered `Forbidden` days later.
+ */
+export function resolveServiceAccountName(config: Record<string, unknown>): string {
+  const perAgent = asString(config.serviceAccountName, "").trim();
+  if (perAgent) return perAgent;
+  const fleetDefault = (process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME ?? "").trim();
+  if (fleetDefault) return fleetDefault;
+  throw new Error(
+    'claude_k8s: no serviceAccountName resolved for this agent\'s Job pods. Set the agent\'s "Service Account" config field (serviceAccountName), or set PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME on the paperclip Deployment for a fleet-wide default. Refusing to fall back to the namespace\'s `default` ServiceAccount, which has no cluster-scoped read (BLO-21812).',
+  );
+}
+
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { ctx, selfPod, promptBundle } = input;
   const { runId, agent, runtime, config: rawConfig, context } = ctx;
@@ -751,6 +819,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Resolve config values
   const namespace = asString(config.namespace, "") || selfPod.namespace;
+  const serviceAccountName = resolveServiceAccountName(config);
   const image = asString(config.image, "") || selfPod.image;
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
@@ -1447,7 +1516,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         metadata: { labels },
         spec: {
           restartPolicy: "Never",
-          serviceAccountName: asString(config.serviceAccountName, "") || undefined,
+          serviceAccountName,
           securityContext: podSecurityContext,
           ...(selfPod.imagePullSecrets.length > 0 ? { imagePullSecrets: selfPod.imagePullSecrets } : {}),
           ...(selfPod.dnsConfig ? { dnsConfig: selfPod.dnsConfig } : {}),
@@ -1493,5 +1562,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     );
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath };
+  // Fail-closed backstop for the inheritance allowlist (BLO-22514). Checked on
+  // the assembled spec for the same reason as the guard above: it covers every
+  // container, including ones added later. A server-only credential reaching an
+  // agent pod is a control-plane compromise, so refuse to build rather than
+  // return a manifest that leaks it.
+  const serverOnlyNames = findServerOnlyEnvVarsInPodSpec(job.spec!.template.spec!);
+  if (serverOnlyNames.length > 0) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
+    );
+  }
+
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName };
 }

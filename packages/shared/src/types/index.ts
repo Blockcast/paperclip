@@ -281,7 +281,7 @@ export type {
   DocumentTextRange,
   UpdateDocumentAnnotationThreadRequest,
 } from "./document-annotation.js";
-export type { Project, ProjectBudgetSummary, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, LinearProjectLink, ProjectManagedByPlugin, ProjectWorkspace } from "./project.js";
+export type { Project, PrimaryWorkspaceSource, ProjectBudgetSummary, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, LinearProjectLink, ProjectManagedByPlugin, ProjectWorkspace } from "./project.js";
 export type {
   CompanySearchCountType,
   CompanySearchExtractIssueResult,

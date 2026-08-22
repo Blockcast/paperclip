@@ -602,6 +602,38 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("rejects foreign project ids on create and update", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const foreignCompanyId = await seedAssignableAgentCompany();
+    const foreignProjectId = randomUUID();
+    await db.insert(projects).values({
+      id: foreignProjectId,
+      companyId: foreignCompanyId,
+      name: "Foreign project",
+    });
+
+    await expect(svc.create(companyId, {
+      title: "Foreign project create",
+      status: "todo",
+      priority: "medium",
+      projectId: foreignProjectId,
+    })).rejects.toMatchObject({
+      status: 422,
+      message: "Project must belong to the issue's company",
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Foreign project update",
+      status: "todo",
+      priority: "medium",
+    });
+    await expect(svc.update(issue.id, { projectId: foreignProjectId })).rejects.toMatchObject({
+      status: 422,
+      message: "Project must belong to the issue's company",
+    });
+    await expect(svc.getById(issue.id)).resolves.toMatchObject({ projectId: null });
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;
@@ -7406,6 +7438,204 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     // work-children, so we should not wake it. See PCL-2418.
     expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
   });
+
+  // BLO-22909 (Ally, follow-on to BLO-20385 / #970). The delegate-recovery
+  // unpark patch shape mandates `blockedByIssueIds: []` and then applies it, so
+  // the readiness check that authorizes it and the clear that follows must
+  // observe the same snapshot. The route-level pre-check reads readiness on its
+  // own connection, and adding a blocker edge changes neither status nor
+  // assignee — so it slips past `expectedCurrentStatus` and
+  // `expectedCurrentAssigneeAgentId` alike. These pin the write-time guard.
+  describe("unpark unresolved-blocker precondition", () => {
+    async function seedUnparkScenario() {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      const dependentId = randomUUID();
+      const doneBlockerId = randomUUID();
+      const liveBlockerId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Delegate",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Unpark project",
+        status: "in_progress",
+      });
+      await db.insert(issues).values([
+        {
+          id: doneBlockerId,
+          companyId,
+          projectId,
+          title: "Stale blocker (terminal)",
+          status: "done",
+          priority: "medium",
+        },
+        {
+          id: liveBlockerId,
+          companyId,
+          projectId,
+          title: "Live blocker",
+          status: "in_progress",
+          priority: "medium",
+        },
+        {
+          id: dependentId,
+          companyId,
+          projectId,
+          title: "Parked dependent",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+        },
+      ]);
+
+      return { companyId, projectId, assigneeAgentId, dependentId, doneBlockerId, liveBlockerId };
+    }
+
+    const unparkPatch = {
+      status: "todo" as const,
+      blockedByIssueIds: [] as string[],
+      expectedCurrentStatus: "blocked",
+      expectedNoUnresolvedBlockers: true,
+    };
+
+    async function readBlockedBy(issueId: string) {
+      const summaries = await svc.getRelationSummaries(issueId);
+      return summaries.blockedBy.map((relation) => relation.id).sort();
+    }
+
+    it("clears genuinely stale terminal edges — the case the recovery patch exists for", async () => {
+      const { dependentId, doneBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      const updated = await svc.update(dependentId, { ...unparkPatch });
+
+      expect(updated?.status).toBe("todo");
+      expect(await readBlockedBy(dependentId)).toEqual([]);
+    });
+
+    it("refuses and leaves edges intact when a blocker is unresolved (no race)", async () => {
+      const { dependentId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [liveBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        details: {
+          reason: "delegate_recovery_unresolved_blockers",
+          unresolvedBlockerCount: 1,
+          unresolvedBlockerIssueIds: [liveBlockerId],
+        },
+      });
+
+      // The edge must survive, and the row must stay parked.
+      expect(await readBlockedBy(dependentId)).toEqual([liveBlockerId]);
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, dependentId))
+        .then((rows) => rows[0] ?? null);
+      expect(row?.status).toBe("blocked");
+    });
+
+    it("refuses when a blocker is committed after the readiness read but before the write", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // The route's pre-check: readiness read on its own connection, well before
+      // the write. It legitimately sees nothing unresolved and admits the patch.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        unresolvedBlockerCount: 0,
+      });
+
+      // ...and *then* someone adds a live blocker and commits. This is the
+      // window #970 left open: neither optimistic guard notices, because the
+      // status is still `blocked` and the assignee is unchanged.
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, liveBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
+    });
+
+    it("re-reads readiness inside the write transaction, not from the pre-transaction snapshot", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // The pre-check passes: at this instant nothing is unresolved.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        unresolvedBlockerCount: 0,
+      });
+
+      // A concurrent writer adds the live blocker but has NOT committed yet, so
+      // it holds the company issue-parent advisory lock that every
+      // blockedByIssueIds write takes.
+      const blockerAdded = deferred<void>();
+      const releaseBlockerAdd = deferred<void>();
+      const concurrentBlockerAdd = db.transaction(async (tx) => {
+        await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, liveBlockerId] }, tx);
+        blockerAdded.resolve();
+        await releaseBlockerAdd.promise;
+      });
+      await blockerAdded.promise;
+
+      // The unpark now runs concurrently and must block on that advisory lock —
+      // which is the whole point of evaluating the precondition *after* it.
+      const unpark = svc.update(dependentId, { ...unparkPatch });
+      const unparkExpectation = expect(unpark).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+
+      const lockWaitDeadline = Date.now() + 10_000;
+      let unparkWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'pg_advisory_xact_lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          unparkWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      // Assert the interleaving actually happened. Without this the test could
+      // pass vacuously by running the two transactions in sequence.
+      expect(unparkWaitingForLock).toBe(true);
+
+      releaseBlockerAdd.resolve();
+      await concurrentBlockerAdd;
+      await unparkExpectation;
+
+      // Both edges survive: the unpark saw the newly-committed blocker.
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
+    });
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
@@ -7969,6 +8199,63 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  /**
+   * Runs `start` against a held company graph lock so every operation it launches
+   * parks at that same boundary, then releases them together.
+   *
+   * Bare `Promise.allSettled` proves nothing about concurrency: a connection-pool
+   * schedule that runs one call to completion before the other begins still
+   * produces the expected results, so these regressions could stay green even if
+   * the lock invariant regressed. Holding the lock from a control transaction and
+   * polling `pg_stat_activity` for the waiters asserts the overlap actually
+   * happened, mirroring the stale-workspace test's lock-wait probe above.
+   */
+  async function withIssueGraphOverlapBarrier<T>(
+    companyId: string,
+    expectedWaiters: number,
+    start: () => Promise<T>,
+  ): Promise<T> {
+    const barrierHeld = deferred<void>();
+    const releaseBarrier = deferred<void>();
+    const control = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
+      );
+      barrierHeld.resolve();
+      await releaseBarrier.promise;
+    });
+    await barrierHeld.promise;
+
+    const pending = start();
+    // Keep the rejection handled while we poll; `pending` is still returned so the
+    // caller observes the real settlement.
+    pending.catch(() => {});
+
+    let observedWaiters = 0;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiters: number }>`
+          select count(*)::int as waiters
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+            and wait_event = 'advisory'
+            and query ~* 'pg_advisory_xact_lock'
+        `);
+        observedWaiters = Number(Array.from(waitingRows)[0]?.waiters ?? 0);
+        if (observedWaiters >= expectedWaiters) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    } finally {
+      releaseBarrier.resolve();
+      await control;
+    }
+    expect(observedWaiters).toBeGreaterThanOrEqual(expectedWaiters);
+    return pending;
+  }
+
   it("returns cycle validation instead of deadlocking concurrent reciprocal reparent updates", async () => {
     const companyId = randomUUID();
     const issueAId = randomUUID();
@@ -7998,10 +8285,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueAId, { parentId: issueBId }),
-      svc.update(issueBId, { parentId: issueAId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueAId, { parentId: issueBId }),
+        svc.update(issueBId, { parentId: issueAId }),
+      ]),
+    );
     const fulfilled = results.filter((result) => result.status === "fulfilled");
     const rejected = results.filter((result) => result.status === "rejected");
 
@@ -8064,10 +8353,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issueAId }),
-      svc.update(issueYId, { parentId: issueBId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issueAId }),
+        svc.update(issueYId, { parentId: issueBId }),
+      ]),
+    );
     const fulfilled = results.filter((result) => result.status === "fulfilled");
     const rejected = results.filter((result) => result.status === "rejected");
 
@@ -8126,10 +8417,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
-      svc.update(issueYId, { parentId: issueQId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
+        svc.update(issueYId, { parentId: issueQId }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -8186,10 +8479,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
-      svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+        svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -8245,15 +8540,17 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
-      svc.create(companyId, {
-        title: "New dependent",
-        status: "todo",
-        priority: "medium",
-        blockedByIssueIds: [issuePId, issueZId],
-      }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+        svc.create(companyId, {
+          title: "New dependent",
+          status: "todo",
+          priority: "medium",
+          blockedByIssueIds: [issuePId, issueZId],
+        }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -8276,6 +8573,64 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
         expect.objectContaining({ id: issueZId }),
       ],
     });
+  });
+
+  it("serializes concurrent deletion and reparent onto the deleted parent without deadlocking", async () => {
+    const companyId = randomUUID();
+    // remove() sweeps children before locking the parent row, while update()
+    // locks the parent first. Ordering the ids P < C is what let the two paths
+    // take the same rows in opposite order and abort with 40P01 (a 500) before
+    // remove() joined the company graph lock.
+    const parentId = "00000000-0000-4000-8000-00000000000a";
+    const childId = "ffffffff-ffff-4fff-bfff-fffffffffffe";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Parent under deletion",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: childId,
+        companyId,
+        title: "Child being reparented",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    // Both paths must park on the company graph lock. Before the fix remove()
+    // never requested it, so only one waiter appears and the barrier fails here.
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.remove(parentId),
+        svc.update(childId, { parentId }),
+      ]),
+    );
+
+    for (const result of results) {
+      if (result.status !== "rejected") continue;
+      const reason = result.reason as { status?: number; message?: string };
+      expect(String(reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      expect(reason?.status ?? 0).toBeLessThan(500);
+    }
+
+    // The delete owns the parent either way, so both orderings converge: whether
+    // the reparent lands first and is swept, or is rejected against an already
+    // deleted parent, the parent is gone and the child is detached.
+    expect(results[0].status).toBe("fulfilled");
+    await expect(svc.getById(parentId)).resolves.toBeNull();
+    const child = await svc.getById(childId);
+    expect(child?.parentId ?? null).toBeNull();
   });
 
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {

@@ -256,6 +256,103 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     return { companyId, agentId, issueId, nextCheckAt };
   }
 
+  // BLO-25865: seeds the exact live state observed on BLO-21020/BLO-22798 — a
+  // monitor that already fired (status "triggered", monitorNextCheckAt null,
+  // executionPolicy.monitor already stripped per buildIssueMonitorTriggeredPatch)
+  // whose woken run never called back to re-arm or clear it, so its `timeoutAt`
+  // sails past with nothing scheduled to notice.
+  async function seedExpiredTriggeredFixture(input?: {
+    agentStatus?: "active" | "paused";
+    issueStatus?: "in_progress" | "in_review";
+    attemptCount?: number;
+    monitorStateOverrides?: Record<string, unknown>;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const lastTriggeredAt = new Date("2026-04-10T00:00:00.000Z");
+    const timeoutAt = new Date("2026-04-11T00:00:00.000Z");
+    const attemptCount = input?.attemptCount ?? 3;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Monitor Bot",
+      role: "engineer",
+      status: input?.agentStatus ?? "active",
+      adapterType: "process",
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", ""],
+        cwd: process.cwd(),
+      },
+      runtimeConfig: {
+        heartbeat: {
+          enabled: false,
+          wakeOnDemand: true,
+        },
+      },
+      permissions: {},
+    });
+    seededAgentIds.add(agentId);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Watch external deploy",
+      status: input?.issueStatus ?? "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: lastTriggeredAt.toISOString(),
+          attemptCount,
+          notes: "Check deploy",
+          scheduledBy: "assignee",
+          serviceName: "Deploy provider",
+          externalRef: null,
+          timeoutAt: timeoutAt.toISOString(),
+          maxAttempts: null,
+          recoveryPolicy: "wake_owner",
+          clearedAt: null,
+          clearReason: null,
+          ...(input?.monitorStateOverrides ?? {}),
+        },
+      },
+      monitorNextCheckAt: null,
+      monitorWakeRequestedAt: null,
+      monitorLastTriggeredAt: lastTriggeredAt,
+      monitorAttemptCount: attemptCount,
+      monitorNotes: "Check deploy",
+      monitorScheduledBy: "assignee",
+    });
+
+    return { companyId, agentId, issueId, timeoutAt, lastTriggeredAt };
+  }
+
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
     const { issueId, agentId } = await seedFixture();
     const heartbeat = createHeartbeat();
@@ -762,4 +859,153 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
   });
+
+  // BLO-25865: a monitor that fired and whose woken run never called back to
+  // re-arm or clear it is invisible to tickDueIssueMonitors forever, because
+  // that sweep only claims rows where monitorNextCheckAt is non-null. Nothing
+  // else evaluated `timeoutAt`, so clearedAt/clearReason stayed null and the
+  // configured wake_owner recovery never ran. This is the missing sweep.
+  it("recovers a monitor stuck triggered past its timeout with a null nextCheckAt", async () => {
+    const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    const monitorState = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(monitorState).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+    });
+    expect(monitorState?.clearedAt).not.toBeNull();
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(1);
+    expect(recoveryWakeups[0]?.payload).toMatchObject({
+      issueId,
+      clearReason: "timeout_exceeded",
+    });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_exhausted");
+    expect(activity).toContain("issue.monitor_recovery_wake_queued");
+  });
+
+  it("does not recover the same expired monitor twice across repeated ticks", async () => {
+    const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+    await heartbeat.tickTimers(new Date(tickAt.getTime() + 60 * 1000));
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+    });
+  });
+
+  // Control: a monitor that already reached a normal terminal `cleared` state
+  // (the gate resolved and something explicitly cleared it) must not be
+  // re-touched or trigger a spurious recovery wake, even past its timeoutAt.
+  it("does not recover a monitor that already cleared normally", async () => {
+    const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture({
+      monitorStateOverrides: {
+        status: "cleared",
+        clearedAt: new Date("2026-04-10T12:00:00.000Z").toISOString(),
+        clearReason: "manual",
+      },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "manual",
+    });
+  });
+
+  // Control: a triggered monitor whose timeoutAt has not yet passed is not a
+  // BLO-25865 instance — it is simply mid-flight, waiting on its woken run.
+  it("leaves a triggered monitor alone until its timeout actually passes", async () => {
+    const { issueId, timeoutAt } = await seedExpiredTriggeredFixture();
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(timeoutAt.getTime() - 60 * 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+  });
+
+  it.each([
+    ["user reassignment", { assigneeUserId: "board-user" }],
+    ["terminal status", { status: "done" }],
+  ])("does not recover an expired monitor when %s races the claim", async (_label, mutation) => {
+    const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
+    const heartbeat = createHeartbeatWithClaimRace(issueId, mutation);
+    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorWakeRequestedAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+  });
+
+  function createHeartbeatWithClaimRace(
+    issueId: string,
+    mutation: { assigneeUserId?: string; status?: "done" },
+  ) {
+    const service = heartbeatService(db, {
+      issueMonitorClaimHook: async () => {
+        await db.update(issues).set(mutation).where(eq(issues.id, issueId));
+      },
+    });
+    heartbeatServices.add(service);
+    return service;
+  }
 });

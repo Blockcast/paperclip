@@ -131,6 +131,12 @@ import {
   requireExternalRuntimeExecutionOwnership,
   refreshExternalRuntimeReservationMetrics,
 } from "./external-runtime-reservations.js";
+import {
+  acquireBranchRunClaim,
+  BranchClaimConflictError,
+  computeBranchClaimKey,
+  releaseBranchRunClaimForKey,
+} from "./branch-run-claims.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterRunIsolationDescriptor,
@@ -233,6 +239,7 @@ import {
   buildIssueMonitorDispatchRearmPatch,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  derivePersistedMonitorState,
   exhaustedMonitorClearReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -540,6 +547,58 @@ const execFile = promisify(execFileCallback);
 // terminalized still owns its issue lock); sourced from there so the two cannot
 // drift apart again. See issue-execution-lock.ts for the drift this closed.
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES;
+// BLO-22060: how many times a run whose issue lock the stale-lock sweep has
+// already released may be re-adopted as that issue's executionRunId by the
+// legacy-run fallback below.
+//
+// sweepStaleIssueLocks bounds a pre-claim lock at STALE_PRE_CLAIM_ISSUE_LOCK_MS
+// from executionLockedAt, and on expiry clears the issue columns but leaves the
+// run alive so a park can still fire. Without this bound the fallback simply
+// re-selected that same released run — cancelStaleScheduledRetry declines to
+// cancel a park owned by the issue's own assignee — and re-stamped
+// executionLockedAt = now(). The cap was real but renewable: a capacity park
+// deadlined days out could re-acquire a fresh 6h lock on every wake.
+//
+// Deliberately NOT scoped to `scheduled_retry`. The sweep releases, and counts,
+// three shapes of holder, and every one of them is selectable by the fallback
+// via EXECUTION_PATH_HEARTBEAT_RUN_STATUSES (now every non-terminal status,
+// sourced from ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES, so the candidate set
+// is a superset of the three below and the bound still covers all of them):
+//   - `queued`   — a run stamped onto the lock at enqueue time and never
+//                  claimed (BLO-18995). This is the *original* renewable shape.
+//   - `running`  — a silent run past STALE_RUNNING_ISSUE_LOCK_MS (BLO-19941).
+//   - `scheduled_retry` — a park (BLO-21309).
+// A status-scoped bound also let a released park evade it by simply being
+// promoted: promoteDueScheduledRetry flips the run to `queued` and the run
+// carries its release count across, so a `scheduled_retry`-only predicate
+// stopped applying to the very same row. The count is a property of the run's
+// history, not of the status it happens to hold at select time.
+//
+// At 1, the first release is final: the run keeps the one lock window it had
+// already been granted and is never re-adopted afterwards, so total lock time
+// attributable to a single run is bounded regardless of wake volume.
+//
+// Still required after master's 8446c1011, which narrowed the fallback's issue
+// -lock stamp to `running` runs only. That removes the *renewal* (a swept park
+// no longer re-stamps executionLockedAt) but not the *absorption*: the park is
+// still assigned to `activeExecutionRun`, so the wake is consumed by a run that
+// will not execute until its deadline and no live run is produced. Observed in
+// production on BLO-22438, where two comments were absorbed by a park deadlined
+// six days out. This bound removes the released run from the candidate set
+// entirely, so the wake falls through and a real run is created.
+//
+// Declining adoption strands nothing, because this fallback is not how a live
+// run acquires the lock in the first place. promoteDueScheduledRetry's UPDATE
+// is conditioned only on the run row (`status='scheduled_retry' and
+// scheduledRetryAt <= now`) and never reads the issue lock, and claimQueuedRun
+// re-stamps under `or(isNull(executionRunId), eq(executionRunId, claimed.id))`
+// — so a park still fires and a `queued` run still claims, both re-acquiring if
+// the issue is free. If a fresh run has taken the issue by then the retry
+// declines to claim and is cancelled, which is the correct outcome: live work
+// outranks a days-old continuation. For a swept `running` holder, declining is
+// the whole point — the sweep has already declared it silent, and re-adopting
+// it would re-wedge the issue behind a run nothing is driving.
+const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -572,6 +631,12 @@ const K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipK8sIsolationRetryAttem
 const K8S_ISOLATION_RETRY_AT_CONTEXT_KEY = "paperclipK8sIsolationRetryAt";
 const K8S_ISOLATION_RETRY_BASE_DELAY_MS = 15_000;
 const K8S_ISOLATION_RETRY_MAX_DELAY_MS = 5 * 60_000;
+const BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipBranchClaimRetryAttempt";
+const BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY = "paperclipBranchClaimRetryAt";
+// BLO-21602: renewal cadence for an in-flight run's branch claim. Kept well
+// under DEFAULT_BRANCH_CLAIM_LEASE_MS (30m) so a couple of missed ticks (e.g.
+// a slow DB write) still can't let the lease lapse out from under a live run.
+const BRANCH_CLAIM_RENEWAL_INTERVAL_MS = 5 * 60_000;
 // Rate-limit retries (errorFamily = "rate_limit_exhausted") use a flat short
 // delay instead of stacking exponential backoff. Rationale: rate-limit isn't
 // a transient upstream fault — it means "this account's window is closed".
@@ -702,7 +767,7 @@ export const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS =
 export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
-export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 72;
+export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
 
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
@@ -916,7 +981,29 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
+// Error codes `finalizeAgentStatus` treats as recoverable: the agent is parked
+// `idle` rather than flipped to `error`, and the quota-exhausted hook fires.
+//
+// INVARIANT (BLO-28924): every code here MUST resolve to a non-null family via
+// `readHeartbeatRunErrorFamily`. "Recoverable" is only half a contract — staying
+// `idle` keeps the dashboard honest, but the retry that actually resumes the work
+// is keyed on the *family*, not the code (see
+// `readTransientRecoveryContractFromRun` -> `shouldScheduleAutomaticRunRetry`).
+// A code that is recoverable-but-unmapped therefore gets no scheduled retry and,
+// since #1407, no recovery wake either: an agent with a heartbeat interval limps
+// to its next timer tick, and an interval-less event-driven agent never recovers.
+// `heartbeat-recoverable-error-family.test.ts` asserts this set-wide, so adding a
+// code here without a mapping below fails CI.
+export const RECOVERABLE_AGENT_STATUS_ERROR_CODES = [
+  // Emitted by the first-party `claude-local` adapter (execute.ts) alongside a
+  // provider-supplied `retryNotBefore`; also reachable from pluggable adapters.
+  "provider_quota_exhausted",
+  // Set by isRateLimitExhausted() on 429 / 401-cap / "you've hit your limit".
+  "rate_limit_exhausted",
+  "provider_quota",
+] as const;
+
+export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
@@ -926,7 +1013,13 @@ function readHeartbeatRunErrorFamily(
   if (run.errorCode === "rate_limit_exhausted") {
     return "rate_limit_exhausted";
   }
-  if (run.errorCode === "provider_quota") {
+  // BLO-28924: `provider_quota_exhausted` shares `provider_quota`'s contract —
+  // a billing/session boundary carrying an authoritative reset instant, not a
+  // capacity estimate — so it inherits that family rather than getting its own.
+  // That keeps it out of `clampTransientHorizon` (which deliberately excludes
+  // `provider_quota`), so the adapter's `retryNotBefore` is honoured verbatim
+  // instead of being clamped to a per-attempt capacity ceiling.
+  if (run.errorCode === "provider_quota" || run.errorCode === "provider_quota_exhausted") {
     return "provider_quota";
   }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
@@ -977,7 +1070,7 @@ type TransientRecoveryContract =
       retryNotBefore: Date | null;
     };
 
-function readTransientRecoveryContractFromRun(
+export function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ): TransientRecoveryContract | null {
   const family = readHeartbeatRunErrorFamily(run);
@@ -1007,14 +1100,12 @@ function readTransientRecoveryContractFromRun(
  * Module-scoped and exported so the exact-head requirement is unit-testable
  * without standing up the whole external-lifecycle finalize path.
  *
- * `githubHasReviewerEvidenceForPr` derives its comment-mode `headPrefix` from
- * the resolved head; when the wake carried no head SHA it falls back to
- * fetching the PR's current head, and if THAT fetch fails there is no prefix,
- * the comment-mode pass is skipped entirely, and the probe can answer
- * `{found: false}` while a comment-mode review exists. That is additive
- * elsewhere, but here a false negative authorizes a retry — so require the
- * wake's exact head and report an unresolved head as unproven (`null`),
- * never as `false`.
+ * `githubHasReviewerEvidenceForPr` keys its comment-mode pass on the resolved
+ * head; when the wake carried no head SHA it falls back to fetching the PR's
+ * current head, and if THAT fetch fails it answers `{found: false}` without
+ * having proven anything. That is additive elsewhere, but here a false negative
+ * authorizes a retry — so require the wake's exact head and report an unresolved
+ * head as unproven (`null`), never as `false`.
  */
 export async function probeStaleKillReviewEvidence(
   run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
@@ -5363,6 +5454,32 @@ export function isK8sIsolationRetryDeferred(
   return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
 }
 
+// BLO-21602: deferRunForBranchClaimConflict (like deferRunForK8sIsolationConflict)
+// sends a run back to `queued` with a computed backoff rather than failing it,
+// stamping paperclipBranchClaimRetryAt on the run's contextSnapshot. Queued-run
+// admission must honor that backoff the same way it already honors the K8s
+// isolation retry stamp -- otherwise the run is immediately eligible again and
+// repeatedly performs setup, conflict, and requeue instead of waiting.
+export function isBranchClaimRetryDeferred(
+  context: Record<string, unknown> | null | undefined,
+  now = new Date(),
+): boolean {
+  const retryAtValue = readNonEmptyString(context?.[BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY]);
+  if (!retryAtValue) return false;
+  const retryAt = new Date(retryAtValue);
+  return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
+}
+
+// Combines every "queued run is not actually admissible yet" backoff stamp a
+// run's contextSnapshot may carry. Use this everywhere queued runs are
+// scanned for admission instead of checking isK8sIsolationRetryDeferred alone.
+export function isQueuedRunAdmissionDeferred(
+  context: Record<string, unknown> | null | undefined,
+  now = new Date(),
+): boolean {
+  return isK8sIsolationRetryDeferred(context, now) || isBranchClaimRetryDeferred(context, now);
+}
+
 export function buildK8sRunIsolationDescriptor(input: {
   adapterType: string | null | undefined;
   runId: string;
@@ -5865,7 +5982,7 @@ function isRunClaimable(
   now: Date,
 ): boolean {
   if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
-  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
   return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }
 
@@ -5900,7 +6017,7 @@ function isDispatchRankReady(
   readiness: { isDependencyReady: boolean } | null | undefined,
   now: Date,
 ): boolean {
-  if (isK8sIsolationRetryDeferred(contextSnapshot, now)) return false;
+  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
   return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }
 
@@ -8790,6 +8907,57 @@ function buildRunEventRuntimeProgress(input: {
   };
 }
 
+// The only wakeReasons that structurally guarantee a review actually EXISTS,
+// and therefore the only ones allowed to tell a PR author that a reviewer
+// posted findings and that they should push a follow-up commit. See the
+// author branch in buildPaperclipTaskMarkdown.
+//
+// An allowlist rather than a denylist on purpose: every other wakeReason --
+// today's lifecycle events (opened/reopened/synchronize/ready_for_review),
+// review_requested, and whatever is added next -- carries no review, so an
+// unrecognized reason must fail into "no findings recorded" rather than into a
+// false claim that findings exist.
+const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
+  "github_pr_review_submitted",
+  "github_pr_review_feedback",
+]);
+
+// BLO-20886 AC3: was this PR provably written by someone other than the woken agent?
+//
+// Owning-issue routing (routes/github-webhook.ts) fixed *which* issue receives
+// the author-directed wake, but it does not make the recipient the PR's author.
+// An agent's issue can legitimately own a PR a HUMAN wrote: `kkroo/blo-19132-*`
+// resolves to BLO-19132 through the branch tier, so BLO-19132's assignee is
+// woken and told "YOUR pull request ... push a follow-up commit" about a branch
+// they do not own. That is the original paperclip#953 damage path, and it is not
+// hypothetical -- 3 of the 100 most recent paperclip PRs are `kkroo/blo-*`.
+// Pushing there is actively harmful when the PR exists precisely to have a
+// non-bot author (#953 did), since a bot commit destroys that independence.
+//
+// Every agent authors through the same GitHub App installation, so we cannot
+// tell WHICH agent wrote a bot-authored PR -- but we can tell for certain when
+// NO agent did. A PR authored by anyone other than the configured bot identity
+// was provably not written by the woken agent, so the possessive and the push
+// instruction are both dropped for it.
+//
+// Fails OPEN (returns null, keeping today's wording) when the author login is
+// absent: an unknown author is not *proof* of third-party authorship, and the
+// bot-authored case is by far the common one. The gate only ever fires on a
+// positive, signed-webhook mismatch.
+//
+// Returns the author's login rather than a boolean so it stays narrowed for the
+// directive text, which names the real author so the agent can see at a glance
+// why the PR is not theirs.
+function resolveThirdPartyPrAuthor(prReview: { prAuthorLogin?: string | null }): string | null {
+  const raw = prReview.prAuthorLogin;
+  if (!raw) return null;
+  const author = normalizeGithubAuthorHandle(raw);
+  if (author.length === 0) return null;
+  const configured = normalizeGithubAuthorHandle(loadConfig().prReviewerBotLogin ?? "");
+  if (configured.length === 0) return null;
+  return author === configured ? null : raw;
+}
+
 export function buildPaperclipTaskMarkdown(input: {
   issue: {
     id: string;
@@ -8830,6 +8998,10 @@ export function buildPaperclipTaskMarkdown(input: {
     reviewAuthorLogin?: string | null;
     requestCommentBody?: string | null;
     requestCommentAuthorLogin?: string | null;
+    // BLO-20886 AC3: `pull_request.user.login` from the signed webhook. Gates
+    // the "YOUR pull request" possessive and the push instruction — see
+    // resolveThirdPartyPrAuthor.
+    prAuthorLogin?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
 }) {
@@ -8896,26 +9068,63 @@ export function buildPaperclipTaskMarkdown(input: {
       // review, which re-posts the marker and spins the loop that the #583
       // author-filter and PC#822's marker were both meant to keep closed.
       const requesterLabel = prReview.requestCommentAuthorLogin ?? "Someone";
+      const thirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
       lines.push(
         "",
         "GitHub PR review request directive:",
-        `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
+        thirdPartyAuthor
+          ? `${requesterLabel} requested a review on pull request #${prReview.prNumber}, which is owned by your issue but was authored by ${quoteTaskScalar(thirdPartyAuthor)} — NOT by you. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`
+          : `${requesterLabel} requested a review on YOUR pull request. This is a review REQUEST, not review feedback: no review has been submitted in response to it yet, and there are no findings to act on.`,
         "The reviewer was woken separately by this same event — you do NOT need to request the review again. Re-posting a `<!-- paperclip:review-request -->` comment here would only re-trigger this wake.",
         "If you were already waiting on this review, treat this run as a no-op: verify with `gh api repos/{owner}/{repo}/pulls/{n}/reviews` (and check for a comment-shaped `## Ally` review, which files no review object), then return to what you were doing. Act only on a review that actually exists.",
       );
       if (prReview.requestCommentBody) {
         lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
       }
+    } else if (prReview.prRole === "author" && !AUTHOR_REVIEW_CONTENT_WAKE_REASONS.has(prReview.wakeReason)) {
+      // BLO-20886 generalizes the BLO-19522 branch above. That branch names one
+      // reasonless wakeReason; the author-role wake loop also covers plain PR
+      // lifecycle events (opened/reopened/synchronize/ready_for_review) that
+      // carry no review data at all, and those fell through to the feedback
+      // directive for the same reason review_requested did. Observed live:
+      // paperclip#953 had zero reviews (`gh api .../pulls/953/reviews` empty)
+      // when this directive told the woken agent "a reviewer just posted
+      // findings on YOUR pull request" and to push a follow-up commit.
+      //
+      // Gating on an ALLOWLIST of wakeReasons that structurally guarantee a
+      // review exists -- rather than adding lifecycle reasons to a denylist --
+      // is what makes this hold for the next wakeReason someone introduces: a
+      // new reason is reasonless until it is proven otherwise, which fails in
+      // the safe direction.
+      lines.push(
+        "",
+        "GitHub PR event directive:",
+        `Wake reason: ${quoteTaskScalar(prReview.wakeReason)}. No review findings are recorded for this PR yet, so do not push new commits on the strength of unconfirmed feedback. If you are this PR's author, confirm current state with \`gh pr view\` / \`gh api repos/<owner>/<repo>/pulls/${prReview.prNumber}/reviews\` before acting. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.`,
+      );
     } else if (prReview.prRole === "author") {
       const reviewerLabel = prReview.reviewAuthorLogin ?? "A reviewer";
       const stateLabel = prReview.reviewState ? prReview.reviewState.toUpperCase() : null;
+      // BLO-20886 AC3: a real review DOES exist on this branch (the wakeReason
+      // allowlist guarantees it), so the findings are genuine — but they are not
+      // necessarily findings on a PR the woken agent wrote. When the signed
+      // webhook names a third-party author, drop the possessive and the push
+      // instruction: writing to someone else's branch is the #953 damage path,
+      // and on a PR that exists to have a non-bot author a bot commit destroys
+      // the independence the PR was opened to establish.
+      const thirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
+      const prLabel = thirdPartyAuthor ? `pull request #${prReview.prNumber}` : "YOUR pull request";
       lines.push(
         "",
         "GitHub PR review feedback directive:",
         stateLabel
-          ? `${reviewerLabel} just submitted a review on YOUR pull request (state: ${stateLabel}).`
-          : `${reviewerLabel} just posted findings on YOUR pull request.`,
+          ? `${reviewerLabel} just submitted a review on ${prLabel} (state: ${stateLabel}).`
+          : `${reviewerLabel} just posted findings on ${prLabel}.`,
       );
+      if (thirdPartyAuthor) {
+        lines.push(
+          `This PR was authored by ${quoteTaskScalar(thirdPartyAuthor)}, NOT by you — it is linked to you only because it references your issue. Do NOT push commits to it. Read the findings, and if they need action on your side, comment on the PR or act in your own branch.`,
+        );
+      }
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
@@ -8929,9 +9138,11 @@ export function buildPaperclipTaskMarkdown(input: {
         "Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.";
       lines.push(
         "",
-        normalizedReviewState === "approved"
-          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
-          : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
+        thirdPartyAuthor
+          ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here) so you know where it leaves your issue. You are not this PR's author: do NOT commit to its branch. Raise anything that needs changing as a PR comment, or act in your own branch. ${commonClosing}`
+          : normalizedReviewState === "approved"
+            ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
+            : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
@@ -9424,6 +9635,8 @@ export interface HeartbeatServiceOptions {
    * background executeRun's finally-block transactions. Production unaffected.
    */
   skipQueuedRunDispatch?: boolean;
+  /** Test-only hook for exercising the monitor select/claim race. */
+  issueMonitorClaimHook?: (issueId: string) => Promise<void>;
   /**
    * Node role for this process (mirrors config.paperclipNodeRole; wired from
    * index.ts). On the "api" tier, run dispatch (claim + `executeRun`) is fenced
@@ -10655,8 +10868,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorScheduledBy: string | null;
   }
 
+  type IssueExecutionMonitorPolicyLike = Pick<
+    IssueExecutionMonitorPolicy,
+    "serviceName" | "timeoutAt" | "maxAttempts" | "recoveryPolicy"
+  >;
+
   function monitorRecoveryPolicy(
-    monitor: IssueExecutionMonitorPolicy | null,
+    monitor: Pick<IssueExecutionMonitorPolicy, "recoveryPolicy"> | null,
   ): IssueExecutionMonitorRecoveryPolicy {
     return monitor?.recoveryPolicy ?? "wake_owner";
   }
@@ -10667,7 +10885,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
-    monitor: IssueExecutionMonitorPolicy | null;
+    monitor: IssueExecutionMonitorPolicyLike | null;
     source: "manual" | "scheduled";
   }) {
     return {
@@ -10736,7 +10954,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
-    monitor: IssueExecutionMonitorPolicy | null;
+    monitor: IssueExecutionMonitorPolicyLike | null;
     actorType: "user" | "agent" | "system";
     actorId: string;
     agentId: string | null;
@@ -10889,7 +11107,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
-    monitor: IssueExecutionMonitorPolicy | null;
+    monitor: IssueExecutionMonitorPolicyLike | null;
     now: Date;
     actorType: "user" | "agent" | "system";
     actorId: string;
@@ -11514,6 +11732,144 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       checked: dueMonitors.length,
       triggered,
       skipped,
+    };
+  }
+
+  /**
+   * BLO-25865: `tickDueIssueMonitors` above claims work strictly off
+   * `monitorNextCheckAt`. The moment a monitor fires, `dispatchClaimedIssueMonitor`
+   * sets `monitorNextCheckAt` to null *optimistically* — before the woken run has
+   * actually re-armed it — which is correct for the common case (the run re-arms
+   * or clears the monitor within its own turn) but leaves a permanent gap: a
+   * monitor whose woken run never re-arms it (dies, gets reassigned, or the
+   * assignee simply never calls back) drops out of `tickDueIssueMonitors`'s
+   * `WHERE monitorNextCheckAt IS NOT NULL` predicate forever. Nothing else
+   * re-evaluates it, so `exhaustedMonitorClearReason` — which already knows how
+   * to compare `timeoutAt` against `now` — never runs again, `clearedAt`/
+   * `clearReason` are never set, and the configured `recoveryPolicy` (typically
+   * `wake_owner`) never fires. Observed live: BLO-21020 and BLO-22798, both stuck
+   * in `executionState.monitor.status: "triggered"` with `nextCheckAt: null` for
+   * days past their `timeoutAt`.
+   *
+   * This sweep is the missing second half: it scans for monitors that are
+   * `triggered` (fired, not yet cleared) with a null `nextCheckAt` and a
+   * `timeoutAt` that has passed, and routes them through the exact same
+   * clear-and-recover pipeline `tickDueIssueMonitors` uses for exhaustion — so a
+   * monitor always reaches a terminal `cleared` state with its `recoveryPolicy`
+   * honoured, regardless of whether the run that consumed the last trigger ever
+   * called back. `attemptCount`/`maxAttempts` are deliberately not re-evaluated
+   * here beyond what `exhaustedMonitorClearReason` already does — this sweep
+   * exists to catch a stalled *trigger*, not to retune bounds.
+   */
+  async function tickExpiredIssueMonitors(now = new Date()) {
+    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const expiredMonitorTimeoutCondition = and(
+      sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
+      sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is not null`,
+      sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz <= ${now.toISOString()}`,
+    );
+
+    const expiredMonitors = await db
+      .select(issueMonitorDispatchColumns)
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          isNull(issues.monitorNextCheckAt),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          inArray(issues.status, ["in_progress", "in_review"]),
+          expiredMonitorTimeoutCondition,
+          or(
+            isNull(issues.monitorWakeRequestedAt),
+            lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+          ),
+        ),
+      )
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(50);
+
+    let checked = 0;
+    let recovered = 0;
+
+    for (const due of expiredMonitors) {
+      await options.issueMonitorClaimHook?.(due.id);
+      const claimed = await db.transaction(async (tx) => {
+        if (!await tryLockIssueMonitorQueue(tx)) return null;
+        const [updated] = await tx
+          .update(issues)
+          .set({
+            monitorWakeRequestedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, due.id),
+              isNull(issues.monitorNextCheckAt),
+              isNull(issues.assigneeUserId),
+              sql`${issues.assigneeAgentId} is not null`,
+              inArray(issues.status, ["in_progress", "in_review"]),
+              expiredMonitorTimeoutCondition,
+              or(
+                isNull(issues.monitorWakeRequestedAt),
+                lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
+              ),
+            ),
+          )
+          .returning();
+        return (updated ?? null) as IssueMonitorDispatchRow | null;
+      });
+
+      if (!claimed) continue;
+      checked += 1;
+
+      try {
+        const policy = normalizeIssueExecutionPolicy(claimed.executionPolicy ?? null);
+        const existingState = parseIssueExecutionState(claimed.executionState);
+        const currentMonitorState = derivePersistedMonitorState({ issue: claimed, state: existingState, policy });
+        if (!currentMonitorState || currentMonitorState.status !== "triggered") {
+          // Raced with a concurrent clear/re-arm between the select above and this claim.
+          continue;
+        }
+
+        const monitor: IssueExecutionMonitorPolicyLike = {
+          serviceName: currentMonitorState.serviceName ?? null,
+          timeoutAt: currentMonitorState.timeoutAt ?? null,
+          maxAttempts: currentMonitorState.maxAttempts ?? null,
+          recoveryPolicy: currentMonitorState.recoveryPolicy ?? null,
+        };
+        const clearReason = exhaustedMonitorClearReason({
+          monitor,
+          attemptCount: currentMonitorState.attemptCount,
+          now,
+        }) ?? "timeout_exceeded";
+        const recoveryPolicy = monitorRecoveryPolicy(monitor);
+
+        await clearIssueMonitorAndRecover({
+          claimed,
+          policy,
+          scheduledAtIso: currentMonitorState.timeoutAt ?? now.toISOString(),
+          nextAttemptCount: currentMonitorState.attemptCount,
+          clearReason,
+          recoveryPolicy,
+          monitor,
+          now,
+          actorType: "system",
+          actorId: "heartbeat_scheduler",
+          agentId: null,
+          runId: null,
+          activitySource: "scheduled",
+        });
+        recovered += 1;
+      } catch (err) {
+        logger.error({ err, issueId: claimed.id }, "expired issue monitor recovery failed");
+      }
+    }
+
+    return {
+      checked,
+      recovered,
     };
   }
 
@@ -16199,7 +16555,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const context = parseObject(run.contextSnapshot);
     let issueDependencyReadyForAutoCheckout = true;
-    if (isK8sIsolationRetryDeferred(context)) {
+    if (isQueuedRunAdmissionDeferred(context)) {
       return null;
     }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
@@ -17078,17 +17434,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // doesn't show a spurious error AND fire the on-limit hook so
     // ccrotate gets a chance to rotate to a base-tier account.
     //
-    // Both error codes route here:
-    //  - `provider_quota_exhausted`: legacy/pluggable adapter signal.
-    //  - `rate_limit_exhausted`: set by isRateLimitExhausted() when the
-    //    run hits 429, 401-cap, or "you've hit your limit" cap text.
-    //    Without unifying these, rate-limit-flagged runs flipped agents
-    //    to error and the on-limit hook never fired (cluster sat silent
-    //    until the cap window rolled — observed 2026-05-05 16:08-17:30Z).
-    const recoverable =
-      options?.errorCode === "provider_quota_exhausted" ||
-      options?.errorCode === "rate_limit_exhausted" ||
-      options?.errorCode === "provider_quota";
+    // The codes routed here live in RECOVERABLE_AGENT_STATUS_ERROR_CODES, which
+    // is also what the BLO-28924 invariant test iterates: each one must map to a
+    // transient-retry family, or the agent stays idle with nothing scheduled to
+    // resume it. Without unifying these, rate-limit-flagged runs flipped agents
+    // to error and the on-limit hook never fired (cluster sat silent until the
+    // cap window rolled — observed 2026-05-05 16:08-17:30Z).
+    const recoverable = (RECOVERABLE_AGENT_STATUS_ERROR_CODES as readonly string[]).includes(
+      options?.errorCode ?? "",
+    );
     const nextStatus =
       runningCount > 0
         ? "running"
@@ -17465,9 +17819,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId">,
   ) {
     const reservation = await getActiveExternalRuntimeReservation(db, run.id);
-    if (!reservation?.jobName || !reservation.jobUid) {
+    // BLO-20482: split "no reservation at all" from "reservation without Job
+    // identity". Both still refuse the delete and return "mismatch" (every
+    // caller treats anything other than "deleted"/"missing" as fail-closed),
+    // but only the second is anomalous.
+    //
+    // No ACTIVE reservation is an expected, benign outcome, not a failure: a
+    // Job only ever exists alongside a reservation carrying its name/UID, so
+    // there is nothing to target and nothing was leaked. The cancel cascade
+    // reaches this deliberately — see cancelRunInternal, where the dispatcher
+    // may already have released the terminal run's reservation before the
+    // cascade runs. Logging it at error poisoned the API error rate (~13
+    // occurrences per 26 minutes, all with reservationId: null) and buried
+    // real failures.
+    if (!reservation) {
+      logger.debug(
+        { runId: run.id, reservationId: null },
+        "skipping external-runtime Job deletion: no active reservation to target",
+      );
+      return "mismatch" as const;
+    }
+    // A PERSISTED reservation missing its Job name/UID is a genuine anomaly:
+    // we recorded the reservation but never its Job identity, so a Job may be
+    // running that we cannot safely target. Keep this at error.
+    if (!reservation.jobName || !reservation.jobUid) {
       logger.error(
-        { runId: run.id, reservationId: reservation?.id ?? null },
+        { runId: run.id, reservationId: reservation.id },
         "refusing external-runtime Job deletion without persisted name and UID",
       );
       return "mismatch" as const;
@@ -17915,9 +18292,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
     >,
   ): number {
-    const liveProgressRef = runTimestampMs(run.lastUsefulActionAt) || runTimestampMs(run.lastOutputAt);
+    // BLO-20775: take the NEWEST stamp, not the first non-null. This was
+    // `runTimestampMs(lastUsefulActionAt) || runTimestampMs(lastOutputAt)`, which
+    // encodes an invariant nothing enforces: that lastUsefulActionAt is never
+    // older than lastOutputAt. By schema these are independent columns written by
+    // different paths, and on TERMINAL rows they do diverge exactly that way —
+    // classifyAndPersistRunLiveness stamps lastUsefulActionAt to the last concrete
+    // *evidence* time (comment/doc/work-product, often hours old) while leaving
+    // lastOutputAt fresh (run-liveness.ts:314,320).
+    //
+    // On a RUNNING row consumed HERE they cannot diverge today, and no currently
+    // reachable transition makes them: the only writer that touches a live run is
+    // flushOutputProgress, which sets BOTH to the same value in one .set() (see
+    // the coupling guard in heartbeat-process-recovery.test.ts). So the old chain
+    // was not returning wrong answers on this path — for the external-lifecycle
+    // reaper this change is purely future-proofing, not an active-incident fix.
+    //
+    // Specifically NOT a live race here, though an earlier revision of this
+    // comment claimed it was: the unguarded setRunStatus(id, "running") below
+    // (~:17444) can resurrect a terminal row still carrying the terminal-path
+    // stamp, but it sits behind processPidAlive → isTrackedLocalChildProcessAdapter,
+    // i.e. SESSIONED_LOCAL_ADAPTERS (claude_local, codex_local, …). This helper is
+    // only ever called under hasExternalLifecycle → EXTERNAL_LIFECYCLE_ADAPTER_TYPES
+    // (claude_k8s, opencode_k8s). Those two sets are disjoint, so that resurrection
+    // cannot produce a divergent row on the external-lifecycle path. It IS reachable
+    // for the dispatcher slot gate, whose query is adapter-agnostic — see
+    // nonStaleRunningRuns, where that rationale properly lives.
+    //
+    // What this guards instead: a FUTURE deliberate decoupling of the two stamps
+    // (or a future external-lifecycle transition that preserves terminal stamps).
+    // Should either arrive, max() is already correct and the reaper does not
+    // silently regain the power to force-kill a live Job.
+    //
+    // max() is the established idiom for this question in-repo
+    // (silenceStartedAtForRun / latestRunActivityAt in recovery/service.ts,
+    // latestDate in productivity-review.ts), is monotonic toward LESS destructive
+    // reaper behaviour, and keeps the answer correct if the two stamps are ever
+    // decoupled deliberately. runTimestampMs maps null/NaN to 0, so one bad row
+    // cannot win the max or poison the comparison.
+    //
+    // Convergence, deliberately: because streamed output counts as activity, a run
+    // that emits forever never trips isHardStale, so the reaper never kills it.
+    // That is correct for a SILENCE detector — "still talking" is the definition
+    // of not-silent, per the note above — and is unchanged by this commit, since
+    // the stamps are equal on live runs either way. An emitting-but-unproductive
+    // run is the liveness/productivity detectors' problem, not the reaper's; the
+    // reaper has no wall-clock backstop and is not meant to be one.
     return Math.max(
-      liveProgressRef,
+      runTimestampMs(run.lastUsefulActionAt),
+      runTimestampMs(run.lastOutputAt),
       runTimestampMs(run.finishedAt),
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
@@ -19885,7 +20308,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.buildRunOutputSilence(run, now);
   }
 
-  async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: { lookbackHours?: number; now?: Date }) {
+  async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: {
+    lookbackHours?: number;
+    now?: Date;
+    // Mirrors `reconcileIssueGraphLiveness` below, and for the same reason: this
+    // wrapper is the only way into the preview from typechecked callers, and the
+    // preview now applies both re-escalation suppressors. An option the service
+    // accepts but this literal type omits is an excess-property error for every
+    // caller under `src/`, so previewing the documented rollback lever would be
+    // unreachable while running it is not.
+    reescalationCooldownMs?: number;
+    unchangedTargetSuppressionMs?: number;
+  }) {
     return recovery.buildIssueGraphLivenessAutoRecoveryPreview(opts);
   }
 
@@ -19895,6 +20329,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     lookbackHours?: number;
     now?: Date;
     reescalationCooldownMs?: number;
+    // Both re-escalation suppressors must be settable from here: this wrapper is
+    // the only way into the detector (`index.ts` boot paths, the operator route
+    // at `routes/instance-settings.ts`, and the tests all call it rather than
+    // `recovery.reconcileIssueGraphLiveness`). An option the service accepts but
+    // this literal type omits is an excess-property error for every caller under
+    // `src/`, i.e. unreachable from typechecked code rather than merely
+    // inconvenient -- which would leave the documented rollback for a
+    // liveness-detector behaviour change as "edit a constant and redeploy".
+    // Note this is NOT enforced for the test suite: `server/tsconfig.json`
+    // excludes `src/__tests__`, so a test can pass the field either way and
+    // cannot pin this. The production callers above are what keep it honest.
+    unchangedTargetSuppressionMs?: number;
   }) {
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -20379,21 +20825,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // BLO-12990 Fix #1: stale/silent running runs must not block new high-priority
       // work. Fetch full run rows so we can partition into active vs. stale using
       // the same silence metric the reaper uses (EXTERNAL_LIFECYCLE_STALE_MS). A run
-      // is stale when its most-recent signal (lastUsefulActionAt > lastOutputAt >
-      // startedAt) is older than the threshold. Only non-stale runs count toward the
-      // slot gate — a k8s Job that has been silent for >15 min should not starve
-      // newly-queued high-priority work indefinitely.
+      // is stale when its most-recent signal — the NEWEST of lastUsefulActionAt /
+      // lastOutputAt / startedAt — is older than the threshold. Only non-stale runs
+      // count toward the slot gate — a k8s Job that has been silent for >15 min
+      // should not starve newly-queued high-priority work indefinitely.
       const dispatchNow = new Date();
       const staleFloorMs = dispatchNow.getTime() - EXTERNAL_LIFECYCLE_STALE_MS;
       const runningRunRows = await listRunningRunsForAgent(agentId);
       const nonStaleRunningRuns = runningRunRows.filter((r) => {
-        const signalMs = r.lastUsefulActionAt
-          ? new Date(r.lastUsefulActionAt).getTime()
-          : r.lastOutputAt
-          ? new Date(r.lastOutputAt).getTime()
-          : r.startedAt
-          ? new Date(r.startedAt).getTime()
-          : 0;
+        // BLO-20775: newest stamp, NOT the first non-null. The old chain
+        // (lastUsefulActionAt ? … : lastOutputAt ? …) encodes an invariant nothing
+        // enforces — that lastUsefulActionAt is never older than lastOutputAt. That
+        // is false on TERMINAL rows, where classifyAndPersistRunLiveness stamps
+        // lastUsefulActionAt to an often-hours-old concrete *evidence* time while
+        // lastOutputAt stays fresh.
+        //
+        // Unlike the external-lifecycle reaper helper, that divergent row IS
+        // reachable here. listRunningRunsForAgent filters on agentId + status only,
+        // with no adapter predicate, so it returns sessioned-local rows too — and a
+        // terminal local row can be resurrected to `running` by the unguarded
+        // setRunStatus(id, "running") in reapOrphanedRuns (gated on processPidAlive →
+        // isTrackedLocalChildProcessAdapter), carrying its terminal-path stamp with
+        // it. Such a run genuinely occupies a slot; under the old chain it read as
+        // stale, dropped out of the count, and a second run could dispatch on top of
+        // a live one. runTimestampMs maps null/NaN to 0, so an unparseable stamp is
+        // dropped rather than propagated.
+        const signalMs = Math.max(
+          runTimestampMs(r.lastUsefulActionAt),
+          runTimestampMs(r.lastOutputAt),
+          runTimestampMs(r.startedAt),
+        );
         return signalMs >= staleFloorMs;
       });
       const runningCount = nonStaleRunningRuns.length;
@@ -21601,6 +22062,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // has already been created" case -- if a refactor moves isolation binding
   // to after Job creation, or lets a bound reservation re-enter the throw
   // path, that test fails before this function can strand a live Job.
+  // BLO-22060 decision — the uncapped re-queue attempt count here is
+  // INTENTIONAL, and deliberately not bounded the way the parked-retry
+  // re-adoption above now is. Recorded so it stays a decision rather than an
+  // omission:
+  //
+  //  - This path never resets the stale-lock clock by itself. It leaves
+  //    issues.executionLockedAt untouched, and the sweep's `queued` branch
+  //    measures from that column, so a run stuck deferring is still swept 6h
+  //    after its original lock. The clock only moves when the run is genuinely
+  //    re-claimed (claimQueuedRun re-stamps executionLockedAt) — i.e. when it
+  //    made real progress toward dispatch, not while it sits parked.
+  //  - The failure mode it protects against is transient by construction: the
+  //    conflict is raised only while another live run holds the same mutable
+  //    isolation scope, so the correct response is to wait for that run, and
+  //    the wait is already capped at K8S_ISOLATION_RETRY_MAX_DELAY_MS (5 min)
+  //    per attempt.
+  //  - Capping attempts would convert "the neighbour is taking a long time"
+  //    into a failed run. That trades a bounded wait for lost work, on a
+  //    condition we cannot distinguish from a slow-but-healthy neighbour.
+  //  - A genuine live-lock is therefore a bug in reservation binding, not
+  //    something a retry cap should paper over — and it is already observable
+  //    without one: retryAttempt is stamped on the run event and the log line
+  //    at the end of this function, so a climbing count is visible per run.
+  //
+  // Revisit if that log ever shows attempts climbing without a distinct
+  // conflictingRunId, which would mean the scope is never actually released.
   async function deferRunForK8sIsolationConflict(
     run: typeof heartbeatRuns.$inferSelect,
     conflict: ExternalRuntimeIsolationConflictError,
@@ -21701,6 +22188,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return deferredRun;
   }
 
+  // BLO-21602: mirrors deferRunForK8sIsolationConflict -- a branch claim
+  // conflict is a normal, expected race (two runs starting close together on
+  // issues that share a branch), not a failure. Send this run back to
+  // `queued` with backoff rather than failing it, and name the holder
+  // (run + issue) on the run event so the loser has an actionable signal.
+  async function deferRunForBranchClaimConflict(
+    run: typeof heartbeatRuns.$inferSelect,
+    conflict: BranchClaimConflictError,
+  ) {
+    const latestRun = await getRun(run.id);
+    if (!latestRun || latestRun.status !== "running") return null;
+
+    const now = new Date();
+    const context = parseObject(latestRun.contextSnapshot);
+    const retryAttempt = Math.max(
+      1,
+      Math.floor(asNumber(context[BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY], 0)) + 1,
+    );
+    const retryAt = new Date(now.getTime() + computeK8sIsolationRetryDelayMs(retryAttempt));
+    context[BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY] = retryAttempt;
+    context[BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY] = retryAt.toISOString();
+
+    const deferredRun = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "queued",
+        startedAt: null,
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        externalRunId: null,
+        processPid: null,
+        processGroupId: null,
+        processStartedAt: null,
+        contextSnapshot: context,
+        updatedAt: now,
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!deferredRun) return null;
+
+    await setWakeupStatus(deferredRun.wakeupRequestId, "queued", {
+      claimedAt: null,
+      finishedAt: null,
+      error: null,
+    });
+    await appendRunEvent(deferredRun, await nextRunEventSeq(deferredRun.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Deferred run because another active run already claims this branch",
+      payload: {
+        branchKey: conflict.branchKey,
+        holderRunId: conflict.holderRunId,
+        holderIssueId: conflict.holderIssueId,
+        retryAttempt,
+        retryAt: retryAt.toISOString(),
+      },
+    });
+    publishLiveEvent({
+      companyId: deferredRun.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: deferredRun.id,
+        agentId: deferredRun.agentId,
+        status: deferredRun.status,
+        invocationSource: deferredRun.invocationSource,
+        triggerDetail: deferredRun.triggerDetail,
+        error: null,
+        errorCode: null,
+        startedAt: null,
+        finishedAt: null,
+      },
+    });
+    publishRunLifecyclePluginEvent(deferredRun);
+    logger.info(
+      {
+        runId: deferredRun.id,
+        agentId: deferredRun.agentId,
+        branchKey: conflict.branchKey,
+        holderRunId: conflict.holderRunId,
+        holderIssueId: conflict.holderIssueId,
+        retryAttempt,
+        retryAt: retryAt.toISOString(),
+      },
+      "deferred run behind active branch claim",
+    );
+    return deferredRun;
+  }
+
   async function executeRun(runId: string) {
     if ((await getSchedulingSuppression()).suppressed) return;
 
@@ -21724,6 +22302,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let deferredForK8sIsolationConflict = false;
+    let deferredForBranchClaimConflict = false;
     // BLO-16537: set when this invocation discovers its own run-scoped Job is
     // still alive after the adapter refused to (re)launch it (see the guard
     // below). The run/reservation/lease are intentionally left untouched, so
@@ -22619,6 +23198,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       issueId,
     });
+    // BLO-21602 (Ally round-3, Important #1): claim the branch BEFORE the
+    // workspace is realized, not after. `provisionExecutionWorkspaceForFreshnessDecision`
+    // below restores/checks out the shared working tree -- that is already a
+    // mutation of the contended resource. Claiming only after it returns
+    // means a losing sibling has by then reset, checked out, or otherwise
+    // rewritten the branch's working tree before it ever discovers the
+    // conflict, which is precisely the divergent-sibling hazard this issue is
+    // about.
+    //
+    // The durable `(repoUrl, branch)` identity for the reuse/restore path is
+    // already on the persisted execution_workspaces row, so it is knowable
+    // here without realizing anything. That is also exactly the contended
+    // case from the incident: a parent and a child issue both resolving to
+    // one shared workspace. A brand-new workspace has no persisted branch
+    // yet and cannot collide with an existing claim, so it is correctly
+    // claimed post-realization by the re-key step further down.
+    let activeBranchClaimKey: string | null = null;
+    if (issueRef && reusableExistingExecutionWorkspace?.branchName) {
+      activeBranchClaimKey = computeBranchClaimKey({
+        repoUrl: reusableExistingExecutionWorkspace.repoUrl ?? null,
+        branchName: reusableExistingExecutionWorkspace.branchName,
+      });
+      await acquireBranchRunClaim(db, {
+        companyId: agent.companyId,
+        branchKey: activeBranchClaimKey,
+        executionWorkspaceId: reusableExistingExecutionWorkspace.id,
+        issueId: issueRef.id,
+        runId: run.id,
+        agentId: agent.id,
+      });
+    }
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
@@ -22790,6 +23400,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
       throw error;
+    }
+    // BLO-21602: the issue-scoped checkoutRunId/executionRunId guard cannot
+    // see contention between two DIFFERENT issues that resolve to the same
+    // branch (parent + child sharing one execution workspace, or any
+    // operator_branch/reuse_existing pairing) -- each independently passes
+    // its own issue-scoped ownership check.
+    //
+    // The pre-realization claim above already covers the reuse/restore path.
+    // This is the re-key step: a fresh workspace has no persisted branch to
+    // claim early, and a restore can legitimately resolve to a different
+    // branch than the one recorded (a forward-branch reconcile). Either way
+    // the authoritative branch is only known now, so claim it -- and drop the
+    // provisional claim if the key moved, so this run never holds two.
+    // Throwing BranchClaimConflictError here is caught by the outer
+    // `catch (outerErr)` below and deferred back to `queued`, mirroring
+    // ExternalRuntimeIsolationConflictError / deferRunForK8sIsolationConflict.
+    // `activeBranchClaimKey`, once set, is renewed periodically for the
+    // lifetime of the adapter invocation below (see branchClaimRenewalTimer)
+    // so a run that legitimately runs past DEFAULT_BRANCH_CLAIM_LEASE_MS
+    // never has its lease lapse out from under it.
+    if (issueRef && branchNameForInitialPersistence) {
+      const resolvedBranchClaimKey = computeBranchClaimKey({
+        repoUrl: persistedExecutionWorkspace?.repoUrl ?? executionWorkspace.repoUrl ?? null,
+        branchName: branchNameForInitialPersistence,
+      });
+      if (resolvedBranchClaimKey !== activeBranchClaimKey) {
+        await acquireBranchRunClaim(db, {
+          companyId: agent.companyId,
+          branchKey: resolvedBranchClaimKey,
+          executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+          issueId: issueRef.id,
+          runId: run.id,
+          agentId: agent.id,
+        });
+        if (activeBranchClaimKey) {
+          await releaseBranchRunClaimForKey(db, {
+            runId: run.id,
+            branchKey: activeBranchClaimKey,
+            reason: "rekeyed_after_workspace_realization",
+          });
+        }
+        activeBranchClaimKey = resolvedBranchClaimKey;
+      }
     }
     await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
     await recordWorkspaceConfigFreshnessOperation({
@@ -23792,6 +24445,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      // BLO-21602: renew the branch claim on a cadence well inside
+      // DEFAULT_BRANCH_CLAIM_LEASE_MS so a run that is genuinely still
+      // executing never has its lease expire and get superseded by a
+      // sibling run racing to claim the same branch. `acquireBranchRunClaim`
+      // is idempotent for the same runId -- it just extends `expiresAt`.
+      // If renewal ever reports a *different* holder, our lease already
+      // lapsed and another run has legitimately taken over the branch; we
+      // cannot safely abort the in-flight adapter process here, so this is
+      // surfaced as a run event / error log for operator follow-up rather
+      // than silently ignored.
+      let branchClaimRenewalTimer: ReturnType<typeof setInterval> | null = null;
+      if (activeBranchClaimKey && issueRef) {
+        const branchKeyForRenewal = activeBranchClaimKey;
+        const issueIdForRenewal = issueRef.id;
+        branchClaimRenewalTimer = setInterval(() => {
+          void acquireBranchRunClaim(db, {
+            companyId: agent.companyId,
+            branchKey: branchKeyForRenewal,
+            executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+            issueId: issueIdForRenewal,
+            runId: run.id,
+            agentId: agent.id,
+          }).catch(async (renewErr) => {
+            if (renewErr instanceof BranchClaimConflictError) {
+              logger.error(
+                {
+                  runId: run.id,
+                  branchKey: branchKeyForRenewal,
+                  holderRunId: renewErr.holderRunId,
+                  holderIssueId: renewErr.holderIssueId,
+                },
+                "Lost branch run claim to a competing run mid-run; a divergent commit is possible",
+              );
+              await appendRunEvent(run, await nextRunEventSeq(run.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "error",
+                message: "Lost branch run claim mid-run to a competing run",
+                payload: {
+                  branchKey: branchKeyForRenewal,
+                  holderRunId: renewErr.holderRunId,
+                  holderIssueId: renewErr.holderIssueId,
+                },
+              }).catch(() => {});
+              return;
+            }
+            logger.warn(
+              { err: renewErr, runId: run.id, branchKey: branchKeyForRenewal },
+              "Failed to renew branch run claim",
+            );
+          });
+        }, BRANCH_CLAIM_RENEWAL_INTERVAL_MS);
+      }
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         const adapterContext = { ...context };
@@ -24088,6 +24795,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
+        if (branchClaimRenewalTimer) {
+          clearInterval(branchClaimRenewalTimer);
+        }
         try {
           await revokeHeartbeatRunGatewayTokens({
             db,
@@ -25007,6 +25717,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(agent.id, "failed", message);
     }
     } catch (outerErr) {
+          if (outerErr instanceof BranchClaimConflictError) {
+            try {
+              const deferredRun = await deferRunForBranchClaimConflict(run, outerErr);
+              if (deferredRun) {
+                deferredForBranchClaimConflict = true;
+                await finalizeAgentStatus(run.agentId, "cancelled").catch(() => undefined);
+              }
+              return;
+            } catch (deferError) {
+              logger.error(
+                { err: deferError, runId, branchKey: outerErr.branchKey },
+                "failed to defer run after branch-claim contention",
+              );
+            }
+          }
           if (outerErr instanceof ExternalRuntimeIsolationConflictError) {
             try {
               const deferredRun = await deferRunForK8sIsolationConflict(run, outerErr);
@@ -25224,7 +25949,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // pass the agent process exit code and adapter type to the hook
           // for branching (e.g. only refresh the cache on success, or only
           // for `_k8s` adapters).
-          if (!deferredForK8sIsolationConflict && !abandonedForLiveOwnJob) {
+          if (!deferredForK8sIsolationConflict && !deferredForBranchClaimConflict && !abandonedForLiveOwnJob) {
             const latestRunForHook = await getRun(run.id).catch(() => null);
             const agentForHook = await getAgent(run.agentId).catch(() => null);
             const exitCode = (() => {
@@ -27207,6 +27932,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(heartbeatRuns.companyId, issue.companyId),
                 inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                // BLO-22060: a run whose issue lock the stale-lock sweep has
+                // already released is not an adoption candidate any more.
+                // Excluded in SQL rather than after the fact so a *different*
+                // eligible run for this issue is still found and adopted
+                // normally — only the burnt-out holder is passed over. Applies
+                // to every status this fallback selects, not just
+                // `scheduled_retry`: the sweep releases and counts `queued`
+                // (BLO-18995) and silent-`running` (BLO-19941) holders too, and
+                // a released park that is later promoted arrives here as
+                // `queued` carrying its count. See
+                // MAX_SWEPT_ISSUE_LOCK_RELEASES.
+                lt(heartbeatRuns.issueLockReleaseCount, MAX_SWEPT_ISSUE_LOCK_RELEASES),
               ),
             )
             .orderBy(
@@ -27220,6 +27957,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (await cancelStaleScheduledRetry(legacyRun)) {
               activeExecutionRun = null;
             } else {
+              // Master (8446c1011) narrowed the issue-lock stamp to `running`
+              // legacy runs: a `queued`/`scheduled_retry` holder is adopted as
+              // the in-memory `activeExecutionRun` for this wake but no longer
+              // re-stamps `executionLockedAt`. That kills the *renewal* half of
+              // BLO-22060; the release bound in the SELECT above kills the
+              // *absorption* half, so a swept park cannot silently swallow the
+              // wake either.
               activeExecutionRun = legacyRun;
               if (legacyRun.status === "running") {
                 const legacyAgent = await tx
@@ -27227,7 +27971,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   .from(agents)
                   .where(eq(agents.id, legacyRun.agentId))
                   .then((rows) => rows[0] ?? null);
-                await tx
+                // BLO-22060: guard the adoption on the lock still being free.
+                // The enclosing transaction DOES hold this issue row `for
+                // update` (taken at the top, before the issue is read), so a
+                // concurrent writer that goes through the same path cannot
+                // interleave here — this predicate is not load-bearing against
+                // that class of race. It is kept as a cheap assertion of the
+                // invariant the block is written against: every branch above
+                // either left executionRunId null or cleared it, so adoption
+                // must never overwrite a live holder. If the row lock is ever
+                // narrowed, or a writer that does not take it is added, this
+                // fails closed instead of silently stamping over the holder —
+                // and the fallback below then adopts whoever actually holds the
+                // issue.
+                const adopted = await tx
                   .update(issues)
                   .set({
                     executionRunId: legacyRun.id,
@@ -27235,7 +27992,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     executionLockedAt: new Date(),
                     updatedAt: new Date(),
                   })
-                  .where(eq(issues.id, issue.id));
+                  .where(and(eq(issues.id, issue.id), isNull(issues.executionRunId)))
+                  .returning({ id: issues.id })
+                  .then((rows) => rows[0] ?? null);
+
+                if (!adopted) {
+                  const currentHolderId = await tx
+                    .select({ executionRunId: issues.executionRunId })
+                    .from(issues)
+                    .where(eq(issues.id, issue.id))
+                    .then((rows) => rows[0]?.executionRunId ?? null);
+                  activeExecutionRun = currentHolderId
+                    ? await tx
+                      .select()
+                      .from(heartbeatRuns)
+                      .where(eq(heartbeatRuns.id, currentHolderId))
+                      .then((rows) => rows[0] ?? null)
+                    : null;
+                }
               }
             }
           }
@@ -30145,6 +30919,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     },
     __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
+    __test_tickExpiredIssueMonitors: (now?: Date) => tickExpiredIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
@@ -30178,6 +30953,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     sweepStaleIssueLocks,
 
+    // BLO-22060: already the injected dependency behind recoveryService,
+    // productivity-review and task-watchdogs; exposed here so the issue-lock
+    // adoption path can be driven directly from a test rather than only through
+    // a plugin-host or route wrapper.
+    enqueueWakeup,
     reconcileDetachedQueuedRuns,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
@@ -30344,14 +31124,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const expiredIssueMonitors = await tickExpiredIssueMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
+        checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        skipped: skipped + issueMonitors.skipped + expiredIssueMonitors.recovered,
         idleSkipped,
       };
     },
+
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 

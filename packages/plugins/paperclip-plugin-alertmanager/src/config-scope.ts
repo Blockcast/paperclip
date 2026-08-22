@@ -13,8 +13,9 @@
  * own `companyId`, so the token is resolved from that instead.
  */
 
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { DEFAULT_ISSUE_ROUTE_MAP, DEFAULT_OWNER_MAP } from "./constants.js";
+import { readBearerCredential, verifyBearerToken } from "./webhook-handler.js";
 import { recordCredentialResolution } from "./credential-health.js";
 import type {
   AlertmanagerPluginConfig,
@@ -79,17 +80,12 @@ export function isEmptyConfig(
 /**
  * Resolve the inline bearer token this company's webhook endpoint should accept.
  *
- * Returns `null` ONLY when this company has configured no credential at all.
- * That is a determinate answer — nothing can authenticate against an endpoint
- * with no token — so the caller is right to reject the delivery.
+ * Returns the inline token when configured. A `null` result either means there
+ * is no credential or that a secret ref must be verified separately.
  *
- * `webhookTokenRef` is intentionally not resolved in the worker's public
- * webhook path. Invalid public deliveries would otherwise force one
- * `ctx.secrets.resolve` operation before authentication, letting unauthenticated
- * traffic spend the shared secret-resolution budget. A secret-ref production
- * posture needs a host-side verifier that can authenticate before invoking the
- * worker. Until that exists, secret refs fail closed and inline tokens remain
- * the only enabled worker-side authentication mechanism.
+ * `webhookTokenRef` is intentionally not resolved in the worker. The webhook
+ * path verifies it through `ctx.secrets.verify`, which returns only a boolean
+ * and does not consume the secret value-resolution budget.
  */
 export async function resolveWebhookToken(
   ctx: PluginContext,
@@ -97,24 +93,98 @@ export async function resolveWebhookToken(
   companyId?: string,
 ): Promise<string | null> {
   const forCompany = companyId ? ` for company ${companyId}` : "";
+  // A configured `webhookTokenRef` resolves to no inline value ON PURPOSE: the
+  // secret never enters this worker. Until BLO-20738 this branch threw, because
+  // the only way to check a ref was to resolve it. `authenticateWebhook` now
+  // checks the presented bearer through `ctx.secrets.verify`, so a ref is a
+  // usable credential and `null` here means "verified elsewhere", not "absent".
+  // Callers must therefore treat a ref as configured — see `resolveCompanyScope`.
+  if (config.webhookTokenRef) return null;
   if (config.webhookToken) return config.webhookToken;
-  if (config.webhookTokenRef) {
-    ctx.logger.error(
-      `paperclip-plugin-alertmanager: webhookTokenRef is configured${forCompany}, but secret-ref webhook auth requires host-side verification before the worker is invoked`,
-    );
-    // This throws, so the delivery never reaches `handleWebhook` and never
-    // reaches the recorder there — record it here or `onHealth()` reports `ok`
-    // for a company whose every delivery fails (BLO-20572). This is the exact
-    // posture BLO-20219's planned cutover to `webhookTokenRef` would produce,
-    // so it must be the loudest case, not the silent one.
-    if (companyId) recordCredentialResolution(companyId, null);
-    throw new CompanyScopeUnavailableError(
-      `webhookTokenRef${forCompany} requires host-side webhook verification`,
-    );
-  }
   ctx.logger.warn(
     `paperclip-plugin-alertmanager: no webhookToken or webhookTokenRef configured${forCompany} — webhook endpoint will reject every request`,
   );
+  return null;
+}
+
+export async function authenticateWebhook(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  input: PluginWebhookInput,
+): Promise<boolean> {
+  if (config.webhookTokenRef) {
+    const presented = readBearerCredential(input.headers);
+    // Reject a credential-less request before spending a host round trip:
+    // that is what keeps an anonymous flood free (BLO-20706 / PR #924).
+    if (presented === null) return false;
+    try {
+      return await ctx.secrets.verify(config.webhookTokenRef, presented, {
+        companyId: input.companyId,
+        configPath: "webhookTokenRef",
+      });
+    } catch (err) {
+      // The host refuses to verify some secret versions (BLO-20738). Either way
+      // that is a permanent configuration or data fault for this company, NOT a
+      // wrong bearer, so it must not be reported as `unauthorized` — that would
+      // read as an Alertmanager misconfiguration and hide the real cause.
+      const unverifiable = verifierRefusalCode(err);
+      if (unverifiable) {
+        // Both codes fail closed identically, but they send an operator to two
+        // different places, so they must not share a message. `unsupported` is
+        // a legitimate configuration choice the host cannot serve; `unavailable`
+        // means the version row is missing or its digest is malformed, which is
+        // a data-integrity fault — telling that operator to "use an inline
+        // token" would point them at the wrong problem entirely.
+        ctx.logger.error(
+          unverifiable === "secret_verifier_unsupported"
+            ? `paperclip-plugin-alertmanager: webhookTokenRef for company ${input.companyId} points at an external provider reference, which cannot be verified host-side — use an inline webhookToken or a Paperclip-managed secret version`
+            : `paperclip-plugin-alertmanager: webhookTokenRef for company ${input.companyId} resolved to a secret version the host cannot verify — its version row is missing or its stored digest is malformed. This is a vault data fault, not a configuration choice: check the secret's versions rather than switching credential shape.`,
+        );
+        // `resolveCompanyScope` already recorded this company as credentialed
+        // on the strength of the ref being set; correct that, or `onHealth()`
+        // reports `ok` for a tenant rejecting 100% of deliveries (BLO-20572).
+        recordCredentialResolution(input.companyId, null);
+        throw new CompanyScopeUnavailableError(
+          `webhookTokenRef for company ${input.companyId} cannot be verified host-side (${unverifiable})`,
+        );
+      }
+      throw err;
+    }
+  }
+  return verifyBearerToken(input.headers, config.webhookToken ?? null);
+}
+
+/**
+ * Which "the host cannot verify this secret" refusal is this, if any?
+ *
+ * Returns the discriminating code so the caller can explain the right fault,
+ * or `null` for anything else. Both codes fail closed the same way, but they
+ * are different problems: `secret_verifier_unsupported` is an external
+ * provider reference (a configuration choice the host cannot serve), while
+ * `secret_verifier_unavailable` is a missing version row or malformed digest
+ * (a data-integrity fault). A single boolean forced one message onto both.
+ *
+ * Matched on `err.data.code`, which is where a host error's machine-readable
+ * discriminator lands: the host projects `HttpError.details.code` into the
+ * JSON-RPC error's `data` (`plugin-worker-manager.ts` → `workerHostErrorData`),
+ * and the worker transport surfaces that as `JsonRpcCallError.data`
+ * (`packages/plugins/sdk/src/protocol.ts`).
+ *
+ * NOT matched on `err.code`: that is the numeric JSON-RPC code, and an
+ * `unprocessable()` from a host service always arrives as `INTERNAL_ERROR`
+ * (-32603) because `HttpError` carries `status`, not a numeric `code`. NOT
+ * matched on the message either — prose is not a contract, and string-matching
+ * it is how this check silently rots.
+ */
+function verifierRefusalCode(
+  err: unknown,
+): "secret_verifier_unsupported" | "secret_verifier_unavailable" | null {
+  if (!err || typeof err !== "object") return null;
+  const data = (err as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const code = (data as { code?: unknown }).code;
+  if (code === "secret_verifier_unsupported") return code;
+  if (code === "secret_verifier_unavailable") return code;
   return null;
 }
 
@@ -125,9 +195,8 @@ export interface CompanyScope {
 
 /**
  * Raised when this delivery's company scope could not be established for a
- * reason that may not still hold on a retry — a failed config RPC, a company
- * with no stored config yet, or a configured `webhookTokenRef` on a build that
- * requires host-side verification before secret refs can be used safely.
+ * reason that may not still hold on a retry — a failed config RPC or a company
+ * with no stored config yet.
  *
  * It must propagate out of `onWebhook`. Returning normally makes the host record
  * the delivery `success` and answer HTTP 200 (`server/src/routes/plugins.ts`
@@ -220,7 +289,19 @@ export async function resolveCompanyScope(
   // degraded entry, because the mismatch always threw before recording ran
   // again (BLO-20572 review feedback on PR #948).
   const token = await resolveWebhookToken(ctx, config, companyId);
-  recordCredentialResolution(companyId, token);
+  // `webhookTokenRef ?? token`, not `token`: a ref-configured company resolves
+  // no inline token by design (BLO-20738), and recording that `null` would
+  // report every ref-configured tenant as credential-less while its deliveries
+  // authenticate perfectly. The ref is an opaque identifier, never a secret
+  // value, and this recorder only reads truthiness — it never stores or logs
+  // what it is handed.
+  //
+  // This is now the ONLY success-path recorder. `handleWebhook` used to record
+  // too, but it is handed an authentication *verdict* rather than a credential
+  // once a ref is in play, so it can no longer distinguish "no credential
+  // configured" from "wrong bearer presented" — exactly the conflation
+  // credential-health.ts exists to avoid.
+  recordCredentialResolution(companyId, config.webhookTokenRef ?? token);
 
   // The host picked this delivery's tenant when it matched the endpoint key;
   // `defaultCompanyId` is just an operator-typed field inside that tenant's own

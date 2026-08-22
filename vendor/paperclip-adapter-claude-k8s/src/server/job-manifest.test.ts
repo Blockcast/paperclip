@@ -11,6 +11,7 @@ import {
   isSensitiveEnvName,
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
+  findServerOnlyEnvVarsInPodSpec,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
@@ -70,6 +71,19 @@ function createClaudeConfigDirWithSession(sessionId: string, workingDir = "/pape
   writeFileSync(join(projectDir, `${sessionId}.jsonl`), "{}\n");
   return configDir;
 }
+
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. File-scoped so every describe block below gets a working
+// default; the "serviceAccountName" describe block overrides/clears it
+// per case to exercise the actual resolution and refusal behavior.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
 
 describe("buildJobManifest", () => {
   let ctx: AdapterExecutionContext;
@@ -1340,9 +1354,47 @@ describe("buildJobManifest", () => {
       expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
     });
 
-    it("omits serviceAccountName when not configured", () => {
+    it("echoes the resolved serviceAccountName on the result for log/manifest discoverability", () => {
+      ctx.config = { serviceAccountName: "paperclip-agent" };
+      const { serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(serviceAccountName).toBe("paperclip-agent");
+    });
+
+    it("falls back to PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME when the per-agent value is unset", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip");
+      expect(serviceAccountName).toBe("paperclip");
+    });
+
+    it("prefers the per-agent serviceAccountName over the fleet default", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      ctx.config = { serviceAccountName: "paperclip-agent" };
       const { job } = buildJobManifest({ ctx, selfPod });
-      expect(job.spec?.template?.spec?.serviceAccountName).toBeUndefined();
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
+    });
+
+    // Both `.trim()` calls in resolveServiceAccountName are load-bearing:
+    // serviceAccountName is a `type: "text"` field, so a whitespace-only value
+    // is reachable from the UI form, and a bare `||` would pass it straight
+    // through as a Job SA name the API server rejects.
+    it("treats a whitespace-only per-agent serviceAccountName as unset and falls back to the fleet default", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      ctx.config = { serviceAccountName: "   " };
+      const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip");
+      expect(serviceAccountName).toBe("paperclip");
+    });
+
+    it("refuses to build the manifest when both the per-agent value and the fleet default are whitespace-only", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "  ";
+      ctx.config = { serviceAccountName: "  " };
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
+    });
+
+    it("refuses to build the manifest — never silently lands on the namespace `default` ServiceAccount — when neither serviceAccountName nor the fleet default is set", () => {
+      delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
     });
   });
 
@@ -2041,5 +2093,135 @@ describe("fail-closed sensitive-env guard covers every container on the pod", ()
     expect(podSpec.initContainers!.map((c) => c.name)).toContain("dind");
     // ...and is inside the guard's field of view (it returns clean today).
     expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+  });
+});
+
+/**
+ * BLO-22514: agent Job pods used to inherit the paperclip server's entire secret
+ * env, so any single agent could mint tokens as any other agent. The primary
+ * control is the allowlist in getSelfPodInfo() (see inherit-allowlist.test.ts
+ * and k8s-client.test.ts); these tests pin the invariant on the artifact this
+ * file actually produces.
+ *
+ * Both directions are asserted deliberately. A test suite that only proved the
+ * secrets are gone would pass just as happily if the filter dropped everything
+ * and broke every agent run in the fleet.
+ */
+describe("buildJobManifest — server credential propagation (BLO-22514)", () => {
+  const SERVER_ONLY = [
+    "PAPERCLIP_AGENT_JWT_SECRET",
+    "DATABASE_URL",
+    "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+    "PAPERCLIP_DEX_OIDC_CLIENT_SECRET",
+    "PAPERCLIP_ALERTMANAGER_WEBHOOK_TOKEN",
+  ];
+
+  function agentEnvNames(job: ReturnType<typeof buildJobManifest>["job"]): string[] {
+    const podSpec = job.spec!.template.spec!;
+    return [
+      ...(podSpec.initContainers ?? []),
+      ...(podSpec.containers ?? []),
+    ].flatMap((c) => (c.env ?? []).map((e) => e.name!));
+  }
+
+  it.each(SERVER_ONLY)("refuses to build a Job that would carry %s", (name) => {
+    // SelfPodInfo is a plain object, so a caller (or a future code path) can put
+    // a server credential in it without going through getSelfPodInfo's filter.
+    // buildJobManifest must fail closed rather than emit the manifest.
+    const selfPod = makeSelfPod({ inheritedEnv: { [name]: "leaked-value" } });
+    expect(() => buildJobManifest({ ctx: makeCtx(), selfPod })).toThrow(
+      /server-only credential env var\(s\) would be propagated/,
+    );
+  });
+
+  it("fails closed on a secretKeyRef too, not just a literal value", () => {
+    // A secretKeyRef hides the value from `GET Pod`, which is why an earlier
+    // analysis called these "fine". The kubelet still resolves it into the
+    // container env, so the agent reads it either way.
+    const selfPod = makeSelfPod({
+      inheritedEnvValueFrom: [
+        {
+          name: "PAPERCLIP_AGENT_JWT_SECRET",
+          valueFrom: { secretKeyRef: { name: "paperclip-jwt", key: "secret" } },
+        },
+      ],
+    });
+    expect(() => buildJobManifest({ ctx: makeCtx(), selfPod })).toThrow(
+      /server-only credential env var\(s\) would be propagated/,
+    );
+  });
+
+  it("names the offending container and variable in the refusal", () => {
+    const selfPod = makeSelfPod({ inheritedEnv: { DATABASE_URL: "postgres://leaked" } });
+    expect(() => buildJobManifest({ ctx: makeCtx(), selfPod })).toThrow(/claude\/DATABASE_URL/);
+  });
+
+  it("still propagates every keep-set env var an agent depends on", () => {
+    // The other half of the invariant: the filter must not have been "fixed" by
+    // dropping everything. These are the names derived from the adapter's own
+    // by-name reads plus deploy/helm/paperclip's agent-facing vars.
+    const keep: Record<string, string> = {
+      PAPERCLIP_API_URL: "http://paperclip-api.paperclip.svc:3000",
+      CLAUDE_CONFIG_DIR: "/paperclip/.claude",
+      PAPERCLIP_HOME: "/paperclip",
+      PAPERCLIP_INSTANCE_ID: "default",
+      PATH: "/usr/local/bin:/usr/bin",
+      PAPERCLIP_GITHUB_TOKEN_FILE: "/paperclip/.secrets/github-token/token",
+      ANTHROPIC_BASE_URL: "https://api.penstock.run/anthropic",
+      OPENAI_BASE_URL: "https://api.penstock.run/openai",
+    };
+    const { job } = buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod({ inheritedEnv: keep }) });
+    const names = agentEnvNames(job);
+    for (const name of Object.keys(keep)) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("carries an allowlisted provider credential through as a secretKeyRef", () => {
+    // ANTHROPIC_AUTH_TOKEN is an *agent* credential: the agent cannot call a
+    // model without it. It must survive the filter, while still being routed
+    // away from a literal value by the existing BLO-17980 guard.
+    const selfPod = makeSelfPod({
+      inheritedEnvValueFrom: [
+        {
+          name: "ANTHROPIC_AUTH_TOKEN",
+          valueFrom: { secretKeyRef: { name: "paperclip-penstock-org-key", key: "token" } },
+        },
+      ],
+    });
+    const { job } = buildJobManifest({ ctx: makeCtx(), selfPod });
+    expect(agentEnvNames(job)).toContain("ANTHROPIC_AUTH_TOKEN");
+  });
+
+  it("builds clean from a realistic filtered SelfPodInfo", () => {
+    // End-to-end sanity: the shape getSelfPodInfo actually returns post-filter
+    // must still produce a manifest, and must trip neither guard.
+    const selfPod = makeSelfPod({
+      inheritedEnv: {
+        PAPERCLIP_API_URL: "http://paperclip-api.paperclip.svc:3000",
+        PATH: "/usr/local/bin:/usr/bin",
+        ANTHROPIC_BASE_URL: "https://api.penstock.run/anthropic",
+      },
+      inheritedEnvValueFrom: [
+        {
+          name: "ANTHROPIC_AUTH_TOKEN",
+          valueFrom: { secretKeyRef: { name: "paperclip-penstock-org-key", key: "token" } },
+        },
+      ],
+      secretVolumes: [
+        {
+          volumeName: "github-merge-token",
+          secretName: "paperclip-github-merge-token",
+          mountPath: "/paperclip/.secrets/github-merge-token",
+          defaultMode: 0o444,
+        },
+      ],
+    });
+    const { job } = buildJobManifest({ ctx: makeCtx(), selfPod });
+    const podSpec = job.spec!.template.spec!;
+    expect(findServerOnlyEnvVarsInPodSpec(podSpec)).toEqual([]);
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+    expect(podSpec.volumes!.map((v) => v.name)).toContain("github-merge-token");
   });
 });

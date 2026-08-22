@@ -206,6 +206,12 @@ export function instanceSettingsRoutes(db: Db) {
               escalationsCreated: result.escalationsCreated,
               existingEscalations: result.existingEscalations,
               skippedOutsideLookback: result.skippedOutsideLookback,
+              // Suppression volume is the quantity BLO-27676 changed, and an
+              // operator-triggered run is where it most wants recording: without
+              // these the audit trail cannot distinguish "nothing was wrong" from
+              // "everything was suppressed".
+              skippedReescalationCooldown: result.skippedReescalationCooldown,
+              skippedUnchangedTarget: result.skippedUnchangedTarget,
               escalationIssueIds: result.escalationIssueIds,
             },
           }),

@@ -1222,15 +1222,30 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // adapter execution is left holding an open promise and an undrained
     // queued run leaks into later tests in this file.
     try {
+      // BLO-20885: these two waits carried a 3s bound, the only hard-coded
+      // `waitForStarted` timeouts in the file — everything else takes the 60s
+      // default or the `diagnosticRemainingMs` budget. That reintroduced the
+      // load sensitivity BLO-22418 set out to remove: shrinking the fixture cut
+      // the seed+scan cost, but a 3s deadline still asserts how fast the runner
+      // is, not what the dispatcher does. Measured 1 failure in a 20-run soak
+      // (`expected 1 to be 2`) on a runner where iterations had slowed from
+      // ~131s to ~270s under load.
+      //
+      // A generous bound costs nothing: `waitForStarted` polls every 25ms and
+      // returns the moment the count is reached, so the happy path is unchanged.
+      // It removes only the false deadline — the properties under test are the
+      // two assertions below (claim the head first, then resume PAST the scan
+      // window), and a genuinely broken cursor still fails on those.
+      //
       // The first pass reads the first `windowRows` rows and claims the oldest.
       await boundedHeartbeat.resumeQueuedRuns();
-      expect(await adapter.waitForStarted(1, 3_000)).toBe(1);
+      expect(await adapter.waitForStarted(1)).toBe(1);
       expect(adapter.started[0]).toBe(issuelessRunIds[0]);
 
       // Free the slot. The next pass must continue from the scan boundary, so
       // it claims the oldest row PAST the window — not the head's second row.
       adapter.releaseAll();
-      expect(await adapter.waitForStarted(2, 3_000)).toBe(2);
+      expect(await adapter.waitForStarted(2)).toBe(2);
       const claimedPosition = issuelessRunIds.indexOf(adapter.started[1]);
       expect(claimedPosition).toBeGreaterThanOrEqual(windowRows);
     } finally {

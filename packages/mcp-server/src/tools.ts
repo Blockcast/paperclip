@@ -194,8 +194,15 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
 
 const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
-  action: z.enum(["approve", "reject", "requestRevision", "resubmit"]),
+  action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
+  // `withdraw` and `resubmit` are both requester-scoped; only approve/reject/
+  // requestRevision call assertBoard. The withdraw route additionally requires a
+  // non-empty reason, so accept a dedicated `reason` rather than making callers
+  // learn that `decisionNote` is overloaded. `decisionNote` is still read as a
+  // fallback, and on the non-withdraw path `reason` folds back into
+  // `decisionNote` so a note can never be silently dropped either way.
+  reason: z.string().optional(),
   payloadJson: z.string().optional(),
 });
 
@@ -729,9 +736,26 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, or resubmit an approval",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. `approve`, `reject`, and `requestRevision` are board-only — an agent calling them gets `403 Board access required`. `withdraw` and `resubmit` are **both requester-scoped**: the requesting agent may rescind its own ask or resubmit it, so a card that went moot is yours to clear rather than something to ask a human to close, and a card the board sent back as `revision_requested` is yours to resubmit. You can only act on cards you filed, and only while they are still pending; acting on another agent's card is refused (403), as is acting on one already decided (409). `withdraw` requires a non-empty `reason` (or `decisionNote`) — the audit trail relies on it to tell a moot request apart from an abandoned one. Note one destructive side effect: withdrawing a `hire_agent` approval also terminates the pending agent it would have created (it would otherwise be stranded frozen with no approval left to decide it).",
       approvalDecisionSchema,
-      async ({ approvalId, action, decisionNote, payloadJson }) => {
+      async ({ approvalId, action, decisionNote, reason, payloadJson }) => {
+        if (action === "withdraw") {
+          // Refuse here rather than letting an empty reason reach the server as a
+          // bare 400: the caller learns which field to fill, and a withdrawal can
+          // never silently lose the note the audit trail depends on.
+          const withdrawReason = (reason ?? decisionNote ?? "").trim();
+          if (!withdrawReason) {
+            throw new Error(
+              "withdraw requires a non-empty reason: pass `reason` (or `decisionNote`) saying why the request became moot",
+            );
+          }
+          return client.requestJson(
+            "POST",
+            `/approvals/${encodeURIComponent(approvalId)}/withdraw`,
+            { body: { reason: withdrawReason } },
+          );
+        }
+
         const path =
           action === "approve"
             ? `/approvals/${encodeURIComponent(approvalId)}/approve`
@@ -747,7 +771,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
             ? replacementPayload === undefined
               ? {}
               : { payload: replacementPayload }
-            : { decisionNote };
+            : { decisionNote: decisionNote ?? reason };
 
         return client.requestJson("POST", path, { body });
       },

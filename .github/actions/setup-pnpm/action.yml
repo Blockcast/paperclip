@@ -1,0 +1,128 @@
+# Retrying wrapper around pnpm/action-setup. See BLO-28813.
+#
+# WHY THIS EXISTS
+#
+# pnpm/action-setup@v6 cannot install a pinned pnpm in one step. It `npm ci`s a
+# bootstrap pnpm whose version is pinned inside the action itself (v11.19.0 as
+# of this writing), then unconditionally runs `pnpm self-update <target>` to get
+# from there to ours. Because the action's bootstrap pin can never equal our
+# `packageManager` pin, that self-update ALWAYS runs -- and pnpm 11's
+# engine-identity check resolves `@pnpm/exe@<target>` plus every one of its
+# per-platform optional dependencies against registry.npmjs.org and verifies the
+# signatures fail-closed. A Linux runner fetches `@pnpm/win-arm64` to do this,
+# so it is roughly one request per supported platform and all of them must land.
+#
+# The result is that every CI job depends on a healthy registry before it can
+# run a single test, and a slow registry produces:
+#
+#   [ERR_PNPM_PNPM_ENGINE_IDENTITY_UNVERIFIABLE] Refusing to run pnpm@9.15.4:
+#   its npm registry signature could not be verified (@pnpm/exe@9.15.4: The
+#   operation was aborted due to timeout).
+#
+# On 2026-08-19 that ejected three jobs in sixteen minutes, one of them a
+# merge-queue candidate. `pnpm/action-setup@v4` did not have this failure mode --
+# it ran `pnpm install pnpm@<target> --no-lockfile`, one call, no verifier -- so
+# this is a regression the v6 upgrade brought in rather than a new registry
+# problem.
+#
+# WHAT WE DELIBERATELY DO NOT DO
+#
+# The error text suggests setting `pmOnFail` to `ignore`. Do not. That does not
+# skip the fetch, it skips the version SWITCH, leaving the job running pnpm
+# 11.19.0 against a pnpm 9 lockfile. This repo pins packageManager to
+# pnpm@9.15.4, hard-blocks lockfile edits in PRs, and monitors lockfile drift;
+# silently resolving with the wrong major is a correctness hazard strictly worse
+# than a red build. The verifier failing closed is correct behaviour. What was
+# missing is any tolerance around it.
+#
+# The structural fix is to stop reaching for the registry at all -- bake the
+# pinned pnpm into the ARC runner images and skip this action when it is already
+# on PATH. That is a shared-fleet change in onprem-k8s and is tracked
+# separately. This wrapper is the bounded, in-repo mitigation.
+#
+# HONEST LIMIT
+#
+# One jittered retry survives a blip, not a sustained outage. It converts the
+# common case from "PR ejected from the merge queue" into "this job took another
+# ninety seconds". A multi-minute registry brownout still fails, by design --
+# see the note on pmOnFail above for why failing is the right answer there.
+
+name: Setup pnpm
+description: Install the pnpm pinned by package.json packageManager, with one jittered retry.
+
+inputs:
+  run_install:
+    description: Forwarded to pnpm/action-setup's run_install input.
+    required: false
+    default: "false"
+
+outputs:
+  dest:
+    description: Expanded path of the pnpm install destination.
+    # The retry only runs when the first attempt failed, so at most one of these
+    # is ever set; an unrun step's outputs are empty, which is falsy here.
+    value: ${{ steps.retry.outputs.dest || steps.first.outputs.dest }}
+  bin_dest:
+    description: Location of the installed pnpm and pnpx commands.
+    value: ${{ steps.retry.outputs.bin_dest || steps.first.outputs.bin_dest }}
+
+runs:
+  using: composite
+  steps:
+    # No `version:` input on purpose. The action reads package.json
+    # "packageManager" when version is omitted, which keeps the pnpm pin in
+    # exactly one place instead of duplicated across every workflow -- and the
+    # action errors loudly if the two ever disagree, so there is no silent-drift
+    # path. Callers must therefore check out the repo before using this action;
+    # scripts/__tests__/pnpm-setup-retry.test.mjs enforces that.
+    - name: Setup pnpm
+      id: first
+      uses: pnpm/action-setup@v6
+      continue-on-error: true
+      env:
+        # pnpm's default is 60s. The 2026-08-19 failures included a request that
+        # completed in 70,506ms and was aborted anyway, so 120s turns that exact
+        # case from a failure into a success.
+        npm_config_fetch_timeout: "120000"
+        # NOTE: `npm_config_*` is npm's namespace, not pnpm's, and run.ts spawns
+        # the bootstrap `npm ci` with `{...process.env}` -- so this disables
+        # retries for BOTH stages, not just the self-update the failures came
+        # from. That is deliberate, and the arithmetic is the reason:
+        #
+        #   per stage, master: 1 try + 2 in-process retries, 60s each, one step
+        #   per stage, here:   1 try each on 2 whole steps, 120s each, jittered
+        #
+        # So each stage trades 3 back-to-back attempts on one connection for 2
+        # attempts on fresh processes ~10-25s apart with double the deadline.
+        # Fewer raw attempts, better distributed, and bounded: leaving both
+        # layers on would be 2 in-process x 2 steps = up to 6 registry stalls,
+        # which does not fit the 10-minute floor the wrapper's own guard test
+        # asserts. Whoever next tunes this should move both stages together --
+        # this knob cannot separate them.
+        npm_config_fetch_retries: "0"
+      with:
+        run_install: ${{ inputs.run_install }}
+
+    - name: Back off before retrying pnpm setup
+      if: steps.first.outcome == 'failure'
+      shell: bash
+      run: |
+        # Jitter rather than a fixed sleep. pr.yml fans out eight jobs that each
+        # run this step, so they hit the registry simultaneously and a constant
+        # backoff would just re-synchronise them into a second thundering herd
+        # against a registry that is already struggling.
+        delay=$(( 10 + RANDOM % 16 ))
+        echo "pnpm setup failed; retrying once in ${delay}s (BLO-28813)"
+        sleep "$delay"
+
+    - name: Setup pnpm (retry)
+      id: retry
+      if: steps.first.outcome == 'failure'
+      # No continue-on-error here: a second failure is the job's failure. That
+      # is the intended outcome -- see the pmOnFail note in the header.
+      uses: pnpm/action-setup@v6
+      env:
+        npm_config_fetch_timeout: "120000"
+        npm_config_fetch_retries: "0"
+      with:
+        run_install: ${{ inputs.run_install }}
