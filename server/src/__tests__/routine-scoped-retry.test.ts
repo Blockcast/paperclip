@@ -165,9 +165,11 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
   });
 
   it("abandons every failure inside the final margin of a window", () => {
-    // Ally's 360-case reproduction, inverted. Sweeping the last hour of an open
-    // 6h window minute by minute, the pre-ruling function clamped 60/60 to the
-    // close and abandoned none. The contract is now the stated one.
+    // Ally's 360-case reproduction, inverted. Over this 60-minute sweep the
+    // pre-ruling function clamped 59 cases to exactly the window close and
+    // abandoned only the m=0 boundary, where `failedAt` coincides with the
+    // close and the degenerate already-closed guard happens to fire. Every one
+    // of those 59 was a wake with 0ms of usable window.
     const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
     const decisions = new Set<string>();
     for (let minutesBeforeClose = 0; minutesBeforeClose < 60; minutesBeforeClose += 1) {
