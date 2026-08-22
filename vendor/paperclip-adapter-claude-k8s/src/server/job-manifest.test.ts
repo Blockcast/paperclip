@@ -992,11 +992,15 @@ describe("buildJobManifest", () => {
       expect(apiKeyEntry?.value).toBeUndefined();
     });
 
-    it("stamps x-penstock-session: agent:<name> into ANTHROPIC_CUSTOM_HEADERS", () => {
-      const { job } = buildJobManifest({ ctx, selfPod });
+    it("stamps x-penstock-session: agent:<name> into ANTHROPIC_CUSTOM_HEADERS, via the Secret (BLO-21858)", () => {
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const envList = job.spec?.template?.spec?.containers[0]?.env ?? [];
       const headers = envList.find((e) => e.name === "ANTHROPIC_CUSTOM_HEADERS");
-      expect(headers?.value).toContain("x-penstock-session: agent:");
+      // AC1: never a literal. AC4: the value still reaches the container.
+      expect(headers?.value).toBeUndefined();
+      expect(headers?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(headers?.valueFrom?.secretKeyRef?.key).toBe("ANTHROPIC_CUSTOM_HEADERS");
+      expect(envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain("x-penstock-session: agent:");
     });
 
     it("appends the session header to an existing ANTHROPIC_CUSTOM_HEADERS and respects a manual override", () => {
@@ -1008,8 +1012,9 @@ describe("buildJobManifest", () => {
       const h1 = (r1.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
         (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
       );
-      expect(h1?.value).toContain("X-Custom: 1");
-      expect(h1?.value).toContain("x-penstock-session: agent:");
+      expect(h1?.value).toBeUndefined();
+      expect(r1.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain("X-Custom: 1");
+      expect(r1.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain("x-penstock-session: agent:");
 
       const withOverride = {
         ...ctx,
@@ -1022,7 +1027,8 @@ describe("buildJobManifest", () => {
       const h2 = (r2.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
         (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
       );
-      expect(h2?.value).toBe("x-penstock-session: manual-pin");
+      expect(h2?.value).toBeUndefined();
+      expect(r2.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toBe("x-penstock-session: manual-pin");
     });
 
     it("literal env overrides valueFrom with the same name", () => {
@@ -2093,6 +2099,73 @@ describe("fail-closed sensitive-env guard covers every container on the pod", ()
     expect(podSpec.initContainers!.map((c) => c.name)).toContain("dind");
     // ...and is inside the guard's field of view (it returns clean today).
     expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+  });
+});
+
+/**
+ * BLO-21858 (from the BLO-21593 review of adapter PR #31, probe 6).
+ *
+ * ANTHROPIC_CUSTOM_HEADERS carries arbitrary "Name: value" header lines that
+ * Claude Code forwards on every Anthropic API call, so it can hold a literal
+ * `Authorization:` header — but its name matches none of the six patterns in
+ * SENSITIVE_ENV_NAME_RE, so before this fix it shipped as a literal
+ * env[].value readable through a plain read-only `GET Pod` (BLO-17973).
+ */
+describe("ANTHROPIC_CUSTOM_HEADERS is always Secret-backed (BLO-21858)", () => {
+  const HEADER = "Authorization: Bearer sk-leaked-via-a-header-line";
+
+  it("never ships ANTHROPIC_CUSTOM_HEADERS as a literal env value on any container, even when set via adapterConfig.env", () => {
+    const ctx = makeCtx({ config: { env: { ANTHROPIC_CUSTOM_HEADERS: HEADER } } });
+    const { job, envSecret } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const podSpec = job.spec!.template.spec!;
+    const allContainers = [
+      ...(podSpec.initContainers ?? []),
+      ...(podSpec.containers ?? []),
+      ...((podSpec.ephemeralContainers ?? []) as unknown as typeof podSpec.containers),
+    ];
+
+    // (a) the header text appears in no literal env value on any container.
+    for (const c of allContainers) {
+      for (const e of c.env ?? []) {
+        expect(e.value ?? "").not.toContain("Authorization:");
+        expect(e.value ?? "").not.toContain("sk-leaked-via-a-header-line");
+      }
+    }
+
+    // (b) it is present as a secretKeyRef, and the value still reaches the
+    //     container through the per-Job EnvSecret (AC4 — runs keep working).
+    const entry = podSpec.containers![0].env!.find((e) => e.name === "ANTHROPIC_CUSTOM_HEADERS");
+    expect(entry).toBeDefined();
+    expect(entry!.value).toBeUndefined();
+    expect(entry!.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+    expect(entry!.valueFrom?.secretKeyRef?.key).toBe("ANTHROPIC_CUSTOM_HEADERS");
+    expect(envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain(HEADER);
+  });
+
+  it("is treated as sensitive by name, case-insensitively, despite matching none of the six patterns", () => {
+    // The negative control: it genuinely does not match the regex, so this is
+    // the pinned-name path doing the work, not an accidental substring hit.
+    expect(/(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i.test("ANTHROPIC_CUSTOM_HEADERS")).toBe(false);
+    expect(isSensitiveEnvName("ANTHROPIC_CUSTOM_HEADERS")).toBe(true);
+    expect(isSensitiveEnvName("anthropic_custom_headers")).toBe(true);
+    // Unrelated non-sensitive names stay literal (AC4 — no collateral).
+    expect(isSensitiveEnvName("ANTHROPIC_BASE_URL")).toBe(false);
+    expect(isSensitiveEnvName("ANTHROPIC_MODEL")).toBe(false);
+  });
+
+  it("the fail-closed guard flags a literal ANTHROPIC_CUSTOM_HEADERS if a future code path reintroduces one", () => {
+    // buildJobManifest throws on any non-empty result from this function (see
+    // the "refusing to build Job manifest" throw), so flagging here is the
+    // rejection. Driven off a synthetic spec because the routing above makes
+    // the literal unreachable through buildJobManifest today — which is the
+    // point of a backstop.
+    const podSpec = {
+      initContainers: [{ name: "write-prompt", env: [{ name: "PROMPT_FILE", value: "/tmp/p" }] }],
+      containers: [{ name: "claude", env: [{ name: "ANTHROPIC_CUSTOM_HEADERS", value: HEADER }] }],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual(["claude/ANTHROPIC_CUSTOM_HEADERS"]);
+    expect(findLiteralSensitiveEnvVars(podSpec.containers![0].env ?? [])).toEqual(["ANTHROPIC_CUSTOM_HEADERS"]);
   });
 });
 

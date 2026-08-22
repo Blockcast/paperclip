@@ -416,8 +416,23 @@ export interface McpConfigSecret {
  */
 const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
 
+/**
+ * Names pinned as always-Secret because they carry credential material while
+ * matching none of the patterns above (BLO-21858, from the BLO-21593 review).
+ *
+ * The pattern list is fail-closed against over-matching but fail-*open*
+ * against a credential-carrying variable whose name simply doesn't match.
+ * ANTHROPIC_CUSTOM_HEADERS is the concrete instance: it holds arbitrary
+ * "Name: value" header lines that Claude Code forwards on every Anthropic API
+ * call — including, in principle, a real `Authorization:` line — and it is
+ * writable both by the Penstock session-header stamp below and by
+ * `adapterConfig.env`. Compared upper-cased so it behaves like the
+ * case-insensitive regex.
+ */
+const ALWAYS_SECRET_ENV_NAMES = new Set(["ANTHROPIC_CUSTOM_HEADERS"]);
+
 export function isSensitiveEnvName(name: string): boolean {
-  return SENSITIVE_ENV_NAME_RE.test(name);
+  return ALWAYS_SECRET_ENV_NAMES.has(name.toUpperCase()) || SENSITIVE_ENV_NAME_RE.test(name);
 }
 
 /**
