@@ -9054,6 +9054,7 @@ export function recoveryService(
     result.checked = candidates.length;
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
     const lastCandidate = candidates[candidates.length - 1] ?? null;
+    const cursorBeforeAdvance = resolvedDependencyWakeBackstopCandidateCursor;
     if (useCursor) {
       resolvedDependencyWakeBackstopCandidateCursor =
         result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.id : null;
@@ -9062,6 +9063,11 @@ export function recoveryService(
       logger.warn(
         {
           processed: candidates.length,
+          // Rows remaining BEYOND this page, i.e. deferred to the next tick of
+          // this rotating sweep -- not dropped. `count(*) over()` is evaluated
+          // after the cursor predicate, so this shrinks by `limit` each tick
+          // until the sweep-completion tick logs below.
+          deferredToNextTick: result.candidateLimitSkipped,
           skipped: result.candidateLimitSkipped,
           limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
           nextCursor: useCursor ? resolvedDependencyWakeBackstopCandidateCursor : null,
@@ -9069,6 +9075,24 @@ export function recoveryService(
           blockerIssueId: opts?.blockerIssueId ?? null,
         },
         "issue graph liveness backstop deferred resolved dependency wake candidates past page limit",
+      );
+    } else if (useCursor && cursorBeforeAdvance) {
+      // Sweep-completion signal (BLO-29722). Without this line the drain tick is
+      // silent, so a healthy rotating sweep and a permanently starved tail emit
+      // byte-identical logs -- only the WARN above, forever, at a pinned cursor.
+      // That ambiguity is what made this loop read as starving ~939 candidates
+      // when it was in fact completing a 3-page sweep every ~75s. An operator
+      // (or an alert) can now assert that this line appears at least once per
+      // sweep interval; its absence, with the WARN still firing, is the real
+      // starvation signature.
+      logger.info(
+        {
+          processed: candidates.length,
+          limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+          sweptFromCursor: cursorBeforeAdvance,
+          source,
+        },
+        "issue graph liveness backstop completed resolved dependency wake candidate sweep",
       );
     }
 
@@ -9413,6 +9437,7 @@ export function recoveryService(
     result.checked = candidates.length;
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
     const lastCandidate = candidates[candidates.length - 1] ?? null;
+    const cursorBeforeAdvance = strandedRecoveryWakeBackstopCandidateCursor;
     strandedRecoveryWakeBackstopCandidateCursor =
       result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.actionId : null;
 
@@ -9420,11 +9445,27 @@ export function recoveryService(
       logger.warn(
         {
           processed: candidates.length,
+          // Deferred to the next tick of this rotating sweep, not dropped. See
+          // the sibling comment in the resolved-dependency backstop above.
+          deferredToNextTick: result.candidateLimitSkipped,
           skipped: result.candidateLimitSkipped,
           limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
           nextCursor: strandedRecoveryWakeBackstopCandidateCursor,
         },
         "stranded recovery wake backstop deferred candidates past page limit",
+      );
+    } else if (cursorBeforeAdvance) {
+      // Sweep-completion signal (BLO-29722), same rationale as the sibling
+      // backstop: this loop's 2-page sweep previously logged only its first
+      // page, so 45 consecutive identical WARN lines at a pinned cursor were
+      // indistinguishable from a starved tail. They were a healthy sweep.
+      logger.info(
+        {
+          processed: candidates.length,
+          limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+          sweptFromCursor: cursorBeforeAdvance,
+        },
+        "stranded recovery wake backstop completed candidate sweep",
       );
     }
 
