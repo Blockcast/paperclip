@@ -35,7 +35,7 @@ function review(overrides = {}) {
     id: 1,
     state: "APPROVED",
     commit_id: HEAD,
-    user: { login: "allyblockcast[bot]", type: "Bot" },
+    user: { login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "Bot" },
     body: canonicalBody(),
     ...overrides,
   };
@@ -46,11 +46,11 @@ function canonicalBody(head = HEAD, extra = "") {
 }
 
 function appReview(overrides = {}) {
-  return review({ user: { login: "allyblockcast[bot]", type: "Bot" }, ...overrides });
+  return review({ user: { login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "Bot" }, ...overrides });
 }
 
 function seatReview(overrides = {}) {
-  return review({ user: { login: "allyblockcast", type: "User" }, ...overrides });
+  return review({ user: { login: "allyblockcast", id: ALLY_USER_REVIEWER_ID, type: "User" }, ...overrides });
 }
 
 describe("isAllyLogin", () => {
@@ -79,18 +79,25 @@ describe("Ally review lanes", () => {
     assert.equal(isAllyAppLogin("allyblockcast"), false);
     assert.equal(isAllySeatLogin("allyblockcast"), true);
     assert.equal(isAllySeatLogin("allyblockcast[bot]"), false);
-    assert.equal(isAllyAppReviewer({ login: "allyblockcast[bot]", type: "Bot" }), true);
-    assert.equal(isAllySeatReviewer({ login: "allyblockcast", type: "User" }), true);
-    assert.equal(allyReviewLane({ login: "allyblockcast[bot]", type: "Bot" }), "app");
-    assert.equal(allyReviewLane({ login: "allyblockcast", type: "User" }), "seat");
+    assert.equal(isAllyAppReviewer({ login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "Bot" }), true);
+    assert.equal(isAllySeatReviewer({ login: "allyblockcast", id: ALLY_USER_REVIEWER_ID, type: "User" }), true);
+    assert.equal(allyReviewLane({ login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "Bot" }), "app");
+    assert.equal(allyReviewLane({ login: "allyblockcast", id: ALLY_USER_REVIEWER_ID, type: "User" }), "seat");
   });
 
   it("rejects opposite GitHub account types even when the login matches", () => {
-    assert.equal(isAllyAppReviewer({ login: "allyblockcast[bot]", type: "User" }), false);
-    assert.equal(isAllySeatReviewer({ login: "allyblockcast", type: "Bot" }), false);
-    assert.equal(allyReviewLane({ login: "allyblockcast[bot]", type: "User" }), null);
-    assert.equal(allyReviewLane({ login: "allyblockcast", type: "Bot" }), null);
+    assert.equal(isAllyAppReviewer({ login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "User" }), false);
+    assert.equal(isAllySeatReviewer({ login: "allyblockcast", id: ALLY_USER_REVIEWER_ID, type: "Bot" }), false);
+    assert.equal(allyReviewLane({ login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "User" }), null);
+    assert.equal(allyReviewLane({ login: "allyblockcast", id: ALLY_USER_REVIEWER_ID, type: "Bot" }), null);
     assert.equal(allyReviewLane({ login: "allyblockcast[bot]" }), null);
+  });
+
+  it("requires the immutable REST ID for each canonical reviewer", () => {
+    assert.equal(isAllyAppReviewer({ login: "allyblockcast[bot]", id: 42, type: "Bot" }), false);
+    assert.equal(isAllySeatReviewer({ login: "allyblockcast", id: 42, type: "User" }), false);
+    assert.equal(allyReviewLane({ login: "allyblockcast[bot]", id: 42, type: "Bot" }), null);
+    assert.equal(allyReviewLane({ login: "allyblockcast", id: 42, type: "User" }), null);
   });
 });
 
@@ -311,7 +318,7 @@ describe("findPrViolations", () => {
         seatReview({
           id: 4888299747,
           state: "APPROVED",
-          body: canonicalBody(HEAD, "\nally-verdict: pass"),
+          body: "Approved after an independent review.",
         }),
       ],
     };
@@ -383,7 +390,7 @@ describe("findPrViolations", () => {
         appReview({ id: 1, state: "DISMISSED", body: canonicalBody(OTHER) }),
         seatReview({ id: 2, state: "DISMISSED", body: canonicalBody(OTHER) }),
         appReview({ id: 3 }),
-        seatReview({ id: 4 }),
+        seatReview({ id: 4, body: "Approved after an independent review." }),
       ],
     };
     assert.deepEqual(findPrViolations(pr), []);
@@ -672,6 +679,31 @@ describe("I1 accepts only the protected-merge approval pair", () => {
 
     assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.equal(violations.filter((v) => v.startsWith("I1")).length, 0);
+    assert.equal(violations.filter((v) => v.startsWith("I5")).length, 1);
+  });
+
+  it("reports an unexpected immutable App ID at the runtime guard", () => {
+    const [app, user] = requiredApprovalPair();
+    const reviews = [
+      { ...app, user: { login: ALLY_APP_REVIEWER_LOGIN, id: 42, type: "Bot" } },
+      user,
+    ];
+    const violations = findPrViolations({ number: 1199, headSha: HEAD, reviews });
+
+    assert.equal(violations.filter((v) => v.startsWith("I5")).length, 1);
+    assert.match(violations.find((v) => v.startsWith("I5")) ?? "", /Ally App review 11 uses the canonical login\/type/);
+  });
+
+  it("reports an unexpected immutable User-seat ID at the runtime guard", () => {
+    const [app, user] = requiredApprovalPair();
+    const reviews = [
+      app,
+      { ...user, user: { login: ALLY_USER_REVIEWER_LOGIN, id: 42, type: "User" } },
+    ];
+    const violations = findPrViolations({ number: 1200, headSha: HEAD, reviews });
+
+    assert.equal(violations.filter((v) => v.startsWith("I5")).length, 1);
+    assert.match(violations.find((v) => v.startsWith("I5")) ?? "", /Ally User seat review 12 uses the canonical login\/type/);
   });
 
   it("requires both required identities to submit APPROVED reviews", () => {
