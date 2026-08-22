@@ -1055,6 +1055,11 @@ describe("execute: job creation", () => {
     mockPrepareBundle.mockResolvedValue(makeBundle());
     mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
     mockBatchDeleteJob.mockResolvedValue({});
+    // The real client always returns a Promise, and the secret-cleanup paths
+    // chain .catch() onto it. Left unstubbed these return undefined, so the
+    // cleanup throws a TypeError instead of doing what it says (BLO-21858).
+    mockCoreCreateSecret.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
