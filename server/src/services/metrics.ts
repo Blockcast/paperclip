@@ -118,6 +118,29 @@ export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_r
  */
 export const OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC = "paperclip_overdue_scheduled_retry_oldest_age_seconds";
 /**
+ * Freshness companion for {@link OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC}
+ * (BLO-22094, Ally review on #1184). Exactly the role
+ * {@link QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} plays for the sibling
+ * gauge, and it is load-bearing for the same reason -- more so here, in fact.
+ *
+ * The age gauge is reset-then-set only on the refresh success path, so a
+ * throw leaves the previous per-agent values frozen in the registry while
+ * `/metrics` keeps returning 200. The frozen value is almost always `0`, the
+ * *healthy* reading, which means a dead refresh is indistinguishable from a
+ * healthy fleet on both the dashboard and the alert. That is precisely the
+ * invisible-failure class this whole metric exists to eliminate, so shipping
+ * the detector without its own freshness gate would make the fix for an
+ * unobservable failure itself unobservable.
+ *
+ * A separate gauge from the sibling's rather than a shared one: the two
+ * refreshes run different aggregates against different indexes (0217 for
+ * `status='queued'`, 0224 for the overdue-parked predicate), so a statement
+ * timeout or plan regression can hit one and not the other. Sharing a
+ * freshness signal would let a healthy sibling refresh vouch for a dead one.
+ */
+export const OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_overdue_scheduled_retry_age_metrics_refresh_success";
+/**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
  * (claude_k8s/opencode_k8s/other), `error_bucket` (the fixed reaper failure
@@ -1006,6 +1029,7 @@ let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
+let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -1037,6 +1061,7 @@ function ensureRegistry(): {
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
+  overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -1068,6 +1093,7 @@ function ensureRegistry(): {
     || !githubWorkflowRunConclusion
     || !queuedRunOldestAge
     || !overdueScheduledRetryOldestAge
+    || !overdueScheduledRetryAgeMetricsRefreshSuccess
     || !authRequest
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
@@ -1400,6 +1426,18 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    overdueScheduledRetryAgeMetricsRefreshSuccess = new Gauge({
+      name: OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent overdue-scheduled_retry-age database refresh completed "
+        + "before metrics exposition; 0 when it failed, so stale overdue-parked ages "
+        + "cannot be read as fresh. Separate from "
+        + QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC
+        + " because the two refreshes run different aggregates against different indexes "
+        + "and can fail independently.",
+      registers: [registry],
+    });
+    overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1488,6 +1526,7 @@ function ensureRegistry(): {
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
+    overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
     authRequestCounter: authRequest,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
@@ -1986,6 +2025,17 @@ export function setOverdueScheduledRetryAgeMetrics(
   if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
 }
 
+/**
+ * Mark whether the overdue-scheduled_retry age gauge was refreshed from the
+ * database (BLO-22094). Deliberately separate from
+ * {@link setQueuedRunAgeMetricsRefreshSuccess}: the two refreshes hit
+ * different aggregates behind different indexes, so a healthy sibling refresh
+ * must never vouch for a dead one.
+ */
+export function setOverdueScheduledRetryAgeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().overdueScheduledRetryAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -2117,6 +2167,8 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
   queuedRunOldestAge = null;
+  overdueScheduledRetryOldestAge = null;
+  overdueScheduledRetryAgeMetricsRefreshSuccess = null;
   authRequest = null;
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;

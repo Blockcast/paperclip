@@ -7,7 +7,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
-import { refreshOverdueScheduledRetryAgeMetrics } from "../services/queued-run-age-metrics.js";
+import {
+  refreshOverdueScheduledRetryAgeMetrics,
+  refreshQueuedRunAgeMetrics,
+} from "../services/queued-run-age-metrics.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -217,5 +220,74 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     expect((await renderMetrics()).body).toContain(
       `paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`,
     );
+  });
+
+  it("marks the overdue snapshot stale after a refresh failure without publishing a false zero", async () => {
+    // The reset-then-set only runs on the success path, so a throw leaves the
+    // last per-agent values frozen while /metrics still returns 200. Because
+    // the frozen value is usually 0 -- the HEALTHY reading -- a dead refresh
+    // is otherwise indistinguishable from a quiet fleet. The freshness gauge
+    // is what makes that distinguishable, and the alert is gated on it.
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-08-07T12:00:00.000Z");
+    const scheduledRetryAt = new Date(now.getTime() - 600_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt: scheduledRetryAt,
+      updatedAt: scheduledRetryAt,
+      scheduledRetryAt,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+    });
+    await refreshOverdueScheduledRetryAgeMetrics(db, now);
+    expect((await renderMetrics()).body).toContain(
+      "paperclip_overdue_scheduled_retry_age_metrics_refresh_success 1",
+    );
+
+    const failingDb = {
+      select: () => {
+        throw new Error("simulated overdue-scheduled-retry metric refresh outage");
+      },
+    } as unknown as typeof db;
+    await expect(refreshOverdueScheduledRetryAgeMetrics(failingDb, now)).rejects.toThrow(
+      "simulated overdue-scheduled-retry metric refresh outage",
+    );
+
+    const { body } = await renderMetrics();
+    // Last good age survives -- not overwritten with a synthetic zero.
+    expect(body).toContain(
+      `paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 600`,
+    );
+    expect(body).toContain("paperclip_overdue_scheduled_retry_age_metrics_refresh_success 0");
+  });
+
+  it("tracks freshness independently of the sibling queued-run-age refresh", async () => {
+    // The two refreshes run different aggregates behind different indexes
+    // (0217 for status='queued', 0224 for the overdue-parked predicate), so a
+    // statement timeout or plan regression can hit one alone. A shared
+    // freshness signal would let a healthy sibling vouch for a dead detector,
+    // which is why these are separate gauges and separate alerts.
+    await insertCompanyAndAgent();
+    const now = new Date("2026-08-07T12:00:00.000Z");
+
+    await refreshQueuedRunAgeMetrics(db, now);
+
+    const failingDb = {
+      select: () => {
+        throw new Error("simulated overdue-only outage");
+      },
+    } as unknown as typeof db;
+    await expect(refreshOverdueScheduledRetryAgeMetrics(failingDb, now)).rejects.toThrow(
+      "simulated overdue-only outage",
+    );
+
+    const { body } = await renderMetrics();
+    expect(body).toContain("paperclip_queued_run_age_metrics_refresh_success 1");
+    expect(body).toContain("paperclip_overdue_scheduled_retry_age_metrics_refresh_success 0");
   });
 });

@@ -420,13 +420,48 @@ spec:
           # a bad ccrotate_capacity-contention day (that reason's own p99 was
           # 2528s) cannot false-page; `for:` below only rides out scrape
           # flapping on top of that.
-          expr: max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}
+          #
+          # Gated on the companion freshness gauge, exactly as
+          # PaperclipQueuedRunStranded is above, and load-bearing for a
+          # sharper reason here: refreshOverdueScheduledRetryAgeMetrics only
+          # reset-then-sets on its success path, so a failed refresh freezes
+          # the previous per-agent values while /metrics still returns 200.
+          # The frozen value is almost always 0 -- the HEALTHY reading -- so
+          # an ungated alert would sit silently green on top of a dead
+          # detector, which is the invisible-failure mode this whole alert
+          # exists to eliminate. The gate must live inside the `max by
+          # (agent_id)` because `on(instance)` needs the instance label the
+          # aggregation strips. PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed
+          # below is what pages when the gate closes.
+          expr: max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds and on(instance) (paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}
           for: {{ .Values.prometheusRule.overdueScheduledRetryFor }}
           labels:
             severity: warning
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a scheduled_retry row overdue past its due time for longer than {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}s"
-            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest overdue `scheduled_retry` heartbeat run has been sitting past its due time for {{`{{ $value }}`}}s (BLO-22094). This row is still parked, not dispatched -- it has never even reached the `queued` state PaperclipQueuedRunStranded covers, so the promotion sweep (promoteScheduledRetryRun) either never ran for it or is systematically wedged. Query `select id, agent_id, scheduled_retry_reason, scheduled_retry_attempt, scheduled_retry_at, now() - scheduled_retry_at as overdue_by, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'scheduled_retry' and scheduled_retry_at < now() and agent_id = '{{`{{ $labels.agent_id }}`}}' order by scheduled_retry_at asc limit 10` to find the specific rows. See the runbook to distinguish a wedged promotion sweep from a gate legitimately re-deferring the row (e.g. issue_dependencies_blocked re-defer, which re-arms scheduled_retry_at further out rather than promoting -- that is designed backoff, not a strand)."
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest overdue `scheduled_retry` heartbeat run has been sitting past its due time for {{`{{ $value }}`}}s (BLO-22094). The age is only trusted while paperclip_overdue_scheduled_retry_age_metrics_refresh_success is 1. This row is still parked, not dispatched -- it has never even reached the `queued` state PaperclipQueuedRunStranded covers, so the promotion sweep (promoteScheduledRetryRun) either never ran for it or is systematically wedged. Query `select id, agent_id, scheduled_retry_reason, scheduled_retry_attempt, scheduled_retry_at, now() - scheduled_retry_at as overdue_by, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'scheduled_retry' and scheduled_retry_at < now() and agent_id = '{{`{{ $labels.agent_id }}`}}' order by scheduled_retry_at asc limit 10` to find the specific rows. See the runbook to distinguish a wedged promotion sweep from a gate legitimately re-deferring the row (e.g. issue_dependencies_blocked re-defer, which re-arms scheduled_retry_at further out rather than promoting -- that is designed backoff, not a strand)."
+            runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
+        - alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed
+          # Separate from the overdue alert above for the same reason
+          # PaperclipQueuedRunAgeMetricsRefreshFailed is separate from the
+          # strand alert: a failed refresh means the age gauge is not fresh,
+          # NOT that no row is overdue. Without this, closing the freshness
+          # gate would silently disable the detector.
+          #
+          # Also separate from the sibling's refresh-failed alert rather than
+          # sharing one signal: the two refreshes run different aggregates
+          # behind different indexes (0217 for status='queued', 0224 for the
+          # overdue-parked predicate), so a statement timeout or plan
+          # regression can hit this one alone -- leaving
+          # paperclip_queued_run_age_metrics_refresh_success at 1 while this
+          # gauge is frozen.
+          expr: paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.overdueScheduledRetryAgeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip overdue-scheduled_retry age metric refresh is failing"
+            description: "The most recent /metrics overdue-scheduled_retry-age database refresh failed (BLO-22094), so overdue-parked ages may be stale and PaperclipOverdueScheduledRetry is intentionally gated off. Note this can fail independently of the sibling queued-run-age refresh -- a healthy paperclip_queued_run_age_metrics_refresh_success does not vouch for this one. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty park queue."
             runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}

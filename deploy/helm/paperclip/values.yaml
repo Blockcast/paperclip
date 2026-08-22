@@ -517,6 +517,8 @@ prometheusRule:
   overdueScheduledRetryAgeSeconds: 5400
   # -- Scrape-flap tolerance only (BLO-22094). The ageing lives in overdueScheduledRetryAgeSeconds above; it stacks on top of that threshold rather than testing independently, same reasoning as queuedRunStrandedFor.
   overdueScheduledRetryFor: 5m
+  # -- Alert only after sustained failed refreshes of the overdue-scheduled_retry age gauge (BLO-22094); a one-off failed scrape is logged and retried on the next scrape. Separate from queuedRunAgeMetricsRefreshFailureFor because the two refreshes query different aggregates behind different indexes and can fail independently.
+  overdueScheduledRetryAgeMetricsRefreshFailureFor: 5m
   # -- Runbook for the overdue-scheduled-retry alert, linked from its annotation.
   overdueScheduledRetryRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#overdue-scheduled-retry-blo-22094"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
