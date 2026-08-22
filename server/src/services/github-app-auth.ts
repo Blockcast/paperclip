@@ -532,9 +532,23 @@ export async function githubListIssueCommentsWithTimestamps(input: {
  * already reads both surfaces for the same reason.
  *
  * `PENDING` reviews are skipped: an unsubmitted draft is visible only to its
- * creator and carries no `submitted_at`. Returns null on any unreadable page so
- * callers leave the prior status untouched rather than publishing a verdict
- * from partial history.
+ * creator and carries no `submitted_at`.
+ *
+ * `DISMISSED` reviews are skipped too, and the contrast with
+ * `githubHasReviewerEvidenceForPr` — which deliberately *accepts* them — is the
+ * point rather than an inconsistency (BLO-29711). That function asks whether a
+ * review run happened; a dismissed review still happened. This one supplies the
+ * verdict a merge gate is computed from, and dismissal is precisely an
+ * authorized actor withdrawing a verdict from operation, by hand or via branch
+ * protection's `dismiss_stale_reviews`. GitHub keeps the body but stops counting
+ * it toward `reviewDecision`, so reading it here re-animates a retraction, in
+ * both directions: a dismissed *blocking* review wedges a PR whose only escape
+ * hatch is the dismissal being ignored, and a dismissed *clean* review
+ * dispositions findings it no longer vouches for. Not theoretical —
+ * `Blockcast/paperclip#937` carries six DISMISSED head-attested Ally reviews.
+ *
+ * Returns null on any unreadable page so callers leave the prior status
+ * untouched rather than publishing a verdict from partial history.
  */
 export async function githubListPrReviewsWithTimestamps(input: {
   repoFullName: string;
@@ -559,7 +573,8 @@ export async function githubListPrReviewsWithTimestamps(input: {
       }>;
 
       for (const review of batch) {
-        if ((review.state ?? "").toUpperCase() === "PENDING") continue;
+        const state = (review.state ?? "").toUpperCase();
+        if (state === "PENDING" || state === "DISMISSED") continue;
         if (typeof review.submitted_at !== "string") continue;
         reviews.push({
           login: review.user?.login ?? null,
