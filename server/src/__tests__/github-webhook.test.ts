@@ -3190,7 +3190,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     }));
   });
 
-  it("counts scheduled retries when assigning to the least-loaded active reviewer", async () => {
+  it("counts scheduled retries when assigning to the least-loaded invokable reviewer", async () => {
     const { companyId, agentId: busyReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",
     });
@@ -3250,7 +3250,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
-  it("uses a task-scoped tie-break when active reviewers have equal load", async () => {
+  it("uses a task-scoped tie-break when invokable reviewers have equal load", async () => {
     const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",
     });
@@ -3362,6 +3362,39 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, terminatedReviewerId));
     expect(terminatedRuns).toHaveLength(0);
+  });
+
+  it("assigns a PR review wake to an error-status reviewer with a healthy org chain", async () => {
+    const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, reviewerId));
+
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 978,
+        title: "Wake the reviewer after a recoverable adapter error",
+        body: null,
+        head: { ref: "reviewer-error-status" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-reviewer-error-status")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewerWakeFired).toBe(true);
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId));
+    expect(runs).toEqual([{ agentId: reviewerId, status: "queued" }]);
   });
 
   it("dedupes a replayed reviewer delivery across the whole reviewer pool", async () => {
@@ -3605,6 +3638,148 @@ describeEmbeddedPostgres("github-webhook route", () => {
         repository: { full_name: REPO },
       };
     }
+
+    it("durably retries an initially paused reviewer and recovers when it returns", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 22003;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-initially-paused")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      const retryRows = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+      const retry = (retryRows[0]!.payload as Record<string, any>).prReviewerContendedRetry;
+      expect(retry.availabilityAttempts).toBe(1);
+      expect(typeof retry.unavailableSince).toBe("string");
+      expect(new Date(retry.nextAttemptAt).getTime()).toBeGreaterThan(Date.now());
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const recovered = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 60_000),
+      );
+      expect(recovered).toMatchObject({ recovered: 1, exhausted: 0, superseded: 0 });
+      expect(await runsForTask(taskKey)).toHaveLength(1);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    it("does not retry a paused reviewer whose reporting chain is invalid", async () => {
+      const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const terminatedManagerId = randomUUID();
+      await db.insert(agents).values({
+        id: terminatedManagerId,
+        companyId,
+        name: "Terminated manager",
+        role: "manager",
+        status: "terminated",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db
+        .update(agents)
+        .set({ status: "paused", reportsTo: terminatedManagerId })
+        .where(eq(agents.id, reviewerId));
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+
+      const { body, signature } = signedRequest(openedPayload(22005));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-invalid-paused-reviewer")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(0);
+    });
+
+    it("coalesces duplicate marker requests while the reviewer is paused", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const app = buildApp({
+        prReviewerAgentIds: [reviewerId],
+        prReviewerBotLogin: "allyblockcast[bot]",
+      });
+      const prNumber = 22004;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+      const payload = {
+        action: "created",
+        issue: {
+          number: prNumber,
+          title: "Durable marker request while reviewer is paused",
+          html_url: `https://github.com/${REPO}/pull/${prNumber}`,
+          pull_request: { url: `https://api.github.com/repos/${REPO}/pulls/${prNumber}` },
+          user: { login: "codex" },
+        },
+        comment: {
+          id: 49000022004,
+          body: "<!-- paperclip:review-request -->\n@ally please re-review",
+          html_url: `https://github.com/${REPO}/pull/${prNumber}#issuecomment-49000022004`,
+          user: { login: "allyblockcast[bot]" },
+        },
+        repository: { full_name: REPO },
+      };
+      const { body, signature } = signedRequest(payload);
+      const send = (deliveryId: string) =>
+        request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "issue_comment")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", deliveryId)
+          .set("content-type", "application/json")
+          .send(body);
+
+      const [first, replay] = await Promise.all([
+        send("delivery-blo-21995-marker-paused-1"),
+        send("delivery-blo-21995-marker-paused-2"),
+      ]);
+      expect(first.status).toBe(200);
+      expect(replay.status).toBe(200);
+      expect(first.body.reviewerWakeFired).toBe(false);
+      expect(replay.body.reviewerWakeFired).toBe(false);
+
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 60_000),
+      );
+      expect(await runsForTask(taskKey)).toHaveLength(1);
+      expect(await deliveryCount("queued")).toBe(1);
+    }, 40_000);
 
     it("persists a durable record when the PR scope is contended, then dispatches exactly one wake", async () => {
       __resetMetricsForTest();
