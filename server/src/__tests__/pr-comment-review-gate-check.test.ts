@@ -10,12 +10,14 @@ const h = vi.hoisted(() => ({
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 
 const mockListComments = vi.hoisted(() => vi.fn());
+const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/github-app-auth.js", () => ({
   githubFetchPrHeadSha: mockFetchHeadSha,
   githubListIssueCommentsWithTimestamps: mockListComments,
+  githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
   githubReviewerIdentityMatches: (login: string, configuredLogin: string) => {
     const candidate = login.trim().toLowerCase().replace(/^@/, "");
@@ -50,8 +52,12 @@ beforeEach(() => {
   h.cfg.prCommentReviewGateStatusContext = "review/ally-comment-gate";
   h.cfg.prReviewerBotLogin = "allyblockcast[bot]";
   mockListComments.mockReset();
+  mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
   mockPostStatus.mockReset();
+  // Default both surfaces to empty; each test overrides the one it exercises.
+  mockListComments.mockResolvedValue([]);
+  mockListReviews.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -137,4 +143,56 @@ describe("runPrCommentReviewGateCheck", () => {
     await Promise.all([first, second]);
     expect(events).toEqual(["fetch", "post", "fetch", "post"]);
   });
+
+  // BLO-29711: Ally files its consolidated review as a COMMENTED
+  // pull_request_review, not an issue comment. Measured over the 25 most recent
+  // PRs in this repo: 33 of 33 consolidated reviews were reviews-API objects and
+  // zero were issue comments. A gate reading only issue comments therefore never
+  // observed a review, and published a green not-evaluated verdict every time.
+  it("reads the reviews surface, where Ally actually files its review", async () => {
+    mockListComments.mockResolvedValue([]);
+    mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+    expect(mockListReviews).toHaveBeenCalledWith({
+      repoFullName: TARGET.repoFullName,
+      prNumber: TARGET.prNumber,
+    });
+  });
+
+  it("merges both surfaces by chronology rather than preferring one", async () => {
+    // A blocking review on the reviews surface, superseded by a later clean
+    // issue comment for the same head. Newest attestation wins regardless of
+    // which surface carried it.
+    mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "clean" },
+    });
+  });
+
+  it("leaves the prior status untouched when the reviews surface cannot be read", async () => {
+    // Half the history is not a verdict. Symmetric with the issue-comment path.
+    mockListComments.mockResolvedValue([]);
+    mockListReviews.mockResolvedValue(null);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
+      posted: false,
+      reason: "fetch_failed",
+    });
+    expect(mockPostStatus).not.toHaveBeenCalled();
+  }, 10_000);
 });

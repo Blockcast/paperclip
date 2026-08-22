@@ -1,10 +1,15 @@
 /**
  * Merge-visible gate for Ally's comment-shaped PR reviews (BLO-21907).
  *
- * GitHub considers only formal pull_request_review objects for reviewDecision.
- * Ally must emit a plain PR comment when it cannot formally review its own
- * App-authored pull request, so Critical/Important findings on that surface
- * otherwise have no effect on merge eligibility.
+ * GitHub considers only APPROVED/CHANGES_REQUESTED pull_request_review objects
+ * for reviewDecision. Ally reviews its own App-authored pull requests, which it
+ * cannot formally approve or request changes on, so its Critical/Important
+ * findings otherwise have no effect on merge eligibility.
+ *
+ * "Comment-shaped" is about the *review state*, not the API surface. Ally
+ * carries that review as either a `COMMENTED` pull_request_review or a plain
+ * issue comment, and both are read here — reading only issue comments left this
+ * gate unable to observe any real review (BLO-29711).
  */
 import { loadConfig } from "../config.js";
 import {
@@ -15,6 +20,7 @@ import {
 import {
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
+  githubListPrReviewsWithTimestamps,
   githubPostCommitStatusDetailed,
   githubReviewerIdentityMatches,
   type GitHubCommitStatusPostResult,
@@ -340,14 +346,28 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
-  const comments = await withBoundedRetry(
-    () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
-    (result) => result == null,
-  );
-  if (comments == null) return { posted: false, reason: "fetch_failed" };
+  // Both surfaces, because Ally uses whichever is available to it: a
+  // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
+  // comment. Measured over the 25 most recent PRs in this repo, 33 of 33
+  // consolidated reviews were reviews-API objects and none were issue
+  // comments, so reading only the latter made this gate structurally unable to
+  // observe a review (BLO-29711). Either surface failing to read leaves the
+  // prior status untouched rather than publishing a verdict from half the
+  // history.
+  const [issueComments, prReviews] = await Promise.all([
+    withBoundedRetry(
+      () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+      (result) => result == null,
+    ),
+    withBoundedRetry(
+      () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+      (result) => result == null,
+    ),
+  ]);
+  if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
   const verdict = evaluateCommentReviewGate({
-    comments: comments.map((comment) => ({
+    comments: [...issueComments, ...prReviews].map((comment) => ({
       authorLogin: comment.login,
       body: comment.body,
       createdAt: comment.createdAt,

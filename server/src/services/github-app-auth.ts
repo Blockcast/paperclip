@@ -632,6 +632,62 @@ export async function githubListIssueCommentsWithTimestamps(input: {
   }
 }
 
+/**
+ * Fetch the submitted-review history for the comment-review gate.
+ *
+ * Ally emits its consolidated review as a `pull_request_review` in the
+ * `COMMENTED` state, not as an issue comment (BLO-29711). `COMMENTED` reviews
+ * are invisible to GitHub's `reviewDecision`, which is exactly why the gate
+ * exists — but they live on `/pulls/{n}/reviews`, so a gate reading only
+ * `/issues/{n}/comments` never observes one. `githubHasReviewerEvidenceForPr`
+ * already reads both surfaces for the same reason.
+ *
+ * `PENDING` reviews are skipped: an unsubmitted draft is visible only to its
+ * creator and carries no `submitted_at`. Returns null on any unreadable page so
+ * callers leave the prior status untouched rather than publishing a verdict
+ * from partial history.
+ */
+export async function githubListPrReviewsWithTimestamps(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const reviews: Array<{ login: string | null; body: string; createdAt: string }> = [];
+
+  try {
+    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
+      const response = await ghFetch(url, { headers });
+      if (!response.ok) return null;
+      const batch = (await response.json()) as Array<{
+        user?: { login?: string | null } | null;
+        body?: string | null;
+        state?: string | null;
+        submitted_at?: string | null;
+      }>;
+
+      for (const review of batch) {
+        if ((review.state ?? "").toUpperCase() === "PENDING") continue;
+        if (typeof review.submitted_at !== "string") continue;
+        reviews.push({
+          login: review.user?.login ?? null,
+          body: review.body ?? "",
+          createdAt: review.submitted_at,
+        });
+      }
+
+      if (batch.length < 100) return reviews;
+      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
+    }
+    return reviews;
+  } catch {
+    return null;
+  }
+}
+
 export type GitHubCommitStatusState = "error" | "failure" | "pending" | "success";
 
 export type GitHubCommitStatusPostResult =
