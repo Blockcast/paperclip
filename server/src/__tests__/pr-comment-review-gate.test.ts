@@ -161,6 +161,26 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
   });
 
+  it("does not mistake a prior-head disposition ledger for a new finding", () => {
+    // Shape taken from a real Ally re-review (PR #1441 @d7cdeb75): the body
+    // dispositions earlier findings by head and severity while reporting zero
+    // open issues. Counting those bullets as findings would make every
+    // re-review permanently blocking.
+    const body = reviewBody(CURRENT_HEAD, [
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — the terminator is gone.`,
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — the assertion is back.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(body, "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
   it("reports not_evaluated rather than clean when nothing attests the head", () => {
     const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
 
