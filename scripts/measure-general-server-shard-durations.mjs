@@ -78,6 +78,16 @@ export function selectTargetFiles({ allFiles, durations, all, shardIndex, shardC
 // positive evidence of a non-run -- an absent `assertionResults` or `status`
 // (reporter shape drift) keeps the entry, because a guard that could silently
 // empty the manifest would be worse than the bug it closes.
+//
+// Known cost of that direction: a suite that legitimately registers no tests
+// -- everything behind a `describe.skip`, or a runtime condition never met in
+// CI -- is indistinguishable from a collection error here and is skipped the
+// same way. It therefore never acquires a manifest entry and stays on
+// check-shard-manifest-freshness's missing list permanently, which no refresh
+// run can clear. That is intentional (a zero-test suite costs ~0s, so the
+// median default it falls back to is harmless), but it means a name that
+// never leaves the missing list is a signal to go look at the suite, not a
+// sign the refresh workflow is broken.
 export function parseVitestJsonReport(reportText, repoRoot) {
   const report = JSON.parse(reportText);
   const measured = {};

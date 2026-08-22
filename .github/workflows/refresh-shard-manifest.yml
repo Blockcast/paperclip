@@ -74,11 +74,34 @@ jobs:
 
   refresh:
     needs: [measure]
+    # Not a bare `needs:`. With fail-fast: false across four shards, a single
+    # infra failure in one shard would otherwise skip the merge and leave the
+    # manifest un-refreshed for the whole week -- discarding three good
+    # quarters to punish one bad one. The merge is safe against partial input
+    # by construction: it spreads `measured` over the existing `durations`, so
+    # an absent quarter keeps its previous values, and the prune is keyed on
+    # the on-disk suite set rather than the measured set so it cannot delete
+    # them. If all four shards fail there is nothing to download and this job
+    # fails loudly, which is the right outcome for a total measurement loss.
+    if: ${{ !cancelled() }}
     runs-on: default
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
+      # For the stall alarm's actions/runs read at the end of this job.
+      actions: read
+    env:
+      # BLO-25515/BLO-24150: a GITHUB_TOKEN-authored push/PR gets its own
+      # workflow runs quarantined behind `action_required` -- or, per
+      # BLO-24150's later occurrence, never queued at all -- once the merge
+      # queue is the only merge path. A weekly manifest PR that can never pass
+      # checks never merges, so the manifest never refreshes and this
+      # workflow's entire reason to exist quietly stops holding. Blockcast
+      # provisions this key; if a fork doesn't, the steps that need it degrade
+      # to github.token rather than failing the job, and the stall alarm below
+      # reports the resulting quarantine by name instead of leaving it silent.
+      COMMITPERCLIP_ENABLED: ${{ secrets.COMMITPERCLIP_KEY != '' }}
 
     steps:
       - name: Checkout repository
@@ -96,6 +119,19 @@ jobs:
         with:
           node-version: 24
 
+      # No `pnpm install` needed ahead of this: get-bot-token.mjs imports only
+      # node: builtins, same as the merge script below.
+      - name: Generate commitperclip token
+        id: bot-token
+        if: env.COMMITPERCLIP_ENABLED == 'true'
+        run: |
+          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          echo "::add-mask::$TOKEN"
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          COMMITPERCLIP_APP_ID: ${{ vars.COMMITPERCLIP_APP_ID }}
+
       - name: Merge shards into the manifest
         env:
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -105,7 +141,11 @@ jobs:
       - name: Create or update pull request
         id: upsert-pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          # BLO-25515: push and PR creation must use the App token (falling
+          # back to github.token only when COMMITPERCLIP_KEY isn't provisioned)
+          # so this PR's checks are not attributed to GITHUB_TOKEN -- that
+          # attribution is what quarantines the bot's own workflow runs.
+          GH_TOKEN: ${{ steps.bot-token.outputs.value || github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           if git diff --quiet -- scripts/general-server-shard-durations.json; then
@@ -121,7 +161,11 @@ jobs:
           git checkout -B "$BRANCH"
           git add scripts/general-server-shard-durations.json
           git commit -m "ci: refresh general-server shard durations"
-          git push --force origin "$BRANCH"
+          # Push through an explicit x-access-token URL rather than the
+          # `origin` remote actions/checkout wired up: that remote's stored
+          # credential is always github.token, which would silently undo the
+          # point of GH_TOKEN above.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
 
           pr_url="$(
             gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
@@ -138,3 +182,47 @@ jobs:
             echo "PR already exists: $pr_url"
           fi
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      # BLO-25515/BLO-24150, ported from refresh-lockfile.yml:161. Unlike that
+      # workflow this one deliberately does not merge its own PR -- a duration
+      # manifest is worth a human skim first. That makes the GITHUB_TOKEN
+      # quarantine *quieter* here, not less damaging: there is no `--auto`
+      # merge left visibly waiting, just a PR sitting with no checks until
+      # someone eventually wonders why the manifest went stale again. Silence
+      # is exactly the failure mode this workflow exists to remove, so make it
+      # loud. Both observed shapes are covered: runs parked in
+      # `action_required`, and BLO-24150's later occurrence (#1237, #1240)
+      # where zero runs are queued at all.
+      - name: Alert if the refresh PR got no CI
+        if: steps.upsert-pr.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr_url="${{ steps.upsert-pr.outputs.pr_url }}"
+          head_sha="$(gh pr view "$pr_url" --json headRefOid --jq .headRefOid)"
+
+          # Runs are queued asynchronously after the push, so a zero count read
+          # immediately after `gh pr create` means "too early", not "stalled".
+          # Poll first, otherwise this alarm cries wolf every single Monday and
+          # becomes the thing people learn to ignore.
+          action_required_count=0
+          total_run_count=0
+          for _ in $(seq 1 8); do
+            runs_json="$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$head_sha&per_page=50")"
+            total_run_count="$(printf '%s' "$runs_json" | jq '.workflow_runs | length')"
+            action_required_count="$(printf '%s' "$runs_json" | jq '[.workflow_runs[] | select(.status == "action_required")] | length')"
+            if [ "${total_run_count:-0}" -gt 0 ]; then
+              break
+            fi
+            sleep 15
+          done
+
+          if [ "${action_required_count:-0}" -gt 0 ]; then
+            gh pr comment "$pr_url" --body "🚨 **Weekly shard-manifest refresh is stalled on a human approval gate (BLO-24150/BLO-25515).** \`$action_required_count\` workflow run(s) on this commit are sitting in \`action_required\`, so this PR's checks cannot start until someone clicks *Approve and run* (Actions tab → this PR → pending runs). Until then the PR cannot merge and \`scripts/general-server-shard-durations.json\` keeps drifting — which is the exact depends-on-a-human-noticing failure this workflow exists to remove (BLO-24241). Most likely cause: \`COMMITPERCLIP_KEY\` is not provisioned, so the push fell back to \`GITHUB_TOKEN\`."
+            echo "Posted stall alert: $action_required_count run(s) awaiting approval."
+          elif [ "${total_run_count:-0}" -eq 0 ]; then
+            gh pr comment "$pr_url" --body "🚨 **Weekly shard-manifest refresh opened a PR with zero workflow runs (BLO-24150/BLO-25515).** No workflow runs are recorded for \`$head_sha\` after ~2 minutes of polling, so this PR's required checks will never report and it can never merge. This is the same class of stall as \`action_required\`, just without a run object to click approve on. Check the Actions tab for this PR; if nothing is queued, verify \`COMMITPERCLIP_KEY\`/\`COMMITPERCLIP_APP_ID\` are still provisioned (a \`GITHUB_TOKEN\`-authored push does not trigger workflows), then re-run *Refresh Shard Manifest* via workflow_dispatch. Until resolved, \`scripts/general-server-shard-durations.json\` keeps drifting — see https://paperclip.blockcast.net/BLO/issues/BLO-24241."
+            echo "Posted stall alert: zero workflow runs recorded for $head_sha."
+          else
+            echo "Refresh PR has CI running normally (action_required=$action_required_count, total_runs=$total_run_count) — no stall signature."
+          fi
