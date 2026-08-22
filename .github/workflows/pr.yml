@@ -673,6 +673,39 @@ jobs:
             exit 1
           fi
 
+      # Guards the "Current version" row against the same drift, which the hash
+      # above structurally cannot catch: PROVENANCE.md is excluded from it, so a
+      # version bump updates package.json + package-lock.json, changes the hash,
+      # and still leaves the recorded identity stale with CI green. That is
+      # exactly what happened on #1459 (doc said -blockcast.2, package said .3),
+      # caught by a reviewer rather than by this job. PROVENANCE.md is the stated
+      # source of truth for which release is in the tree, so a wrong value here
+      # misdirects the next audit or incident response.
+      - name: Verify provenance version
+        run: |
+          set -euo pipefail
+          doc=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
+          if [ -z "$doc" ]; then
+            echo "::error::No 'Current version' row found in PROVENANCE.md."
+            exit 1
+          fi
+          # The lockfile carries the version twice and npm ci does not compare
+          # either copy against package.json, so both are checked explicitly.
+          pkg=$(node -p 'require("./package.json").version')
+          lock=$(node -p 'require("./package-lock.json").version')
+          lock_self=$(node -p 'require("./package-lock.json").packages[""].version')
+          echo "PROVENANCE.md:              $doc"
+          echo "package.json:               $pkg"
+          echo "package-lock.json:          $lock"
+          echo "package-lock.json packages: $lock_self"
+          for found in "$pkg" "$lock" "$lock_self"; do
+            if [ "$found" != "$doc" ]; then
+              echo "::error::Version drift in the vendored tree: PROVENANCE.md records $doc but a manifest says $found."
+              echo "Set the same version in package.json, package-lock.json (both copies), and the 'Current version' row of PROVENANCE.md."
+              exit 1
+            fi
+          done
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the four general-server matrix jobs,
