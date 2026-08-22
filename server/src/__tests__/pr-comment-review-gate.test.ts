@@ -7,6 +7,7 @@ import {
 
 const OLD_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CURRENT_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const INTERMEDIATE_HEAD = "cccccccccccccccccccccccccccccccccccccccc";
 const ALLY_BOT_LOGIN = "allyblockcast[bot]";
 
 function reviewBody(headSha: string, lines: string[]): string {
@@ -92,6 +93,72 @@ describe("evaluateCommentReviewGate", () => {
     });
 
     expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("keeps carrying a finding when the clean review attests a different head", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(cleanReview(INTERMEDIATE_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    // A(blocking) -> B(clean) -> C(unattested). B's clean review examined a
+    // different tree, so it does not disposition A's finding: comment
+    // chronology is not commit ancestry. Reading only the globally newest
+    // attestation dropped A silently.
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+      expect(verdict.commentCreatedAt).toBe("2026-08-04T20:09:19.000Z");
+    }
+  });
+
+  it("carries the newest of several undispositioned heads", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(blockingReview(INTERMEDIATE_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(INTERMEDIATE_HEAD);
+    }
+  });
+
+  it("still clears when every attested head was re-reviewed clean", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(blockingReview(INTERMEDIATE_HEAD), "2026-08-04T20:39:19Z"),
+        allyComment(cleanReview(OLD_HEAD), "2026-08-04T21:09:19Z"),
+        allyComment(cleanReview(INTERMEDIATE_HEAD), "2026-08-04T21:39:19Z"),
+      ],
+    });
+
+    // Per-head disposition must not become a ratchet that no clean review can
+    // release: each head's own newest attestation is clean here.
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("lets a clean review of the current head disposition every earlier finding", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(blockingReview(INTERMEDIATE_HEAD), "2026-08-04T20:39:19Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    // Ally examined the exact tree being merged and found nothing. That is the
+    // strongest evidence available, so it releases the carry.
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
   });
 
   it("reports not_evaluated rather than clean when nothing attests the head", () => {

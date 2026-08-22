@@ -89,15 +89,15 @@ interface AttestingComment {
 }
 
 /**
- * Latest Ally consolidated-review comment carrying exactly one head
- * attestation, optionally restricted to one head. Comments with an absent or
- * ambiguous attestation are skipped: a required check must not be set from a
- * guess about which head was examined.
+ * Latest Ally consolidated-review comment attesting exactly one head, matching
+ * the requested head. Comments with an absent or ambiguous attestation are
+ * skipped: a required check must not be set from a guess about which head was
+ * examined.
  */
 function latestAttestingAllyComment(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
-  matchHeadSha: string | null,
+  matchHeadSha: string,
 ): AttestingComment | null {
   let latest: AttestingComment | null = null;
   let latestTime = -Infinity;
@@ -106,7 +106,7 @@ function latestAttestingAllyComment(
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
     const attestedHeadSha = extractAllyReviewedHeadSha(comment.body);
     if (!attestedHeadSha) continue;
-    if (matchHeadSha !== null && attestedHeadSha !== matchHeadSha) continue;
+    if (attestedHeadSha !== matchHeadSha) continue;
 
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
@@ -118,6 +118,48 @@ function latestAttestingAllyComment(
     }
   }
   return latest;
+}
+
+/**
+ * Heads whose own newest attestation still carries an unresolved finding,
+ * newest attestation first.
+ *
+ * Disposition is tracked per attested head, not by global comment recency. A
+ * later clean attestation of head H disposes a finding raised against H: Ally
+ * re-examined that exact tree and found nothing. A clean attestation of some
+ * *other* head does not, because nothing available here establishes that the
+ * other head contains the fix — comment chronology is not commit ancestry, and
+ * reviews can land out of order relative to pushes.
+ *
+ * Reading only the globally newest attestation instead let A(blocking) ->
+ * B(clean) -> C(unattested) drop A's finding silently (BLO-29711, Ally review
+ * of #1464).
+ */
+function headsWithUndispositionedFinding(
+  comments: CommentReviewGateComment[],
+  reviewerBotLogin: string,
+): AttestingComment[] {
+  const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
+
+  for (const comment of comments) {
+    if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
+    const attestedHeadSha = extractAllyReviewedHeadSha(comment.body);
+    if (!attestedHeadSha) continue;
+    const commentTime = toEpochMs(comment.createdAt);
+    if (!Number.isFinite(commentTime)) continue;
+
+    const existing = newestPerHead.get(attestedHeadSha);
+    // Ties prefer the later item, matching latestAttestingAllyComment: the
+    // comment endpoint is chronological but its timestamps are second-resolution.
+    if (!existing || commentTime >= existing.timeMs) {
+      newestPerHead.set(attestedHeadSha, { attesting: { comment, attestedHeadSha }, timeMs: commentTime });
+    }
+  }
+
+  return [...newestPerHead.values()]
+    .filter((entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body))
+    .sort((a, b) => b.timeMs - a.timeMs)
+    .map((entry) => entry.attesting);
 }
 
 /**
@@ -163,19 +205,21 @@ export function evaluateCommentReviewGate(input: {
 
   // Nothing attests this head. A finding raised against an earlier head is not
   // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). It clears the moment Ally attests the current head
-  // — which the push that produced this head already triggers — so this cannot
-  // wedge a PR that keeps being reviewed on the same surface.
-  const latestAttestation = latestAttestingAllyComment(comments, reviewerBotLogin, null);
-  if (latestAttestation && hasActionablePrReviewFeedback(latestAttestation.comment.body)) {
+  // going green (BLO-29711). Only a later clean review of that same earlier
+  // head disposes it — see headsWithUndispositionedFinding. It clears the
+  // moment Ally attests the current head, which the push that produced this
+  // head already triggers, so this cannot wedge a PR that keeps being reviewed
+  // on the same surface.
+  const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
+  if (carried) {
     return {
       state: "failure",
       outcome: "carried_finding",
       reason:
-        `An unresolved finding from Ally's review of ${latestAttestation.attestedHeadSha.slice(0, 7)} ` +
+        `An unresolved finding from Ally's review of ${carried.attestedHeadSha.slice(0, 7)} ` +
         "is still undispositioned; no comment attests the current head.",
-      commentCreatedAt: new Date(toEpochMs(latestAttestation.comment.createdAt)).toISOString(),
-      carriedFromHeadSha: latestAttestation.attestedHeadSha,
+      commentCreatedAt: new Date(toEpochMs(carried.comment.createdAt)).toISOString(),
+      carriedFromHeadSha: carried.attestedHeadSha,
     };
   }
 
