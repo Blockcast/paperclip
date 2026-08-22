@@ -117,6 +117,51 @@ describe("parseCpuQuantityToMillicores", () => {
   });
 });
 
+// Pure — no database, so this arm runs on every host.
+describe("numberFromEnv (liveness tunable parsing)", () => {
+  const ENV_NAME = "PAPERCLIP_K8S_AGENT_POD_BUSY_CPU_MILLICORES";
+
+  afterEach(() => {
+    delete process.env[ENV_NAME];
+  });
+
+  it("falls back to the default instead of producing NaN from a malformed value", async () => {
+    const { numberFromEnv } = await import("../services/k8s-job-liveness.js");
+    // The regression: `Math.max(1, Number("abc"))` is NaN, so every
+    // `millicores >= threshold` test would be false, every pod would classify
+    // "idle", and the reaper would kill live subprocesses — the exact failure
+    // this module exists to prevent. A bad value must never disarm the probe.
+    for (const bad of ["abc", "", "   ", "12x", "NaN", "Infinity", "-5", "0"]) {
+      process.env[ENV_NAME] = bad;
+      const threshold = numberFromEnv(ENV_NAME, 100, 1);
+      expect(threshold).toBe(100);
+      expect(Number.isFinite(threshold)).toBe(true);
+      // A busy pod must still read as busy under a rejected override.
+      expect(500 >= threshold).toBe(true);
+    }
+  });
+
+  it("honours a valid override and an unset variable", async () => {
+    const { numberFromEnv } = await import("../services/k8s-job-liveness.js");
+    delete process.env[ENV_NAME];
+    expect(numberFromEnv(ENV_NAME, 100, 1)).toBe(100);
+    process.env[ENV_NAME] = "250";
+    expect(numberFromEnv(ENV_NAME, 100, 1)).toBe(250);
+    process.env[ENV_NAME] = " 250 ";
+    expect(numberFromEnv(ENV_NAME, 100, 1)).toBe(250);
+  });
+
+  it("accepts 0 only where 0 is meaningful, via the minimum argument", async () => {
+    const { numberFromEnv } = await import("../services/k8s-job-liveness.js");
+    process.env[ENV_NAME] = "0";
+    // Cache TTL: 0 legitimately disables caching, so minimum 0 keeps it.
+    expect(numberFromEnv(ENV_NAME, 10_000, 0)).toBe(0);
+    // CPU threshold: 0m would classify every pod busy forever, so minimum 1
+    // rejects it back to the default.
+    expect(numberFromEnv(ENV_NAME, 100, 1)).toBe(100);
+  });
+});
+
 describeEmbeddedPostgres("hard-stale reaper respects live subprocesses (BLO-20251)", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;

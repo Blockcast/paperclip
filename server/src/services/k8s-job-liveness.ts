@@ -66,6 +66,32 @@ const FAILURE_LOG_TAIL_MAX_BYTES = Math.max(
   Number(process.env.PAPERCLIP_K8S_FAILURE_LOG_TAIL_MAX_BYTES ?? "16384"),
 );
 
+// BLO-20251 (Ally review) — a malformed override must not silently disarm the
+// liveness probe. `Number("abc")` is NaN, and NaN survives Math.max, so the
+// older `Math.max(1, Number(env))` shape yielded a NaN threshold; every
+// `millicores >= NaN` comparison is then false, every sampled pod classifies as
+// "idle", and the hard-stale reaper kills exactly the live subprocesses this
+// module exists to protect. Fail closed onto the documented default instead,
+// mirroring how parseCpuQuantityToMillicores rejects a non-finite magnitude
+// rather than guessing.
+//
+// Falls back rather than throwing: these are background-reaper tunables read at
+// import time, and a typo in a deployment value should not take the whole API
+// server down. Exported for unit testing, like parseCpuQuantityToMillicores.
+export function numberFromEnv(name: string, fallback: number, minimum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw.trim());
+  if (!Number.isFinite(parsed) || parsed < minimum) {
+    logger.warn(
+      { env: name, value: redactSensitiveText(raw), fallback },
+      "invalid k8s liveness tunable; falling back to default",
+    );
+    return fallback;
+  }
+  return parsed;
+}
+
 // BLO-20251 — subprocess liveness for the hard-stale reaper.
 //
 // WHY POD CPU, and not the alternatives:
@@ -103,9 +129,11 @@ const FAILURE_LOG_TAIL_MAX_BYTES = Math.max(
 // 8-26m, agents running real subprocesses at 148-2979m. 100m sits in that gap.
 // Being wrong in the "busy" direction only DELAYS the kill to the absolute
 // ceiling enforced by the caller, so the conservative choice is the safe one.
-const AGENT_POD_BUSY_CPU_MILLICORES = Math.max(
+const AGENT_POD_BUSY_CPU_MILLICORES = numberFromEnv(
+  "PAPERCLIP_K8S_AGENT_POD_BUSY_CPU_MILLICORES",
+  100,
+  // A 0m threshold would classify every pod busy forever, so the floor is 1m.
   1,
-  Number(process.env.PAPERCLIP_K8S_AGENT_POD_BUSY_CPU_MILLICORES ?? "100"),
 );
 
 // One namespace-wide PodMetrics read serves every hard-stale candidate in a
@@ -113,9 +141,11 @@ const AGENT_POD_BUSY_CPU_MILLICORES = Math.max(
 // re-read, but a tick with 20 stale candidates still makes a single call.
 // metrics-server itself only refreshes every ~15s, so a finer TTL would buy
 // nothing but load.
-const AGENT_POD_METRICS_CACHE_TTL_MS = Math.max(
+const AGENT_POD_METRICS_CACHE_TTL_MS = numberFromEnv(
+  "PAPERCLIP_K8S_AGENT_POD_METRICS_CACHE_TTL_MS",
+  10_000,
+  // 0 is meaningful here: it disables the cache (every probe re-reads).
   0,
-  Number(process.env.PAPERCLIP_K8S_AGENT_POD_METRICS_CACHE_TTL_MS ?? "10000"),
 );
 
 export type AgentJobRunStatus = {
