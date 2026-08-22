@@ -75,6 +75,7 @@ import {
   removeWatch,
   listWatches,
   checkWatches,
+  WatchesAlreadyDeliveredError,
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
 import { resolveSlackUserId } from "./user-mapping.js";
@@ -1228,16 +1229,31 @@ const WATCH_QUEUE_MAX = 100;
  * An unguarded re-queue therefore rethrows on exactly the occasions it exists to
  * handle, and the batch is gone (BLO-28764).
  *
- * Two distinct outcomes, both bounded here rather than escaping to the caller:
+ * **Delivery guarantee: at-most-once, and it is the re-queue condition that
+ * makes it true — not the absence of a retry.** The watch-registry calls that
+ * are `checkWatches`'s only escaping failures sit on *both* sides of the paid
+ * side effects: the registry read precedes them, the registry write follows
+ * them. Re-queueing on the second kind restores a batch whose agents have
+ * already been invoked and whose Slack messages have already been posted, so
+ * the next tick pays for them again. That is at-least-once on a path that
+ * spends money, and it is reachable from a telemetry blip alone
+ * (BLO-29663, Ally on #1374).
+ *
+ * So `checkWatches` distinguishes the two and this function re-queues only the
+ * first. Three outcomes, all bounded here rather than escaping to the caller:
  *
  * - Backend unhealthy for the whole tick: the swap's `set([])` fails too, so the
  *   queue is never emptied and the batch survives untouched. Nothing is lost.
- * - Backend completes the swap and then fails: the batch cannot be written back
- *   to a store that is refusing writes. It is unrecoverable, so it is logged at
- *   `error` with the company id and the event count instead of vanishing
- *   silently. Holding it in memory for the next tick would preserve it at the
- *   cost of duplicate delivery if the rejected `set` actually landed; that is a
- *   deliberate at-most-once choice, not an oversight.
+ * - Swap completed, then failure *before* anything was delivered: nothing has
+ *   been paid for, so the batch is re-queued ahead of whatever arrived
+ *   meanwhile and retried on the next tick.
+ * - Swap completed, then failure *after* delivery
+ *   (`WatchesAlreadyDeliveredError`): the batch is deliberately **not**
+ *   re-queued. Any of its events that had not yet matched a watch are lost, and
+ *   that is the price of the guarantee — logged at `error` with the company id,
+ *   the delivered count and the event count, never silently. Retrying instead
+ *   would duplicate real agent invocations and real Slack posts, which is the
+ *   larger harm and the one the caller cannot undo.
  */
 async function drainAndCheckWatches(
   ctx: PluginContext,
@@ -1267,6 +1283,22 @@ async function drainAndCheckWatches(
   try {
     await checkWatches(ctx, token, companyId, recentEvents);
   } catch (err) {
+    if (err instanceof WatchesAlreadyDeliveredError) {
+      // Agents were invoked and Slack was posted to before this threw. The
+      // batch is unrecoverable by design: re-queueing it would buy back the
+      // undelivered tail at the price of duplicating everything already
+      // delivered (BLO-29663).
+      ctx.logger.error(
+        "check-watches failed after delivering; batch dropped rather than re-queued to avoid duplicate agent invocations",
+        {
+          companyId,
+          deliveredCount: err.delivered,
+          droppedEventCount: recentEvents.length,
+          err: err.cause ?? err,
+        },
+      );
+      return;
+    }
     try {
       await withStateLock(watchQueueLockKey(companyId), async () => {
         const currentRaw = await ctx.state.get(queueKey);
@@ -1277,6 +1309,20 @@ async function drainAndCheckWatches(
         // block is to preserve the drained batch, and `slice(-N)` would discard
         // precisely that in favour of whatever arrived during the failed run.
         const restored = [...recentEvents, ...current];
+        if (restored.length > WATCH_QUEUE_MAX) {
+          // The one case where the cap actually bites, and it bites hardest
+          // here: a full re-queue discards everything that arrived during the
+          // failed run. Silent truncation at a known-lossy point reads as
+          // "nothing was dropped" (BLO-29663).
+          ctx.logger.warn(
+            "re-queued watch batch exceeds the queue cap; dropping the newest events",
+            {
+              companyId,
+              droppedEventCount: restored.length - WATCH_QUEUE_MAX,
+              queueMax: WATCH_QUEUE_MAX,
+            },
+          );
+        }
         await ctx.state.set(queueKey, restored.slice(0, WATCH_QUEUE_MAX));
       });
       ctx.logger.error(
