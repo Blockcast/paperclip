@@ -27,13 +27,19 @@ export function withStateLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const previous = chains.get(lockKey) ?? Promise.resolve();
-  // Run `fn` whether the previous holder resolved or rejected: one caller's
-  // failure must not wedge the key for everyone behind it.
+  // One caller's failure must not wedge the key for everyone behind it. That
+  // property is enforced *below*, by storing `settled` rather than `run`: what
+  // a waiter chains onto therefore never rejects, which is also why the reject
+  // handler in `then(fn, fn)` is unreachable as written. Keep it anyway — it
+  // becomes the only guard the moment someone "simplifies" the `chains.set`
+  // line to store `run` directly.
   const run = previous.then(fn, fn);
   const settled = run.then(
     () => undefined,
     () => undefined,
   );
+  // Load-bearing: `settled` swallows rejection, so the next waiter runs even
+  // when this one threw.
   chains.set(lockKey, settled);
   // Keep the map bounded: drop the entry once this caller is the tail and has
   // finished, so a long-lived worker does not retain one promise per company

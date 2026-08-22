@@ -37,6 +37,12 @@ interface MkCtxOptions {
    * because a real backend outage does not pick keys (BLO-28764).
    */
   stateFailWhen?: (stateKey: string, op: "get" | "set" | "delete") => boolean;
+  /**
+   * Reject `ctx.metrics.write`. Independent of `stateFailWhen` because a
+   * telemetry backend is a different system from the state backend — the whole
+   * point of BLO-29663 is that a metrics blip must not reprocess a batch.
+   */
+  failMetricsWrite?: boolean;
 }
 
 const mkCtx = (options: MkCtxOptions = {}) => {
@@ -49,6 +55,7 @@ const mkCtx = (options: MkCtxOptions = {}) => {
     invokeGate,
     onInvoke,
     stateFailWhen,
+    failMetricsWrite = false,
   } = options;
   const storedState = new Map(Object.entries(state));
   const registeredJobs = new Map<string, (...args: unknown[]) => unknown>();
@@ -151,7 +158,12 @@ const mkCtx = (options: MkCtxOptions = {}) => {
         };
       }),
     },
-    metrics: { write: vi.fn() },
+    metrics: {
+      write: vi.fn(async () => {
+        await tick();
+        if (failMetricsWrite) throw new Error("metrics backend unavailable");
+      }),
+    },
     tools: { register: vi.fn() },
     logger: {
       info: vi.fn(),
@@ -513,5 +525,137 @@ describe("check-watches state-outage resilience (BLO-28764)", () => {
     );
     // Criterion 2: and the next tenant still ran.
     expect(postedMessages.map((m) => m.channel)).toContain("C-midtick-b");
+  });
+});
+
+// BLO-29663: the re-queue above was documented as "a deliberate at-most-once
+// choice". It was not — it was at-least-once, on a path that spends money.
+//
+// `checkWatches` only reaches `setAllWatches` and `ctx.metrics.write` when
+// `triggered > 0`, i.e. once `agents.invoke` and `postMessage` have already
+// committed. Both sat outside the per-watch try/catch, so a rejection from
+// either arrived at the re-queue with the side effects already done and the
+// next tick paid for them again. A telemetry write failure alone was enough.
+//
+// The fix makes `checkWatches` distinguish pre- from post-delivery failure, so
+// the re-queue fires only when nothing was delivered. Both directions below.
+describe("check-watches delivery guarantee (BLO-29663)", () => {
+  const watchFor = (companyId: string) => ({
+    id: `watch-${companyId}`,
+    companyId,
+    eventPattern: "issue.created",
+    prompt: "look at {{id}}",
+    agentId: "agent-1",
+    channelId: `C-${companyId}`,
+    createdAt: new Date().toISOString(),
+    triggerCount: 0,
+  });
+
+  const mkWatchCtx = (companyId: string, extra: MkCtxOptions = {}) =>
+    mkCtx({
+      companies: [{ id: companyId }],
+      companyConfigs: { [companyId]: { slackTokenRef: "tok" } },
+      secrets: { tok: "xoxb-token" },
+      state: {
+        "instance:global:global-watches-list": [watchFor(companyId)],
+        [watchQueueKey(companyId)]: [
+          { eventType: "issue.created", payload: { id: "issue-paid-for" } },
+        ],
+      },
+      ...extra,
+    });
+
+  it("does not reprocess the batch when only the metrics write fails", async () => {
+    // A telemetry blip is the cheapest possible failure and used to have the
+    // most expensive consequence: the whole batch re-queued, and every agent in
+    // it invoked a second time on the next tick.
+    const companyId = "metrics-blip-co";
+    const { ctx, registeredJobs, storedState, postedMessages } = mkWatchCtx(
+      companyId,
+      { failMetricsWrite: true },
+    );
+
+    await plugin.definition.setup(ctx);
+    const job = registeredJobs.get("check-watches")!;
+    await expect(job()).resolves.toBeUndefined();
+
+    // The delivery itself happened, exactly once.
+    expect(ctx.agents.invoke).toHaveBeenCalledTimes(1);
+    expect(postedMessages.map((m) => m.channel)).toEqual([`C-${companyId}`]);
+    // The batch is consumed: a telemetry failure is not a reason to retry it.
+    expect(storedState.get(watchQueueKey(companyId))).toEqual([]);
+    // ...and the dropped sample is visible without being escalated.
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("watch-trigger metric"),
+      expect.objectContaining({ companyId }),
+    );
+
+    // The consequence that actually costs money: a second tick must not pay
+    // for the same watch again. Pre-fix this reaches 2.
+    await expect(job()).resolves.toBeUndefined();
+    expect(ctx.agents.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-queue when the registry write fails after delivery", async () => {
+    // The post-delivery shape: agents invoked, Slack posted, then the
+    // watch-registry write fails. Re-queueing here buys back the undelivered
+    // tail at the price of duplicating everything already delivered.
+    const companyId = "post-delivery-co";
+    const { ctx, registeredJobs, storedState } = mkWatchCtx(companyId, {
+      stateFailWhen: (key, op) =>
+        key === "instance:global:global-watches-list" && op === "set",
+    });
+
+    await plugin.definition.setup(ctx);
+    const job = registeredJobs.get("check-watches")!;
+    await expect(job()).resolves.toBeUndefined();
+
+    expect(ctx.agents.invoke).toHaveBeenCalledTimes(1);
+    // Not re-queued — and the loss is named out loud rather than implied.
+    expect(storedState.get(watchQueueKey(companyId))).toEqual([]);
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("avoid duplicate agent invocations"),
+      expect.objectContaining({
+        companyId,
+        deliveredCount: 1,
+        droppedEventCount: 1,
+      }),
+    );
+
+    await expect(job()).resolves.toBeUndefined();
+    expect(ctx.agents.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("still re-queues when the failure precedes any delivery", async () => {
+    // The counter-direction, and the reason this is a distinction rather than
+    // just "stop re-queueing": the registry *read* fails, so nothing was
+    // invoked or posted. That batch is safe to retry and must be.
+    const companyId = "pre-delivery-co";
+    const { ctx, registeredJobs, storedState, postedMessages } = mkWatchCtx(
+      companyId,
+      {
+        stateFailWhen: (key, op) =>
+          key === "instance:global:global-watches-list" && op === "get",
+      },
+    );
+
+    await plugin.definition.setup(ctx);
+    await expect(
+      registeredJobs.get("check-watches")!(),
+    ).resolves.toBeUndefined();
+
+    // Nothing was delivered...
+    expect(ctx.agents.invoke).not.toHaveBeenCalled();
+    expect(postedMessages).toEqual([]);
+    // ...so the batch is still there to be retried.
+    expect(
+      (storedState.get(watchQueueKey(companyId)) as Array<{
+        payload: { id?: string };
+      }>).map((e) => e.payload.id),
+    ).toEqual(["issue-paid-for"]);
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("re-queued"),
+      expect.objectContaining({ companyId }),
+    );
   });
 });
