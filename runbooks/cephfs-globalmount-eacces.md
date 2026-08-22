@@ -80,6 +80,27 @@ No agent can do this — the fleet holds a read-only k8s grant only.
 `spec.containers[].env` in the clear, so an agent asked to help here can leak every other agent's
 run credentials into a transcript. Keep the caps/keyring inspection on the node.
 
+### Reading container termination reasons without touching `pods_get`
+
+The datum that decides the resource-pressure question is
+`containerStatuses[].lastState.terminated.reason`, and the only k8s-API route to it is the
+`pods_get`/`resources_get` call the warning above rules out. Take it from kube-state-metrics
+instead — same field, no env in the response:
+
+```promql
+kube_pod_container_status_last_terminated_reason{namespace="kube-system",pod=~"ceph-csi-cephfs.*"} > 0
+```
+
+Always pair it with a positive control, because an empty result from a metric that is not being
+scraped is indistinguishable from a genuine absence of `OOMKilled`:
+
+```promql
+count by (reason) (kube_pod_container_status_last_terminated_reason > 0)
+```
+
+If that control does not return a nonzero `OOMKilled` bucket from *somewhere* in the cluster, your
+"no OOM" reading is uninformative rather than negative.
+
 ## Verify
 
 Done is **not** "nodeplugin restarted". Done is all three:
@@ -88,6 +109,39 @@ Done is **not** "nodeplugin restarted". Done is all three:
 - `Deployment/paperclip-api` reporting `Available: True` with `readyReplicas: 2`;
 - a recorded answer on what the restarts' actual cause was — a refuted hypothesis recorded here is
   a deliverable, because it stops the next responder re-deriving it.
+
+## Outcome of the 2026-08-20 → 08-22 incident
+
+Recorded 2026-08-22T~06:5xZ, closing the third `Verify` bullet above.
+
+**The fault cleared on its own, with no node-level remediation performed.** Measured at 06:5xZ:
+
+- Zero `lstat …/globalmount: permission denied` events in the `paperclip` namespace across the
+  ~55-minute Warning window then visible (05:55Z–06:50Z). The last EACCES anyone recorded was
+  03:37:50Z.
+- `Deployment/paperclip-api`: `Available: True`, `readyReplicas: 2`, condition
+  `lastTransitionTime: 2026-08-22T04:37:04Z` — it recovered ~14 min after the last status comment
+  claiming 16.8h of degradation, and before anyone acted on the asks.
+- Zero pods in `Pending` namespace-wide; 19 agent-job pods `Running 1/1` across four nodes, all
+  mounting the same claim.
+
+**Resource pressure is REFUTED as the cause of the nodeplugin restarts.** Every terminated
+container in the `ceph-csi-cephfs` DaemonSet and both provisioner replicas reports
+`reason: Error` (one nodeplugin shows `StartError`/`Unknown`). There is **no `OOMKilled` and no
+`Evicted` anywhere in the driver**. Positive control at the same instant: 4 `OOMKilled` containers
+did exist cluster-wide — `prometheus-mcp-server`, `paperclip-mcp` (auth-proxy),
+`proxmox-mcp-server`, `tempo-0` — so the metric was live and reporting that reason, just not for
+ceph-csi.
+
+⇒ Do **not** promote the `ceph-csi-cephfs` BestEffort/requests-hardening ticket on the strength of
+this incident. That hardening may still be worth doing on its own merits, but this outage is not
+evidence for it, and a uniform `Error` across all three containers of a pod looks like whole-pod
+restart (rollout / node reboot / SIGTERM recorded as `Error`), not selective resource kill.
+
+**Root cause was never established, and the evidence window has closed** — the failed pods have
+been reaped by TTL and the EACCES events have aged out. Treat a recurrence as a fresh
+investigation, and capture the globalmount ownership/mode *while it is still failing*; that is the
+one datum nobody obtained during 33 hours of this incident.
 
 ## Related
 
