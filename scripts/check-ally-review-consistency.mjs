@@ -33,6 +33,9 @@
  *       the App from approving its own PR, so its clean canonical self-review
  *       is necessarily `COMMENTED`. A clean App `COMMENTED` review cannot
  *       satisfy the App lane for any independently authored PR.
+ *   I5  A review using an Ally canonical login and account type must also
+ *       carry the immutable REST ID for that principal. A lookalike identity
+ *       must never become valid evidence merely by copying the login string.
  *
  * On I3's mechanism. An earlier revision of this file said `gh pr review`
  * binds a review to the head at submit time, so a mid-review push "certifies a
@@ -145,15 +148,30 @@ export function isAllySeatLogin(login) {
   return ALLY_SEAT_LOGIN_RE.test(normalizedLogin(login));
 }
 
-export function isAllyAppReviewer(user) {
-  return (
+function allyReviewIdentityShape(user) {
+  if (
     ALLY_APP_REVIEW_LOGIN_RE.test(normalizedLogin(user?.login)) &&
     normalizedAccountType(user) === "bot"
-  );
+  ) {
+    return { lane: "app", expectedId: ALLY_APP_REVIEWER_ID };
+  }
+  if (
+    ALLY_SEAT_LOGIN_RE.test(normalizedLogin(user?.login)) &&
+    normalizedAccountType(user) === "user"
+  ) {
+    return { lane: "seat", expectedId: ALLY_USER_REVIEWER_ID };
+  }
+  return null;
+}
+
+export function isAllyAppReviewer(user) {
+  const identity = allyReviewIdentityShape(user);
+  return identity?.lane === "app" && user?.id === identity.expectedId;
 }
 
 export function isAllySeatReviewer(user) {
-  return isAllySeatLogin(user?.login) && normalizedAccountType(user) === "user";
+  const identity = allyReviewIdentityShape(user);
+  return identity?.lane === "seat" && user?.id === identity.expectedId;
 }
 
 export function allyReviewLane(user) {
@@ -288,6 +306,18 @@ export function findPrViolations(pr) {
   const head = pr.headSha;
   const short = String(head ?? "").slice(0, 8);
   const violations = [];
+
+  for (const review of pr.reviews ?? []) {
+    if (isDismissedOrPending(review) || String(review?.commit_id ?? "").toLowerCase() !== String(head ?? "").toLowerCase()) {
+      continue;
+    }
+    const identity = allyReviewIdentityShape(review?.user);
+    if (identity && review?.user?.id !== identity.expectedId) {
+      violations.push(
+        `I5 PR #${pr.number} @${short}: ${laneLabel(identity.lane)} review ${review.id} uses the canonical login/type but REST id ${String(review?.user?.id ?? "<missing>")} (expected ${identity.expectedId}) — identity mismatch cannot satisfy the review lane`,
+      );
+    }
+  }
 
   const reviewsByLane = new Map(
     ALLY_REVIEW_LANES.map((lane) => [lane, operativeAllyReviews(pr.reviews, head, lane)]),
