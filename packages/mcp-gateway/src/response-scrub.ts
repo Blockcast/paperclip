@@ -463,8 +463,8 @@ function isValidEnvVarSource(value: unknown): boolean {
     case "configMapKeyRef":
     case "secretKeyRef":
       return (
+        isNonEmptyString(ref.name) &&
         isNonEmptyString(ref.key) &&
-        (ref.name === undefined || typeof ref.name === "string") &&
         (ref.optional === undefined || typeof ref.optional === "boolean")
       );
     case "fieldRef":
