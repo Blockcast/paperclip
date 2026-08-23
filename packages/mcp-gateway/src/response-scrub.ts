@@ -1025,14 +1025,14 @@ function scrubJsonValueTracked(
       result[key] = Object.fromEntries(
         entries.map(([name, inner]) => [
           name,
-          // A nested object here is a `valueFrom`-shaped reference, which names a
-          // source without carrying it; anything scalar is the material itself.
-          inner && typeof inner === "object"
-            ? scrubJsonValueTracked(inner, ctx, nowSecret, inContainers)
-            : REDACTED,
+          // A nested object here claims to be a `valueFrom`-shaped reference.
+          // Validate that closed schema instead of trusting generic recursion,
+          // which has no "inside env" state and preserved arbitrary nested
+          // material such as `{ value: "plaintext" }`.
+          isValidEnvVarSource(inner) ? inner : REDACTED,
         ]),
       );
-      if (entries.some(([, inner]) => !inner || typeof inner !== "object")) ctx.changed = true;
+      if (entries.some(([, inner]) => !isValidEnvVarSource(inner))) ctx.changed = true;
       continue;
     }
     if (RESOURCE_ECHO_ANNOTATIONS.includes(key) && typeof value === "string") {

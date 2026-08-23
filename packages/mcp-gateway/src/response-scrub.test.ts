@@ -787,6 +787,22 @@ describe("scrubJsonValue — env serialized as a mapping", () => {
     expect(JSON.stringify(out)).toContain("secretKeyRef");
     expect(JSON.stringify(out)).toContain("creds");
   });
+
+  it("redacts an unrecognized nested object instead of trusting it as a reference", () => {
+    const out = scrubJsonValue({
+      kind: "Pod",
+      env: {
+        TOKEN: { value: LEAK },
+        MISSING_NAME: { secretKeyRef: { key: LEAK } },
+      },
+    });
+
+    expectNoLeak(JSON.stringify(out));
+    expect(out).toEqual({
+      kind: "Pod",
+      env: { TOKEN: REDACTED, MISSING_NAME: REDACTED },
+    });
+  });
 });
 
 /**
