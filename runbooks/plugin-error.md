@@ -2,6 +2,7 @@
 
 Source: `server/src/services/plugin-status-metrics.ts` (collector), `server/src/services/metrics.ts` (`PLUGIN_ERROR_METRIC`)
 Trigger: alert `PaperclipPluginCriticalErrored` or `PaperclipPluginErrored` — `paperclip_plugin_error{plugin_key=~/!~"<critical-key-regex>"} == 1` for 10m
+Also triggers on: `PaperclipPluginStatusCollectorStale` / `PaperclipPluginStatusCollectorAbsent` — collector-heartbeat alerts that carry **no** `plugin_key` label; skip to [Collector is stale or absent](#collector-is-stale-or-absent) rather than starting at Step 1.
 Owner: Platform / SRE (gstack)
 
 ## What this alert means
@@ -113,6 +114,44 @@ paperclip_plugin_error{plugin_key="<plugin_key>"}
 Should read `0` within one collector tick (~30s) of the plugin returning to
 `status='ready'`. The alert itself clears once that holds for the evaluation
 interval — no manual silence needed.
+
+## Collector is stale or absent
+
+`PaperclipPluginStatusCollectorStale` and
+`PaperclipPluginStatusCollectorAbsent` also route here, and neither carries a
+`plugin_key` label — so Step 1 above does not apply. These fire on the
+collector's own heartbeat
+(`paperclip_plugin_status_collector_last_success_timestamp_seconds{role="worker"}`),
+not on plugin data, because while the collector is broken the two
+`plugin_error` alerts are silently unreliable: a plugin that just crashed is
+not reflected, and one that just recovered keeps paging.
+
+The two cases are genuinely different failures and need different first moves:
+
+- **`...Stale` (warning) — the series exists but stopped advancing.** The
+  worker is alive and being scraped; its `listInstalled()` call is failing.
+  Most often DB connectivity from the worker pod. Grep worker-tier logs for
+  `plugin-status-metrics: collector tick failed`. The last-known plugin
+  snapshot is still visible, so treat the `plugin_error` values as
+  as-of-last-success rather than current.
+
+- **`...Absent` (critical) — the series does not exist at all.** The worker is
+  down, crashlooping, never started the collector, or is not a scrape target.
+  Note `paperclip_plugin_error` is absent too, which on a dashboard looks
+  identical to every plugin being healthy — this is the invisible-failure mode
+  BLO-20410 was, which is why it pages critical. Check, in order: a worker-tier
+  pod is `Running` with `PAPERCLIP_NODE_ROLE != 'api'` (`app.ts` gates plugin
+  lifecycle off the API tier, so an API-only deployment never starts this
+  collector); the `paperclip-workers` Service still falls inside the
+  ServiceMonitor's selector (it selects on name + instance only — adding a
+  `component` label to the selector would silently drop worker-tier metrics);
+  and the target is `up` in Prometheus.
+
+  This alert is deliberately `absent_over_time(...)` rather than a threshold on
+  `time() - <gauge>`: the subtraction form cannot detect this case at all,
+  because with the worker gone the difference is ~0 at the moment scraping
+  stops and only grows past the threshold once Prometheus's lookback delta has
+  already evicted the series from instant queries.
 
 ## Silencing
 

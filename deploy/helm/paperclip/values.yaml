@@ -550,6 +550,8 @@ prometheusRule:
   pluginStatusCollectorStaleSeconds: 300
   # -- How long the staleness condition above must hold before paging. Combined with pluginStatusCollectorStaleSeconds this pages at roughly the same ~10m scale as pluginErrorFor, so a dead collector is not treated as more urgent than the plugin outages it exists to detect.
   pluginStatusCollectorStaleFor: 5m
+  # -- Lookback window for the companion ABSENCE guard (BLO-21092 Ally review). pluginStatusCollectorStaleSeconds above can only catch a collector that is stuck while still being scraped; it is structurally unable to catch a worker that is down, crashlooping, or never started the collector at all, because `time() - <gauge>` needs the gauge to still be queryable and Prometheus drops it from instant queries at the 5m lookback -- the same instant the difference would first exceed 300s. This window must therefore exceed Prometheus's lookback-delta (5m default) so the absence is unambiguous rather than a scrape-gap artifact.
+  pluginStatusCollectorAbsentFor: 10m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 
