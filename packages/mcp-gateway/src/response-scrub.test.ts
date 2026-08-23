@@ -328,11 +328,13 @@ describe("scrubJsonValue — structural path, in case the server changes format"
         },
         { name: "B", valueFrom: { secretKeyRef: { name: "creds" } } },
         { name: "C", valueFrom: { secretKeyRef: { name: "creds", key: "t", extra: LEAK } } },
+        { name: "D", valueFrom: { secretKeyRef: { key: "t" } } },
+        { name: "E", valueFrom: { configMapKeyRef: { name: "", key: "mode" } } },
       ],
     });
 
     expectNoLeak(JSON.stringify(out));
-    expect(out).toEqual({ env: [REDACTED, REDACTED, REDACTED] });
+    expect(out).toEqual({ env: [REDACTED, REDACTED, REDACTED, REDACTED, REDACTED] });
   });
 
   it("keeps only a schema-valid valueFrom EnvVar shape", () => {
