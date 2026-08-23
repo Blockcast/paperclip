@@ -9,10 +9,19 @@
  * shared App identity and 18 with no local identity at all, and AGENTS.md
  * compensated by asking every agent to run `git config` by hand.
  *
- * This module is that provisioning step. It is called from every path that
+ * This module provides both the best-effort checkout provisioning step and the
+ * authoritative per-run environment overlay. It is called from every path that
  * hands a checkout to a run -- the managed project workspace in `heartbeat.ts`
- * and both git-worktree realization paths in `workspace-runtime.ts` -- and it is
- * deliberately shaped to be safe to call unconditionally:
+ * and both git-worktree realization paths in `workspace-runtime.ts` -- and the
+ * environment overlay is applied immediately before adapter dispatch.
+ *
+ * The environment variables are the authority for a run. Local config remains a
+ * compatibility aid for standalone checkouts and for operators inspecting a
+ * workspace after a run, but it cannot be used as the concurrency boundary:
+ * linked worktrees resolve `--local` through the common repository config.
+ *
+ * The provisioning helper is deliberately shaped to be safe to call
+ * unconditionally:
  *
  * - It **no-ops when the path carries no git metadata.** Running `git config` in
  *   a plain directory does not fail harmlessly: git walks *up* from the cwd, so
@@ -24,15 +33,12 @@
  * - It is **idempotent**: a checkout already carrying this agent's identity is
  *   left untouched, so repeated runs do not rewrite the config.
  *
- * Scope note: the write is local (`git config --local`), never `--global` or
- * `--system`. For a *linked worktree* "local" resolves to the shared repository
- * config in the common dir rather than to something worktree-private (that would
- * need `extensions.worktreeConfig`, a repo-wide change with its own `core.bare`
- * and `core.worktree` caveats, which is out of scope here). Concurrent runs by
- * different agents against one repo therefore still share a single identity
- * slot -- but provisioning happens immediately before dispatch, so the last
- * writer is the agent about to commit, and either way it is a strict improvement
- * over "unset, or permanently stamped to the App".
+ * Scope note: standalone checkouts use a local (`git config --local`) write,
+ * never `--global` or `--system`. For a *linked worktree*, `.git` is a file and
+ * `--local` resolves to the common repository config rather than to something
+ * worktree-private. We intentionally skip that write and rely on the final
+ * per-run environment overlay; enabling `extensions.worktreeConfig` would be a
+ * repo-wide migration with its own `core.bare` and `core.worktree` caveats.
  */
 
 import { execFile as execFileCallback } from "node:child_process";
@@ -48,6 +54,14 @@ export const PAPERCLIP_AGENT_EMAIL_DOMAIN = "paperclip.blockcast.net";
 
 /** Budget for the handful of `git config` reads and writes below. */
 export const GIT_IDENTITY_COMMAND_TIMEOUT_MS = 10_000;
+
+/** Git's four process-level identity overrides, in the order Git consumes them. */
+export const GIT_IDENTITY_ENV_KEYS = [
+  "GIT_AUTHOR_NAME",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_COMMITTER_NAME",
+  "GIT_COMMITTER_EMAIL",
+] as const;
 
 /**
  * Author emails that identify the shared write credential rather than an agent,
@@ -86,6 +100,8 @@ export type CheckoutGitIdentityStatus =
   | "skipped_no_git"
   /** No agent to attribute to; a placeholder identity would be worse. */
   | "skipped_no_agent"
+  /** A linked worktree has shared local config; the run-level env is authoritative. */
+  | "skipped_linked_worktree"
   /**
    * The checkout carries an identity paperclip did not write -- a human's, in a
    * checkout they also use. Left untouched on purpose; see the policy note on
@@ -145,7 +161,7 @@ function sanitizeGitAuthorName(value: string, fallback: string): string {
     const isControl = code < 0x20 || code === 0x7f;
     stripped += isControl || char === "<" || char === ">" ? " " : char;
   }
-  const cleaned = stripped.replace(/\s+/g, " ").replace(/^-+/, "").trim();
+  const cleaned = stripped.replace(/\s+/g, " ").trim().replace(/^-+/, "").trim();
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
@@ -169,6 +185,47 @@ export function buildAgentGitIdentity(agent: CheckoutIdentityAgentRef): {
   };
 }
 
+export type AgentGitIdentityEnv = Record<(typeof GIT_IDENTITY_ENV_KEYS)[number], string>;
+
+/**
+ * Build the process-level identity used by every adapter invocation.
+ *
+ * Git gives these variables precedence over repository, global, and system
+ * config, which makes the identity independent of shared checkout config and
+ * carries it across adapters that clone a workspace inside another runtime.
+ */
+export function buildAgentGitIdentityEnv(agent: CheckoutIdentityAgentRef): AgentGitIdentityEnv {
+  const identity = buildAgentGitIdentity(agent);
+  return {
+    GIT_AUTHOR_NAME: identity.name,
+    GIT_AUTHOR_EMAIL: identity.email,
+    GIT_COMMITTER_NAME: identity.name,
+    GIT_COMMITTER_EMAIL: identity.email,
+  };
+}
+
+/**
+ * Apply the system identity after all agent/project/routine/environment
+ * overlays. User-supplied `GIT_*` values are intentionally overwritten.
+ */
+export function applyAgentGitIdentityToRuntimeConfig(input: {
+  runtimeConfig: Record<string, unknown>;
+  agent: CheckoutIdentityAgentRef;
+}): Record<string, unknown> {
+  const rawEnv = input.runtimeConfig.env;
+  const env =
+    rawEnv && typeof rawEnv === "object" && !Array.isArray(rawEnv)
+      ? (rawEnv as Record<string, unknown>)
+      : {};
+  return {
+    ...input.runtimeConfig,
+    env: {
+      ...env,
+      ...buildAgentGitIdentityEnv(input.agent),
+    },
+  };
+}
+
 async function defaultGitRunner(args: string[], cwd: string): Promise<string> {
   const result = await execFile("git", args, {
     cwd,
@@ -185,11 +242,17 @@ async function defaultGitRunner(args: string[], cwd: string): Promise<string> {
  * every worktree checkout as "not a git checkout" and would skip exactly the
  * checkouts the git_worktree strategy creates.
  */
-async function hasGitMetadata(cwd: string): Promise<boolean> {
+type GitMetadataKind = "directory" | "file";
+
+async function readGitMetadataKind(cwd: string): Promise<GitMetadataKind | null> {
   return fs
     .lstat(path.resolve(cwd, ".git"))
-    .then((entry) => entry.isDirectory() || entry.isFile())
-    .catch(() => false);
+    .then((entry) => {
+      if (entry.isDirectory()) return "directory";
+      if (entry.isFile()) return "file";
+      return null;
+    })
+    .catch(() => null);
 }
 
 async function readLocalConfigValue(
@@ -238,7 +301,23 @@ export async function ensureCheckoutGitIdentity(input: {
   const identity = buildAgentGitIdentity(agent);
 
   try {
-    if (!await hasGitMetadata(cwd)) return skipped("skipped_no_git");
+    const gitMetadataKind = await readGitMetadataKind(cwd);
+    if (!gitMetadataKind) return skipped("skipped_no_git");
+
+    // A linked worktree's `.git` file points at `.git/worktrees/<name>` in the
+    // common repository. `git config --local` from that cwd therefore mutates
+    // the parent checkout's shared identity, making concurrent runs race. The
+    // final GIT_* environment overlay is private to this run and covers both
+    // the host adapter and any clone performed by a remote adapter.
+    if (gitMetadataKind === "file") {
+      return {
+        status: "skipped_linked_worktree",
+        email: identity.email,
+        name: identity.name,
+        previousEmail: null,
+        warning: null,
+      };
+    }
 
     const currentEmail = await readLocalConfigValue(runGit, cwd, "user.email");
     const currentName = await readLocalConfigValue(runGit, cwd, "user.name");

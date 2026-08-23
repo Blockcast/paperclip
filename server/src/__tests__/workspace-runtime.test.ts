@@ -755,11 +755,10 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe("Codex Coder");
   });
 
-  it("stamps the running agent's git author identity on a created worktree, and re-stamps it on reuse", async () => {
-    // BLO-23894: the checkout's local user.email is the only thing that
-    // distinguishes one agent's `git push` from another's, and nothing used to
-    // set it. Reuse matters more than creation here: every already-existing
-    // checkout in the 2026-08-10 sweep reached a run through the reuse path.
+  it("keeps linked-worktree config shared and relies on the run identity env", async () => {
+    // Linked worktrees resolve `git config --local` through the common repo
+    // config. The run-level GIT_* environment is therefore the authority for
+    // attribution; provisioning must not rewrite the shared config.
     //
     // The repo is App-stamped first to model the real starting population: the
     // sweep found 11 checkouts carrying the shared App identity. `createTempRepo`
@@ -767,7 +766,6 @@ describe("realizeExecutionWorkspace", () => {
     // provisioning deliberately refuses to overwrite (see the companion test
     // below), so leaving the fixture as-is would assert the wrong policy.
     const repoRoot = await createTempRepo();
-    const agentEmail = "codex-coder@paperclip.blockcast.net";
     await runGit(repoRoot, [
       "config", "--local", "user.email",
       "290875700+allyblockcast[bot]@users.noreply.github.com",
@@ -775,9 +773,9 @@ describe("realizeExecutionWorkspace", () => {
 
     const created = await realizeWorktreeForTest(repoRoot, "HEAD");
     await expect(readGit(created.cwd, ["config", "--local", "--get", "user.email"]))
-      .resolves.toBe(agentEmail);
+      .resolves.toBe("290875700+allyblockcast[bot]@users.noreply.github.com");
     await expect(readGit(created.cwd, ["config", "--local", "--get", "user.name"]))
-      .resolves.toBe("Codex Coder");
+      .resolves.toBe("Paperclip Test");
     expect(created.warnings).not.toEqual(
       expect.arrayContaining([expect.stringContaining("per-agent git author identity")]),
     );
@@ -791,7 +789,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reusedWorktree.created).toBe(false);
     expect(reusedWorktree.cwd).toBe(created.cwd);
     await expect(readGit(reusedWorktree.cwd, ["config", "--local", "--get", "user.email"]))
-      .resolves.toBe(agentEmail);
+      .resolves.toBe("290875700+allyblockcast[bot]@users.noreply.github.com");
   });
 
   it("leaves a developer's own git identity alone when realizing a worktree in their repo", async () => {
@@ -2693,7 +2691,7 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe("codex-coder@paperclip.blockcast.net");
   }, 15_000);
 
-  it("re-stamps the agent git identity when a persisted worktree is reused without a provision command", async () => {
+  it("does not rewrite shared config when a persisted linked worktree is reused without a provision command", async () => {
     // BLO-23894: this reuse branch used to run provisioning only when a
     // provisionCommand was configured, so the overwhelmingly common
     // no-provision-command workspace was never stamped at all.
@@ -2742,9 +2740,9 @@ describe("realizeExecutionWorkspace", () => {
 
     expect(restored?.cwd).toBe(initial.cwd);
     await expect(readGit(initial.cwd, ["config", "--local", "--get", "user.email"]))
-      .resolves.toBe("codex-coder@paperclip.blockcast.net");
+      .resolves.toBe("allyblockcast[bot]@users.noreply.github.com");
     await expect(readGit(initial.cwd, ["config", "--local", "--get", "user.name"]))
-      .resolves.toBe("Codex Coder");
+      .resolves.toBe("allyblockcast[bot]");
   }, 15_000);
 
   it("classifies persisted git worktree branch incoherence as diverged when the checked-out branch is not forward", async () => {
