@@ -2425,6 +2425,71 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(link).toMatchObject({ retiredReason: "stage_exited" });
   });
 
+  // BLO-19771: the live failure was a `drafting` automation issue that stayed
+  // `in_progress` after its case ran on to a terminal stage, waking the assigned
+  // agent 91 minutes later. Both stages are asserted: the one the case merely
+  // passed through, and the one it was sitting in when it went terminal.
+  it("retires stage automation issues from every stage once the case reaches a terminal stage", async () => {
+    const company = await seedCompany();
+    const draftingRoutine = await seedRoutine(company.id, "Terminal drafting");
+    const assetsRoutine = await seedRoutine(company.id, "Terminal assets");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "terminal-retirement",
+      name: "Terminal retirement",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: draftingRoutine.id } } },
+        { key: "assets", name: "Assets", kind: "working", config: { onEnter: { type: "run_routine", routineId: assetsRoutine.id } } },
+        { key: "published", name: "Published", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({ companyId: company.id, pipelineId: pipeline.id, caseKey: "blog-post", title: "Blog post", actor: userActor });
+    const drafting = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const draftingIssueId = drafting.automationExecution.status === "succeeded"
+      ? drafting.automationExecution.execution.executionIssueId!
+      : "";
+    const assets = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "assets",
+      expectedVersion: drafting.case.version,
+      actor: userActor,
+    });
+    const assetsIssueId = assets.automationExecution.status === "succeeded"
+      ? assets.automationExecution.execution.executionIssueId!
+      : "";
+    expect(draftingIssueId).not.toBe("");
+    expect(assetsIssueId).not.toBe("");
+    expect(assetsIssueId).not.toBe(draftingIssueId);
+
+    const terminal = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "published",
+      expectedVersion: assets.case.version,
+      actor: userActor,
+    });
+    expect(terminal.case.terminalKind).toBe("done");
+
+    // The stage the case passed through, and the stage it went terminal from.
+    for (const issueId of [draftingIssueId, assetsIssueId]) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const [link] = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.issueId, issueId));
+      expect(issue!.status).toBe("cancelled");
+      expect(link!.retiredAt).not.toBeNull();
+      expect(link).toMatchObject({ retiredReason: "stage_exited" });
+    }
+  });
+
   it("retires the automation link without cancelling an issue that has live non-automation ownership", async () => {
     const company = await seedCompany();
     const routine = await seedRoutine(company.id, "Shared ownership");
