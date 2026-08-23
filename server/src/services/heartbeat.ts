@@ -6162,6 +6162,101 @@ export function filterZombieCoalesceTarget<
   return target && isZombieRun(target, tracked) ? null : target;
 }
 
+/**
+ * `lastOutputSeq` counts flushed output-progress records (see
+ * `flushOutputProgress`), so a run at or below 1 has had at most a single flush
+ * land in its whole lifetime. Measured on the live specimen: seq 1, log frozen
+ * at 3 lines / 682 B, no `acpx.session` event — i.e. nothing beyond the
+ * pre-exec prefix. Anything above this means the adapter answered and kept
+ * answering.
+ */
+const PRE_EXEC_OUTPUT_SEQ = 1;
+
+export type LaunchStallSignals = {
+  status: string;
+  lastOutputSeq?: number | null;
+  lastOutputAt?: Date | string | null;
+  lastUsefulActionAt?: Date | string | null;
+  startedAt?: Date | string | null;
+};
+
+function runSignalMs(value: Date | string | null | undefined): number {
+  if (value == null) return 0;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * PEN-1995: a run that was claimed but never got past the pre-exec prefix, and
+ * has been silent past the slot-accounting floor.
+ *
+ * `isZombieRun` cannot see this one. `executeRun` adds the run to
+ * `activeRunExecutions` at claim, *before* the adapter invoke, so a run that
+ * stalls in that window is tracked in memory — genuinely awaited by this pod —
+ * while having produced nothing. It is not a zombie; it is a live await over a
+ * launch that never happened.
+ *
+ * That combination deadlocks the agent. The run is excluded from the reaper at
+ * any age (`activeRunExecutions.has(run.id) && !externalLifecycleRun`), so
+ * nothing finalizes it; and because it is `status: "running"` under the same
+ * `__heartbeat__` task key, every later timer wake coalesces into it. The
+ * coalesce is a bare UPDATE that mints no run and stamps no `lastHeartbeatAt`,
+ * so each absorbed wake is simply lost — and the UPDATE refreshes `updatedAt`,
+ * which re-arms the shield. Measured on Summarizer `9d5bc03e`: a run wedged at
+ * seq 1 for 11.87 h took every hourly heartbeat down with it, and cadence
+ * resumed one interval after a worker restart cleared the Set.
+ *
+ * The floor is deliberately the dispatcher's own: BLO-12990/BLO-20775 already
+ * drop a >15-min-silent row from `runningCount` so it cannot starve new work.
+ * Freeing that slot accomplishes nothing while this path is still swallowing
+ * the wake that would fill it — the two halves of dispatch have to agree.
+ *
+ * Narrower than the slot gate in the way that matters: it also requires the run
+ * to have never flushed output past the pre-exec prefix. A healthy run that is
+ * merely quiet between outputs has `lastOutputSeq` well above 1 and keeps
+ * absorbing wakes, which is what the 45-min hard-stale floor exists to protect.
+ *
+ * This is not a kill and must not be read as one. The stalled run is left
+ * entirely alone — still tracked, still awaited, still free to finish and
+ * deliver. All that changes is that it stops speaking for wakes it cannot
+ * service. That asymmetry is why the elapsed-time objection recorded against a
+ * *terminating* ceiling on PEN-1995 does not carry here: firing early costs one
+ * extra queued run, not destroyed work.
+ */
+export function isLaunchStalledRun(
+  run: LaunchStallSignals,
+  nowMs: number,
+  staleMs: number = RUN_STALE_SILENCE_MS,
+): boolean {
+  if (run.status !== "running") return false;
+  if ((run.lastOutputSeq ?? 0) > PRE_EXEC_OUTPUT_SEQ) return false;
+  // Newest stamp, not the first non-null — BLO-20775. Mirrors the dispatcher's
+  // staleness test exactly, including its treatment of a row with no parseable
+  // stamp at all (0 < floor ⇒ stale).
+  const newestSignalMs = Math.max(
+    runSignalMs(run.lastUsefulActionAt),
+    runSignalMs(run.lastOutputAt),
+    runSignalMs(run.startedAt),
+  );
+  return newestSignalMs < nowMs - staleMs;
+}
+
+/**
+ * Filter a coalesce target that is stalled at launch — see `isLaunchStalledRun`.
+ * Returning null lets the wake fall through and mint its own queued run.
+ *
+ * Composes with `filterZombieCoalesceTarget`: that one catches a `running` row
+ * with no in-memory execution (post-restart), this one catches a `running` row
+ * whose in-memory execution never reached the adapter.
+ */
+export function filterLaunchStalledCoalesceTarget<T extends LaunchStallSignals>(
+  target: T | null,
+  nowMs: number,
+  staleMs: number = RUN_STALE_SILENCE_MS,
+): T | null {
+  return target && isLaunchStalledRun(target, nowMs, staleMs) ? null : target;
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -29769,9 +29864,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       sameScopeScheduledRetryRun ??
       (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
 
-    const coalescedTargetRun = filterZombieCoalesceTarget(
-      rawCoalescedTarget,
-      liveRunExecutions,
+    // PEN-1995: two independent reasons a `running` target cannot service this
+    // wake — no live execution at all (zombie), or a live execution that never
+    // reached the adapter (stalled at launch). Either way the wake must mint its
+    // own run rather than be absorbed and lost.
+    const coalescedTargetRun = filterLaunchStalledCoalesceTarget(
+      filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions),
+      Date.now(),
     );
 
     if (coalescedTargetRun) {
