@@ -2091,6 +2091,95 @@ describe("comment-review gate webhook trigger", () => {
       ),
     ).toBeNull();
   });
+
+  // BLO-29853. The event carrying 33 of 33 real consolidated reviews in this
+  // repo was absent from this matrix entirely — neither asserted to trigger nor
+  // asserted not to — while the block around it read as exhaustive. That
+  // omission is why the gate shipped able to publish only "not evaluated".
+  function reviewPayload(
+    overrides: {
+      action?: string;
+      author?: string;
+      body?: string;
+      commitId?: string;
+    } = {},
+  ) {
+    return {
+      action: overrides.action ?? "submitted",
+      repository: { full_name: repo },
+      pull_request: { number: 1049, html_url: `https://github.com/${repo}/pull/1049`, head: { sha: head } },
+      review: {
+        state: "commented",
+        commit_id: overrides.commitId ?? head,
+        user: { login: overrides.author ?? reviewer },
+        body: overrides.body ?? `## Ally — Consolidated PR Review\nReviewed head: ${head}`,
+      },
+    };
+  }
+
+  // `submitted` is the live repro from BLO-29853: Ally submitted a COMMENTED
+  // review carrying an open Important at the then-current head of #1471 and the
+  // gate never re-ran, leaving its push-time green standing for 6h+ on a
+  // mergeable PR. `edited` because the verdict is a pure function of the review
+  // bodies, so editing one changes it.
+  it.each(["submitted", "edited"])("re-evaluates the gate on pull_request_review.%s", (action) => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger("pull_request_review", reviewPayload({ action }), reviewer),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  // Asserted as its own case because it is a design decision, not an omission:
+  // resolving the live head lets the carried-finding path see an unattested new
+  // head when a review lands against one the branch has moved past. Trusting
+  // `review.commit_id` (or this payload's snapshot) would instead write a status
+  // to a non-head commit, where branch protection cannot see it.
+  it("leaves the head unresolved so the gate reads the live head, not the reviewed one", () => {
+    const trigger = __test_resolvePrCommentReviewGateWebhookTrigger(
+      "pull_request_review",
+      reviewPayload({ commitId: "feedfacefeedfacefeedfacefeedfacefeedface" }),
+      reviewer,
+    );
+    expect(trigger).not.toBeNull();
+    expect(trigger).not.toHaveProperty("headSha");
+  });
+
+  it("rejects a review from any author but the configured reviewer", () => {
+    // Same near-miss login the issue_comment path guards: the bot suffix matters.
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request_review",
+        reviewPayload({ author: "allyblockcast" }),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects a reviewer review that is not a consolidated review", () => {
+    // Not an attestation the evaluator would count either, so triggering would
+    // re-publish an identical verdict for the cost of three API calls.
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request_review",
+        reviewPayload({ body: "Looks good, shipping." }),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+
+  it("does not re-evaluate on pull_request_review.dismissed", () => {
+    // Dismissal leaves the review body, and therefore the verdict, unchanged.
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request_review",
+        reviewPayload({ action: "dismissed" }),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
 });
 
 describeEmbeddedPostgres("github-webhook route", () => {
