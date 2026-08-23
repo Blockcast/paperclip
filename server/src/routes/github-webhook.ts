@@ -560,25 +560,38 @@ function resolvePrCommentReviewGateWebhookTrigger(
   // green "not evaluated" (BLO-29853: 30/30 recent merges, 9/10 of them on
   // heads that demonstrably had been reviewed).
   if (eventName === "pull_request_review") {
-    // `edited` counts as much as `submitted`: the verdict is a pure function of
-    // the review bodies, so editing a finding into or out of one changes it.
-    // `dismissed` is excluded for that same reason — dismissal leaves the body,
-    // and therefore the verdict, untouched.
-    if (payload.action !== "submitted" && payload.action !== "edited") return null;
+    // All three mutating actions, because the trigger's only job is to answer
+    // "could the evaluator now compute something different?" — and it is not
+    // this function's job to guess what. `executeCommentReviewGateCheck` never
+    // reads this payload: it re-lists both surfaces live and recomputes from
+    // the whole history. So the predicate is the reviewer's identity and the
+    // fact that their review set changed, nothing about *this* review's body.
+    //
+    // `dismissed` is included because `githubListPrReviewsWithTimestamps`
+    // (github-app-auth.ts:688) drops `DISMISSED` reviews before the evaluator
+    // sees them. Dismissing a blocking review therefore does change the
+    // verdict, and excluding it here would strand the old `failure` on the PR
+    // indefinitely. An earlier revision of this branch excluded `dismissed` on
+    // the reasoning that "dismissal leaves the body untouched" — true, and
+    // irrelevant, because the reader filters on `state`, not body.
+    if (payload.action !== "submitted" && payload.action !== "edited" && payload.action !== "dismissed") {
+      return null;
+    }
     const review = payload.review as Record<string, unknown> | undefined;
     const reviewUser = review?.user as Record<string, unknown> | undefined;
     const reviewedPr = payload.pull_request as Record<string, unknown> | undefined;
     const reviewedPrNumber = typeof reviewedPr?.number === "number" ? reviewedPr.number : null;
+    // Deliberately no consolidated-heading check. Gating dispatch on this
+    // payload's body cannot see the body it *replaced*: editing a blocking
+    // consolidated review into an ordinary comment would return null here and
+    // leave the old `failure` standing forever. The evaluator decides what
+    // attests; this function only decides when to ask it.
     if (
       reviewedPrNumber === null ||
       !githubReviewerIdentityMatches(
         readStringField(reviewUser, "login") ?? "",
         configuredReviewerLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN,
-      ) ||
-      // A review without the consolidated heading is not an attestation the
-      // evaluator would count either, so triggering on it would re-publish an
-      // identical verdict for the cost of three API calls.
-      !hasAllyConsolidatedReviewHeading(readStringField(review, "body"))
+      )
     ) {
       return null;
     }

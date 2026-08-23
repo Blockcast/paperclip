@@ -2158,27 +2158,59 @@ describe("comment-review gate webhook trigger", () => {
     ).toBeNull();
   });
 
-  it("rejects a reviewer review that is not a consolidated review", () => {
-    // Not an attestation the evaluator would count either, so triggering would
-    // re-publish an identical verdict for the cost of three API calls.
+  // Regression for the two Important findings Ally raised on #1478 @ c13ec58a.
+  // Both earlier revisions of this block asserted the *bug* was correct, which
+  // is why the suite stayed green across them.
+  it("re-evaluates on a reviewer review that is not a consolidated review", () => {
+    // The evaluator never reads this payload — it re-lists both surfaces and
+    // recomputes. So a body without the heading is not evidence that nothing
+    // changed: this may be an `edited` event that just removed the heading from
+    // a previously blocking review, and dropping it here would leave that
+    // review's `failure` published forever.
     expect(
       __test_resolvePrCommentReviewGateWebhookTrigger(
         "pull_request_review",
-        reviewPayload({ body: "Looks good, shipping." }),
+        reviewPayload({ action: "edited", body: "Looks good, shipping." }),
         reviewer,
       ),
-    ).toBeNull();
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
   });
 
-  it("does not re-evaluate on pull_request_review.dismissed", () => {
-    // Dismissal leaves the review body, and therefore the verdict, unchanged.
+  it("re-evaluates on pull_request_review.dismissed", () => {
+    // `githubListPrReviewsWithTimestamps` (github-app-auth.ts) skips DISMISSED
+    // reviews before the evaluator sees them, so dismissing a blocking review
+    // *does* change the verdict. Excluding this action stranded the stale
+    // `failure` on the PR with no event able to clear it.
     expect(
       __test_resolvePrCommentReviewGateWebhookTrigger(
         "pull_request_review",
         reviewPayload({ action: "dismissed" }),
         reviewer,
       ),
-    ).toBeNull();
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("still ignores review actions that cannot change the review set", () => {
+    // The predicate is not "any pull_request_review": these carry no change to
+    // what the evaluator would read, so triggering would burn three API calls
+    // to republish an identical verdict.
+    for (const action of ["dismissed_stale_unknown_action", "labeled"]) {
+      expect(
+        __test_resolvePrCommentReviewGateWebhookTrigger(
+          "pull_request_review",
+          reviewPayload({ action }),
+          reviewer,
+        ),
+      ).toBeNull();
+    }
   });
 
   it("rejects a review payload carrying no resolvable PR number", () => {
