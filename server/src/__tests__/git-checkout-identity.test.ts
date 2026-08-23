@@ -5,6 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  applyAgentGitIdentityToRuntimeConfig,
+  buildAgentGitIdentityEnv,
   buildAgentGitIdentity,
   ensureCheckoutGitIdentity,
   isPaperclipProvisionedAuthorEmail,
@@ -33,9 +35,10 @@ function makeTempRoot(): string {
   return root;
 }
 
-function git(args: string[], cwd: string): string {
+function git(args: string[], cwd: string, env?: Record<string, string>): string {
   return execFileSync("git", args, {
     cwd,
+    env: env ? { ...process.env, ...env } : undefined,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
   }).trim();
@@ -109,6 +112,7 @@ describe("buildAgentGitIdentity", () => {
     // "<" / ">" would corrupt the `Name <email>` header, and a leading "-" would
     // be consumed by `git config` as an option instead of a value.
     expect(buildAgentGitIdentity({ id: AGENT.id, name: "--Ally <bot>" }).name).toBe("Ally bot");
+    expect(buildAgentGitIdentity({ id: AGENT.id, name: "  --Ally" }).name).toBe("Ally");
   });
 
   it("keeps digits in the author name", () => {
@@ -146,6 +150,37 @@ describe("isPaperclipProvisionedAuthorEmail", () => {
     // literal does not read as paperclip-owned and keeps its identity.
     expect(isPaperclipProvisionedAuthorEmail("a@evil-paperclip.blockcast.net")).toBe(false);
     expect(isPaperclipProvisionedAuthorEmail("a@sub.paperclip.blockcast.net")).toBe(false);
+  });
+});
+
+describe("per-run git identity environment", () => {
+  it("overrides every user-supplied Git identity value", () => {
+    const result = applyAgentGitIdentityToRuntimeConfig({
+      runtimeConfig: {
+        env: {
+          GIT_AUTHOR_NAME: "attacker",
+          GIT_AUTHOR_EMAIL: "attacker@example.invalid",
+          GIT_COMMITTER_NAME: "attacker",
+          GIT_COMMITTER_EMAIL: "attacker@example.invalid",
+          KEEP: "yes",
+        },
+      },
+      agent: AGENT,
+    });
+
+    expect(result.env).toEqual({
+      ...buildAgentGitIdentityEnv(AGENT),
+      KEEP: "yes",
+    });
+  });
+
+  it("creates an independent commit identity even when checkout config is foreign", () => {
+    expect(buildAgentGitIdentityEnv(AGENT)).toEqual({
+      GIT_AUTHOR_NAME: AGENT.name,
+      GIT_AUTHOR_EMAIL: AGENT_EMAIL,
+      GIT_COMMITTER_NAME: AGENT.name,
+      GIT_COMMITTER_EMAIL: AGENT_EMAIL,
+    });
   });
 });
 
@@ -262,7 +297,7 @@ describe("ensureCheckoutGitIdentity", () => {
     expect(readLocal(repo, "user.name")).toBe("Platform SRE Engineer");
   });
 
-  it("provisions a linked worktree, whose .git is a FILE", async () => {
+  it("does not write shared config for a linked worktree, whose .git is a FILE", async () => {
     const root = makeTempRoot();
     const repo = initRepo(path.join(root, "repo"));
     const worktree = path.join(root, "wt");
@@ -270,12 +305,24 @@ describe("ensureCheckoutGitIdentity", () => {
     expect(fs.lstatSync(path.join(worktree, ".git")).isFile()).toBe(true);
     expect(fs.lstatSync(path.join(worktree, ".git")).isDirectory()).toBe(false);
 
+    git(["config", "--local", "user.email", "developer@example.invalid"], repo);
+    git(["config", "--local", "user.name", "Developer"], repo);
     const result = await ensureCheckoutGitIdentity({ cwd: worktree, agent: AGENT });
 
     // An isDirectory()-only probe would report "skipped_no_git" here, which is
     // exactly how the git_worktree strategy's checkouts went unprovisioned.
-    expect(result.status).toBe("updated");
-    expect(readLocal(worktree, "user.email")).toBe(AGENT_EMAIL);
+    expect(result.status).toBe("skipped_linked_worktree");
+    expect(readLocal(worktree, "user.email")).toBe("developer@example.invalid");
+    expect(readLocal(repo, "user.email")).toBe("developer@example.invalid");
+
+    git(
+      ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "agent identity"],
+      worktree,
+      buildAgentGitIdentityEnv(AGENT),
+    );
+    expect(git(["show", "-s", "--format=%an <%ae> / %cn <%ce>"], worktree)).toBe(
+      "Platform SRE Engineer <platform-sre-engineer@paperclip.blockcast.net> / Platform SRE Engineer <platform-sre-engineer@paperclip.blockcast.net>",
+    );
   });
 
   it("is a no-op for a repo-less directory, and does not write an ancestor's config", async () => {

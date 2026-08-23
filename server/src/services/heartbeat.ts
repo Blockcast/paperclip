@@ -257,7 +257,10 @@ import {
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { ensureCheckoutGitIdentity } from "./git-checkout-identity.js";
+import {
+  applyAgentGitIdentityToRuntimeConfig,
+  ensureCheckoutGitIdentity,
+} from "./git-checkout-identity.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -23662,6 +23665,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipK8sIsolation;
     }
+
+    // This must remain the final env overlay before adapter dispatch. Git's
+    // process-level identity wins over shared/local config, cannot race between
+    // linked worktrees, and is inherited by remote adapters such as claude_k8s
+    // after they clone a fresh in-pod checkout. Applying it here also prevents
+    // agent, environment, project, routine, scratch, or isolation config from
+    // replacing the system-generated identity for this run.
+    runtimeConfig = applyAgentGitIdentityToRuntimeConfig({
+      runtimeConfig,
+      agent,
+    });
 
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,

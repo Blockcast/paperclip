@@ -40,7 +40,10 @@ import {
   pruneOwnStaleGitWorktree,
 } from "./git-worktree-ownership.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { ensureCheckoutGitIdentity } from "./git-checkout-identity.js";
+import {
+  buildAgentGitIdentityEnv,
+  ensureCheckoutGitIdentity,
+} from "./git-checkout-identity.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 
@@ -3393,7 +3396,10 @@ function buildWorkspaceCommandEnv(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
 }) {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...buildAgentGitIdentityEnv(input.agent),
+  };
   env.PAPERCLIP_WORKSPACE_CWD = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_PATH = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = input.worktreePath;
@@ -3633,9 +3639,11 @@ async function stampCheckoutIdentity(
 }
 
 /**
- * Final step of every worktree realization path: stamp the running agent's git
- * author identity (BLO-23894), then run the configured provision command if
- * there is one.
+ * Final step of every worktree realization path: attempt the compatibility
+ * checkout stamp (BLO-23894), then run the configured provision command if
+ * there is one. Linked worktrees deliberately skip the local-config write
+ * because it would mutate the common repository; the provision command and the
+ * later adapter invocation receive the authoritative per-run GIT_* environment.
  *
  * Identity is applied here rather than at the four `git worktree add` call sites
  * because this function is the one thing all of them funnel through -- the
