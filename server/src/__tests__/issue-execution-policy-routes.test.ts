@@ -530,6 +530,8 @@ describe("issue execution policy routes", () => {
       status: "todo",
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
       createdByUserId: "local-board",
       identifier: "PAP-1006",
       title: "External review monitor",
@@ -562,6 +564,8 @@ describe("issue execution policy routes", () => {
             nextCheckAt: "2026-12-01T12:00:00.000Z",
             scheduledBy: "assignee",
             notes: "Wait for external QA report.",
+            kind: "external_service",
+            serviceName: "github-actions",
           },
         },
       });
@@ -574,6 +578,68 @@ describe("issue execution policy routes", () => {
         monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
       }),
     );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-1",
+      "Yielded after persisting an external-service wait",
+      expect.objectContaining({
+        errorCode: "external_wait_yield",
+        persistBeforeTerminate: true,
+        repairTerminalRelease: true,
+        resultJson: expect.objectContaining({
+          yieldedExternalWait: true,
+          issueId: issue.id,
+          serviceName: "github-actions",
+        }),
+      }),
+    );
+  });
+
+  it("does not yield the current run for a non-external monitor", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+      createdByUserId: "local-board",
+      identifier: "PAP-1007",
+      title: "Internal follow-up monitor",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            scheduledBy: "assignee",
+            notes: "Resume an internal follow-up.",
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
   it("lets a checked-out execution agent re-arm a board-scheduled monitor", async () => {

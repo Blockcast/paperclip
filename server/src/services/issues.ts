@@ -19,6 +19,7 @@ import {
   heartbeatRuns,
   routineRuns,
   executionWorkspaces,
+  externalRuntimeReservations,
   issueApprovals,
   issueAttachments,
   issueCreateIdempotencyKeys,
@@ -6033,7 +6034,19 @@ export function issueService(db: Db) {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+    const activeReservation = await dbOrTx
+      .select({ id: externalRuntimeReservations.id })
+      .from(externalRuntimeReservations)
+      .where(
+        and(
+          eq(externalRuntimeReservations.runId, runId),
+          isNull(externalRuntimeReservations.releasedAt),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return activeReservation === null;
   }
 
   async function cancelNeverStartedOwnerRun(
@@ -6311,12 +6324,23 @@ export function issueService(db: Db) {
       // runs FIRST when checkoutRunId is set, so a divergence here would make the
       // fix unreachable for the common shape (checkout and execution locks both
       // pointing at one never-started run).
-      const stale = isReapableHeartbeatRunRow(existingRun);
+      const activeReservation = await tx
+        .select({ id: externalRuntimeReservations.id })
+        .from(externalRuntimeReservations)
+        .where(
+          and(
+            eq(externalRuntimeReservations.runId, input.expectedCheckoutRunId),
+            isNull(externalRuntimeReservations.releasedAt),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const stale = isReapableHeartbeatRunRow(existingRun) && activeReservation === null;
       const actorLive = actorRun?.status === "running";
       const sameAgentRetry =
         actorRun?.agentId === input.actorAgentId &&
         actorRun.retryOfRunId === input.expectedCheckoutRunId;
-      if ((!stale && !sameAgentRetry) || !actorLive) {
+      if ((!stale && (!sameAgentRetry || activeReservation !== null)) || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -6511,6 +6535,7 @@ export function issueService(db: Db) {
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !await isTerminalOrMissingHeartbeatRun(issue.executionRunId, tx)) return false;
 
       const updated = await tx
         .update(issues)
@@ -6706,6 +6731,7 @@ export function issueService(db: Db) {
         .where(eq(heartbeatRuns.id, issue.checkoutRunId))
         .then((rows) => rows[0] ?? null);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !await isTerminalOrMissingHeartbeatRun(issue.checkoutRunId, tx)) return false;
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
         await tx.execute(
@@ -6717,6 +6743,7 @@ export function issueService(db: Db) {
           .where(eq(heartbeatRuns.id, issue.executionRunId))
           .then((rows) => rows[0] ?? null);
         if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
+        if (executionRun && !await isTerminalOrMissingHeartbeatRun(issue.executionRunId, tx)) return false;
       }
 
       const updated = await tx
