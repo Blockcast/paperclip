@@ -669,6 +669,10 @@ const RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS = 12;
 // poll interval lets the sweep re-check capacity soon. PEN-382.
 export const CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000;
 export const CCROTATE_CAPACITY_RETRY_REASON = "ccrotate_capacity";
+export const MANUAL_CAPACITY_REPROBE_ERROR_CODE = "manual_capacity_reprobe";
+const MANUAL_CAPACITY_REPROBE_ACTIVITY_ACTION = "heartbeat.capacity_retry_superseded_by_manual_wake";
+const MANUAL_CAPACITY_REPROBE_CANCEL_REASON =
+  "Cancelled because an explicit manual wake requested a fresh provider-capacity probe";
 export const ISSUE_MONITOR_DISPATCH_LAPSE_MS = 15 * 60 * 1000;
 const ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS = 5 * 60 * 1000;
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
@@ -8111,6 +8115,7 @@ async function coalescePendingTaskScopeWake(input: {
   tx: WakeCoalescingDb;
   companyId: string;
   agentId: string;
+  issueId?: string | null;
   source: string;
   triggerDetail: string | null;
   reason: string | null;
@@ -8127,6 +8132,34 @@ async function coalescePendingTaskScopeWake(input: {
   const coalescibleStatuses = input.includeRunning
     ? EXECUTION_PATH_HEARTBEAT_RUN_STATUSES
     : TASK_SCOPE_COALESCIBLE_RUN_STATUSES;
+  const legacyTaskKeyPredicate = and(
+    isNull(heartbeatRuns.contextIssueId),
+    isNull(heartbeatRuns.contextTaskId),
+    matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
+    input.issueId
+      ? not(
+          exists(
+            input.tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.companyId, input.companyId),
+                  ne(issues.id, input.issueId),
+                  or(eq(issues.checkoutRunId, heartbeatRuns.id), eq(issues.executionRunId, heartbeatRuns.id)),
+                ),
+              ),
+          ),
+        )
+      : undefined,
+  );
+  const taskScopePredicate = input.issueId
+    ? or(
+        eq(heartbeatRuns.contextIssueId, input.issueId),
+        eq(heartbeatRuns.contextTaskId, input.issueId),
+        legacyTaskKeyPredicate,
+      )
+    : matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey);
 
   const existingRun = await input.tx
     .select()
@@ -8138,7 +8171,7 @@ async function coalescePendingTaskScopeWake(input: {
         inArray(heartbeatRuns.status, coalescibleStatuses),
         // Shared casing-compatibility predicate: a normalized pr_review key must
         // still coalesce into a legacy mixed-case run while those drain.
-        matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
+        taskScopePredicate,
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -10799,6 +10832,248 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const wakeReason = readNonEmptyString(input.contextSnapshot.wakeReason);
     if (wakeReason && ISSUE_RESPONSIBLE_USER_WAKE_REASONS.has(wakeReason)) return false;
     return input.source === "on_demand" || input.triggerDetail === "manual";
+  }
+
+  /**
+   * An operator's explicit demand is a capacity re-probe, not another delivery
+   * to postpone behind the provider's old retry horizon. The caller holds the
+   * enclosing scope lock (issue first for an issue wake, agent first otherwise),
+   * so the conditional update serializes against scheduled-retry promotion.
+   */
+  async function supersedeCapacityRetryForManualWake(input: {
+    tx: DbTransaction;
+    companyId: string;
+    agentId: string;
+    issueId: string | null;
+    taskKey: string | null;
+    source: string;
+    triggerDetail: string | null;
+    reason: string | null;
+    requestedByActorId: string | null | undefined;
+  }): Promise<{
+    cancelledRuns: typeof heartbeatRuns.$inferSelect[];
+    publishes: ActivityPublish[];
+    releasedIssueIds: string[];
+    superseded: boolean;
+  }> {
+    const issueIdentityPredicate = input.issueId
+      ? or(
+          eq(heartbeatRuns.contextIssueId, input.issueId),
+          eq(heartbeatRuns.contextTaskId, input.issueId),
+        )
+      : null;
+    const scopePredicate = input.issueId
+      ? input.taskKey
+        ? or(
+            issueIdentityPredicate!,
+            // Older rows may have only a task key. Restrict this fallback to
+            // rows without either explicit issue identity so a shared task key
+            // cannot cancel another issue's retry.
+            and(
+              isNull(heartbeatRuns.contextIssueId),
+              isNull(heartbeatRuns.contextTaskId),
+              matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
+              not(
+                exists(
+                  input.tx
+                    .select({ id: issues.id })
+                    .from(issues)
+                    .where(
+                      and(
+                        eq(issues.companyId, input.companyId),
+                        ne(issues.id, input.issueId),
+                        or(eq(issues.checkoutRunId, heartbeatRuns.id), eq(issues.executionRunId, heartbeatRuns.id)),
+                      ),
+                    ),
+                ),
+              ),
+            ),
+          )
+        : issueIdentityPredicate!
+      : input.taskKey
+        ? and(
+            isNull(heartbeatRuns.contextIssueId),
+            isNull(heartbeatRuns.contextTaskId),
+            matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
+          )
+        : and(
+            isNull(heartbeatRuns.contextIssueId),
+            isNull(heartbeatRuns.contextTaskId),
+            isNull(heartbeatRuns.contextTaskKey),
+          );
+    const now = new Date();
+    const cancelledRuns = await input.tx
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: MANUAL_CAPACITY_REPROBE_CANCEL_REASON,
+        errorCode: MANUAL_CAPACITY_REPROBE_ERROR_CODE,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, CCROTATE_CAPACITY_RETRY_REASON),
+          scopePredicate,
+        ),
+      )
+      .returning()
+      .then((rows) => rows);
+
+    const publishes: ActivityPublish[] = [];
+    const releasedIssueIds = new Set<string>();
+    for (const cancelled of cancelledRuns) {
+      if (cancelled.wakeupRequestId) {
+        await input.tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: MANUAL_CAPACITY_REPROBE_CANCEL_REASON,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+      }
+
+      const ownedIssueRows = await input.tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, input.companyId),
+            or(eq(issues.checkoutRunId, cancelled.id), eq(issues.executionRunId, cancelled.id)),
+          ),
+        )
+        .orderBy(asc(issues.id));
+      for (const ownedIssue of ownedIssueRows) {
+        if (await releaseIssueRunOwnership(input.tx, {
+          issueId: ownedIssue.id,
+          companyId: input.companyId,
+          runId: cancelled.id,
+          updatedAt: now,
+        })) {
+          releasedIssueIds.add(ownedIssue.id);
+        }
+      }
+      const cancelledIssueId =
+        ownedIssueRows[0]?.id ??
+        readNonEmptyString(cancelled.contextIssueId) ??
+        readNonEmptyString(cancelled.contextTaskId) ??
+        input.issueId;
+
+      const [eventSeq] = await input.tx
+        .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, cancelled.id));
+      await input.tx.insert(heartbeatRunEvents).values({
+        companyId: cancelled.companyId,
+        runId: cancelled.id,
+        agentId: cancelled.agentId,
+        seq: Number(eventSeq?.maxSeq ?? 0) + 1,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Provider-capacity retry superseded by an explicit manual wake",
+        payload: {
+          issueId: cancelledIssueId,
+          taskKey: input.taskKey,
+          scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
+          scheduledRetryAt: cancelled.scheduledRetryAt
+            ? new Date(cancelled.scheduledRetryAt).toISOString()
+            : null,
+          scheduledRetryReason: cancelled.scheduledRetryReason,
+          manualWakeSource: input.source,
+          manualWakeTriggerDetail: input.triggerDetail,
+          manualWakeReason: input.reason,
+        },
+      });
+
+      const statusPayload = {
+        runId: cancelled.id,
+        agentId: cancelled.agentId,
+        status: cancelled.status,
+        invocationSource: cancelled.invocationSource,
+        triggerDetail: cancelled.triggerDetail,
+        error: cancelled.error ?? null,
+        errorCode: cancelled.errorCode ?? null,
+        startedAt: cancelled.startedAt ? new Date(cancelled.startedAt).toISOString() : null,
+        finishedAt: cancelled.finishedAt ? new Date(cancelled.finishedAt).toISOString() : null,
+      };
+      const eventPayload = {
+        issueId: cancelledIssueId,
+        taskKey: input.taskKey,
+        scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
+        scheduledRetryAt: cancelled.scheduledRetryAt
+          ? new Date(cancelled.scheduledRetryAt).toISOString()
+          : null,
+        scheduledRetryReason: cancelled.scheduledRetryReason,
+        manualWakeSource: input.source,
+        manualWakeTriggerDetail: input.triggerDetail,
+        manualWakeReason: input.reason,
+      };
+      publishes.push(() => {
+        clearHeartbeatRunRuntimeStatus(cancelled.id);
+        publishLiveEvent({
+          companyId: cancelled.companyId,
+          type: "heartbeat.run.status",
+          payload: statusPayload,
+        });
+        publishRunLifecyclePluginEvent(cancelled);
+        publishLiveEvent({
+          companyId: cancelled.companyId,
+          type: "heartbeat.run.event",
+          payload: {
+            runId: cancelled.id,
+            agentId: cancelled.agentId,
+            issueId: cancelledIssueId,
+            seq: Number(eventSeq?.maxSeq ?? 0) + 1,
+            eventType: "lifecycle",
+            stream: "system",
+            level: "info",
+            color: null,
+            message: "Provider-capacity retry superseded by an explicit manual wake",
+            currentToolName: null,
+            lastAssistantSnippet: null,
+            lastEventAt: now.toISOString(),
+            payload: eventPayload,
+          },
+        });
+      });
+
+      publishes.push(await logActivity(input.tx as unknown as Db, {
+        companyId: cancelled.companyId,
+        actorType: "user",
+        actorId: input.requestedByActorId ?? "user",
+        agentId: cancelled.agentId,
+        runId: cancelled.id,
+        action: MANUAL_CAPACITY_REPROBE_ACTIVITY_ACTION,
+        entityType: "heartbeat_run",
+        entityId: cancelled.id,
+        issueId: cancelledIssueId,
+        details: {
+          issueId: cancelledIssueId,
+          taskKey: input.taskKey,
+          scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
+          scheduledRetryAt: cancelled.scheduledRetryAt
+            ? new Date(cancelled.scheduledRetryAt).toISOString()
+            : null,
+          scheduledRetryReason: cancelled.scheduledRetryReason,
+          source: input.source,
+          triggerDetail: input.triggerDetail,
+          reason: input.reason,
+        },
+      }, { deferPublish: true }));
+    }
+
+    return {
+      cancelledRuns,
+      publishes,
+      releasedIssueIds: [...releasedIssueIds],
+      superseded: cancelledRuns.length > 0,
+    };
   }
 
   async function resolveResponsibleUserIdForRunSeed(input: {
@@ -27848,6 +28123,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggerDetail,
       payload,
     });
+    const manualUserWake = isManualUserRun({
+      contextSnapshot: enrichedContextSnapshot,
+      requestedByActorType: opts.requestedByActorType,
+      source,
+      triggerDetail,
+    });
     const initialRetryReason = readNonEmptyString(enrichedContextSnapshot.retryReason);
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
 
@@ -28152,6 +28433,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload,
           contextSnapshot: retryContextSnapshotBase,
           taskKey: effectiveTaskKey,
+          issueId: issueId ?? null,
           requestedByActorType: opts.requestedByActorType,
           requestedByActorId: opts.requestedByActorId,
           idempotencyKey: opts.idempotencyKey,
@@ -28340,6 +28622,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
+    let manualCapacityActivityPublishes: ActivityPublish[] = [];
+    let manualCapacityReleasedIssueIds: string[] = [];
+
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(agent.companyId, issueId);
       if (activePauseHold) {
@@ -28462,6 +28747,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
           return { kind: "skipped" as const };
         }
+
+        if (manualUserWake) {
+          const supersession = await supersedeCapacityRetryForManualWake({
+            tx,
+            companyId: agent.companyId,
+            agentId,
+            issueId: issue.id,
+            taskKey: effectiveTaskKey,
+            source,
+            triggerDetail,
+            reason,
+            requestedByActorId: opts.requestedByActorId,
+          });
+          manualCapacityActivityPublishes = supersession.publishes;
+          manualCapacityReleasedIssueIds = supersession.releasedIssueIds;
+        }
+
+        const restoreManualCapacityCheckoutIfUnreplaced = async () => {
+          if (manualCapacityReleasedIssueIds.length === 0) return;
+          await restoreCheckoutPromotedStatuses(tx, {
+            issueIds: manualCapacityReleasedIssueIds,
+            companyId: issue.companyId,
+          });
+        };
 
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
@@ -28750,6 +29059,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
           });
           if (suppression) suppression.durableSkipReason = "pipeline_stage_exit_cancellation_pending";
+          await restoreManualCapacityCheckoutIfUnreplaced();
           return { kind: "skipped" as const };
         }
 
@@ -29153,6 +29463,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // transaction rather than firing inline (see the `outcome.kind`
             // switch right after `db.transaction` below), so a rollback throws
             // past the publish call instead of falling through to it.
+            await restoreManualCapacityCheckoutIfUnreplaced();
             return { kind: "skipped" as const, activityPublish };
           }
         }
@@ -29492,6 +29803,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 idempotencyKey: opts.idempotencyKey ?? null,
                 finishedAt: throttleNow,
               });
+              await restoreManualCapacityCheckoutIfUnreplaced();
               return { kind: "skipped" as const };
             }
           }
@@ -29529,6 +29841,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               })
               .where(eq(agents.id, agentId));
           }
+          await restoreManualCapacityCheckoutIfUnreplaced();
           return { kind: "skipped" as const };
         }
 
@@ -29537,7 +29850,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // wake may already have queued the single follow-up while this
         // transaction waited on the issue lock; absorb into that pending task
         // scope before inserting another follow-up.
-        const coalescedTaskScopeRun = hasInitialRetryMetadata ? null : await coalescePendingTaskScopeWake({
+        const coalescedTaskScopeRun = hasInitialRetryMetadata
+          ? null
+          : await coalescePendingTaskScopeWake({
           tx,
           companyId: agent.companyId,
           agentId,
@@ -29547,6 +29862,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload,
           contextSnapshot: enrichedContextSnapshot,
           taskKey: effectiveTaskKey,
+          issueId: issue.id,
           requestedByActorType: opts.requestedByActorType,
           requestedByActorId: opts.requestedByActorId,
           idempotencyKey: opts.idempotencyKey,
@@ -29555,7 +29871,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
         }
 
-        const coalescedGithubStateRun = hasInitialRetryMetadata ? null : await coalesceQueuedGithubStateWake({
+        const coalescedGithubStateRun = hasInitialRetryMetadata
+          ? null
+          : await coalesceQueuedGithubStateWake({
           tx,
           companyId: agent.companyId,
           agentId,
@@ -29600,6 +29918,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: new Date(),
             });
+            await restoreManualCapacityCheckoutIfUnreplaced();
             return { kind: "skipped" as const };
           }
         }
@@ -29671,6 +29990,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return { kind: "queued" as const, run: newRun };
       });
+
+      for (const publish of manualCapacityActivityPublishes) {
+        try {
+          publish();
+        } catch (err) {
+          logger.warn(
+            { err, issueId, agentId },
+            "failed to publish manual capacity-reprobe activity event",
+          );
+        }
+      }
 
       // Reached only on commit; a rollback throws past this rather than
       // falling through to it, so the workspace-preflight-blocked activity
@@ -29769,8 +30099,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       sameScopeScheduledRetryRun ??
       (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
 
+    const manualCapacityRetryTarget =
+      manualUserWake &&
+      rawCoalescedTarget?.status === "scheduled_retry" &&
+      rawCoalescedTarget.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON
+        ? rawCoalescedTarget
+        : null;
     const coalescedTargetRun = filterZombieCoalesceTarget(
-      rawCoalescedTarget,
+      manualCapacityRetryTarget ? null : rawCoalescedTarget,
       liveRunExecutions,
     );
 
@@ -29815,35 +30151,61 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
 
+      if (manualUserWake) {
+        const supersession = await supersedeCapacityRetryForManualWake({
+          tx,
+          companyId: agent.companyId,
+          agentId,
+          issueId: null,
+          taskKey: effectiveTaskKey,
+          source,
+          triggerDetail,
+          reason,
+          requestedByActorId: opts.requestedByActorId,
+        });
+        manualCapacityActivityPublishes = supersession.publishes;
+        manualCapacityReleasedIssueIds = supersession.releasedIssueIds;
+      }
+
+      const restoreManualCapacityCheckoutIfUnreplaced = async () => {
+        if (manualCapacityReleasedIssueIds.length === 0) return;
+        await restoreCheckoutPromotedStatuses(tx, {
+          issueIds: manualCapacityReleasedIssueIds,
+          companyId: agent.companyId,
+        });
+      };
+
       // The optimistic same-scope lookup above avoids taking the lock in the
       // common case. Re-check after acquiring it so a queued run or a
       // capacity-deferred scheduled retry that appeared meanwhile absorbs the
       // new wake. Keep a coalesced wake row for audit, but only one run.
-      const coalescedTaskScopeRun = hasInitialRetryMetadata ? null : await coalescePendingTaskScopeWake({
-        tx,
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        contextSnapshot: enrichedContextSnapshot,
-        taskKey: effectiveTaskKey,
-        requestedByActorType: opts.requestedByActorType,
-        requestedByActorId: opts.requestedByActorId,
-        idempotencyKey: opts.idempotencyKey,
-        // If the unlocked snapshot saw no running candidate, a same-task run
-        // found after taking the agent lock was created while this enqueue was
-        // waiting. It is therefore a live concurrency race, not a pre-existing
-        // zombie. Merge into it unless this wake intentionally needs a new run
-        // boundary (for example, an issue-comment follow-up, or an explicit PR
-        // review request that a run already reviewing this PR cannot satisfy —
-        // BLO-18953).
-        includeRunning:
-          !sameScopeRunningRun &&
-          !shouldQueueFollowupForRunningWake &&
-          !explicitPrReviewRequestWake,
-      });
+      const coalescedTaskScopeRun = hasInitialRetryMetadata
+        ? null
+        : await coalescePendingTaskScopeWake({
+            tx,
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason,
+            payload,
+            contextSnapshot: enrichedContextSnapshot,
+            taskKey: effectiveTaskKey,
+            requestedByActorType: opts.requestedByActorType,
+            requestedByActorId: opts.requestedByActorId,
+            idempotencyKey: opts.idempotencyKey,
+            // If the unlocked snapshot saw no running candidate, a same-task run
+            // found after taking the agent lock was created while this enqueue was
+            // waiting. It is therefore a live concurrency race, not a pre-existing
+            // zombie. Merge into it unless this wake intentionally needs a new run
+            // boundary (for example, an issue-comment follow-up, or an explicit PR
+            // review request that a run already reviewing this PR cannot satisfy —
+            // BLO-18953).
+            includeRunning:
+              !sameScopeRunningRun &&
+              !shouldQueueFollowupForRunningWake &&
+              !explicitPrReviewRequestWake,
+          });
       if (coalescedTaskScopeRun) {
         return { kind: "coalesced" as const, run: coalescedTaskScopeRun };
       }
@@ -29880,23 +30242,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agents.id, agentId));
         }
+        await restoreManualCapacityCheckoutIfUnreplaced();
         return { kind: "skipped" as const };
       }
 
-      const coalescedGithubStateRun = hasInitialRetryMetadata ? null : await coalesceQueuedGithubStateWake({
-        tx,
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        contextSnapshot: enrichedContextSnapshot,
-        taskKey: effectiveTaskKey,
-        requestedByActorType: opts.requestedByActorType,
-        requestedByActorId: opts.requestedByActorId,
-        idempotencyKey: opts.idempotencyKey,
-      });
+      const coalescedGithubStateRun = hasInitialRetryMetadata
+        ? null
+        : await coalesceQueuedGithubStateWake({
+            tx,
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason,
+            payload,
+            contextSnapshot: enrichedContextSnapshot,
+            taskKey: effectiveTaskKey,
+            requestedByActorType: opts.requestedByActorType,
+            requestedByActorId: opts.requestedByActorId,
+            idempotencyKey: opts.idempotencyKey,
+          });
       if (coalescedGithubStateRun) {
         return { kind: "coalesced" as const, run: coalescedGithubStateRun };
       }
@@ -29949,6 +30314,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       return { kind: "queued" as const, run: newRun };
     });
+
+    for (const publish of manualCapacityActivityPublishes) {
+      try {
+        publish();
+      } catch (err) {
+        logger.warn(
+          { err, issueId, agentId },
+          "failed to publish manual capacity-reprobe activity event",
+        );
+      }
+    }
 
     if (queueOutcome.kind === "skipped") return null;
     if (queueOutcome.kind === "coalesced") return queueOutcome.run;
