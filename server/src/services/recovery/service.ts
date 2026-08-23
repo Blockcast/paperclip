@@ -373,6 +373,10 @@ export const STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD = 3;
 // (issue_comments.metadata is a strict schema with no room for a custom tag,
 // so we count by this prefix on system-authored comments within the window).
 export const STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER = "[detector] +1 fire";
+// BLO-29601: prefix on the comment left when a liveness escalation is closed because its
+// originating invariant stopped holding. Exported so tests and any future
+// "why did this close?" audit can select these without parsing prose.
+export const STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER = "[liveness] auto-resolved:";
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
@@ -8504,7 +8508,7 @@ export function recoveryService(
     return result;
   }
 
-  async function collectIssueGraphLivenessFindings() {
+  async function collectIssueGraphLiveness() {
     const issueRowsPromise = Promise.resolve(db
       .select({
         id: issues.id,
@@ -8689,24 +8693,29 @@ export function recoveryService(
       }),
     ]);
 
-    const openRecoveryIssues = recoveryIssueRows.flatMap((row) => {
-      if (row.originKind === RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation) {
-        const parsed = parseIssueGraphLivenessIncidentKey(row.originId);
-        if (!parsed || parsed.companyId !== row.companyId) return [];
-        return [
-          {
-            companyId: row.companyId,
-            issueId: parsed.issueId,
-            status: row.status,
-          },
-          {
-            companyId: row.companyId,
-            issueId: parsed.leafIssueId,
-            status: row.status,
-          },
-        ];
-      }
+    // Waiting paths contributed by OPEN liveness escalations, kept separate from every
+    // other recovery-shaped waiting path (stranded-issue recoveries, open recovery
+    // actions) so the premise re-check below can drop exactly these and nothing else.
+    const escalationRecoveryIssues = recoveryIssueRows.flatMap((row) => {
+      if (row.originKind !== RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation) return [];
+      const parsed = parseIssueGraphLivenessIncidentKey(row.originId);
+      if (!parsed || parsed.companyId !== row.companyId) return [];
+      return [
+        {
+          companyId: row.companyId,
+          issueId: parsed.issueId,
+          status: row.status,
+        },
+        {
+          companyId: row.companyId,
+          issueId: parsed.leafIssueId,
+          status: row.status,
+        },
+      ];
+    });
 
+    const nonEscalationRecoveryIssues = recoveryIssueRows.flatMap((row) => {
+      if (row.originKind === RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation) return [];
       const issueId = readNonEmptyString(row.originId);
       if (!issueId) return [];
       return [{
@@ -8716,7 +8725,7 @@ export function recoveryService(
       }];
     });
 
-    return classifyIssueGraphLiveness({
+    const sharedInput = {
       issues: issueRows.map(({ description, ...issue }) => ({
         ...issue,
         hasExternalWaitOwner: externalWaitFromDescription(description ?? null) !== null,
@@ -8742,9 +8751,46 @@ export function recoveryService(
       })),
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
-      openRecoveryIssues: openRecoveryIssues.concat(recoveryActionRows),
       now: new Date(),
-    });
+    };
+
+    const baselineRecoveryIssues = escalationRecoveryIssues
+      .concat(nonEscalationRecoveryIssues)
+      .concat(recoveryActionRows);
+
+    return {
+      // The MINTING view. An open escalation contributes a waiting path for its own
+      // subject and leaf, which is what stops the detector re-firing the same incident
+      // every 30s tick while somebody is already on it (BLO-15200). Everything that
+      // creates escalations must keep reading this one.
+      findings: classifyIssueGraphLiveness({
+        ...sharedInput,
+        openRecoveryIssues: baselineRecoveryIssues,
+      }),
+      // BLO-29601: the PREMISE RE-CHECK view, and the reason this function classifies
+      // twice. `hasExplicitWaitingPath` treats an open recovery issue as a satisfier, so
+      // an escalation supplies the action path for the very issue it was minted about.
+      // That is self-sealing: the invariant stops firing the moment the escalation
+      // exists, so "does this still fire?" answers no for every escalation — the live
+      // ones included — and a re-check built on the minting view would auto-close the
+      // entire backlog rather than only the dead half.
+      //
+      // Dropping ALL escalation-contributed waiting paths rather than only the one under
+      // evaluation is deliberate: two escalations covering each other's subject would
+      // otherwise each read as satisfied by the other, which is the same self-sealing
+      // defect one hop out. Non-escalation recovery paths stay in — those are real,
+      // independently-owned action paths.
+      //
+      // Strictly a read: this set is never used to create anything.
+      escalationBlindFindings: classifyIssueGraphLiveness({
+        ...sharedInput,
+        openRecoveryIssues: nonEscalationRecoveryIssues.concat(recoveryActionRows),
+      }),
+    };
+  }
+
+  async function collectIssueGraphLivenessFindings() {
+    return (await collectIssueGraphLiveness()).findings;
   }
 
   async function findOpenLivenessEscalation(companyId: string, incidentKey: string) {
@@ -9282,6 +9328,125 @@ export function recoveryService(
         .then((rows) => rows[0] ?? null),
     ]);
     return Boolean(contextRun || issueRun);
+  }
+
+  /**
+   * BLO-29601: close open liveness escalations whose originating invariant has stopped
+   * holding, before anything spends an agent run adjudicating them.
+   *
+   * An escalation is minted from a premise ("BLO-x is in review with no action path")
+   * and then never re-checked. When the premise clears — the blocker resolves, the
+   * assignee wakes, a monitor re-arms — the row stays open and keeps demanding a run to
+   * rediscover that there is nothing to do. `retireObsoleteLivenessRecoveryIssues`
+   * cannot do this job: it reads the minting view, in which an open escalation
+   * suppresses its own subject's finding, so every escalation looks obsolete there and
+   * the only thing standing between the backlog and a mass close is its
+   * still-wired-as-a-blocker guard.
+   *
+   * The re-check therefore runs against `escalationBlindFindings`, where escalation
+   * -contributed waiting paths are removed and the invariant is evaluated against the
+   * graph on its own terms. Premise still present in that set → leave the row alone.
+   *
+   * Two properties this must preserve, both load-bearing:
+   *
+   *  - Equality is on the full incident key (company, subject, invariant, leaf), not on
+   *    the subject alone. A subject that has moved to a DIFFERENT invariant retires the
+   *    old escalation; the mint path then raises the new one through its own suppressors
+   *    rather than this pass silently re-scoping a live row.
+   *  - The blocker edge comes off the source BEFORE the row is cancelled. Cancelling
+   *    first would leave the source blocked behind a cancelled issue, which is itself a
+   *    liveness violation (`blocked_by_cancelled_issue`) — trading one dead escalation
+   *    for another.
+   */
+  async function autoResolveStaleLivenessEscalations(
+    escalationBlindFindings: IssueLivenessFinding[],
+    opts?: { runId?: string | null },
+  ) {
+    const livePremiseKeys = new Set(
+      escalationBlindFindings.map((finding) => finding.incidentKey),
+    );
+    const openEscalations = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+
+    const result = {
+      checked: 0,
+      autoResolved: 0,
+      premiseStillTrueSkipped: 0,
+      unparsableSkipped: 0,
+      runsReleased: 0,
+      blockerRelationsRemoved: 0,
+      autoResolvedIssueIds: [] as string[],
+    };
+
+    for (const escalation of openEscalations) {
+      result.checked += 1;
+      const parsed = parseLivenessIncidentKey(escalation.originId);
+      // No parsable premise means nothing to re-check. Left for
+      // `retireObsoleteLivenessRecoveryIssues`, which has its own disposal path.
+      if (!parsed || !escalation.originId) {
+        result.unparsableSkipped += 1;
+        continue;
+      }
+      // AC3. The one branch that must not regress: a live incident stays open.
+      if (livePremiseKeys.has(escalation.originId)) {
+        result.premiseStillTrueSkipped += 1;
+        continue;
+      }
+
+      const sourceIssue = await db
+        .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.companyId, parsed.companyId), eq(issues.id, parsed.issueId)))
+        .then((rows) => rows[0] ?? null);
+
+      await issuesSvc.addComment(
+        escalation.id,
+        [
+          `${STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER} premise no longer holds — closing without an agent run.`,
+          "",
+          `- Invariant: \`${parsed.state}\``,
+          `- Subject issue: ${sourceIssue?.identifier ?? parsed.issueId}${
+            sourceIssue ? ` (now \`${sourceIssue.status}\`)` : " (no longer visible)"
+          }`,
+          `- Incident key: \`${escalation.originId}\``,
+          "",
+          sourceIssue
+            ? `Re-evaluated against current state with open liveness escalations excluded as action paths, so this row could not vouch for itself: \`${parsed.state}\` no longer fires for ${sourceIssue.identifier ?? parsed.issueId}. Nothing here needs adjudicating.`
+            : "The subject issue is no longer visible, so the invariant has nothing left to hold against.",
+        ].join("\n"),
+        { runId: opts?.runId ?? null },
+      );
+
+      if (await removeRecoveryBlockerFromSource(escalation)) {
+        result.blockerRelationsRemoved += 1;
+      }
+
+      // AC2. A dead escalation holding an execution lock strands that run: the issue
+      // keeps pointing at it, and `retireObsoleteLivenessRecoveryIssues` refuses to
+      // touch a row with an active run, so the lock outlives the premise. Terminal
+      // status alone does NOT clear these columns (`issuesSvc.update` leaves
+      // executionRunId untouched on done/cancelled), so release explicitly. This
+      // cancels only never-started runs — an already-executing run is left to finish
+      // and find the row closed, rather than being killed mid-write.
+      if (escalation.executionRunId || escalation.checkoutRunId) {
+        const released = await issuesSvc.adminForceRelease(escalation.id);
+        if (released) result.runsReleased += 1;
+      }
+
+      await issuesSvc.update(escalation.id, { status: "cancelled" });
+      result.autoResolved += 1;
+      result.autoResolvedIssueIds.push(escalation.id);
+    }
+
+    return result;
   }
 
   async function retireObsoleteLivenessRecoveryIssues(
@@ -10903,7 +11068,17 @@ export function recoveryService(
     /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
     abandonedRecoveryMs?: number;
   }) {
-    let findings = await collectIssueGraphLivenessFindings();
+    const collected = await collectIssueGraphLiveness();
+    let findings = collected.findings;
+    // BLO-29601: run the premise re-check FIRST, so a sweep that closes a dead
+    // escalation does it before anything downstream reads the escalation as an owned
+    // action path. Unfiltered by `issueCreatedAtGte` on purpose: that knob narrows which
+    // findings may CREATE escalations, and applying it here would leave the pre-cutoff
+    // backlog — the population this exists to drain — permanently unreachable.
+    const staleEscalationCleanup = await autoResolveStaleLivenessEscalations(
+      collected.escalationBlindFindings,
+      { runId: opts?.runId ?? null },
+    );
     if (opts?.issueCreatedAtGte) {
       const findingIssueIds = [...new Set(findings.map((finding) => finding.recoveryIssueId))];
       const eligibleIssueIds = new Set(
@@ -10959,6 +11134,19 @@ export function recoveryService(
       skippedReescalationCooldown: 0,
       skippedUnchangedTarget: 0,
       obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
+      // BLO-29601. `findings` above was collected BEFORE these closures landed, so the
+      // subjects freed by this pass still carry their (now-cancelled) escalation as a
+      // waiting path in the minting view and cannot be re-escalated on this same tick.
+      // That is the wanted shape: closing a dead escalation should not immediately mint
+      // a replacement. A subject that is genuinely still stuck re-fires next sweep,
+      // through the normal staleness and cooldown gates.
+      staleEscalationsChecked: staleEscalationCleanup.checked,
+      staleEscalationsAutoResolved: staleEscalationCleanup.autoResolved,
+      staleEscalationsPremiseStillTrueSkipped: staleEscalationCleanup.premiseStillTrueSkipped,
+      staleEscalationsUnparsableSkipped: staleEscalationCleanup.unparsableSkipped,
+      staleEscalationRunsReleased: staleEscalationCleanup.runsReleased,
+      staleEscalationBlockerRelationsRemoved: staleEscalationCleanup.blockerRelationsRemoved,
+      staleEscalationAutoResolvedIssueIds: staleEscalationCleanup.autoResolvedIssueIds,
       obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
       // Breakout of the dominant `activeSkipped` arm. `activeSkipped` stays the
       // total so existing consumers keep working; this names the "source is
