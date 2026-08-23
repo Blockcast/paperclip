@@ -1625,6 +1625,23 @@ export interface PluginIssuesClient {
       blockedByIssueIds?: string[];
       labelIds?: string[];
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      /**
+       * Compare-and-set on the issue's execution-lock columns, evaluated as a
+       * write precondition inside `updateIssue`'s transaction. When the pinned
+       * value does not match, the update applies nothing and throws a 409
+       * whose message ends in "before the update could be applied".
+       *
+       * Pass `null` for both to mean "only apply this if no run holds the
+       * issue". Any plugin that transitions an issue it does not itself hold
+       * should do so: `updateIssue` clears all four lock columns on a
+       * transition out of `in_progress`, so an unguarded status write silently
+       * evicts whatever run was working the row (BLO-29908).
+       *
+       * Pinning one column is not sufficient — an issue can be held via
+       * `checkoutRunId` with `executionRunId` still null (BLO-19749).
+       */
+      expectedCurrentCheckoutRunId?: string | null;
+      expectedCurrentExecutionRunId?: string | null;
     },
     companyId: string,
     actor?: PluginIssueMutationActor,

@@ -1202,10 +1202,140 @@ describe("handleWebhook — resolved", () => {
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
-      { status: "cancelled" },
+      {
+        status: "cancelled",
+        expectedCurrentCheckoutRunId: null,
+        expectedCurrentExecutionRunId: null,
+      },
       "company-1",
     );
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  // BLO-29908. Observed live: a run checked out BLO-25023 at 15:22:08, wrote its
+  // findings document at 15:24:24, and the bridge cancelled the row at 15:24:54
+  // — clearing checkoutRunId, executionRunId, executionAgentNameKey and
+  // executionLockedAt out from under it. These tests are that trace.
+  describe("resolve does not evict a live execution lock (BLO-29908)", () => {
+    const HELD_RUN_ID = "0657f242-e2b9-4ed0-87ce-f57beb8067ef";
+    // One of the three 409 messages updateIssue raises for a failed write
+    // precondition; the plugin matches on the shared suffix.
+    const lockConflict = () =>
+      new Error("Issue execution owner changed before the update could be applied");
+
+    const heldState = (): AlertStateRecord => ({
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "LLMProxyProviderHighErrorRatio",
+      severity: "warning",
+      firstSeenAt: "2026-08-23T04:24:00Z",
+      lastFiredAt: "2026-08-23T15:22:00Z",
+      resolvedAt: null,
+    });
+
+    const resolveOnce = async (
+      ctx: PluginContext,
+      mocks: MockClients,
+      updateImpl: () => Promise<unknown>,
+    ) => {
+      mocks.state.get.mockResolvedValueOnce(heldState());
+      mocks.issues.get.mockResolvedValueOnce({
+        id: "issue-existing",
+        status: "in_progress",
+        checkoutRunId: HELD_RUN_ID,
+        executionRunId: HELD_RUN_ID,
+      });
+      mocks.issues.update.mockImplementationOnce(updateImpl);
+      const envelope = baseEnvelope({
+        status: "resolved",
+        alerts: [baseAlert({ status: "resolved", endsAt: "2026-08-23T15:22:00Z" })],
+      });
+      return handleWebhook(
+        ctx,
+        baseConfig({ autoCloseOnResolve: true }),
+        true,
+        baseInput({ parsedBody: envelope }),
+      );
+    };
+
+    it("pins BOTH lock columns on the cancel, not just executionRunId", async () => {
+      const { ctx, mocks } = mkCtx();
+      await resolveOnce(ctx, mocks, async () => ({ id: "issue-existing" }));
+
+      // checkoutRunId alone can hold an issue with executionRunId still null
+      // (BLO-19749), so a guard on one column would miss that holder.
+      expect(mocks.issues.update).toHaveBeenCalledWith(
+        "issue-existing",
+        {
+          status: "cancelled",
+          expectedCurrentCheckoutRunId: null,
+          expectedCurrentExecutionRunId: null,
+        },
+        "company-1",
+      );
+    });
+
+    it("leaves the row untouched and annotates it when the lock is held", async () => {
+      const { ctx, mocks } = mkCtx();
+      await resolveOnce(ctx, mocks, async () => {
+        throw lockConflict();
+      });
+
+      // The guarded update is the ONLY status write. No unguarded retry.
+      expect(mocks.issues.update).toHaveBeenCalledTimes(1);
+
+      const body = String(mocks.issues.createComment.mock.calls[0]![1]);
+      expect(body).toContain(HELD_RUN_ID);
+      expect(body).toContain("auto-cancel withheld");
+
+      expect(mocks.metrics.write).toHaveBeenCalledWith(
+        "alertmanager.resolved.cancel_withheld",
+        1,
+        expect.objectContaining({ alertname: "LLMProxyProviderHighErrorRatio" }),
+      );
+      // The resolve is still recorded — the alert did clear — but the state row
+      // now names the run the cancel was withheld for.
+      expect(mocks.state.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          resolvedAt: "2026-08-23T15:22:00Z",
+          cancelWithheldForRunId: HELD_RUN_ID,
+        }),
+      );
+    });
+
+    it("annotates once per holding run, not once per flap cycle", async () => {
+      const { ctx, mocks } = mkCtx();
+      await resolveOnce(ctx, mocks, async () => {
+        throw lockConflict();
+      });
+      const body = String(mocks.issues.createComment.mock.calls[0]![1]);
+
+      // Second resolve of the same flapping fingerprint: the marker is already
+      // on the thread. LLMProxy* rules carry keepFiringFor: 0 and the fault
+      // cycles in ~16m blocks, so this path runs about twice an hour.
+      mocks.issues.listComments.mockResolvedValueOnce([{ id: "c1", body }] as never);
+      await resolveOnce(ctx, mocks, async () => {
+        throw lockConflict();
+      });
+
+      expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    });
+
+    it("rethrows a non-precondition failure so Alertmanager retries", async () => {
+      const { ctx, mocks } = mkCtx();
+      await expect(
+        resolveOnce(ctx, mocks, async () => {
+          throw new Error("connection reset");
+        }),
+      ).rejects.toThrow();
+
+      // A transient fault must not be banked as a resolved+withheld outcome.
+      expect(mocks.issues.createComment).not.toHaveBeenCalled();
+      expect(mocks.state.set).not.toHaveBeenCalled();
+    });
   });
 
   it("fails the delivery without marking resolved when issue cancellation fails", async () => {
@@ -1362,7 +1492,11 @@ describe("handleWebhook — resolved", () => {
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
-      { status: "cancelled" },
+      {
+        status: "cancelled",
+        expectedCurrentCheckoutRunId: null,
+        expectedCurrentExecutionRunId: null,
+      },
       "company-1",
     );
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
@@ -1400,7 +1534,11 @@ describe("handleWebhook — resolved", () => {
     });
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
-      { status: "cancelled" },
+      {
+        status: "cancelled",
+        expectedCurrentCheckoutRunId: null,
+        expectedCurrentExecutionRunId: null,
+      },
       "company-1",
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
@@ -1999,7 +2137,11 @@ describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
     );
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-tracked",
-      { status: "cancelled" },
+      {
+        status: "cancelled",
+        expectedCurrentCheckoutRunId: null,
+        expectedCurrentExecutionRunId: null,
+      },
       "company-1",
     );
     // The state write is the half that actually stops the ladder:
@@ -2140,7 +2282,11 @@ describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
     );
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-tracked",
-      { status: "cancelled" },
+      {
+        status: "cancelled",
+        expectedCurrentCheckoutRunId: null,
+        expectedCurrentExecutionRunId: null,
+      },
       "company-1",
     );
     // The state write is the half that actually stops the ladder.

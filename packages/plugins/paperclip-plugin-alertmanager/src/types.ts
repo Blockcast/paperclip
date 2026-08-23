@@ -218,6 +218,17 @@ export interface AlertStateRecord {
    * recomputable in the sweep because alert labels are not persisted.
    */
   escalationIntervalMs?: number | null;
+  /**
+   * BLO-29908: set when a resolve arrived while a run held the issue's
+   * execution lock, so the auto-cancel was withheld rather than evicting that
+   * run. Names the holding run; null once a resolve cancels cleanly.
+   *
+   * Diagnostic, not control state — nothing reconciles off it. It exists so
+   * that "this row is open even though its alert cleared" is answerable from
+   * the state row instead of only from the issue thread.
+   */
+  cancelWithheldForRunId?: string | null;
+  cancelWithheldAt?: string | null;
 }
 
 /**
