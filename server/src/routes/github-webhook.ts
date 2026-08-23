@@ -550,6 +550,52 @@ function resolvePrCommentReviewGateWebhookTrigger(
     };
   }
 
+  // The formal-review surface, which is the one Ally actually uses: 33 of 33
+  // consolidated reviews measured in this repo arrived as reviews-API objects
+  // and none as issue comments (see pr-comment-review-gate.ts). Without this
+  // branch the gate only ever ran on `issue_comment` and at push time — and
+  // push time is the one instant at which a review of that head cannot yet
+  // exist — so the reviews half of the both-surfaces read added by #1464 was
+  // structurally unreachable and every verdict the gate ever published was a
+  // green "not evaluated" (BLO-29853: 30/30 recent merges, 9/10 of them on
+  // heads that demonstrably had been reviewed).
+  if (eventName === "pull_request_review") {
+    // `edited` counts as much as `submitted`: the verdict is a pure function of
+    // the review bodies, so editing a finding into or out of one changes it.
+    // `dismissed` is excluded for that same reason — dismissal leaves the body,
+    // and therefore the verdict, untouched.
+    if (payload.action !== "submitted" && payload.action !== "edited") return null;
+    const review = payload.review as Record<string, unknown> | undefined;
+    const reviewUser = review?.user as Record<string, unknown> | undefined;
+    const reviewedPr = payload.pull_request as Record<string, unknown> | undefined;
+    const reviewedPrNumber = typeof reviewedPr?.number === "number" ? reviewedPr.number : null;
+    if (
+      reviewedPrNumber === null ||
+      !githubReviewerIdentityMatches(
+        readStringField(reviewUser, "login") ?? "",
+        configuredReviewerLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN,
+      ) ||
+      // A review without the consolidated heading is not an attestation the
+      // evaluator would count either, so triggering on it would re-publish an
+      // identical verdict for the cost of three API calls.
+      !hasAllyConsolidatedReviewHeading(readStringField(review, "body"))
+    ) {
+      return null;
+    }
+    // No `headSha`, deliberately — let the gate resolve the live head rather
+    // than trusting `review.commit_id` or this payload's snapshot. A review can
+    // be submitted against a head the branch has already moved past, and a
+    // status written to a non-head commit is invisible to branch protection.
+    // Resolving live also lets the carried-finding path (BLO-29711) see that
+    // the new head is unattested, which passing the stale sha would defeat.
+    // Matches the `issue_comment` branch above.
+    return {
+      repoFullName,
+      prNumber: reviewedPrNumber,
+      prUrl: githubPrUrl(repoFullName, reviewedPrNumber, readStringField(reviewedPr, "html_url")),
+    };
+  }
+
   if (eventName !== "pull_request") return null;
   const action = payload.action;
   if (action !== "opened" && action !== "reopened" && action !== "synchronize") return null;
