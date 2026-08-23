@@ -61,6 +61,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
 | `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24, clamped to a 720h (30-day) ceiling. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
+| `fallbackAgentName`  | string  | effectively yes | Exact agent **name** assigned when nothing else resolves an owner. Must match exactly one *invokable* agent. Missing, unmatched, ambiguous, or matching only a non-invokable agent (`paused` / `pending_approval` / broken reporting chain) **fails closed**: the alert creates no issue and the delivery is retried. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
 ### Example `AlertmanagerConfig` YAML
@@ -162,14 +163,80 @@ below.
 
 First hit wins:
 
-1. `alert.labels.paperclip_assignee_email`
-2. `ownerMap[<label>][<value>]` matched against `alert.labels`
-3. `alert.annotations.paperclip_assignee_email`
-4. unassigned
+1. `alert.labels.paperclip_assignee_email` (explicit override)
+2. `alert.annotations.paperclip_assignee_email` (explicit override)
+3. `issueRouteMap[<label>][<value>].assigneeAgentId` / `.assigneeUserId`
+4. `ownerMap[<label>][<value>]` matched against `alert.labels`
+5. `fallbackAgentName` — the configured named agent
+6. **fail closed** — no issue is created
+
+Explicit label/annotation overrides outrank the route; the `ownerMap` does
+not — a matching route wins over it.
+
+Step 6 is deliberate. An ownerless alert issue is never routed to anyone, is
+not woken on, and auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438
+all landed `assigneeAgentId: null` on 2026-08-17 and died that way), so the
+plugin refuses to create one. Because that is a *configuration* fault rather
+than a property of the alert, the delivery fails rather than being
+acknowledged: Alertmanager keeps retrying and the alert survives until an
+operator fixes `fallbackAgentName`. Watch `alertmanager.owner.fallback_failed`.
+
+`fallbackAgentName` matches on the agent's name, case-insensitively after
+trimming, and must match **exactly one invokable** agent in the company. Zero
+matches (wrong name) and more than one match (ambiguous) both fail closed.
+
+Invokability is part of the match, not a separate check. `ctx.agents.list`
+filters out only `terminated` agents, so a `paused` or `pending_approval` agent
+can still match a name — and `ctx.agents.invoke` throws on exactly those. An
+issue assigned to one of them has a non-null assignee that can never be woken,
+which reproduces the BLO-27435 harm while the ownerless-issue check reads clean.
+Candidates are therefore filtered through `getAgentWorkEligibility`, which also
+rejects a broken reporting chain, before the exactly-one test — so a leftover
+paused duplicate of the right name does not break an otherwise valid config,
+while a sole paused match fails closed with a log line naming the blocking
+reason (`paused`) rather than reporting the name as unmatched. Budget
+enforcement pauses agents, so this is a live runtime transition, not only a
+config typo.
 
 Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
 cached too (empty string) so a missing user doesn't cause repeated lookups.
+
+### Issue creation floor and rule-level opt-out
+
+Two gates keep low-value alerts from becoming issues:
+
+- **`severity: info` creates no issue.** The gate is *creation-only* and runs
+  after the re-fire branch, so an `info` issue that already exists (filed
+  before this floor) still gets refreshed and still closes on resolve.
+  Emits `alertmanager.webhook.below_issue_floor`.
+- **`paperclip_issue: "false"`** — as a label *or* an annotation — suppresses
+  the alert at **any** severity. Like the floor, the gate is *creation-only*: it
+  suppresses the **firing** path entirely (no issue created, no existing one
+  refreshed, no state written, no suppression anchor banked) but deliberately
+  lets the **resolved** path through. Emits
+  `alertmanager.webhook.issue_opt_out`.
+
+Letting resolve through is what keeps the opt-out from wedging the issues it was
+added to silence. Gating it too would mean `handleResolved` never runs for an
+opted-out rule, so `state.resolvedAt` would stay `null` and the issue would
+never reach a terminal status — and `advanceIssueLadder` returns early only on
+`resolvedAt`, `escalationComplete`, or a terminal issue status. The escalation
+sweep would keep climbing the ladder, waking agents, and eventually file a
+`[user-cover]` board escalation for a rule that was explicitly opted out and
+whose alert had already resolved. That is the normal adoption path, not an edge
+case: operators opt a rule out *because* it has already been filing noisy
+issues, so a tracked issue usually exists at that moment.
+
+This does not weaken the guarantee for a rule opted out from the start: with no
+issue ever filed there is no state row, and a resolved delivery for an unknown
+fingerprint is dropped without touching anything.
+
+Both are permanent policy decisions, so a failure to write their telemetry is
+logged but does not fail the delivery — otherwise Alertmanager would redeliver
+an alert that will be dropped identically every time. A non-string
+`paperclip_issue` is refused rather than coerced
+(`alertmanager.alert.malformed`).
 
 ### Severity → priority defaults
 

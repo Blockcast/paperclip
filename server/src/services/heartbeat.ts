@@ -322,6 +322,9 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   applyCcrotateCapacityDecision,
+  resolveCapacityEscalation,
+  CAPACITY_ESCALATION_AFTER_MS,
+  CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
 } from "./ccrotate-capacity-retry.js";
 import {
@@ -527,6 +530,9 @@ const QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS = 1_000;
  * convention used by execution-workspaces / issue-tree-control / routines.
  */
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+const PIPELINE_STAGE_EXIT_ERROR_CODE = "pipeline_stage_exited";
+const PIPELINE_STAGE_EXIT_CANCELLATION_REASON =
+  "Cancelled because the pipeline case left the automation issue's originating stage";
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -730,16 +736,22 @@ const K8S_CCROTATE_IN_RUN_RETRY_MAX_DELAY_MS = Math.max(
 // Backstop so a pool that never recovers eventually stops re-deferring and
 // surfaces for operator attention instead of looping forever. PEN-382.
 //
-// BLO-22860 raised this from 24. It is not an independent knob: it is the
-// second half of the horizon cap above, and the two MUST be sized together.
-// Before the cap, attempts were paced by the provider's own `resumeAt`, so 24
-// of them spanned however long the provider asked for. Capping each hop makes
-// the ceiling bind on wall clock instead — at the 4h maximum hop, 24 attempts
-// would have covered only ~3.5 days, converting the 5.2-day window observed on
-// BLO-22844 into a hard exhaustion (strictly worse than the uncapped park this
-// issue set out to fix). 48 attempts cover ~7.5 days, clearing both windows on
-// record with headroom. Shorten the cap or the max hop and this must grow.
-export const CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS = 48;
+// BLO-28919: this is now measured on the WALL CLOCK, not in attempts. The
+// attempt count that used to live here (48) was the real give-up horizon and
+// its own docblock had the arithmetic wrong by ~15x — it reasoned at a "4h
+// maximum hop" that matched no constant in the tree and concluded "48 attempts
+// cover ~7.5 days", where 48 x CCROTATE_CAPACITY_MAX_PARK_MS (15m) is 12h.
+// Both provider outages on record (BLO-22844 at 124.8h, BLO-23438 at ~5.2d)
+// fall outside 12h, so they would have hard-exhausted — the outcome the comment
+// below at the exhaustion branch calls "lost for real, not merely late".
+//
+// The fix is structural rather than a bigger number: `attempts x cadence`
+// couples re-probe promptness to outage tolerance, so shortening a hop silently
+// shrinks coverage with nothing failing. That coupling is why this class
+// recurred four times. See CAPACITY_ESCALATION_AFTER_MS for the full argument.
+// `scheduledRetryAttempt` still increments, but it is observability only and
+// terminates nothing.
+export { CAPACITY_ESCALATION_AFTER_MS };
 // When adapter resolution momentarily falls back to the no-op `process`
 // adapter for a non-process agent type (e.g. claude_k8s briefly unresolved),
 // we treat it as a transient miss and schedule a quick bounded retry instead
@@ -771,6 +783,66 @@ export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
 
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
+}
+
+// Wall-clock ceiling on a dependency-blocked park, enforced independently of
+// `scheduledRetryAttempt` (BLO-29055).
+//
+// Why an age bound is needed *in addition to* the attempt bound: when an issue's
+// blocker SET changes, the pending row is cancelled and a fresh one is inserted at
+// `scheduledRetryAttempt: 0` (see the churn branch in enqueueWakeup). That resets the
+// attempt budget, so an issue whose blockers churn faster than its backoff can be
+// re-parked forever at ANY attempt ceiling. Measured 2026-08-20: 87 of 112 live
+// dep-blocked rows sat at attempt > 20, the oldest parked 3.4 days.
+//
+// Derivation — deliberately NOT hand-picked. The full attempt budget spans:
+//   initial park            DEP_BLOCKED_BASE_DELAY_MS                    =   5 min
+//   attempts 1..3           10 + 20 + 40                                 =  70 min
+//   attempts 4..12          9 x DEP_BLOCKED_MAX_DELAY_MS (60 min capped) = 540 min
+//                                                                   total = 615 min ≈ 10.25 h
+// The ceiling must exceed that, or it would terminate rows still legitimately inside
+// their attempt budget. 12h is the smallest whole number of hours strictly greater
+// than 10.25h, so this bound can only ever fire on a row whose attempt counter was
+// reset — which is exactly the leak it exists to close.
+export const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
+
+// Lineage-stable origin for the age ceiling. `createdAt` is NOT usable on its own:
+// the churn path inserts a brand-new row, so a per-row createdAt resets alongside the
+// attempt counter. The first park stamps `depBlockedFirstParkedAt` into the context
+// snapshot; rows predating this field fall back to their own createdAt. Note what that
+// means on the deploy that ships this: the cohort it was written for (measured
+// 2026-08-20: 87 of 112 rows at attempt > 20) has ALREADY churned, so each one has a
+// createdAt from its most recent re-park and gets up to a fresh full age budget rather
+// than terminating promptly. A one-time cost, but do not read the resulting slow start
+// on `dep_blocked_age_expired` as evidence there is no churn leak.
+//
+// HOW FAR THE CARRY ACTUALLY REACHES — read this before relying on the bound:
+//   - blocker-SET churn (`enqueueWakeup`, the `!setsMatch` branch): carried. The origin
+//     is read before `cancelDepBlockedScheduledRetry` and re-stamped on the replacement.
+//   - `blockedInteractionWake` (`enqueueWakeup`, ~L28204): NOT carried. That branch
+//     cancels the park inline and clears `issues.executionRunId`, and the re-park is
+//     suppressed in the same call by `&& !blockedInteractionWake`. On a later wake both
+//     `activeExecutionRun` and the in-memory carry are null, so a fresh origin is
+//     stamped. An issue taking interaction wakes more often than
+//     DEP_BLOCKED_MAX_PARK_AGE_MS therefore keeps this ceiling out of reach.
+//   - `cancelStaleScheduledRetry`: NOT carried, and that is arguably correct — a
+//     reassignment ends the episode. Left deliberately unchanged.
+//
+// So this bound closes the churn leak but is not unconditional. Closing the interaction
+// -wake hole needs state that survives across calls (the origin does survive on the
+// CANCELLED run's contextSnapshot, so it is recoverable without a migration); tracked
+// separately rather than asserted away here. Corollary for anyone reading the metric:
+// `dep_blocked_age_expired == 0` does NOT mean no unbounded parks exist.
+export function readDepBlockedFirstParkedAt(run: {
+  contextSnapshot: unknown;
+  createdAt: Date;
+}): Date {
+  const raw = readNonEmptyString(parseObject(run.contextSnapshot).depBlockedFirstParkedAt);
+  if (raw) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return run.createdAt;
 }
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
@@ -981,7 +1053,29 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
+// Error codes `finalizeAgentStatus` treats as recoverable: the agent is parked
+// `idle` rather than flipped to `error`, and the quota-exhausted hook fires.
+//
+// INVARIANT (BLO-28924): every code here MUST resolve to a non-null family via
+// `readHeartbeatRunErrorFamily`. "Recoverable" is only half a contract — staying
+// `idle` keeps the dashboard honest, but the retry that actually resumes the work
+// is keyed on the *family*, not the code (see
+// `readTransientRecoveryContractFromRun` -> `shouldScheduleAutomaticRunRetry`).
+// A code that is recoverable-but-unmapped therefore gets no scheduled retry and,
+// since #1407, no recovery wake either: an agent with a heartbeat interval limps
+// to its next timer tick, and an interval-less event-driven agent never recovers.
+// `heartbeat-recoverable-error-family.test.ts` asserts this set-wide, so adding a
+// code here without a mapping below fails CI.
+export const RECOVERABLE_AGENT_STATUS_ERROR_CODES = [
+  // Emitted by the first-party `claude-local` adapter (execute.ts) alongside a
+  // provider-supplied `retryNotBefore`; also reachable from pluggable adapters.
+  "provider_quota_exhausted",
+  // Set by isRateLimitExhausted() on 429 / 401-cap / "you've hit your limit".
+  "rate_limit_exhausted",
+  "provider_quota",
+] as const;
+
+export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
@@ -991,7 +1085,13 @@ function readHeartbeatRunErrorFamily(
   if (run.errorCode === "rate_limit_exhausted") {
     return "rate_limit_exhausted";
   }
-  if (run.errorCode === "provider_quota") {
+  // BLO-28924: `provider_quota_exhausted` shares `provider_quota`'s contract —
+  // a billing/session boundary carrying an authoritative reset instant, not a
+  // capacity estimate — so it inherits that family rather than getting its own.
+  // That keeps it out of `clampTransientHorizon` (which deliberately excludes
+  // `provider_quota`), so the adapter's `retryNotBefore` is honoured verbatim
+  // instead of being clamped to a per-attempt capacity ceiling.
+  if (run.errorCode === "provider_quota" || run.errorCode === "provider_quota_exhausted") {
     return "provider_quota";
   }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
@@ -1042,7 +1142,7 @@ type TransientRecoveryContract =
       retryNotBefore: Date | null;
     };
 
-function readTransientRecoveryContractFromRun(
+export function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ): TransientRecoveryContract | null {
   const family = readHeartbeatRunErrorFamily(run);
@@ -9329,6 +9429,54 @@ export function normalizeSessionParams(params: Record<string, unknown> | null | 
 
 type RunSessionOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
+type PersistedRunTerminalDecision = {
+  outcome: RunSessionOutcome;
+  wakeupStatus: "completed" | RunSessionOutcome;
+  error: string | null;
+  errorCode: string | null;
+  pipelineStageExited: boolean;
+};
+
+function isPersistedPipelineStageExitRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "errorCode" | "resultJson"> | null | undefined,
+) {
+  if (!run) return false;
+  if (run.errorCode === PIPELINE_STAGE_EXIT_ERROR_CODE) return true;
+  return typeof parseObject(run.resultJson).pipelineStageExitCancellationRequestedAt === "string";
+}
+
+function persistedRunTerminalDecision(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "error" | "errorCode" | "resultJson"> | null | undefined,
+  fallback: RunSessionOutcome,
+): PersistedRunTerminalDecision {
+  const pipelineStageExited = isPersistedPipelineStageExitRun(run);
+  if (pipelineStageExited) {
+    return {
+      outcome: "cancelled",
+      wakeupStatus: "cancelled",
+      error: run?.error ?? PIPELINE_STAGE_EXIT_CANCELLATION_REASON,
+      errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE,
+      pipelineStageExited: true,
+    };
+  }
+  const persistedStatus = run?.status;
+  const outcome: RunSessionOutcome =
+    persistedStatus === "succeeded" ||
+    persistedStatus === "interrupted" ||
+    persistedStatus === "failed" ||
+    persistedStatus === "cancelled" ||
+    persistedStatus === "timed_out"
+      ? persistedStatus
+      : fallback;
+  return {
+    outcome,
+    wakeupStatus: outcome === "succeeded" ? "completed" : outcome,
+    error: run?.error ?? null,
+    errorCode: run?.errorCode ?? null,
+    pipelineStageExited: false,
+  };
+}
+
 export function isConfirmedAdapterTimeout(
   result: Pick<AdapterExecutionResult, "timedOut" | "exitCode">,
 ): boolean {
@@ -11347,6 +11495,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     try {
+      // BLO-22048: an unresolved blocker makes enqueueWakeup park the wake as a
+      // `dependency_blocked` scheduled_retry and return null *without throwing*,
+      // so the triggered patch below would otherwise fire for a wake that never
+      // ran. The sink is how that deferral is distinguished from a real dispatch.
+      const monitorSuppression: WakeSuppressionOutcome = {
+        durableSkipReason: null,
+        providerCapacityDeferred: false,
+        dependencyBlockedRetryAt: null,
+      };
       await enqueueWakeup(targetAgentId, {
         source: input.source,
         triggerDetail: input.triggerDetail,
@@ -11374,7 +11531,93 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...reviewRecoveryContext,
           manualTrigger: input.activitySource === "manual",
         },
-      });
+      }, monitorSuppression);
+
+      // The wake was parked behind an unresolved blocker, so no turn ran. Keep
+      // the monitor instead of consuming it, re-armed at the park's own retry
+      // instant — arming at the original (now-past) nextCheckAt would re-fire
+      // every tick into the same coalesced park. The attempt IS consumed, so
+      // this stays bounded by DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS and the
+      // clearReason path above still hands a genuinely stuck issue to the
+      // recovery lane rather than deferring forever (AC2). The safety property
+      // is untouched: the park, not the monitor, governs execution (AC4).
+      // Clamp the re-arm strictly forward. Only the FIRST fire's park instant is
+      // guaranteed to be in the future (it was just created at `now +
+      // DEP_BLOCKED_BASE_DELAY_MS`). Every later fire COALESCES into that same
+      // park, and coalescing updates only `contextSnapshot`/`updatedAt` — it
+      // never advances `scheduledRetryAt` — so the sink hands back the original
+      // instant, which is precisely the instant that made this dispatch due.
+      // Arming at it verbatim writes `monitorNextCheckAt <= now`, and because the
+      // re-arm patch also nulls `monitorWakeRequestedAt` the stale-claim guard
+      // will not throttle it either: the monitor is instantly re-due and burns an
+      // attempt on every scheduler pass, draining the maxAttempts budget far
+      // faster than the intended backoff schedule and churning the activity log.
+      // Clamping to the park's own base cadence is a no-op on the first-fire path
+      // (raw is already `now + DEP_BLOCKED_BASE_DELAY_MS` there) and only bites on
+      // the coalesce path this is guarding.
+      const rawDeferredRetryAt = monitorSuppression.dependencyBlockedRetryAt;
+      const deferredRetryAt = rawDeferredRetryAt
+        ? new Date(
+            Math.max(rawDeferredRetryAt.getTime(), input.now.getTime() + DEP_BLOCKED_BASE_DELAY_MS),
+          )
+        : null;
+      // Deferring is only safe when the re-arm can actually be PERSISTED. If the
+      // monitor policy is absent while `monitorNextCheckAt` is still set — the
+      // executionPolicy/monitor_* column drift the claim query below does not
+      // exclude — there is nothing to rebuild, and returning "deferred" without a
+      // write would leave `monitorNextCheckAt` in the past AND
+      // `monitorAttemptCount` unincremented. The row would then re-claim every
+      // staleClaimThreshold (5m) forever, with `exhaustedMonitorClearReason`
+      // reading the same frozen attempt count and never firing: an unbounded loop
+      // in the one branch whose comment claims boundedness. Falling through to the
+      // triggered patch instead clears the column and terminates, exactly as this
+      // drift state behaved before BLO-22048.
+      const deferredPolicy = deferredRetryAt && monitor
+        ? normalizeIssueExecutionPolicy({
+            ...policy,
+            monitor: { ...monitor, nextCheckAt: deferredRetryAt.toISOString() },
+          })
+        : null;
+      if (deferredRetryAt && deferredPolicy?.monitor) {
+        const retryAt = deferredRetryAt;
+        await db
+          .update(issues)
+          .set({
+            ...buildIssueMonitorDispatchRearmPatch({
+              issue: claimed,
+              policy: deferredPolicy,
+              attemptCount: nextAttemptCount,
+            }),
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, claimed.id));
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_dependency_blocked_deferred",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            // Two distinct timelines, and the clamp above is exactly what pulls
+            // them apart on the coalesce path: `nextCheckAt` is when this
+            // MONITOR next checks, while `parkRetryAt` is when the parked run is
+            // actually due. An operator reading only the clamped value cannot
+            // tell when the work resumes, and the pre-clamp value is what makes
+            // a past-instant re-arm visible in the log rather than only in the DB.
+            nextCheckAt: retryAt.toISOString(),
+            parkRetryAt: rawDeferredRetryAt?.toISOString() ?? null,
+            previousCheckAt: scheduledAtIso,
+            monitorAttemptCount: nextAttemptCount,
+            ...monitorMetadata,
+            source: input.activitySource,
+          },
+        });
+        return { outcome: "dependency_blocked_deferred" as const, nextCheckAt: retryAt.toISOString() };
+      }
 
       await db
         .update(issues)
@@ -11650,6 +11893,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let triggered = 0;
     let skipped = 0;
+    // Counted separately from `skipped`: a deferral declined nothing, it re-armed.
+    // Leaving it uncounted made `checked` exceed `triggered + skipped` with no
+    // explanation — the same "the deferral is invisible" shape BLO-22048 is about.
+    let dependencyBlockedDeferred = 0;
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
@@ -11695,6 +11942,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
+        if (result.outcome === "dependency_blocked_deferred") dependencyBlockedDeferred += 1;
       } catch (err) {
         logger.error({ err, issueId: claimed.id }, "issue monitor tick failed");
       }
@@ -11704,6 +11952,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       checked: dueMonitors.length,
       triggered,
       skipped,
+      dependencyBlockedDeferred,
     };
   }
 
@@ -12665,6 +12914,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
   ) {
+    // Pipeline retirement records cancellation intent while holding the issue
+    // lock. A natural adapter completion may race that marker; terminalization
+    // must give the persisted stage-exit decision precedence rather than erase
+    // it with adapter output.
+    const hasResultJsonPatch = Object.prototype.hasOwnProperty.call(patch ?? {}, "resultJson");
+    const resultJsonPatchParam = hasResultJsonPatch
+      ? JSON.stringify(patch?.resultJson ?? null)
+      : null;
+    const normalResultJson = hasResultJsonPatch
+      ? sql`${resultJsonPatchParam}::jsonb`
+      : sql`${heartbeatRuns.resultJson}`;
+    const stageExitResultJson = hasResultJsonPatch
+      ? sql`coalesce(${resultJsonPatchParam}::jsonb, '{}'::jsonb)`
+      : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)`;
+    const statusPatch =
+      expectedStatus === "running"
+        ? {
+            status: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then 'cancelled'
+              else ${status}
+            end`,
+            ...patch,
+            error: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then ${PIPELINE_STAGE_EXIT_CANCELLATION_REASON}
+              else ${patch?.error ?? null}
+            end`,
+            errorCode: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then ${PIPELINE_STAGE_EXIT_ERROR_CODE}
+              else ${patch?.errorCode ?? null}
+            end`,
+            resultJson: sql`case
+              when ${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null
+                then ${stageExitResultJson} || jsonb_build_object(
+                  'pipelineStageExitCancellationRequestedAt',
+                  ${heartbeatRuns.resultJson} -> 'pipelineStageExitCancellationRequestedAt',
+                  'stopReason', 'cancelled',
+                  'timeoutFired', false
+                )
+              else ${normalResultJson}
+            end`,
+          }
+        : { status, ...patch };
     // BLO-16998: same transient-retry rationale as setRunStatus — the guarded
     // finalize UPDATE is idempotent (status set-by-id, gated on the expected
     // current status) so replaying it on a transient failure is safe.
@@ -12675,7 +12969,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         () =>
           db
             .update(heartbeatRuns)
-            .set({ status, ...patch, updatedAt: new Date() })
+            .set({ ...statusPatch, updatedAt: new Date() })
             .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
             .returning()
             .then((rows) => rows[0] ?? null),
@@ -13792,27 +14086,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
-    const existingRetry = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
-      .orderBy(asc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (existingRetry) {
+    if (isPersistedPipelineStageExitRun(run)) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        message: "Process-loss retry suppressed because pipeline stage exit already cancelled this run",
         payload: {
-          retryRunId: existingRetry.id,
-          retryRunStatus: existingRetry.status,
+          errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE,
         },
       });
-      return existingRetry;
+      return null;
     }
-
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -13832,6 +14117,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because the run has no open issue",
+      });
+      return null;
+    }
+    if (!UUID_PATTERN.test(issueId)) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because the run issue id is malformed",
+      });
+      return null;
+    }
     const retryReason = readNonEmptyString(contextSnapshot.wakeReason) === "issue_monitor_due"
       ? "issue_continuation_needed"
       : "process_lost";
@@ -13845,20 +14148,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
-    const queued = await db.transaction(async (tx) => {
-      // Transactions touching both ownership rows always lock issue before run.
-      if (issueId) {
-        await tx
-          .select({ id: issues.id })
-          .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
-          .for("update");
-      }
-      await tx
-        .select({ id: heartbeatRuns.id })
+    const claim = await db.transaction(async (tx) => {
+      // Keep the issue-before-run locking order used by the dispatcher. Once
+      // both ownership rows are locked, stage exit cannot race a retry claim.
+      const issue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .limit(1)
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const sourceRun = await tx
+        .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
-        .for("update");
+        .limit(1)
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!sourceRun || isPersistedPipelineStageExitRun(sourceRun)) {
+        return { kind: "pipeline_stage_exited" as const };
+      }
+      if (
+        !issue ||
+        TERMINAL_ISSUE_STATUSES.has(issue.status) ||
+        issue.executionRunId !== sourceRun.id
+      ) {
+        return {
+          kind: "issue_not_open" as const,
+          issueStatus: issue?.status ?? null,
+          executionRunId: issue?.executionRunId ?? null,
+        };
+      }
+
+      const existingRetry = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, sourceRun.id)))
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existingRetry) return { kind: "existing" as const, retryRun: existingRetry };
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -13892,8 +14225,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: retryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: sessionBefore,
-          retryOfRunId: run.id,
-          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          retryOfRunId: sourceRun.id,
+          processLossRetryCount: (sourceRun.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
         })
         .returning()
@@ -13910,26 +14243,70 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx
         .update(heartbeatRuns)
         .set({
-          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          processLossRetryCount: (sourceRun.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
         })
-        .where(eq(heartbeatRuns.id, run.id));
+        .where(eq(heartbeatRuns.id, sourceRun.id));
 
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({
-            checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
-      }
+      // Queued retries do not own the execution lock; the dispatcher claims it
+      // when the retry actually starts. This also releases the exiting run's
+      // ownership without letting it be repointed after the stage-exit check.
+      await tx
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issues.id, issueId),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionRunId, sourceRun.id),
+        ));
 
-      return retryRun;
+      return { kind: "queued" as const, retryRun };
     });
+
+    if (claim.kind === "pipeline_stage_exited") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because pipeline stage exit won the terminal transition",
+        payload: { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE },
+      });
+      return null;
+    }
+    if (claim.kind === "issue_not_open") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry suppressed because the source issue is no longer open and owned by this run",
+        payload: {
+          issueId,
+          issueStatus: claim.issueStatus,
+          executionRunId: claim.executionRunId,
+        },
+      });
+      return null;
+    }
+    if (claim.kind === "existing") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        payload: {
+          retryRunId: claim.retryRun.id,
+          retryRunStatus: claim.retryRun.status,
+        },
+      });
+      return claim.retryRun;
+    }
+    const queued = claim.retryRun;
 
     publishLiveEvent({
       companyId: queued.companyId,
@@ -14283,9 +14660,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (!interruptedStatus.updated || !interruptedStatus.run) continue;
       let interrupted = interruptedStatus.run;
+      const terminalDecision = persistedRunTerminalDecision(interrupted, "interrupted");
+      const terminalMessage = terminalDecision.error ?? message;
+      // The shutdown-consumed wake is not the retry's execution result. The
+      // retry receives a new wake request, so always cancel the original one;
+      // preserve the stage-exit reason when that path already won the race.
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: now,
-        error: null,
+        error: terminalDecision.pipelineStageExited ? terminalDecision.error : null,
       });
       interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
 
@@ -14297,7 +14679,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+      const retry = terminalDecision.pipelineStageExited
+        ? null
+        : await enqueueProcessLossRetry(interrupted, agent, now);
       if (!retry) {
         await releaseIssueExecutionAndPromote(interrupted);
       } else {
@@ -14308,17 +14692,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message,
+        message: terminalDecision.pipelineStageExited
+          ? "Pipeline stage exit was already persisted during shutdown; restart recovery was suppressed"
+          : message,
         payload: {
           signal,
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+          ...(terminalDecision.pipelineStageExited ? { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE } : {}),
           ...(retry ? { retryRunId: retry.id } : {}),
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message);
-      interruptedRunIds.push(interrupted.id);
+      await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
+        errorCode: terminalDecision.errorCode,
+        runId: interrupted.id,
+      });
+      if (!terminalDecision.pipelineStageExited) interruptedRunIds.push(interrupted.id);
     }
 
     if (interruptedRunIds.length > 0) {
@@ -14694,7 +15084,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // A ccrotate capacity defer must re-check the gate at promotion time: if the
     // pool is still exhausted, re-defer with backoff instead of promoting a run
     // that would dispatch and immediately 429. PEN-382.
-    if (dueRun.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON) {
+    //
+    // BLO-28919: that re-check must ALSO cover a capacity park the scheduler
+    // merely LABELLED `transient_failure`. `transient_failure` is the default
+    // `retryReason` of `scheduleBoundedRetryForRun`, so a provider capacity
+    // denial whose reset arrived as prose (parsed server-side, see
+    // PROVIDER_CAPACITY_RESET_AT_PATTERN) lands under that label with a
+    // capacity floor attached — measured at 484 of 700 fleet parks on
+    // 2026-08-19. Those rows reached here and were promoted straight to
+    // `queued` with no capacity re-probe, because this branch keyed on the
+    // reason rather than on the error family.
+    //
+    // This is the load-bearing half of the fix. Promotion does NOT run the
+    // wake-time penstock gate — `promoteDueScheduledRetries` reads
+    // `scheduled_retry` rows directly and never enters `wakeup()`, where
+    // `gateAppliesToWake` lives — so this branch is the only thing standing
+    // between a capacity park and a dispatch into a pool that is still empty.
+    // Shortening such a park without extending the re-probe to it would burn a
+    // paid attempt per hop against a closed door, which is BLO-24011 inverted.
+    const capacityDrivenTransientPark =
+      dueRun.scheduledRetryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      readHeartbeatRunErrorFamily(dueRun) === "rate_limit_exhausted" &&
+      readTransientRetryNotBeforeFromRun(dueRun) !== null;
+    if (
+      dueRun.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON ||
+      capacityDrivenTransientPark
+    ) {
       let capacity: {
         target: "claude" | "codex";
         reason: string;
@@ -14725,16 +15140,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (capacity) {
         const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
-        if (nextAttempt > CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS) {
-          // The pool never recovered within the retry budget. Terminate the
-          // scheduled retry so it surfaces for operator attention instead of
-          // looping forever.
+        // BLO-28919: the give-up condition is how long the pool has ACTUALLY
+        // been down, not how many times we looked. Reading the chain origin off
+        // the row rather than counting hops is what decouples outage tolerance
+        // from re-probe cadence; see CAPACITY_ESCALATION_AFTER_MS.
+        const capacityEscalation = resolveCapacityEscalation({
+          firstDeferredAtIso: parseObject(dueRun.resultJson)[
+            CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY
+          ],
+          now,
+        });
+        if (capacityEscalation.exhausted) {
+          // The pool never recovered inside the escalation horizon. Terminate
+          // the scheduled retry so it surfaces for operator attention instead
+          // of looping forever.
+          const downForHours = (capacityEscalation.elapsedMs / (60 * 60 * 1000)).toFixed(1);
           const exhausted = await db
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: `provider capacity retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; pool did not recover`,
+              error: `provider capacity retry exhausted after ${downForHours}h unavailable (${dueRun.scheduledRetryAttempt ?? 0} re-probes); pool did not recover`,
               errorCode: "rate_limit_exhausted",
               updatedAt: now,
             })
@@ -14773,10 +15199,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eventType: "lifecycle",
               stream: "system",
               level: "warn",
-              message: "provider capacity retry exhausted; pool did not recover within the retry budget",
+              message:
+                "provider capacity retry exhausted; pool did not recover within the escalation horizon",
               payload: {
                 scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
-                maxAttempts: CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS,
+                capacityUnavailableMs: capacityEscalation.elapsedMs,
+                capacityEscalationAfterMs: capacityEscalation.escalateAfterMs,
+                capacityFirstDeferredAt: capacityEscalation.firstDeferredAtIso,
                 ccrotateTarget: capacity.target,
                 providerCapacityReason: capacity.reason,
                 ...(capacity.penstockProvider ? { penstockProvider: capacity.penstockProvider } : {}),
@@ -14832,12 +15261,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryAfterSeconds: capacity.penstockRetryAfterSeconds,
           advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
           clampedFromIso: capacityRetryPlan.clampedFromIso,
+          // Set once for the chain. `resolveCapacityEscalation` already echoed
+          // back the stored origin when the row had one, so passing it here is
+          // idempotent — it only takes effect on the first hop.
+          firstDeferredAtIso: capacityEscalation.firstDeferredAtIso,
         });
         const rescheduled = await db
           .update(heartbeatRuns)
           .set({
             scheduledRetryAttempt: nextAttempt,
             scheduledRetryAt: nextDueAt,
+            // BLO-28919: a re-deferred capacity park carries the capacity reason
+            // from here on, whatever label it arrived with. This is the AC's
+            // labelling criterion: a park whose horizon is set by an advertised
+            // capacity floor must not read as `transient_failure`. It is also
+            // what makes the census split-check meaningful — a fall in the
+            // transient bucket has to show up as a rise in the capacity bucket
+            // with a 15m ceiling, rather than the same park under a new name.
+            scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
             resultJson: nextResultJson,
             updatedAt: now,
           })
@@ -14859,6 +15300,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             payload: {
               scheduledRetryAttempt: nextAttempt,
               scheduledRetryAt: nextDueAt.toISOString(),
+              // How long the pool has been down, and the horizon it is racing.
+              // Reported on every hop so a chain approaching escalation is
+              // legible without replaying the whole run history (BLO-28919).
+              capacityUnavailableMs: capacityEscalation.elapsedMs,
+              capacityEscalationAfterMs: capacityEscalation.escalateAfterMs,
+              capacityFirstDeferredAt: capacityEscalation.firstDeferredAtIso,
               ccrotateTarget: capacity.target,
               providerCapacityReason: capacity.reason,
               ...(capacityRetryPlan.clampedFromIso
@@ -14906,6 +15353,82 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const readiness = (await issuesSvc.listDependencyReadiness(dueRun.companyId, [depIssueId])).get(depIssueId);
         if (readiness && !readiness.isDependencyReady) {
           const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
+          // Age ceiling is evaluated BEFORE the attempt ceiling and independently of
+          // it (BLO-29055). A blocker-set change resets `scheduledRetryAttempt` to 0,
+          // so an attempt-only bound can be evaded indefinitely by churn; the age
+          // origin is carried across those re-parks, so churn cannot reset it.
+          // It is NOT carried across the `blockedInteractionWake` cancel — see the
+          // carry-reach notes on readDepBlockedFirstParkedAt. This bound closes the
+          // churn leak; it is not unconditional.
+          const firstParkedAt = readDepBlockedFirstParkedAt(dueRun);
+          const parkAgeMs = now.getTime() - firstParkedAt.getTime();
+          if (parkAgeMs > DEP_BLOCKED_MAX_PARK_AGE_MS) {
+            const expired = await db
+              .update(heartbeatRuns)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: `dependency-blocked park exceeded the ${Math.round(
+                  DEP_BLOCKED_MAX_PARK_AGE_MS / 3_600_000,
+                )}h maximum age (first parked ${firstParkedAt.toISOString()}, attempt ${
+                  dueRun.scheduledRetryAttempt ?? 0
+                }); blockers never resolved`,
+                errorCode: "issue_dependencies_blocked",
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, dueRun.id),
+                  eq(heartbeatRuns.status, "scheduled_retry"),
+                  lte(heartbeatRuns.scheduledRetryAt, now),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (expired) {
+              incrementDepBlockedMetric("dep_blocked_age_expired");
+              await appendRunEvent(expired, await nextRunEventSeq(expired.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: "dependency-blocked park exceeded its maximum age; terminated rather than re-deferred",
+                payload: {
+                  scheduledRetryAttempt: dueRun.scheduledRetryAttempt ?? 0,
+                  firstParkedAt: firstParkedAt.toISOString(),
+                  parkAgeMs,
+                  maxParkAgeMs: DEP_BLOCKED_MAX_PARK_AGE_MS,
+                  unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                },
+              });
+              if (expired.wakeupRequestId) {
+                await db
+                  .update(agentWakeupRequests)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: now,
+                    error: "Cancelled because the dependency-blocked park exceeded its maximum age",
+                    updatedAt: now,
+                  })
+                  .where(eq(agentWakeupRequests.id, expired.wakeupRequestId));
+              }
+              await db
+                .update(issues)
+                .set({
+                  executionRunId: null,
+                  executionAgentNameKey: null,
+                  executionLockedAt: null,
+                  updatedAt: now,
+                })
+                .where(and(eq(issues.id, depIssueId), eq(issues.executionRunId, expired.id)));
+              // Same reasoning as the attempt-exhausted branch below (BLO-20649): no
+              // run will resume this issue, so the checkout promotion comes back off.
+              await restoreCheckoutPromotedStatus(db, {
+                issueId: depIssueId,
+                companyId: expired.companyId,
+              });
+            }
+            return { outcome: "not_promoted", run: expired };
+          }
           if (nextAttempt > DEP_BLOCKED_MAX_RETRY_ATTEMPTS) {
             const exhausted = await db
               .update(heartbeatRuns)
@@ -17406,17 +17929,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // doesn't show a spurious error AND fire the on-limit hook so
     // ccrotate gets a chance to rotate to a base-tier account.
     //
-    // Both error codes route here:
-    //  - `provider_quota_exhausted`: legacy/pluggable adapter signal.
-    //  - `rate_limit_exhausted`: set by isRateLimitExhausted() when the
-    //    run hits 429, 401-cap, or "you've hit your limit" cap text.
-    //    Without unifying these, rate-limit-flagged runs flipped agents
-    //    to error and the on-limit hook never fired (cluster sat silent
-    //    until the cap window rolled — observed 2026-05-05 16:08-17:30Z).
-    const recoverable =
-      options?.errorCode === "provider_quota_exhausted" ||
-      options?.errorCode === "rate_limit_exhausted" ||
-      options?.errorCode === "provider_quota";
+    // The codes routed here live in RECOVERABLE_AGENT_STATUS_ERROR_CODES, which
+    // is also what the BLO-28924 invariant test iterates: each one must map to a
+    // transient-retry family, or the agent stays idle with nothing scheduled to
+    // resume it. Without unifying these, rate-limit-flagged runs flipped agents
+    // to error and the on-limit hook never fired (cluster sat silent until the
+    // cap window rolled — observed 2026-05-05 16:08-17:30Z).
+    const recoverable = (RECOVERABLE_AGENT_STATUS_ERROR_CODES as readonly string[]).includes(
+      options?.errorCode ?? "",
+    );
     const nextStatus =
       runningCount > 0
         ? "running"
@@ -18002,7 +18523,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             error: prReviewIncompleteOverride.errorMessage,
           }
         : baseTerminalOutcome;
-    if (!terminalOutcome) return false;
+    if (!terminalOutcome) return null;
 
     const adapterInvocationStarted =
         baseTerminalOutcome?.errorCode === "job_failed" || baseTerminalOutcome?.errorCode === "job_missing"
@@ -18135,13 +18656,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
     }
-    await setWakeupStatus(input.run.wakeupRequestId, terminalOutcome.wakeupStatus, {
+    const persistedDecision = persistedRunTerminalDecision(finalizedRun, terminalOutcome.status);
+    await setWakeupStatus(input.run.wakeupRequestId, persistedDecision.wakeupStatus, {
       finishedAt: input.now,
-      error: terminalOutcome.error,
+      error: persistedDecision.error,
     });
 
     if (!finalizedRun) finalizedRun = await getRun(input.run.id);
-    if (!finalizedRun) return true;
+    if (!finalizedRun) {
+      return { pipelineStageExited: persistedDecision.pipelineStageExited };
+    }
 
     // BLO-20815: additive-only telemetry, no behavioral effect. Uses the same
     // signal precedence as the dispatcher's own staleness filter (see
@@ -18166,7 +18690,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // fires for these reconciler-finalized failures as well. Non-pr / non-retryable
     // codes return false from the predicate and stay terminal (BLO-7913 leak guard).
     if (
-      terminalOutcome.status === "failed" &&
+      persistedDecision.outcome === "failed" &&
+      !persistedDecision.pipelineStageExited &&
       adapterInvocationStarted !== true &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
@@ -18189,15 +18714,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (terminalJobQuiesced) {
       await releaseExternalRuntimeReservation(db, {
         runId: finalizedRun.id,
-        reason: terminalOutcome.errorCode ?? terminalOutcome.status,
+        reason: persistedDecision.errorCode ?? persistedDecision.outcome,
       });
     }
-    // BLO-19085: pass the reason we already computed. Omitting it latched the
-    // agent into `error` with `errorReason: null` while the very same
-    // `terminalOutcome` (e.g. "External lifecycle Job is missing while heartbeat
-    // run is still running" / job_missing) sat on the run record one frame away.
-    await finalizeAgentStatus(input.run.agentId, terminalOutcome.status, terminalOutcome.error, {
-      errorCode: terminalOutcome.errorCode,
+    await finalizeAgentStatus(input.run.agentId, persistedDecision.outcome, persistedDecision.error, {
+      errorCode: persistedDecision.errorCode,
       runId: input.run.id,
     });
     const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
@@ -18206,10 +18727,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
       deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
     });
-    const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+    let livenessContinuationOwnsCheckout = false;
     let successfulHandoffOwnsCheckout = false;
-    if (finalizationAgent) {
-      successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+    if (!persistedDecision.pipelineStageExited) {
+      livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+      if (finalizationAgent) {
+        successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+      }
     }
     if (
       deferredCheckoutRestoreIssueId &&
@@ -18225,10 +18749,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
       eventType: "lifecycle",
       stream: "system",
-      level: terminalOutcome.status === "succeeded" ? "info" : "error",
-      message: terminalOutcome.error ?? "External lifecycle Job completed",
+      level: persistedDecision.outcome === "succeeded"
+        ? "info"
+        : persistedDecision.outcome === "cancelled"
+          ? "warn"
+          : "error",
+      message: persistedDecision.error ?? "External lifecycle Job completed",
       payload: {
         externalLifecycleRecovery: true,
+        attemptedStatus: terminalOutcome.status,
+        persistedStatus: persistedDecision.outcome,
+        persistedErrorCode: persistedDecision.errorCode,
         jobPhase: terminalOutcome.jobPhase,
         jobReason: terminalOutcome.jobReason,
         jobMessage: terminalOutcome.jobMessage,
@@ -18241,10 +18772,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     activeRunExecutions.delete(input.run.id);
     await environmentsSvc.releaseLeasesForRun(
       input.run.id,
-      terminalOutcome.status === "succeeded" ? "released" : "failed",
+      persistedDecision.outcome === "succeeded" || persistedDecision.outcome === "cancelled" ? "released" : "failed",
     );
 
-    return true;
+    return { pipelineStageExited: persistedDecision.pipelineStageExited };
   }
 
   function runTimestampMs(value: Date | string | null | undefined): number {
@@ -19187,7 +19718,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               staleKill: true,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19242,7 +19773,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               now,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19272,7 +19803,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               now,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19294,7 +19825,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               staleKill: true,
             });
             if (finalized) {
-              reaped.push(run.id);
+              if (!finalized.pipelineStageExited) reaped.push(run.id);
               continue;
             }
           }
@@ -19334,7 +19865,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 staleKill: true,
               });
               if (finalized) {
-                reaped.push(run.id);
+                if (!finalized.pipelineStageExited) reaped.push(run.id);
                 continue;
               }
             }
@@ -19530,37 +20061,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
       let finalizedRun = finalizedRunWrite.run;
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
+      const terminalDecision = persistedRunTerminalDecision(finalizedRun, "failed");
+      const terminalMessage = terminalDecision.error ?? baseMessage;
+      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: terminalDecision.error,
       });
       // BLO-16184: the process_lost mint is now committed for this run -- count it
       // (bounded adapter + error-string bucket + durable classification).
-      recordProcessLost({
-        adapter: adapterType,
-        errorString: baseMessage,
-        classification: processLossCapture.classification,
-      });
+      if (!terminalDecision.pipelineStageExited) {
+        recordProcessLost({
+          adapter: adapterType,
+          errorString: baseMessage,
+          classification: processLossCapture.classification,
+        });
+      }
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       // PCL-2571: cancel any open stale_active_run_evaluation review for
       // this run now that the silence is explained by process_lost. The
       // detector and the reaper race on the suspicion threshold (~1h);
       // without this cleanup, reviews accreted indefinitely on the CTO
       // inbox (11 stuck reviews in 5 days observed 2026-05-25).
-      try {
-        await recovery.dismissStaleEvaluationOnRunTerminated({
-          companyId: finalizedRun.companyId,
-          runId: finalizedRun.id,
-          agentId: finalizedRun.agentId,
-          terminalStatus: "failed",
-          errorCode: "process_lost",
-          errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        });
-      } catch (err) {
-        logger.warn(
-          { err, runId: finalizedRun.id, companyId: finalizedRun.companyId },
-          "failed to dismiss stale active run evaluation during process_lost cleanup",
-        );
+      if (!terminalDecision.pipelineStageExited) {
+        try {
+          await recovery.dismissStaleEvaluationOnRunTerminated({
+            companyId: finalizedRun.companyId,
+            runId: finalizedRun.id,
+            agentId: finalizedRun.agentId,
+            terminalStatus: "failed",
+            errorCode: "process_lost",
+            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: finalizedRun.id, companyId: finalizedRun.companyId },
+            "failed to dismiss stale active run evaluation during process_lost cleanup",
+          );
+        }
       }
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
@@ -19569,22 +20106,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      // BLO-19085: `baseMessage` is the process_lost diagnosis already written
-      // to the run record; pass it through so the agent record carries it too
-      // instead of latching into `error` with a null reason.
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
-        errorCode: "process_lost",
+      await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
+        errorCode: terminalDecision.errorCode,
         runId: run.id,
       });
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let promotedRunDispatched = false;
       const retryAgent = await getAgent(run.agentId);
-      if (shouldRetry) {
+      if (!terminalDecision.pipelineStageExited && shouldRetry) {
         if (retryAgent) {
           retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
         }
-      } else if (retryAgent) {
+      } else if (!terminalDecision.pipelineStageExited && retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
@@ -19599,8 +20133,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
         stream: "system",
-        level: "error",
-        message: shouldRetry
+        level: terminalDecision.pipelineStageExited ? "warn" : "error",
+        message: terminalDecision.pipelineStageExited
+          ? "Pipeline stage exit was already persisted; orphan process-loss recovery was suppressed"
+          : shouldRetry
           ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
           : baseMessage,
         payload: {
@@ -19608,6 +20144,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(externalLifecyclePreAdapter ? { externalLifecyclePreAdapter: true } : {}),
+          ...(terminalDecision.pipelineStageExited ? { errorCode: PIPELINE_STAGE_EXIT_ERROR_CODE } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
         },
       });
@@ -19622,8 +20159,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // environment isn't permanently checked out (ported from upstream
       // v513). Marks lease as `failed` rather than `released` to preserve
       // forensic signal for stuck-lease audits.
-      await environmentsSvc.releaseLeasesForRun(run.id, "failed");
-      reaped.push(run.id);
+      await environmentsSvc.releaseLeasesForRun(
+        run.id,
+        terminalDecision.pipelineStageExited ? "released" : "failed",
+      );
+      if (!terminalDecision.pipelineStageExited) reaped.push(run.id);
 
     }
 
@@ -20021,6 +20561,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
+    // The issue lock is deliberately retained until an active adapter is
+    // interrupted. If the immediate post-commit cancellation fails, discover
+    // the durable marker from the run itself—not only through the issue's
+    // pointer, which stale-lock cleanup may later clear.
+    const pendingStageExitCancellations = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "running"),
+        sql`${heartbeatRuns.resultJson} ->> 'pipelineStageExitCancellationRequestedAt' is not null`,
+      ));
+    for (const run of pendingStageExitCancellations) {
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pipeline case left the automation issue's originating stage",
+        {
+          errorCode: "pipeline_stage_exited",
+          eventMessage: "run cancelled after pipeline stage exit",
+        },
+      ).catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "failed to reconcile pending pipeline stage-exit cancellation");
+      });
+    }
     return recovery.sweepStaleIssueLocks();
   }
 
@@ -20282,7 +20845,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.buildRunOutputSilence(run, now);
   }
 
-  async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: { lookbackHours?: number; now?: Date }) {
+  async function buildIssueGraphLivenessAutoRecoveryPreview(opts?: {
+    lookbackHours?: number;
+    now?: Date;
+    // Mirrors `reconcileIssueGraphLiveness` below, and for the same reason: this
+    // wrapper is the only way into the preview from typechecked callers, and the
+    // preview now applies both re-escalation suppressors. An option the service
+    // accepts but this literal type omits is an excess-property error for every
+    // caller under `src/`, so previewing the documented rollback lever would be
+    // unreachable while running it is not.
+    reescalationCooldownMs?: number;
+    unchangedTargetSuppressionMs?: number;
+  }) {
     return recovery.buildIssueGraphLivenessAutoRecoveryPreview(opts);
   }
 
@@ -20292,6 +20866,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     lookbackHours?: number;
     now?: Date;
     reescalationCooldownMs?: number;
+    // Both re-escalation suppressors must be settable from here: this wrapper is
+    // the only way into the detector (`index.ts` boot paths, the operator route
+    // at `routes/instance-settings.ts`, and the tests all call it rather than
+    // `recovery.reconcileIssueGraphLiveness`). An option the service accepts but
+    // this literal type omits is an excess-property error for every caller under
+    // `src/`, i.e. unreachable from typechecked code rather than merely
+    // inconvenient -- which would leave the documented rollback for a
+    // liveness-detector behaviour change as "edit a constant and redeploy".
+    // Note this is NOT enforced for the test suite: `server/tsconfig.json`
+    // excludes `src/__tests__`, so a test can pass the field either way and
+    // cannot pin this. The production callers above are what keep it honest.
+    unchangedTargetSuppressionMs?: number;
   }) {
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -24855,7 +25441,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let outcome: RunSessionOutcome;
       let silentFailureMessage: string | null = null;
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+      const stageExitCancellationRequested = isPersistedPipelineStageExitRun(latestRun);
+      if (stageExitCancellationRequested) {
+        outcome = "cancelled";
+      } else if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
       } else if (isConfirmedAdapterTimeout(adapterResult)) {
         outcome = "timed_out";
@@ -25001,11 +25590,78 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : null;
       const persistedProviderCapacityResetAt =
         providerCapacityResetAt ?? providerCapacityOverHorizonParkAt ?? structuredProviderCapacityResetAt;
-      const effectiveRetryNotBefore =
+      const advertisedRetryNotBefore =
         adapterResult.retryNotBefore ??
         providerCapacityResetAt?.toISOString() ??
         providerCapacityOverHorizonParkAt?.toISOString() ??
         null;
+      // BLO-28919: `retryNotBefore` has two writers and they disagreed on its
+      // ceiling. `persistProviderCapacityRetry` (the wake-gate writer) runs the
+      // advertised reset through `resolveCcrotateCapacityRetry` FIRST and
+      // persists the clamped instant, precisely because
+      // `scheduleBoundedRetryForRun` treats this field as a retry floor and
+      // pushes `dueAt` out to it — its own comment says so. This writer did not,
+      // so the same capacity denial landed on a 24h ceiling
+      // (MAX_TRANSIENT_RETRY_HORIZON_MS, the generic read-side backstop) instead
+      // of the capacity ceiling of 15m: one field, one consumer, two ceilings
+      // 96x apart. That is the whole severity inversion measured on BLO-28919 —
+      // 484/700 fleet parks at median 4.6h under `transient_failure` while
+      // correctly-gated capacity parks sat at 17.9m, for the identical error.
+      //
+      // Clamping here is safe only because of the paired change in
+      // `promoteScheduledRetryRun`, and the reason is worth stating precisely
+      // because the obvious version of it is WRONG. It is tempting to argue
+      // "coming due does not dispatch, since the wake-time ccrotate gate
+      // (`gateAppliesToWake`) covers `automation` wakes" — that is false.
+      // `promoteDueScheduledRetries` selects `scheduled_retry` rows straight
+      // from the DB and calls `promoteScheduledRetryRun`; it never enters
+      // `wakeup()`, so the wake-time gate never evaluates for a promoted retry.
+      // The ONLY thing standing between a shortened capacity park and a
+      // dispatch into a still-empty pool is the capacity re-probe branch in
+      // `promoteScheduledRetryRun`, which is why BLO-28919 extends that branch
+      // to cover a capacity park labelled `transient_failure`. Shortening the
+      // horizon without that would burn a paid attempt per hop against a closed
+      // door — BLO-24011 inverted. Do not weaken one half without the other.
+      //
+      // With both halves in place the run re-probes capacity for free (a cached
+      // availability check, not a paid invocation) and re-defers while the pool
+      // is empty, so it stays in `scheduled_retry` — a live execution path, so
+      // no strand — and recovers within one ceiling of capacity actually
+      // returning rather than sleeping to a horizon we already distrust.
+      //
+      // The re-defer also relabels the park to CCROTATE_CAPACITY_RETRY_REASON,
+      // so it stops reading as the scheduler's defaulted `transient_failure`.
+      //
+      // Deliberate consequence, recorded rather than hidden: a multi-day outage
+      // now escalates to an operator-visible issue at the capacity path's
+      // attempt budget instead of silently re-parking 24h at a time. That is the
+      // disposition ccrotate-capacity-retry.ts already argues for ("a genuinely
+      // long outage still terminates ... rather than silent frozen work").
+      // Strictly a shortening operation. `resolveCcrotateCapacityRetry` falls
+      // back to its default poll delay when the advertised instant is absent,
+      // stale, or unparseable, which would PUSH a run whose floor is already in
+      // the past out past the base curve — so the clamp is adopted only when it
+      // lands earlier than what the provider advertised. The change can then
+      // only ever pull a park in, never delay one.
+      const capacityFloorClamp =
+        providerCapacityThrottleOverride && advertisedRetryNotBefore
+          ? resolveCcrotateCapacityRetry({
+              resumeAt: new Date(advertisedRetryNotBefore),
+              now: new Date(),
+              defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
+            })
+          : null;
+      const advertisedRetryNotBeforeMs = advertisedRetryNotBefore
+        ? new Date(advertisedRetryNotBefore).getTime()
+        : null;
+      const capacityFloorClampApplies =
+        capacityFloorClamp !== null &&
+        advertisedRetryNotBeforeMs !== null &&
+        Number.isFinite(advertisedRetryNotBeforeMs) &&
+        capacityFloorClamp.retryAt.getTime() < advertisedRetryNotBeforeMs;
+      const effectiveRetryNotBefore = capacityFloorClampApplies
+        ? capacityFloorClamp!.retryAt.toISOString()
+        : advertisedRetryNotBefore;
       let prReviewCompletionEvidence = outcome === "succeeded"
         ? evaluatePrReviewCompletionEvidence(context, {
           resultJson: adapterResult.resultJson ?? null,
@@ -25105,7 +25761,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : emptyResultOverride
                 ? "Agent exited successfully but produced no result"
                 : outcome === "cancelled"
-                  ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
+                  ? (stageExitCancellationRequested
+                      ? PIPELINE_STAGE_EXIT_CANCELLATION_REASON
+                      : latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
                   : outcome === "succeeded"
                     ? null
                     : redactCurrentUserText(
@@ -25134,7 +25792,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 : outcome === "timed_out"
                   ? "timeout"
                   : outcome === "cancelled"
-                    ? (latestRun?.errorCode ?? "cancelled")
+                    ? (stageExitCancellationRequested
+                        ? "pipeline_stage_exited"
+                        : latestRun?.errorCode ?? "cancelled")
                     : outcome === "failed"
                       ? (silentFailureMessage
                           ? "silent_failure"
@@ -25250,6 +25910,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                       },
                     }
                   : {}),
+                ...(capacityFloorClampApplies
+                  ? {
+                      // BLO-28919: same key the wake-gate writer uses, so a
+                      // clamped floor reads identically whichever writer set it.
+                      penstockCapacityParkClampedFrom: advertisedRetryNotBefore,
+                    }
+                  : {}),
                 ...(prReviewIncompleteOverride
                   ? {
                     prReviewOutputGate: {
@@ -25312,26 +25979,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         return;
       }
+      // The conditional write above may have converted a natural completion
+      // into the durable stage-exit cancellation. Every downstream side effect
+      // must now follow that persisted outcome, especially retry scheduling.
+      const persistedDecision = persistedRunTerminalDecision(persistedRunWrite.run, outcome);
+      outcome = persistedDecision.outcome;
 
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
-        persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
+        persistedRun = await classifyAndPersistRunLiveness(
+          persistedRun,
+          parseObject(persistedRun.resultJson),
+        ) ?? persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+      const finalizedRun = persistedRun ?? (await getRun(run.id));
+      const terminalDecision = persistedRunTerminalDecision(finalizedRun, persistedDecision.outcome);
+      outcome = terminalDecision.outcome;
+      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: new Date(),
-        error: runErrorMessage,
+        error: terminalDecision.error,
       });
 
-      const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
-          message: `run ${outcome}`,
+          level: outcome === "succeeded" ? "info" : outcome === "cancelled" ? "warn" : "error",
+          message: terminalDecision.pipelineStageExited
+            ? terminalDecision.error ?? "Pipeline stage exit cancelled this run"
+            : `run ${outcome}`,
           payload: {
-            status,
+            status: terminalDecision.outcome,
+            errorCode: terminalDecision.errorCode,
             exitCode: adapterResult.exitCode,
           },
         });
@@ -25341,7 +26021,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId,
             issueWorkMode: issueRef?.workMode ?? null,
             outcome,
-            error: runErrorMessage,
+            error: terminalDecision.error,
           });
         } catch (err) {
           logger.warn(
@@ -25354,9 +26034,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
         const livenessRun = finalizedRun;
-        await refreshContinuationSummaryForRun(livenessRun, agent);
+        if (!terminalDecision.pipelineStageExited) {
+          await refreshContinuationSummaryForRun(livenessRun, agent);
+        }
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
-        if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
+        if (issueId && !terminalDecision.pipelineStageExited && outcome === "succeeded" && !skipRunIssueComment) {
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
             if (!existingRunComment) {
@@ -25382,7 +26064,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         await recordZeroTokenCompletedRunStreak(agent);
         let suppressImmediateRecovery = false;
-        if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+        if (!terminalDecision.pipelineStageExited && outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
             await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -25403,7 +26085,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
           }
-        } else if (outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
+        } else if (!terminalDecision.pipelineStageExited && outcome === "failed" && shouldScheduleAutomaticRunRetry(livenessRun)) {
           const automaticRetryResult = await scheduleBoundedRetryForRun(
             livenessRun,
             agent,
@@ -25416,7 +26098,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             suppressImmediateRecovery = true;
           }
         }
-        const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
+        const issueCommentPolicyResult = terminalDecision.pipelineStageExited
+          ? { outcome: "not_applicable" as const, queuedRun: null }
+          : await finalizeIssueCommentPolicy(livenessRun, agent);
         const deferredCheckoutRestoreIssueId = livenessRun.status === "succeeded"
           ? issueIdFromRunContext(livenessRun.contextSnapshot) ?? null
           : null;
@@ -25424,16 +26108,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           suppressImmediateRecovery,
           deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
         });
-        const livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
-        const successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
-          issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
-            ? {
-              ...livenessRun,
-              issueCommentStatus: issueCommentPolicyResult.outcome,
-            }
-            : livenessRun,
-          agent,
-        );
+        let livenessContinuationOwnsCheckout = false;
+        let successfulHandoffOwnsCheckout = false;
+        if (!terminalDecision.pipelineStageExited) {
+          livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(livenessRun);
+          successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(
+            issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
+              ? {
+                ...livenessRun,
+                issueCommentStatus: issueCommentPolicyResult.outcome,
+              }
+              : livenessRun,
+            agent,
+          );
+        }
         if (
           deferredCheckoutRestoreIssueId &&
           !promotedRunDispatched &&
@@ -25451,7 +26139,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // workspace finalization or merged into this run. Reuse the level-triggered
         // dependency backstop so finalize and periodic recovery share idempotency,
         // readiness, active-path, and observability rules.
-        if (issueId && finalizedRun) {
+        if (issueId && finalizedRun && !terminalDecision.pipelineStageExited) {
           try {
             const blockerIssueStatus = await db
               .select({ status: issues.status })
@@ -25476,10 +26164,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       if (finalizedRun) {
-        await updateRuntimeState(agent, finalizedRun, adapterResult, {
+        // The adapter may have returned useful usage even though pipeline
+        // retirement won the terminal CAS. Keep that accounting, but never
+        // let the superseded adapter result become the runtime state's last
+        // error/result for a cancelled stage-owned run.
+        const runtimeResult = terminalDecision.pipelineStageExited
+          ? {
+              ...adapterResult,
+              errorCode: terminalDecision.errorCode ?? adapterResult.errorCode,
+              errorMessage: terminalDecision.error,
+            }
+          : adapterResult;
+        await updateRuntimeState(agent, finalizedRun, runtimeResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
-        if (taskKey) {
+        // A stale adapter completion must not overwrite the task session after
+        // the stage that owned it exited. The next stage gets to establish its
+        // own session boundary instead.
+        if (taskKey && !terminalDecision.pipelineStageExited) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
@@ -25520,16 +26222,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(
         agent.id,
         outcome,
-        outcome === "succeeded" ? null : runErrorMessage,
+        outcome === "succeeded" ? null : terminalDecision.error,
         {
           keepIdleOnFailure:
             outcome === "failed" &&
             (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
-          errorCode: runErrorCode,
+          errorCode: terminalDecision.errorCode ?? runErrorCode,
           retryNotBefore:
-            adapterRetryNotBefore && !Number.isNaN(adapterRetryNotBefore.getTime())
+            !terminalDecision.pipelineStageExited && adapterRetryNotBefore && !Number.isNaN(adapterRetryNotBefore.getTime())
               ? adapterRetryNotBefore
               : null,
+          runId: finalizedRun?.id ?? run.id,
         },
       );
     } catch (err) {
@@ -25601,27 +26304,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return;
       }
 
-      const failedRun = failedRunWrite.run;
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
+      let terminalDecision = persistedRunTerminalDecision(failedRunWrite.run, "failed");
+      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: new Date(),
-        error: message,
+        error: terminalDecision.error,
       });
 
-      if (failedRun) {
-        await appendRunEvent(failedRun, seq++, {
-          eventType: "error",
+      if (failedRunWrite.run) {
+        const livenessRun = await classifyAndPersistRunLiveness(failedRunWrite.run) ?? failedRunWrite.run;
+        terminalDecision = persistedRunTerminalDecision(livenessRun, terminalDecision.outcome);
+        await appendRunEvent(livenessRun, seq++, {
+          eventType: terminalDecision.pipelineStageExited ? "lifecycle" : "error",
           stream: "system",
-          level: "error",
-          message,
+          level: terminalDecision.pipelineStageExited ? "warn" : "error",
+          message: terminalDecision.error ?? message,
+          payload: {
+            status: terminalDecision.outcome,
+            errorCode: terminalDecision.errorCode,
+          },
         });
-        const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         try {
           await completeSkillTestRunForHeartbeatOutcome({
             run: livenessRun,
             issueId,
             issueWorkMode: issueRef?.workMode ?? null,
-            outcome: "failed",
-            error: message,
+            outcome: terminalDecision.outcome,
+            error: terminalDecision.error,
           });
         } catch (err) {
           logger.warn(
@@ -25629,24 +26337,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed to complete skill test run after heartbeat adapter failure",
           );
         }
-        await refreshContinuationSummaryForRun(livenessRun, agent);
-        if (!isWorkspaceValidationFailedRun(livenessRun) && !isConfigurationIncompleteFailedRun(livenessRun)) {
+        if (!terminalDecision.pipelineStageExited) {
+          await refreshContinuationSummaryForRun(livenessRun, agent);
+        }
+        if (
+          !terminalDecision.pipelineStageExited &&
+          !isWorkspaceValidationFailedRun(livenessRun) &&
+          !isConfigurationIncompleteFailedRun(livenessRun)
+        ) {
           await finalizeIssueCommentPolicy(livenessRun, agent);
         }
-        await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        if (!terminalDecision.pipelineStageExited) {
+          await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        }
         await releaseIssueExecutionAndPromote(livenessRun);
 
         await updateRuntimeState(agent, livenessRun, {
           exitCode: null,
           signal: null,
           timedOut: false,
-          errorMessage: message,
+          errorCode: terminalDecision.errorCode ?? failureErrorCode,
+          errorMessage: terminalDecision.error ?? message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
         });
         await recordZeroTokenCompletedRunStreak(agent);
 
-        if (taskKey && !isolationSessionMismatch && (runtimeSessionParams || previousSessionDisplayId || taskSession)) {
+        if (
+          taskKey &&
+          !terminalDecision.pipelineStageExited &&
+          !isolationSessionMismatch &&
+          (runtimeSessionParams || previousSessionDisplayId || taskSession)
+        ) {
           // Persist the current run's scoped params so failure-path resumes keep the isolation key.
           await upsertTaskSession({
             companyId: agent.companyId,
@@ -25659,13 +26381,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sessionConfigMetadata,
             ),
             sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
+            lastRunId: livenessRun.id,
+            lastError: terminalDecision.error ?? message,
           });
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      await finalizeAgentStatus(agent.id, terminalDecision.outcome, terminalDecision.error, {
+        errorCode: terminalDecision.errorCode ?? failureErrorCode,
+        runId: failedRunWrite.run?.id ?? run.id,
+      });
     }
     } catch (outerErr) {
           if (outerErr instanceof BranchClaimConflictError) {
@@ -25746,6 +26471,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }),
             } : {}),
           }).catch(() => ({ run: null, updated: false as const }));
+          let terminalDecision: PersistedRunTerminalDecision | null = null;
           if (!setupFailureWrite.updated) {
             logger.info(
               {
@@ -25756,29 +26482,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               "skipping late setup failure finalization because the run already left running state",
             );
           } else {
-            await setWakeupStatus(run.wakeupRequestId, "failed", {
+            terminalDecision = persistedRunTerminalDecision(setupFailureWrite.run, "failed");
+            await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
               finishedAt: new Date(),
-              error: message,
+              error: terminalDecision.error,
             }).catch(() => undefined);
           }
-          const failedRun = await getRun(runId).catch(() => null);
-          if (setupFailureWrite.updated && failedRun) {
+          const failedRun = setupFailureWrite.updated
+            ? setupFailureWrite.run ?? await getRun(runId).catch(() => null)
+            : null;
+          if (setupFailureWrite.updated && failedRun && terminalDecision) {
+            const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
+            terminalDecision = persistedRunTerminalDecision(livenessRun, terminalDecision.outcome);
             // Emit a run-log event so the failure is visible in the run timeline,
             // consistent with what the inner catch block does for adapter failures.
-            await appendRunEvent(failedRun, await nextRunEventSeq(failedRun.id), {
-              eventType: "error",
+            await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
+              eventType: terminalDecision.pipelineStageExited ? "lifecycle" : "error",
               stream: "system",
-              level: "error",
-              message,
+              level: terminalDecision.pipelineStageExited ? "warn" : "error",
+              message: terminalDecision.error ?? message,
+              payload: {
+                status: terminalDecision.outcome,
+                errorCode: terminalDecision.errorCode,
+              },
             }).catch(() => undefined);
-            const livenessRun = await classifyAndPersistRunLiveness(failedRun).catch(() => failedRun);
             const setupFailureIssueId = readNonEmptyString(parseObject(livenessRun.contextSnapshot).issueId);
             if (setupFailureIssueId) {
               await completeSkillTestRunForHeartbeatOutcome({
                 run: livenessRun,
                 issueId: setupFailureIssueId,
-                outcome: "failed",
-                error: message,
+                outcome: terminalDecision.outcome,
+                error: terminalDecision.error,
               }).catch((completionErr) => {
                 logger.warn(
                   { err: completionErr, runId: livenessRun.id, issueId: setupFailureIssueId },
@@ -25788,16 +26522,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
-              await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
-              if (!isWorkspaceValidationFailedRun(livenessRun) && !isConfigurationIncompleteFailedRun(livenessRun)) {
+              if (!terminalDecision.pipelineStageExited) {
+                await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
+              }
+              if (
+                !terminalDecision.pipelineStageExited &&
+                !isWorkspaceValidationFailedRun(livenessRun) &&
+                !isConfigurationIncompleteFailedRun(livenessRun)
+              ) {
                 await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
               }
-              await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent).catch((retryError) => {
-                logger.warn(
-                  { err: retryError, runId: livenessRun.id },
-                  "failed to schedule interaction continuation retry after setup failure",
-                );
-              });
+              if (!terminalDecision.pipelineStageExited) {
+                await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent).catch((retryError) => {
+                  logger.warn(
+                    { err: retryError, runId: livenessRun.id },
+                    "failed to schedule interaction continuation retry after setup failure",
+                  );
+                });
+              }
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch((releaseError) => {
               logger.error(
@@ -25809,8 +26551,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Ensure the agent is not left stuck in "running" if the setup-failure
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
-          if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+          if (setupFailureWrite.updated && terminalDecision) {
+            await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalDecision.error, {
+              errorCode: terminalDecision.errorCode ?? setupErrorCode,
+              runId: failedRun?.id ?? run.id,
+            }).catch(() => undefined);
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
@@ -26096,6 +26841,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       deferPrimaryCheckoutRestoration?: boolean;
     } = {},
   ): Promise<boolean> {
+    // A pipeline-stage exit made this run obsolete, not failed. Release its
+    // execution lock, but never turn that cancellation into generic automatic
+    // issue recovery (which would recreate the work the stage exit retired).
+    const suppressImmediateRecovery =
+      options.suppressImmediateRecovery || isPersistedPipelineStageExitRun(run);
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = issueIdFromRunContext(runContext);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -26852,7 +27602,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
 
       if (!issueNeedsImmediateRecovery) return completePromotion({ kind: "released" as const });
-      if (options.suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
+      if (suppressImmediateRecovery) return completePromotion({ kind: "released" as const });
 
       const existingExecutionPath = await findExistingExecutionPath();
       const immediateRecoveryHasReplacementPath = Boolean(existingExecutionPath || issueHasPersistedMonitor);
@@ -27353,9 +28103,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // value there would reintroduce the very park this clamp removes, on the
       // next failure of the same run. The provider's claim is preserved
       // verbatim under its own key instead.
+      const capacityDeferredAt = new Date();
       const capacityRetryPlan = resolveCcrotateCapacityRetry({
         resumeAt: gateResult.resumeAt,
-        now: new Date(),
+        now: capacityDeferredAt,
         defaultRetryDelayMs: CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS,
       });
       const advertisedResumeAtIso = gateResult.resumeAt ? gateResult.resumeAt.toISOString() : null;
@@ -27497,6 +28248,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 retryAfterSeconds: gateResult.retryAfterSeconds,
                 advertisedResumeAtIso: advertisedResumeAtIso,
                 clampedFromIso: capacityRetryPlan.clampedFromIso,
+                // First hop of a fresh chain by construction — this is the
+                // insert path — so the escalation clock starts here rather than
+                // at the first re-defer. Same instant the park was computed
+                // from, so the origin and the first hop cannot disagree
+                // (BLO-28919).
+                firstDeferredAtIso: capacityDeferredAt.toISOString(),
               },
             ),
             contextSnapshot: retryContextSnapshot,
@@ -27796,6 +28553,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null)
           : null;
 
+        // Set when a dep-blocked park is cancelled for blocker-set churn, so the
+        // replacement park inherits the original park instant (BLO-29055).
+        let carriedDepBlockedFirstParkedAt: Date | null = null;
+
         if (
           activeExecutionRun &&
           !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
@@ -27964,6 +28725,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }
             }
           }
+        }
+
+        // A wake that was already waiting on the issue lock when pipeline
+        // retirement committed must not become a new deferred wake. Preserve a
+        // durable skipped record so its caller has an auditable terminal answer
+        // while the marked running generation is being interrupted.
+        if (
+          issue.status === "cancelled" &&
+          activeExecutionRun?.status === "running" &&
+          readNonEmptyString(parseObject(activeExecutionRun.resultJson).pipelineStageExitCancellationRequestedAt)
+        ) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "pipeline_stage_exit_cancellation_pending",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          if (suppression) suppression.durableSkipReason = "pipeline_stage_exit_cancellation_pending";
+          return { kind: "skipped" as const };
         }
 
         const dependencyReadiness = await issuesSvc.listDependencyReadiness(
@@ -28152,6 +28939,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const setsMatch =
             storedSet.size === currentSet.size && [...storedSet].every((id) => currentSet.has(id));
           if (!setsMatch) {
+            // Capture the park's lineage origin BEFORE cancelling, so the replacement
+            // row inherits it (BLO-29055). Without this the age ceiling would reset on
+            // every blocker-set change, exactly as the attempt counter does.
+            const churnedFirstParkedAt = readDepBlockedFirstParkedAt(activeExecutionRun);
             const cancelled = await cancelDepBlockedScheduledRetry(
               activeExecutionRun,
               "Cancelled because the dependency blocker set changed before the scheduled retry became due",
@@ -28160,10 +28951,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               {
                 previousUnresolvedBlockerIssueIds: [...storedSet],
                 currentUnresolvedBlockerIssueIds: currentBlockerIds,
+                depBlockedFirstParkedAt: churnedFirstParkedAt.toISOString(),
               },
             );
             if (cancelled) {
               activeExecutionRun = null;
+              carriedDepBlockedFirstParkedAt = churnedFirstParkedAt;
             }
           }
         }
@@ -28175,6 +28968,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...enrichedContextSnapshot,
             unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: dependencyReadiness.unresolvedBlockerCount,
+            // A first park stamps `now`; a re-park after blocker churn inherits the
+            // original instant so the age ceiling measures the whole wait (BLO-29055).
+            depBlockedFirstParkedAt: (carriedDepBlockedFirstParkedAt ?? now).toISOString(),
           };
           const wakeupRequest = await tx
             .insert(agentWakeupRequests)
@@ -28890,8 +29686,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "dep_blocked_scheduled") return null;
+      if (outcome.kind === "dep_blocked_scheduled") {
+        // Signal the deferral only here, after the transaction has committed,
+        // so nothing can read "deferred until T" for a park that rolled back —
+        // the same ordering rule the provider-capacity gate documents above.
+        // Without this the caller cannot tell this `null` from a durable
+        // decline, and the issue-monitor dispatcher destroys a monitor whose
+        // wake never ran (BLO-22048).
+        if (suppression) suppression.dependencyBlockedRetryAt = outcome.run.scheduledRetryAt ?? null;
+        return null;
+      }
+      if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
+        // BLO-22048: only the FIRST dep-blocked fire creates the park and returns
+        // `dep_blocked_scheduled` above. Every later fire meets that park and
+        // coalesces into it instead — still a deferral, since the merged run stays
+        // parked and no turn executes. Without signalling it here the sink stays
+        // null from deferral #2 onward and the issue-monitor dispatcher destroys
+        // the monitor exactly as it did before the fix.
+        //
+        // Gate on status as well as reason: `scheduledRetryReason` is never
+        // cleared on promotion, so a *running* run still carries
+        // "dependency_blocked". Coalescing into one of those is a real dispatch
+        // and must keep consuming the monitor.
+        if (
+          suppression &&
+          outcome.run.status === "scheduled_retry" &&
+          outcome.run.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON
+        ) {
+          suppression.dependencyBlockedRetryAt = outcome.run.scheduledRetryAt ?? null;
+        }
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
       }
@@ -29250,10 +30074,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * durable skip, gets counted terminal `suppressed`, and (having no reason)
    * lands on the `other` cause the outage alert pages on. A provider rate-limit
    * would page as "reviews are being dropped".
+   *
+   * `dependencyBlockedRetryAt` is the second `return null` that is a deferral
+   * rather than a decline (BLO-22048): an unresolved `blockedBy` edge converts
+   * the wake into a `dependency_blocked` scheduled_retry park. It carries the
+   * park's `scheduledRetryAt` rather than a bare boolean because the issue
+   * monitor caller has to re-arm *at that instant* — re-arming at the original
+   * `nextCheckAt` (already in the past, since it just fired) makes the monitor
+   * re-dispatch on every scheduler tick, and each redispatch coalesces into the
+   * same park, so the issue never moves but the activity log churns forever.
+   * Note the value is the park's instant as recorded, which on the coalesce path
+   * is the ORIGINAL park instant and can therefore already be in the past; the
+   * monitor caller clamps it forward before arming a timer on it.
    */
   type WakeSuppressionOutcome = {
     durableSkipReason: string | null;
     providerCapacityDeferred: boolean;
+    dependencyBlockedRetryAt: Date | null;
   };
 
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
@@ -29265,11 +30102,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const suppression: WakeSuppressionOutcome = {
       durableSkipReason: null,
       providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
     };
     let lastError: unknown;
     for (let attempt = 0; attempt <= WAKE_DISPATCH_RETRY_BACKOFF_MS.length; attempt++) {
       suppression.durableSkipReason = null;
       suppression.providerCapacityDeferred = false;
+      suppression.dependencyBlockedRetryAt = null;
       try {
         const result = await enqueueWakeup(agentId, opts, suppression);
         if (!result && githubReviewReason !== null) {
@@ -29449,6 +30288,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const suppression: WakeSuppressionOutcome = {
         durableSkipReason: null,
         providerCapacityDeferred: false,
+        dependencyBlockedRetryAt: null,
       };
       try {
         const recoveredRun = await enqueueWakeup(row.agentId, originalOpts, suppression);
@@ -31080,7 +31920,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return {
         checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped + expiredIssueMonitors.recovered,
+        // Blocker-deferred monitors delivered no wake, so they belong on the
+        // not-enqueued side of the ledger rather than silently widening the gap
+        // between `checked` and the two counters that explain it (BLO-22048).
+        skipped: skipped + issueMonitors.skipped + issueMonitors.dependencyBlockedDeferred +
+          expiredIssueMonitors.recovered,
         idleSkipped,
       };
     },

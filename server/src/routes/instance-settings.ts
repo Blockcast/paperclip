@@ -8,7 +8,15 @@ import {
   patchInstanceGeneralSettingsSchema,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
+import {
+  auditHookCommands,
+  describeHookCommandFinding,
+  LIFECYCLE_HOOK_COMMAND_SETTINGS,
+  LIFECYCLE_HOOK_COMMAND_UNRESOLVED_ACTION,
+  type HookCommandAuditFinding,
+} from "../services/lifecycle-hook-command-audit.js";
 import {
   companyService,
   heartbeatService,
@@ -27,6 +35,49 @@ function assertCanManageInstanceSettings(req: Request) {
     return;
   }
   throw forbidden("Instance admin access required");
+}
+
+/**
+ * Audit the lifecycle hook commands carried by a general-settings PATCH for
+ * absolute script paths that do not exist (BLO-28782).
+ *
+ * Advisory, never a gate. `existsSync` here runs on the pod serving the PATCH,
+ * which is not the pod that later spawns the hook. That is decidable for paths
+ * baked into the image — same image on both tiers — but a path on a **mounted
+ * volume** is per-pod: `bash /paperclip/scripts/relogin.sh` on a volume mounted
+ * into workers but not the API tier is unresolvable from here while being
+ * perfectly runnable where it actually fires. Rejecting that write would lock an
+ * operator out of a valid configuration with no override, and `preRunCmd` /
+ * `postRunCmd` are not exposed in the settings UI at all — they are set through
+ * exactly the ops path most likely to reference volume-mounted scripts.
+ *
+ * That undecidability is the same reason the boot audit is deliberately
+ * non-fatal, and it applies with more force here, where the consequence would be
+ * refusing the write rather than logging. So the write path matches the boot
+ * path: never block, always surface. Findings are returned to the caller and
+ * recorded under `instance.lifecycle_hook_command_unresolved` — the activity
+ * action an operator already queries to see hook failures.
+ *
+ * Only keys present in the patch are audited, so an unrelated PATCH is never
+ * annotated with pre-existing drift — that case is the boot audit's job.
+ */
+function auditPatchedHookCommands(patch: Record<string, unknown>): HookCommandAuditFinding[] {
+  const patched = LIFECYCLE_HOOK_COMMAND_SETTINGS.filter((setting) =>
+    Object.prototype.hasOwnProperty.call(patch, setting),
+  );
+  if (patched.length === 0) return [];
+
+  return auditHookCommands({
+    preRunCmd: null,
+    postRunCmd: null,
+    quotaExhaustedCmd: null,
+    ...Object.fromEntries(
+      patched.map((setting) => [
+        setting,
+        typeof patch[setting] === "string" ? (patch[setting] as string) : null,
+      ]),
+    ),
+  });
 }
 
 export function instanceSettingsRoutes(db: Db) {
@@ -90,6 +141,7 @@ export function instanceSettingsRoutes(db: Db) {
     validate(patchInstanceGeneralSettingsSchema),
     async (req, res) => {
       assertCanManageInstanceSettings(req);
+      const hookFindings = auditPatchedHookCommands(req.body);
       const updated = await svc.updateGeneral(req.body);
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();
@@ -112,7 +164,49 @@ export function instanceSettingsRoutes(db: Db) {
           }),
         ),
       );
-      res.json(updated.general);
+      if (hookFindings.length > 0) {
+        // Advisory only: the write already landed, so a failure to record the
+        // warning must not turn a successful save into a 500 the operator reads
+        // as "it did not save".
+        try {
+          await Promise.all(
+            companyIds.flatMap((companyId) =>
+              hookFindings.map((finding) =>
+                logActivity(db, {
+                  companyId,
+                  actorType: actor.actorType,
+                  actorId: actor.actorId,
+                  agentId: actor.agentId,
+                  runId: actor.runId,
+                  agentApiKeyId: actor.agentApiKeyId,
+                  action: LIFECYCLE_HOOK_COMMAND_UNRESOLVED_ACTION,
+                  entityType: "instance_settings",
+                  entityId: finding.setting,
+                  details: {
+                    setting: finding.setting,
+                    command: finding.command,
+                    missingPaths: finding.missingPaths,
+                    detectedAt: "write",
+                  },
+                }),
+              ),
+            ),
+          );
+        } catch (err) {
+          logger.warn({ err }, "failed to record lifecycle hook command write-time warning");
+        }
+      }
+      res.json(
+        hookFindings.length === 0
+          ? updated.general
+          : {
+              ...updated.general,
+              hookCommandWarnings: hookFindings.map((finding) => ({
+                ...finding,
+                message: describeHookCommandFinding(finding),
+              })),
+            },
+      );
     },
   );
 
@@ -206,6 +300,12 @@ export function instanceSettingsRoutes(db: Db) {
               escalationsCreated: result.escalationsCreated,
               existingEscalations: result.existingEscalations,
               skippedOutsideLookback: result.skippedOutsideLookback,
+              // Suppression volume is the quantity BLO-27676 changed, and an
+              // operator-triggered run is where it most wants recording: without
+              // these the audit trail cannot distinguish "nothing was wrong" from
+              // "everything was suppressed".
+              skippedReescalationCooldown: result.skippedReescalationCooldown,
+              skippedUnchangedTarget: result.skippedUnchangedTarget,
               escalationIssueIds: result.escalationIssueIds,
             },
           }),

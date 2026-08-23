@@ -1,0 +1,108 @@
+name: review-gate-sweep
+
+# Reconciler for BLO-22892, ported to this repo by BLO-28203.
+#
+# A reviewer wake fired by `pull_request.opened` is event-driven and can be
+# silently declined or starved (busy agent, capacity gate, k8s dispatch hang)
+# with no retry and no alert -- Ally "does not patrol the issue board", so a
+# lost wake stays lost forever and the PR simply sits there, unreviewed and
+# indistinguishable from one merely waiting its turn. This repo is the one
+# that carried the ~13-PR loss set measured on BLO-22892 (2026-08-15/16), so
+# it has demonstrated exposure, not theoretical exposure.
+#
+# This runs on a SCHEDULE, not an event, precisely so it does not depend on
+# the same wake-delivery path it exists to backstop.
+#
+# PREDICATE_MODE=status-free is deliberate and is the decision recorded on
+# BLO-28203. Unlike trafficcontrol and pim-multicast-gateway, this repo has
+# NO `review/ally-complete` producer: measured 2026-08-20, **0 of 100** open
+# PRs carried that status. A status-keyed sweep here would classify every PR
+# as "not pending" and silently do nothing forever -- the very failure this
+# reconciler exists to prevent, reintroduced one layer up. So the sweep keys
+# on the load-bearing half instead: non-draft, open, and no Ally consolidated
+# report at the exact head, for longer than STALL_THRESHOLD_SECONDS.
+#
+# Standing up the `review/ally-complete` gate here first was the considered
+# alternative and was rejected: it would add a new commit status to a repo
+# with a merge queue, changing merge behaviour for a reconciler that is meant
+# to be observe-and-re-fire only -- a strictly larger blast radius for no gain
+# in detection.
+#
+# AC4 (BLO-22892): the stranded condition must surface without a human
+# noticing by hand. If a re-fire ALSO goes unserviced past
+# ALARM_THRESHOLD_SECONDS, this job exits non-zero -- turning the schedule
+# persistently red on this repo's Actions tab.
+
+on:
+  schedule:
+    # Hourly, NOT every 30 minutes, and that is a rate-limit decision.
+    #
+    # In status-free mode each non-draft PR costs 3 requests (head commit +
+    # comments page + reviews page). Measured 2026-08-21 on this repo: 147
+    # open PRs, 119 non-draft and unlocked -> ~359 requests per run. At
+    # `9,39` that is ~718/hour from this job alone, against `github.token`'s
+    # documented 1,000/hour/repository budget shared with the 26 other
+    # workflows here -- exhaustion would be the steady state, not an edge
+    # case. Hourly halves it to ~359/hour and leaves real headroom.
+    #
+    # The cheap predicate-level cut (skipping PRs younger than the stall
+    # threshold, which cannot be stranded) was measured too and saves only
+    # 3 of those 359 calls on this repo -- almost every open PR here is
+    # older than 90 minutes. It is kept because it is free and correct, but
+    # cadence is the lever that actually moves the number.
+    #
+    # ALARM_THRESHOLD_SECONDS is raised to 5.5h in the script to absorb the
+    # coarser polling granularity -- see the comment on that constant. Off
+    # the hour to avoid clustering with every other cron in the org, and
+    # offset from trafficcontrol (7,37) and pim-multicast-gateway (8,38) so
+    # the repos' sweeps do not fire their re-requests at Ally at once.
+    - cron: '9 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  # write, not read: re-firing POSTs a native review request
+  # (.../pulls/{n}/requested_reviewers), not just the marker comment.
+  pull-requests: write
+  statuses: read
+
+concurrency:
+  group: review-gate-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep stalled Ally reviews
+    runs-on: default
+    # Bounded so one hung API call cannot hold the job to the Actions 6-hour
+    # ceiling. That matters more here than on a normal job: with
+    # `cancel-in-progress: false` above, every subsequent 30-minute run queues
+    # behind a hung one, so a single stalled socket becomes a multi-hour
+    # reconciler outage. Matches the sibling `ally-review-consistency.yml`
+    # (10m); slightly higher because this sweep makes one request per open PR.
+    # The script also bounds each individual request (REQUEST_TIMEOUT_SECONDS).
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Unit tests for the sweep's pure decision logic
+        run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
+
+      - name: Sweep and re-fire stalled review requests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # See the header comment: this repo has no `review/ally-complete`
+          # producer, so there is no pending status to key on.
+          PREDICATE_MODE: status-free
+          # Which logins' reviews count as an Ally signal for a head. Note
+          # `claude[bot]` (id 209825114) is deliberately absent -- counting it
+          # is the exact false negative that hid trafficcontrol#1448.
+          ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast,allyblockcast
+          # The distinct User identity to request a formal review from when
+          # re-firing (see sweep-stalled-ally-reviews.py's comment on this
+          # constant for why the User, not the App, login is used here).
+          ALLY_REQUEST_REVIEWER_LOGIN: allyblockcast
+        run: python3 .github/scripts/sweep-stalled-ally-reviews.py

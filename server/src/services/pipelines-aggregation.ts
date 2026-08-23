@@ -568,6 +568,8 @@ export async function loadActiveWorkForCases(
       eq(pipelineCaseIssueLinks.companyId, companyId),
       inArray(pipelineCaseIssueLinks.caseId, caseIds),
       inArray(pipelineCaseIssueLinks.role, ["work", "automation"]),
+      isNull(pipelineCaseIssueLinks.retiredAt),
+      eq(pipelineCaseIssueLinks.attachmentState, "attached"),
       eq(issues.companyId, companyId),
       eq(issues.status, "in_progress"),
       visibleIssueCondition(),
@@ -627,6 +629,8 @@ export async function loadDescendantActiveWorkCountsForCases(
       on link.company_id = ${companyId}
      and link.case_id = subtree.id
      and link.role in ('work', 'automation')
+     and link.retired_at is null
+     and link.attachment_state = 'attached'
     join issues issue
       on issue.id = link.issue_id
      and issue.company_id = ${companyId}
@@ -686,6 +690,8 @@ export async function loadPipelineDescendantActiveWorkCounts(
       on link.company_id = ${companyId}
      and link.case_id = subtree.id
      and link.role in ('work', 'automation')
+     and link.retired_at is null
+     and link.attachment_state = 'attached'
     join issues issue
       on issue.id = link.issue_id
      and issue.company_id = ${companyId}

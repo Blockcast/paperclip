@@ -21,6 +21,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  authorizationDeniedDetails,
   authorizationService,
   commentAuthorCanGrantIssueMention,
 } from "../services/authorization.js";
@@ -633,6 +634,75 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({
       allowed: true,
       reason: "allow_self",
+    });
+  });
+
+  it("ignores a foreign project pointer without weakening configured cross-company boundary denial", async () => {
+    const company = await createCompany(db, "ForeignProjectPointer");
+    const foreignCompany = await createCompany(db, "ForeignProjectSource");
+    const foreignProject = await createProject(db, foreignCompany.id, "Foreign");
+    const actorAgent = await createAgent(db, company.id);
+    const issue = await createIssue(db, company.id, {
+      projectId: foreignProject.id,
+      assigneeAgentId: actorAgent.id,
+    });
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+    const authorization = authorizationService(db);
+
+    for (const action of ["issue:read", "issue:comment"] as const) {
+      await expect(authorization.decide({
+        actor,
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: issue.id,
+          assigneeAgentId: actorAgent.id,
+        },
+      })).resolves.toMatchObject({ allowed: true });
+    }
+
+    await db.update(issues).set({
+      executionPolicy: {
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: foreignCompany.id,
+            rootIssueId: issue.id,
+          },
+        },
+      },
+    }).where(eq(issues.id, issue.id));
+
+    const denied = await authorization.decide({
+      actor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: actorAgent.id,
+      },
+    });
+    expect(denied).toMatchObject({
+      allowed: false,
+      reason: "deny_policy_restricted",
+      policyResolution: {
+        reason: "cross_company_boundary",
+        source: "issue",
+      },
+    });
+    expect(authorizationDeniedDetails(denied)).toMatchObject({
+      resolution: {
+        reason: "cross_company_boundary",
+        source: "issue",
+        detail: expect.any(String),
+      },
     });
   });
 

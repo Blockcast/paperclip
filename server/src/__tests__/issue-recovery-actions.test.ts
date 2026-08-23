@@ -25,6 +25,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
@@ -37,6 +38,7 @@ import {
   STRANDED_ASSIGNED_ISSUE_STATUSES,
   STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES,
   STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
+  isInfraClassStrandedFailure,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
 } from "../services/recovery/service.js";
@@ -744,6 +746,80 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  /**
+   * BLO-19124. The all-skipped sweep is the diagnostic case and it used to emit nothing:
+   * the backstop logged only on `healed > 0`, and both `reconcileIssueGraphLiveness`
+   * callers in index.ts log only when `escalationsCreated`/`dependencyWakesHealed` move.
+   * So the state where every candidate is gated — the state that leaves actions reaching
+   * their horizon at attemptCount 0 — was invisible, and the per-gate counters that name
+   * the responsible gate were computed and discarded.
+   *
+   * Asserting on the counter payload rather than just the message is what makes this a
+   * regression test: dropping the `else if` branch, or logging a bare message without the
+   * breakdown, both fail here.
+   */
+  it("reports the per-gate skip breakdown when a sweep redelivers nothing", async () => {
+    const { companyId, sourceIssueId, managerId, issue, latestRun, stageId } =
+      await seedPendingReviewRecovery();
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    enqueueWakeup.mockRejectedValueOnce(new Error("wake dispatch unavailable"));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "in_review",
+      latestRun,
+      recoveryCause: "execution_review_participant_recovery",
+      recoveryOwnerAgentId: managerId,
+      expectedReviewStage: { stageId, participantAgentId: managerId, executionRunId: null },
+    })).rejects.toThrow("wake dispatch unavailable");
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+
+    // Inside the cooldown rather than past it, so the sweep selects the candidate and then
+    // gates it: checked = 1, healed = 0 — the shape production is stuck in.
+    const now = new Date();
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(now.getTime() - 60 * 1000) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => logger);
+    let calls: unknown[][] = [];
+    let result: Awaited<ReturnType<typeof recovery.reconcileStrandedRecoveryWakeBackstop>>;
+    try {
+      result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+        companyId,
+        now,
+        cooldownMs: 30 * 60 * 1000,
+      });
+      // Snapshot before restoring: mockRestore() clears mock.calls.
+      calls = infoSpy.mock.calls.map((call) => [...call]);
+    } finally {
+      infoSpy.mockRestore();
+    }
+
+    expect(result).toMatchObject({ checked: 1, healed: 0, cooldownSkipped: 1 });
+
+    const reported = calls.find(
+      (call) => call[1] === "stranded recovery wake backstop redelivered nothing this sweep",
+    );
+    expect(reported, "all-skipped sweep must emit its per-gate breakdown").toBeDefined();
+    expect(reported?.[0]).toMatchObject({ checked: 1, cooldownSkipped: 1 });
+    // Every gate is present even at zero, so the line is a usable time series rather than
+    // a shape that changes with whichever gate happened to fire.
+    expect(reported?.[0]).toMatchObject({
+      livePathSkipped: expect.any(Number),
+      pauseHoldSkipped: expect.any(Number),
+      exhaustedSkipped: expect.any(Number),
+      candidateLimitSkipped: expect.any(Number),
+      enqueueFailed: expect.any(Number),
+    });
+  });
+
   it("publishes the committed review-stage escalation activity", async () => {
     const { companyId, managerId, sourceIssueId, stageId, issue, latestRun } = await seedPendingReviewRecovery();
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
@@ -841,7 +917,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // the second sweep is recovery observing its own reassignment and must leave the
       // grant subject alone. `managerId` here asserted the pre-fix behaviour.
       previousOwnerAgentId: coderId,
-      returnOwnerAgentId: managerId,
+      // BLO-20933: the CODER here too. BLO-20263 fixed the sliding anchor for
+      // `previousOwnerAgentId` but left `returnOwnerAgentId` reading the issue's
+      // *current* assignee, which the first sweep has already escalated to the
+      // manager — so a second sweep overwrote the return owner with the manager and
+      // the original assignee was lost permanently. The manager never ran and never
+      // failed; it is not a return-owner candidate for the same reason it is not a
+      // handoff subject. `managerId` here asserted that residual pre-fix behaviour.
+      returnOwnerAgentId: coderId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
     });
@@ -959,6 +1042,448 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(finalIssue).toMatchObject({ status: "cancelled", assigneeAgentId: sourceIssue.assigneeAgentId });
   });
+
+  // BLO-20933: verified live on BLO-20321 — a run whose pod was evicted/removed
+  // surfaced as `claude_truncated` and still transferred `ownerAgentId` to the
+  // manager, even though `returnOwnerAgentId` already named the correct owner and
+  // nothing about the work itself had failed. These two cases pin the narrowed
+  // behavior: infra-class causes re-dispatch to the existing assignee and record
+  // the classification in evidence; a non-infra `claude_truncated` still escalates.
+  it("re-dispatches a pod-eviction claude_truncated failure to the existing assignee instead of the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; pod is gone — Job pod was removed (eviction, preemption, or external " +
+        "delete) before exit could be read",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    expect(action?.evidence).toMatchObject({ infraClassCause: true });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: coderId,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
+  });
+
+  it("still escalates a claude_truncated failure without pod-removal evidence to the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; exit code 1, reason=Error, message=panic: nil pointer dereference",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.evidence).toMatchObject({ infraClassCause: false });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: managerId,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.anything());
+  });
+
+  it("keeps the original return owner after a temporary invocability fallback", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // The first sweep must use the manager fallback, but the action must still
+    // remember which assignee should receive the work when it recovers.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [firstAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(firstAction).toMatchObject({
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+    });
+
+    // A later sweep sees the manager on the issue, but must not replace the
+    // durable return owner with that escalation artifact.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, coderId));
+    const [reassignedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    await recovery.escalateStrandedAssignedIssue({
+      issue: reassignedIssue!,
+      previousStatus: "in_progress",
+      latestRun: { ...latestRun, id: randomUUID() },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [secondAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(secondAction).toMatchObject({ returnOwnerAgentId: coderId });
+  });
+
+  // BLO-20933 (review finding 1): the return-owner pin above is correct ONLY when the
+  // current assignee is recovery's own escalation artifact. Pinning it unconditionally
+  // reverts a genuine third-party reassignment from the second sweep onward — a
+  // laundering bug inside the laundering fix, re-introducing the exact misrouting this
+  // issue exists to kill. The discriminator is whether the assignee still equals the
+  // owner the previous action named.
+  it("prefers a genuine reassignment over the recorded return owner on a later sweep", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const newOwnerId = randomUUID();
+    await db.insert(agents).values({
+      id: newOwnerId,
+      companyId,
+      name: "Successor",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const infraRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; pod is gone — Job pod was removed (eviction, preemption, or external " +
+        "delete) before exit could be read",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // Sweep 1: infra-class, so the coder keeps the work and is recorded as return owner.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: infraRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    const [firstAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(firstAction).toMatchObject({ ownerAgentId: coderId, returnOwnerAgentId: coderId });
+
+    // A human reassigns the issue to a different engineer. This is NOT recovery's own
+    // artifact — the assignee no longer matches the action's recorded owner.
+    await db.update(issues).set({ assigneeAgentId: newOwnerId }).where(eq(issues.id, sourceIssue.id));
+    const [reassignedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+
+    // Sweep 2: a second eviction must respect the reassignment, not revert it.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: reassignedIssue!,
+      previousStatus: "in_progress",
+      latestRun: { ...infraRun, id: randomUUID() },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [secondAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(secondAction).toMatchObject({
+      ownerAgentId: newOwnerId,
+      returnOwnerAgentId: newOwnerId,
+    });
+    expect(secondAction?.returnOwnerAgentId).not.toBe(coderId);
+
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(finalIssue?.assigneeAgentId).toBe(newOwnerId);
+  });
+
+  // BLO-20933 (review finding 2): `expectedCurrentAssigneeAgentId` is enforced by a THROWN
+  // 409, not a falsy return, and it fires after the action upsert and the owner wake have
+  // already committed. Unhandled, that throw escapes `reconcileStrandedAssignedIssues`'s
+  // per-issue loop (which has no try/catch) and leaves every remaining stranded issue in
+  // the batch unreconciled. The lost race must degrade to a skip for this one issue.
+  it("skips instead of throwing when the assignee changes mid-escalation", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const raceWinnerId = randomUUID();
+    await db.insert(agents).values({
+      id: raceWinnerId,
+      companyId,
+      name: "Race Winner",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // The injected wake runs after the lock-fresh read and before the source-issue UPDATE,
+    // so mutating the assignee here reproduces the lost race deterministically.
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => {
+      await db.update(issues).set({ assigneeAgentId: raceWinnerId }).where(eq(issues.id, sourceIssue.id));
+      return { id: randomUUID() };
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    })).resolves.not.toThrow();
+
+    // The reassignment stands; recovery did not clobber it back to the manager.
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(finalIssue?.assigneeAgentId).toBe(raceWinnerId);
+    expect(finalIssue?.status).toBe("in_progress");
+  });
+
+  // BLO-20933: the regex used to also match the bare words `eviction`, `preempt(ion|ed)`,
+  // and `external delete` on their own. Those words only ever appear inside the same
+  // fixed adapter sentence as the two stable markers below, so they added no true-positive
+  // coverage — only a false-collision surface. Pin the narrowed regex directly.
+  describe("isInfraClassStrandedFailure", () => {
+    const baseRun = {
+      id: "run-1",
+      agentId: "agent-1",
+      status: "failed",
+      contextSnapshot: {},
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    it("is true for k8s_job_deleted_externally regardless of error text", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "k8s_job_deleted_externally",
+          error: "some unrelated wording that does not mention eviction at all",
+        }),
+      ).toBe(true);
+    });
+
+    it("is true for the adapter's fixed pod-removal sentence", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; pod is gone — Job pod was removed (eviction, preemption, " +
+            "or external delete) before exit could be read",
+        }),
+      ).toBe(true);
+    });
+
+    it("does not false-collide on a claude_truncated failure that merely mentions eviction/preemption", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 1, reason=Error, message=node preempted the " +
+            "eviction handler during shutdown and panicked",
+        }),
+      ).toBe(false);
+    });
+
+    it("is false for a non-truncated, non-deleted errorCode even with pod-removal wording", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "adapter_failed",
+          error: "pod is gone — Job pod was removed (eviction, preemption, or external delete)",
+        }),
+      ).toBe(false);
+    });
+  });
+
+  // BLO-20933: `resolveStrandedRecoveryRouting` computed a fresh, correctly-prioritized
+  // `returnOwnerAgentId` from the issue's current `assigneeAgentId`, then discarded it in
+  // the `routeToOriginal` branch in favor of the failed run's (possibly stale) `agentId`.
+  // These pin the fix across every cause that re-dispatches "to the original assignee":
+  // when the issue has been reassigned since the failing run, routing must follow the
+  // current assignee, not whoever happened to be running when the pod/process died.
+  it.each([
+    [
+      "stranded_assigned_issue infra-class (pod-eviction claude_truncated)",
+      "claude_truncated",
+      "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; pod is gone — Job pod was removed (eviction, preemption, or " +
+        "external delete) before exit could be read",
+      undefined,
+    ],
+    [
+      "stranded_assigned_issue infra-class (k8s_job_deleted_externally)",
+      "k8s_job_deleted_externally",
+      "Job was deleted out from under the run",
+      undefined,
+    ],
+    ["process_lost", "process_lost", "process lost", undefined],
+    ["codex_output_inactivity_monitor", "codex_output_inactivity_monitor", "no output", undefined],
+    ["successful_run_missing_state", "adapter_failed", "adapter failed", "successful_run_missing_state"],
+  ] as const)(
+    "routes %s recovery to the issue's current assignee, not the stale run agent, when they've diverged",
+    async (_label, errorCode, error, explicitCause) => {
+      const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+      const reassignedAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: reassignedAgentId,
+        companyId,
+        name: "Reassigned Engineer",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      // Reassign the issue away from `coderId` (who owns the failed run) after the run
+      // started - `escalateStrandedAssignedIssue` re-reads the issue under an advisory
+      // lock, so this is the "lock-fresh" snapshot the routing decision must use.
+      await db.update(issues).set({ assigneeAgentId: reassignedAgentId }).where(eq(issues.id, sourceIssue.id));
+      const [reassignedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const latestRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: errorCode === "adapter_failed" && explicitCause === "successful_run_missing_state"
+          ? "succeeded"
+          : "failed",
+        error,
+        errorCode,
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: reassignedIssue!,
+        previousStatus: "in_progress",
+        latestRun,
+        ...(explicitCause ? { recoveryCause: explicitCause } : {}),
+      });
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(action).toMatchObject({
+        ownerAgentId: reassignedAgentId,
+        returnOwnerAgentId: reassignedAgentId,
+      });
+      expect(action?.ownerAgentId).not.toBe(coderId);
+      expect(action?.ownerAgentId).not.toBe(managerId);
+
+      const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      expect(updatedIssue).toMatchObject({ assigneeAgentId: reassignedAgentId });
+      expect(enqueueWakeup).toHaveBeenCalledWith(reassignedAgentId, expect.anything());
+    },
+  );
 
   it.each([
     ["process_lost", undefined, "coder"],
@@ -1661,7 +2186,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // Note the run IDs differ across the two sweeps here: the discriminator is whose
       // run failed, not which run, so a new run ID alone must not refresh the subject.
       previousOwnerAgentId: coderId,
-      returnOwnerAgentId: managerId,
+      // BLO-20933: and the CODER for the return owner too, by exactly the argument
+      // above — the manager never ran and never failed, so it must not displace the
+      // coder here either. BLO-20263 applied that reasoning only to
+      // `previousOwnerAgentId`; `returnOwnerAgentId` kept reading the issue's current
+      // assignee, which sweep 1 had already escalated to the manager.
+      returnOwnerAgentId: coderId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
     });
@@ -2061,7 +2591,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(secondAction).toMatchObject({
         previousOwnerAgentId: engId,
         ownerAgentId: ctoId,
-        returnOwnerAgentId: emId,
+        // BLO-20933: `ownerAgentId` walks the manager ladder a rung per sweep
+        // (eng -> em -> cto), but `returnOwnerAgentId` must stay pinned to the agent
+        // the work actually belongs to. This previously read `emId` — sweep 1 had
+        // reassigned the issue to the EM, and the return owner was re-derived from
+        // that fresh assignee, so it slid up the ladder one rung behind the owner and
+        // the original assignee was unrecoverable after two sweeps.
+        returnOwnerAgentId: engId,
       });
       expect(handoffAnchor(secondAction!.evidence)).toBe(firstAnchor);
     } finally {

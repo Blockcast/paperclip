@@ -31,9 +31,13 @@ export const instanceGeneralSettingsSchema = z.object({
     DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   ),
   backupRetention: backupRetentionPolicySchema.default(DEFAULT_BACKUP_RETENTION),
-  quotaExhaustedCmd: z.string().nullable().default(null),
-  preRunCmd: z.string().nullable().default(null),
-  postRunCmd: z.string().nullable().default(null),
+  // Bounded because these are the only settings strings a request turns into
+  // filesystem syscalls: the hook-command audit stats every script-like token,
+  // so an unbounded string is unbounded synchronous work on the API event loop
+  // (BLO-28872 review). 4 KiB is ~40x the longest real hook command.
+  quotaExhaustedCmd: z.string().max(4096).nullable().default(null),
+  preRunCmd: z.string().max(4096).nullable().default(null),
+  postRunCmd: z.string().max(4096).nullable().default(null),
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),

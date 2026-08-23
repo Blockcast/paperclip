@@ -7,6 +7,7 @@ import type {
   PatchInstanceExperimentalSettings,
 } from "@paperclipai/shared";
 import { instanceSettingsApi } from "@/api/instanceSettings";
+import { formatDurationMs } from "@/lib/utils";
 import { getWorktreeInstanceId, isWorktreeRuntime } from "../lib/worktree-branding";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
@@ -28,6 +29,64 @@ function issueHref(identifier: string | null, issueId: string) {
   if (!identifier) return `/issues/${issueId}`;
   const prefix = identifier.split("-")[0] || "PAP";
   return `/${prefix}/issues/${identifier}`;
+}
+
+/**
+ * Describe the suppressed-finding split for the confirm dialog.
+ *
+ * Both suppressors expire, so every clause here has to carry its bound. The
+ * previous string said the aggregate "will not be re-raised" unqualified and
+ * qualified only the target subset as "held until the target changes", which was
+ * wrong in both directions at once (BLO-27676 review):
+ *
+ *   - `skippedReescalationCooldown` is the aggregate across BOTH suppressors, so
+ *     the remainder after subtracting the target subset is the *cooldown* subset
+ *     -- the most transient population there is, back within the hour. Leaving
+ *     exactly that group under a bare "will not be re-raised" invited the
+ *     operator to read it as permanent.
+ *   - the target subset is the sticky one, and it is bounded too: an untouched
+ *     leaf re-raises once the ceiling elapses. "Held until the target changes"
+ *     with no ceiling describes the unbounded suppressor this PR round removed.
+ *
+ * Both bounds are read from the preview response rather than restated here, so
+ * the sentence stays true if either constant is tuned or a caller overrides the
+ * windows via the documented rollback lever.
+ */
+export function describeSuppressedFindings(preview: {
+  skippedReescalationCooldown: number;
+  skippedUnchangedTarget: number;
+  reescalationCooldownMs: number;
+  unchangedTargetSuppressionMs: number;
+}): string | null {
+  const total = preview.skippedReescalationCooldown;
+  if (total <= 0) return null;
+  // Clamp: the target subset is a subset by construction, but a clamp keeps the
+  // remainder from going negative and rendering "-1 are within the cooldown" if
+  // the two counters ever drift apart.
+  const heldForTarget = Math.max(0, Math.min(preview.skippedUnchangedTarget, total));
+  const inCooldown = total - heldForTarget;
+
+  const sentences = [
+    `${total} current ${total === 1 ? "finding has" : "findings have"} already been escalated and resolved, so this run will not re-raise ${total === 1 ? "it" : "them"}.`,
+  ];
+  const targetWindow = formatDurationMs(preview.unchangedTargetSuppressionMs);
+  const cooldownWindow = formatDurationMs(preview.reescalationCooldownMs);
+  if (heldForTarget > 0 && inCooldown > 0) {
+    // Mixed: name both subsets and both bounds, and make clear which is which.
+    sentences.push(
+      `${heldForTarget} of those ${heldForTarget === 1 ? "is" : "are"} held until the target changes or ${targetWindow} elapses.`,
+      `The remaining ${inCooldown} ${inCooldown === 1 ? "is" : "are"} within the ${cooldownWindow} re-escalation cooldown and will re-raise shortly.`,
+    );
+  } else if (heldForTarget > 0) {
+    sentences.push(
+      `${total === 1 ? "It is" : "All of them are"} held until the target changes or ${targetWindow} elapses.`,
+    );
+  } else {
+    sentences.push(
+      `${total === 1 ? "It is" : "All of them are"} within the ${cooldownWindow} re-escalation cooldown and will re-raise shortly.`,
+    );
+  }
+  return sentences.join(" ");
 }
 
 function formatRecoveryState(state: string) {
@@ -90,6 +149,7 @@ function RecoveryPreviewDialog({
   isPending: boolean;
 }) {
   const count = preview?.recoverableFindings ?? 0;
+  const suppressedSummary = preview ? describeSuppressedFindings(preview) : null;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-3xl">
@@ -144,6 +204,18 @@ function RecoveryPreviewDialog({
             {preview.skippedOutsideLookback === 1 ? "finding is" : "findings are"} outside the configured lookback and
             will not be touched.
           </p>
+        ) : null}
+
+        {/*
+          The suppressed count has to be shown, not just subtracted: without it a
+          preview of an already-reported backlog reads as "nothing is wrong"
+          rather than "everything here has already been escalated once and the
+          target has not moved since" (BLO-27676 review). The wording lives in
+          `describeSuppressedFindings` because every clause has to carry the bound
+          that clause expires under -- see that docblock.
+        */}
+        {suppressedSummary ? (
+          <p className="text-xs text-muted-foreground">{suppressedSummary}</p>
         ) : null}
 
         <DialogFooter>

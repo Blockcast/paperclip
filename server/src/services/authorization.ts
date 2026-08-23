@@ -27,6 +27,8 @@ import {
   isIssueWithinLowTrustBoundary,
   resolveCoreTrustPreset,
   type TrustPresetResolution,
+  type TrustPresetDenyReason,
+  type TrustPresetPolicySource,
 } from "./trust-preset-resolver.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
@@ -107,6 +109,11 @@ export type AuthorizationDecision = {
   explanation: string;
   inboxPolicyMode?: InboxAgentPolicyMode | "grant_override";
   code?: "RESPONSIBLE_USER_UNAUTHORIZED" | "RESPONSIBLE_USER_UNAVAILABLE";
+  policyResolution?: {
+    reason: TrustPresetDenyReason;
+    source: TrustPresetPolicySource | null;
+    detail: string;
+  };
   reason:
     | "allow_low_trust_boundary"
     | "allow_local_board"
@@ -591,6 +598,7 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
     ...(decision.code ? { code: decision.code } : {}),
     reason: decision.reason,
     boundary: authorizationBoundaryLabel(decision.reason),
+    ...(decision.policyResolution ? { resolution: decision.policyResolution } : {}),
   };
 }
 
@@ -865,7 +873,7 @@ export function authorizationService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
+  async function loadProject(companyId: string, projectId: string): Promise<ProjectAuthorizationRow | null> {
     return db
       .select({
         id: projects.id,
@@ -873,7 +881,7 @@ export function authorizationService(db: Db) {
         executionWorkspacePolicy: projects.executionWorkspacePolicy,
       })
       .from(projects)
-      .where(eq(projects.id, projectId))
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
   }
 
@@ -941,7 +949,7 @@ export function authorizationService(db: Db) {
         : resource.type === "project"
           ? resource.projectId ?? null
           : null;
-    const project = projectId ? await loadProject(projectId) : null;
+    const project = projectId ? await loadProject(resource.companyId, projectId) : null;
     return { issue, project };
   }
 
@@ -1049,6 +1057,11 @@ export function authorizationService(db: Db) {
         action: input.action,
         reason: "deny_policy_restricted",
         explanation: input.resolution.detail,
+        policyResolution: {
+          reason: input.resolution.reason,
+          source: input.resolution.source,
+          detail: input.resolution.detail,
+        },
       });
     }
 

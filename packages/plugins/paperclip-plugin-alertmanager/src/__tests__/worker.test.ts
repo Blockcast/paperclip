@@ -43,6 +43,13 @@ import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk"
 
 const TOKEN = "super-secret-token";
 
+// Named fallback owner (BLO-21310 item 1). The harness models a *correctly
+// configured* instance: without a resolvable `fallbackAgentName`, creation now
+// fails closed rather than filing an ownerless issue, so every creation test
+// would otherwise be exercising the misconfiguration path.
+const FALLBACK_AGENT_NAME = "Ops Triage";
+const FALLBACK_AGENT_ID = "agent-fallback-1";
+
 const baseAlert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAlert => ({
   status: "firing",
   labels: {
@@ -87,6 +94,7 @@ const baseConfig = (
   severityToPriority: { critical: "critical", warning: "high", info: "medium" },
   autoCloseOnResolve: false,
   ownerMap: { team: { platform: "alice@example.com" } },
+  fallbackAgentName: FALLBACK_AGENT_NAME,
   ...overrides,
 });
 
@@ -109,6 +117,7 @@ const baseInput = (
 interface MockClients {
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
+  agents: { list: ReturnType<typeof vi.fn> };
   issues: {
     list: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
@@ -145,6 +154,18 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
     users: {
       get: vi.fn(async () => null),
       findByEmail: vi.fn(async () => null),
+    },
+    // A correctly-configured instance can always resolve `FALLBACK_AGENT_NAME`
+    // to exactly one agent. Tests that exercise the fail-closed path override
+    // this with zero matches, multiple matches, or a non-invokable status.
+    // `status` is load-bearing: the resolver requires the match to be
+    // *invokable*, so an agent with no status would fail closed here exactly as
+    // a paused one does in production.
+    agents: {
+      list: vi.fn(async () => [
+        { id: FALLBACK_AGENT_ID, name: FALLBACK_AGENT_NAME, status: "idle" },
+        { id: "agent-other", name: "Some Other Agent", status: "idle" },
+      ]),
     },
     issues: {
       list: vi.fn(async () => []),
@@ -541,7 +562,7 @@ describe("handleWebhook — firing first time", () => {
     const alert = baseAlert({
       labels: {
         alertname: "X",
-        severity: "info",
+        severity: "warning",
         billing_code: "cost-ctr-7",
       },
       annotations: {},
@@ -1472,7 +1493,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
     const alert = baseAlert({
       labels: {
         alertname: "Watchdog",
-        severity: "info",
+        severity: "warning",
         paperclip: "true",
       },
     });
@@ -1562,7 +1583,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     const alert = baseAlert({
       labels: {
         alertname: "X",
-        severity: "info",
+        severity: "warning",
         team: "platform",
         paperclip_assignee_email: "bob@example.com",
       },
@@ -1588,7 +1609,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(createArgs.assigneeUserId).toBe("user-alice");
   });
 
-  it("annotation override is the last resort before unassigned", async () => {
+  it("annotation override is the last resort before the named fallback", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
     mocks.users.findByEmail.mockResolvedValueOnce({
@@ -1597,7 +1618,7 @@ describe("handleWebhook — owner resolution fallback chain", () => {
       name: "Carol",
     });
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "info" },
+      labels: { alertname: "X", severity: "warning" },
       annotations: { paperclip_assignee_email: "carol@example.com" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
@@ -1606,11 +1627,11 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(createArgs.assigneeUserId).toBe("user-carol");
   });
 
-  it("creates the issue unassigned when nothing resolves", async () => {
+  it("assigns the named fallback agent when nothing else resolves", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {} });
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "info" },
+      labels: { alertname: "X", severity: "warning" },
       annotations: {},
     });
     const envelope = baseEnvelope({ alerts: [alert] });
@@ -1618,6 +1639,529 @@ describe("handleWebhook — owner resolution fallback chain", () => {
     expect(mocks.users.findByEmail).not.toHaveBeenCalled();
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.assigneeAgentId).toBe(FALLBACK_AGENT_ID);
+  });
+
+  it("fails closed — no issue, raised error — when fallbackAgentName is unset", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    // No state row either: a fingerprint must not look "already handled" when
+    // the alert was in fact dropped, or the retry would skip it.
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      expect.objectContaining({ alertname: "X" }),
+    );
+  });
+
+  it("fails closed when fallbackAgentName matches no agent", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: "Nobody" });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when fallbackAgentName is ambiguous across agents", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValueOnce([
+      { id: "agent-a", name: FALLBACK_AGENT_NAME, status: "idle" },
+      { id: "agent-b", name: FALLBACK_AGENT_NAME, status: "idle" },
+    ]);
+    const config = baseConfig({ ownerMap: {} });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("resolves the fallback owner once per delivery, not once per alert", async () => {
+    // `resolveFallbackAgentId` is an unwindowed company-wide `agents.list`, and
+    // the host answers it with two full-table selects plus a costEvents
+    // aggregation. Most firing alerts reach the fallback rung, so an
+    // un-memoized lookup multiplies that by the batch size — worst exactly
+    // during a storm, when the batch is largest and the host is busiest.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    const alerts = ["fp-a", "fp-b", "fp-c"].map((fingerprint) =>
+      baseAlert({
+        labels: { alertname: "X", severity: "warning" },
+        annotations: {},
+        fingerprint,
+      }),
+    );
+    const envelope = baseEnvelope({ alerts });
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    expect(mocks.issues.create).toHaveBeenCalledTimes(3);
+    // All three are assigned — the memo caches the resolution, not a skip.
+    for (const call of mocks.issues.create.mock.calls) {
+      expect(call[0].assigneeAgentId).toBe(FALLBACK_AGENT_ID);
+    }
+    expect(mocks.agents.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not cache a transient agents.list failure across the batch", async () => {
+    // The memo holds a config fact, so a *refusal* (bad name / paused) is
+    // legitimately cached for the delivery. A thrown host error is not a config
+    // fact — caching it would let one blip poison every remaining alert in the
+    // batch, converting a single-alert retry into a whole-delivery failure.
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockRejectedValueOnce(new Error("host down"));
+    const config = baseConfig({ ownerMap: {} });
+    const alerts = ["fp-fails", "fp-succeeds"].map((fingerprint) =>
+      baseAlert({
+        labels: { alertname: "X", severity: "warning" },
+        annotations: {},
+        fingerprint,
+      }),
+    );
+    const envelope = baseEnvelope({ alerts });
+    // The delivery still fails overall, so Alertmanager retries the lost alert.
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+    // But the second alert re-attempted the lookup and got its issue.
+    expect(mocks.agents.list).toHaveBeenCalledTimes(2);
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["paused", "pending_approval"])(
+    "fails closed when the only fallback match is %s",
+    async (status) => {
+      // A name match is not enough — `agents.invoke` throws on these statuses,
+      // so assigning one would create an issue with a non-null assignee that
+      // can never be woken. That is the BLO-27435 harm with the ownerless-issue
+      // check passing clean, so it has to fail closed like any other
+      // misconfiguration.
+      const { ctx, mocks } = mkCtx();
+      mocks.agents.list.mockResolvedValueOnce([
+        { id: "agent-a", name: FALLBACK_AGENT_NAME, status },
+      ]);
+      const config = baseConfig({ ownerMap: {} });
+      const alert = baseAlert({
+        labels: { alertname: "X", severity: "warning" },
+        annotations: {},
+      });
+      const envelope = baseEnvelope({ alerts: [alert] });
+      await expect(
+        handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+      ).rejects.toThrow(AlertDeliveryIncompleteError);
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("resolves the invokable match when a same-named agent is paused", async () => {
+    // The ambiguity guard applies to *invokable* candidates: a leftover paused
+    // duplicate must not turn a working config into a hard failure.
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValueOnce([
+      { id: "agent-stale", name: FALLBACK_AGENT_NAME, status: "paused" },
+      { id: "agent-live", name: FALLBACK_AGENT_NAME, status: "idle" },
+    ]);
+    const config = baseConfig({ ownerMap: {} });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeAgentId).toBe("agent-live");
+  });
+
+  it("does not consult the fallback when an owner already resolved", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    mocks.users.findByEmail.mockResolvedValueOnce({
+      id: "user-alice",
+      email: "alice@example.com",
+      name: "Alice",
+    });
+    await handleWebhook(ctx, config, true, baseInput());
+    expect(mocks.agents.list).not.toHaveBeenCalled();
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeUserId).toBe("user-alice");
+  });
+});
+
+describe("BLO-21310 — issue creation floor (severity=info)", () => {
+  const infoAlert = () =>
+    baseAlert({
+      labels: { alertname: "NoisyInfo", severity: "info", team: "platform" },
+      annotations: {},
+    });
+
+  it("creates no issue for severity=info", async () => {
+    const { ctx, mocks } = mkCtx();
+    const envelope = baseEnvelope({ alerts: [infoAlert()] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.below_issue_floor",
+      1,
+      { alertname: "NoisyInfo", severity: "info" },
+    );
+  });
+
+  it("matches severity case-insensitively and ignores surrounding space", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      labels: { alertname: "NoisyInfo", severity: "  INFO " },
+      annotations: {},
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges the delivery when the floor metric write fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.write.mockRejectedValueOnce(new Error("metrics down"));
+    const envelope = baseEnvelope({ alerts: [infoAlert()] });
+    // A permanent policy drop must not become a retryable failure just because
+    // telemetry is unavailable — Alertmanager would redeliver forever.
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: envelope })),
+    ).resolves.toBeUndefined();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("still refreshes a pre-existing info issue (resolution behavior unchanged)", async () => {
+    // The floor is creation-only. An info issue filed before the floor existed
+    // must keep being maintained, otherwise it strands open forever.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-legacy",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "NoisyInfo",
+      severity: "info",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    mocks.issues.get.mockResolvedValue({ id: "issue-legacy", status: "todo" });
+    const envelope = baseEnvelope({ alerts: [infoAlert()] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("BLO-21310 — rule-level opt-out (paperclip_issue=false)", () => {
+  const optedOutAlert = (severity: string, viaAnnotation = false) =>
+    baseAlert({
+      labels: {
+        alertname: "OptedOut",
+        severity,
+        ...(viaAnnotation ? {} : { paperclip_issue: "false" }),
+      },
+      annotations: viaAnnotation ? { paperclip_issue: "false" } : {},
+    });
+
+  it.each(["critical", "warning", "info"])(
+    "creates no issue and no state at severity=%s",
+    async (severity) => {
+      const { ctx, mocks } = mkCtx();
+      const envelope = baseEnvelope({ alerts: [optedOutAlert(severity)] });
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        true,
+        baseInput({ parsedBody: envelope }),
+      );
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(mocks.issues.update).not.toHaveBeenCalled();
+      expect(mocks.state.set).not.toHaveBeenCalled();
+      // Gated before any read, too — an opted-out rule touches nothing.
+      expect(mocks.state.get).not.toHaveBeenCalled();
+      expect(mocks.metrics.write).toHaveBeenCalledWith(
+        "alertmanager.webhook.issue_opt_out",
+        1,
+        { alertname: "OptedOut" },
+      );
+    },
+  );
+
+  it("honors the opt-out from an annotation as well as a label", async () => {
+    const { ctx, mocks } = mkCtx();
+    const envelope = baseEnvelope({
+      alerts: [optedOutAlert("critical", true)],
+    });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+
+  it("has no resolve side effect when the rule never filed an issue", async () => {
+    // The AC's "no state side effect" case: opted out from the start, so there
+    // is no state row and handleResolved drops the unknown fingerprint. Note
+    // this passes for that reason and NOT because the opt-out gates the
+    // resolved path — the test below is the one that pins the gate's placement.
+    const { ctx, mocks } = mkCtx();
+    const alert = {
+      ...optedOutAlert("critical"),
+      status: "resolved" as const,
+      endsAt: "2026-04-29T09:00:00Z",
+    };
+    const envelope = baseEnvelope({ status: "resolved", alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+  });
+
+  it("still closes a pre-existing tracked issue when the rule is opted out", async () => {
+    // Regression for the stranding hazard: gating the resolved path would mean
+    // handleResolved never runs, `state.resolvedAt` stays null, the issue never
+    // reaches a terminal status, and `advanceIssueLadder` (escalation.ts:377,380)
+    // keeps escalating — ultimately filing a board cover for a rule that was
+    // explicitly opted out and has already resolved. This is the modal adoption
+    // path: operators opt a rule out *because* it already filed noisy issues.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-tracked",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "OptedOut",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    mocks.issues.get.mockResolvedValue({ id: "issue-tracked", status: "todo" });
+    const alert = {
+      ...optedOutAlert("critical"),
+      status: "resolved" as const,
+      endsAt: "2026-04-29T09:00:00Z",
+    };
+    const envelope = baseEnvelope({ status: "resolved", alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-tracked",
+      { status: "cancelled" },
+      "company-1",
+    );
+    // The state write is the half that actually stops the ladder:
+    // advanceIssueLadder returns early on resolvedAt / escalationComplete.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        resolvedAt: "2026-04-29T09:00:00Z",
+        escalationComplete: true,
+        nextEscalationAt: null,
+      }),
+    );
+  });
+
+  it("still suppresses the firing path for a pre-existing tracked issue", async () => {
+    // The other half of the placement: letting resolve through must not let
+    // re-fires through. An opted-out rule stops generating activity on an issue
+    // it already filed.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-tracked",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "OptedOut",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    const envelope = baseEnvelope({ alerts: [optedOutAlert("critical")] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+  });
+
+  it("does not opt out on other values (true / absent / arbitrary)", async () => {
+    for (const value of ["true", "yes", ""]) {
+      const { ctx, mocks } = mkCtx();
+      const alert = baseAlert({
+        labels: {
+          alertname: "NotOptedOut",
+          severity: "warning",
+          paperclip_issue: value,
+        },
+        annotations: {},
+      });
+      const envelope = baseEnvelope({ alerts: [alert] });
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        true,
+        baseInput({ parsedBody: envelope }),
+      );
+      expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("drops the alert when paperclip_issue is not a string", async () => {
+    // `isAlertmanagerPayload` validates that `labels` is an object but not that
+    // its values are strings, so a rule can genuinely deliver a JSON boolean.
+    // Note this builds a FIRING alert — the resolved counterpart is the test
+    // below, which pins that the malformed gate is scoped to this branch.
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      labels: { alertname: "BadPolicy", severity: "critical" },
+      annotations: {},
+    });
+    (alert.labels as Record<string, unknown>).paperclip_issue = false;
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.malformed",
+      1,
+      { alertname: "BadPolicy" },
+    );
+  });
+
+  it("still closes a pre-existing tracked issue when paperclip_issue is malformed", async () => {
+    // Regression for the same stranding hazard as the opt-out, one branch
+    // higher: the malformed guard used to `continue` before the status
+    // dispatch, so a resolved alert carrying a non-string `paperclip_issue`
+    // never reached handleResolved. `state.resolvedAt` stayed null, the issue
+    // never reached a terminal status, and advanceIssueLadder kept escalating —
+    // turning a YAML `true` written where a `"true"` was meant into a
+    // permanently escalating issue for an alert that had already cleared.
+    //
+    // `paperclip_issue` is a creation policy that the resolved path never
+    // reads, so a defect in it must not suppress the close.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-tracked",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "BadPolicy",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: false,
+      escalationIntervalMs: null,
+    } satisfies AlertStateRecord);
+    mocks.issues.get.mockResolvedValue({ id: "issue-tracked", status: "todo" });
+    const alert = {
+      ...baseAlert({
+        labels: { alertname: "BadPolicy", severity: "critical" },
+        annotations: {},
+      }),
+      status: "resolved" as const,
+      endsAt: "2026-04-29T09:00:00Z",
+    };
+    (alert.labels as Record<string, unknown>).paperclip_issue = false;
+    const envelope = baseEnvelope({ status: "resolved", alerts: [alert] });
+    await handleWebhook(
+      ctx,
+      baseConfig({ autoCloseOnResolve: true }),
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-tracked",
+      { status: "cancelled" },
+      "company-1",
+    );
+    // The state write is the half that actually stops the ladder.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        resolvedAt: "2026-04-29T09:00:00Z",
+        escalationComplete: true,
+        nextEscalationAt: null,
+      }),
+    );
+  });
+
+  it("acknowledges the delivery when the opt-out metric write fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.write.mockRejectedValueOnce(new Error("metrics down"));
+    const envelope = baseEnvelope({ alerts: [optedOutAlert("critical")] });
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: envelope })),
+    ).resolves.toBeUndefined();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
   });
 });
 

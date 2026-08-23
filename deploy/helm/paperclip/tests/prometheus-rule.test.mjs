@@ -39,7 +39,6 @@ test("Blockcast values do not render a PrometheusRule (paperclip-ci-deploy has n
     "values.blockcast.yaml must keep prometheusRule.enabled=false until paperclip-ci-deploy is granted RBAC on prometheusrules.monitoring.coreos.com",
   );
 });
-
 test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains usable once RBAC exists)", () => {
   const rendered = execFileSync(
     "helm",
@@ -551,6 +550,112 @@ test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-2
       `bare 'on (agent_id)' join is many-to-many and fails at evaluation time ` +
       `with "found duplicate series for the match group". Wrap each side in ` +
       `'max by (agent_id) (...)':\n  ${unaggregated.join("\n  ")}`,
+  );
+});
+
+test("PaperclipOverdueScheduledRetry is agent-keyed, gauge-thresholded, and links its runbook (BLO-22094)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipOverdueScheduledRetry/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "overdue-scheduled-retry alert must render an expr");
+
+  // Must threshold the per-agent overdue-parked-age gauge, not a summed
+  // scheduled_retry row count under a long `for:` -- same reasoning as
+  // PaperclipQueuedRunStranded above. The `and on(instance) (... == 1)`
+  // freshness gate is load-bearing and asserted here rather than left
+  // optional: refreshOverdueScheduledRetryAgeMetrics only reset-then-sets on
+  // its success path, so a failed refresh freezes the last per-agent values
+  // while /metrics still returns 200 -- and the frozen value is almost always
+  // 0, the HEALTHY reading. Ungated, this alert would sit silently green on
+  // top of a dead detector, the exact invisible failure BLO-22094 exists to
+  // close. The gate must sit INSIDE the `max by (agent_id)` because
+  // `on(instance)` needs the instance label the aggregation strips.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_overdue_scheduled_retry_oldest_age_seconds and on\(instance\) \(paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "overdue-scheduled-retry alert must gate each replica's age on its own "
+      + "freshness gauge before taking the per-agent max",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh
+  // (see setOverdueScheduledRetryAgeMetrics), so a strictly positive
+  // threshold is the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // `for:` is scrape-flap tolerance only -- the ageing lives in the
+  // threshold above, derived from a 7-day population (see values.yaml
+  // comment), not from `for:` duration.
+  assert.ok(forWindow, "overdue-scheduled-retry alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#overdue-scheduled-retry-blo-22094"/,
+    "overdue-scheduled-retry alert must link the runbook from its annotation",
+  );
+
+  // A run merely backing off (scheduled_retry_at in the future) must never
+  // read as overdue -- the gauge only ages off rows already past due, so a
+  // strictly-greater-than comparison against a positive threshold is the
+  // only way this alert can stay silent for designed backoff.
+  assert.match(expr, />/, "overdue-scheduled-retry alert must use a strict greater-than comparison");
+});
+
+test("PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it (BLO-22094)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  // Closing the freshness gate on PaperclipOverdueScheduledRetry silences it.
+  // Without a companion alert on the gate itself, that silence is
+  // indistinguishable from a healthy fleet -- the detector would be dead and
+  // nothing would say so.
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 0\n/,
+    "a failed overdue-scheduled_retry-age refresh must have its own alert",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#overdue-scheduled-retry-blo-22094"/,
+    "the freshness failure alert must route responders to the overdue-scheduled-retry runbook section",
+  );
+
+  // The two refreshes query different aggregates behind different indexes
+  // (0217 for status='queued', 0224 for the overdue-parked predicate), so
+  // this must be its OWN series -- sharing the sibling's freshness gauge
+  // would let a healthy queued-run refresh vouch for a dead one.
+  assert.doesNotMatch(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?\n\s+expr: [^\n]*paperclip_queued_run_age_metrics_refresh_success/,
+    "the overdue alert must gate on its own freshness gauge, not the sibling's",
   );
 });
 

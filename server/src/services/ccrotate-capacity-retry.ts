@@ -31,17 +31,83 @@
  *
  * So we clamp: honour the advertised reset when it is near, and otherwise
  * re-probe at the ceiling. Re-probing is a single cached GET, and a genuinely
- * long outage still terminates — CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS re-defers
- * then escalate to an operator-visible issue, which is the outcome we want from
- * a multi-day outage rather than silent frozen work.
+ * long outage still terminates — see {@link CAPACITY_ESCALATION_AFTER_MS} —
+ * escalating to an operator-visible issue, which is the outcome we want from a
+ * multi-day outage rather than silent frozen work.
  */
 
 /**
- * Longest a capacity deferral may park before re-probing. Paired with
- * CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS (24) this bounds a non-recovering pool at
- * roughly six hours of polling before it escalates for operator attention.
+ * Longest a capacity deferral may park before re-probing.
+ *
+ * This is a *cadence* knob and nothing else: how promptly a recovered pool is
+ * noticed. It deliberately carries no sizing claim about how long an outage is
+ * tolerated — that is {@link CAPACITY_ESCALATION_AFTER_MS}, measured on the
+ * wall clock.
+ *
+ * ## Do not re-derive an outage budget from this constant (BLO-28919)
+ *
+ * The sentence that used to close this comment — "Paired with
+ * CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS (24) this bounds a non-recovering pool
+ * at roughly six hours" — was wrong twice over, and the same mistake in the
+ * heartbeat-side docblock is what made a 24x reduction in outage coverage look
+ * already-argued for 484 rows. Both errors had one shape: multiplying a
+ * re-probe cadence by an attempt count to obtain an outage horizon.
+ *
+ * That product is not an outage horizon. `attempts x cadence` couples two
+ * independently-chosen concerns, so shortening the cadence to notice recovery
+ * sooner silently shrinks how long an outage is survived, with no test
+ * failing — which is how this class recurred four times. The give-up condition
+ * is now wall-clock and the two are independent: change this number freely to
+ * tune responsiveness without touching outage coverage.
  */
 export const CCROTATE_CAPACITY_MAX_PARK_MS = 15 * 60 * 1000;
+
+/**
+ * Shortest a capacity deferral may park, however short a reset the provider
+ * advertises (BLO-28919).
+ *
+ * ## Why a floor appeared when the attempt cap left
+ *
+ * `CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS` was retired as a terminator because
+ * `attempts x cadence` couples two independent concerns. But that product was
+ * quietly providing a second bound nobody had named: a ceiling on how much
+ * *work* one chain can do. {@link CAPACITY_ESCALATION_AFTER_MS} bounds how long
+ * a chain lives and says nothing about how many times it hops, and the two come
+ * apart precisely where {@link resolveCcrotateCapacityRetry} had a ceiling but
+ * no floor — a provider answering `Retry-After: 1` while still exhausted
+ * resolved to a ~1s park, leaving the promotion sweep's 10s floor as the only
+ * pacing. Across the 187.2h horizon that is ~67k hops per run, and it scales
+ * with the cohort: the 484-row population this ticket was filed against would
+ * have sustained ~48 row updates/sec on `heartbeat_runs` for the length of an
+ * outage. Removing a bound and replacing it with an argument about *rate* left
+ * *count* unbounded, which is the same shape as the docblock this ticket fixed.
+ *
+ * A floor is the right replacement rather than a restored attempt cap: it
+ * bounds the hop count as a function of the horizon while keeping cadence and
+ * outage tolerance independent, which is the decoupling the retired cap
+ * destroyed. Pinned by an invariant test rather than left to arithmetic in a
+ * comment.
+ *
+ * ## Why 60s and not the 5m default poll delay
+ *
+ * Matching `CCROTATE_CAPACITY_DEFAULT_RETRY_DELAY_MS` (5m) was suggested in
+ * review and rejected, because it inverts this module's own thesis. BLO-22860
+ * exists to make a capacity park re-probe *earlier* than the provider
+ * advertised; a 5m floor would make it sleep *longer* than advertised for
+ * everything in the 1s-5m band, including the 90s window this suite documents
+ * as a genuine short outage deliberately honoured. Refusing to believe a
+ * sub-minute reset is a different claim from refusing to believe a 90s one: a
+ * sub-second value is indistinguishable from a broken or absent header, while
+ * 90s is ordinary provider guidance and probing before it just hammers.
+ *
+ * 60s is therefore the largest floor that overrides nothing a provider
+ * plausibly means. It bounds a chain at ~11.2k hops over the 187.2h horizon;
+ * for the 484-row cohort this ticket was filed against that is ~8 row
+ * writes/sec worst case, against ~48/sec unbounded. The remaining headroom is
+ * deliberate — this is a bound on pathological work, not a cadence knob, and
+ * {@link CCROTATE_CAPACITY_MAX_PARK_MS} remains the only knob that sets cadence.
+ */
+export const CCROTATE_CAPACITY_MIN_PARK_MS = 60 * 1000;
 
 /**
  * Jitter as a fraction of the resolved delay. Spreads a cohort that was denied
@@ -58,6 +124,12 @@ export interface CcrotateCapacityRetryInput {
   /** Fallback delay when the provider advertised no usable resume instant. */
   defaultRetryDelayMs: number;
   maxParkMs?: number;
+  /**
+   * Shortest permitted park. Defaults to {@link CCROTATE_CAPACITY_MIN_PARK_MS};
+   * overridable so a test can pin the floor's behaviour without depending on
+   * the shipped value.
+   */
+  minParkMs?: number;
   /** Injectable for tests; defaults to Math.random. */
   random?: () => number;
 }
@@ -86,6 +158,7 @@ export function resolveCcrotateCapacityRetry(
 ): CcrotateCapacityRetryPlan {
   const nowMs = input.now.getTime();
   const maxParkMs = Math.max(1, input.maxParkMs ?? CCROTATE_CAPACITY_MAX_PARK_MS);
+  const minParkMs = Math.max(0, input.minParkMs ?? CCROTATE_CAPACITY_MIN_PARK_MS);
   const random = input.random ?? Math.random;
 
   const advertisedMs = input.resumeAt ? input.resumeAt.getTime() : null;
@@ -96,7 +169,13 @@ export function resolveCcrotateCapacityRetry(
 
   const baseMs = usableAdvertisedMs ?? nowMs + input.defaultRetryDelayMs;
   const ceilingMs = nowMs + maxParkMs;
-  const resolvedMs = Math.min(baseMs, ceilingMs);
+  // The floor bounds hop *count* the way the retired attempt cap silently did;
+  // see CCROTATE_CAPACITY_MIN_PARK_MS. Clamped to the ceiling before it is
+  // applied so it can never push a park past `maxParkMs` — the ceiling is the
+  // stronger guarantee (a caller may pass a `maxParkMs` below the floor, and
+  // tests do), so `resolvedMs <= ceilingMs` must survive adding a floor.
+  const floorMs = nowMs + Math.min(minParkMs, maxParkMs);
+  const resolvedMs = Math.max(Math.min(baseMs, ceilingMs), floorMs);
 
   const delayMs = Math.max(resolvedMs - nowMs, 0);
   const jitterMs = Math.floor(random() * delayMs * CCROTATE_CAPACITY_PARK_JITTER_RATIO);
@@ -129,6 +208,65 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
   "penstockCapacityParkClampedFrom",
 ] as const;
 
+/**
+ * When the *current* capacity deferral chain began, ISO-8601. Set once, then
+ * carried forward unchanged across every re-defer (BLO-28919).
+ *
+ * ## This key is deliberately ABSENT from CCROTATE_CAPACITY_DECISION_KEYS
+ *
+ * Every key in that list is deleted and rewritten on each re-defer, by design:
+ * a field describing the *previous* denial must not linger. This key describes
+ * the chain rather than any one denial, so it is the one capacity field that
+ * must survive that wipe.
+ *
+ * Adding it to the list would be silently catastrophic rather than merely
+ * wrong. {@link resolveCapacityEscalation} measures the give-up horizon from
+ * this instant, so a key that is cleared on every hop is re-seeded to `now` on
+ * every hop, the elapsed time never grows, the horizon never elapses, and the
+ * run parks forever — strictly worse than the 24h backstop this ticket set out
+ * to remove. The set-once read below is what prevents that, and it is the only
+ * reason the wall-clock horizon terminates at all.
+ *
+ * Exported so the promotion-time reader names it through this binding rather
+ * than repeating the literal. A duplicated key string across two writers is the
+ * exact drift BLO-28919 is about, and a typo in one copy would silently restart
+ * the clock on every hop.
+ */
+export const CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY = "penstockCapacityFirstDeferredAt";
+
+/**
+ * Read a persisted chain origin, accepting ONLY the exact serialization both
+ * writers produce (`Date.prototype.toISOString`).
+ *
+ * Deliberately stricter than `Date.parse`, which is lenient enough to be
+ * dangerous here: `Date.parse("2020")` yields a valid instant in 2020, so a
+ * truncated or hand-edited value could pin a chain's origin years in the past
+ * and force an immediate escalation on the very next hop — the premature-cancel
+ * outcome this whole change exists to remove. A bare `Number.isFinite` check on
+ * the parse result does not catch it, because the parse succeeds.
+ *
+ * A round-trip equality test admits exactly what we write and rejects
+ * everything else, and rejection is the safe direction (the clock restarts).
+ * Shared by the writer and the predicate so the two cannot disagree about what
+ * counts as a usable origin — same drift lesson as the rest of this module.
+ */
+function readCapacityChainOriginIso(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const parsedMs = Date.parse(value);
+  if (!Number.isFinite(parsedMs)) return null;
+  return new Date(parsedMs).toISOString() === value ? value : null;
+}
+
+/**
+ * The keys above, plus the one that survives them. Exported for the invariant
+ * test that pins the exclusion, so the hazard documented above cannot be
+ * reintroduced by editing one list and not the other.
+ */
+export const CCROTATE_CAPACITY_RESULT_KEYS = {
+  clearedOnRedefer: CCROTATE_CAPACITY_DECISION_KEYS,
+  carriedAcrossRedefer: CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+} as const;
+
 export interface CcrotateCapacityDecision {
   /** The clamped instant the run will actually re-probe at. */
   retryAtIso: string;
@@ -140,6 +278,12 @@ export interface CcrotateCapacityDecision {
   advertisedResumeAtIso: string | null;
   /** The advertised horizon this decision declined to honour, or null. */
   clampedFromIso: string | null;
+  /**
+   * `now`, ISO-8601, used only to seed
+   * {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY} when this is the first
+   * deferral of a chain. Ignored when the row already carries one.
+   */
+  firstDeferredAtIso: string;
 }
 
 /**
@@ -165,6 +309,41 @@ export function applyCcrotateCapacityDecision(
   for (const key of CCROTATE_CAPACITY_DECISION_KEYS) {
     delete next[key];
   }
+  // Set once, then carried forward untouched. See the key's docblock: re-seeding
+  // this on each hop would stop the wall-clock horizon from ever elapsing.
+  //
+  // Read strictly, and in BOTH directions. A corrupt value must not pin the
+  // origin in the past and force an immediate escalation, so anything that is
+  // not the exact serialization we write is replaced. A *future* value must not
+  // be preserved either: `resolveCapacityEscalation` treats a future origin as
+  // clock skew and restarts the clock at `now`, but that correction only takes
+  // effect if it is what gets persisted. Preferring `previous` unconditionally
+  // wrote the future instant straight back, so every hop recomputed
+  // `elapsedMs = 0` and the chain could not escalate until wall clock passed the
+  // stored instant — the park-forever outcome the key's docblock exists to
+  // prevent, reached from the one direction the round-trip check admits.
+  //
+  // `decision.firstDeferredAtIso` is the resolver's verdict (the echoed origin
+  // when the stored one was usable, else `now`), so comparing against it applies
+  // the resolver's own `<= now` rule without duplicating it or taking a clock as
+  // a parameter. The preserve is kept rather than replaced by a bare assignment
+  // so a future caller that forgets to run the resolver still carries the chain
+  // forward instead of silently restarting it on every hop.
+  const storedOriginIso = readCapacityChainOriginIso(
+    previous[CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY],
+  );
+  // Both call sites pass a value the resolver produced, so this always parses.
+  // Guarded anyway because the failure would be silent and in the wrong
+  // direction: a bare `stored <= Date.parse(...)` comparison against NaN is
+  // false, which would discard a perfectly good stored origin and restart the
+  // chain on every hop.
+  const decisionOriginMs = Date.parse(decision.firstDeferredAtIso);
+  const keepStored =
+    storedOriginIso !== null &&
+    (!Number.isFinite(decisionOriginMs) || Date.parse(storedOriginIso) <= decisionOriginMs);
+  next[CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY] = keepStored
+    ? storedOriginIso
+    : decision.firstDeferredAtIso;
   next.errorFamily = "rate_limit_exhausted";
   // `retryNotBefore` is a *floor* consumed by scheduleBoundedRetryForRun, so it
   // carries the clamped instant. The provider's own claim lives under
@@ -192,8 +371,34 @@ export function applyCcrotateCapacityDecision(
  * Deliberately far looser than CCROTATE_CAPACITY_MAX_PARK_MS. This bounds the
  * *general* bounded-retry scheduler, which serves every transient family, so the
  * goal is only to remove the pathological horizon named in the acceptance
- * criteria — not to second-guess ordinary provider backoff. At 24h every retry
- * the fleet actually schedules today is unaffected.
+ * criteria — not to second-guess ordinary provider backoff.
+ *
+ * ## This value is a backstop, NOT a sizing decision (BLO-28919)
+ *
+ * The sentence that used to close this comment — "At 24h every retry the fleet
+ * actually schedules today is unaffected" — was measured and **falsified** on
+ * 2026-08-19. A full parked census (700 runs) found `scheduledRetryReason =
+ * "transient_failure"` at p50 4.6h with **p90 == max == exactly 1440.0m**: the
+ * ceiling was binding on more than a tenth of the population, so the
+ * never-fires safety net had become the modal outcome. 484 of 700 fleet parks
+ * sat in that bucket while correctly-gated capacity parks sat at 17.9m — the
+ * identical provider error, 96x apart, decided only by which of the two
+ * `retryNotBefore` writers had run.
+ *
+ * The defect was never this number. It was that a *capacity* floor reached this
+ * generic backstop at all: the wake-gate writer clamps a capacity reset through
+ * {@link resolveCcrotateCapacityRetry} before persisting it, and the finalize
+ * writer did not. That is fixed at the writer (heartbeat.ts, where
+ * `effectiveRetryNotBefore` is computed), so capacity floors are bounded by
+ * CCROTATE_CAPACITY_MAX_PARK_MS and no longer arrive here.
+ *
+ * Lowering this constant was considered and rejected: it serves every transient
+ * family, and shortening it uniformly would retry non-capacity families sooner
+ * with no gate to protect them. Keep it as the loose last-resort bound it is —
+ * but do NOT re-derive a sizing claim from it, and if a census ever shows it
+ * binding again, that is evidence of a new unclamped writer upstream rather
+ * than a number that needs tuning. That inference is the one this comment
+ * previously got wrong.
  */
 export const MAX_TRANSIENT_RETRY_HORIZON_MS = 24 * 60 * 60 * 1000;
 
@@ -204,6 +409,120 @@ export const MAX_TRANSIENT_RETRY_HORIZON_MS = 24 * 60 * 60 * 1000;
  * depends on it — that decoupling is exactly BLO-23525's failure mode.
  */
 export const LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS = 124.8 * 60 * 60 * 1000;
+
+/**
+ * Headroom over the longest recorded outage before a capacity chain gives up.
+ *
+ * Named rather than folded into the constant below so the judgement is visible:
+ * we tolerate an outage half again as long as the worst one on record before
+ * deciding a human should look at it.
+ */
+export const CAPACITY_ESCALATION_HEADROOM_RATIO = 1.5;
+
+/**
+ * How long a provider may be continuously unavailable before a capacity park
+ * stops re-deferring and escalates to an operator (BLO-28919).
+ *
+ * ## Why this is wall-clock and not an attempt count
+ *
+ * This replaces `CCROTATE_CAPACITY_MAX_RETRY_ATTEMPTS`, whose product with
+ * {@link CCROTATE_CAPACITY_MAX_PARK_MS} was the real give-up horizon and was
+ * wrong by ~15x: its docblock reasoned at a "4h maximum hop" that matched no
+ * constant in the tree, concluding "48 attempts cover ~7.5 days" where
+ * 48 x 15m is **12h**. Both windows on record (BLO-22844 at 124.8h, BLO-23438
+ * at ~5.2 days) fell outside that, so they would have hard-exhausted — which
+ * `heartbeat.ts` itself calls "strictly worse than the uncapped park this issue
+ * set out to fix", because a GitHub delivery cancelled here is lost for real
+ * rather than merely late.
+ *
+ * The defect was structural, not arithmetic. `attempts x cadence` multiplies two
+ * concerns that are chosen independently — how promptly recovery is noticed, and
+ * how long an outage is survived — so tightening the cadence silently shrinks
+ * outage coverage with no test failing. That coupling is why this class has now
+ * recurred four times (BLO-22860, BLO-23525, BLO-24011, BLO-28919). Measuring
+ * the give-up condition on the wall clock decouples them permanently: the
+ * cadence constant can move without anyone re-deriving this one.
+ *
+ * Raising the attempt count instead (to ~500, as suggested in review) was
+ * considered and rejected: it restores coverage only while the cadence stays at
+ * 15m, so it re-arms the same trap for the next person who shortens a hop.
+ *
+ * Unbounded re-probing is not a concern this bound needs to carry. A hop cannot
+ * be faster than the promotion sweep, which is floored at 10s by config
+ * (`heartbeatSchedulerIntervalMs`, `server/src/config.ts`), and each hop is a
+ * cached availability GET plus one row update — not a paid dispatch. So the
+ * attempt counter is kept for observability only and no longer terminates
+ * anything.
+ */
+export const CAPACITY_ESCALATION_AFTER_MS = Math.ceil(
+  LONGEST_RECORDED_PROVIDER_CAPACITY_WINDOW_MS * CAPACITY_ESCALATION_HEADROOM_RATIO,
+);
+
+export interface CapacityEscalationPlan {
+  /**
+   * The instant this chain began, ISO-8601. Echoes the persisted value when the
+   * row carried a usable one, and is `now` when this is the first hop or the
+   * stored value was unusable. Callers persist this verbatim.
+   */
+  firstDeferredAtIso: string;
+  /** True once the provider has been unavailable for longer than the horizon. */
+  exhausted: boolean;
+  /** How long the pool has been continuously unavailable, clamped at >= 0. */
+  elapsedMs: number;
+  escalateAfterMs: number;
+}
+
+/**
+ * Decide whether a capacity chain has outlived {@link CAPACITY_ESCALATION_AFTER_MS}.
+ *
+ * Fails open in every ambiguous case — absent, non-string, unparseable, or a
+ * future instant (clock skew between writers) all restart the clock at `now`
+ * rather than escalating. A premature escalation cancels the run and loses the
+ * delivery, whereas a restarted clock costs at most one extra horizon of cheap
+ * re-probing, so the asymmetry decides the direction.
+ *
+ * The restart is only *computed* here; it takes effect because
+ * {@link applyCcrotateCapacityDecision} persists this `firstDeferredAtIso` in
+ * preference to a stored origin later than it. Until BLO-28919 that writer
+ * preferred the stored value unconditionally, so this function's future-instant
+ * fail-open was computed on every hop and discarded on every hop, and the chain
+ * parked until wall clock passed the skewed instant. Anyone checking the skew
+ * behaviour needs both halves: a reader who stops at this docblock concludes the
+ * system is covered, which is the same trap as the "roughly six hours" sentence
+ * this ticket removed.
+ *
+ * Note this makes rows parked before the key existed start their clock at their
+ * first re-defer after deploy rather than at their original park. That is
+ * intentional: it is the safe direction, and it self-heals within one hop.
+ */
+export function resolveCapacityEscalation(input: {
+  firstDeferredAtIso: unknown;
+  now: Date;
+  escalateAfterMs?: number;
+}): CapacityEscalationPlan {
+  const escalateAfterMs = Math.max(1, input.escalateAfterMs ?? CAPACITY_ESCALATION_AFTER_MS);
+  const nowMs = input.now.getTime();
+  const storedIso = readCapacityChainOriginIso(input.firstDeferredAtIso);
+  const storedMs = storedIso === null ? Number.NaN : Date.parse(storedIso);
+  const usableMs = Number.isFinite(storedMs) && storedMs <= nowMs ? storedMs : null;
+
+  if (usableMs === null) {
+    return {
+      firstDeferredAtIso: input.now.toISOString(),
+      exhausted: false,
+      elapsedMs: 0,
+      escalateAfterMs,
+    };
+  }
+
+  const elapsedMs = nowMs - usableMs;
+  return {
+    firstDeferredAtIso: new Date(usableMs).toISOString(),
+    exhausted: elapsedMs > escalateAfterMs,
+    elapsedMs,
+    escalateAfterMs,
+  };
+}
 
 /**
  * Minimum attempt count for any bounded-retry family whose `retryNotBefore`
