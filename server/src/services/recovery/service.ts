@@ -55,6 +55,7 @@ import {
   externalWaitFromDescription,
   issueService,
   lockIssueParentMutationCompany,
+  type IssueDependencyReadiness,
 } from "../issues.js";
 import {
   issueLockOwnerStateMatches,
@@ -7172,6 +7173,10 @@ export function recoveryService(
       }
 
       const newestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Memoised per candidate: the dependency-blocked arm below and the
+      // review-participant block can both need readiness for the same issue on
+      // the fall-through path this sweep now has (BLO-29604).
+      let dependencyReadiness: IssueDependencyReadiness | null = null;
       // `issue_terminal_status` means this queued dispatch was correctly
       // cancelled while the issue was terminal. The candidate query above has
       // already established that the issue is non-terminal now, so this is
@@ -7235,11 +7240,35 @@ export function recoveryService(
       const agentInvokable = agent && agent.companyId === issue.companyId
         ? await isAgentInvokable(agent)
         : false;
+      const dependencyBlockedStrand = latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
+        (issue.status === "in_review" || !agentInvokable);
+      if (dependencyBlockedStrand) {
+        dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id);
+      }
+      // BLO-29604: this arm's contract is "keep the owner and let the dependency
+      // machinery do the routing", and BOTH of its outputs need a blocker row to
+      // exist — `blocked` is only honest while one is unresolved, and the wake
+      // below is keyed on `resolvedBlockerIssueId`. With no blocker rows at all
+      // it is provably a no-op that still `continue`s, which is how a
+      // review-stage strand ended up with no recovery action, no
+      // blockers-resolved wake, and no scheduler dispatch (an `in_review` issue
+      // with a pending stage is never re-dispatched). That zero-blocker shape is
+      // the common one, not the edge case: `issue_dependencies_blocked` is also
+      // the code provider rate-limit/quota parks are finalized under, so it
+      // arrives on runs that never had a dependency at all.
+      //
+      // Consume the issue here only when there is something to consume it for;
+      // otherwise fall through and let the review-participant block below own
+      // it. For the `!agentInvokable` assignee lane that fall-through is
+      // behaviour-preserving by construction — the very next guard skips a
+      // non-`in_review` issue whose agent is not invokable — minus the phantom
+      // `issueIds` push a no-op used to record.
       if (
-        latestRun?.errorCode === "issue_dependencies_blocked" &&
-        (issue.status === "in_review" || !agentInvokable)
+        dependencyBlockedStrand && dependencyReadiness &&
+        (dependencyReadiness.unresolvedBlockerCount > 0 ||
+          (dependencyReadiness.blockerIssueIds.length > 0 && issue.assigneeAgentId !== null))
       ) {
-        const readiness = await issuesSvc.getDependencyReadiness(issue.id);
+        const readiness = dependencyReadiness;
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
         // A dependency-ready issue has no blocker wake backstop unless this
         // reconciliation persists one. Do not manufacture a blocked state for
@@ -7560,6 +7589,26 @@ export function recoveryService(
         }
 
         const participantContinuationClassification = classifyContinuationFailure(participantLatestRun);
+        // BLO-29604: `issue_dependencies_blocked` on a participant run is the
+        // dispatcher declining to *start* the reviewer, not the reviewer
+        // failing — `claimQueuedRun`'s dependency gate cancels any queued run
+        // for the issue, participant wakes included. It sits in
+        // NON_RETRYABLE_CONTINUATION_ERROR_CODES so a retry can never burn
+        // attempts against a genuinely open blocker, and while one is open that
+        // is right. Once readiness is satisfied the refusal has expired and the
+        // reviewer is precisely who should run, so treat it as requeueable
+        // instead: escalating parks a pending review stage `blocked` under a
+        // manager who cannot submit the decision, which is the ownership
+        // ratchet BLO-19123 exists to stop. Mirrors the assignee lane's own
+        // readiness re-check (BLO-19124) further down this function.
+        //
+        // Bounded, not a loop: the requeue below stamps retryReason
+        // `execution_review_participant_recovery`, so if that run also ends
+        // terminal the `didAutomaticRecoveryFail` arm escalates on the next
+        // sweep whatever error code it carries.
+        const participantDependencyRefusalExpired =
+          participantContinuationClassification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
+          (dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id)).isDependencyReady;
         const queuedParticipantRecovery = agentInvokable
           ? await hasQueuedExecutionReviewParticipantRecoveryWake(
               issue.companyId,
@@ -7570,7 +7619,8 @@ export function recoveryService(
           : false;
         if (
           isUnsuccessfulTerminalIssueRun(participantLatestRun) &&
-          participantContinuationClassification.kind === "non_retryable"
+          participantContinuationClassification.kind === "non_retryable" &&
+          !participantDependencyRefusalExpired
         ) {
           if (queuedParticipantRecovery) {
             result.skipped += 1;
