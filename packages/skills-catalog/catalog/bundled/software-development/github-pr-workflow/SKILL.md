@@ -226,15 +226,21 @@ mangling backticks and newlines on the way through.
 
 Skip the `Risk and rollback` section only for clearly trivial PRs (typos, docs).
 
-## commitperclip pre-review gates
+## Repository pre-review gates
 
-Paperclip repositories run `commitperclip PR Review` before Ally or a human reviewer should spend time on the PR. Missing template sections, a missing linked issue/issue description, or an unchecked dedup-search checkbox wastes a review cycle and blocks that gate.
+Before requesting or re-requesting review, inspect the repository for its actual
+quality-gate workflow or checker. If it has a commitperclip workflow or checker
+(for example `.github/workflows/commitperclip-review.yml`), missing template
+sections, a missing linked issue/issue description, or an unchecked dedup-search
+checkbox wastes a review cycle and blocks `commitperclip PR Review`. If it does
+not have commitperclip, wait for the repository's actual required quality gates
+and checks instead; do not assume a Paperclip-specific check exists.
 
 Before requesting or re-requesting review:
 
 - Confirm the PR body still matches `.github/PULL_REQUEST_TEMPLATE.md` if the repo has one.
 - Confirm the dedup-search checkbox is present and checked after you searched the GitHub PR list.
-- Confirm `commitperclip PR Review` and related quality gates are passing, or update the PR body and wait/rerun them before pinging Ally or another reviewer.
+- For a repository with commitperclip, confirm `commitperclip PR Review` and its related quality gates are passing; for other repositories, confirm their actual required quality gates are passing. If a gate fails, update the PR and wait for it to rerun before pinging Ally or another reviewer.
 
 ## Verification evidence
 
