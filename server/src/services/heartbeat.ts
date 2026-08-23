@@ -8169,6 +8169,12 @@ async function coalescePendingTaskScopeWake(input: {
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
         inArray(heartbeatRuns.status, coalescibleStatuses),
+        // A stale-lock sweep has already declared this run's issue ownership
+        // spent. It may remain queued or parked for its own recovery path, but
+        // it must not absorb a new wake and make the released lock effective
+        // again. Keep this bound here as well as in the legacy adoption query;
+        // issue-scoped coalescing can reach the same run before that fallback.
+        lt(heartbeatRuns.issueLockReleaseCount, MAX_SWEPT_ISSUE_LOCK_RELEASES),
         // Shared casing-compatibility predicate: a normalized pr_review key must
         // still coalesce into a legacy mixed-case run while those drain.
         taskScopePredicate,
@@ -8197,6 +8203,7 @@ async function coalescePendingTaskScopeWake(input: {
       and(
         eq(heartbeatRuns.id, existingRun.id),
         inArray(heartbeatRuns.status, coalescibleStatuses),
+        lt(heartbeatRuns.issueLockReleaseCount, MAX_SWEPT_ISSUE_LOCK_RELEASES),
       ),
     )
     .returning()
