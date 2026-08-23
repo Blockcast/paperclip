@@ -2257,7 +2257,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -2267,6 +2267,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     app.use("/api/webhooks/github", githubWebhookRoutes(db, {
       webhookSecret,
       ...config,
+      resolvePrReviewHeadSha: config.resolvePrReviewHeadSha ?? (async () => null),
       runPrCommentReviewGateCheck: config.runPrCommentReviewGateCheck ?? (async () => ({
         posted: false as const,
         reason: "not_configured" as const,
@@ -5542,6 +5543,76 @@ describeEmbeddedPostgres("github-webhook route", () => {
         reviewKind: "pr_review",
       }),
     });
+  });
+
+  it("resolves and persists the exact PR head for issue-comment review wakes", async () => {
+    const { companyId, agentId: authorAgentId } = await seedIssueWithIdentifier("BLO-31415");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const fetchedHeadSha = "0123456789abcdef0123456789abcdef01234567";
+    const quotedHeadSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const lookups: Array<{ repoFullName: string; prNumber: number }> = [];
+    const app = buildApp({
+      prReviewerAgentId: reviewerAgentId,
+      resolvePrReviewHeadSha: async (input) => {
+        lookups.push(input);
+        return fetchedHeadSha;
+      },
+    });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 1435,
+        title: "Fix BLO-31415 reviewer evidence",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1435",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1435" },
+        user: { login: "codex" },
+      },
+      comment: {
+        id: 5003000001,
+        body: `@ally please review head ${quotedHeadSha}`,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1435#issuecomment-5003000001",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-comment-head-context")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(lookups).toEqual([{ repoFullName: "Blockcast/paperclip", prNumber: 1435 }]);
+
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, [authorAgentId, reviewerAgentId]));
+    expect(runs).toHaveLength(2);
+    for (const run of runs) {
+      expect(run.contextSnapshot).toMatchObject({
+        githubHeadSha: fetchedHeadSha,
+        githubPrNumber: 1435,
+        githubRepoFullName: "Blockcast/paperclip",
+      });
+      expect(run.contextSnapshot).not.toMatchObject({ githubHeadSha: quotedHeadSha });
+    }
   });
 
   it("skips the reviewer wake for the reviewer's own review self-echo but still wakes for human and other-bot reviews (BLO-15799)", async () => {
