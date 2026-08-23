@@ -62,6 +62,7 @@ import {
   type OwningIdentifierResolution,
 } from "../services/paperclip-identifiers.js";
 import {
+  githubFetchPrHeadSha,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
@@ -148,6 +149,13 @@ export interface GithubWebhookConfig {
    * than pull_request_review.submitted.
    */
   prReviewerBotLogin?: string | null;
+  /**
+   * Resolve the current PR head for issue-comment review events. GitHub's
+   * `issue_comment` payload omits `pull_request.head.sha`, but reviewer
+   * evidence is valid only for the exact head that was reviewed. Production
+   * uses the GitHub App lookup; route tests can provide a deterministic seam.
+   */
+  resolvePrReviewHeadSha?: typeof githubFetchPrHeadSha;
   /**
    * Optional seam for the comment-review status gate. Production uses the
    * service implementation; route tests supply a local recorder so webhook
@@ -3760,7 +3768,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     }
 
     const payload = (req.body ?? {}) as Record<string, unknown>;
-    const context = resolveEventContext(eventName, payload, {
+    let context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
       // BLO-18273/BLO-21618: surface both silent drops in this handler — an
       // agent request missing the marker, and a marker-bearing agent request
@@ -3818,6 +3826,56 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
       },
     });
+
+    // GitHub's issue_comment payload identifies the PR but does not include
+    // `pull_request.head.sha`. Reviewer runs persist the head in their
+    // contextSnapshot and the evidence gate compares against that exact value;
+    // without this lookup a valid Ally comment review is recorded with no head
+    // and can never satisfy the gate. Do this only for actionable review
+    // comments, and never infer a SHA from comment prose.
+    if (
+      context &&
+      eventName === "issue_comment" &&
+      (context.wakeReason === "github_pr_review_requested" ||
+        context.wakeReason === "github_pr_review_feedback") &&
+      !context.headSha &&
+      typeof context.prNumber === "number" &&
+      context.repoFullName
+    ) {
+      const resolveHeadSha = config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha;
+      try {
+        const headSha = await resolveHeadSha({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+        });
+        if (headSha) {
+          context = { ...context, headSha };
+        } else {
+          logger.warn(
+            {
+              event: eventName,
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+            },
+            "github webhook could not resolve current PR head for review comment; continuing without head context",
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            event: eventName,
+            deliveryId,
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+            wakeReason: context.wakeReason,
+          },
+          "github webhook PR-head lookup failed for review comment; continuing without head context",
+        );
+      }
+    }
 
     // BLO-21078: fleet-wide visibility into workflow_run conclusions, so a
     // mass-cancellation wave (GitHub cancelling live runners mid-job across
@@ -3896,21 +3954,25 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       if (
         reviewerAgentIds.length === 0 ||
         !reviewerWorkRetired ||
+        !context ||
         typeof context.prNumber !== "number"
       ) {
         return 0;
       }
 
+      const reviewerContext = context;
+      const reviewerPrNumber = reviewerContext.prNumber;
+      if (typeof reviewerPrNumber !== "number") return 0;
       const reviewerTaskKey = buildPrReviewerTaskKey({
-        ...context,
-        prNumber: context.prNumber,
+        ...reviewerContext,
+        prNumber: reviewerPrNumber,
       });
       const heartbeat = heartbeatService(db, {
         pluginWorkerManager: config.pluginWorkerManager,
         ...config.heartbeatOptions,
       });
-      const reason = `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} ${
-        context.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
+      const reason = `Cancelled because GitHub PR ${reviewerContext.repoFullName ?? "unknown"}#${reviewerPrNumber} ${
+        reviewerContext.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
       } before review dispatch`;
       let cancelled = 0;
       for (const reviewerAgentId of reviewerAgentIds) {
@@ -3923,9 +3985,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       logger.info(
         {
           deliveryId,
-          repoFullName: context.repoFullName,
-          prNumber: context.prNumber,
-          wakeReason: context.wakeReason,
+          repoFullName: reviewerContext.repoFullName,
+          prNumber: reviewerPrNumber,
+          wakeReason: reviewerContext.wakeReason,
           reviewerTaskKey,
           reviewerCount: reviewerAgentIds.length,
           cancelled,
