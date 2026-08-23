@@ -14,18 +14,30 @@ name: Stack package tests
 # 10 failures -- a plaintext token printing in the clear directly beneath its
 # own redaction marker.
 #
-# Scope, deliberately narrow. This closes the *review-time* half only. The
-# merge gate is already closed: `general_tests` in pr.yml carries no paths
-# filter and fires on `merge_group`, so nothing reaches master untested. What
-# was missing is the signal during intermediate stack review, which is exactly
-# where the silent revert above survived.
+# Scope, deliberately narrow. This closes the *review-time* half only, and it
+# is NOT sufficient on its own: as of this commit the merge gate is still open,
+# and it is #1472 rather than this file that closes it.
+#
+# The reason the merge gate is open is project selection, not a `paths:`
+# filter. pr.yml's `general_tests` runs `pnpm test:run:general`, i.e.
+# scripts/run-vitest-stable.mjs, which selects work with `--project <name>` off
+# its own `nonServerProjects` list. `@paperclipai/mcp-gateway` appears neither
+# in that list nor in `vitest.config.ts` `projects`, so `general_tests`
+# executes zero mcp-gateway tests -- on `pull_request` and on `merge_group`
+# alike. Absence of a paths filter is necessary but not sufficient; the
+# enumeration is the gate. Wiring the package into both lists is the sibling
+# fix (#1472), which must land first: until it does, a master-targeting change
+# to this package still reaches the merge queue with its suites unexecuted.
+#
+# What this file adds is the signal during intermediate stack review, which is
+# exactly where the silent revert above survived.
 #
 # Why a separate workflow rather than dropping `branches:` from pr.yml:
 # `on.pull_request.branches` is workflow-level, not job-level, so relaxing it
 # there would put ~20 check runs on every intermediate PR in every stack and
 # lean on the arc-light saturation that file already documents. One
-# paths-filtered job, skipped outright when pr.yml already covers the PR, buys
-# the missing signal at a fraction of that cost. Base-unrestricted,
+# paths-filtered job, skipped outright on the base pr.yml owns, buys the
+# missing signal at a fraction of that cost. Base-unrestricted,
 # paths-filtered workflows are established practice here -- see
 # graphify-staleness.yml and the docker-*-bot workflows.
 #
@@ -44,9 +56,13 @@ permissions:
 jobs:
   mcp_gateway:
     name: Stack tests (mcp-gateway)
-    # Master-targeting PRs and merge-group candidates already run these suites
-    # via pr.yml's general_tests lane. Duplicating them here would spend runner
-    # time on the one path that never lacked the signal.
+    # pr.yml owns master-targeting PRs and merge-queue candidates; this lane
+    # exists for the stack-review path its `branches: [master]` gate excludes.
+    # mcp-gateway joins pr.yml's `general_tests` selection via #1472, so once
+    # that lands, running the same suites here would duplicate an existing
+    # lane. Before it lands, a master-targeting mcp-gateway PR has no vitest
+    # lane at all -- that hole is #1472's to close, not this workflow's, which
+    # is why #1472 is a hard prerequisite rather than a sibling nicety.
     if: github.base_ref != 'master'
     runs-on: arc-paperclip-general
     timeout-minutes: 20
@@ -72,7 +88,9 @@ jobs:
       # into `nonServerProjects` in scripts/run-vitest-stable.mjs. Repairing
       # those two lists is PEN-2491's sibling fix (#1472); this lane stays
       # correct whether or not that has landed, and cannot be silently
-      # de-selected by a future edit to either list.
+      # de-selected by a future edit to either list. That independence is about
+      # *this lane's* reliability only -- it does not substitute for #1472's
+      # merge-time coverage, which no `pull_request`-triggered job can provide.
       - name: Run mcp-gateway tests
         run: pnpm --filter @paperclipai/mcp-gateway exec vitest run
 
