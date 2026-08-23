@@ -6,7 +6,7 @@
  * heartbeat.ts doesn't need to import from a route module.
  */
 import { type Db, agents, issues } from "@paperclipai/db";
-import { and, desc, eq, isNull, notInArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import { issueService } from "./issues.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { logger } from "../middleware/logger.js";
@@ -70,6 +70,40 @@ export async function findOpenDependabotAlertIssue(db: Db, companyId: string, or
     .orderBy(desc(issues.createdAt))
     .limit(1)
     .then((rows) => rows[0] ?? null);
+}
+
+// BLO-28981: the counterpart to findOpenDependabotAlertIssue -- the rows it
+// deliberately excludes. `issues_active_dependabot_alert_uq` only covers
+// non-terminal rows, so once a cycle's issue is closed the next
+// `reintroduced`/`reopened` delivery matches nothing and the intake mints a
+// brand-new full-weight row. On `Blockcast/magma` that produced 8 alerts x 3
+// re-fire cycles = 24 rows under 8 identical originIds, each one context-free:
+// the adjudication that closed the previous cycle never travelled with the
+// alert, so the fleet re-derived the same conclusion three times.
+//
+// Ordered newest-first so callers can both reopen the most recent row and
+// quote the older ones as the adjudication chain. Bounded because the point is
+// to carry forward a readable history, not to page through an unbounded one.
+export async function findTerminalDependabotAlertIssues(
+  db: Db,
+  companyId: string,
+  originId: string,
+  limit = 10,
+) {
+  return db
+    .select()
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND),
+        eq(issues.originId, originId),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, ["done", "cancelled"]),
+      ),
+    )
+    .orderBy(desc(issues.createdAt))
+    .limit(limit);
 }
 
 // Records a durable diagnostic when a `dependabot_alert` delivery (or a

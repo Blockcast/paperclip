@@ -114,3 +114,40 @@ Resolved image ref.
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 {{- end }}
+
+{{/*
+Resolved image pull policy.
+
+An explicit `.Values.image.pullPolicy` always wins. When it is left empty the
+policy is derived from whether the image is digest-pinned, because the safe
+answer differs between the two cases and only the chart knows which one it
+rendered:
+
+  digest set   -> IfNotPresent. A digest is content-addressed and cannot be
+                  republished, so re-resolving the manifest on every pod start
+                  cannot pick up new content — it only adds a mandatory network
+                  round-trip to the registry. That registry is
+                  harbor.blockcast.net, whose stateful backend runs on the same
+                  `workload=paperclip` node pool as paperclip itself, so the
+                  round-trip is a correlated failure domain: node churn degrades
+                  Harbor, and degraded Harbor then blocks paperclip from
+                  restarting. Observed three times — BLO-29180 (api 1/2 for
+                  2h06m), BLO-23736 (25-min control-plane outage), BLO-15520
+                  (24 pods in ImagePullBackOff). BLO-29306.
+
+  digest unset -> Always. A floating tag CAN be republished under the same name,
+                  so the manifest must be re-resolved on every start or a
+                  republish silently never lands. Keeping this branch is what
+                  makes the derivation safe to apply chart-wide: it preserves
+                  mutable-tag semantics for the documented manual
+                  `helm upgrade` path, which passes no digest (BLO-21660).
+*/}}
+{{- define "paperclip.imagePullPolicy" -}}
+{{- if .Values.image.pullPolicy }}
+{{- .Values.image.pullPolicy }}
+{{- else if .Values.image.digest }}
+{{- "IfNotPresent" }}
+{{- else }}
+{{- "Always" }}
+{{- end }}
+{{- end }}

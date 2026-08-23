@@ -8,6 +8,7 @@ import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
 import {
+  awaitSessionWithProgress,
   createAcpxEngineExecutor,
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
@@ -1795,5 +1796,161 @@ describe("summarizeAcpxTurnUsage no-report turns", () => {
     expect(summary.usageDetail).toBeNull();
     expect(summary.costUsd).toBeCloseTo(0.25);
     expect(summary.cumulativeCostUsd).toBeCloseTo(0.75);
+  });
+});
+
+describe("ACPX session establishment progress (PEN-1995)", () => {
+  function collector() {
+    const lines: Array<Record<string, unknown>> = [];
+    const ctx = {
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            lines.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // non-JSON prose lines are not part of this contract
+          }
+        }
+      },
+    } as never;
+    const stages = () =>
+      lines
+        .filter((entry) => entry.type === "acpx.session_establish")
+        .map((entry) => entry.stage as string);
+    return { lines, ctx, stages };
+  }
+
+  const fastDelays = { firstDelayMs: 5, maxDelayMs: 10 };
+
+  it("brackets a normal handshake with started/established and reports elapsed", async () => {
+    const { ctx, lines, stages } = collector();
+
+    const handle = await awaitSessionWithProgress(
+      ctx,
+      { attempt: "initial", resume: false },
+      async () => "session-handle",
+      fastDelays,
+    );
+
+    expect(handle).toBe("session-handle");
+    expect(stages()).toEqual(["started", "established"]);
+    const established = lines.find((entry) => entry.stage === "established");
+    expect(typeof established?.elapsedMs).toBe("number");
+    expect(established?.attempt).toBe("initial");
+    expect(established?.resume).toBe(false);
+    expect(typeof established?.observedAt).toBe("string");
+  });
+
+  // The regression this issue is about: a handshake that produces nothing used
+  // to leave the run log frozen, making a stall indistinguishable from a dead
+  // process. Progress ticks must keep arriving while the await is pending.
+  it("emits periodic waiting ticks while the handshake is stalled", async () => {
+    const { ctx, stages } = collector();
+    let release: () => void = () => {};
+    const stalled = new Promise<string>((resolve) => {
+      release = () => resolve("late-handle");
+    });
+
+    const pending = awaitSessionWithProgress(
+      ctx,
+      { attempt: "initial", resume: false },
+      () => stalled,
+      fastDelays,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const waitingWhileStalled = stages().filter((stage) => stage === "waiting").length;
+    expect(waitingWhileStalled).toBeGreaterThanOrEqual(2);
+    expect(stages()).not.toContain("established");
+
+    release();
+    await expect(pending).resolves.toBe("late-handle");
+    expect(stages()).toContain("established");
+  });
+
+  // Guards the CTO's constraint on PEN-1995: handshakes have recovered as late
+  // as 43.20h, so instrumentation must never terminate a slow attempt.
+  it("does not terminate a slow handshake", async () => {
+    const { ctx, stages } = collector();
+
+    const handle = await awaitSessionWithProgress(
+      ctx,
+      { attempt: "initial", resume: false },
+      () => new Promise<string>((resolve) => setTimeout(() => resolve("slow-handle"), 40)),
+      fastDelays,
+    );
+
+    expect(handle).toBe("slow-handle");
+    expect(stages()).toContain("waiting");
+    expect(stages().at(-1)).toBe("established");
+  });
+
+  it("stops ticking and records failure when the handshake rejects, preserving the error", async () => {
+    const { ctx, stages } = collector();
+
+    await expect(
+      awaitSessionWithProgress(
+        ctx,
+        { attempt: "fresh_retry", resume: false },
+        async () => {
+          throw new Error("ACP_SESSION_INIT_FAILED");
+        },
+        fastDelays,
+      ),
+    ).rejects.toThrow("ACP_SESSION_INIT_FAILED");
+
+    expect(stages()).toEqual(["started", "failed"]);
+
+    const before = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(before);
+  });
+
+  // Wiring check: the helper is only useful if the real execute() path routes
+  // ensureSession through it. Drives the full executor, not the helper.
+  it("routes the real executor's session establishment through the progress helper", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const events = logs
+      .filter((entry) => entry.stream === "stdout")
+      .flatMap((entry) => entry.text.split("\n"))
+      .filter((line) => line.trim().startsWith("{"))
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null)
+      .filter((entry) => entry.type === "acpx.session_establish");
+
+    expect(events.map((entry) => entry.stage)).toEqual(["started", "established"]);
+    expect(events[0]?.attempt).toBe("initial");
+    expect(typeof events[1]?.elapsedMs).toBe("number");
+  });
+
+  it("never emits prompt, credential, or environment material", async () => {
+    const { lines, ctx } = collector();
+
+    await awaitSessionWithProgress(
+      ctx,
+      { attempt: "initial", resume: true },
+      async () => "handle",
+      fastDelays,
+    );
+
+    const allowed = new Set([
+      "type",
+      "stage",
+      "attempt",
+      "resume",
+      "elapsedMs",
+      "observedAt",
+    ]);
+    for (const entry of lines) {
+      expect(Object.keys(entry).filter((key) => !allowed.has(key))).toEqual([]);
+    }
   });
 });

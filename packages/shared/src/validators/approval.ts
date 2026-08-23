@@ -6,11 +6,66 @@ const approvalTitleMessage =
   "payload.title is required and must be a non-empty, non-whitespace string. " +
   "Include a short, human-readable payload.title so the card is decidable in the board queue.";
 
+/**
+ * Machine-readable pointer from a card to the external gate a human must act on.
+ *
+ * Cards that escalate a CI/deploy gate have only ever carried the run as prose in
+ * `payload.title` / `summary` / `recommendedAction`, so nothing could tell whether
+ * the gate a card names is still alive. Cards then outlive their runs: BLO-29359
+ * recorded three `paperclip-production` gates dying unclicked in 24h, one card
+ * pointing approvers at a cancelled run for ~19h, and an approver had no way to
+ * see that was what happened.
+ *
+ * Supplying this lets `approval-gate-reconciler` close the card when the run
+ * reaches a terminal state. It stays optional because most approval types have no
+ * external gate — absence means "nothing to reconcile", never "gate is healthy".
+ */
+export const approvalGateSchema = z.object({
+  kind: z.literal("github_actions_run"),
+  repoFullName: z
+    .string()
+    .trim()
+    // GitHub's real charset, not just "no slashes or spaces". The looser
+    // `[^/\s]+/[^/\s]+` accepted `.` and `..` as segments, and this value is
+    // interpolated into an authenticated API URL (`github-app-auth.ts`), so a
+    // traversal-shaped repo name should not be expressible in the first place.
+    .regex(
+      /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/,
+      "gate.repoFullName must be in owner/repo form",
+    )
+    // The repo half legitimately allows dots, so `.`/`..` still need an explicit reject.
+    .refine(
+      (value) => !value.split("/").some((segment) => segment === "." || segment === ".."),
+      "gate.repoFullName must not contain `.` or `..` path segments",
+    ),
+  runId: z.number().int().positive(),
+  url: z.string().trim().url().optional(),
+});
+
+export type ApprovalGate = z.infer<typeof approvalGateSchema>;
+
+/**
+ * Read a gate out of a persisted `payload` jsonb blob.
+ *
+ * Deliberately total: rows written before `gate` was validated on create may hold
+ * an arbitrary value under that key, and a reconciler sweep must skip those rather
+ * than throw and stall the whole batch. A malformed gate is indistinguishable from
+ * no gate here — by design, since neither is reconcilable.
+ */
+export function parseApprovalGate(payload: unknown): ApprovalGate | null {
+  if (!payload || typeof payload !== "object") return null;
+  const gate = (payload as Record<string, unknown>).gate;
+  if (gate === undefined || gate === null) return null;
+  const parsed = approvalGateSchema.safeParse(gate);
+  return parsed.success ? parsed.data : null;
+}
+
 const approvalPayloadSchema = z.object({
   title: z.string({
     required_error: approvalTitleMessage,
     invalid_type_error: approvalTitleMessage,
   }).refine((title) => title.trim().length > 0, approvalTitleMessage),
+  gate: approvalGateSchema.optional(),
 }).catchall(z.unknown());
 
 export const createApprovalSchema = z.object({

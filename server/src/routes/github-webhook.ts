@@ -40,11 +40,16 @@ import {
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
+import {
+  evaluateAgentInvokability,
+  type AgentOrgRow,
+} from "../services/agent-invokability.js";
 import { issueService } from "../services/issues.js";
 import {
   GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
   GITHUB_DEPENDABOT_WEBHOOK_DIAGNOSTIC_ORIGIN_KIND,
   findOpenDependabotAlertIssue,
+  findTerminalDependabotAlertIssues,
   recordDependabotWebhookDiagnostic,
   resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
@@ -125,7 +130,7 @@ export interface GithubWebhookConfig {
   pluginWorkerManager?: PluginWorkerManager;
   /**
    * Agent IDs that receive additional wakes on PR-shaped events. New reviews
-   * are assigned to the least-loaded active reviewer. The singular option is
+   * are assigned to the least-loaded invokable reviewer. The singular option is
    * retained for callers that have not migrated to the pool configuration.
    *
    * Review-driving events are
@@ -1371,12 +1376,109 @@ function isUniqueDependabotAlertConflict(error: unknown): boolean {
   );
 }
 
+// BLO-28981: a re-fire arriving for an alert whose previous cycle was already
+// adjudicated and closed. The body is deliberately short -- the reopened row
+// already carries the previous cycle's comments and receipts, which is the
+// whole point of reopening rather than filing a fresh row. What it must add is
+// (a) that this is a *repeat*, not a first sighting, (b) which delivery
+// re-fired it, and (c) pointers to any earlier sibling rows that predate the
+// reopen behaviour, so the full adjudication chain is reachable from the one
+// surviving row.
+function buildDependabotRefireComment(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+  reopenedFromStatus: string;
+  priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const priorLines = input.priorAdjudications.length
+    ? [
+        "",
+        `## Earlier rows for this same alert (${input.priorAdjudications.length})`,
+        ...input.priorAdjudications.map((prior) => {
+          const closedAt = prior.completedAt ? prior.completedAt.toISOString() : "close time not recorded";
+          return `- ${prior.identifier ?? "(no identifier)"} — \`${prior.status}\`, ${closedAt}`;
+        }),
+        "",
+        "Read those before re-investigating: this alert has been adjudicated before, and the previous conclusion very likely still applies.",
+      ]
+    : [];
+  return [
+    `[github-dependabot-refire] GitHub re-fired this alert (\`${input.alert.action}\`) after it was closed as \`${input.reopenedFromStatus}\`.`,
+    "",
+    "This issue was **reopened in place** rather than refiled, so every comment above is the prior adjudication of this same alert.",
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- Severity: ${input.alert.severity}`,
+    // The reopened row keeps the PREVIOUS cycle's title and description, so if
+    // the advisory moved between cycles those quote stale values. Carrying the
+    // current range/patched version here is what corrects them.
+    `- Vulnerable range: ${input.alert.vulnerableRange ?? "not provided in the webhook payload"}`,
+    `- Patched version: ${input.alert.patchedVersion ?? "not provided in the webhook payload"}`,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    ...priorLines,
+    "",
+    "If the earlier adjudication still holds, close this issue again citing it — do not repeat the investigation. If the dependency genuinely regressed, remediate as normal.",
+  ].join("\n");
+}
+
+// BLO-28981: a re-fire arriving for an alert whose newest row was `cancelled`.
+// Cancelling an alert issue is a deliberate human act meaning "stop
+// re-adjudicating this" -- the exact lever BLO-28864's phantom `fbinternal`
+// alerts need. So the row is left cancelled and NOT re-queued; this comment is
+// the audit trail that the re-fire arrived and was deliberately suppressed,
+// rather than lost.
+function buildDependabotSuppressedRefireComment(input: {
+  repoFullName: string;
+  alert: DependabotAlertContext;
+  deliveryId: string | null;
+  cancelledAt: Date | null;
+}): string {
+  const alertUrl =
+    input.alert.alertUrl ??
+    `https://github.com/${input.repoFullName}/security/dependabot/${input.alert.alertNumber}`;
+  const cancelledAt = input.cancelledAt ? input.cancelledAt.toISOString() : "cancel time not recorded";
+  return [
+    `[github-dependabot-refire-suppressed] GitHub re-fired this alert (\`${input.alert.action}\`), and it was **not** re-queued.`,
+    "",
+    `This issue was cancelled (${cancelledAt}), which this intake treats as a standing decision to stop re-adjudicating this alert. No new issue was filed and no agent was woken.`,
+    `- Repository: \`${input.repoFullName}\``,
+    `- Alert: [#${input.alert.alertNumber}](${alertUrl})`,
+    `- Action: \`${input.alert.action}\``,
+    `- Severity: ${input.alert.severity}`,
+    `- Vulnerable range: ${input.alert.vulnerableRange ?? "not provided in the webhook payload"}`,
+    `- Patched version: ${input.alert.patchedVersion ?? "not provided in the webhook payload"}`,
+    `- GitHub delivery: \`${input.deliveryId ?? "unavailable"}\``,
+    "",
+    "To start taking this alert again, move this issue out of `cancelled` (or close it as `done` instead) — the next re-fire will then reopen it normally.",
+  ].join("\n");
+}
+
 // Finds the open issue for this alert (originId is the stable
 // `github-dependabot:<repo>#<alertNumber>` key), or creates one. A
 // `reintroduced`/`reopened` redelivery for an alert that already has an open
 // issue reuses it rather than spawning a duplicate remediation run — the
 // Release Engineer sees one issue per alert to comment on and dedupe against,
 // per BLO-16319's verifying signal.
+//
+// BLO-28981: when there is no open issue but the same originId has already
+// been adjudicated and closed, reopen the most recent terminal row instead of
+// minting a fresh one. `issues_active_dependabot_alert_uq` only constrains
+// non-terminal rows, so nothing stopped the intake from stacking a new
+// full-weight issue per re-fire cycle (measured: 24 rows across 8 originIds on
+// `Blockcast/magma`). Reopening keeps exactly one row per alert forever and,
+// more importantly, keeps the prior adjudication attached to it — the next
+// agent to pick it up reads why this was closed last time instead of starting
+// cold. The wake still fires against the returned issue id, so a dependency
+// that was genuinely fixed and then regressed still reaches an assignee; this
+// changes which row the signal lands on, never whether it lands.
+//
+// `cancelled` is treated differently from `done`: see the suppression branch
+// below.
 async function resolveDependabotAlertIssue(
   db: Db,
   input: {
@@ -1385,10 +1487,71 @@ async function resolveDependabotAlertIssue(
     originId: string;
     repoFullName: string;
     alert: DependabotAlertContext;
+    deliveryId: string | null;
   },
-): Promise<{ id: string; identifier: string | null; reused: boolean }> {
+): Promise<{
+  id: string;
+  identifier: string | null;
+  reused: boolean;
+  reopened: boolean;
+  suppressed: boolean;
+}> {
   const existing = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-  if (existing) return { id: existing.id, identifier: existing.identifier, reused: true };
+  if (existing)
+    return {
+      id: existing.id,
+      identifier: existing.identifier,
+      reused: true,
+      reopened: false,
+      suppressed: false,
+    };
+
+  const priorTerminal = await findTerminalDependabotAlertIssues(db, input.companyId, input.originId);
+  const newestTerminal = priorTerminal[0] ?? null;
+
+  // A cancelled newest row is a standing "stop re-adjudicating this" decision,
+  // so honour it instead of resurrecting the row. Reopening a cancelled issue
+  // would also null out `cancelledAt`, destroying the only field-level record
+  // that the cancellation ever happened -- and since the row is then reused
+  // forever, there would be no suppression lever left anywhere in the intake.
+  // The re-fire is still recorded on the row so a suppressed delivery is
+  // auditable rather than silently dropped. Note this makes `cancelled` load
+  // bearing: anything that auto-cancels an alert issue silences that alert
+  // until a human moves it out of `cancelled`.
+  if (newestTerminal?.status === "cancelled") {
+    await recordSuppressedDependabotRefire(db, {
+      companyId: input.companyId,
+      originId: input.originId,
+      repoFullName: input.repoFullName,
+      alert: input.alert,
+      deliveryId: input.deliveryId,
+      target: newestTerminal,
+    });
+    return {
+      id: newestTerminal.id,
+      identifier: newestTerminal.identifier,
+      reused: true,
+      reopened: false,
+      suppressed: true,
+    };
+  }
+
+  const reopenTarget = newestTerminal;
+  if (reopenTarget) {
+    const reopened = await reopenTerminalDependabotAlertIssue(db, {
+      ...input,
+      target: reopenTarget,
+      priorAdjudications: priorTerminal.slice(1),
+    });
+    if (reopened) return reopened;
+    // Lost the reopen race to a concurrent delivery (or the row moved out of a
+    // terminal status between the read and the write). Whichever writer won
+    // left an open row behind; reuse it rather than falling through to create
+    // a duplicate.
+    const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
+    if (raced)
+      return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false, suppressed: false };
+  }
 
   const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
   const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
@@ -1406,13 +1569,177 @@ async function resolveDependabotAlertIssue(
       originId: input.originId,
       originFingerprint: input.originId,
     });
-    return { id: created.id, identifier: created.identifier, reused: false };
+    return { id: created.id, identifier: created.identifier, reused: false, reopened: false, suppressed: false };
   } catch (error) {
     if (!isUniqueDependabotAlertConflict(error)) throw error;
     const raced = await findOpenDependabotAlertIssue(db, input.companyId, input.originId);
-    if (raced) return { id: raced.id, identifier: raced.identifier, reused: true };
+    if (raced)
+      return { id: raced.id, identifier: raced.identifier, reused: true, reopened: false, suppressed: false };
     throw error;
   }
+}
+
+// Records a suppressed re-fire on an already-cancelled alert row. No UPDATE:
+// the row stays cancelled, keeps its `cancelledAt`, and stays out of the
+// queue. Idempotent on the delivery id via the same
+// `issue_comments_issue_system_idempotency_idx` the reopen notice uses, so a
+// replay does not stack notices.
+async function recordSuppressedDependabotRefire(
+  db: Db,
+  input: {
+    companyId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+    target: { id: string; cancelledAt: Date | null };
+  },
+): Promise<void> {
+  const externalKey = `${input.originId}:refire-suppressed:${input.deliveryId ?? input.alert.action}`;
+  await db
+    .insert(issueComments)
+    .values({
+      companyId: input.companyId,
+      issueId: input.target.id,
+      authorType: "system",
+      idempotencyKey: externalKey,
+      body: buildDependabotSuppressedRefireComment({
+        repoFullName: input.repoFullName,
+        alert: input.alert,
+        deliveryId: input.deliveryId,
+        cancelledAt: input.target.cancelledAt,
+      }),
+      metadata: {
+        kind: "github_dependabot_refire_suppressed",
+        source: "github",
+        externalKey,
+        repoFullName: input.repoFullName,
+        alertNumber: input.alert.alertNumber,
+        action: input.alert.action,
+        deliveryId: input.deliveryId,
+      } as never,
+    })
+    .onConflictDoNothing();
+}
+
+// Reopens a closed Dependabot alert row and records why, atomically. Returns
+// null when the row was no longer terminal at write time — the UPDATE's own
+// WHERE re-checks the status against the latest row version, so a concurrent
+// delivery that already reopened it cannot be double-applied (the same
+// optimistic-concurrency shape reopenInReviewIssueForActionablePrFeedback uses
+// for its `in_review` guard). Also returns null on a unique-constraint loss:
+// the UPDATE moves the row INTO `issues_active_dependabot_alert_uq`'s scope,
+// so if a concurrent writer made a different row active in the read→write
+// window, Postgres raises rather than updating zero rows. Both losses land on
+// the caller's `findOpenDependabotAlertIssue` fallback, which is the same
+// idiom the create path at the bottom of resolveDependabotAlertIssue uses.
+//
+// `done` only, never `cancelled`: see the suppression branch in
+// resolveDependabotAlertIssue.
+async function reopenTerminalDependabotAlertIssue(
+  db: Db,
+  input: {
+    companyId: string;
+    assigneeAgentId: string;
+    originId: string;
+    repoFullName: string;
+    alert: DependabotAlertContext;
+    deliveryId: string | null;
+    target: { id: string; identifier: string | null; status: string };
+    priorAdjudications: { identifier: string | null; status: string; completedAt: Date | null }[];
+  },
+): Promise<{
+  id: string;
+  identifier: string | null;
+  reused: boolean;
+  reopened: boolean;
+  suppressed: boolean;
+} | null> {
+  const assigneeAgentId = await resolveDependabotIssueAssigneeId(db, input.companyId, input.assigneeAgentId);
+  const priority = DEPENDABOT_SEVERITY_TO_ISSUE_PRIORITY[input.alert.severity] ?? "medium";
+  const now = new Date();
+  const externalKey = `${input.originId}:refire:${input.deliveryId ?? input.alert.action}`;
+  const body = buildDependabotRefireComment({
+    repoFullName: input.repoFullName,
+    alert: input.alert,
+    deliveryId: input.deliveryId,
+    reopenedFromStatus: input.target.status,
+    priorAdjudications: input.priorAdjudications,
+  });
+
+  return db
+    .transaction(async (tx) => {
+      const updated = await tx
+        .update(issues)
+        .set({
+          status: "todo",
+          priority,
+          assigneeAgentId,
+          assigneeUserId: null,
+          // The row is being handed back to the queue: any execution lock left
+          // over from the run that closed it would otherwise make the reopened
+          // issue look checked-out by a run that has long since finished.
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: null,
+          // `cancelledAt` is deliberately NOT cleared here: this UPDATE only
+          // ever matches `done` rows, so there is nothing to clear, and a
+          // cancelled row must keep its timestamp (see the suppression branch).
+          //
+          // `executionState` is likewise left alone, unlike the
+          // reopenInReviewIssueForActionablePrFeedback precedent this borrows
+          // its concurrency shape from. That path recomputes it via
+          // markExecutionStateChangesRequested because it reopens issues that
+          // are mid-review-stage; alert issues are created with no
+          // `executionPolicy`, so there is no stage progress to reset. If
+          // stages are ever attached to alert issues, this needs to reset them
+          // or the prior cycle's progress carries into the new one
+          // pre-satisfied.
+          updatedAt: now,
+        })
+        .where(and(eq(issues.id, input.target.id), eq(issues.status, "done")))
+        .returning({ id: issues.id, identifier: issues.identifier })
+        .then((rows) => rows[0] ?? null);
+      if (!updated) return null;
+
+    // Idempotent on the delivery id, so a GitHub replay of the same re-fire
+    // does not stack duplicate notices on the reopened row.
+    await tx
+      .insert(issueComments)
+      .values({
+        companyId: input.companyId,
+        issueId: input.target.id,
+        authorType: "system",
+        idempotencyKey: externalKey,
+        body,
+        metadata: {
+          kind: "github_dependabot_refire",
+          source: "github",
+          externalKey,
+          repoFullName: input.repoFullName,
+          alertNumber: input.alert.alertNumber,
+          action: input.alert.action,
+          deliveryId: input.deliveryId,
+          reopenedFromStatus: input.target.status,
+          priorAdjudicationIdentifiers: input.priorAdjudications.map((prior) => prior.identifier),
+        } as never,
+      })
+      .onConflictDoNothing();
+
+      return { id: updated.id, identifier: updated.identifier, reused: true, reopened: true, suppressed: false };
+    })
+    .catch((error) => {
+      // The UPDATE moves this row into `issues_active_dependabot_alert_uq`'s
+      // scope. A concurrent writer that made a different row active in the
+      // read→write window makes Postgres raise here rather than update zero
+      // rows, so a raced delivery would otherwise unwind to the outer handler
+      // and be dropped with only a log. Fall back the same way a zero-row
+      // update does: the caller re-reads the open row.
+      if (!isUniqueDependabotAlertConflict(error)) throw error;
+      return null;
+    });
 }
 
 function buildDependabotTerminalReceipt(input: {
@@ -1568,7 +1895,17 @@ async function recordDependabotTerminalReceipt(
       .onConflictDoNothing();
   }
 
-  if (hasCompleteTerminalEvidence && issue.status !== "done") {
+  // `cancelled` is excluded, not just `done`. The fallback lookup above has no
+  // status filter, so it can resolve a deliberately-cancelled row -- and
+  // `cancelled` -> `done` is a lateral move between two terminal states that
+  // buys nothing while nulling `cancelledAt` (services/issues.ts clears it on
+  // any status change away from `cancelled`). That would defeat the suppression
+  // branch in resolveDependabotAlertIssue through a different door: once the
+  // row reads `done`, every later re-fire takes the reopen path and wakes an
+  // assignee again, with no field-level record the alert was ever cancelled.
+  // The receipt comment above still lands on the row, so the terminal delivery
+  // stays auditable.
+  if (hasCompleteTerminalEvidence && issue.status !== "done" && issue.status !== "cancelled") {
     await issueService(db).update(issue.id, { status: "done" });
   }
 }
@@ -1744,7 +2081,7 @@ function buildPrReviewerWakeIdempotencyKey(
 }
 
 // Deliberately PR-scoped, with no head sha: this key also scopes the reviewer
-// affinity lookup (findActivePrReviewerForTask), the withPrReviewerTaskLock
+// affinity lookup (findInvokablePrReviewerForTask), the withPrReviewerTaskLock
 // serialization, and the cancel-queued-runs-on-close sweep, all of which must
 // stay stable across heads for one PR. Head-awareness for review requests lives
 // in heartbeat's coalescing decision instead (BLO-18953).
@@ -1851,30 +2188,17 @@ function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
 
 async function selectPrReviewerAgentId(
   db: PrReviewerSelectionDb,
-  configuredAgentIds: readonly string[],
+  invokableAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
-  if (configuredAgentIds.length === 0) return null;
-
-  const activeRows = await db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(
-      and(
-        inArray(agents.id, [...configuredAgentIds]),
-        inArray(agents.status, ["idle", "running"]),
-      ),
-    );
-  const activeSet = new Set(activeRows.map((row) => row.id));
-  const activeAgentIds = configuredAgentIds.filter((agentId) => activeSet.has(agentId));
-  if (activeAgentIds.length === 0) return null;
+  if (invokableAgentIds.length === 0) return null;
 
   const loadRows = await db
     .select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` })
     .from(heartbeatRuns)
     .where(
       and(
-        inArray(heartbeatRuns.agentId, activeAgentIds),
+        inArray(heartbeatRuns.agentId, [...invokableAgentIds]),
         inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
       ),
     )
@@ -1883,9 +2207,9 @@ async function selectPrReviewerAgentId(
     loadRows.map((row) => [row.agentId, Number(row.count)]),
   );
   const minimumLoad = Math.min(
-    ...activeAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
+    ...invokableAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
   );
-  const leastLoadedAgentIds = activeAgentIds.filter(
+  const leastLoadedAgentIds = invokableAgentIds.filter(
     (agentId) => (loadByAgent.get(agentId) ?? 0) === minimumLoad,
   );
 
@@ -1897,28 +2221,105 @@ async function selectPrReviewerAgentId(
   return leastLoadedAgentIds[tieBreak % leastLoadedAgentIds.length] ?? null;
 }
 
-async function findActivePrReviewerForTask(
+async function findInvokablePrReviewerForTask(
   db: PrReviewerSelectionDb,
-  configuredAgentIds: readonly string[],
+  invokableAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
-  if (configuredAgentIds.length === 0) return null;
+  if (invokableAgentIds.length === 0) return null;
 
   return db
     .select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns)
-    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
     .where(
       and(
-        inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
+        inArray(heartbeatRuns.agentId, [...invokableAgentIds]),
         inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
-        inArray(agents.status, ["idle", "running"]),
         matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
     .limit(1)
     .then((rows) => rows[0]?.agentId ?? null);
+}
+
+interface PrReviewerEligibility {
+  invokableAgentIds: string[];
+  transientlyUnavailable: boolean;
+}
+
+/**
+ * Keep reviewer routing on the same invokability contract as ordinary
+ * heartbeat dispatch. In particular, `error` is still invokable when the
+ * reporting chain is healthy; paused/terminated/pending agents and invalid
+ * chains remain excluded. A healthy paused reviewer is tracked separately as
+ * transiently unavailable so the request can use the bounded availability
+ * retry without turning terminal configuration errors into six hours of
+ * polling. The webhook runs this under its PR lock, so a single company-scoped
+ * snapshot is sufficient for the selection decision.
+ */
+async function resolvePrReviewerEligibility(
+  db: PrReviewerSelectionDb,
+  configuredAgentIds: readonly string[],
+): Promise<PrReviewerEligibility> {
+  if (configuredAgentIds.length === 0) {
+    return { invokableAgentIds: [], transientlyUnavailable: false };
+  }
+
+  const configuredRows: AgentOrgRow[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(inArray(agents.id, [...configuredAgentIds]));
+  if (configuredRows.length === 0) {
+    return { invokableAgentIds: [], transientlyUnavailable: false };
+  }
+
+  const companyIds = [...new Set(configuredRows.map((row) => row.companyId))];
+  const companyRows: AgentOrgRow[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(inArray(agents.companyId, companyIds));
+  const rowsByCompany = new Map<string, AgentOrgRow[]>();
+  for (const row of companyRows) {
+    const rows = rowsByCompany.get(row.companyId) ?? [];
+    rows.push(row);
+    rowsByCompany.set(row.companyId, rows);
+  }
+  const configuredById = new Map(configuredRows.map((row) => [row.id, row]));
+  let transientlyUnavailable = false;
+  const invokableAgentIds = configuredAgentIds.filter((agentId) => {
+    const agent = configuredById.get(agentId);
+    if (!agent) return false;
+    const invokability = evaluateAgentInvokability(
+      agent,
+      rowsByCompany.get(agent.companyId) ?? [],
+    );
+    if (invokability.invokable) return true;
+    const orgChainHealth = getAgentOrgChainHealth({
+      agent,
+      agents: rowsByCompany.get(agent.companyId) ?? [],
+    });
+    if (
+      invokability.reason === "paused" &&
+      orgChainHealth?.status === "healthy"
+    ) {
+      transientlyUnavailable = true;
+    }
+    return false;
+  });
+  return { invokableAgentIds, transientlyUnavailable };
 }
 
 async function withPrReviewerTaskLock<T>(
@@ -2116,9 +2517,18 @@ async function attemptPrReviewerWake(params: {
         return "duplicate";
       }
 
+      const reviewerEligibility = await resolvePrReviewerEligibility(tx, reviewerAgentIds);
       const reviewerAgentId =
-        (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
-        (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
+        (await findInvokablePrReviewerForTask(
+          tx,
+          reviewerEligibility.invokableAgentIds,
+          reviewerTaskKey,
+        )) ??
+        (await selectPrReviewerAgentId(
+          tx,
+          reviewerEligibility.invokableAgentIds,
+          reviewerTaskKey,
+        ));
       if (!reviewerAgentId) {
         logger.warn(
           {
@@ -2126,9 +2536,13 @@ async function attemptPrReviewerWake(params: {
             event: eventName,
             prNumber: context.prNumber,
             repoFullName: context.repoFullName,
+            transientlyUnavailable: reviewerEligibility.transientlyUnavailable,
           },
-          "github webhook reviewer wake skipped: no configured reviewer is active",
+          "github webhook reviewer wake skipped: no configured reviewer is invokable",
         );
+        if (reviewerEligibility.transientlyUnavailable) {
+          throw new PrReviewerUnavailableError();
+        }
         return "no_reviewer";
       }
 
@@ -2273,6 +2687,8 @@ interface ContendedPrReviewerReplay {
   context: ResolvedEventContext & { prNumber: number };
 }
 
+type PrReviewerRetryCause = "contention" | "unavailable";
+
 /**
  * Persist a PR-reviewer wake that lost its scope lock, so a worker can replay
  * it (BLO-21995).
@@ -2304,17 +2720,35 @@ async function persistContendedPrReviewerWake(params: {
   deliveryId: string | null;
   reviewerAgentIds: readonly string[];
   taskKey: string;
+  cause?: PrReviewerRetryCause;
 }): Promise<boolean> {
-  const { db, context, eventName, deliveryId, reviewerAgentIds, taskKey } = params;
+  const {
+    db,
+    context,
+    eventName,
+    deliveryId,
+    reviewerAgentIds,
+    taskKey,
+    cause = "contention",
+  } = params;
   const wakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
   const idempotencyKey = wakeupOptions.idempotencyKey;
 
   // Prefer a reviewer that is actually invokable so the provisional pick is
   // usually the one the replay lands on anyway, but fall back to any
   // *configured* reviewer row: the column is an FK anchor, not a decision.
+  const reviewerEligibility = await resolvePrReviewerEligibility(db, reviewerAgentIds);
   const provisionalAgentId =
-    (await findActivePrReviewerForTask(db, reviewerAgentIds, taskKey)) ??
-    (await selectPrReviewerAgentId(db, reviewerAgentIds, taskKey)) ??
+    (await findInvokablePrReviewerForTask(
+      db,
+      reviewerEligibility.invokableAgentIds,
+      taskKey,
+    )) ??
+    (await selectPrReviewerAgentId(
+      db,
+      reviewerEligibility.invokableAgentIds,
+      taskKey,
+    )) ??
     (await db
       .select({ id: agents.id })
       .from(agents)
@@ -2341,14 +2775,20 @@ async function persistContendedPrReviewerWake(params: {
 
   const replay: ContendedPrReviewerReplay = {
     attempts: 0,
-    // Null until a replay actually finds the reviewer gone; the availability
-    // clock starts then, not at contention time.
-    unavailableSince: null,
-    availabilityAttempts: 0,
+    // An initial no-reviewer outcome is already an availability observation,
+    // so start its wall clock and ladder here. Contention records keep the
+    // clock dormant until a replay first observes the reviewer unavailable.
+    unavailableSince: cause === "unavailable" ? new Date().toISOString() : null,
+    availabilityAttempts: cause === "unavailable" ? 1 : 0,
     // Never null: a record the due-ness filter can't select is stranded
     // silently, the failure mode the provider-capacity path guards with its
     // own default delay.
-    nextAttemptAt: new Date(Date.now() + PR_REVIEWER_CONTENDED_BACKOFF_MS[0]).toISOString(),
+    nextAttemptAt: new Date(
+      Date.now() +
+        (cause === "unavailable"
+          ? PR_REVIEWER_UNAVAILABLE_BACKOFF_MS[0]
+          : PR_REVIEWER_CONTENDED_BACKOFF_MS[0]),
+    ).toISOString(),
     eventName,
     deliveryId,
     taskKey,
@@ -2405,7 +2845,7 @@ async function persistContendedPrReviewerWake(params: {
     // Still durable, so the caller must not 503 and invite a third replay.
     logger.info(
       { taskKey, deliveryId, event: eventName, idempotencyKey },
-      "contended PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
+      "deferred PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
     );
     return true;
   }
@@ -2427,8 +2867,11 @@ async function persistContendedPrReviewerWake(params: {
       idempotencyKey,
       provisionalAgentId,
       nextAttemptAt: replay.nextAttemptAt,
+      retryCause: cause,
     },
-    "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
+    cause === "unavailable"
+      ? "github webhook reviewer wake deferred: configured reviewer temporarily unavailable, durable retry recorded"
+      : "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
   );
   return true;
 }
@@ -2467,6 +2910,30 @@ function parseContendedReplay(payload: unknown): ContendedPrReviewerReplay | nul
   // non-castable value as NULL (= due), so a row that got here with garbage
   // would otherwise replay on every pass forever instead of being retired.
   if (Number.isNaN(Date.parse(candidate.nextAttemptAt))) return null;
+  if (
+    candidate.unavailableSince !== null &&
+    candidate.unavailableSince !== undefined &&
+    (typeof candidate.unavailableSince !== "string" ||
+      Number.isNaN(Date.parse(candidate.unavailableSince)))
+  ) {
+    return null;
+  }
+  if (
+    candidate.attempts !== undefined &&
+    (typeof candidate.attempts !== "number" ||
+      !Number.isFinite(candidate.attempts) ||
+      candidate.attempts < 0)
+  ) {
+    return null;
+  }
+  if (
+    candidate.availabilityAttempts !== undefined &&
+    (typeof candidate.availabilityAttempts !== "number" ||
+      !Number.isFinite(candidate.availabilityAttempts) ||
+      candidate.availabilityAttempts < 0)
+  ) {
+    return null;
+  }
   return {
     attempts: typeof candidate.attempts === "number" ? candidate.attempts : 0,
     unavailableSince:
@@ -2565,14 +3032,21 @@ export async function reconcileContendedPrReviewerWakes(
         continue;
       }
       if (outcome === "no_reviewer") {
-        // NOT terminal. Reviewer availability is transient — paused for a
-        // config push, mid-restart, momentarily between runs — and the whole
-        // point of a durable record is to outlive exactly that. Retiring here
-        // would drop a sanctioned review request because the reviewer happened
-        // to be down for the seconds this pass ran. Re-armed below on the
-        // dedicated availability ladder, bounded by wall-clock rather than by
-        // the lock-contention attempt budget.
-        throw new PrReviewerUnavailableError();
+        // `attemptPrReviewerWake` throws PrReviewerUnavailableError itself
+        // when it sees a healthy paused reviewer. Reaching this branch means
+        // every configured reviewer is in a terminal policy/configuration
+        // state (terminated, pending approval, invalid chain, unknown status,
+        // or missing), so retrying cannot change the answer. Retire the
+        // contention record without emitting a dead-letter alert for a request
+        // the configured policy has deliberately refused.
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          "no configured reviewer is invokable",
+        );
+        result.superseded += 1;
+        continue;
       }
       // duplicate / declined are terminal for this delivery: replaying cannot
       // change either. `duplicate` is the expected outcome when the delivery
@@ -3530,6 +4004,44 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         });
         return outcome === "queued";
       } catch (err) {
+        if (err instanceof PrReviewerUnavailableError) {
+          let recorded = false;
+          try {
+            recorded = await persistContendedPrReviewerWake({
+              db,
+              context,
+              eventName,
+              deliveryId,
+              reviewerAgentIds,
+              taskKey: buildPrReviewerWakeupOptions(context, eventName, deliveryId).payload.taskKey,
+              cause: "unavailable",
+            });
+          } catch (persistErr) {
+            logger.error(
+              {
+                err: persistErr,
+                agentIds: reviewerAgentIds,
+                event: eventName,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer availability retry persistence failed",
+            );
+          }
+          if (recorded) return false;
+          logger.error(
+            {
+              agentIds: reviewerAgentIds,
+              event: eventName,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "github webhook reviewer was temporarily unavailable and no durable retry could be recorded",
+          );
+          throw new HttpError(503, "PR reviewer is temporarily unavailable", {
+            code: "pr_reviewer_unavailable",
+          });
+        }
         if (err instanceof PrReviewerTaskLockTimeoutError) {
           // BLO-21995: a concurrent delivery for this same PR held the scope for
           // the whole timeout. Nothing reached heartbeat, so there is no partial
@@ -3703,7 +4215,27 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           originId: taskKey,
           repoFullName: alertRepoFullName,
           alert,
+          deliveryId,
         });
+
+        // BLO-28981: the alert's newest row was cancelled, which this intake
+        // reads as a standing decision to stop re-adjudicating it. The re-fire
+        // is already recorded on that row; waking an agent here is exactly the
+        // cost cancelling was meant to stop.
+        if (issue.suppressed) {
+          logger.info(
+            {
+              event: eventName,
+              deliveryId,
+              taskKey,
+              issueId: issue.id,
+              alertNumber: alert.alertNumber,
+              repoFullName: alertRepoFullName,
+            },
+            "github webhook dependabot re-fire suppressed: alert issue is cancelled",
+          );
+          return false;
+        }
 
         const heartbeat = heartbeatService(db, {
           pluginWorkerManager: config.pluginWorkerManager,
@@ -3725,6 +4257,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           contextSnapshot: {
             taskKey,
             issueId: issue.id,
+            // BLO-28981: true when this landed on a previously-adjudicated row
+            // that was reopened rather than a fresh one. The woken run can see
+            // it is handling a repeat without first reading the comment thread.
+            dependabotReopened: issue.reopened,
             wakeReason: "github_dependabot_alert",
             wakeSource: "automation",
             wakeTriggerDetail: "system",

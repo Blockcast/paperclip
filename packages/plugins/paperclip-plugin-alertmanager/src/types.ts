@@ -95,6 +95,14 @@ export interface AlertmanagerPluginConfig {
    */
   ownerMap?: OwnerMap;
   /**
+   * Exact agent name assigned when neither owner resolution nor an issue route
+   * produces an assignee. Required in practice: an instance whose
+   * `fallbackAgentName` is missing, unmatched, or ambiguous fails closed and
+   * creates no issue, because an ownerless alert issue is never actioned and
+   * auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438).
+   */
+  fallbackAgentName?: string;
+  /**
    * Per-instance issue route map. Matches alert labels and applies project,
    * goal, status, and queue defaults to created issues.
    */

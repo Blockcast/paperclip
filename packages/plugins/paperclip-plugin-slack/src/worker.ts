@@ -33,6 +33,11 @@ import {
   type SlackMessage,
 } from "./slack-api.js";
 import { registerTool, registerTools } from "./tools.js";
+import {
+  withStateLock,
+  watchQueueLockKey,
+  costAccumulatorLockKey,
+} from "./state-lock.js";
 import { SlackAdapter } from "./adapter.js";
 import {
   routeMessageToAgent,
@@ -70,6 +75,7 @@ import {
   removeWatch,
   listWatches,
   checkWatches,
+  WatchesAlreadyDeliveredError,
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
 import { resolveSlackUserId } from "./user-mapping.js";
@@ -97,13 +103,18 @@ import type {
 } from "./types.js";
 
 let pluginCtx: PluginContext;
-let pluginToken: string;
 let pluginConfig: SlackPluginConfig;
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 let slackAdapter: SlackAdapter;
 
 // --- Slack signature verification ---
-let slackSigningSecret: string | null = null;
+// No module-level secret: on a multi-company install the bootstrap config is
+// always `{}` (plugin-loader.ts), so a value resolved once at setup() time
+// could only ever be one company's secret — wrongly accepted for every other
+// company's requests, or (as it actually manifested) never resolved at all,
+// permanently disabling verification AND `canProcessMutatingApprovalWebhook`
+// for every company. Resolved fresh per delivery in `onWebhook` instead; see
+// `resolveCompanySigningSecret`.
 
 /** Why a webhook signature check failed (for diagnostic logging only). */
 type SigFailReason =
@@ -157,8 +168,9 @@ function takeSuppressedSigCount(): number {
 function verifySlackSignature(
   headers: Record<string, string | string[]>,
   rawBody: string,
+  signingSecret: string | null,
 ): SigCheckResult {
-  if (!slackSigningSecret) return { ok: true }; // skip if not configured
+  if (!signingSecret) return { ok: true }; // skip if not configured
   const timestamp = String(
     headers["x-slack-request-timestamp"] ??
       headers["X-Slack-Request-Timestamp"] ??
@@ -192,7 +204,7 @@ function verifySlackSignature(
     };
   }
   const baseString = `v0:${timestamp}:${rawBody}`;
-  const hmac = createHmac("sha256", slackSigningSecret)
+  const hmac = createHmac("sha256", signingSecret)
     .update(baseString)
     .digest("hex");
   const expected = `v0=${hmac}`;
@@ -228,13 +240,91 @@ function verifySlackSignature(
   };
 }
 
-function canProcessMutatingApprovalWebhook(source: string): boolean {
-  if (slackSigningSecret) return true;
+function canProcessMutatingApprovalWebhook(
+  source: string,
+  signingSecret: string | null,
+): boolean {
+  if (signingSecret) return true;
   pluginCtx.logger.warn(
     "Rejected mutating Slack approval webhook: missing Slack signing secret",
     { source },
   );
   return false;
+}
+
+/**
+ * Outcome of resolving a company's Slack signing secret.
+ *
+ * The three cases are kept distinct on purpose. An earlier revision collapsed
+ * them all into `string | null`, where `null` reaches `verifySlackSignature`
+ * and means *skip verification* — so a transient config/secret-store failure
+ * silently downgraded a company that HAS configured verification to
+ * unverified for that delivery, turning an infra blip into an
+ * authentication-bypass window on a public endpoint.
+ *
+ * - `none`        — this company has configured no signing secret. The
+ *                   deliberate, pre-existing "skip verification if not
+ *                   configured" behavior, now evaluated per company.
+ * - `secret`      — verify against this value.
+ * - `unavailable` — configured (or possibly configured) but unreadable. The
+ *                   caller MUST reject the delivery: we cannot tell a genuine
+ *                   Slack request from a forged one, so failing closed is the
+ *                   only safe reading.
+ */
+type SigningSecretResolution =
+  | { kind: "none" }
+  | { kind: "secret"; value: string }
+  | { kind: "unavailable"; reason: "missing_company" | "config_read_failed" | "secret_resolve_failed" };
+
+/**
+ * Resolve the Slack signing secret this delivery's own company configured,
+ * for signature verification and the mutating-approval gate. Never the
+ * `setup()` bootstrap snapshot — same reasoning as `resolveInteractionScope`:
+ * the host always hands the worker `{}` on a multi-company install, so a
+ * secret resolved once at startup could only ever be one company's, and using
+ * it to verify a DIFFERENT company's request would accept a signature that
+ * was never actually produced with that company's secret.
+ *
+ * Never throws; a read failure is reported as `unavailable` rather than
+ * conflated with "not configured". See `SigningSecretResolution`.
+ */
+async function resolveCompanySigningSecret(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<SigningSecretResolution> {
+  if (!companyId) return { kind: "unavailable", reason: "missing_company" };
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = await ctx.config.get(companyId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Could not load config to resolve the Slack signing secret for company ${companyId}`,
+      { err },
+    );
+    return { kind: "unavailable", reason: "config_read_failed" };
+  }
+  const ref = (raw as unknown as SlackPluginConfig | undefined)
+    ?.slackSigningSecretRef;
+  if (!ref) return { kind: "none" };
+  let value: string | null;
+  try {
+    value = await ctx.secrets.resolve(ref, { companyId });
+  } catch (err) {
+    ctx.logger.warn(
+      `Could not resolve slackSigningSecretRef for company ${companyId}`,
+      { err },
+    );
+    return { kind: "unavailable", reason: "secret_resolve_failed" };
+  }
+  // A configured ref that resolves to an empty value is a broken secret, not
+  // an opt-out of verification — treat it as unreadable rather than `none`.
+  if (!value) {
+    ctx.logger.warn(
+      `slackSigningSecretRef for company ${companyId} resolved to an empty value`,
+    );
+    return { kind: "unavailable", reason: "secret_resolve_failed" };
+  }
+  return { kind: "secret", value };
 }
 
 // --- Helpers ---
@@ -267,8 +357,11 @@ async function approvalIdForMessage(
   return typeof id === "string" ? id : null;
 }
 
-function isAuthorizedReactor(slackUserId: string): boolean {
-  const allow = pluginConfig.approvalReactorSlackIds ?? [];
+function isAuthorizedReactor(
+  slackUserId: string,
+  config: SlackPluginConfig,
+): boolean {
+  const allow = config.approvalReactorSlackIds ?? [];
   return allow.includes(slackUserId);
 }
 
@@ -285,13 +378,102 @@ async function listTargetCompanies(
   return ctx.companies.list({ limit: 100, offset: 0 });
 }
 
-async function resolveTargetCompanyId(
-  ctx: Pick<PluginContext, "companies">,
-): Promise<string> {
-  const companyId = configuredCompanyId();
-  if (companyId) return companyId;
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  return companies[0]?.id ?? "";
+/**
+ * Load the company-scoped config row for one interactive delivery. Never
+ * falls back to the `setup()` snapshot — see `resolveInteractionScope` for why.
+ * Returns `null` (after logging one warn) for a missing companyId, a config
+ * read failure, or a company with no stored config at all.
+ */
+async function loadCompanyConfig(
+  ctx: PluginContext,
+  companyId: string,
+  label: string,
+): Promise<SlackPluginConfig | null> {
+  if (!companyId) {
+    ctx.logger.warn(
+      `Slack ${label} dropped — inbound delivery carried no companyId, cannot establish tenant`,
+    );
+    return null;
+  }
+  let raw: Record<string, unknown> | null | undefined;
+  try {
+    raw = await ctx.config.get(companyId);
+  } catch (err) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — could not load config`,
+      { err },
+    );
+    return null;
+  }
+  if (!raw || Object.keys(raw).length === 0) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — no stored config`,
+    );
+    return null;
+  }
+  return raw as unknown as SlackPluginConfig;
+}
+
+export interface CompanyInteractionScope {
+  config: SlackPluginConfig;
+  token: string;
+}
+
+/**
+ * Resolve the config + bot token this interactive delivery should use, scoped
+ * strictly to the company the HOST attached to the delivery (`companyId`
+ * below — always the webhook's own `input.companyId`, an inbound event's
+ * `event.companyId`, or a downstream value threaded from one of those; never
+ * a guess).
+ *
+ * Deliberately never falls back to the `setup()` snapshot or to any other
+ * company's token. The snapshot is worthless — `plugin-loader.ts` builds the
+ * bootstrap config as a literal `{}` on any install with more than one
+ * configured company, so `pluginToken`/`pluginConfig` never carry real
+ * per-tenant credentials — and it is dangerous, because the only thing that
+ * ever populated those globals was whichever company's config the operator
+ * saved most recently. Serving that value to a different company's
+ * interaction would authenticate it against the wrong tenant's Slack bot
+ * token. This mirrors `resolveCompanyScope` in
+ * `paperclip-plugin-alertmanager/src/config-scope.ts` (BLO-20467) and
+ * `resolveCompanyJobScope` above (BLO-20959): per-request resolution, fail
+ * closed, one explanatory warn.
+ *
+ * Returns `null` — never throws — so the caller can drop the interaction
+ * without risking a retry that replays the same ambiguous/unresolvable
+ * tenant. `label` is folded into the warn so a log reader can tell which
+ * interactive surface no-oped without needing a stack trace.
+ */
+async function resolveInteractionScope(
+  ctx: PluginContext,
+  companyId: string,
+  label: string,
+): Promise<CompanyInteractionScope | null> {
+  const config = await loadCompanyConfig(ctx, companyId, label);
+  if (!config) return null;
+  if (!config.slackTokenRef) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — config has no slackTokenRef`,
+    );
+    return null;
+  }
+  let token: string;
+  try {
+    token = await ctx.secrets.resolve(config.slackTokenRef, { companyId });
+  } catch (err) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — could not resolve slackTokenRef`,
+      { err },
+    );
+    return null;
+  }
+  if (!token) {
+    ctx.logger.warn(
+      `Slack ${label} dropped for company ${companyId} — slackTokenRef resolved to an empty value`,
+    );
+    return null;
+  }
+  return { config, token };
 }
 
 /**
@@ -300,6 +482,8 @@ async function resolveTargetCompanyId(
  */
 async function handleReactionEvent(
   event: Record<string, unknown>,
+  companyId: string,
+  signingSecret: string | null,
 ): Promise<void> {
   const reaction = String(event.reaction ?? "");
   const decision = emojiToDecision(reaction);
@@ -310,24 +494,32 @@ async function handleReactionEvent(
   const ts = String(item?.ts ?? "");
   const slackUserId = String(event.user ?? "");
   if (!channel || !ts || !slackUserId) return;
-
-  const companyId = await resolveTargetCompanyId(pluginCtx);
   if (!companyId) return;
 
   const approvalId = await approvalIdForMessage(companyId, channel, ts);
   if (!approvalId) return; // reaction on a non-approval message → ignore
 
-  if (!canProcessMutatingApprovalWebhook("reaction")) return;
+  if (!canProcessMutatingApprovalWebhook("reaction", signingSecret)) return;
+
+  // Resolved only once we know this is an approval-card reaction, so the
+  // common case (an emoji on an ordinary message, in a busy channel) never
+  // pays for a config read + secret resolution.
+  const scope = await resolveInteractionScope(
+    pluginCtx,
+    companyId,
+    "reaction interaction",
+  );
+  if (!scope) return;
 
   if (event.type === "reaction_removed") {
-    await handleReactionRemoved(pluginCtx, pluginToken, {
+    await handleReactionRemoved(pluginCtx, scope.token, {
       companyId,
       approvalId,
       decision,
       slackUserId,
       channel,
       ts,
-      paperclipBaseUrl: pluginConfig.paperclipBaseUrl,
+      paperclipBaseUrl: scope.config.paperclipBaseUrl,
     });
     return;
   }
@@ -335,15 +527,15 @@ async function handleReactionEvent(
   // reaction_added → stage a pending decision (committed after the undo grace
   // window). The allowlist check is enforced inside stagePendingReaction so the
   // unauthorized note + no-op behavior is covered by direct unit tests.
-  await stagePendingReaction(pluginCtx, pluginToken, {
+  await stagePendingReaction(pluginCtx, scope.token, {
     companyId,
     approvalId,
     decision,
     slackUserId,
     channel,
     ts,
-    authorized: isAuthorizedReactor(slackUserId),
-    paperclipBaseUrl: pluginConfig.paperclipBaseUrl,
+    authorized: isAuthorizedReactor(slackUserId, scope.config),
+    paperclipBaseUrl: scope.config.paperclipBaseUrl,
   });
 }
 
@@ -355,6 +547,7 @@ async function handleReactionEvent(
  */
 async function handleInboundMessageEvent(
   event: Record<string, unknown>,
+  companyId: string,
 ): Promise<void> {
   // Ignore bot messages and non-plain subtypes (edits, deletes, joins, …).
   if (event.bot_id || event.app_id) return;
@@ -366,8 +559,6 @@ async function handleInboundMessageEvent(
   const threadTs = String(event.thread_ts ?? event.ts ?? "");
   const text = String(event.text ?? "");
   if (!channel || !threadTs) return;
-
-  const companyId = await resolveTargetCompanyId(pluginCtx);
   if (!companyId) return;
 
   const files = Array.isArray(event.files)
@@ -426,20 +617,35 @@ function genId(prefix: string): string {
 async function handleSlashCommand(
   ctx: PluginContext,
   rawBody: string,
+  companyId: string,
 ): Promise<void> {
   const { text, responseUrl, userId, channelId, threadTs } = parseSlashCommand(rawBody);
   const parts = text.trim().split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? "";
   const arg = parts[1]?.toLowerCase() ?? "";
-  const companyId = await resolveTargetCompanyId(ctx);
+  if (!companyId) {
+    ctx.logger.warn(
+      `Slack slash command "${subcommand}" dropped — inbound delivery carried no companyId, cannot establish tenant`,
+    );
+    return;
+  }
   try {
     switch (subcommand) {
       case "status":
-        await handleStatusCommand(ctx, companyId, responseUrl);
+        await handleStatusCommand(
+          ctx,
+          companyId,
+          responseUrl,
+          await resolveCompanyBaseUrl(ctx, companyId),
+        );
         break;
       case "help":
       case "":
-        await handleHelpCommand(ctx, responseUrl);
+        await handleHelpCommand(
+          ctx,
+          responseUrl,
+          await resolveCompanyBaseUrl(ctx, companyId),
+        );
         break;
       case "agents":
         await handleAgentsCommand(ctx, companyId, responseUrl);
@@ -447,12 +653,32 @@ async function handleSlashCommand(
       case "issues":
         await handleIssuesCommand(ctx, companyId, responseUrl, arg);
         break;
-      case "approve":
-        await handleApproveCommand(ctx, companyId, responseUrl, arg, userId);
+      case "approve": {
+        // Needs this company's own config for the approval allowlist —
+        // `pluginConfig` is the setup()-time bootstrap snapshot, which the
+        // host always hands the worker as `{}` (see plugin-loader.ts), so it
+        // never carries a usable `approvalReactorSlackIds` on a multi-company
+        // install.
+        const config = await loadCompanyConfig(ctx, companyId, "approve slash command");
+        if (!config) {
+          await respondEphemeral(ctx, responseUrl, {
+            text: ":warning: Slack is not fully configured for this workspace — command ignored.",
+          });
+          break;
+        }
+        await handleApproveCommand(ctx, companyId, responseUrl, arg, userId, config);
         break;
+      }
       case "acp": {
         const acpText = parts.slice(1).join(" ");
-        await handleAcpSlashCommand(ctx, pluginToken, {
+        const scope = await resolveInteractionScope(ctx, companyId, "acp slash command");
+        if (!scope) {
+          await respondEphemeral(ctx, responseUrl, {
+            text: ":warning: Slack credentials are not available for this workspace — command ignored.",
+          });
+          break;
+        }
+        await handleAcpSlashCommand(ctx, scope.token, {
           channel: channelId,
           threadTs,
           text: acpText,
@@ -509,10 +735,34 @@ async function handleSlashCommand(
   }
 }
 
+/**
+ * Best-effort read of this company's dashboard base URL, for cosmetic links.
+ *
+ * Never `pluginConfig`: that is the setup()-time bootstrap snapshot which the
+ * host always hands the worker as `{}` on a multi-company install, so
+ * `pluginConfig.paperclipBaseUrl` is `undefined` on every such install — which
+ * shipped a URL-less button on the status card and rendered a literal
+ * `undefined` as the link target in the help card.
+ *
+ * Cosmetic-only, so unlike `resolveInteractionScope` this degrades instead of
+ * refusing: `/clip status` and `/clip help` are read-only and still useful
+ * without a dashboard link, so an unreadable or unset config returns `null`
+ * and the caller omits the link rather than failing the command.
+ */
+async function resolveCompanyBaseUrl(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<string | null> {
+  const config = await loadCompanyConfig(ctx, companyId, "dashboard link lookup");
+  const base = config?.paperclipBaseUrl?.trim();
+  return base ? base.replace(/\/+$/, "") : null;
+}
+
 async function handleStatusCommand(
   ctx: PluginContext,
   companyId: string,
   responseUrl: string,
+  baseUrl: string | null,
 ): Promise<void> {
   const agents = await ctx.agents.list({ companyId, limit: 100, offset: 0 });
   const activeAgents = agents.filter(
@@ -551,17 +801,24 @@ async function handleStatusCommand(
           { type: "mrkdwn", text: `*Recent Completions*\n${issueSummary}` },
         ],
       },
-      {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "View Dashboard" },
-            url: pluginConfig.paperclipBaseUrl,
-            action_id: "view_dashboard",
-          },
-        ],
-      },
+      // Omitted entirely when this company has no readable dashboard URL: a
+      // Block Kit button with no `url` renders as a dead control, which is a
+      // worse answer than not offering the button at all.
+      ...(baseUrl
+        ? [
+            {
+              type: "actions",
+              elements: [
+                {
+                  type: "button",
+                  text: { type: "plain_text", text: "View Dashboard" },
+                  url: baseUrl,
+                  action_id: "view_dashboard",
+                },
+              ],
+            },
+          ]
+        : []),
     ],
   });
 }
@@ -569,6 +826,7 @@ async function handleStatusCommand(
 async function handleHelpCommand(
   ctx: PluginContext,
   responseUrl: string,
+  baseUrl: string | null,
 ): Promise<void> {
   await respondEphemeral(ctx, responseUrl, {
     text: "Available /clip commands",
@@ -595,15 +853,21 @@ async function handleHelpCommand(
           ].join("\n"),
         },
       },
-      {
-        type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: `<${pluginConfig.paperclipBaseUrl}|Open Paperclip Dashboard>`,
-          },
-        ],
-      },
+      // Omitted when this company has no readable dashboard URL, rather than
+      // interpolating an undefined base into the link target.
+      ...(baseUrl
+        ? [
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: `<${baseUrl}|Open Paperclip Dashboard>`,
+                },
+              ],
+            },
+          ]
+        : []),
     ],
   });
 }
@@ -684,6 +948,7 @@ async function handleApproveCommand(
   responseUrl: string,
   approvalId: string,
   slackUserId: string,
+  config: SlackPluginConfig,
 ): Promise<void> {
   if (!approvalId) {
     await respondEphemeral(ctx, responseUrl, {
@@ -697,7 +962,7 @@ async function handleApproveCommand(
     });
     return;
   }
-  if (!slackUserId || !isAuthorizedReactor(slackUserId)) {
+  if (!slackUserId || !isAuthorizedReactor(slackUserId, config)) {
     await respondEphemeral(ctx, responseUrl, {
       text: slackUserId
         ? `:warning: <@${slackUserId}> is not on the approval allowlist - command ignored.`
@@ -946,6 +1211,133 @@ async function resolveCompanyJobScope(
   return { config, token };
 }
 
+const WATCH_QUEUE_MAX = 100;
+
+/**
+ * Drain one company's watch-event queue and process the batch.
+ *
+ * The drain is an atomic swap — take the queue and reset it in one locked step,
+ * then do the slow work outside the lock. Reading, awaiting `checkWatches` and
+ * only then writing `[]` destroys every event that arrives while `checkWatches`
+ * is invoking agents and posting to Slack (BLO-23143, Ally finding 2 on #996).
+ *
+ * Emptying the queue up front means a `checkWatches` failure would drop the
+ * batch, so it is put back. That re-queue is itself `ctx.state` I/O against the
+ * backend that just failed, and `checkWatches` swallows every per-watch error
+ * internally — so the only failures that reach it come from the watch-registry
+ * state calls, i.e. it runs almost exclusively when the backend is unhealthy.
+ * An unguarded re-queue therefore rethrows on exactly the occasions it exists to
+ * handle, and the batch is gone (BLO-28764).
+ *
+ * **Delivery guarantee: at-most-once, and it is the re-queue condition that
+ * makes it true — not the absence of a retry.** The watch-registry calls that
+ * are `checkWatches`'s only escaping failures sit on *both* sides of the paid
+ * side effects: the registry read precedes them, the registry write follows
+ * them. Re-queueing on the second kind restores a batch whose agents have
+ * already been invoked and whose Slack messages have already been posted, so
+ * the next tick pays for them again. That is at-least-once on a path that
+ * spends money, and it is reachable from a telemetry blip alone
+ * (BLO-29663, Ally on #1374).
+ *
+ * So `checkWatches` distinguishes the two and this function re-queues only the
+ * first. Three outcomes, all bounded here rather than escaping to the caller:
+ *
+ * - Backend unhealthy for the whole tick: the swap's `set([])` fails too, so the
+ *   queue is never emptied and the batch survives untouched. Nothing is lost.
+ * - Swap completed, then failure *before* anything was delivered: nothing has
+ *   been paid for, so the batch is re-queued ahead of whatever arrived
+ *   meanwhile and retried on the next tick.
+ * - Swap completed, then failure *after* delivery
+ *   (`WatchesAlreadyDeliveredError`): the batch is deliberately **not**
+ *   re-queued. Any of its events that had not yet matched a watch are lost, and
+ *   that is the price of the guarantee — logged at `error` with the company id,
+ *   the delivered count and the event count, never silently. Retrying instead
+ *   would duplicate real agent invocations and real Slack posts, which is the
+ *   larger harm and the one the caller cannot undo.
+ */
+async function drainAndCheckWatches(
+  ctx: PluginContext,
+  token: string,
+  companyId: string,
+): Promise<void> {
+  const queueKey = {
+    scopeKind: "company" as const,
+    scopeId: companyId,
+    stateKey: "recent-watch-events",
+  };
+  const recentEvents = await withStateLock(
+    watchQueueLockKey(companyId),
+    async () => {
+      const recentEventsRaw = await ctx.state.get(queueKey);
+      const drained = Array.isArray(recentEventsRaw)
+        ? (recentEventsRaw as Array<{
+            eventType: string;
+            payload: Record<string, unknown>;
+          }>)
+        : [];
+      if (drained.length > 0) await ctx.state.set(queueKey, []);
+      return drained;
+    },
+  );
+  if (recentEvents.length === 0) return;
+  try {
+    await checkWatches(ctx, token, companyId, recentEvents);
+  } catch (err) {
+    if (err instanceof WatchesAlreadyDeliveredError) {
+      // Agents were invoked and Slack was posted to before this threw. The
+      // batch is unrecoverable by design: re-queueing it would buy back the
+      // undelivered tail at the price of duplicating everything already
+      // delivered (BLO-29663).
+      ctx.logger.error(
+        "check-watches failed after delivering; batch dropped rather than re-queued to avoid duplicate agent invocations",
+        {
+          companyId,
+          deliveredCount: err.delivered,
+          droppedEventCount: recentEvents.length,
+          err: err.cause ?? err,
+        },
+      );
+      return;
+    }
+    try {
+      await withStateLock(watchQueueLockKey(companyId), async () => {
+        const currentRaw = await ctx.state.get(queueKey);
+        const current = Array.isArray(currentRaw)
+          ? (currentRaw as typeof recentEvents)
+          : [];
+        // Keep the head, not the tail, on overflow. The whole point of this
+        // block is to preserve the drained batch, and `slice(-N)` would discard
+        // precisely that in favour of whatever arrived during the failed run.
+        const restored = [...recentEvents, ...current];
+        if (restored.length > WATCH_QUEUE_MAX) {
+          // The one case where the cap actually bites, and it bites hardest
+          // here: a full re-queue discards everything that arrived during the
+          // failed run. Silent truncation at a known-lossy point reads as
+          // "nothing was dropped" (BLO-29663).
+          ctx.logger.warn(
+            "re-queued watch batch exceeds the queue cap; dropping the newest events",
+            {
+              companyId,
+              droppedEventCount: restored.length - WATCH_QUEUE_MAX,
+              queueMax: WATCH_QUEUE_MAX,
+            },
+          );
+        }
+        await ctx.state.set(queueKey, restored.slice(0, WATCH_QUEUE_MAX));
+      });
+      ctx.logger.error(
+        "check-watches failed for company; re-queued its events",
+        { companyId, err },
+      );
+    } catch (requeueErr) {
+      ctx.logger.error(
+        "check-watches failed for company and its drained events could not be re-queued; batch lost",
+        { companyId, droppedEventCount: recentEvents.length, err, requeueErr },
+      );
+    }
+  }
+}
+
 // --- Plugin definition ---
 const plugin = definePlugin({
   async setup(ctx) {
@@ -953,6 +1345,21 @@ const plugin = definePlugin({
     const config = rawConfig as unknown as SlackPluginConfig;
     pluginCtx = ctx;
     pluginConfig = config;
+    // Deliberately NOT converted to a per-delivery call, unlike the two
+    // `paperclipBaseUrl` reads on the slash-command path. `setBaseUrl` mutates
+    // a module-level global in formatters.ts (`dashboardBase`) that twelve URL
+    // builders read, so calling it per delivery would let two concurrent
+    // deliveries race and stamp company A's dashboard host into company B's
+    // message — converting a cosmetic wrong-host default into exactly the
+    // cross-tenant leak this change exists to remove.
+    //
+    // Left as-is because it is correct where it fires: `bootstrapCompanyId` is
+    // set only on a single-company install, which is the one case where this
+    // snapshot carries that company's real value. On a multi-company install
+    // it never fires and the formatters keep their localhost default, which is
+    // wrong-but-inert. Making those links correct per company means threading
+    // the base URL through the formatter signatures — a wider refactor tracked
+    // separately, not smuggled into a credential-scoping fix.
     if (config.paperclipBaseUrl) {
       setBaseUrl(config.paperclipBaseUrl);
     }
@@ -974,98 +1381,109 @@ const plugin = definePlugin({
       const companies = await listTargetCompanies(ctx);
       let posted = false;
       for (const company of companies) {
-        // Check the flag before resolving anything. Secret resolution draws on
-        // a shared budget, so a company that has the digest switched off should
-        // not cost one every day just to be skipped.
-        if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
-        const scope = await resolveCompanyJobScope(
-          ctx,
-          company.id,
-          "daily-digest",
-        );
-        if (!scope) continue;
-        const { config, token } = scope;
-        const channelId = await resolveChannel(
-          ctx,
-          company.id,
-          config.defaultChannelId,
-        );
-        if (!channelId) continue;
-        const issues = await ctx.issues.list({
-          companyId: company.id,
-          limit: 200,
-          offset: 0,
-        });
-        const now = new Date();
-        const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        let tasksCompleted = 0;
-        let tasksCreated = 0;
-        for (const issue of issues) {
-          const updated = new Date(issue.updatedAt);
-          const created = new Date(issue.createdAt);
-          if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
-          if (created >= dayAgo) tasksCreated++;
-        }
-        const agents = await ctx.agents.list({
-          companyId: company.id,
-          limit: 100,
-          offset: 0,
-        });
-        const agentsActive = agents.filter(
-          (a) => a.status === "active" || a.status === "running",
-        ).length;
-        const dateKey = now.toISOString().slice(0, 10);
-        const dailyCost = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        });
-        const totalCost = dailyCost
-          ? String((dailyCost as number).toFixed(2))
-          : "0.00";
-        const topAgentCosts = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-        });
-        let topAgent = "";
-        if (topAgentCosts && typeof topAgentCosts === "object") {
-          const costs = topAgentCosts as Record<string, number>;
-          let maxCost = 0;
-          for (const [name, cost] of Object.entries(costs)) {
-            if (cost > maxCost) {
-              maxCost = cost;
-              topAgent = name;
+        // Each company's whole body is isolated: an unreachable Slack channel,
+        // a revoked token or a failing host call for one tenant must not abort
+        // the loop and silently deny every later tenant its digest (BLO-23143,
+        // Ally finding 1 on #996).
+        try {
+          // Check the flag before resolving anything. Secret resolution draws on
+          // a shared budget, so a company that has the digest switched off should
+          // not cost one every day just to be skipped.
+          if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
+          const scope = await resolveCompanyJobScope(
+            ctx,
+            company.id,
+            "daily-digest",
+          );
+          if (!scope) continue;
+          const { config, token } = scope;
+          const channelId = await resolveChannel(
+            ctx,
+            company.id,
+            config.defaultChannelId,
+          );
+          if (!channelId) continue;
+          const issues = await ctx.issues.list({
+            companyId: company.id,
+            limit: 200,
+            offset: 0,
+          });
+          const now = new Date();
+          const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          let tasksCompleted = 0;
+          let tasksCreated = 0;
+          for (const issue of issues) {
+            const updated = new Date(issue.updatedAt);
+            const created = new Date(issue.createdAt);
+            if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
+            if (created >= dayAgo) tasksCreated++;
+          }
+          const agents = await ctx.agents.list({
+            companyId: company.id,
+            limit: 100,
+            offset: 0,
+          });
+          const agentsActive = agents.filter(
+            (a) => a.status === "active" || a.status === "running",
+          ).length;
+          const dateKey = now.toISOString().slice(0, 10);
+          const dailyCost = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          });
+          const totalCost = dailyCost
+            ? String((dailyCost as number).toFixed(2))
+            : "0.00";
+          const topAgentCosts = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          });
+          let topAgent = "";
+          if (topAgentCosts && typeof topAgentCosts === "object") {
+            const costs = topAgentCosts as Record<string, number>;
+            let maxCost = 0;
+            for (const [name, cost] of Object.entries(costs)) {
+              if (cost > maxCost) {
+                maxCost = cost;
+                topAgent = name;
+              }
             }
           }
+          await postMessage(
+            ctx,
+            token,
+            channelId,
+            formatDailyDigest({
+              tasksCompleted,
+              tasksCreated,
+              agentsActive,
+              totalCost,
+              topAgent,
+            }),
+          );
+          posted = true;
+          // Clean up previous day's cost state
+          const yesterday = new Date(now.getTime() - 86400000)
+            .toISOString()
+            .slice(0, 10);
+          await ctx.state.delete({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyCost(yesterday),
+          });
+          await ctx.state.delete({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
+          });
+        } catch (err) {
+          ctx.logger.error(
+            "Daily digest failed for company; continuing with remaining companies",
+            { companyId: company.id, err },
+          );
         }
-        await postMessage(
-          ctx,
-          token,
-          channelId,
-          formatDailyDigest({
-            tasksCompleted,
-            tasksCreated,
-            agentsActive,
-            totalCost,
-            topAgent,
-          }),
-        );
-        posted = true;
-        // Clean up previous day's cost state
-        const yesterday = new Date(now.getTime() - 86400000)
-          .toISOString()
-          .slice(0, 10);
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(yesterday),
-        });
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
-        });
       }
       if (posted) {
         ctx.logger.info("Daily digest posted to Slack");
@@ -1084,36 +1502,46 @@ const plugin = definePlugin({
       if (cost <= 0) return;
       if (!(await isDailyDigestEnabled(ctx, event.companyId))) return;
       const dateKey = new Date().toISOString().slice(0, 10);
-      const currentTotal = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.dailyCost(dateKey),
-      });
-      await ctx.state.set(
-        {
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        },
-        ((currentTotal as number | null) ?? 0) + cost,
-      );
       const agentName = String(
         payload.agentName ?? payload.name ?? event.entityId,
       );
-      const agentCosts = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-      });
-      const costs = (agentCosts as Record<string, number> | null) ?? {};
-      costs[agentName] = (costs[agentName] ?? 0) + cost;
-      await ctx.state.set(
-        {
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+      // Both accumulators are read-modify-write against a state API with no
+      // atomic increment, so concurrent cost events for one company would
+      // otherwise each read the same total and the last `set` would win —
+      // silently under-reporting the digest (BLO-23143, Ally finding 3 on
+      // #996). Serialize the whole sequence per company+day.
+      await withStateLock(
+        costAccumulatorLockKey(event.companyId, dateKey),
+        async () => {
+          const currentTotal = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          });
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: STATE_KEYS.dailyCost(dateKey),
+            },
+            ((currentTotal as number | null) ?? 0) + cost,
+          );
+          const agentCosts = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          });
+          const costs = (agentCosts as Record<string, number> | null) ?? {};
+          costs[agentName] = (costs[agentName] ?? 0) + cost;
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+            },
+            costs,
+          );
         },
-        costs,
       );
     });
     // Collect watchable events before the bootstrap credential gate below.
@@ -1133,33 +1561,40 @@ const plugin = definePlugin({
     ] as const;
     for (const eventType of watchableEvents) {
       ctx.events.on(eventType, async (event) => {
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        // Keep last 100 events
-        recentEvents.push({
-          eventType: event.eventType,
-          payload: event.payload as Record<string, unknown>,
-        });
-        if (recentEvents.length > 100) {
-          recentEvents.splice(0, recentEvents.length - 100);
-        }
-        await ctx.state.set(
-          {
+        // Append under the company's queue lock. Without it two events
+        // arriving together both read the same array and the second `set`
+        // drops the first (BLO-23143, Ally finding 2 on #996). The drain in
+        // check-watches takes the same lock, so an append can never be
+        // clobbered by the queue reset either.
+        await withStateLock(watchQueueLockKey(event.companyId), async () => {
+          const recentEventsRaw = await ctx.state.get({
             scopeKind: "company",
             scopeId: event.companyId,
             stateKey: "recent-watch-events",
-          },
-          recentEvents,
-        );
+          });
+          const recentEvents = Array.isArray(recentEventsRaw)
+            ? (recentEventsRaw as Array<{
+                eventType: string;
+                payload: Record<string, unknown>;
+              }>)
+            : [];
+          // Keep last 100 events
+          recentEvents.push({
+            eventType: event.eventType,
+            payload: event.payload as Record<string, unknown>,
+          });
+          if (recentEvents.length > WATCH_QUEUE_MAX) {
+            recentEvents.splice(0, recentEvents.length - WATCH_QUEUE_MAX);
+          }
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: "recent-watch-events",
+            },
+            recentEvents,
+          );
+        });
       });
     }
     // Escalation timeout job
@@ -1251,35 +1686,25 @@ const plugin = definePlugin({
     ctx.jobs.register("check-watches", async () => {
       const companies = await listTargetCompanies(ctx);
       for (const company of companies) {
-        const scope = await resolveCompanyJobScope(
-          ctx,
-          company.id,
-          "check-watches",
-        );
-        if (!scope) continue;
-        const { token } = scope;
-        // Get recent events from state (populated by event listeners below)
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        if (recentEvents.length > 0) {
-          await checkWatches(ctx, token, company.id, recentEvents);
-          // Clear after processing
-          await ctx.state.set(
-            {
-              scopeKind: "company",
-              scopeId: company.id,
-              stateKey: "recent-watch-events",
-            },
-            [],
+        // Each company's whole body is isolated, exactly as daily-digest above
+        // is. The atomic swap and the re-queue inside drainAndCheckWatches are
+        // both `ctx.state` I/O, so an unhealthy state backend throws here — and
+        // an unguarded throw aborts the loop and skips every later tenant for
+        // this tick. That is the same bug class as Ally finding 1 on #996,
+        // reintroduced on this path by the very fix for finding 2 (BLO-28764).
+        try {
+          const scope = await resolveCompanyJobScope(
+            ctx,
+            company.id,
+            "check-watches",
+          );
+          if (!scope) continue;
+          const { token } = scope;
+          await drainAndCheckWatches(ctx, token, company.id);
+        } catch (err) {
+          ctx.logger.error(
+            "check-watches failed for company; continuing with remaining companies",
+            { companyId: company.id, err },
           );
         }
       }
@@ -1336,11 +1761,15 @@ const plugin = definePlugin({
       );
       return;
     }
-    pluginToken = token;
-    // Resolve Slack signing secret for webhook signature verification
+    // Signing secret for the in-process thread-message router below, which
+    // (like `token`/`config` in this closure) is still bootstrap-snapshot
+    // scoped — see the BLO-21083 follow-up note near `resolveInteractionScope`.
+    // The webhook entrypoint (`onWebhook`) resolves its own signing secret
+    // per delivery via `resolveCompanySigningSecret` and does not use this.
+    let routerSigningSecret: string | null = null;
     if (config.slackSigningSecretRef) {
       try {
-        slackSigningSecret = await ctx.secrets.resolve(
+        routerSigningSecret = await ctx.secrets.resolve(
           config.slackSigningSecretRef,
         );
       } catch {
@@ -1957,7 +2386,7 @@ const plugin = definePlugin({
           // still-unresolved approval; otherwise treat it as ordinary thread
           // chatter and stop (approval threads do not route to agents).
           const freeformUserId = p.slackUserId ? String(p.slackUserId) : "";
-          if (!freeformUserId || !isAuthorizedReactor(freeformUserId)) return;
+          if (!freeformUserId || !isAuthorizedReactor(freeformUserId, config)) return;
           const resolvedLock = await ctx.state.get({
             scopeKind: "company",
             scopeId: event.companyId,
@@ -1969,7 +2398,7 @@ const plugin = definePlugin({
             stateKey: STATE_KEYS.approvalPending(approvalId),
           });
           if (resolvedLock || pendingDecision) return;
-          if (!canProcessMutatingApprovalWebhook("freeform_revision")) return;
+          if (!canProcessMutatingApprovalWebhook("freeform_revision", routerSigningSecret)) return;
           await requestRevision(ctx, token, {
             companyId: event.companyId,
             approvalId,
@@ -2006,9 +2435,9 @@ const plugin = definePlugin({
           return;
         }
         // parsed.kind === "decision"
-        if (!canProcessMutatingApprovalWebhook("thread_command")) return;
+        if (!canProcessMutatingApprovalWebhook("thread_command", routerSigningSecret)) return;
         const slackUserId = p.slackUserId ? String(p.slackUserId) : "";
-        if (!slackUserId || !isAuthorizedReactor(slackUserId)) {
+        if (!slackUserId || !isAuthorizedReactor(slackUserId, config)) {
           const text = slackUserId
             ? `:warning: <@${slackUserId}> is not on the approval allowlist — command ignored.`
             : ":warning: Command ignored because Slack did not include a user id, so approval allowlist membership could not be verified.";
@@ -2170,11 +2599,39 @@ const plugin = definePlugin({
   // Webhook handler (Slack Events, Slash Commands, Interactivity)
   // =========================================================================
   async onWebhook(input: PluginWebhookInput) {
-    // Verify Slack request signature (skip for url_verification challenge)
+    // Verify Slack request signature (skip for url_verification challenge).
+    // Resolved from THIS delivery's own company, never the setup() bootstrap
+    // snapshot — see resolveCompanySigningSecret.
     const body = input.parsedBody as Record<string, unknown> | undefined;
     const isVerificationChallenge = body?.type === "url_verification";
+    let signingSecret: string | null = null;
     if (!isVerificationChallenge) {
-      const sig = verifySlackSignature(input.headers, input.rawBody);
+      const resolution = await resolveCompanySigningSecret(
+        pluginCtx,
+        input.companyId,
+      );
+      // Fail closed: "configured but unreadable" is NOT "not configured". If
+      // we cannot read the secret we cannot distinguish a genuine Slack
+      // delivery from a forged one, so drop it rather than processing an
+      // unverified request on a public endpoint. Only the explicit `none`
+      // case keeps the documented skip-if-unconfigured behavior.
+      if (resolution.kind === "unavailable") {
+        if (shouldEmitSigWarn()) {
+          pluginCtx.logger.warn(
+            "Rejected webhook: Slack signing secret unavailable, cannot verify signature",
+            {
+              reason: resolution.reason,
+              companyId: input.companyId,
+              endpointKey: input.endpointKey,
+              requestId: input.requestId,
+              suppressedSince: takeSuppressedSigCount(),
+            },
+          );
+        }
+        return;
+      }
+      signingSecret = resolution.kind === "secret" ? resolution.value : null;
+      const sig = verifySlackSignature(input.headers, input.rawBody, signingSecret);
       if (!sig.ok) {
         // Throttle: at most one rejection warn per 5s (public endpoint).
         if (shouldEmitSigWarn()) {
@@ -2198,18 +2655,24 @@ const plugin = definePlugin({
       if (body?.type === "event_callback") {
         const event = body.event as Record<string, unknown> | undefined;
         if (event?.type === "file_shared") {
-          const companyId = await resolveTargetCompanyId(pluginCtx);
           const fileId = String(event.file_id ?? "");
           const channelId = String(event.channel_id ?? "");
-          if (companyId && fileId && channelId) {
-            await processMediaFile(
+          if (fileId && channelId) {
+            const scope = await resolveInteractionScope(
               pluginCtx,
-              pluginToken,
-              companyId,
-              fileId,
-              channelId,
-              "",
+              input.companyId,
+              "file_shared event",
             );
+            if (scope) {
+              await processMediaFile(
+                pluginCtx,
+                scope.token,
+                input.companyId,
+                fileId,
+                channelId,
+                "",
+              );
+            }
           }
         }
         // Approval interactions via emoji reaction (Phase 1)
@@ -2217,12 +2680,12 @@ const plugin = definePlugin({
           event?.type === "reaction_added" ||
           event?.type === "reaction_removed"
         ) {
-          await handleReactionEvent(event);
+          await handleReactionEvent(event, input.companyId, signingSecret);
         }
         // Thread replies → emit the synthetic thread_message event so the
         // existing router (and approval thread-command parsing) activates.
         if (event?.type === "message") {
-          await handleInboundMessageEvent(event);
+          await handleInboundMessageEvent(event, input.companyId);
         }
       }
     }
@@ -2231,11 +2694,11 @@ const plugin = definePlugin({
       const slash = parseSlashCommand(input.rawBody);
       if (
         slash.text.trim().split(/\s+/)[0]?.toLowerCase() === "approve" &&
-        !canProcessMutatingApprovalWebhook("slash_command")
+        !canProcessMutatingApprovalWebhook("slash_command", signingSecret)
       ) {
         return;
       }
-      await handleSlashCommand(pluginCtx, input.rawBody);
+      await handleSlashCommand(pluginCtx, input.rawBody, input.companyId);
       return;
     }
     // Interactivity (button clicks)
@@ -2251,28 +2714,39 @@ const plugin = definePlugin({
         ? String(user.id ?? user.username ?? "unknown")
         : "unknown";
 
+      // Resolved once per delivery: every branch below either checks the
+      // approval allowlist against this company's config or calls a Slack API
+      // that needs this company's bot token, so there is no cheaper path that
+      // would justify deferring it per-branch (contrast handleReactionEvent,
+      // where most reactions never reach an approval card at all).
+      const companyId = input.companyId;
+      const scope = await resolveInteractionScope(
+        pluginCtx,
+        companyId,
+        "interactivity",
+      );
+      if (!scope) return;
+
       // --- Revision modal submit (view_submission) ---
       // The "Request changes" button opens a modal; submitting it lands here as
       // a view_submission (not a block_actions). Route it to the revision path.
       if (payload.type === "view_submission") {
-        if (!canProcessMutatingApprovalWebhook("interactivity")) return;
+        if (!canProcessMutatingApprovalWebhook("interactivity", signingSecret)) return;
         const submission = parseRevisionModalSubmission(payload);
         if (!submission) return;
         try {
-          if (!userId || !isAuthorizedReactor(userId)) {
+          if (!userId || !isAuthorizedReactor(userId, scope.config)) {
             // No response_url for a modal submit; the unauthorized case is
             // dropped silently (the allowlist is also enforced when the modal
             // is opened, so reaching here requires a mid-flight allowlist change).
             return;
           }
-          const companyId = await resolveTargetCompanyId(pluginCtx);
-          if (!companyId) return;
-          await submitRevisionModal(pluginCtx, pluginToken, {
+          await submitRevisionModal(pluginCtx, scope.token, {
             companyId,
             slackUserId: userId,
             metadata: submission.metadata,
             reason: submission.reason,
-            paperclipBaseUrl: pluginConfig.paperclipBaseUrl,
+            paperclipBaseUrl: scope.config.paperclipBaseUrl,
           });
         } catch (err) {
           pluginCtx.logger.warn("Failed to handle revision modal submit", {
@@ -2296,20 +2770,18 @@ const plugin = definePlugin({
       if (!actionValue) return;
       // --- Approval buttons ---
       if (actionId === "approval_approve" || actionId === "approval_reject") {
-        if (!canProcessMutatingApprovalWebhook("interactivity")) return;
+        if (!canProcessMutatingApprovalWebhook("interactivity", signingSecret)) return;
         const approved = actionId === "approval_approve";
         const decision = approved ? "approve" : "reject";
         try {
-          if (!userId || !isAuthorizedReactor(userId)) {
-            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          if (!userId || !isAuthorizedReactor(userId, scope.config)) {
+            await respondToAction(pluginCtx, scope.token, responseUrl, {
               text: userId
                 ? `:warning: <@${userId}> is not on the approval allowlist - action ignored.`
                 : ":warning: Action ignored because Slack did not include a user id.",
             });
             return;
           }
-          const companyId = await resolveTargetCompanyId(pluginCtx);
-          if (!companyId) return;
           const result = await resolvePaperclipApproval(pluginCtx, {
             companyId,
             approvalId: actionValue,
@@ -2317,14 +2789,14 @@ const plugin = definePlugin({
             slackUserId: userId,
           });
           if (result.applied === false) {
-            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+            await respondToAction(pluginCtx, scope.token, responseUrl, {
               text: `:information_source: Approval \`${actionValue}\` was already resolved server-side.`,
             });
             return;
           }
           await respondToAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             responseUrl,
             formatApprovalResolved(actionValue, approved, userId),
           );
@@ -2345,10 +2817,10 @@ const plugin = definePlugin({
       // on view_submission (handled above). The card's channel/ts ride through
       // private_metadata so the revision comment lands on the right thread.
       if (actionId === "approval_request_changes") {
-        if (!canProcessMutatingApprovalWebhook("interactivity")) return;
+        if (!canProcessMutatingApprovalWebhook("interactivity", signingSecret)) return;
         try {
-          if (!userId || !isAuthorizedReactor(userId)) {
-            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          if (!userId || !isAuthorizedReactor(userId, scope.config)) {
+            await respondToAction(pluginCtx, scope.token, responseUrl, {
               text: userId
                 ? `:warning: <@${userId}> is not on the approval allowlist - action ignored.`
                 : ":warning: Action ignored because Slack did not include a user id.",
@@ -2377,7 +2849,7 @@ const plugin = definePlugin({
           }
           await openModal(
             pluginCtx,
-            pluginToken,
+            scope.token,
             triggerId,
             buildRevisionModalView({
               approvalId: actionValue,
@@ -2393,8 +2865,6 @@ const plugin = definePlugin({
         }
         return;
       }
-      const companyId = await resolveTargetCompanyId(pluginCtx);
-      if (!companyId) return;
       // --- Escalation buttons ---
       if (
         actionId === "escalation_use_suggested" ||
@@ -2425,7 +2895,7 @@ const plugin = definePlugin({
           }
           await respondToAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             responseUrl,
             formatEscalationResolved(actionValue, actionId, userId),
           );
@@ -2446,7 +2916,7 @@ const plugin = definePlugin({
           const approved = actionId === "handoff_approve";
           await handleHandoffAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             companyId,
             actionValue,
             approved,
@@ -2454,7 +2924,7 @@ const plugin = definePlugin({
           );
           const emoji = approved ? ":white_check_mark:" : ":x:";
           const label = approved ? "Approved" : "Rejected";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          await respondToAction(pluginCtx, scope.token, responseUrl, {
             text: `Handoff ${label} by ${userId}`,
             blocks: [
               {
@@ -2484,7 +2954,7 @@ const plugin = definePlugin({
             actionId === "discussion_continue" ? "continue" : "stop";
           await handleDiscussionAction(
             pluginCtx,
-            pluginToken,
+            scope.token,
             companyId,
             actionValue,
             discAction,
@@ -2493,7 +2963,7 @@ const plugin = definePlugin({
           const emoji =
             discAction === "continue" ? ":arrow_forward:" : ":stop_button:";
           const label = discAction === "continue" ? "Resumed" : "Stopped";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
+          await respondToAction(pluginCtx, scope.token, responseUrl, {
             text: `Discussion ${label} by ${userId}`,
             blocks: [
               {
@@ -2521,7 +2991,7 @@ const plugin = definePlugin({
         const approved = actionId === "command_step_approve";
         const emoji = approved ? ":white_check_mark:" : ":x:";
         const label = approved ? "Approved" : "Rejected";
-        await respondToAction(pluginCtx, pluginToken, responseUrl, {
+        await respondToAction(pluginCtx, scope.token, responseUrl, {
           text: `Step ${label} by ${userId}`,
           blocks: [
             {

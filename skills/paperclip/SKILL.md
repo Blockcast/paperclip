@@ -547,13 +547,24 @@ Full endpoint table (company imports/exports, OpenClaw invites, company skills, 
 
 ## Searching Issues
 
-Use the `q` query parameter on the issues list endpoint to search across titles, identifiers, descriptions, and comments:
+Use the `q` query parameter on the issues list endpoint to match against titles, identifiers, descriptions, and comment bodies:
 
 ```
 GET /api/companies/{companyId}/issues?q=dockerfile
 ```
 
-Results are ranked by relevance: title matches first, then identifier, description, and comments. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
+**`q` is a literal contiguous substring match, not a search query.** This is intended behaviour, not a bug (BLO-27561): the server runs a single case-insensitive `ILIKE '%q%'` per field. It does not tokenize, so there is no AND-of-terms, no stemming, and no fuzzy matching — the entire string you pass must appear verbatim and contiguously in one field. `%` and `_` are escaped and matched literally.
+
+The practical consequence, and the reason it is called out here:
+
+```
+q=dependency-waits and provider   → matches "…dependency-waits and provider-capacity…"
+q=dependency-waits provider       → NO MATCH (one interior word removed)
+```
+
+**This makes multi-word `q` unsafe as a duplicate check before filing.** An empty result for a descriptive phrase is not evidence that no such issue exists — and the more precisely you describe your finding, the more certain the false clear. Query **one distinctive token** (an error code, a ticket identifier, a rare noun, a symbol name), run several single-token queries rather than one phrase, and read the results yourself.
+
+Results are ordered by a coarse field-precedence bucket — title, then identifier, then **comment body, then description** — followed by the normal priority/activity ordering. Note that comment matches rank *above* description matches. This is field precedence, not a relevance score: there is no term-frequency or similarity component. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
 
 ## Full Reference
 

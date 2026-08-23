@@ -54,6 +54,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueParkedDispositionInput,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -3517,6 +3518,14 @@ const issueListSelect = {
   monitorAttemptCount: issues.monitorAttemptCount,
   monitorNotes: issues.monitorNotes,
   monitorScheduledBy: issues.monitorScheduledBy,
+  // BLO-27912: the deliberate-park disposition, projected alongside the monitor columns it
+  // is modelled on. Listed explicitly because a park has to stay VISIBLE — suppressing the
+  // liveness invariants silently is the failure this disposition exists to avoid, so the
+  // list surface must be able to show that a row is parked, by whom, why, and until when.
+  parkedUntil: issues.parkedUntil,
+  parkedReason: issues.parkedReason,
+  parkedByAgentId: issues.parkedByAgentId,
+  parkedAt: issues.parkedAt,
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
@@ -4546,6 +4555,10 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      // BLO-27912: keep this call site in step with the recovery sweep's own projection in
+      // recovery/service.ts. A park invisible to one of the two classifier callers would
+      // suppress in one surface and re-fire in the other.
+      parkedUntil: issue.parkedUntil,
       hasExternalWaitOwner: externalWaitFromDescription(issue.description ?? null) !== null,
     })),
     relations: graphRelations,
@@ -5068,6 +5081,34 @@ function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
     };
     const constraint = maybe.constraint ?? maybe.constraint_name;
     if (maybe.code === "23505" && constraint === "issues_active_alert_escalation_cover_uq") {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
+}
+
+// PEN-2395: matches a 23505 violation of `issues_open_routine_execution_uq`
+// (partial unique index on companyId+originKind+originId+originFingerprint,
+// scoped to open routine-execution rows that hold an `execution_run_id`).
+// Walks the `cause` chain because drizzle wraps the driver error in a
+// `DrizzleQueryError`, so the constraint name is never on the outermost error.
+// Exported for unit test only: this predicate is what keeps the guard's blast
+// radius to one constraint, so a silent widening here would convert unrelated
+// failures into 409s.
+export function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = maybe.constraint ?? maybe.constraint_name;
+    if (maybe.code === "23505" && constraint === "issues_open_routine_execution_uq") {
       return true;
     }
     current = maybe.cause;
@@ -6477,6 +6518,108 @@ export function issueService(db: Db) {
     return adopted;
   }
 
+  // PEN-2395: `assertCheckoutOwner` answers an authorization question, but it
+  // answers it by *writing* — it adopts an unowned, stale, or dead-run checkout
+  // so the calling run can proceed. Every one of those adoption writes (three
+  // `adopt*` helpers plus the inline refresh after `clearStaleExecutionLock`)
+  // sets `execution_run_id`, and that column is in the predicate of the
+  // `issues_open_routine_execution_uq` partial index. So when a sibling open
+  // execution of the same routine already holds the dispatch lock, the adoption
+  // write raises 23505 and the caller's mutation dies with a 500 — including a
+  // no-op payload, because this runs in the permission check before the payload
+  // is even looked at, which is what made the row read as permanently
+  // unwritable rather than merely locked.
+  //
+  // Adoption is opportunistic self-healing, so losing it is not a server error.
+  // Two cases, and only one of them is a real conflict:
+  //
+  //   - the sibling's lock is held by a TERMINAL run. Nothing owns the work; the
+  //     row is just littered. The index does not check run liveness, so a dead
+  //     run's lock would otherwise wedge every other execution of that routine
+  //     indefinitely — the "permanently unwritable" reading. Reap it and retry.
+  //   - the sibling's lock is held by a LIVE run. Fail the way the explicit
+  //     checkout path already does: a 409 naming the issue that holds the lock.
+  function withOpenRoutineExecutionLockGuard<Result>(
+    fn: (id: string, actorAgentId: string, actorRunId: string | null) => Promise<Result>,
+  ) {
+    return async (id: string, actorAgentId: string, actorRunId: string | null): Promise<Result> => {
+      try {
+        return await fn(id, actorAgentId, actorRunId);
+      } catch (error) {
+        if (!isOpenRoutineExecutionLockConflict(error)) throw error;
+
+        const findLockOwner = async () => {
+          const target = await db
+            .select({ companyId: issues.companyId })
+            .from(issues)
+            .where(eq(issues.id, id))
+            .then((rows) => rows[0] ?? null);
+          return target
+            ? await findOpenRoutineExecutionLockOwnerForIssue(db, target.companyId, id)
+            : null;
+        };
+
+        let owner = await findLockOwner();
+        // Retry once when nothing actually holds the key any more. Two ways to
+        // learn that, and they are the same fact reported differently:
+        //
+        //   - the lookup comes back EMPTY. `findLockOwner` re-queries live state,
+        //     so an empty result means the sibling's run ended and released
+        //     `execution_run_id` in the window between the failed write and this
+        //     select. That is the live moment PEN-2368 recovered on. Treating it
+        //     as a conflict would emit a 409 naming no owner at all — a real
+        //     state reported through the wrong channel, which is the very
+        //     failure mode this guard exists to remove.
+        //   - the lock is held by a TERMINAL run. Nothing owns the work, the row
+        //     is just littered, so reap it and take the key.
+        if (owner === null || (await clearExecutionRunIfTerminal(owner.id))) {
+          if (owner) {
+            // Reaping calls `restoreCheckoutPromotedStatus`, so an authorization
+            // check on THIS issue can change a SIBLING issue's status. That is
+            // legitimate self-healing, but invisible — log it so the change is
+            // attributable when someone later asks why the owner moved.
+            logger.info(
+              {
+                issueId: id,
+                reapedOwnerIssueId: owner.id,
+                reapedOwnerIdentifier: owner.identifier,
+                reapedExecutionRunId: owner.executionRunId,
+                actorAgentId,
+                actorRunId,
+              },
+              "reaped a routine dispatch lock held by a terminal run on a sibling issue",
+            );
+          }
+          try {
+            return await fn(id, actorAgentId, actorRunId);
+          } catch (retryError) {
+            // Retried at most once. A second conflict means a live sibling took
+            // the key in between, so report that rather than letting a raw 23505
+            // escape as the 500 this whole guard exists to prevent.
+            if (!isOpenRoutineExecutionLockConflict(retryError)) throw retryError;
+            owner = await findLockOwner();
+          }
+        }
+
+        // A null owner that survived the retry is contention, not ownership:
+        // say so rather than asserting an owner the response cannot name.
+        throw conflict(
+          owner
+            ? "Routine execution already locked by another open issue"
+            : "Routine execution dispatch lock is contended; retry the request",
+          {
+            issueId: id,
+            ownerIssueId: owner?.id ?? null,
+            ownerIdentifier: owner?.identifier ?? null,
+            ownerExecutionRunId: owner?.executionRunId ?? null,
+            actorAgentId,
+            actorRunId,
+          },
+        );
+      }
+    };
+  }
+
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -6746,6 +6889,12 @@ export function issueService(db: Db) {
   const service = {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    // Exposed for the PATCH /issues/:id terminal-status transition (BLO-23206),
+    // which is the one drain site that lives in the routes layer rather than
+    // here. Cancelling an issue previously ended at most ONE run — the running
+    // one — leaving queued/scheduled_retry rows to be claimed against the dead
+    // issue on the next 30s scheduler tick.
+    cancelStaleIssueContextRuns,
 
     list: async (companyId: string, filters?: IssueFilters) => {
       if (filters?.attention === "blocked") {
@@ -9153,6 +9302,7 @@ export function issueService(db: Db) {
             issueData.projectId = ledProjects[0].id;
           }
         }
+        await assertValidIssueProject(companyId, issueData.projectId, tx);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
         // default-settings block and the assignee-environment-promotion block
@@ -9543,6 +9693,18 @@ export function issueService(db: Db) {
          * down, not a fall-through.
          */
         suppressRoutineSchedulerFailureHeartbeat?: boolean;
+        /**
+         * BLO-27912: record or clear a deliberate-park disposition. The four `parked_*`
+         * columns are server-owned and derived here rather than accepted flat, for the
+         * same reason the `monitor_*` columns are derived from `executionPolicy.monitor`:
+         * `parkedByAgentId` must be stamped from the actor and `parkedAt` from the server
+         * clock, so a caller cannot forge either.
+         *
+         *   object  -> park (all four set)
+         *   null    -> un-park (all four cleared)
+         *   absent  -> leave the park exactly as it is
+         */
+        parkedDisposition?: IssueParkedDispositionInput | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -9567,6 +9729,7 @@ export function issueService(db: Db) {
         expectedCurrentExecutionState,
         expectedCurrentExecutionPolicy,
         suppressRoutineSchedulerFailureHeartbeat,
+        parkedDisposition,
         ...issueData
       } = data;
 
@@ -9732,6 +9895,25 @@ export function issueService(db: Db) {
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
+      }
+      // BLO-27912: derive the four server-owned park columns. Mirrors the monitor
+      // derivation in issue-execution-policy.ts: an object arms, an explicit `null`
+      // clears, and an absent key touches nothing. All four move together so a row can
+      // never carry a deadline with no reason, or a reason with no deadline — the
+      // liveness classifier keys suppression on `parkedUntil` alone, so a half-written
+      // park would suppress without stating why.
+      if (parkedDisposition !== undefined) {
+        if (parkedDisposition === null) {
+          patch.parkedUntil = null;
+          patch.parkedReason = null;
+          patch.parkedByAgentId = null;
+          patch.parkedAt = null;
+        } else {
+          patch.parkedUntil = new Date(parkedDisposition.until);
+          patch.parkedReason = parkedDisposition.reason;
+          patch.parkedByAgentId = actorAgentId ?? null;
+          patch.parkedAt = new Date();
+        }
       }
 
       const nextAssigneeAgentId =
@@ -10832,7 +11014,11 @@ export function issueService(db: Db) {
       });
     },
 
-    assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
+    assertCheckoutOwner: withOpenRoutineExecutionLockGuard(async (
+      id: string,
+      actorAgentId: string,
+      actorRunId: string | null,
+    ) => {
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
       const loadCurrent = () =>
@@ -11124,7 +11310,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
       });
-    },
+    }),
 
     // BLO-22666: the `in_review` counterpart of assertCheckoutOwner, kept as a
     // separate entry point rather than widening that one. assertCheckoutOwner is

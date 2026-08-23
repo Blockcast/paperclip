@@ -1465,11 +1465,118 @@ describe("issue execution policy transitions", () => {
 
       expect(result.patch.executionPolicy).toBeNull();
       expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorNotes).toBeNull();
       expect(result.patch.executionState).toMatchObject({
         monitor: {
           status: "cleared",
           clearReason: "done",
         },
+      });
+    });
+
+    // PEN-1995: the notes column describes the ARMED monitor. Every clear path
+    // nulled nextCheckAt/wakeRequestedAt but left the notes, so a retired
+    // monitor's notes survived as live-looking instructions — observed
+    // outliving their monitor by four days and being read as an active gate.
+    it("nulls monitorNotes when the monitor is cleared by removing it from the policy", () => {
+      const armed = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Read lastHeartbeatAt after the capacity reset",
+          scheduledBy: "assignee",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: armed,
+          executionState: {
+            status: "idle",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "scheduled",
+              nextCheckAt: "2026-04-11T12:30:00.000Z",
+              lastTriggeredAt: null,
+              attemptCount: 0,
+              notes: "Read lastHeartbeatAt after the capacity reset",
+              scheduledBy: "assignee",
+              clearedAt: null,
+              clearReason: null,
+            },
+          },
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: "Read lastHeartbeatAt after the capacity reset",
+          monitorScheduledBy: "assignee",
+        },
+        // Monitor removed from the policy: the manual-clear path.
+        policy: null,
+        previousPolicy: armed,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorNotes).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "cleared",
+          clearReason: "manual",
+          // Audit copy is retained on the state, so nulling the column is lossless.
+          notes: "Read lastHeartbeatAt after the capacity reset",
+        },
+      });
+    });
+
+    it("nulls monitorNotes when a monitor is cleared as invalid for the issue state", () => {
+      const armed = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Poll the deploy",
+          scheduledBy: "assignee",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: armed,
+          executionState: null,
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: "Poll the deploy",
+          monitorScheduledBy: "assignee",
+        },
+        policy: armed,
+        previousPolicy: armed,
+        // A monitor cannot be held on a blocked issue; this is the invalid-state clear.
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorNotes).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "cleared" },
       });
     });
 

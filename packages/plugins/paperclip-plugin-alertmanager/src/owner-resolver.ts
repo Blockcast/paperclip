@@ -6,6 +6,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { getAgentWorkEligibility } from "@paperclipai/shared";
 import {
   ASSIGNEE_OVERRIDE_ANNOTATION,
   ASSIGNEE_OVERRIDE_LABEL,
@@ -138,8 +139,9 @@ export async function resolveOwnerUserId(
 
 /**
  * Combined helper: resolve email from alert → cached Paperclip user id.
- * Returns undefined when nothing matches; the caller should still create the
- * issue (unassigned) per §7.7 step 5.
+ * Returns undefined when nothing matches; the caller then falls back to the
+ * configured named agent (`resolveFallbackAgentId`) rather than creating an
+ * ownerless issue.
  */
 export async function resolveAssigneeUserId(
   ctx: Pick<PluginContext, "users" | "state" | "logger">,
@@ -165,6 +167,78 @@ export async function resolveAssigneeUserId(
   }
   const assigneeUserId = await resolveOwnerUserId(ctx, resolution.email);
   return { assigneeUserId, assigneeAgentId: undefined, resolution };
+}
+
+/**
+ * Last resort in the owner chain: the configured named fallback agent.
+ *
+ * Matching is by exact agent *name* (case-insensitively, after trimming) —
+ * operators configure a name because agent ids are opaque UUIDs that nobody
+ * can review in a config diff. That makes the lookup ambiguous in principle,
+ * so anything other than exactly one match is refused: zero matches means the
+ * name is wrong, and more than one means the caller cannot know which agent
+ * the operator meant. Both return `undefined`, and the caller fails closed
+ * rather than filing an ownerless issue.
+ *
+ * Returning `undefined` for blank/absent config is deliberate: an instance
+ * with no `fallbackAgentName` at all is a misconfiguration for this plugin,
+ * and the caller — not this resolver — decides how loudly to fail.
+ *
+ * A name match is not enough: the agent must also be *invokable*. The host's
+ * `agents.list` filters only `terminated` (`server/src/services/agents.ts`), so
+ * `paused` and `pending_approval` agents come back and could be the single
+ * match — and `ctx.agents.invoke` throws on exactly those. Assigning one
+ * produces a non-null `assigneeAgentId` pointing at an agent that can never be
+ * woken, which is the BLO-27435/27436/27438 harm wearing a disguise: the issue
+ * still goes unactioned and still auto-cancels, while the post-deploy check for
+ * ownerless issues passes clean. Eligibility is delegated to
+ * `getAgentWorkEligibility` rather than re-listing statuses here, so this stays
+ * in step with what `invoke` actually enforces (including an invalid reporting
+ * chain, which blocks invoke just as surely as a paused status). The whole
+ * company snapshot is already in hand, which is exactly the input it needs.
+ */
+export async function resolveFallbackAgentId(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  fallbackAgentName: string | undefined,
+): Promise<string | undefined> {
+  const target = fallbackAgentName?.trim().toLowerCase();
+  if (!target) return undefined;
+  // One unwindowed company-wide snapshot rather than a paged scan: the host's
+  // list is unordered, so paging could drift a match across page boundaries
+  // and turn a stable config into an intermittent ownerless-issue bug.
+  const agents = await ctx.agents.list({ companyId });
+  const nameMatches = agents.filter(
+    (agent) => agent.name.trim().toLowerCase() === target,
+  );
+  const evaluated = nameMatches.map((agent) => ({
+    agent,
+    eligibility: getAgentWorkEligibility({ agent, agents }),
+  }));
+  const invokable = evaluated.filter((entry) => entry.eligibility.invokable);
+  if (invokable.length !== 1) {
+    if (evaluated.length > 0 && invokable.length === 0) {
+      // Distinct from the unmatched case on purpose: "your fallback agent is
+      // paused" and "your fallback agent name is wrong" need different fixes,
+      // and an operator reading `resolved to 0 agents` would go hunting for a
+      // typo that isn't there.
+      const reasons = evaluated
+        .map(
+          (entry) =>
+            `${entry.agent.id}=${entry.eligibility.invokabilityReason}`,
+        )
+        .join(", ");
+      ctx.logger.warn(
+        `Fallback agent "${fallbackAgentName}" matched ${evaluated.length} agent(s) but none are invokable (${reasons}); refusing ownerless issue creation`,
+      );
+      return undefined;
+    }
+    ctx.logger.warn(
+      `Fallback agent "${fallbackAgentName}" resolved to ${invokable.length} invokable agents; refusing ownerless issue creation`,
+    );
+    return undefined;
+  }
+  return invokable[0]?.agent.id;
 }
 
 function normalizeEmail(email: string): string {

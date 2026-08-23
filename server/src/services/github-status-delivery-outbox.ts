@@ -43,10 +43,6 @@ export type EnqueueGithubCommitStatusDeliveryInput = {
   prUrl?: string | null;
 };
 
-function isRetryableGithubHttpStatus(status: number): boolean {
-  return status === 408 || status === 409 || status === 429 || status >= 500;
-}
-
 function normalizeCommitStatusState(value: string): GitHubCommitStatusState {
   return value === "error" || value === "failure" || value === "pending" || value === "success"
     ? value
@@ -58,6 +54,29 @@ function nextAttemptAt(attempt: number, now: Date): Date {
   return new Date(now.getTime() + delayMs);
 }
 
+/**
+ * An evidence-fetch failure is never evidence about the PR — on ANY surface.
+ *
+ * Only the two enumerated *configuration* faults below are permanent. Every
+ * transport error and every HTTP status, on every present or future evidence
+ * surface, is retryable. Stating the rule once as the default (rather than as a
+ * per-surface carve-out) is deliberate: a surface added later cannot inherit a
+ * permanent-failure default by omission.
+ *
+ * BLO-28920 established this for `comments_*` but left `reviews_*` classified by
+ * HTTP status, so a bare 403/404/401 there reached failPermanentDelivery and
+ * permanently dropped the gate-status delivery. That asymmetry was exactly
+ * backwards: a `reviews_*` failure means the predicate read NOTHING — strictly
+ * less information than a `comments_*` failure, which by construction only
+ * happens after the reviews surface has already been read conclusively. So the
+ * surface we knew least about was the one that failed permanently.
+ *
+ * The cost of that is a stall, not a dropped log line. Dropping the delivery
+ * means the required context is never posted, and a required context with no
+ * status reads "Expected — waiting for status" and blocks the PR indefinitely
+ * until a human intervenes (BLO-28968). Retrying is bounded by MAX_ATTEMPTS, so
+ * the fail-safe direction costs at most a few extra reads.
+ */
 function classifyReviewerEvidenceError(error: string): { retryable: boolean; reason: string } {
   if (error === "no_bot_login") return { retryable: false, reason: "missing_pr_reviewer_bot_login" };
   if (error === "no_token") {
@@ -65,24 +84,11 @@ function classifyReviewerEvidenceError(error: string): { retryable: boolean; rea
       ? { retryable: true, reason: "github_app_token_unavailable" }
       : { retryable: false, reason: "missing_github_app_credentials" };
   }
-  // BLO-28920: the comments surface is consulted only AFTER the reviews surface
-  // has been read conclusively, so a permission/404 blip there is not evidence
-  // about this PR at all. Classifying it by HTTP status would send a transient
-  // 403/404 to failPermanentDelivery, permanently dropping the gate-status
-  // delivery so the required context is never posted — a silent death on the
-  // incident path. Retry instead; the reviews half is already known to be clean.
-  if (error.startsWith("comments_")) {
-    return { retryable: true, reason: `reviewer_evidence_${error}` };
-  }
-  const status = Number(error.match(/_(\d{3})$/)?.[1]);
-  if (Number.isInteger(status)) {
-    return {
-      retryable: isRetryableGithubHttpStatus(status),
-      reason: `reviewer_evidence_${error}`,
-    };
-  }
   return { retryable: true, reason: `reviewer_evidence_${error}` };
 }
+
+/** Test-only: assert the classification rule directly (BLO-28968). */
+export { classifyReviewerEvidenceError as _classifyReviewerEvidenceError };
 
 function deliveryClaimWhere(row: DeliveryRow) {
   return and(

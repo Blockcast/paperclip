@@ -25,7 +25,7 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId } from "./owner-resolver.js";
+import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
   ORIGIN_KIND,
@@ -286,6 +286,56 @@ function suppressionExpiryLabel(
 }
 
 /**
+ * Per-delivery memo for the named-fallback owner lookup.
+ *
+ * `resolveFallbackAgentId` is one unwindowed `ctx.agents.list({ companyId })`,
+ * and that call is not cheap on the host side: `server/src/services/agents.ts`
+ * issues two full-table selects for the company (the filtered rows plus the org
+ * chain) and then `hydrateAgentSpend`, which aggregates `costEvents` for the
+ * current month. The fallback rung is also the *common* path — by BLO-20576's
+ * own numbers most firing alerts resolve to no owner — so without a memo every
+ * alert in a batch pays it, and a storm is exactly when the batch is largest
+ * and the host is busiest.
+ *
+ * The resolution is constant for a given `(companyId, fallbackAgentName)`
+ * within a single `handleWebhook` call, so caching it there collapses N host
+ * round-trips to one without changing any semantics. Scoping the memo to the
+ * delivery (rather than the module) is what keeps it correct: a config edit or
+ * an agent being paused takes effect on the very next delivery.
+ */
+export type FallbackOwnerMemo = Map<string, Promise<string | undefined>>;
+
+function resolveFallbackAgentIdMemoized(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  fallbackAgentName: string | undefined,
+  memo: FallbackOwnerMemo | undefined,
+): Promise<string | undefined> {
+  if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
+  // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
+  // operator-supplied config, so any single-character separator could be
+  // embedded in a name to collide with another company's key.
+  const key = JSON.stringify([companyId, fallbackAgentName ?? ""]);
+  const cached = memo.get(key);
+  if (cached) return cached;
+  const pending = resolveFallbackAgentId(
+    ctx,
+    companyId,
+    fallbackAgentName,
+  ).catch((err: unknown) => {
+    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to
+    // `undefined` and IS cached — it is a config fact, stable for the delivery.
+    // A *throw* is a transient host fault, and caching it would let one failed
+    // `agents.list` poison every remaining alert in the batch, converting a
+    // blip that previously cost one alert into a whole-delivery failure.
+    memo.delete(key);
+    throw err;
+  });
+  memo.set(key, pending);
+  return pending;
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -294,6 +344,7 @@ export async function handleFiring(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  fallbackOwnerMemo?: FallbackOwnerMemo,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -489,6 +540,35 @@ export async function handleFiring(
     return;
   }
 
+  // Creation floor. Deliberately placed *after* the re-fire branch above and
+  // before creation only: an `info` alert that already owns an issue (filed
+  // before this floor existed) keeps being refreshed, and `handleResolved`
+  // still closes it. Gating the whole delivery instead would strand those
+  // legacy issues open forever, which is the resolution behavior this ticket
+  // explicitly excludes from scope.
+  //
+  // Reads the `severity` already computed above rather than re-reading the
+  // label: two normalizations of one value drift the moment either changes.
+  if (severity.trim().toLowerCase() === "info") {
+    ctx.logger.info(
+      `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+    } catch (metricErr) {
+      // Best-effort: this drop is permanent policy, already decided. Letting a
+      // metrics outage throw would mark the delivery failed and make
+      // Alertmanager retry an alert we will drop identically every time.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record issue floor metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    return;
+  }
+
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
   const { assigneeUserId, assigneeAgentId, resolution } =
@@ -516,6 +596,52 @@ export async function handleFiring(
       : routeHasAssigneeUserId
         ? routeAssigneeUserId
         : assigneeUserId;
+  // Last rung of the owner chain. Before this, an unresolved owner fell through
+  // to a conditional spread on `issues.create` that simply omitted the field —
+  // so the alert landed as an ownerless issue, which nobody is woken for and
+  // which auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438 all did
+  // exactly this on 2026-08-17). Assigning a configured named agent is what
+  // makes an intake issue actionable.
+  const fallbackAssigneeAgentId =
+    createAssigneeAgentId || createAssigneeUserId
+      ? undefined
+      : await resolveFallbackAgentIdMemoized(
+          ctx,
+          companyId,
+          config.fallbackAgentName,
+          fallbackOwnerMemo,
+        );
+  const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
+  if (!finalAssigneeAgentId && !createAssigneeUserId) {
+    // Fail closed. Throwing (rather than returning) is deliberate: this is a
+    // *configuration* fault, not a property of the alert, so the delivery is
+    // genuinely incomplete. handleWebhook collects the fingerprint and answers
+    // non-2xx, Alertmanager keeps retrying, and the alert survives until an
+    // operator fixes `fallbackAgentName`. Returning here would acknowledge the
+    // delivery and destroy the alert silently — the BLO-20467 loss class.
+    ctx.logger.warn(
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, unmatched, ambiguous, or matched only non-invokable agents; refusing ownerless issue creation`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+        alertname,
+        severity,
+      });
+    } catch (metricErr) {
+      // Unlike the policy drops above, this path throws either way — so the
+      // wrapper is not about the delivery outcome, it is about the message.
+      // An unwrapped metrics outage would replace the explicit
+      // "Fallback owner resolution failed" below with an opaque metrics error,
+      // degrading the diagnostic for exactly the misconfiguration this path
+      // exists to surface.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record fallback owner failure metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    throw new Error(
+      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
+    );
+  }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
@@ -524,9 +650,11 @@ export async function handleFiring(
       ? `agent:${resolution.agentId}`
       : resolution.email ?? "(none)";
   const resolvedAssignee =
-    createAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
+    finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
+    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}${
+      fallbackAssigneeAgentId ? " (named fallback)" : ""
+    }`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -551,7 +679,7 @@ export async function handleFiring(
     ...(routeGoalId ? { goalId: routeGoalId } : {}),
     ...(routeStatus ? { status: routeStatus } : {}),
     ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-    ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
+    ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
     ...(billingCode ? { billingCode } : {}),
   });
 
@@ -559,7 +687,7 @@ export async function handleFiring(
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
     assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeAgentId: finalAssigneeAgentId ?? null,
     alertname,
     severity,
     firstSeenAt: alert.startsAt || nowIso,
@@ -583,7 +711,7 @@ export async function handleFiring(
     annotations: alert.annotations,
     paperclipIssueId: issue.id,
     assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeAgentId: finalAssigneeAgentId ?? null,
     reFired: false,
   });
 
@@ -823,6 +951,10 @@ export async function handleWebhook(
   }
 
   const failedFingerprints: string[] = [];
+  // Scoped to this delivery — see FallbackOwnerMemo. A storm is the case that
+  // matters: without it, every ownerless alert in the batch repeats the same
+  // company-wide agent lookup.
+  const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
 
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
@@ -833,10 +965,98 @@ export async function handleWebhook(
     }
 
     const status = effectiveAlertStatus(alert, body);
+    const alertname = alert.labels.alertname ?? "unknown";
     try {
+      // Rule-level `paperclip_issue` policy, honored before handleFiring so it
+      // precedes every issue-creating and state-writing side effect on the
+      // firing path, at any severity — an opted-out rule must not create an
+      // issue, refresh one, or bank a suppression anchor. Accepted from either
+      // labels or annotations because Prometheus rules commonly carry policy in
+      // annotations.
+      //
+      // BOTH gates it produces — the malformed drop and the opt-out — are
+      // evaluated here but applied only inside the firing branch, and
+      // deliberately do NOT gate the resolved path; see the dispatch below for
+      // why. `paperclip_issue` is a *creation* policy: nothing on the resolved
+      // path reads it, so neither a malformed value nor an explicit opt-out has
+      // any business suppressing the close of an issue that was already filed.
+      const policyValues = [
+        alert.labels.paperclip_issue,
+        alert.annotations.paperclip_issue,
+      ];
+      const malformedPolicy = policyValues.some(
+        (value) => value !== undefined && typeof value !== "string",
+      );
+      const optedOut = policyValues.some(
+        (value) =>
+          typeof value === "string" && value.trim().toLowerCase() === "false",
+      );
       if (status === "firing") {
-        await handleFiring(ctx, config, alert);
+        if (malformedPolicy) {
+          // A non-string here means the rule author wrote something structurally
+          // wrong. Refusing to guess is safer than coercing: `paperclip_issue`
+          // decides whether a page becomes an issue at all.
+          ctx.logger.warn(
+            `paperclip-plugin-alertmanager: dropping alert ${alert.fingerprint} because paperclip_issue must be a string when provided`,
+          );
+          try {
+            await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+              alertname,
+            });
+          } catch (metricErr) {
+            ctx.logger.error(
+              `paperclip-plugin-alertmanager: failed to record malformed alert metric for ${alert.fingerprint}: ${String(metricErr)}`,
+            );
+          }
+          continue;
+        }
+        if (optedOut) {
+          ctx.logger.info(
+            `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
+          );
+          try {
+            await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+              alertname,
+            });
+          } catch (metricErr) {
+            // Best-effort for the same reason as the creation floor: a permanent
+            // policy drop must stay acknowledged even if telemetry is down.
+            ctx.logger.error(
+              `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
+            );
+          }
+          continue;
+        }
+        await handleFiring(ctx, config, alert, fallbackOwnerMemo);
       } else if (status === "resolved") {
+        // Reached with BOTH policy gates above deliberately bypassed — this
+        // path is creation-only, exactly like the severity floor in
+        // handleFiring, and for the same reason. Gating it would strand any
+        // issue the rule had *already* filed: handleResolved would never run,
+        // so `state.resolvedAt` would stay null and the issue would never reach
+        // done/cancelled. `advanceIssueLadder` (escalation.ts:377,380) returns
+        // early only on resolvedAt, escalationComplete, or a terminal issue
+        // status — none of which would ever happen — so the sweep would keep
+        // advancing the ladder, waking agents, and eventually file a
+        // [user-cover] board escalation for an alert that had already resolved.
+        //
+        // That is the modal adoption path for the opt-out, not an exotic one:
+        // operators opt a rule out *because* it has been filing noisy issues,
+        // so a tracked issue almost always exists at that moment. An opt-out is
+        // meant to stop new noise, not to wedge the issues it already made.
+        //
+        // The malformed gate reaches the same conclusion by a shorter route: a
+        // non-string `paperclip_issue` is a defect in a *creation* policy, and
+        // dropping the resolve over it would convert a typo — a YAML `true`
+        // where a `"true"` was meant — into a permanently escalating issue for
+        // an alert that has cleared. The firing-side drop already refuses to
+        // guess what the author meant; the resolve never had to guess, because
+        // it does not read the value at all.
+        //
+        // This does not weaken the "no state side effect" guarantee for a rule
+        // opted out from the start: with no issue ever filed there is no state
+        // row, and handleResolved drops an unknown fingerprint without touching
+        // anything.
         await handleResolved(ctx, config, alert);
       } else {
         ctx.logger.warn(

@@ -56,6 +56,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
@@ -1615,6 +1616,28 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Approval-gate reconciler (BLO-29359). Closes board approval cards whose
+  // external GitHub gate has terminated and announces the death on every linked
+  // issue. Worker-tier only and idempotent: each close re-checks that the card is
+  // still undecided, so a human decision landing mid-sweep always wins. Requires
+  // GitHub App credentials — without them every lookup defers and the sweep is a
+  // no-op, so it is gated on them rather than logging once per pass.
+  if (config.approvalGateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Approval-gate reconciler disabled: GitHub App credentials are not configured (BLO-29359)",
+      );
+    } else {
+      const { startApprovalGateReconciler } = await import("./services/approval-gate-reconciler.js");
+      logger.info(
+        { intervalMinutes: config.approvalGateReconcilerIntervalMinutes },
+        "Approval-gate reconciler enabled (BLO-29359)",
+      );
+      startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
+    }
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1693,6 +1716,29 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
+
+  // Audit the configured lifecycle hook commands against this image (BLO-28782).
+  // These commands live in instance settings, not code, so a refactor that
+  // deletes the module they point at leaves build + tests green and the hook
+  // silently dead — that is exactly how `quotaExhaustedCmd` spent 44+ days
+  // firing MODULE_NOT_FOUND across 11 agents. Non-fatal and post-listen: a
+  // dead hook must not stop the instance serving, it must stop being silent.
+  //
+  // Workers tier only, matching every other boot reconciler here. Two reasons
+  // (BLO-28872 review): the worker is the tier that actually spawns the hook, so
+  // its filesystem view is the authoritative one for a volume-mounted path; and
+  // running on every replica of every tier multiplied the per-company activity
+  // writes by the replica count on every boot — flooding, on a crashloop, the
+  // exact operator surface this audit exists to make legible.
+  if (config.paperclipNodeRole !== "api") {
+    void auditConfiguredHookCommandsOnBoot({
+      db: db as any,
+      getGeneral: () => instanceSettingsService(db).getGeneral(),
+      listCompanyIds: () => instanceSettingsService(db).listCompanyIds(),
+    }).catch((err) => {
+      logger.warn({ err }, "lifecycle hook command audit failed (non-fatal)");
+    });
+  }
 
   // Auto-install bundled plugins (idempotent — skips if already installed).
   // Skipped on the API tier: /api/plugins/install hits pluginWorkerManager

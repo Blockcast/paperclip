@@ -108,6 +108,12 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Per-instance config. e.g. { team: { 'platform': 'alice@blockcast.net' } }. Resolution chain documented in the plugin spec §7.7.",
       },
+      fallbackAgentName: {
+        type: "string",
+        title: "Fallback agent name",
+        description:
+          "Exact agent name assigned when no label, annotation, or issue route resolves an owner. Missing, unmatched, or ambiguous configuration fails closed: the alert creates no issue rather than an ownerless one.",
+      },
       issueRouteMap: {
         type: "object",
         title: "Issue route map (label-key → value → issue fields)",

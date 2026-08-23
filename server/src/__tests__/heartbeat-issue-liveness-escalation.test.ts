@@ -67,7 +67,10 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
-import { DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS } from "../services/recovery/service.ts";
+import {
+  DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS,
+  DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+} from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -214,6 +217,96 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
 
     return { companyId, managerId, coderId, blockedIssueId, blockerIssueId };
+  }
+
+  /**
+   * The prior-escalation fixture, in one place (BLO-27676 review).
+   *
+   * Several tests here need "an escalation for this incident that has already
+   * been closed", differing only in status and two timestamps. Inlining the
+   * ~16-field row once per test had already cost two rounds of correcting the
+   * same fixture detail across a subset of the copies; one shape means the next
+   * such correction is one edit, and each caller shows only the timestamps that
+   * are actually its subject.
+   *
+   * `parentId` is the LEAF blocker because production parents these rows there
+   * (asserted by "creates one manager escalation, preserves blockers, and
+   * records owner selection"). It is NOT in the suppressor's lookup predicate,
+   * so it changes nothing about what these tests prove -- it keeps the fixture
+   * the same shape as the rows the code under test actually produces.
+   */
+  async function seedResolvedEscalation(input: {
+    companyId: string;
+    managerId: string;
+    blockerIssueId: string;
+    incidentKey: string;
+    /** The timestamp the suppressor compares: `coalesce(completedAt, updatedAt)`. */
+    resolvedAt: Date;
+    /** Default "done". "cancelled" re-arms immediately, by design. */
+    status?: "done" | "cancelled";
+    /**
+     * Defaults to `resolvedAt`. Pass `null` to pin the `coalesce` fallback (a
+     * row closed without a `completedAt`); pass `updatedAt` separately to model
+     * a post-close edit that bumps it above the resolution.
+     */
+    completedAt?: Date | null;
+    updatedAt?: Date;
+    /**
+     * When set, backdate the leaf blocker's activity to this instant.
+     *
+     * Timing here is easy to get wrong: the escalation gate ALSO requires the
+     * leaf to have been quiet for the staleness threshold, so "touch the leaf"
+     * cannot mean "touch it just now" -- that suppresses the finding through a
+     * different gate and the test proves nothing. A touch meant to re-arm this
+     * suppressor must fall after `resolvedAt` and still >=24h before `now`.
+     */
+    leafQuietSince?: Date;
+    title?: string;
+    identifier?: string;
+    issueNumber?: number;
+  }) {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId: input.companyId,
+      title: input.title ?? "Closed escalation",
+      status: input.status ?? "done",
+      priority: "high",
+      parentId: input.blockerIssueId,
+      assigneeAgentId: input.managerId,
+      issueNumber: input.issueNumber ?? 3,
+      identifier: input.identifier ?? "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: input.incidentKey,
+      createdAt: new Date(input.resolvedAt.getTime() - 30 * 60 * 1000),
+      updatedAt: input.updatedAt ?? input.resolvedAt,
+      completedAt: input.completedAt === undefined ? input.resolvedAt : input.completedAt,
+    });
+    if (input.leafQuietSince) {
+      // Backdate `createdAt` with the activity, so the leaf does not end up with
+      // `updatedAt` earlier than `createdAt` -- an ordering no real row can have,
+      // and one that `issueCreatedAtGte` (always injected via heartbeat.ts) could
+      // start tripping over for reasons unrelated to this behaviour.
+      await db
+        .update(issues)
+        .set({
+          lastActivityAt: input.leafQuietSince,
+          updatedAt: input.leafQuietSince,
+          createdAt: new Date(input.leafQuietSince.getTime() - 60 * 60 * 1000),
+        })
+        .where(eq(issues.id, input.blockerIssueId));
+    }
+    return id;
+  }
+
+  /** The `blocked_by_*` incident key the detector builds for a seeded chain. */
+  function livenessIncidentKey(
+    companyId: string,
+    blockedIssueId: string,
+    blockerIssueId: string,
+    state = "blocked_by_unassigned_issue",
+  ) {
+    return ["harness_liveness", companyId, blockedIssueId, state, blockerIssueId].join(":");
   }
 
   async function seedResolvedDependencyBackstopFixture(opts: {
@@ -825,7 +918,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations).toHaveLength(1);
   });
 
-  it("creates one manager escalation, preserves blockers, and records owner selection", async () => {
+  it("creates one manager escalation without blocking its own source, and records owner selection", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
@@ -858,13 +951,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       ].join(":"),
     });
 
+    // BLO-28618: the escalation must NOT appear in its own source's blocker
+    // set. Writing that edge wedged the source behind a fabricated dependency
+    // nobody works, and closing the row later dropped the source into a
+    // detector-triggering state -- the re-file loop. The real blocker is the
+    // only edge that survives.
     const blockers = await db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.map((row) => row.blockerIssueId).sort()).toEqual(
-      [blockerIssueId, escalations[0]!.id].sort(),
-    );
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockedIssueId));
     expect(comments).toHaveLength(1);
@@ -887,10 +983,25 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         projectWorkspaceSourceIssueId: blockerIssueId,
       },
     });
-    expect(events.some((event) => event.action === "issue.blockers.updated")).toBe(true);
+    expect(events.some((event) => event.action === "issue.blockers.updated")).toBe(false);
+
+    // The source keeps its own status too -- it is not force-flipped to
+    // `blocked`, which is what left sources at `blocked` with an empty blocker
+    // set once the recovery row was closed.
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("blocked");
+    const [leafAfter] = await db.select().from(issues).where(eq(issues.id, blockerIssueId));
+    expect(leafAfter?.status).toBe("todo");
   });
 
-  it("rejects a cycle-forming escalation edge and logs the persisted blocker set", async () => {
+  // Pre-BLO-28618 this asserted the *cycle rejection* fallback: the detector
+  // tried to add the escalation as a blocker of its source, hit the cycle
+  // guard, and fell back to persisting the pre-existing blocker set. The
+  // detector no longer writes that edge at all, so there is no cycle to
+  // reject. Kept as the stronger invariant: with an escalation already open
+  // and the reverse edge already present, reconciliation leaves both the
+  // source's blocker set and its status exactly as it found them.
+  it("never writes the escalation into its own source's blocker set", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain({
       blockerStatus: "backlog",
@@ -946,10 +1057,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         eq(activityLog.entityId, blockedIssueId),
       ))
       .then((rows) => rows.at(-1));
-    expect(blockerEvent?.details).toMatchObject({ blockerIssueIds: [blockerIssueId] });
+    expect(blockerEvent).toBeUndefined();
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("blocked");
   });
 
-  it("does not strand a zero-pre-existing-blocker source in blocked when the escalation edge would cycle", async () => {
+  it("writes no reverse edge when the source already blocks its open escalation", async () => {
     await enableAutoRecovery();
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -975,11 +1089,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       permissions: {},
     });
 
-    // Source issue is in_review with no assignee and no pre-existing
-    // blockers of its own -- the self-referential "in_review_without_action_path"
-    // finding treats the issue as both the source and its own recovery
-    // issue, so this is the shape that hits the cycle fallback with an
-    // empty blockerIds set.
+    // Source issue is in_review with no assignee and no pre-existing blockers
+    // of its own -- the self-referential "in_review_without_action_path"
+    // finding treats the issue as both the source and its own recovery issue.
+    // Before BLO-28618 this shape reached the cycle fallback in
+    // `ensureIssueBlockedByEscalation` with an empty blockerIds set; that
+    // function is gone and no edge is written at all now, so the case is kept
+    // as the stronger invariant -- see the reverse-edge setup below.
     const issueTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
     await db.insert(issues).values({
       id: issueId,
@@ -1017,10 +1133,14 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         issueId,
       ].join(":"),
     });
-    // Craft the cycle: the source issue already blocks the escalation issue
-    // (e.g. left over from an earlier partial recovery), so adding the
-    // reverse edge -- escalation blocks source -- forms a 2-cycle. The
-    // source has no *other* blockers of its own.
+    // The source issue already blocks the escalation issue (e.g. left over from
+    // an earlier partial recovery). Under the old code, adding the reverse edge
+    // -- escalation blocks source -- would have formed a 2-cycle and taken the
+    // cycle fallback. BLO-28618 removed the reverse-edge write entirely, so the
+    // assertions below are now the stronger claim: no edge is added, this
+    // pre-existing edge is left alone, and the source's status is untouched.
+    // `persistedBlockers` staying empty is what would catch a reintroduced
+    // self-blocker edge.
     await db.insert(issueRelations).values({
       companyId,
       issueId,
@@ -1311,59 +1431,62 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
     expect(escalations).toHaveLength(1);
 
-    const blockers = await db
+    // One recovery row is shared by both dependents -- and blocks neither of
+    // them (BLO-28618). Both dependents keep only their real leaf blocker.
+    const escalationEdges = await db
       .select({ blockedIssueId: issueRelations.relatedIssueId })
       .from(issueRelations)
       .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.issueId, escalations[0]!.id)));
-    expect(blockers.map((row) => row.blockedIssueId).sort()).toEqual(
-      [blockedIssueId, secondBlockedIssueId].sort(),
-    );
+    expect(escalationEdges).toEqual([]);
+
+    for (const dependentId of [blockedIssueId, secondBlockedIssueId]) {
+      const blockers = await db
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, dependentId),
+        ));
+      expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
+    }
   });
 
-  it("holds a recently closed matching escalation, then re-escalates after the cooldown", async () => {
+  it("holds a recently closed matching escalation, and keeps holding past the cooldown while the target is unchanged", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
     const now = new Date();
-    const incidentKey = [
-      "harness_liveness",
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    const closedEscalationId = await seedResolvedEscalation({
       companyId,
-      blockedIssueId,
-      "blocked_by_unassigned_issue",
+      managerId,
       blockerIssueId,
-    ].join(":");
-    const closedEscalationId = randomUUID();
-
-    await db.insert(issues).values({
-      id: closedEscalationId,
-      companyId,
-      title: "Closed escalation",
-      status: "done",
-      priority: "high",
-      parentId: blockedIssueId,
-      assigneeAgentId: managerId,
-      issueNumber: 3,
-      identifier: "CLOSED-3",
-      originKind: "harness_liveness_escalation",
-      originId: incidentKey,
-      createdAt: new Date(now.getTime() - 30 * 60 * 1000),
-      updatedAt: now,
+      incidentKey,
+      resolvedAt: now,
+      // No `completedAt`: this row is closed through the `coalesce` fallback.
+      completedAt: null,
     });
 
     const held = await heartbeat.reconcileIssueGraphLiveness({ now });
 
     expect(held.escalationsCreated).toBe(0);
     expect(held.skippedReescalationCooldown).toBe(1);
+    expect(held.skippedUnchangedTarget).toBe(0);
 
-    const result = await heartbeat.reconcileIssueGraphLiveness({
+    // BLO-27676: past the cooldown this used to re-raise unconditionally, which
+    // is what made the class non-terminating -- an unchanged target regenerated
+    // the same leaf fingerprint every ~75 min indefinitely. The leaf here has not
+    // been touched since the escalation resolved, so the report has already been
+    // delivered and nothing about it has changed. Stay silent.
+    const stillHeld = await heartbeat.reconcileIssueGraphLiveness({
       now: new Date(now.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 1),
     });
 
-    expect(result.escalationsCreated).toBe(1);
-    expect(result.existingEscalations).toBe(0);
+    expect(stillHeld.escalationsCreated).toBe(0);
+    expect(stillHeld.skippedUnchangedTarget).toBe(1);
 
-    const openEscalations = await db
-      .select()
+    const escalations = await db
+      .select({ id: issues.id })
       .from(issues)
       .where(
         and(
@@ -1372,20 +1495,477 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
           eq(issues.originId, incidentKey),
         ),
       );
-    expect(openEscalations).toHaveLength(2);
-    const freshEscalation = openEscalations.find((issue) => issue.status !== "done");
-    expect(freshEscalation).toMatchObject({
-      parentId: blockerIssueId,
-      assigneeAgentId: managerId,
-      status: expect.stringMatching(/^(todo|in_progress|done)$/),
+    expect(escalations.map((row) => row.id)).toEqual([closedEscalationId]);
+  });
+
+  it("re-escalates once the leaf target has been touched since the escalation resolved", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatSvc;
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    // Resolve 50h ago, touch the leaf 30h ago: after the resolution (so this
+    // suppressor re-arms) but still >24h quiet (so the finding fires at all).
+    // See `seedResolvedEscalation`'s `leafQuietSince` note for why the second
+    // half matters.
+    const resolvedAt = new Date(now.getTime() - 50 * 60 * 60 * 1000);
+    const touchedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt,
+      leafQuietSince: touchedAt,
     });
 
+    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+
+    // BLO-28618: the re-escalation path creates a fresh row, so it is a second
+    // place the self-blocker edge could be written. The dedicated test above
+    // covers first-time creation; this asserts the same invariant on re-escalation,
+    // where only the pre-existing real blocker may survive.
     const blockers = await db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.some((row) => row.blockerIssueId === closedEscalationId)).toBe(false);
-    expect(blockers.some((row) => row.blockerIssueId === freshEscalation?.id)).toBe(true);
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
+  });
+
+  it("picks the most recently resolved escalation even when an older row was edited after it closed", async () => {
+    // Regression for the sort-key/value-key mismatch (BLO-27676 review): the
+    // query ordered by `updatedAt` but compared `completedAt ?? updatedAt`, so a
+    // post-close edit to an OLDER escalation made it win the sort while
+    // contributing its older resolution timestamp. That fails OPEN -- the leaf
+    // touch then reads as "after the resolution" and the class re-escalates every
+    // sweep, reinstating exactly the loop this suppressor removes.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    // Two resolutions straddling one leaf touch. The leaf is quiet for 50h, so
+    // the finding still fires (>=24h staleness); the newer resolution is 30h old,
+    // so it is outside the 60m cooldown and inside the 7d ceiling.
+    const olderResolvedAt = new Date(now.getTime() - 100 * 60 * 60 * 1000);
+    const leafTouchedAt = new Date(now.getTime() - 50 * 60 * 60 * 1000);
+    const newerResolvedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      title: "Closed escalation (older, edited after close)",
+      resolvedAt: olderResolvedAt,
+      // The post-close edit: a retitle/label/assignee change bumps `updatedAt`
+      // long after `completedAt`. This is what used to win the ORDER BY.
+      updatedAt: new Date(now.getTime() - 60 * 1000),
+    });
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      title: "Closed escalation (most recently resolved)",
+      identifier: "CLOSED-4",
+      issueNumber: 4,
+      resolvedAt: newerResolvedAt,
+      leafQuietSince: leafTouchedAt,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    // The leaf touch predates the LATEST resolution, so the report is already
+    // delivered and nothing has changed since: stay silent.
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.skippedUnchangedTarget).toBe(1);
+  });
+
+  it("re-escalates an untouched leaf once the suppression ceiling has elapsed", async () => {
+    // The target-state gate is what lets this class terminate, but unbounded it
+    // is permanent: the leaf is quiet by construction, so an escalation closed
+    // `done` without giving the leaf an action path would never be re-reported --
+    // a silent hole in a liveness detector. The ceiling bounds it to weekly.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    // Resolved 8d ago, past the 7d ceiling, and the leaf has NOT been touched
+    // since (9d quiet). Without the ceiling this is suppressed forever.
+    const resolvedAt = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 9 * 24 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt,
+      leafQuietSince,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("holds an untouched leaf inside the suppression ceiling", async () => {
+    // Companion to the test above: the ceiling must not be so eager that it
+    // re-opens the ~75 min loop. Same fixture, resolved 30h ago instead of 8d.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    const resolvedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 40 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt,
+      leafQuietSince,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.skippedUnchangedTarget).toBe(1);
+  });
+
+  it("holds a leaf whose escalation closed with completed_at ahead of updated_at at the horizon edge", async () => {
+    // Regression test for the scan bound, not for the suppressor logic.
+    //
+    // The suppressor ORDERS and COMPARES on `coalesce(completed_at, updated_at)`
+    // but must FILTER on bare `updated_at`, because only the bare column is
+    // servable by `issues_company_updated_idx` and the alternative is an
+    // unbounded scan of the company's entire escalation history. Those two
+    // columns are NOT the same instant: `services/issues.ts` stamps `updatedAt`
+    // when it builds its patch and then `applyStatusSideEffects` sets
+    // `completedAt` from a second, later clock read in the same request. So
+    // `completed_at` LEADS `updated_at` on the primary close path -- the
+    // direction that breaks a naive bound.
+    //
+    // This fixture is that row, positioned so the two columns straddle the
+    // horizon: `completed_at` is 5s INSIDE the 7d ceiling (so the target-state
+    // branch must suppress) while `updated_at` is 5s OUTSIDE it. Bounding at
+    // `now - horizon` filters the row out, the suppressor returns null, and the
+    // escalation re-raises -- the loop BLO-27676 closes, through a narrower
+    // door. `LIVENESS_SUPPRESSION_SCAN_SKEW_MS` absorbs the gap.
+    //
+    // Falsified before being trusted: with the skew term removed from
+    // `horizonCutoff` this fails `expected 1 to be +0`.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    const ceilingMs = 7 * 24 * 60 * 60 * 1000;
+    const completedAt = new Date(now.getTime() - ceilingMs + 5_000);
+    const updatedAt = new Date(now.getTime() - ceilingMs - 5_000);
+    // Quiet well before the resolution, so the leaf-activity check cannot be
+    // what decides this test.
+    const leafQuietSince = new Date(now.getTime() - ceilingMs - 24 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      // `resolvedAt` only backdates `createdAt` here; the two columns the
+      // suppressor and the bound read are both passed explicitly.
+      resolvedAt: completedAt,
+      completedAt,
+      updatedAt,
+      leafQuietSince,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.skippedUnchangedTarget).toBe(1);
+  });
+
+  it("falls back to time-only suppression when the target-state gate is disabled", async () => {
+    // Exercises the documented rollback lever: the docblocks on
+    // `findSuppressingResolvedLivenessRecoveryIssue` and
+    // `DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS` both tell a caller to
+    // pass `unchangedTargetSuppressionMs: 0` for pre-BLO-27676 behaviour, and
+    // nothing exercised that path before.
+    //
+    // Scope note, so this is not mistaken for more than it is: this test does
+    // NOT pin the wrapper opts-type fix that made the option reachable. Test
+    // files are not typechecked (`server/tsconfig.json` excludes `src/__tests__`)
+    // and the wrapper spreads `{ ...opts }`, so this passes with or without the
+    // field declared. What pins that is the typechecked production callers under
+    // `src/`. This test pins the BEHAVIOUR of the disable path only.
+    //
+    // Fixture is deliberately the one from "holds an untouched leaf inside the
+    // suppression ceiling" -- resolved 30h ago, leaf quiet 40h, i.e. inside the
+    // 7d ceiling and past the 60m cooldown. That case is held by the target-state
+    // gate and by nothing else, so flipping the gate off flips the outcome.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    const resolvedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 40 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt,
+      leafQuietSince,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now,
+      unchangedTargetSuppressionMs: 0,
+    });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("suppresses nothing when both re-escalation suppressors are disabled", async () => {
+    // The fully-disabled configuration: `cooldownMs <= 0` AND
+    // `unchangedTargetSuppressionMs <= 0`. Guards the early return that skips the
+    // `mostRecentDone` query in that case -- the assertion is behavioural (a row
+    // resolved 90 seconds ago, well inside the default 60m cooldown, still
+    // re-escalates), so the guard cannot be "optimised" into changing behaviour.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    const resolvedAt = new Date(now.getTime() - 90 * 1000);
+    const leafQuietSince = new Date(now.getTime() - 40 * 60 * 60 * 1000);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt,
+      leafQuietSince,
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now,
+      reescalationCooldownMs: 0,
+      unchangedTargetSuppressionMs: 0,
+    });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  it("still holds on the target gate when only the cooldown is disabled", async () => {
+    // The third combination of the two knobs, and the one the docblock sentence
+    // on `findSuppressingResolvedLivenessRecoveryIssue` specifically describes:
+    // "passing 0 no longer disables re-escalation suppression outright, it
+    // disables the weaker of the two". An operator reaching for the old
+    // `reescalationCooldownMs: 0` lever expecting it to turn suppression off
+    // gets the target gate instead, so that sentence is worth pinning.
+    //
+    // Same 90s-resolved fixture as the fully-disabled test above: well inside
+    // the default 60m cooldown, so with the cooldown ON it is held as
+    // "cooldown". With the cooldown OFF the only thing that can hold it is the
+    // target gate, and the leaf has been quiet since before the resolution.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: new Date(now.getTime() - 90 * 1000),
+      leafQuietSince: new Date(now.getTime() - 40 * 60 * 60 * 1000),
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now,
+      reescalationCooldownMs: 0,
+    });
+
+    expect(result.escalationsCreated).toBe(0);
+    // Attributed to the target gate, not to the cooldown that is switched off:
+    // `skippedReescalationCooldown` is the aggregate across both suppressors, so
+    // the cooldown-only count is the difference, here zero.
+    expect(result.skippedUnchangedTarget).toBe(1);
+    expect(result.skippedReescalationCooldown).toBe(1);
+  });
+
+  it("subtracts suppressed findings from the operator preview, matching what a run would create", async () => {
+    // BLO-27676 review: the preview and the run are paired operator endpoints
+    // (`/issue-graph-liveness-auto-recovery/preview` and `.../run`), and the
+    // confirm dialog renders `recoverableFindings` as the label on the button
+    // that triggers the run ("Enable and create N"). The preview used to filter
+    // on staleness alone, so a suppressed finding was counted as one the run
+    // would create. The steady-state case was a preview listing n and a run
+    // creating zero, because the target-state gate spans 7d and selects exactly
+    // the population an operator previews: leaves already reported once and
+    // since quiet.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    // Held by the target gate and by nothing else: outside the 60m cooldown,
+    // inside the 7d ceiling, leaf quiet since before the resolution.
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 40 * 60 * 60 * 1000),
+    });
+
+    const preview = await heartbeatSvc.buildIssueGraphLivenessAutoRecoveryPreview({ now });
+
+    expect(preview.findings).toBe(1);
+    expect(preview.recoverableFindings).toBe(0);
+    expect(preview.items).toHaveLength(0);
+    expect(preview.skippedReescalationCooldown).toBe(1);
+    expect(preview.skippedUnchangedTarget).toBe(1);
+    // Not the reason this finding is held -- asserted so a future staleness
+    // change cannot make this test pass for the wrong reason.
+    expect(preview.skippedOutsideLookback).toBe(0);
+
+    // The invariant the finding is about, asserted directly rather than through
+    // two independently hardcoded numbers: the preview promises exactly what
+    // pressing run delivers. Preview is read-only, so this ordering is safe.
+    const run = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(run.escalationsCreated).toBe(preview.recoverableFindings);
+    expect(run.skippedReescalationCooldown).toBe(preview.skippedReescalationCooldown);
+    expect(run.skippedUnchangedTarget).toBe(preview.skippedUnchangedTarget);
+  });
+
+  it("still previews an unowned backlog blocker that has never been reported", async () => {
+    // Rejection test for the preview change: it must not degrade into "the
+    // preview shows nothing". A leaf with no owner and no prior resolved
+    // escalation is unsuppressed, so it stays listed -- and the same
+    // preview/run equality has to hold in the other direction.
+    await enableAutoRecovery();
+    const { blockerIssueId } = await seedBlockedChain({ blockerStatus: "backlog" });
+    const now = new Date();
+
+    const preview = await heartbeatSvc.buildIssueGraphLivenessAutoRecoveryPreview({ now });
+
+    expect(preview.recoverableFindings).toBe(1);
+    expect(preview.items).toHaveLength(1);
+    expect(preview.skippedReescalationCooldown).toBe(0);
+    expect(preview.skippedUnchangedTarget).toBe(0);
+    expect(preview.items[0]?.incidentKey.endsWith(`:${blockerIssueId}`)).toBe(true);
+
+    const run = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(run.escalationsCreated).toBe(preview.recoverableFindings);
+  });
+
+  it("previews the documented rollback lever rather than the default windows", async () => {
+    // The preview takes the same two suppression knobs as the run, for the same
+    // reason the run does: an operator who has rolled the target gate back has
+    // to be able to preview the run that lever actually produces. Without the
+    // options on the preview, the disable path is previewable only as the
+    // default 7d behaviour -- i.e. the surface would still lie, just in the
+    // opposite direction.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 40 * 60 * 60 * 1000),
+    });
+
+    // Both readings of one fixture, so this fails in either direction: if the
+    // preview ignored the suppressors the default reading would be 1, and if it
+    // ignored the option the rolled-back reading would be 0.
+    const withDefaults = await heartbeatSvc.buildIssueGraphLivenessAutoRecoveryPreview({ now });
+
+    expect(withDefaults.recoverableFindings).toBe(0);
+    expect(withDefaults.skippedUnchangedTarget).toBe(1);
+    // The confirm dialog states each suppressor's bound from these fields rather
+    // than restating the constants, because both suppressors expire and an
+    // unqualified "will not be re-raised" describes the unbounded behaviour the
+    // ceiling was added to remove (BLO-27676 review). So the preview has to echo
+    // the windows it actually resolved.
+    expect(withDefaults.reescalationCooldownMs).toBe(DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS);
+    expect(withDefaults.unchangedTargetSuppressionMs).toBe(
+      DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+    );
+
+    const preview = await heartbeatSvc.buildIssueGraphLivenessAutoRecoveryPreview({
+      now,
+      unchangedTargetSuppressionMs: 0,
+    });
+
+    expect(preview.recoverableFindings).toBe(1);
+    expect(preview.skippedReescalationCooldown).toBe(0);
+    expect(preview.skippedUnchangedTarget).toBe(0);
+    // An override has to travel too: echoing the default here would have the
+    // dialog promise a 7d hold on a run whose target gate is switched off.
+    expect(preview.unchangedTargetSuppressionMs).toBe(0);
+
+    const run = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now,
+      unchangedTargetSuppressionMs: 0,
+    });
+
+    expect(run.escalationsCreated).toBe(preview.recoverableFindings);
+  });
+
+  it("still escalates an unowned backlog blocker that has never been reported", async () => {
+    // Rejection test for the suppressor above: it must not degrade into "stop
+    // escalating". A leaf with no owner, no disposition and no prior resolved
+    // escalation is exactly the shape the detector exists to catch.
+    await enableAutoRecovery();
+    const { companyId, blockerIssueId } = await seedBlockedChain({ blockerStatus: "backlog" });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+
+    const [escalation] = await db
+      .select({ parentId: issues.parentId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "harness_liveness_escalation"),
+        ),
+      );
+    expect(escalation?.parentId).toBe(blockerIssueId);
   });
 
   it("re-escalates immediately after a matching escalation is cancelled", async () => {
@@ -1393,6 +1973,34 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
     const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      status: "cancelled",
+      title: "Cancelled escalation",
+      identifier: "CANCELLED-3",
+      resolvedAt: now,
+      completedAt: null,
+    });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  // Drain path for the legacy edges filed before BLO-28618 stopped writing
+  // them. The escalation is seeded with the edge by hand because the detector
+  // no longer produces that shape.
+  it("prunes a legacy escalation blocker edge and lifts the source out of blocked", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatSvc;
+    const legacyEscalationId = randomUUID();
     const incidentKey = [
       "harness_liveness",
       companyId,
@@ -1402,70 +2010,103 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     ].join(":");
 
     await db.insert(issues).values({
-      id: randomUUID(),
+      id: legacyEscalationId,
       companyId,
-      title: "Cancelled escalation",
-      status: "cancelled",
+      title: "Unblock liveness incident (legacy)",
+      status: "done",
       priority: "high",
-      parentId: blockedIssueId,
+      parentId: blockerIssueId,
       assigneeAgentId: managerId,
-      issueNumber: 3,
-      identifier: "CANCELLED-3",
+      issueNumber: 9,
+      identifier: "LEGACY-9",
       originKind: "harness_liveness_escalation",
       originId: incidentKey,
-      createdAt: new Date(now.getTime() - 30 * 60 * 1000),
-      updatedAt: now,
     });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: legacyEscalationId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    // The real leaf is resolved, so once the fabricated edge goes the source has
+    // no unresolved blockers left -- exactly the state that used to be left
+    // behind as `blocked` with an empty blocker set (the `blocked_without_blockers`
+    // trigger, measured at 11 of 11 sources on 2026-08-18).
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
 
-    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
-
-    expect(result.escalationsCreated).toBe(1);
-    expect(result.skippedReescalationCooldown).toBe(0);
-  });
-
-  it("removes closed liveness escalations from blocker relations during reconciliation", async () => {
-    await enableAutoRecovery();
-    const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
-    const heartbeat = heartbeatSvc;
-
-    const first = await heartbeat.reconcileIssueGraphLiveness();
-    expect(first.escalationsCreated).toBe(1);
-
-    const escalations = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          eq(issues.originKind, "harness_liveness_escalation"),
-        ),
-      );
-    expect(escalations).toHaveLength(1);
-
-    await db
-      .update(issues)
-      // `blockedByIssueIds` was never a column on the `issues` table — blocker
-      // relationships live in `recoveryBlockerIssues`. Status=done is the
-      // signal `reconcileIssueGraphLiveness` reads to prune the relation.
-      .set({ status: "done" })
-      .where(eq(issues.id, escalations[0]!.id));
-    await db
-      .update(issues)
-      // `blockedByIssueIds` was never a column on the `issues` table — blocker
-      // relationships live in `recoveryBlockerIssues`. Status=done is the
-      // signal `reconcileIssueGraphLiveness` reads to prune the relation.
-      .set({ status: "done" })
-      .where(eq(issues.id, blockerIssueId));
-
-    const second = await heartbeat.reconcileIssueGraphLiveness();
-    expect(second.obsoleteRecoveryBlockerRelationsRemoved).toBe(0);
-    expect(second.doneRecoveryBlockerRelationsRemoved).toBe(1);
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.doneRecoveryBlockerRelationsRemoved).toBe(1);
 
     const blockers = await db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.some((row) => row.blockerIssueId === escalations[0]!.id)).toBe(false);
+    expect(blockers.some((row) => row.blockerIssueId === legacyEscalationId)).toBe(false);
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("todo");
+
+    const pruneEvent = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.liveness_recovery_blocker_pruned"),
+        eq(activityLog.entityId, blockedIssueId),
+      ))
+      .then((rows) => rows.at(-1));
+    expect(pruneEvent?.details).toMatchObject({
+      recoveryIssueId: legacyEscalationId,
+      previousStatus: "blocked",
+      remainingUnresolvedBlockerCount: 0,
+      restoredSourceStatus: true,
+    });
+  });
+
+  // Counterpart: a real remaining blocker must keep the source `blocked`.
+  it("keeps the source blocked when a real blocker survives the legacy prune", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatSvc;
+    const legacyEscalationId = randomUUID();
+
+    await db.insert(issues).values({
+      id: legacyEscalationId,
+      companyId,
+      title: "Unblock liveness incident (legacy)",
+      status: "cancelled",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 9,
+      identifier: "LEGACY-9",
+      originKind: "harness_liveness_escalation",
+      originId: [
+        "harness_liveness",
+        companyId,
+        blockedIssueId,
+        "blocked_by_unassigned_issue",
+        blockerIssueId,
+      ].join(":"),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: legacyEscalationId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.doneRecoveryBlockerRelationsRemoved).toBe(1);
+
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(sourceAfter?.status).toBe("blocked");
   });
 
   it("handles an armed cutoff when no liveness findings exist", async () => {

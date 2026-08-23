@@ -69,6 +69,73 @@ the App identity `allyblockcast[bot]`. A PR authored by either the App or the
 author cannot provide the corresponding required review. The App and User
 then provide their distinct review artifacts on that same replacement head.
 
+## Ageing an unanswered review request (BLO-24517)
+
+Routing a request is not the same as getting one answered. Nothing used to
+notice that a required-team request had gone unanswered; this is the policy that
+does. It is implemented in `server/src/services/pr-review-request-ageing.ts`.
+
+**Threshold: 7 days** of no answering review. **Cap: 15** escalations per sweep,
+oldest first, with the remainder reported as a count.
+
+Both numbers come from the live distribution of the 196 open App-authored
+`onprem-k8s` PRs carrying an unanswered team request, measured 2026-08-20:
+`<3d` 42 · `3–7d` 24 · **`7–14d` 88** · `14–30d` 42 · `>=30d` **0** (median 8d,
+oldest 18d). Nothing survives past ~18 days, and not because review arrives — of
+the last 250 closed App-authored PRs, 118 merged and **132 were closed
+unmerged**, so the queue drains ~47% by abandonment. A threshold near that edge
+would fire only after the moment a nudge could still change the outcome. 7d
+fires at the front of the largest band; because that is 130 of 196 on day one,
+the cap is what keeps the digest readable.
+
+**Escalation target: a named human who is not an ally identity.** File a
+Paperclip issue with a non-null `assigneeUserId`. Do **not** re-request a
+reviewer on GitHub — see the measurement note below; a request is already
+pending on 196 of 206, so re-requesting only adds a duplicate to a queue nobody
+is reading. That is the failure mode that put 28 stacked review-request markers
+on `paperclip#937`.
+
+The notify set must exclude both `allyblockcast` seats. An escalation the agent
+fleet can satisfy itself is not an escalation — the same reason the ageing clock
+below refuses to count an ally review as an answer.
+
+**Idempotency: one escalation per PR, ever.** Keyed on a stored `escalatedAt`,
+not on PR state. Nothing on GitHub changes when an escalation is filed, so a
+sweep that re-derives "have I escalated this?" from the PR will re-fire on every
+pass.
+
+### Measuring this correctly
+
+**Do not use the REST pending-reviewer arrays as ground truth.** The App token
+has no org-team read scope, so a request pending against a *team* is invisible
+to it: REST omits it from `requested_teams` and GraphQL nulls
+`reviewRequests.nodes[].requestedReviewer`. Neither surface says "no request" —
+both say "no request *you can see*". Measured 2026-08-20 across 206 open
+App-authored PRs, REST reported 145 with zero pending reviewers; that is exactly
+10 genuinely-zero plus 135 pending-but-unreadable. Ten of the 135, sampled
+against the timeline, each showed one `review_requested` to
+`onprem-k8s-ally-reviewer` and **zero** `review_request_removed`.
+
+Use the timeline for ground truth:
+
+```sh
+gh api repos/Blockcast/onprem-k8s/issues/<n>/timeline --paginate \
+  --jq '.[] | select(.event | test("review_request"))
+        | "\(.created_at) \(.event) \(.requested_reviewer.login // .requested_team.slug)"'
+```
+
+**An ally review does not answer a request.** Of those 196 PRs, 155 carry ally
+reviews only, 3 carry a review from a genuine non-ally human, and 48 carry none.
+A naive "does this PR have a review?" check therefore sees 158 of 206 as
+answered when a human has looked at 3.
+
+Note this sits in tension with the routing guidance above, which treats the
+`allyblockcast` User-seat approval as a legitimate way to satisfy the
+singleton-team rule. It is legitimate *today* only because that seat is a member
+of team `18686279` — which is the loophole BLO-24517 is open against. If the org
+removes that seat from the team (or repoints the ruleset at a humans-only team),
+the routing steps above must be revised at the same time.
+
 ## Historical evidence
 
 Historical merges or approvals that predate the current gate are context, not
