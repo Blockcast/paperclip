@@ -1608,3 +1608,183 @@ describe("argv redaction in the production-shaped pod (Ally 9d6470b)", () => {
     expect(out).toContain("name: b");
   });
 });
+
+/**
+ * PEN-2370 ask 3, "the method is the control": after each remediation, go
+ * looking for another route to the same material rather than re-reading the
+ * patch. Doors #5 and #6 were both found that way. These are the routes reached
+ * by that method against this scrubber.
+ *
+ * Every one of them already passed the first time it was probed — none of these
+ * tests is a bug fix, and that is the point worth stating. They are here because
+ * the routes were *unlocked*: the scrubber earns them by keying on
+ * `containers:` / `env:` by NAME at any depth, never on a pod-shaped
+ * `spec.containers` path. Nothing pinned that property. A later change that
+ * narrowed detection to the pod path — the obvious "tighten the match"
+ * refactor — would reopen every route below while all 105 pre-existing tests
+ * stayed green, because every one of them reads a bare pod.
+ */
+describe("alternate routes to the same material (PEN-2370 ask 3 method)", () => {
+  it("YAML: a workload controller nests env one level deeper than a pod", () => {
+    // resources_get(apps/v1, Deployment) is an advertised use of the same
+    // read-only grant, and its material sits at
+    // spec.template.spec.containers[] rather than spec.containers[].
+    const out = scrubYamlText(
+      [
+        "apiVersion: apps/v1",
+        "kind: Deployment",
+        "metadata:",
+        "  name: api",
+        "spec:",
+        "  replicas: 2",
+        "  template:",
+        "    spec:",
+        "      containers:",
+        "      - name: api",
+        "        image: ghcr.io/example/api:v1",
+        "        env:",
+        "        - name: DATABASE_URL",
+        `          value: ${LEAK}`,
+        "        - name: LOG_LEVEL",
+        `          value: ${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    // Names are the diagnostic value the grant exists for; they must survive.
+    expect(out).toContain("name: DATABASE_URL");
+    expect(out).toContain("name: LOG_LEVEL");
+  });
+
+  it("JSON: a workload controller nests env one level deeper than a pod", () => {
+    const out = JSON.stringify(
+      scrubJsonValue({
+        apiVersion: "apps/v1",
+        kind: "Deployment",
+        spec: {
+          template: {
+            spec: {
+              containers: [{ name: "api", env: [{ name: "DATABASE_URL", value: LEAK }] }],
+            },
+          },
+        },
+      }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("DATABASE_URL");
+    expect(out).toContain(REDACTED);
+  });
+
+  it("YAML: CronJob's doubly-nested template is still reached", () => {
+    // The deepest nesting the core API ships:
+    // spec.jobTemplate.spec.template.spec.containers[].
+    const out = scrubYamlText(
+      [
+        "apiVersion: batch/v1",
+        "kind: CronJob",
+        "spec:",
+        "  jobTemplate:",
+        "    spec:",
+        "      template:",
+        "        spec:",
+        "          containers:",
+        "          - name: rotate",
+        "            env:",
+        "            - name: SIGNING_MATERIAL",
+        `              value: ${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("name: SIGNING_MATERIAL");
+  });
+
+  it("JSON: a list response scrubs every item, not just the document root", () => {
+    // resources_list / pods_list return items[]. A root-only scrub would hand
+    // back the whole namespace in one call rather than one pod at a time.
+    const out = JSON.stringify(
+      scrubJsonValue({
+        apiVersion: "v1",
+        kind: "PodList",
+        items: [
+          {
+            kind: "Pod",
+            spec: { containers: [{ name: "a", env: [{ name: "TOKEN_A", value: LEAK }] }] },
+          },
+          {
+            kind: "Pod",
+            spec: { containers: [{ name: "b", env: [{ name: "TOKEN_B", value: LEAK }] }] },
+          },
+        ],
+      }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("TOKEN_A");
+    expect(out).toContain("TOKEN_B");
+  });
+
+  it("JSON: SecretList items are covered, not only a single Secret", () => {
+    const out = JSON.stringify(
+      scrubJsonValue({
+        kind: "SecretList",
+        items: [{ kind: "Secret", data: { token: "YWJj" }, stringData: { plain: LEAK } }],
+      }),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain(REDACTED);
+  });
+
+  it("JSON: material re-embedded as a string in an annotation does not pass through", () => {
+    // kubectl stores the whole submitted object — values included — in
+    // metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]
+    // as JSON *text*. A structural walker sees one long opaque string there,
+    // not a container list, so this route sidesteps the env rule entirely.
+    const lastApplied = JSON.stringify({
+      apiVersion: "v1",
+      kind: "Pod",
+      spec: { containers: [{ name: "app", env: [{ name: "DSN", value: LEAK }] }] },
+    });
+
+    const out = JSON.stringify(
+      scrubJsonValue({
+        apiVersion: "v1",
+        kind: "Pod",
+        metadata: {
+          name: "app",
+          annotations: { "kubectl.kubernetes.io/last-applied-configuration": lastApplied },
+        },
+        spec: { containers: [{ name: "app", env: [{ name: "DSN", value: LEAK }] }] },
+      }),
+    );
+
+    expectNoLeak(out);
+  });
+
+  it("YAML: material re-embedded as an annotation scalar does not pass through", () => {
+    const lastApplied = JSON.stringify({
+      spec: { containers: [{ name: "app", env: [{ name: "DSN", value: LEAK }] }] },
+    });
+
+    const out = scrubYamlText(
+      [
+        "apiVersion: v1",
+        "kind: Pod",
+        "metadata:",
+        "  annotations:",
+        `    kubectl.kubernetes.io/last-applied-configuration: '${lastApplied}'`,
+        "  name: app",
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        "    env:",
+        "    - name: DSN",
+        `      value: ${LEAK}`,
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+  });
+});
