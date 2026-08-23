@@ -930,6 +930,13 @@ describe.sequential("agent skill routes", () => {
         }),
         expect.any(Object),
       );
+      expect(mockAgentInstructionsService.materializeManagedBundle).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({
+          "AGENTS.md": expect.stringContaining("if the repository has no template or checkbox, follow its own PR-body"),
+        }),
+        expect.any(Object),
+      );
     });
   });
 
