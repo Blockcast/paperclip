@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql }
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
@@ -258,6 +259,19 @@ function latestRunActivityAt(...values: Array<Date | string | null | undefined>)
   return times.length > 0 ? new Date(Math.max(...times)) : null;
 }
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+// PEN-2106: `run.logBytes` is only written back when the log is FINALIZED, so it
+// is null/0 for the entire population this detector fires on (a still-`running`
+// row). It therefore cannot be a precondition for reading — only a seek hint.
+// When the hint is absent or stale-low we walk forward from it in chunks and
+// keep the trailing window, bounded so a pathologically large log cannot turn a
+// detector sweep into a multi-MB read.
+const ACTIVE_RUN_OUTPUT_EVIDENCE_SCAN_CHUNK_BYTES = 256 * 1024;
+const ACTIVE_RUN_OUTPUT_EVIDENCE_MAX_SCAN_BYTES = 4 * 1024 * 1024;
+// PEN-2106: only these adapters have a pod/Job behind a run row. On a
+// sessioned-local adapter (claude_local, codex_local, …) there is no external
+// lifecycle, so BLO-4467's "the pod is gone, reap it to free the concurrency
+// lock" story is false in every clause — see staleRunOrphanedRowRemedy.
+const RECOVERY_EXTERNAL_LIFECYCLE_ADAPTER_TYPES = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 // BLO-7113: re-fire suppression for `stale_active_run_evaluation` wrappers.
 // When the underlying `runs.status='running'` row is the canonical
 // BLO-4467-family wedge (pod already reaped), the detector keeps re-firing
@@ -2922,17 +2936,43 @@ export function recoveryService(
   }
 
   async function readRunLogTailForEvidence(run: typeof heartbeatRuns.$inferSelect) {
-    if (!run.logStore || !run.logRef || !run.logBytes) return "";
+    // PEN-2106: do NOT gate on `run.logBytes`. `logStore`/`logRef` are written
+    // immediately after runLogStore.begin(), but `logBytes` is only written back
+    // on finalize — so it is null/0 for exactly the runs this detector fires on,
+    // and requiring it made the card's evidence block unconditionally empty for
+    // every stale-run wrapper ever minted. The store already stat()s and clamps
+    // the range to the real file, so the hint is advisory in both directions.
+    if (!run.logStore || !run.logRef) return "";
+    const sizeHint = Number(run.logBytes ?? 0);
+    let offset = Number.isFinite(sizeHint) && sizeHint > ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES
+      ? sizeHint - ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES
+      : 0;
+    let tail = "";
+    let scanned = 0;
     try {
-      const offset = Math.max(0, run.logBytes - ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES);
-      const result = await runLogStore.read(
-        { store: run.logStore as "local_file", logRef: run.logRef },
-        { offset, limitBytes: ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES },
-      );
-      return result.content;
+      while (scanned < ACTIVE_RUN_OUTPUT_EVIDENCE_MAX_SCAN_BYTES) {
+        const limitBytes = Math.min(
+          ACTIVE_RUN_OUTPUT_EVIDENCE_SCAN_CHUNK_BYTES,
+          ACTIVE_RUN_OUTPUT_EVIDENCE_MAX_SCAN_BYTES - scanned,
+        );
+        const result = await runLogStore.read(
+          { store: run.logStore as "local_file", logRef: run.logRef },
+          { offset, limitBytes },
+        );
+        scanned += Buffer.byteLength(result.content, "utf8");
+        // Keep only the trailing window: the last lines are the diagnostic ones
+        // (an adapter timeout on stderr is typically the final entry).
+        tail = (tail + result.content).slice(-ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES);
+        // `nextOffset` is undefined once the store has served the final byte.
+        // The `<= offset` guard keeps a misbehaving store from looping forever.
+        if (result.nextOffset == null || result.nextOffset <= offset) break;
+        offset = result.nextOffset;
+      }
+      return tail;
     } catch (err) {
       logger.warn({ err, runId: run.id }, "failed to read stale-run watchdog evidence tail");
-      return "";
+      // A partial tail is strictly better evidence than none.
+      return tail;
     }
   }
 
@@ -3528,6 +3568,31 @@ export function recoveryService(
     return true;
   }
 
+  // PEN-2106: the BLO-4467 wedge is an EXTERNAL-LIFECYCLE story — a pod/Job died
+  // while its run row stayed `running`, and because external-lifecycle agents are
+  // clamped to one concurrent run, that row holds the agent's only slot until it
+  // is reaped. None of that holds on a sessioned-local adapter: there is no pod
+  // and no Job, and `runningCount` already excludes rows silent past
+  // RUN_STALE_SILENCE_MS, so a multi-hour-silent row contributes 0 to
+  // concurrency and holds no lock. Asserting the k8s mechanism there sends the
+  // reader after a pod that does not exist and invites a cancel to "free" a lock
+  // nothing is holding. Both the reopen remedy and the suppression note render
+  // through here so the two can't drift apart.
+  function staleRunOrphanedRowRemedy(adapterType: string) {
+    if (RECOVERY_EXTERNAL_LIFECYCLE_ADAPTER_TYPES.has(adapterType)) {
+      return {
+        mechanism: "the canonical BLO-4467-family wedge (pod already reaped)",
+        remedy:
+          "Likely the canonical BLO-4467-family wedge: the run row is `running` but the pod/Job is gone. Force-finish the run (reaper) so the agent's concurrency lock releases — do not just re-close this wrapper.",
+      };
+    }
+    return {
+      mechanism: `an orphaned \`running\` row on \`${adapterType}\`, which has no external lifecycle`,
+      remedy:
+        `\`${adapterType}\` has no external lifecycle, so this is NOT the BLO-4467 pod/Job wedge: there is nothing to reap, and a run silent this long is already excluded from the agent's concurrency count, so no lock is being held and cancelling frees nothing. The row is simply orphaned \`running\`. The only route to terminal is \`POST /heartbeat-runs/:runId/cancel\`, which is board-gated — an agent assignee cannot perform it, so escalate to the board rather than re-closing this wrapper.`,
+    };
+  }
+
   // BLO-7113: reopen the most-recent closed wrapper to `in_progress` and ping
   // its owner (the resolved manager/CTO) instead of opening wrapper #N+1.
   // Once reopened, subsequent detector sweeps find an OPEN wrapper via
@@ -3581,7 +3646,7 @@ export function recoveryService(
         `That is past the ${STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD}-suppressed-fire threshold, so the underlying \`running\` run row is NOT draining on its own — closing this wrapper as a false-positive is no longer the right disposition.`,
         "",
         "- This wrapper has been reopened to `in_progress` rather than spawning yet another duplicate review.",
-        "- Likely the canonical BLO-4467-family wedge: the run row is `running` but the pod/Job is gone. Force-finish the run (reaper) so the agent's concurrency lock releases — do not just re-close this wrapper.",
+        `- ${staleRunOrphanedRowRemedy(input.runningAgent.adapterType).remedy}`,
         "- Refs: BLO-4467 (completed-run-not-reaped), BLO-7113 (this dedupe).",
       ].join("\n"),
       { runId: input.run.id },
@@ -3662,7 +3727,7 @@ export function recoveryService(
         `${STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER} (${fireOrdinal} suppressed re-fire${fireOrdinal === 1 ? "" : "s"} in the last ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS)})`,
         "",
         `The \`stale_active_run_evaluation\` detector fired again for run \`${input.run.id}\` (${input.runningAgent.name}), but ${input.closedEvaluation.identifier} was already closed \`${input.closedEvaluation.status}\` within the last ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_REFIRE_COOLDOWN_MS)}.`,
-        "Suppressing a fresh wrapper: the orphaned `running` row is the canonical BLO-4467-family wedge (pod already reaped), so re-opening a new review every ~10-15 min would only burn a triage slot.",
+        `Suppressing a fresh wrapper: the orphaned \`running\` row is ${staleRunOrphanedRowRemedy(input.runningAgent.adapterType).mechanism}, so re-opening a new review every ~10-15 min would only burn a triage slot.`,
         `- After ${STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD} suppressed re-fires in ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS)} this wrapper is reopened to \`in_progress\` instead of opening wrapper #${fireOrdinal + 1}.`,
       ].join("\n"),
       { runId: input.run.id },
