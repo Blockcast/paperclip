@@ -2,7 +2,6 @@ import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql }
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
-  EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
@@ -32,6 +31,7 @@ import {
   routines,
   workspaceOperations,
 } from "@paperclipai/db";
+import { EXTERNAL_LIFECYCLE_ADAPTER_TYPES } from "@paperclipai/shared/validators/agent";
 import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -3587,9 +3587,9 @@ export function recoveryService(
       };
     }
     return {
-      mechanism: `an orphaned \`running\` row on \`${adapterType}\`, which has no external lifecycle`,
+      mechanism: `an orphaned \`running\` row on \`${adapterType}\`, which has no external runtime lifecycle`,
       remedy:
-        `\`${adapterType}\` has no external lifecycle, so this is NOT the BLO-4467 pod/Job wedge: there is nothing to reap, and a run silent this long is already excluded from the agent's concurrency count, so no lock is being held and cancelling frees nothing. The row is simply orphaned \`running\`. The only route to terminal is \`POST /heartbeat-runs/:runId/cancel\`, which is board-gated — an agent assignee cannot perform it, so escalate to the board rather than re-closing this wrapper.`,
+        `\`${adapterType}\` has no external runtime lifecycle, so the BLO-4467 wedge does not apply: there is no external workload to force-finish, and a run silent this long is already excluded from the agent's concurrency accounting, so terminating it frees no capacity. The row is simply orphaned \`running\`. The only route to terminal is \`POST /heartbeat-runs/:runId/cancel\`, which is board-gated — an agent assignee cannot perform it, so escalate to the board rather than re-closing this wrapper.`,
     };
   }
 
