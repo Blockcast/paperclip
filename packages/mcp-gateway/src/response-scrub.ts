@@ -429,6 +429,91 @@ function readKind(source: Record<string, unknown>): unknown {
   return undefined;
 }
 
+const ENV_VAR_SOURCE_REF_KEYS: Record<string, ReadonlySet<string>> = {
+  configMapKeyRef: new Set(["name", "key", "optional"]),
+  fieldRef: new Set(["apiVersion", "fieldPath"]),
+  resourceFieldRef: new Set(["containerName", "resource", "divisor"]),
+  secretKeyRef: new Set(["name", "key", "optional"]),
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(source: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(source).every((key) => allowed.has(key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isValidEnvVarSource(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const selectors = Object.keys(value);
+  if (selectors.length !== 1) return false;
+
+  const selector = selectors[0]!;
+  const allowedRefKeys = ENV_VAR_SOURCE_REF_KEYS[selector];
+  if (!allowedRefKeys) return false;
+  const ref = value[selector];
+  if (!isRecord(ref) || !hasOnlyKeys(ref, allowedRefKeys)) return false;
+
+  switch (selector) {
+    case "configMapKeyRef":
+    case "secretKeyRef":
+      return (
+        isNonEmptyString(ref.key) &&
+        (ref.name === undefined || typeof ref.name === "string") &&
+        (ref.optional === undefined || typeof ref.optional === "boolean")
+      );
+    case "fieldRef":
+      return (
+        isNonEmptyString(ref.fieldPath) &&
+        (ref.apiVersion === undefined || typeof ref.apiVersion === "string")
+      );
+    case "resourceFieldRef":
+      return (
+        isNonEmptyString(ref.resource) &&
+        (ref.containerName === undefined || typeof ref.containerName === "string") &&
+        (ref.divisor === undefined || typeof ref.divisor === "string")
+      );
+    default:
+      return false;
+  }
+}
+
+/**
+ * Scrub one object-shaped EnvVar without passing unknown properties through.
+ * Kubernetes' EnvVar schema is closed: an entry is either `name` + `value` or
+ * `name` + one valid `valueFrom` selector. Anything else is an upstream shape
+ * change, so replacing the whole entry is safer than preserving a partial map.
+ */
+function scrubJsonEnvVarEntry(entry: Record<string, unknown>, ctx: ScrubContext): unknown {
+  const keys = new Set(Object.keys(entry));
+  if (!isNonEmptyString(entry.name)) {
+    ctx.changed = true;
+    return REDACTED;
+  }
+
+  if (keys.size === 2 && keys.has("name") && keys.has("value") && typeof entry.value === "string") {
+    ctx.changed = true;
+    return { name: entry.name, value: REDACTED };
+  }
+
+  if (
+    keys.size === 2 &&
+    keys.has("name") &&
+    keys.has("valueFrom") &&
+    isValidEnvVarSource(entry.valueFrom)
+  ) {
+    return { name: entry.name, valueFrom: entry.valueFrom };
+  }
+
+  ctx.changed = true;
+  return REDACTED;
+}
+
 /** Threaded through the scrubbers so a pure pass-through can be detected. */
 type ScrubContext = { changed: boolean };
 
@@ -925,11 +1010,7 @@ function scrubJsonValueTracked(
           ctx.changed = true;
           return REDACTED;
         }
-        const envVar = entry as Record<string, unknown>;
-        // Preserve `name` and any `valueFrom` reference; drop only the literal.
-        if (!("value" in envVar)) return envVar;
-        ctx.changed = true;
-        return { ...envVar, value: REDACTED };
+        return scrubJsonEnvVarEntry(entry as Record<string, unknown>, ctx);
       });
       continue;
     }
