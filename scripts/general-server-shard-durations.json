@@ -1,5 +1,5 @@
 {
-  "$comment": "Per-suite Vitest elapsed durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from the four successful ARC PR jobs in run 31248977534 on 2026-08-08. Suites absent from that run are intentionally omitted and use the median fallback.",
+  "$comment": "Per-suite Vitest elapsed durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from the four successful ARC PR jobs in run 31248977534 on 2026-08-08. Suites absent from that run are intentionally omitted and use the median fallback. EXCEPTION (BLO-21092): server/src/__tests__/plugin-status-metrics.test.ts was added after that sampling run and is NOT ARC-sampled -- it is a local measurement (median 52ms of 3 runs) scaled by 0.64, the ARC/local ratio measured on metrics-service.test.ts (269ms manifest / 418ms local) as a co-located control. Both values sit far below the 123ms median, so shard balance is insensitive to the estimate; the entry exists because the >=90% coverage assertion in scripts/__tests__/run-vitest-stable-shard.test.mjs had zero headroom (397/441 = 0.9002), so ANY new suite failed CI. That headroom problem is master drift, not this suite's: 44 other suites were already missing. Regenerate wholesale.",
   "unit": "ms",
   "durations": {
     "server/src/__tests__/ac-policy-assignee-routing.test.ts": 19,
@@ -299,6 +299,7 @@
     "server/src/__tests__/plugin-sdk-testing.test.ts": 20,
     "server/src/__tests__/plugin-secrets-handler.test.ts": 4609,
     "server/src/__tests__/plugin-state-store.test.ts": 8495,
+    "server/src/__tests__/plugin-status-metrics.test.ts": 33,
     "server/src/__tests__/plugin-store-consistency.test.ts": 34853,
     "server/src/__tests__/plugin-telemetry-bridge.test.ts": 106,
     "server/src/__tests__/plugin-tenant-isolation.test.ts": 4757,
