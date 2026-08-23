@@ -142,6 +142,7 @@
     "server/src/__tests__/gemini-local-adapter.test.ts": 29,
     "server/src/__tests__/gemini-local-execute.test.ts": 1046,
     "server/src/__tests__/gemini-local-skill-sync.test.ts": 41,
+    "server/src/__tests__/git-checkout-identity.test.ts": 18930,
     "server/src/__tests__/git-worktree-ownership.test.ts": 4170,
     "server/src/__tests__/github-app-auth.test.ts": 219,
     "server/src/__tests__/github-status-delivery-outbox.test.ts": 11013,
