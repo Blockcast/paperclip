@@ -416,23 +416,300 @@ export interface McpConfigSecret {
  */
 const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
 
+export type EnvClassification = "SECRET" | "SAFE_LITERAL";
+
+/** One declared env name (or name family) this file can put on a Job pod. */
+export interface EnvNameClassification {
+  /** Exact env var name, or the family prefix when `prefix` is true. */
+  name: string;
+  /** True when `name` is a prefix covering a family of generated names. */
+  prefix?: boolean;
+  classification: EnvClassification;
+  /**
+   * Why this classification. For SAFE_LITERAL this is the review artifact —
+   * the sentence a future reviewer reads instead of re-deriving whether the
+   * value can carry a credential.
+   */
+  reason: string;
+}
+
+/**
+ * Declarative classification of every env name this adapter's own code can put
+ * on an agent Job pod (BLO-29804, recording the decision on BLO-21858 remedy 2).
+ *
+ * WHY THIS EXISTS. `SENSITIVE_ENV_NAME_RE` is fail-closed against over-matching
+ * but fail-*open* against a credential-carrying variable whose name simply
+ * doesn't match; BLO-21858 is the proof it happens. Pinning names one at a time
+ * only fixes the instances someone notices. This table is the forcing function:
+ * `job-manifest.test.ts` builds manifests across the config permutations and
+ * fails, naming the variable, when an emitted name is absent here. A new env var
+ * therefore reddens CI in the pull request that introduces it, and the author
+ * has to state which class it is rather than inheriting a default.
+ *
+ * The alternative considered and declined was inverting to "everything is
+ * Secret-backed unless declared safe-literal". Measured on live `ac-*` pods
+ * there are 8 secretKeyRef vars against 37-41 non-sensitive literals, so
+ * inversion would move ~40 operationally-load-bearing fields (`HOME`, `TMPDIR`,
+ * `PAPERCLIP_RUN_ID`, the isolation roots) into an opaque Secret and stop
+ * `GET Pod` being a triage tool — a bounded security gain for an unbounded
+ * operability loss. See BLO-29804 for the full reasoning.
+ *
+ * SCOPE — read this before adding an entry. This table covers names *this code*
+ * introduces. Three channels put operator-supplied names on the pod and cannot
+ * be pre-declared, because their names are data rather than code:
+ *
+ *   1. `adapterConfig.env` (layer 4) — arbitrary keys chosen by an operator.
+ *   2. `selfPod.inheritedEnv` — the server Deployment's env, already governed by
+ *      `AGENT_ENV_ALLOWLIST` in `inherit-allowlist.ts`, which is the same
+ *      declare-or-refuse shape applied at that boundary.
+ *   3. `selfPod.inheritedEnvValueFrom` — Deployment `valueFrom` entries, which
+ *      carry no literal value on the pod spec at all.
+ *
+ * The test supplies known values through all three and subtracts exactly those
+ * names, so what remains is code-originated and must appear below.
+ *
+ * NOT a behaviour switch. `isSensitiveEnvName()` keeps its semantics — regex ∪
+ * pinned SECRET names — so which vars are Secret-backed is unchanged by the
+ * table's existence. A `SECRET` entry whose name the regex already matches is a
+ * statement about that name, not a new route.
+ */
+export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
+  // --- SECRET -----------------------------------------------------------
+  {
+    name: "PAPERCLIP_API_KEY",
+    classification: "SECRET",
+    reason: "Run-scoped JWT authenticating agent callbacks to the Paperclip API.",
+  },
+  {
+    name: "ANTHROPIC_CUSTOM_HEADERS",
+    classification: "SECRET",
+    reason:
+      "Arbitrary 'Name: value' lines Claude Code forwards on every Anthropic API call, so it can hold a real Authorization: header; matches none of the regex patterns, hence pinned (BLO-21858).",
+  },
+  {
+    name: "PAPERCLIP_K8S_ISOLATION_KEY",
+    classification: "SECRET",
+    reason:
+      "Not a credential — an isolation-root path segment — but the name contains KEY, so SENSITIVE_ENV_NAME_RE already routes it to a secretKeyRef. Declared SECRET to record today's behaviour truthfully; reclassifying it is a behaviour change and gets its own row (BLO-29804).",
+  },
+
+  // --- SAFE_LITERAL: identity and run context ---------------------------
+  {
+    name: "PAPERCLIP_AGENT_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque agent UUID. Confers nothing without PAPERCLIP_API_KEY, and is already a Job label.",
+  },
+  {
+    name: "PAPERCLIP_COMPANY_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque company UUID; scoping identifier, not an authorization token.",
+  },
+  {
+    name: "PAPERCLIP_API_URL",
+    classification: "SAFE_LITERAL",
+    reason: "In-cluster service URL inherited from the Deployment; an address, not a secret.",
+  },
+  {
+    name: "PAPERCLIP_RUN_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque run UUID. Load-bearing for triage — it is how an SRE ties a wedged pod to its run.",
+  },
+  {
+    name: "PAPERCLIP_TASK_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Issue UUID the run was woken for; readable by anyone who can read the board.",
+  },
+  {
+    name: "PAPERCLIP_LINKED_ISSUE_IDS",
+    classification: "SAFE_LITERAL",
+    reason: "Comma-separated issue UUIDs from the approval wake; board identifiers.",
+  },
+
+  // --- SAFE_LITERAL: wake context ---------------------------------------
+  {
+    name: "PAPERCLIP_WAKE_REASON",
+    classification: "SAFE_LITERAL",
+    reason: "Enum-shaped wake cause (issue_assigned, issue_commented, ...).",
+  },
+  {
+    name: "PAPERCLIP_WAKE_COMMENT_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque comment UUID.",
+  },
+  {
+    name: "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Compact issue summary plus the new-comment batch. Board content, not credential material, and already readable by this pod through its own API token — but it is the one SAFE_LITERAL here whose value is free-form text, so a credential pasted into an issue comment would appear on the pod spec. Accepted: the same text is equally readable via the API, so Secret-backing it would not close that path.",
+  },
+  {
+    name: "PAPERCLIP_APPROVAL_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque approval UUID.",
+  },
+  {
+    name: "PAPERCLIP_APPROVAL_STATUS",
+    classification: "SAFE_LITERAL",
+    reason: "Enum-shaped approval outcome.",
+  },
+
+  // --- SAFE_LITERAL: workspace wiring -----------------------------------
+  {
+    name: "PAPERCLIP_WORKSPACE_",
+    prefix: true,
+    classification: "SAFE_LITERAL",
+    reason:
+      "Workspace coordinates — cwd, source, strategy, id, repo URL/ref, branch, worktree path. Filesystem paths and a git remote; the remote is authenticated separately by the gh App token, never embedded here. Prefix because the family is set field-by-field from workspace context.",
+  },
+  {
+    name: "PAPERCLIP_WORKSPACES_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Serialized list of the same workspace coordinates for multi-workspace projects.",
+  },
+  {
+    name: "AGENT_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Filesystem path to the agent's home directory on the mounted PVC.",
+  },
+
+  // --- SAFE_LITERAL: runtime services -----------------------------------
+  {
+    name: "PAPERCLIP_RUNTIME_SERVICES_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Managed preview/dev service descriptors: names, ports, in-cluster URLs.",
+  },
+  {
+    name: "PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Requested runtime services not yet started; same shape as above.",
+  },
+  {
+    name: "PAPERCLIP_RUNTIME_PRIMARY_URL",
+    classification: "SAFE_LITERAL",
+    reason: "In-cluster URL of the primary runtime service; an address.",
+  },
+
+  // --- SAFE_LITERAL: isolation and home ---------------------------------
+  {
+    name: "HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Must be readable off the pod spec — it is the first thing checked when session resume misbehaves.",
+  },
+  {
+    name: "CLAUDE_CONFIG_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "Path to the run's Claude config dir under the isolation root.",
+  },
+  {
+    name: "XDG_CONFIG_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Path to the run's XDG config root.",
+  },
+  {
+    name: "PAPERCLIP_K8S_ISOLATION_MODE",
+    classification: "SAFE_LITERAL",
+    reason: "Enum: shared | run | workspace. Diagnostic for cross-run state bleed.",
+  },
+
+  // --- SAFE_LITERAL: caches and temp ------------------------------------
+  {
+    name: "XDG_CACHE_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Cache path on the runtime-cache volume.",
+  },
+  {
+    name: "GOCACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Go build cache path.",
+  },
+  {
+    name: "GOMODCACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Go module cache path.",
+  },
+  {
+    name: "npm_config_cache",
+    classification: "SAFE_LITERAL",
+    reason: "npm cache path. Lower-cased by npm convention; matching is case-sensitive so this is exact.",
+  },
+  {
+    name: "BUN_INSTALL_CACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Bun install cache path.",
+  },
+  {
+    name: "PIP_CACHE_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "pip cache path.",
+  },
+  {
+    name: "PLAYWRIGHT_BROWSERS_PATH",
+    classification: "SAFE_LITERAL",
+    reason: "Playwright browser download path.",
+  },
+  {
+    name: "TMPDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Run-scoped temp dir (BLO-16219). Load-bearing for triaging concurrent-run collisions.",
+  },
+  {
+    name: "TMP",
+    classification: "SAFE_LITERAL",
+    reason: "Same path as TMPDIR, for tools that read TMP.",
+  },
+  {
+    name: "TEMP",
+    classification: "SAFE_LITERAL",
+    reason: "Same path as TMPDIR, for tools that read TEMP.",
+  },
+
+  // --- SAFE_LITERAL: container wiring -----------------------------------
+  {
+    name: "DOCKER_HOST",
+    classification: "SAFE_LITERAL",
+    reason: "unix:///var/run/docker.sock — the DinD sidecar socket path. Constant, no credential.",
+  },
+  {
+    name: "DOCKER_TLS_CERTDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Set empty on the DinD sidecar to disable TLS on the shared emptyDir socket. A constant.",
+  },
+  {
+    name: "PROMPT_CONTENT",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Init-container-only. The prompt the agent is about to run; it is written to an emptyDir and read via stdin. Oversized prompts already move to a Secret-backed volume for size reasons, so this path carries only small prompts. Not credential material by construction — the prompt is board-authored text.",
+  },
+];
+
 /**
  * Names pinned as always-Secret because they carry credential material while
  * matching none of the patterns above (BLO-21858, from the BLO-21593 review).
  *
- * The pattern list is fail-closed against over-matching but fail-*open*
- * against a credential-carrying variable whose name simply doesn't match.
- * ANTHROPIC_CUSTOM_HEADERS is the concrete instance: it holds arbitrary
- * "Name: value" header lines that Claude Code forwards on every Anthropic API
- * call — including, in principle, a real `Authorization:` line — and it is
- * writable both by the Penstock session-header stamp below and by
- * `adapterConfig.env`. Compared upper-cased so it behaves like the
- * case-insensitive regex.
+ * Derived from ENV_NAME_CLASSIFICATION so the table is the single source of
+ * truth: declaring a name SECRET there is what pins it here. Compared
+ * upper-cased so it behaves like the case-insensitive regex.
  */
-const ALWAYS_SECRET_ENV_NAMES = new Set(["ANTHROPIC_CUSTOM_HEADERS"]);
+const ALWAYS_SECRET_ENV_NAMES = new Set(
+  ENV_NAME_CLASSIFICATION.filter((e) => e.classification === "SECRET" && !e.prefix).map((e) =>
+    e.name.toUpperCase(),
+  ),
+);
 
 export function isSensitiveEnvName(name: string): boolean {
   return ALWAYS_SECRET_ENV_NAMES.has(name.toUpperCase()) || SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+/**
+ * Look up an env name in ENV_NAME_CLASSIFICATION. Exact matches win over
+ * prefix matches. Returns null when the name is undeclared — which is what
+ * the classification test in job-manifest.test.ts fails on.
+ */
+export function classifyEnvName(name: string): EnvClassification | null {
+  const exact = ENV_NAME_CLASSIFICATION.find((e) => !e.prefix && e.name === name);
+  if (exact) return exact.classification;
+  const prefixed = ENV_NAME_CLASSIFICATION.find((e) => e.prefix && name.startsWith(e.name));
+  return prefixed ? prefixed.classification : null;
 }
 
 /**
