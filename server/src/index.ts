@@ -1367,7 +1367,11 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (issueGraphReconciled.escalationsCreated > 0 || issueGraphReconciled.dependencyWakesHealed > 0) {
+        if (
+          issueGraphReconciled.escalationsCreated > 0 ||
+          issueGraphReconciled.dependencyWakesHealed > 0 ||
+          issueGraphReconciled.staleEscalationsAutoResolved > 0
+        ) {
           logger.warn(
             { ...issueGraphReconciled },
             "startup issue-graph liveness reconciliation changed issue graph state",
@@ -1619,7 +1623,14 @@ export async function startServer(): Promise<StartedServer> {
             })
             .then(async () => {
               const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-              if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
+              // BLO-29601: auto-resolving a dead escalation is a change to the issue
+              // graph too. Without it in this gate the drain runs silently and the only
+              // evidence it happened at all is the cancelled rows themselves.
+              if (
+                reconciled.escalationsCreated > 0 ||
+                reconciled.dependencyWakesHealed > 0 ||
+                reconciled.staleEscalationsAutoResolved > 0
+              ) {
                 logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
               }
             })

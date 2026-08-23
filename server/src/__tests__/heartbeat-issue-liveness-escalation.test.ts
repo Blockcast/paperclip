@@ -72,6 +72,7 @@ import {
   DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS,
   DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS,
   DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
+  STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER,
 } from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -994,6 +995,162 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(sourceAfter?.status).toBe("blocked");
     const [leafAfter] = await db.select().from(issues).where(eq(issues.id, blockerIssueId));
     expect(leafAfter?.status).toBe("todo");
+  });
+
+  /**
+   * BLO-29601: an escalation is minted from a premise and then never re-checked, so when
+   * the premise clears the row stays open and keeps costing an agent run to rediscover
+   * that there is nothing to do.
+   *
+   * All three tests below mint a REAL escalation through `reconcileIssueGraphLiveness`
+   * rather than hand-inserting one, because the defect lives in the interaction between
+   * the row's `originId` and the classifier — a fixture with a hand-written key would
+   * not exercise the parse, the blocker wiring, or the self-satisfying waiting path that
+   * makes the re-check hard in the first place.
+   */
+  async function mintEscalation() {
+    await enableAutoRecovery();
+    const seeded = await seedBlockedChain();
+    const created = await heartbeatSvc.reconcileIssueGraphLiveness();
+    expect(created.escalationsCreated).toBe(1);
+    const escalation = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, seeded.companyId),
+          eq(issues.originKind, "harness_liveness_escalation"),
+        ),
+      )
+      .then((rows) => rows[0]!);
+    expect(escalation.originId).toContain("blocked_by_unassigned_issue");
+    return { ...seeded, escalation };
+  }
+
+  it("auto-closes a liveness escalation once its originating invariant stops holding", async () => {
+    const { blockedIssueId, blockerIssueId, escalation } = await mintEscalation();
+
+    // Clear the premise the escalation was minted from: the unassigned blocker leaf is
+    // resolved, so `blocked_by_unassigned_issue` has nothing left to fire against.
+    await db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.staleEscalationsAutoResolved).toBe(1);
+    expect(result.staleEscalationsPremiseStillTrueSkipped).toBe(0);
+    expect(result.staleEscalationAutoResolvedIssueIds).toEqual([escalation.id]);
+
+    const closed = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, escalation.id))
+      .then((rows) => rows[0]!);
+    expect(closed.status).toBe("cancelled");
+
+    // The comment must name the invariant, so a human reading the closed row can tell
+    // WHY it went away rather than finding a silently-cancelled escalation.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, escalation.id));
+    const autoResolve = comments.find((comment) =>
+      comment.body.includes(STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER),
+    );
+    expect(autoResolve).toBeTruthy();
+    expect(autoResolve?.body).toContain("blocked_by_unassigned_issue");
+    expect(autoResolve?.body).toContain(escalation.originId!);
+
+    // The blocker edge comes off the source first. Cancelling while still wired would
+    // leave the source blocked behind a cancelled issue — a fresh liveness violation.
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.map((row) => row.blockerIssueId)).not.toContain(escalation.id);
+  });
+
+  it("releases the execution run held by a stale escalation instead of stranding it", async () => {
+    const { companyId, managerId, blockerIssueId, escalation } = await mintEscalation();
+
+    // A live run holding the escalation. This is the branch `retireObsoleteLivenessRecoveryIssues`
+    // refuses to touch (`hasActiveRunForIssueId` -> activeSkipped), and terminal status alone
+    // does NOT clear these columns, so without an explicit release the lock outlives the premise.
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      status: "queued",
+      contextSnapshot: { issueId: escalation.id },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: runId,
+        checkoutRunId: runId,
+        executionAgentNameKey: "cto",
+        executionLockedAt: new Date(),
+      })
+      .where(eq(issues.id, escalation.id));
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.staleEscalationsAutoResolved).toBe(1);
+    expect(result.staleEscalationRunsReleased).toBe(1);
+
+    const closed = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, escalation.id))
+      .then((rows) => rows[0]!);
+    expect(closed.status).toBe("cancelled");
+    expect(closed.executionRunId).toBeNull();
+    expect(closed.checkoutRunId).toBeNull();
+    expect(closed.executionLockedAt).toBeNull();
+  });
+
+  /**
+   * The branch that must not regress, and the one a happy-path-only suite would miss.
+   *
+   * An open escalation contributes a waiting path for its OWN subject issue
+   * (`hasExplicitWaitingPath` -> `openRecoveryIssues`), so the naive re-check — "re-run
+   * the classifier and see whether the invariant still fires" — reports "premise
+   * cleared" for every escalation, live ones included, and closes the whole backlog
+   * while the incidents are still real. The re-check has to exclude escalation-supplied
+   * waiting paths before it can answer the question at all.
+   */
+  it("leaves a liveness escalation open while its originating invariant still holds", async () => {
+    const { escalation } = await mintEscalation();
+
+    // Nothing about the graph changes: the blocker leaf is still todo and unassigned.
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.staleEscalationsAutoResolved).toBe(0);
+    expect(result.staleEscalationsPremiseStillTrueSkipped).toBe(1);
+    expect(result.staleEscalationRunsReleased).toBe(0);
+
+    const stillOpen = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, escalation.id))
+      .then((rows) => rows[0]!);
+    expect(stillOpen.status).not.toBe("cancelled");
+    expect(stillOpen.status).not.toBe("done");
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, escalation.id));
+    expect(
+      comments.some((comment) =>
+        comment.body.includes(STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER),
+      ),
+    ).toBe(false);
   });
 
   // Pre-BLO-28618 this asserted the *cycle rejection* fallback: the detector
