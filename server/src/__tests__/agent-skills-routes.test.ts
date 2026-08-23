@@ -919,7 +919,14 @@ describe.sequential("agent skill routes", () => {
       expect(mockAgentInstructionsService.materializeManagedBundle).toHaveBeenCalledWith(
         expect.any(Object),
         expect.objectContaining({
-          "AGENTS.md": expect.stringContaining("commitperclip PR Review"),
+          "AGENTS.md": expect.stringContaining(".github/workflows/commitperclip-review.yml"),
+        }),
+        expect.any(Object),
+      );
+      expect(mockAgentInstructionsService.materializeManagedBundle).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({
+          "AGENTS.md": expect.stringContaining("repository's actual required quality gates instead"),
         }),
         expect.any(Object),
       );
