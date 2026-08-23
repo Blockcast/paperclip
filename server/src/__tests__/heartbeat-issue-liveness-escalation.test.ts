@@ -1993,6 +1993,249 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.skippedReescalationCooldown).toBe(0);
   });
 
+  // BLO-29761: the suppression decision is persisted, so "suppressed by
+  // history" is distinguishable from "never detected". Before this, the filing
+  // path wrote `issue.harness_liveness_escalation_created` and the suppression
+  // path wrote nothing, leaving row titles as the only evidence -- which is the
+  // method that produced this issue's own false 470/496 census.
+  async function readSuppressionEvents(companyId: string) {
+    const events = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.harness_liveness_escalation_suppressed"),
+        ),
+      );
+    return events;
+  }
+
+  it("records a cooldown suppression against the prior done row, with its status", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    const closedEscalationId = await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: now,
+      identifier: "CLOSED-COOLDOWN",
+    });
+
+    const held = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+    expect(held.escalationsCreated).toBe(0);
+    expect(held.skippedReescalationCooldown).toBe(1);
+
+    const events = await readSuppressionEvents(companyId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.entityId).toBe(blockedIssueId);
+    expect(events[0]?.details).toMatchObject({
+      reason: "cooldown",
+      incidentKey,
+      suppressedByIssueId: closedEscalationId,
+      suppressedByIdentifier: "CLOSED-COOLDOWN",
+      // The amended AC: carry the prior row's status so a suppression sourced
+      // from a `cancelled` row stays distinguishable once BLO-29838 lands.
+      suppressedByStatus: "done",
+      leafIssueId: blockerIssueId,
+      findingState: "blocked_by_unassigned_issue",
+      sourceIssueId: blockedIssueId,
+    });
+  });
+
+  it("records an unchanged_target suppression, distinguishably from a cooldown one", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    const closedEscalationId = await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      // Outside the 60m cooldown, inside the 7d ceiling, leaf quiet since
+      // before the resolution -- held by the target gate and nothing else.
+      resolvedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 40 * 60 * 60 * 1000),
+      identifier: "CLOSED-TARGET",
+    });
+
+    const held = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+    expect(held.skippedUnchangedTarget).toBe(1);
+
+    const events = await readSuppressionEvents(companyId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.details).toMatchObject({
+      reason: "unchanged_target",
+      suppressedByIssueId: closedEscalationId,
+      suppressedByStatus: "done",
+    });
+  });
+
+  it("records an existing-open suppression, distinguishably from the resolved-history branch", async () => {
+    // Two dependents share one leaf blocker, so the sweep produces two findings
+    // and the second is suppressed by the row the first just created. This is
+    // the `existing` branch: an OPEN row owns the incident, which an operator
+    // must be able to tell apart from "a CLOSED row suppressed this".
+    await enableAutoRecovery();
+    const { companyId, blockerIssueId } = await seedBlockedChain();
+    const secondBlockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const issueTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: secondBlockedIssueId,
+      companyId,
+      title: "Second blocked parent",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: `${issuePrefix}-3`,
+      createdAt: issueTimestamp,
+      updatedAt: issueTimestamp,
+      lastActivityAt: issueTimestamp,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: secondBlockedIssueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.existingEscalations).toBe(1);
+
+    const [escalation] = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+
+    const events = await readSuppressionEvents(companyId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.details).toMatchObject({
+      reason: "existing_open",
+      suppressedByIssueId: escalation?.id,
+      // Not `done`/`cancelled` -- this is what makes the open branch legible.
+      suppressedByStatus: escalation?.status,
+    });
+
+    // Counting suppressions for the period is one filter on the activity log:
+    // no title parsing, no inference from row counts.
+    const all = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(all.filter((e) => e.action === "issue.harness_liveness_escalation_created")).toHaveLength(1);
+  });
+
+  it("writes no suppression row for a first filing", async () => {
+    // Regression guard: observability must not start narrating the happy path.
+    await enableAutoRecovery();
+    const { companyId } = await seedBlockedChain({ blockerStatus: "backlog" });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+    expect(result.escalationsCreated).toBe(1);
+
+    const events = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(events.some((e) => e.action === "issue.harness_liveness_escalation_created")).toBe(true);
+    expect(await readSuppressionEvents(companyId)).toHaveLength(0);
+  });
+
+  it("records one row per suppression decision, not one per sweep", async () => {
+    // The load-bearing property. A suppressed finding is re-evaluated on EVERY
+    // heartbeat tick (default 30s) for as long as it stays suppressed -- up to
+    // the 7d ceiling. Logging per evaluation would be ~2,880 rows per incident
+    // per day across ~400 in-window incidents on two replicas, which would bury
+    // the signal this row exists to surface. The unit of record is therefore
+    // the decision `(incidentKey, reason, suppressedByIssueId)`, and re-running
+    // the identical sweep must add nothing.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: now,
+      completedAt: null,
+    });
+
+    await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+    await heartbeatSvc.reconcileIssueGraphLiveness({ now: new Date(now.getTime() + 30 * 1000) });
+    await heartbeatSvc.reconcileIssueGraphLiveness({ now: new Date(now.getTime() + 60 * 1000) });
+
+    const events = await readSuppressionEvents(companyId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.details).toMatchObject({ reason: "cooldown" });
+  });
+
+  it("records the cooldown -> unchanged_target handover as a second decision", async () => {
+    // The rejection test for the dedupe above: it must collapse repeats without
+    // collapsing genuine changes. When the cooldown lapses and the target-state
+    // gate takes over, the reason changed, so the log must say so -- otherwise
+    // "why is this still suppressed on day 6?" is unanswerable.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: now,
+      completedAt: null,
+    });
+
+    await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+    await heartbeatSvc.reconcileIssueGraphLiveness({
+      now: new Date(now.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 1),
+    });
+
+    const events = await readSuppressionEvents(companyId);
+    expect(events).toHaveLength(2);
+    expect(events.map((e) => (e.details as Record<string, unknown>).reason).sort()).toEqual([
+      "cooldown",
+      "unchanged_target",
+    ]);
+  });
+
+  it("does not write suppression activity rows from the operator preview", async () => {
+    // A read-only preview must not be indistinguishable from a run in the audit
+    // log. This holds structurally -- the preview calls the suppressor directly
+    // rather than through `createIssueGraphLivenessEscalation`, which is where
+    // the write lives -- and is pinned here so unifying the two paths cannot
+    // silently start forging run records from a preview.
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      resolvedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 40 * 60 * 60 * 1000),
+    });
+
+    const before = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+
+    const preview = await heartbeatSvc.buildIssueGraphLivenessAutoRecoveryPreview({ now });
+    expect(preview.skippedUnchangedTarget).toBe(1);
+
+    const after = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(after).toHaveLength(before.length);
+    expect(await readSuppressionEvents(companyId)).toHaveLength(0);
+
+    // And the run that the preview predicted DOES write one, so the assertion
+    // above is about the preview rather than about the fixture being inert.
+    await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+    expect(await readSuppressionEvents(companyId)).toHaveLength(1);
+  });
+
   // Drain path for the legacy edges filed before BLO-28618 stopped writing
   // them. The escalation is seeded with the edge by hand because the detector
   // no longer produces that shape.
