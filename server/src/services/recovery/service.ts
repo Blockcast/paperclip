@@ -146,6 +146,17 @@ export const DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS = 7 * 24 * 60 * 60
  */
 export const LIVENESS_SUPPRESSION_SCAN_SKEW_MS = 60 * 1000;
 
+/**
+ * Why a liveness finding produced no escalation row, as recorded in
+ * `issue.harness_liveness_escalation_suppressed` (BLO-29761).
+ *
+ * `existing_open` is the open-row branch and the other two are the
+ * resolved-history branch; keeping all three under one action means counting
+ * suppressions for a period is a single filter, while telling "an open row owns
+ * this" from "a closed row suppressed this" is a single GROUP BY.
+ */
+export type LivenessSuppressionReason = "existing_open" | "cooldown" | "unchanged_target";
+
 type RecoveryActionBoundsConfig = {
   maxAttempts: number;
   timeoutMs: number;
@@ -8158,6 +8169,15 @@ export function recoveryService(
     const mostRecentDone = await db
       .select({
         id: issues.id,
+        identifier: issues.identifier,
+        // Read the status back rather than hardcoding "done" at the return
+        // sites, even though the filter below currently admits only `done`.
+        // BLO-29764 ruled (2026-08-23) that `cancelled` rows will suppress on
+        // these same two gates; BLO-29838 implements that by widening the
+        // filter. Sourcing the logged status from the row means that change
+        // flows into the audit log for free -- and a hardcoded "done" would
+        // instead go quietly, permanently wrong the day it lands.
+        status: issues.status,
         completedAt: issues.completedAt,
         updatedAt: issues.updatedAt,
       })
@@ -8192,7 +8212,13 @@ export function recoveryService(
     if (resolvedAtMs === undefined || !Number.isFinite(resolvedAtMs)) return null;
 
     if (cooldownMs > 0 && resolvedAtMs >= now.getTime() - cooldownMs) {
-      return { id: mostRecentDone.id, reason: "cooldown" as const };
+      return {
+        id: mostRecentDone.id,
+        identifier: mostRecentDone.identifier,
+        status: mostRecentDone.status,
+        resolvedAtMs,
+        reason: "cooldown" as const,
+      };
     }
 
     // Bound the target-state suppressor before paying for the leaf read. 0
@@ -8220,7 +8246,13 @@ export function recoveryService(
     if (leafActivityMs === undefined || !Number.isFinite(leafActivityMs)) return null;
     if (leafActivityMs > resolvedAtMs) return null;
 
-    return { id: mostRecentDone.id, reason: "unchanged_target" as const };
+    return {
+      id: mostRecentDone.id,
+      identifier: mostRecentDone.identifier,
+      status: mostRecentDone.status,
+      resolvedAtMs,
+      reason: "unchanged_target" as const,
+    };
   }
 
   type LivenessBlockerPruneOutcome = {
@@ -8668,6 +8700,15 @@ export function recoveryService(
       // Cost is one indexed `select` per stale finding, plus a leaf read only
       // for findings that reach the target-state branch -- the same per-finding
       // cost the run already pays, on a read-only operator-triggered endpoint.
+      // Note this calls the suppressor DIRECTLY rather than going through
+      // `createIssueGraphLivenessEscalation`, which is also what keeps the
+      // preview out of the audit log (BLO-29761 AC5): the
+      // `issue.harness_liveness_escalation_suppressed` write lives in that
+      // function, not in the suppressor, so a preview reproduces the run's
+      // decisions without writing a row that would make a read-only operator
+      // preview indistinguishable from an actual run. Pinned by "does not write
+      // suppression activity rows from the operator preview". Keep the write on
+      // the creation path if these two are ever unified.
       const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
         finding,
         now,
@@ -8800,6 +8841,130 @@ export function recoveryService(
   }
 
   /**
+   * Persists the decision NOT to file a liveness escalation (BLO-29761).
+   *
+   * The filing path writes `issue.harness_liveness_escalation_created`; the
+   * suppression path used to write nothing at all, so an operator could not
+   * tell "suppressed by history" from "never detected", and suppression
+   * effectiveness could only be inferred by parsing row titles -- the exact
+   * method that produced this issue's own false 470/496 census.
+   *
+   * ## Why this is deduped rather than written per evaluation
+   *
+   * A suppressed finding is not evaluated once. Nothing about it changes, so
+   * the detector re-collects it and the suppressor re-suppresses it on EVERY
+   * sweep, and the sweep is the heartbeat scheduler tick --
+   * `config.heartbeatSchedulerIntervalMs`, default 30s (`server/src/config.ts`).
+   * That is 2,880 evaluations per incident per day, held for up to the 7d
+   * `unchanged_target` ceiling: ~20k rows for ONE incident, times the ~400
+   * resolved escalations currently inside that window, on both `paperclip-api`
+   * replicas. Logging per evaluation would add ~1M activity rows/day and make
+   * the log it exists to clarify unreadable.
+   *
+   * So the unit of record is the DECISION, not the evaluation:
+   * `(incidentKey, reason, suppressedByIssueId)`. That triple is
+   * once-per-lifetime by construction rather than merely coarse --
+   * `resolvedAtMs` only recedes and leaf activity only advances, so once a
+   * given prior row stops suppressing under a given reason it cannot resume
+   * under that same pair. A `cooldown` -> `unchanged_target` handover, a
+   * different prior row, or a re-file after the ceiling each produce a new
+   * triple and so a new row. Nothing countable is lost; the per-sweep
+   * evaluation count remains available as the run's `skippedReescalationCooldown`
+   * / `skippedUnchangedTarget` counters.
+   *
+   * Dedupe reads `activity_log` rather than an in-process cache deliberately:
+   * an in-memory Set would double-write on every sweep from the second API
+   * replica and re-write the whole working set after each deploy, neither of
+   * which a shared table does. The lookup is served by
+   * `activity_log_entity_type_id_idx` on `(entity_type, entity_id)` and scans
+   * only one issue's activity, which is a rounding error next to the two issue
+   * reads the suppressor itself already pays per finding.
+   *
+   * This is check-then-insert, not an upsert, so two replicas that evaluate the
+   * same finding inside the same instant can both miss and both write. That is
+   * a bounded, one-off duplicate on a first-observation edge rather than the
+   * per-sweep duplication an in-memory cache would produce, and the row carries
+   * `suppressionKey` so a counting query can `count(distinct ...)` past it. A
+   * unique index would close it outright, but not for free: `activity_log` is
+   * an append-only audit table with no unique constraint anywhere in its
+   * schema, and adding a partial one for a best-effort observability row would
+   * let a duplicate key abort a write path that must never affect the sweep.
+   *
+   * This is best-effort observability. It must never be able to change a
+   * suppression decision or fail a sweep, so the caller ignores its result and
+   * it swallows its own errors.
+   */
+  async function logLivenessSuppressionDecision(input: {
+    finding: IssueLivenessFinding;
+    sourceIssue: typeof issues.$inferSelect;
+    runId?: string | null;
+    reason: LivenessSuppressionReason;
+    suppressedBy: { id: string; identifier: string | null; status: string };
+    resolvedAtMs?: number | null;
+  }) {
+    try {
+      const suppressionKey = [input.finding.incidentKey, input.reason, input.suppressedBy.id].join("|");
+      const already = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, input.sourceIssue.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, input.sourceIssue.id),
+            eq(activityLog.action, "issue.harness_liveness_escalation_suppressed"),
+            sql`${activityLog.details}->>'suppressionKey' = ${suppressionKey}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (already) return;
+
+      await logActivity(db, {
+        companyId: input.sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.harness_liveness_escalation_suppressed",
+        entityType: "issue",
+        entityId: input.sourceIssue.id,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          // Stable dedupe identity for the read above. Also the natural GROUP BY
+          // for "count suppressions in a period" without touching row titles.
+          suppressionKey,
+          incidentKey: input.finding.incidentKey,
+          // `existing_open` = an OPEN row already owns this incident.
+          // `cooldown` / `unchanged_target` = a RESOLVED row suppressed it.
+          // One action with a reason discriminator, rather than two actions, so
+          // a period count is one filter and the split is one GROUP BY.
+          reason: input.reason,
+          suppressedByIssueId: input.suppressedBy.id,
+          suppressedByIdentifier: input.suppressedBy.identifier,
+          // Required by BLO-29761's amended AC: once BLO-29838 lets `cancelled`
+          // rows suppress, this is the only field that distinguishes a
+          // suppression sourced from a cancel from one sourced from a close.
+          suppressedByStatus: input.suppressedBy.status,
+          suppressedByResolvedAt:
+            input.resolvedAtMs != null ? new Date(input.resolvedAtMs).toISOString() : null,
+          findingState: input.finding.state,
+          leafIssueId: livenessRecoveryLeafIssueId(input.finding),
+          sourceIssueId: input.sourceIssue.id,
+          sourceIdentifier: input.sourceIssue.identifier,
+          recoveryIssueId: input.finding.recoveryIssueId,
+        },
+      });
+    } catch (err) {
+      // Observability must not be able to break the sweep it observes.
+      logger.warn(
+        { err, incidentKey: input.finding.incidentKey, reason: input.reason },
+        "failed to log liveness escalation suppression decision",
+      );
+    }
+  }
+
+  /**
    * Files the "Unblock liveness incident for X" row for a finding.
    *
    * Deliberately does NOT add the escalation to the source's blocker set, and
@@ -8843,6 +9008,13 @@ export function recoveryService(
       await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
       await findOpenLivenessRecoveryIssueForLeaf(input.finding);
     if (existing) {
+      await logLivenessSuppressionDecision({
+        finding: input.finding,
+        sourceIssue: issue,
+        runId: input.runId,
+        reason: "existing_open",
+        suppressedBy: { id: existing.id, identifier: existing.identifier, status: existing.status },
+      });
       return { kind: "existing" as const, escalationIssueId: existing.id };
     }
     const suppressed = await findSuppressingResolvedLivenessRecoveryIssue(
@@ -8852,6 +9024,18 @@ export function recoveryService(
       input.unchangedTargetSuppressionMs,
     );
     if (suppressed) {
+      await logLivenessSuppressionDecision({
+        finding: input.finding,
+        sourceIssue: issue,
+        runId: input.runId,
+        reason: suppressed.reason,
+        suppressedBy: {
+          id: suppressed.id,
+          identifier: suppressed.identifier,
+          status: suppressed.status,
+        },
+        resolvedAtMs: suppressed.resolvedAtMs,
+      });
       return { kind: "suppressed" as const, reason: suppressed.reason };
     }
 
@@ -8893,6 +9077,16 @@ export function recoveryService(
         await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
         await findOpenLivenessRecoveryIssueForLeaf(input.finding);
       if (!raced) throw error;
+      // Same suppression shape as the pre-insert `existing` branch above: a
+      // concurrent sweep won the unique index, so this finding produced no row.
+      // The winner logs `created`; this side logs why it stood down.
+      await logLivenessSuppressionDecision({
+        finding: input.finding,
+        sourceIssue: issue,
+        runId: input.runId,
+        reason: "existing_open",
+        suppressedBy: { id: raced.id, identifier: raced.identifier, status: raced.status },
+      });
       return { kind: "existing" as const, escalationIssueId: raced.id };
     }
 
