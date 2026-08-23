@@ -312,6 +312,49 @@ describe("scrubJsonValue — structural path, in case the server changes format"
     });
   });
 
+  it("redacts an env object with an unknown property instead of passing it through", () => {
+    const out = scrubJsonValue({ env: [{ name: "A", credential: LEAK }] });
+
+    expectNoLeak(JSON.stringify(out));
+    expect(out).toEqual({ env: [REDACTED] });
+  });
+
+  it("redacts malformed valueFrom objects and their unknown properties", () => {
+    const out = scrubJsonValue({
+      env: [
+        {
+          name: "A",
+          valueFrom: { secretKeyRef: { name: "creds", key: "t" }, credential: LEAK },
+        },
+        { name: "B", valueFrom: { secretKeyRef: { name: "creds" } } },
+        { name: "C", valueFrom: { secretKeyRef: { name: "creds", key: "t", extra: LEAK } } },
+      ],
+    });
+
+    expectNoLeak(JSON.stringify(out));
+    expect(out).toEqual({ env: [REDACTED, REDACTED, REDACTED] });
+  });
+
+  it("keeps only a schema-valid valueFrom EnvVar shape", () => {
+    const env = [
+      {
+        name: "FROM_SECRET",
+        valueFrom: { secretKeyRef: { name: "creds", key: "t", optional: true } },
+      },
+      {
+        name: "FROM_CONFIG_MAP",
+        valueFrom: { configMapKeyRef: { name: "settings", key: "mode" } },
+      },
+      { name: "FROM_FIELD", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+      {
+        name: "FROM_RESOURCE",
+        valueFrom: { resourceFieldRef: { containerName: "app", resource: "limits.cpu", divisor: "1m" } },
+      },
+    ];
+
+    expect(scrubJsonValue({ env })).toEqual({ env });
+  });
+
   it("recurses into YAML carried inside a string field", () => {
     // This is the real MCP shape: the resource arrives as YAML text inside a
     // JSON-RPC content block.
