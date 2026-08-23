@@ -542,6 +542,47 @@ spec:
             summary: "Paperclip plugin-status collector has not ticked successfully in over {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}s"
             description: "paperclip_plugin_status_collector_last_success_timestamp_seconds has not advanced in over {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}s (BLO-21092 review follow-up). While this collector is stuck, PaperclipPluginCriticalErrored/PaperclipPluginErrored are silently unreliable: a plugin that just crashed will not be reflected, and a plugin that just recovered will keep paging. Check worker-tier logs for 'plugin-status-metrics: collector tick failed' to find the listInstalled() failure (most likely a DB connectivity issue on the worker pod), then see the runbook."
             runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+        - alert: PaperclipPluginStatusCollectorAbsent
+          # BLO-21092 Ally review. PaperclipPluginStatusCollectorStale above is
+          # structurally unable to catch the MOST severe variant of the gap it
+          # was added to close, so it needs this companion rather than a
+          # threshold tweak.
+          #
+          # That alert is `(time() - <gauge>) > 300` with `for: 5m`. It works
+          # for a collector that is stuck while its pod is still alive and
+          # scraped: the series persists at a frozen value, the difference
+          # grows past 300s, and it fires ~10m later. It CANNOT work when the
+          # worker pod is down, crashlooping, or never scraped. There the last
+          # sample was written at ~= time() when scraping stopped, so the
+          # difference is ~= 0 at that instant and only crosses 300s at
+          # t ~= 300s -- which is exactly when Prometheus's 5m lookback delta
+          # drops the series from instant queries. The condition is true for
+          # ~0 seconds, so a 5m `for:` window can never be satisfied. Same
+          # outcome, even more directly, if the collector never started at
+          # all (PAPERCLIP_NODE_ROLE misconfigured on the worker StatefulSet,
+          # or the -workers Service falling out of scrape scope): the series
+          # never exists, and `time() - <absent>` returns an empty vector
+          # rather than a large number.
+          #
+          # absent_over_time() is the correct primitive because it is TRUE on
+          # an empty range -- unlike the subtraction above, it does not need
+          # the series to still be queryable in order to report on it. The
+          # window is deliberately wider than the lookback delta so a single
+          # missed scrape or a rolling worker restart cannot trip it; only a
+          # genuinely gone series does.
+          #
+          # Severity is critical rather than warning: a stuck collector still
+          # leaves the last-known plugin snapshot visible, but an absent one
+          # means paperclip_plugin_error does not exist at all, which is
+          # indistinguishable at the dashboard from "all plugins healthy" --
+          # the precise invisible-failure mode BLO-20410 was.
+          expr: absent_over_time(paperclip_plugin_status_collector_last_success_timestamp_seconds{role="worker"}[{{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }}])
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip plugin-status collector has reported no successful tick for {{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }} (series absent)"
+            description: "paperclip_plugin_status_collector_last_success_timestamp_seconds{role=\"worker\"} has been entirely absent for {{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }} (BLO-21092 Ally review). This is the worker-down / collector-never-started case that PaperclipPluginStatusCollectorStale cannot detect: with no series, `time() - <gauge>` yields an empty vector instead of a growing number, so the staleness rule stays silent forever. While this fires, paperclip_plugin_error is absent too -- which on a dashboard looks identical to every plugin being healthy, exactly the invisible failure BLO-20410 was. Check that a worker-tier pod is Running with PAPERCLIP_NODE_ROLE != 'api', that it is a live Prometheus scrape target (the `paperclip-workers` Service must stay within the ServiceMonitor selector), and grep worker logs for 'plugin-status-metrics'."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

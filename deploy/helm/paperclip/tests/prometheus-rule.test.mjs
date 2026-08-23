@@ -826,3 +826,57 @@ test("PaperclipPluginStatusCollectorStale's role label prevents an API-tier targ
       + "every tier including API, which is exactly the false-fire this alert must not reintroduce",
   );
 });
+
+test("PaperclipPluginStatusCollectorAbsent covers the worker-down case the staleness rule structurally cannot (BLO-21092 Ally review)", () => {
+  // The staleness rule is `(time() - <gauge>) > N` with a `for:` window. That
+  // shape can only fire while the series is still queryable, so it catches a
+  // collector that is stuck behind a live scrape target and MISSES the worse
+  // case: worker down, crashlooping, or never started. There the last sample
+  // sits at ~= time() when scraping stopped, so the difference is ~= 0 then
+  // and only crosses N at t ~= N -- the same moment Prometheus's lookback
+  // delta drops the series from instant queries. True for ~0s, so `for:`
+  // never completes. absent_over_time() is the required companion because it
+  // reports TRUE on an empty range instead of needing the series to survive.
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginStatusCollectorAbsent/,
+    "an absence guard must accompany the staleness guard, or a dead/never-started collector is silent forever",
+  );
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorAbsent[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "collector-absent alert must render an expr");
+
+  // Must use absent_over_time over a range -- `absent()` on an instant vector
+  // is subject to the same lookback-delta eviction that defeats the
+  // subtraction form, and a plain `== 0`/threshold cannot represent absence.
+  assert.match(
+    expr,
+    /absent_over_time\(\s*paperclip_plugin_status_collector_last_success_timestamp_seconds\{role="worker"\}\[\d+[smh]\]\s*\)/,
+    "absence must be expressed as absent_over_time(<gauge>{role=\"worker\"}[window]) so it is TRUE on an empty range",
+  );
+
+  // The window must exceed Prometheus's 5m lookback delta, otherwise a single
+  // missed scrape or a rolling worker restart reads as a vanished series.
+  const [, win, unit] = expr.match(/\[(\d+)([smh])\]/) ?? [];
+  const seconds = Number(win) * (unit === "h" ? 3600 : unit === "m" ? 60 : 1);
+  assert.ok(
+    seconds > 300,
+    `absence window must exceed the 5m lookback delta to be unambiguous, got ${win}${unit}`,
+  );
+
+  // Absence is strictly worse than staleness: with no series at all,
+  // paperclip_plugin_error is absent too, which is indistinguishable on a
+  // dashboard from every plugin being healthy -- the BLO-20410 failure mode.
+  const [, block] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorAbsent([\s\S]*?)(?=\n\s+- alert:|\n\s{0,4}\S|$)/,
+  ) ?? [];
+  assert.match(
+    block ?? "",
+    /severity: critical/,
+    "an absent collector must page critical -- it renders the plugin gauges invisible, not merely stale",
+  );
+});
