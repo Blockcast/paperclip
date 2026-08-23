@@ -3,12 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
   buildJobManifest,
   buildPodLogPath,
   sanitizeLabelValue,
   isSensitiveEnvName,
+  classifyEnvName,
+  ENV_NAME_CLASSIFICATION,
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
   findServerOnlyEnvVarsInPodSpec,
@@ -2296,5 +2299,228 @@ describe("buildJobManifest — server credential propagation (BLO-22514)", () =>
     expect(findServerOnlyEnvVarsInPodSpec(podSpec)).toEqual([]);
     expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
     expect(podSpec.volumes!.map((v) => v.name)).toContain("github-merge-token");
+  });
+});
+
+/**
+ * BLO-29804 — the declare-or-fail gate on env classification.
+ *
+ * SENSITIVE_ENV_NAME_RE is fail-open against a credential-carrying variable
+ * whose name doesn't match one of its six patterns; BLO-21858
+ * (ANTHROPIC_CUSTOM_HEADERS) is the proof. Pinning names one at a time only
+ * fixes the instances someone notices. These tests are the forcing function:
+ * a new env var introduced in job-manifest.ts reddens CI in the pull request
+ * that introduces it, naming the variable, and the author has to declare it
+ * SECRET or SAFE_LITERAL rather than inheriting a default.
+ */
+describe("env name classification gate (BLO-29804)", () => {
+  /**
+   * Names the test itself injects through the three operator-supplied
+   * channels. Their names are data, not code, so they cannot be pre-declared
+   * in ENV_NAME_CLASSIFICATION; subtracting exactly what we supplied leaves
+   * only code-originated names, which is what the table must cover.
+   *
+   * `inheritedEnv` is separately governed by AGENT_ENV_ALLOWLIST in
+   * inherit-allowlist.ts — the same declare-or-refuse shape at that boundary.
+   */
+  const OPERATOR_CONFIG_ENV = {
+    OPERATOR_TUNABLE: "some-value",
+    OPERATOR_API_TOKEN: "should-be-secret-backed",
+  };
+  const OPERATOR_INHERITED_ENV = {
+    PAPERCLIP_API_URL: "http://paperclip.paperclip.svc.cluster.local:3100",
+    GH_TOKEN: "inherited-and-secret-backed",
+  };
+  const OPERATOR_VALUE_FROM = [
+    { name: "INHERITED_VALUE_FROM_DEPLOYMENT", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+  ];
+
+  const OPERATOR_SUPPLIED_NAMES = new Set([
+    ...Object.keys(OPERATOR_CONFIG_ENV),
+    ...Object.keys(OPERATOR_INHERITED_ENV),
+    ...OPERATOR_VALUE_FROM.map((e) => e.name),
+  ]);
+
+  /**
+   * A context populated on every optional field, so the conditional
+   * setIfPresent branches in buildEnvVars all fire. A var that only appears
+   * when, say, an approval wake supplies approvalId is still a var the table
+   * has to classify.
+   */
+  function maximalCtx(config: Record<string, unknown>): AdapterExecutionContext {
+    const ctx = makeCtx({
+      authToken: "pk_test_token",
+      context: {
+        taskId: "task-1",
+        issueId: "issue-1",
+        wakeReason: "issue_assigned",
+        wakeCommentId: "comment-1",
+        commentId: "comment-1",
+        approvalId: "approval-1",
+        approvalStatus: "approved",
+        issueIds: ["issue-1", "issue-2"],
+        paperclipWake: { issue: { identifier: "BLO-1" }, comments: [] },
+        paperclipWorkspace: {
+          cwd: "/paperclip/workspace",
+          source: "git_repo",
+          strategy: "project_primary",
+          workspaceId: "ws-1",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+          repoRef: "master",
+          branchName: "feature",
+          worktreePath: "/paperclip/wt",
+          agentHome: "/paperclip/home",
+        },
+        paperclipWorkspaces: [{ id: "ws-1", name: "paperclip" }],
+        paperclipRuntimeServiceIntents: [{ name: "web", port: 3000 }],
+        paperclipRuntimeServices: [{ name: "web", url: "http://web:3000" }],
+        paperclipRuntimePrimaryUrl: "http://web:3000",
+      } as AdapterExecutionContext["context"],
+    });
+    ctx.config = config;
+    return ctx;
+  }
+
+  /** The four AC permutations, as a full 2x2x2x2 cross product. */
+  function permutations(): { label: string; ctx: AdapterExecutionContext }[] {
+    const out: { label: string; ctx: AdapterExecutionContext }[] = [];
+    for (const isolation of [false, true]) {
+      for (const dind of [false, true]) {
+        for (const operatorEnv of [false, true]) {
+          for (const mcp of [false, true]) {
+            const config: Record<string, unknown> = { enableDocker: dind };
+            if (isolation) {
+              config.isolationMode = "isolated";
+              config.isolationKey = "pr-review-123";
+            }
+            if (operatorEnv) config.env = { ...OPERATOR_CONFIG_ENV };
+            if (mcp) config.mcpServers = { extra: { command: "node", args: ["server.js"] } };
+            out.push({
+              label: `isolation=${isolation} dind=${dind} adapterConfigEnv=${operatorEnv} mcpServers=${mcp}`,
+              ctx: maximalCtx(config),
+            });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  const selfPodWithInherited = () =>
+    makeSelfPod({
+      inheritedEnv: { ...OPERATOR_INHERITED_ENV },
+      inheritedEnvValueFrom: OPERATOR_VALUE_FROM,
+    });
+
+  /** Every env name on every container of the assembled pod spec. */
+  function allEnvNames(podSpec: k8s.V1PodSpec): string[] {
+    const containers: k8s.V1Container[] = [
+      ...(podSpec.initContainers ?? []),
+      ...(podSpec.containers ?? []),
+      ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+    ];
+    return containers.flatMap((c) => (c.env ?? []).map((e) => e.name).filter((n): n is string => !!n));
+  }
+
+  it("classifies every code-originated env name across all 16 config permutations", () => {
+    const undeclared = new Map<string, string[]>();
+
+    for (const { label, ctx } of permutations()) {
+      const { job } = buildJobManifest({ ctx, selfPod: selfPodWithInherited() });
+      for (const name of allEnvNames(job.spec!.template.spec!)) {
+        if (OPERATOR_SUPPLIED_NAMES.has(name)) continue;
+        if (classifyEnvName(name) !== null) continue;
+        undeclared.set(name, [...(undeclared.get(name) ?? []), label]);
+      }
+    }
+
+    // Name the variable, not just the failure — that is the whole point of the
+    // gate. A PR adding an env var reads its own name out of this message.
+    expect(
+      [...undeclared.entries()].map(
+        ([name, labels]) =>
+          `${name} (emitted under: ${labels[0]}) — declare it SECRET or SAFE_LITERAL in ENV_NAME_CLASSIFICATION in job-manifest.ts`,
+      ),
+    ).toEqual([]);
+  });
+
+  it("agrees with isSensitiveEnvName on every name it declares", () => {
+    // The table must describe what the code actually does. A SECRET entry the
+    // routing does not treat as sensitive, or a SAFE_LITERAL entry it does,
+    // means the classification has drifted from behaviour.
+    const disagreements = ENV_NAME_CLASSIFICATION.filter((e) => !e.prefix).filter(
+      (e) => isSensitiveEnvName(e.name) !== (e.classification === "SECRET"),
+    );
+    expect(disagreements.map((e) => `${e.name} declared ${e.classification}`)).toEqual([]);
+  });
+
+  it("does not let a prefix entry silently absolve a credential-shaped name", () => {
+    // The check above only covers exact entries, so a prefix family is the one
+    // way a new credential-shaped name could enter classified without anyone
+    // deciding: `PAPERCLIP_WORKSPACE_AUTH_TOKEN` inherits SAFE_LITERAL from
+    // the `PAPERCLIP_WORKSPACE_` family while isSensitiveEnvName routes it to
+    // a secretKeyRef. Runtime would be right and the table would be lying.
+    // Assert the two agree on every name actually emitted, which is what
+    // closes the prefix escape hatch without banning prefixes.
+    const drifted = new Set<string>();
+
+    for (const { ctx } of permutations()) {
+      const { job } = buildJobManifest({ ctx, selfPod: selfPodWithInherited() });
+      for (const name of allEnvNames(job.spec!.template.spec!)) {
+        if (OPERATOR_SUPPLIED_NAMES.has(name)) continue;
+        const declared = classifyEnvName(name);
+        if (declared === null) continue; // the coverage test above owns this case
+        if (isSensitiveEnvName(name) !== (declared === "SECRET")) {
+          drifted.add(
+            `${name} classifies as ${declared} but isSensitiveEnvName says ${isSensitiveEnvName(name) ? "sensitive" : "not sensitive"} — declare it explicitly in ENV_NAME_CLASSIFICATION instead of inheriting a prefix`,
+          );
+        }
+      }
+    }
+
+    expect([...drifted]).toEqual([]);
+  });
+
+  it("requires a stated reason on every entry", () => {
+    // Non-empty is the whole machine-checkable invariant, deliberately. A
+    // character-count floor looks stricter but measures nothing a reviewer
+    // cares about — it is satisfied by padding and it reddens on a reason
+    // that is short because the variable is simple ("pip cache path."). The
+    // useful reason is the one a reviewer reads instead of re-deriving
+    // whether the value can carry a credential, and that is a review
+    // judgement, not a length.
+    expect(ENV_NAME_CLASSIFICATION.filter((e) => e.reason.trim().length === 0).map((e) => e.name)).toEqual([]);
+  });
+
+  it("keeps the Secret-backed name set identical to the pre-change set (no behaviour change)", () => {
+    // The no-behaviour-change proof required by BLO-29804. This is the set as
+    // it stood before the classification table existed: regex matches plus the
+    // one name BLO-21858 pinned. If introducing the table ever moves a var
+    // between literal and secretKeyRef, this reddens.
+    const EXPECTED_SECRET_BACKED = [
+      "ANTHROPIC_CUSTOM_HEADERS",
+      "GH_TOKEN",
+      "OPERATOR_API_TOKEN",
+      "PAPERCLIP_API_KEY",
+      "PAPERCLIP_K8S_ISOLATION_KEY",
+    ];
+
+    const ctx = maximalCtx({
+      isolationMode: "isolated",
+      isolationKey: "pr-review-123",
+      enableDocker: true,
+      env: { ...OPERATOR_CONFIG_ENV },
+      mcpServers: { extra: { command: "node", args: ["server.js"] } },
+    });
+    const { job, envSecret } = buildJobManifest({ ctx, selfPod: selfPodWithInherited() });
+
+    const mainEnv = job.spec!.template.spec!.containers[0]?.env ?? [];
+    const secretBacked = mainEnv
+      .filter((e) => e.valueFrom?.secretKeyRef?.name === envSecret?.name)
+      .map((e) => e.name!)
+      .sort();
+
+    expect(secretBacked).toEqual(EXPECTED_SECRET_BACKED);
+    expect(Object.keys(envSecret?.data ?? {}).sort()).toEqual(EXPECTED_SECRET_BACKED);
   });
 });
