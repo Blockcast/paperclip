@@ -2180,6 +2180,15 @@ describe("comment-review gate webhook trigger", () => {
       ),
     ).toBeNull();
   });
+
+  it("rejects a review payload carrying no resolvable PR number", () => {
+    // The gate keys every read and the status write on the PR number, so a
+    // payload without one has to drop rather than reach the API with a guess.
+    const { pull_request: _omitted, ...withoutPr } = reviewPayload();
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger("pull_request_review", withoutPr, reviewer),
+    ).toBeNull();
+  });
 });
 
 describeEmbeddedPostgres("github-webhook route", () => {
