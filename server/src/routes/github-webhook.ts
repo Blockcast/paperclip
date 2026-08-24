@@ -3923,7 +3923,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       return;
     }
 
-    const payload = (req.body ?? {}) as Record<string, unknown>;
     let context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
       // BLO-18273/BLO-21618: surface both silent drops in this handler — an
