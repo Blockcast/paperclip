@@ -32454,6 +32454,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const suppression: WakeSuppressionOutcome = {
           durableSkipReason: null,
           providerCapacityDeferred: false,
+          dependencyBlockedRetryAt: null,
         };
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
