@@ -11,6 +11,7 @@ import {
   isSensitiveEnvName,
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
+  findLiteralOperatorEnvVarsInPodSpec,
   findServerOnlyEnvVarsInPodSpec,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
@@ -915,12 +916,21 @@ describe("buildJobManifest", () => {
       expect(env.get("GOCACHE")).toBe("/runtime-cache/go-build");
     });
 
-    it("preserves explicit adapter cache env overrides", () => {
+    it("preserves explicit adapter cache env overrides, delivered via the env Secret", () => {
+      // BLO-22546: the override still takes effect, but adapterConfig.env is
+      // default-deny, so it now reaches the pod as a secretKeyRef rather than a
+      // literal `value`. The operator intent (custom cache paths) is unchanged;
+      // only the delivery mechanism is.
       ctx.config = { env: { XDG_CACHE_HOME: "/custom-cache", GOCACHE: "/custom-go-cache" } };
-      const { job } = buildJobManifest({ ctx, selfPod });
-      const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
-      expect(env.get("XDG_CACHE_HOME")).toBe("/custom-cache");
-      expect(env.get("GOCACHE")).toBe("/custom-go-cache");
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
+      const env = job.spec?.template?.spec?.containers[0]?.env ?? [];
+      for (const name of ["XDG_CACHE_HOME", "GOCACHE"]) {
+        const entry = env.find((e) => e.name === name);
+        expect(entry?.value).toBeUndefined();
+        expect(entry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      }
+      expect(envSecret?.data.XDG_CACHE_HOME).toBe("/custom-cache");
+      expect(envSecret?.data.GOCACHE).toBe("/custom-go-cache");
     });
 
     it("inherits env vars from selfPod, routing the credential-shaped one through a Secret", () => {
@@ -948,12 +958,18 @@ describe("buildJobManifest", () => {
     });
 
 
-    it("user env config overrides inherited env", () => {
+    it("user env config overrides inherited env, delivered via the env Secret", () => {
+      // BLO-22546: precedence is unchanged (operator wins over inherited), but
+      // the winning operator value is Secret-backed regardless of key name —
+      // AWS_REGION matches no sensitive-name pattern and previously shipped as
+      // a readable literal.
       selfPod.inheritedEnv = { AWS_REGION: "us-east-1" };
       ctx.config = { env: { AWS_REGION: "us-west-2" } };
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const awsRegion = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "AWS_REGION");
-      expect(awsRegion?.value).toBe("us-west-2");
+      expect(awsRegion?.value).toBeUndefined();
+      expect(awsRegion?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.AWS_REGION).toBe("us-west-2");
     });
 
     it("sets PAPERCLIP_RUN_ID", () => {
@@ -1022,7 +1038,15 @@ describe("buildJobManifest", () => {
       const h2 = (r2.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
         (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
       );
-      expect(h2?.value).toBe("x-penstock-session: manual-pin");
+      // BLO-22546: the manual override still wins (no session line appended),
+      // and because the operator's value survives the merge untouched it is
+      // Secret-backed. Contrast r1 above, where the adapter appended to the
+      // operator value — the shipped value is then adapter-derived and stays a
+      // literal. Same variable, different classification, decided by whether
+      // the operator's value is what actually ships.
+      expect(h2?.value).toBeUndefined();
+      expect(h2?.valueFrom?.secretKeyRef?.name).toBe(r2.envSecret?.name);
+      expect(r2.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toBe("x-penstock-session: manual-pin");
     });
 
     it("literal env overrides valueFrom with the same name", () => {
@@ -2092,6 +2116,103 @@ describe("fail-closed sensitive-env guard covers every container on the pod", ()
     // The sidecar is on the pod...
     expect(podSpec.initContainers!.map((c) => c.name)).toContain("dind");
     // ...and is inside the guard's field of view (it returns clean today).
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+  });
+});
+
+describe("adapterConfig.env is default-deny, regardless of key name (BLO-22546)", () => {
+  // AC 3 on BLO-22546: the sensitive-NAME pattern is not default-deny — a key
+  // called PENSTOCK_BOARD, GH_PAT or FOO_BAR matches nothing and shipped as a
+  // literal `value`, readable by any principal with `get pods`. Operator env is
+  // almost entirely credentials, so at that layer classification ignores the
+  // name entirely. The first test is the falsifier: a name-pattern-only
+  // implementation fails it.
+
+  it("routes a deliberately non-credential-looking operator key to a secretKeyRef", () => {
+    const ctx = makeCtx({ config: { env: { FOO_BAR: "pcp_board_live_value" } } });
+    const { job, envSecret } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const entry = job.spec!.template.spec!.containers![0].env!.find((e) => e.name === "FOO_BAR");
+
+    // Not a literal...
+    expect(entry?.value).toBeUndefined();
+    // ...and the name pattern alone would never have caught it.
+    expect(isSensitiveEnvName("FOO_BAR")).toBe(false);
+    expect(entry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+    expect(entry?.valueFrom?.secretKeyRef?.key).toBe("FOO_BAR");
+    expect(envSecret?.data.FOO_BAR).toBe("pcp_board_live_value");
+  });
+
+  it("keeps an empty operator value as a literal so no secretKeyRef dangles", () => {
+    // A secretKeyRef to a key that sensitiveEnvData never receives fails the
+    // pod at startup with CreateContainerConfigError, so empty stays inline.
+    const ctx = makeCtx({ config: { env: { FOO_BAR: "" } } });
+    const { job, envSecret } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const entry = job.spec!.template.spec!.containers![0].env!.find((e) => e.name === "FOO_BAR");
+    expect(entry?.value).toBe("");
+    expect(entry?.valueFrom).toBeUndefined();
+    expect(envSecret?.data.FOO_BAR).toBeUndefined();
+  });
+
+  it("leaves an adapter-won override as a literal, since the operator value is not what ships", () => {
+    // Layer 4 is merged BEFORE the HOME/isolation block, which overwrites
+    // unconditionally. The shipped value is the adapter's own non-secret path,
+    // so Secret-ifying it would be wrong and would also make the fail-closed
+    // guard fire on the adapter's own write.
+    const ctx = makeCtx({ config: { env: { HOME: "/operator-supplied" } } });
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const entry = job.spec!.template.spec!.containers![0].env!.find((e) => e.name === "HOME");
+    expect(entry?.value).toBe("/paperclip");
+    expect(entry?.valueFrom).toBeUndefined();
+  });
+
+  it("still builds a clean manifest when the operator sets no env at all", () => {
+    const { job } = buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() });
+    expect(findLiteralOperatorEnvVarsInPodSpec(job.spec!.template.spec!, new Set())).toEqual([]);
+  });
+});
+
+describe("fail-closed guard for operator-supplied env (BLO-22546)", () => {
+  const spec = (containerEnv: { name: string; value?: string }[]) =>
+    ({
+      initContainers: [{ name: "write-prompt", env: [{ name: "PROMPT_FILE", value: "/tmp/p" }] }],
+      containers: [{ name: "claude", env: containerEnv }],
+    }) as unknown as Parameters<typeof findLiteralOperatorEnvVarsInPodSpec>[0];
+
+  it("flags an operator key still carrying a literal value, naming the container", () => {
+    const podSpec = spec([{ name: "FOO_BAR", value: "leaked" }]);
+    // The name-pattern guard is blind to it — this is the gap being closed.
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+    expect(findLiteralOperatorEnvVarsInPodSpec(podSpec, new Set(["FOO_BAR"]))).toEqual([
+      "claude/FOO_BAR",
+    ]);
+  });
+
+  it("ignores keys the operator did not supply", () => {
+    const podSpec = spec([{ name: "AWS_REGION", value: "us-east-1" }]);
+    expect(findLiteralOperatorEnvVarsInPodSpec(podSpec, new Set(["FOO_BAR"]))).toEqual([]);
+  });
+
+  it("ignores an operator key that is correctly a secretKeyRef", () => {
+    const podSpec = {
+      containers: [
+        {
+          name: "claude",
+          env: [{ name: "FOO_BAR", valueFrom: { secretKeyRef: { name: "job-env", key: "FOO_BAR" } } }],
+        },
+      ],
+    } as unknown as Parameters<typeof findLiteralOperatorEnvVarsInPodSpec>[0];
+    expect(findLiteralOperatorEnvVarsInPodSpec(podSpec, new Set(["FOO_BAR"]))).toEqual([]);
+  });
+
+  it("does not fire on DOCKER_HOST, which the adapter re-asserts after buildEnvVars", () => {
+    // enableDocker pushes a literal DOCKER_HOST onto the main container after
+    // buildEnvVars has returned. An operator setting the same key must not turn
+    // that adapter-owned write into a build failure, and must not produce both
+    // a secretKeyRef and a literal for one name.
+    const ctx = makeCtx({ config: { enableDocker: true, env: { DOCKER_HOST: "tcp://x:2375" } } });
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const podSpec = job.spec!.template.spec!;
+    expect(podSpec.containers![0].env!.some((e) => e.name === "DOCKER_HOST" && e.value)).toBe(true);
     expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
   });
 });
