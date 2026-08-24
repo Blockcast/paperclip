@@ -151,7 +151,10 @@ import {
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
-import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import {
+  ACTIVE_RECOVERY_ACTION_STATUSES,
+  BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
+} from "./issue-recovery-actions.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 
@@ -4077,7 +4080,14 @@ export async function listBlockedIssueAutoResumeSuppressions(
       and(
         eq(issueRecoveryActions.companyId, companyId),
         inArray(issueRecoveryActions.sourceIssueId, uniqueIssueIds),
-        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        // NOT `ACTIVE_RECOVERY_ACTION_STATUSES` — `escalated` is deliberately excluded.
+        // An escalated action is definitionally wake-exhausted, so suppressing here would
+        // pin the issue `blocked` with nothing able to re-enter it. See the constant's doc
+        // comment (BLO-21523).
+        inArray(
+          issueRecoveryActions.status,
+          [...BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES],
+        ),
       ),
     );
   for (const row of recoveryRows) {
