@@ -277,7 +277,7 @@ export function companySkillPolicyService(db: Db) {
     });
     // Reached only on commit; a rollback throws straight past this.
     try {
-      publish();
+      await publish();
     } catch (err) {
       logger.warn({ err, companyId: input.companyId }, "failed to publish company.skill_policy_replaced activity event");
     }
@@ -295,7 +295,7 @@ export function companySkillPolicyService(db: Db) {
         .where(eq(companySkillPolicies.companyId, input.companyId))
         .returning({ revision: companySkillPolicies.revision })
         .then((rows) => rows[0] ?? null);
-      let activityPublish: ActivityPublish = () => {};
+      let activityPublish: ActivityPublish = async () => {};
       if (existing) {
         activityPublish = await logActivity(transactionDb, {
           ...input.activity,
@@ -313,7 +313,7 @@ export function companySkillPolicyService(db: Db) {
     });
     // Reached only on commit; a rollback throws straight past this.
     try {
-      publish();
+      await publish();
     } catch (err) {
       logger.warn({ err, companyId: input.companyId }, "failed to publish company.skill_policy_reset activity event");
     }

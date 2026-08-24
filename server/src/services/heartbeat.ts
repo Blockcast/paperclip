@@ -11424,7 +11424,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         manualWakeTriggerDetail: input.triggerDetail,
         manualWakeReason: input.reason,
       };
-      publishes.push(() => {
+      publishes.push(async () => {
         clearHeartbeatRunRuntimeStatus(cancelled.id);
         publishLiveEvent({
           companyId: cancelled.companyId,
@@ -18156,7 +18156,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // transaction that didn't commit.
     if (scheduleResult.outcome === "scheduled" && scheduleResult.activityPublish) {
       try {
-        scheduleResult.activityPublish();
+        await scheduleResult.activityPublish();
       } catch (err) {
         logger.warn(
           { err, runId: run.id, issueId },
@@ -31946,7 +31946,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       for (const publish of manualCapacityActivityPublishes) {
         try {
-          publish();
+          await publish();
         } catch (err) {
           logger.warn(
             { err, issueId, agentId },
@@ -31960,7 +31960,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // event is never published for a transaction that didn't commit.
       if ("activityPublish" in outcome && outcome.activityPublish) {
         try {
-          outcome.activityPublish();
+          await outcome.activityPublish();
         } catch (err) {
           logger.warn(
             { err, issueId, agentId },
@@ -32270,7 +32270,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const publish of manualCapacityActivityPublishes) {
       try {
-        publish();
+        await publish();
       } catch (err) {
         logger.warn(
           { err, issueId, agentId },
