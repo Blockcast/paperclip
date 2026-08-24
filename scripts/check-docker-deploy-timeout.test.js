@@ -189,7 +189,10 @@ test("Docker deploy proves live review-gate capture before authority promotion",
   assert.match(deployJob, /api_deployment="\$\(jq -er '\.metadata\.name/);
   assert.match(deployJob, /kubectl -n "\$\{NS\}" get deployment "\$\{api_deployment\}" -o json/);
   assert.match(deployJob, /PAPERCLIP_API_DEPLOYMENT="\$\{api_deployment\}"/);
-  assert.doesNotMatch(deployJob, /get deployment paperclip-api/);
+  // Current master performs a later two-tier convergence read against the
+  // historical paperclip-api name. The capture/promotion path itself must use
+  // the Helm-resolved name before the admission approval boundary.
+  assert.doesNotMatch(deployJob.slice(0, approval), /get deployment paperclip-api/);
   assert.match(deployJob, /--target "\$\{unstamped\}" --print-authority/);
   assert.match(deployJob, /--target "\$\{unstamped\}" --live "\$\{live_capture\}"/);
 });
