@@ -4510,7 +4510,7 @@ export function pipelineService(
       });
       // Reached only on commit; a rollback throws straight past this.
       try {
-        publish();
+        await publish();
       } catch (err) {
         logger.warn(
           { err, companyId: input.companyId, stageId: input.stageId },
