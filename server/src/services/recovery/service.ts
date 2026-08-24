@@ -8040,12 +8040,23 @@ export function recoveryService(
   /**
    * Should we suppress re-raising an escalation we have already delivered once?
    *
+   * "Resolved" means `done` OR `cancelled`, on identical terms (BLO-29764).
+   * BLO-27676 shipped this `done`-only, on the reading that a cancellation says
+   * "the report was wrong", not "the leaf was given an action path", so it must
+   * re-arm at once. That is true of the report and irrelevant to the loop: the
+   * detector re-derives the same finding from the same unchanged leaf, so the
+   * immediate re-arm regenerates the row that was just judged not worth having,
+   * and an owner who cancels twice has said so twice. Measured 5 repeat
+   * cancellations across 4 incident keys in 22 days. The replacement hatch is
+   * the first bullet under "what still re-arms" -- touch the leaf -- which is
+   * the action the cancellation was standing in for anyway.
+   *
    * Two suppressors (BLO-27676):
    *
-   *   1. `cooldown` -- a `done` escalation for this incident inside `cooldownMs`.
-   *      Debounces the detector against its own sweep cadence. Unchanged.
+   *   1. `cooldown` -- a resolved escalation for this incident inside
+   *      `cooldownMs`. Debounces the detector against its own sweep cadence.
    *
-   *   2. `unchanged_target` -- a `done` escalation for this incident whose leaf
+   *   2. `unchanged_target` -- a resolved escalation for this incident whose leaf
    *      target has had no activity since it resolved. This is the termination
    *      path the class lacked. The old rule was purely time-based: it consulted
    *      only elapsed time, never the target, so it always expired and an
@@ -8058,11 +8069,11 @@ export function recoveryService(
    *
    *      Bounded by `DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS` (7d).
    *      Without a ceiling this suppressor is permanent, because the leaf is
-   *      quiet by construction: an escalation closed `done` without giving the
-   *      leaf an action path would never be re-reported, which is a silent hole
-   *      in a liveness detector and the exact defect this class started as, with
-   *      the sign flipped. The ceiling keeps the worst case at weekly rather
-   *      than never.
+   *      quiet by construction: an escalation resolved without giving the leaf
+   *      an action path would never be re-reported, which is a silent hole in a
+   *      liveness detector and the exact defect this class started as, with the
+   *      sign flipped. The ceiling keeps the worst case at weekly rather than
+   *      never.
    *
    * `cooldownMs` (the public `reescalationCooldownMs` option) governs suppressor
    * 1 only; passing 0 no longer disables re-escalation suppression outright, it
@@ -8081,15 +8092,15 @@ export function recoveryService(
    *   - any activity on the leaf after the resolution
    *   - the suppression ceiling elapsing (see 2 above)
    *   - a different invariant state (the fingerprint carries `state`)
-   *   - a `cancelled` rather than `done` prior escalation
    *   - a leaf we cannot read (fails open)
    *
-   * Trade-off, now bounded rather than open-ended: an escalation resolved `done`
+   * Trade-off, now bounded rather than open-ended: an escalation resolved
    * WITHOUT actually giving the leaf an action path will not re-raise under the
    * same fingerprint until the leaf is touched or the ceiling elapses. That is
    * the intended reading of "closing a row must not, by itself, regenerate it";
-   * the alternative is the unbounded loop this replaces, and cancelling rather
-   * than closing re-arms immediately. Resolving an escalation does not itself
+   * the alternative is the unbounded loop this replaces. Since BLO-29764 that
+   * holds for a cancellation too, so the escape hatch is a leaf touch rather
+   * than a choice of terminal status. Resolving an escalation does not itself
    * write to the leaf (`removeRecoveryBlockerFromSource` touches the SOURCE), so
    * the comparison is stable rather than self-clearing.
    */
@@ -8116,12 +8127,21 @@ export function recoveryService(
     // `updatedAt` silently swallows a genuine leaf touch. Pinned by "picks the
     // most recently resolved escalation even when an older row was edited after
     // it closed".
-    const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`;
+    //
+    // `cancelledAt` sits between the two for the same reason (BLO-29764). It is
+    // not redundant with `completedAt`: `services/issues.ts` nulls whichever of
+    // the pair does not match the new status, so a resolved row has exactly one
+    // of them set, and measured over all 67 August `cancelled` rows of this
+    // origin kind `completedAt` was non-null on 0 and `cancelledAt` on 67.
+    // Without this arm every cancelled row would fall through to `updatedAt` and
+    // be judged by a timestamp that drifts on any later edit -- the same door
+    // the paragraph above documents, reopened for the status this now suppresses.
+    const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.cancelledAt}, ${issues.updatedAt})`;
     // Keep the scan bounded. Neither OR arm is servable for these rows: the
     // fingerprint arm's only indexes (`issues_active_liveness_recovery_leaf_uq`,
     // `issues_active_alert_escalation_cover_uq` -- schema/issues.ts) are partial
     // on `status not in ('done','cancelled')`, mutually exclusive with the
-    // `status = 'done'` filter below, so the planner falls back to the
+    // resolved-status filter below, so the planner falls back to the
     // `(company_id, origin_kind)` prefix of `issues_company_origin_idx` and reads
     // the company's ENTIRE escalation history -- which only ever grows, since
     // resolved rows are never pruned. The version this replaced was bounded to
@@ -8141,15 +8161,16 @@ export function recoveryService(
     // The bound is on `updatedAt` rather than on `resolvedAtExpr` because only
     // the former is sargable. That makes it a superset ONLY up to skew between
     // the two columns, and the skew does not run in the convenient direction: on
-    // the primary write path `completed_at` is the LATER of the two.
+    // the primary write path the resolution stamp is the LATER of the two.
     // `services/issues.ts` builds its patch with `updatedAt: new Date()` and only
-    // then calls `applyStatusSideEffects`, which sets `completedAt` from a second
-    // clock read one request-body later -- so `completed_at >= updated_at` there,
-    // by however long the intervening validation and blocker reads take. (The
-    // escalation-close path below and the other four `update(issues)` sites do
-    // write both from one timestamp, and nothing bumps `updated_at` implicitly:
-    // there is no `$onUpdate` on the column, and migration 0076 mirrors
-    // `updated_at` INTO `last_activity_at`, not back.)
+    // then calls `applyStatusSideEffects`, which sets `completedAt` (or, for a
+    // cancellation, `cancelledAt`) from a second clock read one request-body
+    // later -- so the resolution stamp `>= updated_at` there, by however long the
+    // intervening validation and blocker reads take. (The escalation-close path
+    // below and the other four `update(issues)` sites do write both from one
+    // timestamp, and nothing bumps `updated_at` implicitly: there is no
+    // `$onUpdate` on the column, and migration 0076 mirrors `updated_at` INTO
+    // `last_activity_at`, not back.)
     //
     // Unskewed, that leaves a real hole: a row with
     // `updated_at < cutoff <= completed_at` is dropped by the filter, the
