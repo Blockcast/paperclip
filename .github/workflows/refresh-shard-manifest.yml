@@ -201,7 +201,14 @@ jobs:
       - name: Alert if the refresh PR got no CI
         if: steps.upsert-pr.outputs.pr_url != ''
         env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.value }}
+          # This step only reads Actions runs and posts a diagnostic comment.
+          # Use the workflow token here because the job-level `actions: read`
+          # and `pull-requests: write` permissions apply to it. The
+          # commitperclip installation token is intentionally limited to the
+          # push/PR-creation step above; an installation may not have Actions
+          # read permission, and an alarm that dies on its first 403 would
+          # erase the signal it exists to provide.
+          GH_TOKEN: ${{ github.token }}
         run: |
           pr_url="${{ steps.upsert-pr.outputs.pr_url }}"
           head_sha="$(gh pr view "$pr_url" --json headRefOid --jq .headRefOid)"

@@ -44,14 +44,16 @@ test("refresh refuses to create a GITHUB_TOKEN-authored pull request", () => {
   assert.doesNotMatch(workflow, /\|\|\s*github\.token/);
 });
 
-test("refresh keeps partial-shard recovery and checks the generated PR with the App token", () => {
+test("refresh keeps partial-shard recovery and uses the workflow token for the alarm", () => {
   assert.match(workflow, /needs: \[measure\][\s\S]*?if: \$\{\{ !cancelled\(\) \}\}/);
   assert.match(workflow, /permissions:[\s\S]*?actions: read/);
+  assert.match(workflow, /permissions:[\s\S]*?pull-requests: write/);
 
   const alarmStart = workflow.indexOf("\n      - name: Alert if the refresh PR got no CI\n");
   assert.notEqual(alarmStart, -1, "refresh workflow must retain the no-CI alarm");
   const alarm = workflow.slice(alarmStart);
-  assert.match(alarm, /GH_TOKEN: \$\{\{ steps\.bot-token\.outputs\.value \}\}/);
+  assert.match(alarm, /GH_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.doesNotMatch(alarm, /GH_TOKEN: \$\{\{ steps\.bot-token\.outputs\.value \}\}/);
   assert.match(alarm, /action_required_count/);
   assert.match(alarm, /total_run_count/);
 });
