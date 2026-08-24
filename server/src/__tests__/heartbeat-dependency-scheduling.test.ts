@@ -23,6 +23,7 @@ import {
   DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
   DEP_BLOCKED_RETRY_REASON,
   heartbeatService,
+  resolveHeartbeatTimerSchedulerExclusionReason,
 } from "../services/heartbeat.js";
 import { getDepBlockedMetric, resetDepBlockedMetrics } from "../services/dep-blocked-metrics.js";
 import {
@@ -176,6 +177,95 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("classifies both first and coalesced timer dependency parks as issue-tree holds", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          intervalSec: 60,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "todo",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked timer work",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const timerWake = {
+      source: "timer" as const,
+      triggerDetail: "system" as const,
+      reason: "heartbeat_timer",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "heartbeat_timer" },
+    };
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const firstSuppression = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
+    };
+    const firstRun = await heartbeat.enqueueWakeup(agentId, timerWake, firstSuppression);
+    expect(firstRun).toBeNull();
+    expect(firstSuppression.dependencyBlockedRetryAt).toBeInstanceOf(Date);
+    expect(resolveHeartbeatTimerSchedulerExclusionReason(firstSuppression)).toBe("issue_tree_hold_active");
+
+    const secondSuppression = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
+    };
+    const coalescedRun = await heartbeat.enqueueWakeup(agentId, timerWake, secondSuppression);
+    expect(coalescedRun).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryReason: DEP_BLOCKED_RETRY_REASON,
+    });
+    expect(secondSuppression.dependencyBlockedRetryAt).toBeInstanceOf(Date);
+    expect(resolveHeartbeatTimerSchedulerExclusionReason(secondSuppression)).toBe("issue_tree_hold_active");
   });
 
   it("keeps blocked descendants idle until their blockers resolve", async () => {

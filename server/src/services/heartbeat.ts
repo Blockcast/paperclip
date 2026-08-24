@@ -790,6 +790,25 @@ export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
 export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
 
+/**
+ * Choose the durable reason for a timer wake that did not dispatch.
+ *
+ * A dependency-blocked wake is a deferral, not a terminal skip: the retry park
+ * is the evidence that the issue tree is holding the work. Check that marker
+ * before the other suppression fields so both the initial park and later
+ * coalesced parks retain the bounded operational classification instead of
+ * falling through to `other`.
+ */
+export function resolveHeartbeatTimerSchedulerExclusionReason(input: {
+  dependencyBlockedRetryAt: Date | null;
+  providerCapacityDeferred: boolean;
+  durableSkipReason: string | null;
+}): string | null {
+  if (input.dependencyBlockedRetryAt !== null) return "issue_tree_hold_active";
+  if (input.providerCapacityDeferred) return "provider_capacity_deferred";
+  return input.durableSkipReason;
+}
+
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
 }
@@ -32468,13 +32487,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             now: now.toISOString(),
           },
         }, suppression);
-        if (run) enqueued += 1;
+        // A coalesced dependency-blocked wake returns the existing parked run,
+        // but it still did not dispatch work. Classify the suppression before
+        // treating a non-null return as an enqueue so the timer ledger and
+        // exclusion metric describe the same outcome for first and later parks.
+        if (run && suppression.dependencyBlockedRetryAt === null) enqueued += 1;
         else {
-          recordHeartbeatTimerSchedulerExclusion(
-            suppression.providerCapacityDeferred
-              ? "provider_capacity_deferred"
-              : suppression.durableSkipReason,
-          );
+          recordHeartbeatTimerSchedulerExclusion(resolveHeartbeatTimerSchedulerExclusionReason(suppression));
           skipped += 1;
         }
       }
