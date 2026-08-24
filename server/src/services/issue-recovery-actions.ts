@@ -10,6 +10,40 @@ import type {
 } from "@paperclipai/shared";
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
+
+/**
+ * Recovery-action statuses that still hold a live repair path, for the purpose of
+ * suppressing blocked-issue auto-resume.
+ *
+ * Deliberately NARROWER than `ACTIVE_RECOVERY_ACTION_STATUSES`, and the asymmetry is
+ * load-bearing (BLO-21523). `escalated` belongs in the wider set — it holds
+ * `issue_recovery_actions_active_source_uq` so a fresh action cannot be minted with a
+ * new budget (BLO-18996), it keeps the handoff comment grant open, and it keeps the
+ * owner able to check the issue out. What it does NOT do is wake anyone:
+ *
+ *   - `escalateExpiredWakeHorizons` is the ONLY writer of `escalated`, and it sets it
+ *     exactly when `maxAttempts !== null && timeoutAt !== null && timeoutAt <= now`.
+ *     `strandedRecoveryWakeAttemptsExhausted` returns true for precisely that condition.
+ *     (`upsertSourceScoped` only ever *preserves* an existing `escalated` — it never
+ *     creates one — so there is no second way in.)
+ *   - So every `escalated` action is already wake-exhausted.
+ *     `reconcileStrandedRecoveryWakeBackstop` selects it and then always drops it at
+ *     `exhaustedSkipped`. Should a later re-upsert ever null out `maxAttempts`, the
+ *     conclusion is unchanged: a null budget is reserved for the causes that never wake
+ *     an owner at all.
+ *
+ * The platform says as much verbatim when it escalates: "Paperclip has stopped waking
+ * anyone for it". Suppressing auto-resume on an `escalated` action therefore preserves
+ * no repair path — it only pins the issue `blocked` with zero unresolved blockers, which
+ * is the exact stranded state the reconciler exists to drain, and which no wake, retry or
+ * monitor will ever re-enter. Measured 2026-08-24: 88 of 106 stranded rows were held this
+ * way, 87 of them with no run, no monitor and no scheduled retry, the oldest 6 weeks old.
+ *
+ * Resolving or cancelling the action remains the way to clear the wider set; this constant
+ * only decides whether the row may return to `todo`.
+ */
+export const BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES = ["active"] as const satisfies readonly IssueRecoveryActionStatus[];
+
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
