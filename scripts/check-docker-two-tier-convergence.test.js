@@ -268,7 +268,10 @@ test("the deploy job waits on both tiers before asserting convergence", () => {
   const deployStart = workflow.indexOf("\n  deploy:\n");
   assert.notEqual(deployStart, -1);
   const job = workflow.slice(deployStart);
-  const apiWait = job.indexOf("rollout status deployment/paperclip-api");
+  // The workflow derives the Deployment name from the approved rendered plan;
+  // keep this assertion coupled to that variable rather than a stale chart
+  // name so a legitimate release-name override does not fail the policy gate.
+  const apiWait = job.indexOf('rollout status "deployment/${api_deployment}"');
   const workerWait = job.indexOf("rollout status statefulset/paperclip");
   const gateStart = job.indexOf("# BLO-29008: two-tier convergence gate.");
 
