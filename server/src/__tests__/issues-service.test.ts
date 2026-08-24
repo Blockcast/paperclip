@@ -383,7 +383,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-idempotency-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
