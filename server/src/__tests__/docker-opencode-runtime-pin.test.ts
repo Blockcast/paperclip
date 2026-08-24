@@ -278,7 +278,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
     expect(dockerAgentWorkflow).toContain("AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}");
     expect(dockerAgentWorkflow).toContain(
-      "docker buildx imagetools create --prefer-index=false --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"",
+      "docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"",
     );
 
     const metadataBlock = dockerAgentWorkflow.slice(
