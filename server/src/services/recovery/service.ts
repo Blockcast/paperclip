@@ -1838,14 +1838,16 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
-  async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
+  async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect, graceMs: number) {
     // BLO-24782: this used to be `if (issue.monitorNextCheckAt) return true`, which
-    // accepted a check instant already in the past -- a strictly looser reading than
-    // `hasActiveMonitorPath`, so the two disagreed about whether the same lapsed
-    // monitor was a live wake path. Delegating makes that divergence unrepresentable
-    // rather than merely tested for: there is now one definition of "the monitor is
-    // still a live wake path", and it is bounded.
-    if (hasActiveMonitorPath(issue)) return true;
+    // accepted a check instant already in the past. That was not simply a looser
+    // reading than `hasActiveMonitorPath` -- neither predicate was a subset of the
+    // other, because the old form was also *tighter* for a null check instant with a
+    // recent trigger, which `hasActiveMonitorPath` accepts and this rejected. So the
+    // two genuinely disagreed in both directions about the same monitor. Delegating
+    // makes that divergence unrepresentable rather than merely tested for: there is now
+    // one definition of "the monitor is still a live wake path", and it is bounded.
+    if (hasActiveMonitorPath(issue, graceMs)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -4950,7 +4952,29 @@ export function recoveryService(
       latestRun.errorCode === "issue_continuation_waiting_on_review";
   }
 
-  function hasActiveMonitorPath(issue: typeof issues.$inferSelect) {
+  /**
+   * `graceMs` is a required parameter rather than a value this function reads for
+   * itself, and that is the point.
+   *
+   * BLO-24782 review (#1330): this predicate previously called
+   * `loadConfig().lapsedMonitorGraceMs` inline, and it runs once per candidate inside
+   * `reconcileStrandedAssignedIssues` -- twice, on the paths that consult
+   * `hasPersistedDurableWaitPath` as well. `loadConfig()` is not memoized: each call
+   * re-reads and re-parses the config file and calls `detectTailnetBindHost()`, which
+   * `execFileSync`s `tailscale ip -4` with a 3s timeout whenever
+   * `PAPERCLIP_TAILNET_BIND_HOST` is unset -- the default. On the ~90-candidate queue
+   * this bound was written for that is ~90-180 uncached loads and subprocess attempts
+   * per tick, and where the tailscale binary exists but its daemon is unresponsive the
+   * sweep blocks for minutes. That is a liveness hazard inside the very sweep the bound
+   * exists to protect, so the fix for one stranding mechanism would have introduced
+   * another.
+   *
+   * Taking the grace as an argument makes the hot-path read unrepresentable instead of
+   * merely absent today: there is nowhere in here for a config read to creep back into.
+   * Callers resolve it once per sweep pass, which keeps the retune-without-restart
+   * property the per-call read was there for -- the next tick picks up a new value.
+   */
+  function hasActiveMonitorPath(issue: typeof issues.$inferSelect, graceMs: number) {
     if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()) return true;
 
     // BLO-18643: a monitor that has already fired (`status: "triggered"`) but has not
@@ -4979,7 +5003,7 @@ export function recoveryService(
     return isLapsedMonitorStillLive({
       lastTriggeredAt: monitor.lastTriggeredAt,
       now: Date.now(),
-      graceMs: loadConfig().lapsedMonitorGraceMs,
+      graceMs,
     });
   }
 
@@ -4987,6 +5011,7 @@ export function recoveryService(
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
+    lapsedMonitorGraceMs: number;
   }) {
     return await db.transaction(async (tx) => {
       await tx.execute(
@@ -4998,7 +5023,7 @@ export function recoveryService(
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return null;
+      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh, input.lapsedMonitorGraceMs)) return null;
 
       const updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
       if (!updated) return null;
@@ -6254,6 +6279,13 @@ export function recoveryService(
       skipped: 0,
       issueIds: [] as string[],
     };
+    // Resolved once for the whole pass, not once per candidate. See
+    // `hasActiveMonitorPath` for why: `loadConfig()` shells out to `tailscale` on the
+    // default config, so a per-issue read turns this sweep into ~one subprocess per
+    // candidate. One read per tick still lets an operator retune the grace without a
+    // restart -- the next tick sees the new value -- while making the cost O(1) in the
+    // candidate count.
+    const lapsedMonitorGraceMs = loadConfig().lapsedMonitorGraceMs;
     for (const issue of candidates) {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -6342,7 +6374,7 @@ export function recoveryService(
         adoptionHandoverLostSuccessor = !adoptingRun;
         latestRun = adoptingRun;
       }
-      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue, lapsedMonitorGraceMs)) {
         result.skipped += 1;
         continue;
       }
@@ -6998,11 +7030,12 @@ export function recoveryService(
         }
         continue;
       }
-      if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue)) {
+      if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue, lapsedMonitorGraceMs)) {
         const updated = await parkReviewWaitingContinuationIssue({
           issue,
           previousStatus: "in_progress",
           latestRun,
+          lapsedMonitorGraceMs,
         });
         if (updated) {
           result.reviewWaitingParked += 1;
