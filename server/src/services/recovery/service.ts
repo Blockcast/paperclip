@@ -8187,19 +8187,17 @@ export function recoveryService(
     const horizonCutoff = new Date(
       now.getTime() - suppressionHorizonMs - LIVENESS_SUPPRESSION_SCAN_SKEW_MS,
     );
-    const mostRecentDone = await db
+    const mostRecentResolved = await db
       .select({
         id: issues.id,
         identifier: issues.identifier,
-        // Read the status back rather than hardcoding "done" at the return
-        // sites, even though the filter below currently admits only `done`.
-        // BLO-29764 ruled (2026-08-23) that `cancelled` rows will suppress on
-        // these same two gates; BLO-29838 implements that by widening the
-        // filter. Sourcing the logged status from the row means that change
-        // flows into the audit log for free -- and a hardcoded "done" would
-        // instead go quietly, permanently wrong the day it lands.
+        // Read the status back rather than hardcoding a literal at the return
+        // sites: the filter below admits both `done` and `cancelled`, and
+        // sourcing the logged status from the row keeps the BLO-29761 audit
+        // entry honest about which shape actually suppressed the finding.
         status: issues.status,
         completedAt: issues.completedAt,
+        cancelledAt: issues.cancelledAt,
         updatedAt: issues.updatedAt,
       })
       .from(issues)
@@ -8212,14 +8210,20 @@ export function recoveryService(
             eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
           ),
           visibleIssueCondition(),
-          // `done` only, deliberately. A `cancelled` escalation means the report
-          // was wrong or was consolidated away -- not that the leaf was given an
-          // action path -- so that shape must re-escalate immediately. Pinned by
-          // "re-escalates immediately after a matching escalation is cancelled".
-          eq(issues.status, "done"),
+          // `done` AND `cancelled`, on identical terms (BLO-29764 ruling,
+          // 2026-08-23). BLO-27676 shipped this `done`-only on the reading that
+          // a cancellation says "the report was wrong" rather than "the leaf
+          // was given an action path", so it must re-arm at once -- see the
+          // doc block above for why that is true of the report and irrelevant
+          // to the loop. Pinned by "suppresses re-escalation while a matching
+          // cancelled escalation is inside the cooldown" and the three cases
+          // after it; the replacement re-arm hatch is pinned by
+          // "re-escalates when the leaf is touched after a cancelled escalation
+          // resolved".
+          inArray(issues.status, ["done", "cancelled"]),
           // Sargable superset of the suppression horizon -- see the note above
           // the query. Restores the bound the 60m cooldown used to provide, and
-          // carries a skew allowance because `completed_at` can lead
+          // carries a skew allowance because the resolution stamp can lead
           // `updated_at` on the primary close path.
           gte(issues.updatedAt, horizonCutoff),
         ),
@@ -8227,16 +8231,23 @@ export function recoveryService(
       .orderBy(desc(resolvedAtExpr), desc(issues.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    if (!mostRecentDone) return null;
+    if (!mostRecentResolved) return null;
 
-    const resolvedAtMs = (mostRecentDone.completedAt ?? mostRecentDone.updatedAt)?.getTime();
+    // Must mirror `resolvedAtExpr` above, including the `cancelledAt` arm --
+    // the ORDER BY picks the row by that expression, so reading a different
+    // one here compares a timestamp belonging to no row the sort considered.
+    const resolvedAtMs = (
+      mostRecentResolved.completedAt
+      ?? mostRecentResolved.cancelledAt
+      ?? mostRecentResolved.updatedAt
+    )?.getTime();
     if (resolvedAtMs === undefined || !Number.isFinite(resolvedAtMs)) return null;
 
     if (cooldownMs > 0 && resolvedAtMs >= now.getTime() - cooldownMs) {
       return {
-        id: mostRecentDone.id,
-        identifier: mostRecentDone.identifier,
-        status: mostRecentDone.status,
+        id: mostRecentResolved.id,
+        identifier: mostRecentResolved.identifier,
+        status: mostRecentResolved.status,
         resolvedAtMs,
         reason: "cooldown" as const,
       };
@@ -8268,9 +8279,9 @@ export function recoveryService(
     if (leafActivityMs > resolvedAtMs) return null;
 
     return {
-      id: mostRecentDone.id,
-      identifier: mostRecentDone.identifier,
-      status: mostRecentDone.status,
+      id: mostRecentResolved.id,
+      identifier: mostRecentResolved.identifier,
+      status: mostRecentResolved.status,
       resolvedAtMs,
       reason: "unchanged_target" as const,
     };
