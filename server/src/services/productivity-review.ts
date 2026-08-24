@@ -118,6 +118,18 @@ const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
 //     productivityReviewService from this module; importing back would be
 //     circular. scheduledRetryReason is the primary signal; errorCode is a
 //     fallback for rows written before the reason was recorded on this path.
+//   - retry park (BLO-24149): a `scheduled_retry` stub of ANY other class
+//     whose run never reached `startedAt`. Keyed on the run never having
+//     started rather than on its `scheduledRetryReason` string, because the
+//     reason is not a reliable discriminator of fault: `transient_failure` is
+//     `scheduleBoundedRetryForRun`'s DEFAULT label, so it carries genuine
+//     infrastructure faults (`k8s_pod_schedule_failed`) and — until BLO-28919's
+//     re-probe relabels them — provider capacity denials alike, measured at
+//     484 of 700 fleet parks on 2026-08-19. Whatever parked it, a stub that
+//     never started gave the assignee no turn, so attributing its parked
+//     interval to assignee inactivity is wrong by construction. Kept a
+//     distinct mechanism from `capacity_park` so capacity-specific evidence
+//     text and the fleet-capacity reading stay narrow to what they measure.
 //   - dispatch backlog (BLO-19604): a run that never reached `startedAt`,
 //     whether it is still sitting `queued` or was already `cancelled` out
 //     from under it (e.g. the BLO-21621 sweep's
@@ -203,7 +215,7 @@ type ProductivityReviewThresholds = {
 // BLO-23624: the three run-level mechanisms that all mean "the assignee was
 // never given an executable turn" — see the constants block above for the
 // per-mechanism detail.
-type NoExecutableTurnMechanism = "capacity_park" | "dispatch_backlog" | "zero_token_throttle";
+type NoExecutableTurnMechanism = "capacity_park" | "retry_park" | "dispatch_backlog" | "zero_token_throttle";
 
 type NoExecutableTurnGating = {
   noExecutableTurnMs: number;
@@ -217,8 +229,13 @@ type NoExecutableTurnGating = {
   scheduledRetryAt: Date | null;
   retryReason: string | null;
   errorCode: string | null;
-  // Only meaningful when currentMechanism is "capacity_park": whether that
-  // retry's own due time has already passed.
+  // BLO-24149: for either park mechanism ("capacity_park", "retry_park"),
+  // whether the promise the scheduler made has already been broken — the
+  // retry's own due time has passed and nothing promoted it, or it carries no
+  // due time at all. This is the (b)-vs-(c) discriminator: a park with a
+  // future due time is *scheduled*, a park past it is *overdue-undispatched*.
+  // Null due time reads as broken deliberately: an unverifiable promise must
+  // not buy silence.
   overdue: boolean;
   // Whether the current run's block is still open — i.e. still actually
   // blocking the assignee right now, not just a historical contributor to
@@ -678,11 +695,24 @@ function classifyNoExecutableTurnRun(
   if (run.status === "scheduled_retry") {
     const isCapacityClass =
       run.scheduledRetryReason === CAPACITY_RETRY_REASON || run.errorCode === CAPACITY_RETRY_ERROR_CODE;
-    if (!isCapacityClass) return null;
     const scheduledRetryAt = coerceDate(run.scheduledRetryAt);
-    if (!scheduledRetryAt) return null;
+    if (isCapacityClass) {
+      if (!scheduledRetryAt) return null;
+      return {
+        mechanism: "capacity_park",
+        scheduledRetryAt,
+        retryReason: run.scheduledRetryReason,
+        errorCode: run.errorCode,
+      };
+    }
+    // BLO-24149: any other parked retry stub that never started. A retry stub
+    // is a NEW run row (`retryOfRunId` points at the predecessor that failed),
+    // so `startedAt` is null on it by construction; the guard is here for the
+    // row that has since been promoted and claimed, which is genuine turn
+    // time and must keep flowing to the assignee.
+    if (run.startedAt) return null;
     return {
-      mechanism: "capacity_park",
+      mechanism: "retry_park",
       scheduledRetryAt,
       retryReason: run.scheduledRetryReason,
       errorCode: run.errorCode,
@@ -745,6 +775,7 @@ function noExecutableTurnBreakdown(
 
   const mechanismMs: Record<NoExecutableTurnMechanism, number> = {
     capacity_park: 0,
+    retry_park: 0,
     dispatch_backlog: 0,
     zero_token_throttle: 0,
   };
@@ -789,10 +820,19 @@ function noExecutableTurnBreakdown(
   const currentIsActiveStatus = Boolean(
     currentRun && ACTIVE_RUN_STATUSES.includes(currentRun.status as (typeof ACTIVE_RUN_STATUSES)[number]),
   );
+  // BLO-22331's non-indefinite-suppression guard, widened by BLO-24149 to
+  // cover `retry_park` as well. Widening the *attribution* above without
+  // widening this guard too would be a silence bug: a non-capacity park would
+  // suppress `long_active_duration` for as long as it sat there, however long
+  // past its own due time, which is precisely the indefinite suppression
+  // BLO-22331 exists to prevent. A park with no due time at all counts as
+  // broken for the same reason — there is no promise left to wait on.
+  const currentIsPark =
+    currentClassification?.mechanism === "capacity_park" || currentClassification?.mechanism === "retry_park";
   const overdue = Boolean(
-    currentClassification?.mechanism === "capacity_park"
-      && currentClassification.scheduledRetryAt
-      && currentClassification.scheduledRetryAt.getTime() <= now.getTime(),
+    currentIsPark
+      && (!currentClassification!.scheduledRetryAt
+        || currentClassification!.scheduledRetryAt.getTime() <= now.getTime()),
   );
   const currentBlockOpen = Boolean(currentClassification) && currentIsActiveStatus && !overdue;
 
@@ -1065,6 +1105,7 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
 
 const NO_EXECUTABLE_TURN_MECHANISM_LABELS: Record<NoExecutableTurnMechanism, string> = {
   capacity_park: "capacity park",
+  retry_park: "retry park",
   dispatch_backlog: "dispatch backlog",
   zero_token_throttle: "zero-token throttle",
 };
@@ -1083,10 +1124,19 @@ function describeNoExecutableTurnMechanismMix(mechanismMs: Record<NoExecutableTu
 function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvidence["noExecutableTurnGating"]>) {
   const mix = describeNoExecutableTurnMechanismMix(gating.mechanismMs);
   let currentClause = "";
-  if (gating.currentMechanism === "capacity_park" && gating.scheduledRetryAt) {
-    const dueClause = gating.overdue
-      ? `due ${gating.scheduledRetryAt.toISOString()}, overdue and not yet promoted`
-      : `due ${gating.scheduledRetryAt.toISOString()}`;
+  if (gating.currentMechanism === "capacity_park" || gating.currentMechanism === "retry_park") {
+    // BLO-24149: name the park's dispatch state in the two-way vocabulary a
+    // reader has to act on. "scheduled at X" means a live path exists and
+    // re-arming the monitor would only coalesce into this park and spend an
+    // attempt for nothing; "overdue-undispatched" means the promise was
+    // broken and the row genuinely needs intervention. Both read identically
+    // on the monitor fields alone, which is why the state is spelled out here
+    // rather than left for a reader to derive from a timestamp.
+    const dueClause = !gating.scheduledRetryAt
+      ? "overdue-undispatched (no due time recorded)"
+      : gating.overdue
+        ? `overdue-undispatched since ${gating.scheduledRetryAt.toISOString()}, not yet promoted`
+        : `scheduled at ${gating.scheduledRetryAt.toISOString()}`;
     currentClause = `; current run \`${gating.currentRunId}\` parked \`scheduled_retry\` on \`${gating.retryReason ?? gating.errorCode ?? "unknown"}\`, ${dueClause}`;
   } else if (gating.currentMechanism === "dispatch_backlog") {
     currentClause = `; current run \`${gating.currentRunId}\` never reached \`startedAt\``;
@@ -1104,8 +1154,15 @@ function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvid
 // overdue, unpromoted capacity retry (BLO-22331's guard).
 function formatNoExecutableTurnTriggerNote(gating: NonNullable<ProductivityReviewEvidence["noExecutableTurnGating"]>) {
   const mix = describeNoExecutableTurnMechanismMix(gating.mechanismMs);
-  if (gating.currentMechanism === "capacity_park" && gating.overdue && gating.scheduledRetryAt) {
-    return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), currently behind an overdue \`scheduled_retry\` (run \`${gating.currentRunId}\`, due ${gating.scheduledRetryAt.toISOString()}, not yet promoted); this is a fleet-capacity signal, not assignee inactivity`;
+  if (
+    (gating.currentMechanism === "capacity_park" || gating.currentMechanism === "retry_park")
+    && gating.overdue
+    && gating.scheduledRetryAt
+  ) {
+    const attribution = gating.currentMechanism === "capacity_park"
+      ? "this is a fleet-capacity signal, not assignee inactivity"
+      : "the assignee was never given a turn on it, so this is a dispatch signal, not assignee inactivity";
+    return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), currently behind an overdue-undispatched \`scheduled_retry\` (run \`${gating.currentRunId}\`, due ${gating.scheduledRetryAt.toISOString()}, not yet promoted); ${attribution}`;
   }
   return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), but the current run is no longer blocked, so this is not being suppressed`;
 }
