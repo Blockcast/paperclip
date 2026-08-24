@@ -256,10 +256,27 @@ type ClientState =
       batchApi: k8s.BatchV1Api;
       coreApi: k8s.CoreV1Api;
       // metrics.k8s.io is served by metrics-server, which is an optional
-      // cluster add-on. Constructing the client always succeeds; only the
-      // *call* fails when the add-on (or the RBAC grant) is missing, which is
-      // why every metrics read degrades to "unknown" rather than throwing.
-      metricsApi: k8s.CustomObjectsApi;
+      // cluster add-on, so every metrics *call* degrades to "unknown" rather
+      // than throwing.
+      //
+      // `null` when even CONSTRUCTING the client failed. An earlier draft of
+      // this change asserted construction "always succeeds" and built it inline
+      // with batchApi/coreApi. But `makeApiClient` throws
+      // `TypeError: apiClientType is not a constructor` whenever the symbol it
+      // is handed is absent (verified against @kubernetes/client-node 1.4.0),
+      // and that throw landed in initClient's shared catch. The whole client
+      // then went `unavailable`, and because hasActiveJobForAgent fails OPEN on
+      // a non-ready client (`return false`), an optional add-on's client
+      // construction could silently switch off the BLO-20801 double-dispatch /
+      // RWO-PVC multi-attach guard.
+      //
+      // `CustomObjectsApi` IS exported at 1.4.0, so this is drift/packaging
+      // risk rather than a live production fault — but it is not theoretical
+      // either: it is precisely how this broke all 13 cases of
+      // k8s-job-liveness-run-scoped.test.ts, whose mock exports no
+      // CustomObjectsApi. The optional dependency is therefore isolated: it may
+      // be null, and a null here costs only pod-CPU liveness.
+      metricsApi: k8s.CustomObjectsApi | null;
     };
 
 let clientState: ClientState = { kind: "uninitialized" };
@@ -301,7 +318,21 @@ function initClient(): ClientState {
     }
     const batchApi = kc.makeApiClient(k8s.BatchV1Api);
     const coreApi = kc.makeApiClient(k8s.CoreV1Api);
-    const metricsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    // Constructed in its OWN try: this client is optional, and a throw here
+    // must not reach the shared catch below. See the ClientState comment —
+    // letting it escape marks the entire client `unavailable`, and
+    // hasActiveJobForAgent fails OPEN on that, so a missing metrics symbol
+    // would disable the BLO-20801 double-dispatch guard rather than merely
+    // disabling pod-CPU liveness.
+    let metricsApi: k8s.CustomObjectsApi | null = null;
+    try {
+      metricsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "k8s metrics client unavailable; pod-CPU liveness disabled, job-liveness guard unaffected",
+      );
+    }
     clientState = { kind: "ready", batchApi, coreApi, metricsApi };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -524,6 +555,11 @@ let podMetricsCache: { at: number; byRunId: Map<string, number> | null } | null 
 async function readAgentPodCpuMillicoresByRunId(): Promise<Map<string, number> | null> {
   const state = initClient();
   if (state.kind !== "ready") return null;
+  // No metrics client at all (construction failed) is the same *answer* as a
+  // failed metrics call — "we cannot tell" — so it returns null and the reaper
+  // keeps its pre-existing behavior. Checked before the cache so a null client
+  // can never be mistaken for a cached empty map.
+  if (state.metricsApi === null) return null;
   const now = Date.now();
   if (podMetricsCache && now - podMetricsCache.at < AGENT_POD_METRICS_CACHE_TTL_MS) {
     return podMetricsCache.byRunId;
