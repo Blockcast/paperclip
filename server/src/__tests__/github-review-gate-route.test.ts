@@ -204,8 +204,21 @@ describe("github review-gate authority route", () => {
     const legacyRead = new Promise<unknown[]>((resolve) => {
       releaseLegacyRead = resolve;
     });
+    let selectCalls = 0;
     const routeDb = {
-      select: () => ({ from: () => legacyRead }),
+      select: () => {
+        selectCalls += 1;
+        if (selectCalls === 1) {
+          return {
+            from: () => ({
+              innerJoin: () => ({
+                where: () => legacyRead,
+              }),
+            }),
+          };
+        }
+        return { from: () => Promise.resolve([]) };
+      },
     } as unknown as Db;
 
     let settled = false;
