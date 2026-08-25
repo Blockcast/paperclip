@@ -34,6 +34,15 @@ interface CompanyFixture {
 interface MkCtxOptions {
   /** Per-company config returned by `ctx.config.get(companyId)`. */
   companyConfigs?: Record<string, CompanyFixture>;
+  /**
+   * Config returned by the bare `ctx.config.get()` the worker calls in
+   * `setup()`. Defaults to `{}`, which is what plugin-loader.ts hands a worker
+   * on any install with zero or 2+ configured companies. Pass a real fixture
+   * to model the SINGLE-company install, where the loader sets
+   * `bootstrapCompanyId` and the snapshot carries that one company's real
+   * credentials — the precondition for the BLO-29455 1->2 window.
+   */
+  bootstrapConfig?: CompanyFixture;
   /** Secret resolution behaviour, keyed by ref. */
   secrets?: Record<string, string | Error>;
   /** Initial plugin state, keyed as scopeKind:scopeId:stateKey. */
@@ -44,19 +53,29 @@ const stateId = (key: { scopeKind: string; scopeId: string; stateKey: string }) 
   `${key.scopeKind}:${key.scopeId}:${key.stateKey}`;
 
 function mkCtx(options: MkCtxOptions = {}) {
-  const { companyConfigs = {}, secrets = {}, state = {} } = options;
+  const {
+    companyConfigs = {},
+    bootstrapConfig = {},
+    secrets = {},
+    state = {},
+  } = options;
   const storedState = new Map(Object.entries(state));
   const fetchCalls: Array<{ url: string; init: any }> = [];
+  // Handlers the worker registers via ctx.events.on, so a test can drive the
+  // in-process router the way handleInboundMessageEvent does at runtime.
+  const eventHandlers = new Map<string, (event: any) => Promise<void>>();
   const ctx: any = {
     config: {
-      // Bootstrap (no companyId) is always `{}` on a multi-company install —
-      // exactly the shape plugin-loader.ts hands every worker. Per-company
-      // rows come only from `companyConfigs`, keyed strictly by companyId —
-      // there is no "first configured company" fallback here, so any code
-      // path that guesses instead of using the delivery's own companyId gets
-      // `{}` (or the WRONG company's row) rather than silently working.
+      // Bootstrap (no companyId) is `{}` by default — exactly the shape
+      // plugin-loader.ts hands every worker on a multi-company install — and
+      // a real company fixture when the test models a single-company install.
+      // Per-company rows come only from `companyConfigs`, keyed strictly by
+      // companyId — there is no "first configured company" fallback here, so
+      // any code path that guesses instead of using the delivery's own
+      // companyId gets `{}` (or the WRONG company's row) rather than silently
+      // working.
       get: vi.fn(async (companyId?: string) =>
-        companyId ? (companyConfigs[companyId] ?? {}) : {},
+        companyId ? (companyConfigs[companyId] ?? {}) : bootstrapConfig,
       ),
     },
     secrets: {
@@ -78,7 +97,12 @@ function mkCtx(options: MkCtxOptions = {}) {
       }),
     },
     jobs: { register: vi.fn() },
-    events: { on: vi.fn(), emit: vi.fn(async () => undefined) },
+    events: {
+      on: vi.fn((name: string, handler: (event: any) => Promise<void>) => {
+        eventHandlers.set(name, handler);
+      }),
+      emit: vi.fn(async () => undefined),
+    },
     state: {
       get: vi.fn(async (key: Parameters<typeof stateId>[0]) =>
         storedState.get(stateId(key)) ?? null,
@@ -131,7 +155,7 @@ function mkCtx(options: MkCtxOptions = {}) {
       debug: vi.fn(),
     },
   };
-  return { ctx, storedState, fetchCalls };
+  return { ctx, storedState, fetchCalls, eventHandlers, companyConfigs };
 }
 
 /** Authorization header actually sent on a given fetch call. */
@@ -648,5 +672,211 @@ describe("Slack slash-command dashboard links are per-company (BLO-21083 review)
     // ...but with no dead control and no stringified undefined.
     expect(sent).not.toContain("view_dashboard");
     expect(sent).not.toContain("undefined");
+  });
+});
+
+// ===========================================================================
+// BLO-29455 — the 1->2-company transition.
+//
+// Every case above models an install that was ALREADY multi-company when the
+// worker started, where the bootstrap config is `{}` and the setup() snapshot
+// is therefore empty and harmless. This block models the one shape that is
+// not harmless: an install that started with EXACTLY ONE configured company.
+//
+// There, `plugin-loader.ts` sets `bootstrapCompanyId` to that single company,
+// so `ctx.config.get()` returns A's REAL config, setup() proceeds past the
+// `slackTokenRef` credential gate, and the thread-message router registers
+// while closing over A's `token`, A's `config` (hence A's
+// `approvalReactorSlackIds`) and A's signing secret. Company B then
+// configures the plugin and the host does NOT restart the worker: its restart
+// path keys off a `METHOD_NOT_IMPLEMENTED` error that the SDK never raises for
+// a plugin with no `onConfigChanged`, and the Slack plugin has none. So the
+// stale closure survives and `event.companyId` is now B.
+//
+// The fixtures below drive that transition literally — setup() with only A
+// configured, then add B, then emit for B — rather than asserting against a
+// pre-arranged two-company world, because it is the transition that creates
+// the exposure.
+//
+// PROVEN AGAINST THE PRE-FIX WORKER: see the BLO-29455 PR description for the
+// revert-and-rerun transcript. Both authorization cases invert without the
+// fix (A's allowlist admits U_A to B's approval and rejects B's own U_B), and
+// every Slack call carries `xoxb-a`.
+// ===========================================================================
+
+const APPROVAL_B_THREAD = "approval-b-thread";
+const THREAD_TS = "1717200000.000900";
+
+/** Bearer tokens on every Slack API call, in order. */
+function slackBearers(fetchCalls: Array<{ url: string; init: any }>): string[] {
+  return fetchCalls
+    .filter((c) => c.url.startsWith("https://slack.com/api/"))
+    .map((c) => bearerOf(c) ?? "<none>");
+}
+
+/**
+ * Boot a worker the way a SINGLE-company install does, then add company B
+ * without restarting it — i.e. exactly the BLO-29455 window.
+ *
+ * Returns the captured `plugin.slack.thread_message` handler. `setup()` must
+ * have registered it: on this install the credential gate passes, which is
+ * precisely why the stale closure exists to be wrong.
+ */
+async function bootSingleCompanyThenAddB() {
+  const companyAFixture = {
+    slackTokenRef: "ref-a",
+    slackSigningSecretRef: "sig-ref-a",
+    approvalReactorSlackIds: ["U_A"],
+    paperclipBaseUrl: "http://a.local",
+  };
+  const harness = mkCtx({
+    // At worker start company A is the ONLY configured company, so the host
+    // hands the worker A's real config as the bootstrap snapshot.
+    bootstrapConfig: companyAFixture,
+    companyConfigs: { [COMPANY_A]: companyAFixture },
+    secrets: {
+      "ref-a": "xoxb-a",
+      "ref-b": "xoxb-b",
+      "sig-ref-a": SIGNING_SECRET,
+      "sig-ref-b": SIGNING_SECRET,
+    },
+    state: {
+      [approvalByTsKey(COMPANY_B, CHANNEL, THREAD_TS)]: APPROVAL_B_THREAD,
+    },
+  });
+
+  await plugin.definition.setup?.(harness.ctx as any);
+
+  const handler = harness.eventHandlers.get("plugin.slack.thread_message");
+  // Guard the premise: if setup() bailed at the credential gate there is no
+  // stale closure and these cases would vacuously pass.
+  expect(handler).toBeDefined();
+
+  // --- company B configures the plugin. No restart, no pod delete. ---
+  harness.companyConfigs[COMPANY_B] = {
+    slackTokenRef: "ref-b",
+    slackSigningSecretRef: "sig-ref-b",
+    approvalReactorSlackIds: ["U_B"],
+    paperclipBaseUrl: "http://b.local",
+  };
+
+  return { ...harness, handler: handler! };
+}
+
+function threadEvent(slackUserId: string, text: string) {
+  return {
+    companyId: COMPANY_B,
+    payload: { channel: CHANNEL, threadTs: THREAD_TS, text, slackUserId },
+  };
+}
+
+describe("Slack thread-command router tenant scoping across a 1->2-company transition (BLO-29455)", () => {
+  it("refuses a company-A approver on company B's approval — the allowlist checked is B's, not the bootstrap snapshot's", async () => {
+    const { ctx, storedState, fetchCalls, handler } =
+      await bootSingleCompanyThenAddB();
+
+    // U_A is on company A's allowlist and NOT on company B's.
+    await handler(threadEvent("U_A", "!approve ship it"));
+
+    // Refused: no decision was committed or staged for B's approval.
+    expect(
+      storedState.get(`company:${COMPANY_B}:approval-pending-${APPROVAL_B_THREAD}`),
+    ).toBeUndefined();
+    const posted = fetchCalls.filter(
+      (c) => c.url === "https://slack.com/api/chat.postMessage",
+    );
+    expect(posted).toHaveLength(1);
+    expect(String(posted[0].init?.body)).toContain("not on the approval allowlist");
+
+    // ...and even the refusal notice went out on B's OWN token, never A's.
+    expect(slackBearers(fetchCalls)).toEqual(["xoxb-b"]);
+    expect(slackBearers(fetchCalls)).not.toContain("xoxb-a");
+    // B's credential was resolved company-scoped; the bootstrap path never is.
+    expect(ctx.secrets.resolve).toHaveBeenCalledWith("ref-b", {
+      companyId: COMPANY_B,
+    });
+  });
+
+  it("honours company B's own approver on company B's approval — B's approvers are not locked out by A's allowlist", async () => {
+    const { fetchCalls, handler } = await bootSingleCompanyThenAddB();
+
+    // U_B is on company B's allowlist and NOT on company A's.
+    await handler(threadEvent("U_B", "!approve"));
+
+    // Accepted: it was NOT bounced off A's allowlist.
+    const posted = fetchCalls.filter(
+      (c) => c.url === "https://slack.com/api/chat.postMessage",
+    );
+    expect(
+      posted.some((c) => String(c.init?.body).includes("not on the approval allowlist")),
+    ).toBe(false);
+
+    // The command actually did something, and every Slack call it made used
+    // B's token.
+    const bearers = slackBearers(fetchCalls);
+    expect(bearers.length).toBeGreaterThan(0);
+    expect(new Set(bearers)).toEqual(new Set(["xoxb-b"]));
+  });
+
+  it("links the approval card to company B's dashboard host, never the bootstrap company's", async () => {
+    const { fetchCalls, handler } = await bootSingleCompanyThenAddB();
+
+    await handler(threadEvent("U_B", "!approve"));
+
+    const bodies = fetchCalls.map((c) => String(c.init?.body ?? "")).join("\n");
+    // Asserted positively on purpose: a bare `not.toContain("http://a.local")`
+    // passes vacuously against the pre-fix worker, which bounces U_B off A's
+    // allowlist and so never renders a card with any host in it at all.
+    expect(bodies).toContain("http://b.local/approvals/");
+    expect(bodies).not.toContain("http://a.local");
+  });
+
+  it("refuses the thread command outright once company B's config is gone — never falls back to the bootstrap token", async () => {
+    const { fetchCalls, storedState, handler, companyConfigs } =
+      await bootSingleCompanyThenAddB();
+    // B is de-configured (or its row is unreadable) between events. The
+    // router must drop the command, not serve it under A's still-live token.
+    delete companyConfigs[COMPANY_B];
+
+    await handler(threadEvent("U_B", "!approve"));
+
+    expect(slackBearers(fetchCalls)).toEqual([]);
+    expect(
+      storedState.get(`company:${COMPANY_B}:approval-pending-${APPROVAL_B_THREAD}`),
+    ).toBeUndefined();
+  });
+
+  // NOT a falsification case, deliberately: this one passes against the
+  // pre-fix worker too, and must. It is the no-regression guard for the fix
+  // itself — the risk of resolving a scope per event is that you gate the
+  // whole router on it and take agent routing down for any company without a
+  // Slack credential. Phase 2 posts nothing to Slack and needs no token, so
+  // it stays ungated.
+  it("still routes ordinary thread chatter for B to the agent session — the fix must not make an unconfigured company's threads go dark", async () => {
+    const { ctx, fetchCalls, handler, companyConfigs } =
+      await bootSingleCompanyThenAddB();
+    delete companyConfigs[COMPANY_B];
+
+    // Not an approval thread: a plain message in some other thread.
+    await handler({
+      companyId: COMPANY_B,
+      payload: {
+        channel: "C_GENERAL",
+        threadTs: "1717200000.000999",
+        text: "hello agent",
+      },
+    });
+
+    // Agent routing needs no bot token, so the handler must still reach it and
+    // look up B's OWN session registry. (It finds no active session in this
+    // fixture and stops there — reaching the lookup is the thing under test,
+    // since a scope-gated Phase 2 would never have got this far.)
+    expect(ctx.state.get).toHaveBeenCalledWith({
+      scopeKind: "company",
+      scopeId: COMPANY_B,
+      stateKey: "sessions_C_GENERAL_1717200000.000999",
+    });
+    // ...and it must not have borrowed A's token to do it.
+    expect(slackBearers(fetchCalls)).not.toContain("xoxb-a");
   });
 });
