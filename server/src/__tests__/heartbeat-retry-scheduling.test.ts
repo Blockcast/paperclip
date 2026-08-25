@@ -357,6 +357,62 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .toEqual({ status: "idle", errorReason: null });
   });
 
+  it("coalesces bounded retries by agent, work identity, and reason", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2030-04-22T20:00:00.000Z");
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+
+    await seedRetryFixture({
+      companyId,
+      agentId,
+      runId: firstRunId,
+      now,
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: new Date(now.getTime() + 1_000),
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: new Date(now.getTime() + 1_000),
+      createdAt: new Date(now.getTime() + 1_000),
+    });
+
+    const first = await heartbeat.scheduleBoundedRetry(firstRunId, { now, delayMs: 60_000 });
+    const second = await heartbeat.scheduleBoundedRetry(secondRunId, {
+      now: new Date(now.getTime() + 30_000),
+      delayMs: 120_000,
+    });
+
+    expect(first.outcome).toBe("scheduled");
+    expect(second.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
+    expect(second.run.id).toBe(first.run.id);
+    expect(second.run.retryOfRunId).toBe(firstRunId);
+
+    const retryRows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(retryRows).toEqual([{ id: first.run.id }]);
+
+    const wakeup = await db
+      .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, first.run.wakeupRequestId!))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.coalescedCount).toBe(1);
+  });
+
   async function seedQueuedRunFixture(input: {
     companyId: string;
     agentId: string;
