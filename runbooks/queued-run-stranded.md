@@ -17,6 +17,33 @@ Triggers:
 
 Owner: Platform / SRE (BLO-21116)
 
+## Scheduled-retry park horizon is a different signal
+
+`paperclip_scheduled_retry_park_horizon_seconds` measures the booked interval
+from `heartbeat_runs.created_at` to `scheduled_retry_at` for live
+`status='scheduled_retry'` rows. `PaperclipScheduledRetryParkHorizonImplausible`
+fires when that future-due horizon exceeds 5,400 seconds, based on the
+observed seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s).
+
+This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
+
+- **Park horizon implausible:** the due time was booked too far out; investigate
+  the retry/capacity decision immediately, even while the due time is future.
+- **Overdue against due time:** `scheduled_retry_at` has passed and promotion
+  has not happened; investigate the scheduler/promotion path.
+
+For the horizon alert, query the parked rows directly:
+
+```sql
+select id, agent_id, created_at, scheduled_retry_at,
+       extract(epoch from scheduled_retry_at - created_at) as park_horizon_seconds,
+       scheduled_retry_reason
+from heartbeat_runs
+where status = 'scheduled_retry'
+  and agent_id = '<agent_id from the alert>'
+order by park_horizon_seconds desc;
+```
+
 ## The invariant
 
 A `heartbeat_runs` row at `status='queued'` is a run Paperclip has already
