@@ -16428,7 +16428,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for update`,
       );
       const workIdentity = taskKey ?? HEARTBEAT_TASK_KEY;
-      if (workIdentity) {
+      // Continuation retries have a stricter identity: source run and attempt.
+      // Let their dedicated lookup below enforce those fields instead of
+      // reusing a generic park for a different continuation attempt.
+      if (workIdentity && !requiresIssueExecutionRetryLock(retryReason) &&
+        retryReason !== INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         const pendingRetries = await tx
           .select()
           .from(heartbeatRuns)
