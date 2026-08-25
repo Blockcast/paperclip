@@ -9464,31 +9464,91 @@ export function recoveryService(
       autoResolved: 0,
       premiseStillTrueSkipped: 0,
       unparsableSkipped: 0,
+      liveRunSkipped: 0,
       runsReleased: 0,
       blockerRelationsRemoved: 0,
       autoResolvedIssueIds: [] as string[],
     };
 
-    for (const escalation of openEscalations) {
+    // The set of escalations that survive the premise check, resolved in one pass so the
+    // subject lookup below is a single query rather than one per row. Bounded by the
+    // backlog size, but this sweep runs on every 30s tick and the backlog it exists to
+    // drain is exactly when the row count is highest.
+    const staleEscalations = openEscalations.flatMap((escalation) => {
       result.checked += 1;
       const parsed = parseLivenessIncidentKey(escalation.originId);
       // No parsable premise means nothing to re-check. Left for
       // `retireObsoleteLivenessRecoveryIssues`, which has its own disposal path.
       if (!parsed || !escalation.originId) {
         result.unparsableSkipped += 1;
-        continue;
+        return [];
       }
       // AC3. The one branch that must not regress: a live incident stays open.
       if (livePremiseKeys.has(escalation.originId)) {
         result.premiseStillTrueSkipped += 1;
-        continue;
+        return [];
+      }
+      return [{ escalation, parsed }];
+    });
+
+    const subjectIssueIds = [
+      ...new Set(staleEscalations.map(({ parsed }) => parsed.issueId)),
+    ];
+    const subjectById = new Map(
+      subjectIssueIds.length === 0
+        ? []
+        : (
+            await db
+              .select({
+                id: issues.id,
+                companyId: issues.companyId,
+                identifier: issues.identifier,
+                status: issues.status,
+              })
+              .from(issues)
+              .where(inArray(issues.id, subjectIssueIds))
+          ).map((row) => [row.id, row] as const),
+    );
+
+    for (const { escalation, parsed } of staleEscalations) {
+      // AC2, and the ordering matters. A dead escalation holding an execution lock
+      // strands that run: the issue keeps pointing at it, and
+      // `retireObsoleteLivenessRecoveryIssues` refuses to touch a row with an active run,
+      // so the lock outlives the premise. Terminal status alone does NOT clear these
+      // columns (`issuesSvc.update` leaves executionRunId untouched on done/cancelled),
+      // so it has to be released explicitly.
+      //
+      // But release ONLY when every owner run is reapable, and do it BEFORE the comment
+      // and the cancel. A run that is genuinely executing still owns this row: detaching
+      // its lock and then cancelling the issue underneath it leaves a live worker writing
+      // to a row it no longer holds. Such an escalation is left entirely alone — no
+      // comment, no blocker edge removal, no cancel — and the next tick picks it up once
+      // the run reaches a terminal status. Skipping is safe because the premise is
+      // already false: nothing is lost by resolving it one tick later.
+      //
+      // Called unconditionally, deliberately NOT gated on the loaded row's lock columns.
+      // Those come from `openEscalations`, an unlocked snapshot taken before this loop,
+      // and every row processed here costs a comment insert plus two updates — so by the
+      // time a late row is reached that snapshot can be well out of date. An agent that
+      // checks the escalation out inside that window still reads as unlocked, would skip
+      // this guard entirely, and get cancelled underneath its live run: the same defect
+      // as releasing a live lock, reached through the snapshot instead of through the
+      // predicate. This call re-reads both lock columns and their owner runs FOR UPDATE,
+      // so the decision is made on current state. `no_lock` is the cheap answer when
+      // there is genuinely no owner.
+      {
+        const release = await issuesSvc.releaseExecutionLockIfOwnerReapable(escalation.id);
+        if (release.outcome === "live_owner_run") {
+          result.liveRunSkipped += 1;
+          continue;
+        }
+        if (release.outcome === "released") result.runsReleased += 1;
       }
 
-      const sourceIssue = await db
-        .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
-        .from(issues)
-        .where(and(eq(issues.companyId, parsed.companyId), eq(issues.id, parsed.issueId)))
-        .then((rows) => rows[0] ?? null);
+      // Company-scoped, matching the per-row query this replaced: an incident key names a
+      // company, and a subject row from a different one is not this escalation's subject.
+      const subject = subjectById.get(parsed.issueId) ?? null;
+      const sourceIssue = subject && subject.companyId === parsed.companyId ? subject : null;
 
       await issuesSvc.addComment(
         escalation.id,
@@ -9510,18 +9570,6 @@ export function recoveryService(
 
       if (await removeRecoveryBlockerFromSource(escalation)) {
         result.blockerRelationsRemoved += 1;
-      }
-
-      // AC2. A dead escalation holding an execution lock strands that run: the issue
-      // keeps pointing at it, and `retireObsoleteLivenessRecoveryIssues` refuses to
-      // touch a row with an active run, so the lock outlives the premise. Terminal
-      // status alone does NOT clear these columns (`issuesSvc.update` leaves
-      // executionRunId untouched on done/cancelled), so release explicitly. This
-      // cancels only never-started runs — an already-executing run is left to finish
-      // and find the row closed, rather than being killed mid-write.
-      if (escalation.executionRunId || escalation.checkoutRunId) {
-        const released = await issuesSvc.adminForceRelease(escalation.id);
-        if (released) result.runsReleased += 1;
       }
 
       await issuesSvc.update(escalation.id, { status: "cancelled" });
@@ -11227,6 +11275,7 @@ export function recoveryService(
       staleEscalationsAutoResolved: staleEscalationCleanup.autoResolved,
       staleEscalationsPremiseStillTrueSkipped: staleEscalationCleanup.premiseStillTrueSkipped,
       staleEscalationsUnparsableSkipped: staleEscalationCleanup.unparsableSkipped,
+      staleEscalationsLiveRunSkipped: staleEscalationCleanup.liveRunSkipped,
       staleEscalationRunsReleased: staleEscalationCleanup.runsReleased,
       staleEscalationBlockerRelationsRemoved: staleEscalationCleanup.blockerRelationsRemoved,
       staleEscalationAutoResolvedIssueIds: staleEscalationCleanup.autoResolvedIssueIds,
