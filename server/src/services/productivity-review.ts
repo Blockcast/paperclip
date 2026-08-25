@@ -103,8 +103,10 @@ const MAX_PARENT_WALK_DEPTH = 25;
 // Matches STALE_RUNNING_ISSUE_LOCK_MS in recovery/service.ts, which is the point
 // the stale-lock sweeper itself stops believing the holder — kept as a local
 // constant rather than an import to avoid coupling the detector to the recovery
-// service's module graph.
-const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
+// service's module graph. BLO-30087 exports it so a drift guard can pin it
+// against the sweeper's own bound — the three consumers of this heuristic have
+// already drifted apart once.
+export const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
 // BLO-23248/BLO-22331/BLO-19604/BLO-23624: three distinct mechanisms all
 // produce the same null hypothesis — "the assignee was never given an
 // executable turn" — which BLO-23248 originally tracked under a single

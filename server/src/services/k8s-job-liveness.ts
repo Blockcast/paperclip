@@ -136,6 +136,45 @@ const AGENT_POD_BUSY_CPU_MILLICORES = numberFromEnv(
   1,
 );
 
+// BLO-20251 / BLO-30087: the two silence bounds that gate the busy-pod
+// deferral. They live HERE, in the leaf module that owns probeAgentPodActivity,
+// rather than in heartbeat.ts, because there are now multiple consumers of the
+// "silence == dead" heuristic and they must not be able to drift apart:
+//
+//   * the hard-stale reaper (heartbeat.ts) — KILLS the run
+//   * the stale-lock sweeper (recovery/service.ts) — FREES the issue lock
+//
+// heartbeat.ts imports recovery/service.js, so recovery cannot import heartbeat
+// and the constant could not simply be shared across. This module imports only
+// the k8s client, the logger and the redactor, so both consumers can depend on
+// it without a cycle.
+//
+// BLO-30087 is what happens when they DO drift: the reaper spared a busy pod up
+// to 3h while the sweeper still freed its lock at 2h, producing a run that was
+// alive and actively writing a shared workspace while its issue lock read free —
+// a state that was previously unreachable, because the 45min reaper always won
+// against the 2h sweeper. Two live runs then interleaved writes into one file.
+export const AGENT_POD_HARD_STALE_MS = 45 * 60 * 1000;
+// Absolute ceiling on how long a demonstrably-busy pod may defer. Without it a
+// run wedged in a CPU-burning spin loop would look "busy" forever and hold its
+// agent's dispatch slot indefinitely (the BLO-12996 starvation the force-reap
+// exists to prevent). 4x the floor (3h) is comfortably longer than any real
+// dependency install, test suite or image build we have observed.
+//
+// Parsed defensively via numberFromEnv, which falls back rather than passing a
+// malformed value through: every `silentMs >= NaN` comparison is false, so a NaN
+// here would make the ceiling silently vanish and let a busy-looking zombie hold
+// its slot — and now also its issue lock — forever. That is the one direction
+// this must never fail in.
+export const AGENT_POD_BUSY_MAX_STALE_MS = Math.max(
+  AGENT_POD_HARD_STALE_MS,
+  numberFromEnv(
+    "PAPERCLIP_EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS",
+    4 * AGENT_POD_HARD_STALE_MS,
+    1,
+  ),
+);
+
 // One namespace-wide PodMetrics read serves every hard-stale candidate in a
 // reaper tick. The TTL is deliberately shorter than a tick so consecutive ticks
 // re-read, but a tick with 20 stale candidates still makes a single call.
