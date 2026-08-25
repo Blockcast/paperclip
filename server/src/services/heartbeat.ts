@@ -9883,6 +9883,15 @@ export interface HeartbeatServiceOptions {
   /** Test-only hook for exercising the monitor select/claim race. */
   issueMonitorClaimHook?: (issueId: string) => Promise<void>;
   /**
+   * Test-only seam for the review-wait blocker relation write. Production
+   * leaves this unset; tests use it to inject a write-time cycle error at the
+   * recovery helper's actual update boundary.
+   */
+  beforeContinuationReviewBlockerUpdateForTest?: (input: {
+    issueId: string;
+    blockedByIssueIds: string[];
+  }) => Promise<void> | void;
+  /**
    * Node role for this process (mirrors config.paperclipNodeRole; wired from
    * index.ts). On the "api" tier, run dispatch (claim + `executeRun`) is fenced
    * off entirely: the api tier intentionally skips bundled-adapter load — the
@@ -10172,6 +10181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const recovery = recoveryService(db, {
     enqueueWakeup,
     beforeStaleIssueLockSweepClearForTest: options.beforeStaleIssueLockSweepClearForTest,
+    beforeContinuationReviewBlockerUpdateForTest: options.beforeContinuationReviewBlockerUpdateForTest,
   });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
