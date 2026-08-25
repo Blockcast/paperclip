@@ -1187,7 +1187,7 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
   // BLO-21526: migration 0225 declines to build the candidate index inline on a
   // populated table (an inline build would hold ACCESS EXCLUSIVE for its
   // duration) and raises a NOTICE instead — which the production client
-  // swallows via `onnotice: () => {}`. So a populated deployment records 0211 as
+  // swallows via `onnotice: () => {}`. So a populated deployment records 0225 as
   // complete with the index absent and no visible signal. Without the index the
   // oldest-first candidate scan is a sequential scan plus a top-N sort, which is
   // fine once per process at startup but not every 30s on every scheduler
@@ -1197,8 +1197,8 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
 
     // The embedded test database migrates against an empty `heartbeat_runs`, so
-    // 0211 builds the index inline. Drop it to reproduce a populated production
-    // database that took 0211's skip path.
+    // 0225 builds the index inline. Drop it to reproduce a populated production
+    // database that took 0225's skip path.
     await db.execute(sql`drop index if exists heartbeat_runs_crash_recovery_pending_idx`);
 
     const svc = service();

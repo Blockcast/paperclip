@@ -1547,7 +1547,7 @@ export async function startServer(): Promise<StartedServer> {
               try {
                 const result = await heartbeat.reconcileWorkerCrashedRuns({
                   // BLO-21526: skip this pass until the candidate index exists.
-                  // Migration 0212 leaves it unbuilt on a populated table (an
+                  // Migration 0226 leaves it unbuilt on a populated table (an
                   // inline build would hold ACCESS EXCLUSIVE for its duration),
                   // so until the online CREATE INDEX CONCURRENTLY step has run,
                   // this query is a sequential scan plus a sort — tolerable once
