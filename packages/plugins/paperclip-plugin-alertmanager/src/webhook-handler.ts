@@ -845,7 +845,6 @@ export async function handleResolved(
       // preconditions below, evaluated inside the update's transaction — this
       // snapshot is racy by construction and must never be the thing that
       // decides whether the cancel is safe.
-      const holderRunId = issue.executionRunId ?? issue.checkoutRunId ?? null;
       try {
         await ctx.issues.update(
           existing.paperclipIssueId,
@@ -883,8 +882,12 @@ export async function handleResolved(
           existing.paperclipIssueId,
           existing.paperclipCompanyId,
         );
+        // Only use an owner confirmed by the post-conflict read. The initial
+        // snapshot may describe a run that released before the CAS reached the
+        // transaction; falling back to it would create a stale marker that can
+        // suppress notification for a later holder.
         cancelWithheldForRunId =
-          currentIssue?.executionRunId ?? currentIssue?.checkoutRunId ?? holderRunId;
+          currentIssue?.executionRunId ?? currentIssue?.checkoutRunId ?? null;
         if (cancelWithheldForRunId) {
           await ensureCancelWithheldComment(
             ctx,
