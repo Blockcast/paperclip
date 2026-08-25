@@ -6,10 +6,16 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
+import {
+  __resetMetricsForTest,
+  renderMetrics,
+  SCHEDULED_RETRY_PARK_HORIZON_METRIC,
+  SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC,
+} from "../services/metrics.js";
 import {
   refreshOverdueScheduledRetryAgeMetrics,
   refreshQueuedRunAgeMetrics,
+  refreshScheduledRetryParkHorizonMetrics,
 } from "../services/queued-run-age-metrics.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -289,5 +295,52 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     const { body } = await renderMetrics();
     expect(body).toContain("paperclip_queued_run_age_metrics_refresh_success 1");
     expect(body).toContain("paperclip_overdue_scheduled_retry_age_metrics_refresh_success 0");
+  });
+
+  it("reports a future-due park horizon without making it overdue", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-08-07T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt,
+      updatedAt: createdAt,
+      scheduledRetryAt: new Date(createdAt.getTime() + 1_594_000),
+      scheduledRetryAttempt: 1,
+    });
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 1594`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC} 1`);
+  });
+
+  it("reports a future-due outlier horizon while the overdue metric remains zero", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-08-07T12:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 60_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt,
+      updatedAt: createdAt,
+      scheduledRetryAt: new Date(createdAt.getTime() + 518_000_000),
+      scheduledRetryAttempt: 1,
+    });
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    await refreshOverdueScheduledRetryAgeMetrics(db, now);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 518000`);
+    expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
   });
 });

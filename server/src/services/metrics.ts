@@ -168,6 +168,10 @@ export const OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC = "paperclip_overdue_sche
  */
 export const OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_overdue_scheduled_retry_age_metrics_refresh_success";
+export const SCHEDULED_RETRY_PARK_HORIZON_METRIC =
+  "paperclip_scheduled_retry_park_horizon_seconds";
+export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
+  "paperclip_scheduled_retry_park_horizon_refresh_success";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -1112,6 +1116,8 @@ let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null =
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
+let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
+let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
@@ -1147,6 +1153,8 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
+  scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
+  scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   authRequestCounter: Counter<"operation" | "outcome">;
@@ -1182,6 +1190,8 @@ function ensureRegistry(): {
     || !queuedRunOldestAge
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
+    || !scheduledRetryParkHorizon
+    || !scheduledRetryParkHorizonRefreshSuccess
     || !pluginError
     || !pluginStatusCollectorLastSuccess
     || !authRequest
@@ -1274,6 +1284,36 @@ function ensureRegistry(): {
       registers: [registry],
     });
     queuedRunAgeMetricsRefreshSuccess.set(0);
+    queuedRunOldestAge = new Gauge({
+      name: QUEUED_RUN_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest queued heartbeat run, by agent.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    overdueScheduledRetryOldestAge = new Gauge({
+      name: OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest scheduled_retry row past its due time, by agent.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    overdueScheduledRetryAgeMetricsRefreshSuccess = new Gauge({
+      name: OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+      help: "1 when the overdue scheduled_retry age database refresh succeeded, otherwise 0.",
+      registers: [registry],
+    });
+    overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
+    scheduledRetryParkHorizon = new Gauge({
+      name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
+      help: "Booked scheduled_retry park horizon in seconds, by agent.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    scheduledRetryParkHorizonRefreshSuccess = new Gauge({
+      name: SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC,
+      help: "1 when the scheduled_retry park horizon database refresh succeeded, otherwise 0.",
+      registers: [registry],
+    });
+    scheduledRetryParkHorizonRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -1661,6 +1701,8 @@ function ensureRegistry(): {
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
+    scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
+    scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
     pluginErrorGauge: pluginError,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     authRequestCounter: authRequest,
@@ -1903,6 +1945,51 @@ export function setQueuedRunOldestAgeMetrics(
 /** Mark whether the queued-run age gauge was refreshed from the database. */
 export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+export function setOverdueScheduledRetryAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().overdueScheduledRetryOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+export function setOverdueScheduledRetryAgeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().overdueScheduledRetryAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/** Publish the maximum booked park horizon for each live scheduled retry. */
+export function setScheduledRetryParkHorizonMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; horizonSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().scheduledRetryParkHorizonGauge;
+  gauge.reset();
+  const maxByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
+    const current = maxByAgentId.get(agentId);
+    if (current === undefined || horizonSeconds > current) maxByAgentId.set(agentId, horizonSeconds);
+  }
+  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, maxByAgentId.get(agentId) ?? 0);
+  const unknownHorizon = maxByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownHorizon !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownHorizon);
+}
+
+export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
+  ensureRegistry().scheduledRetryParkHorizonRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -2378,6 +2465,8 @@ export function __resetMetricsForTest(): void {
   queuedRunOldestAge = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
+  scheduledRetryParkHorizon = null;
+  scheduledRetryParkHorizonRefreshSuccess = null;
   pluginError = null;
   pluginStatusCollectorLastSuccess = null;
   authRequest = null;

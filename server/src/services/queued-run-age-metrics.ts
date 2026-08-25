@@ -1,4 +1,4 @@
-import { and, eq, lt, sql } from "drizzle-orm";
+import { and, eq, isNotNull, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import {
@@ -6,6 +6,8 @@ import {
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setQueuedRunOldestAgeMetrics,
+  setScheduledRetryParkHorizonMetrics,
+  setScheduledRetryParkHorizonRefreshSuccess,
 } from "./metrics.js";
 
 /**
@@ -129,6 +131,43 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
     // snapshot in place and let the freshness gauge disqualify it -- the alert
     // is gated on that gauge, and its own refresh-failed alert pages instead.
     setOverdueScheduledRetryAgeMetricsRefreshSuccess(false);
+    throw error;
+  }
+}
+
+/**
+ * Refresh the per-agent maximum booked `scheduled_retry` park horizon
+ * (BLO-25036). Unlike the overdue sibling above, this measures the selected
+ * due time itself, including future due times, so it catches an implausibly
+ * distant retry before the run becomes overdue. `created_at` is the durable
+ * park-start timestamp for a scheduled-retry row; queued_at represents a later
+ * promotion back to queued and must not be used here.
+ */
+export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<void> {
+  try {
+    const [agentRows, horizonByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          horizonSeconds: sql<number | string>`max(extract(epoch from ${heartbeatRuns.scheduledRetryAt} - ${heartbeatRuns.createdAt}))`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.status, "scheduled_retry"), isNotNull(heartbeatRuns.scheduledRetryAt)))
+        .groupBy(heartbeatRuns.agentId),
+    ]);
+
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    setScheduledRetryParkHorizonMetrics(
+      horizonByAgent.map((row) => ({
+        agentId: row.agentId,
+        horizonSeconds: Number(row.horizonSeconds),
+      })),
+      knownAgentIds,
+    );
+    setScheduledRetryParkHorizonRefreshSuccess(true);
+  } catch (error) {
+    setScheduledRetryParkHorizonRefreshSuccess(false);
     throw error;
   }
 }
