@@ -1849,3 +1849,284 @@ describe("alternate routes to the same material (PEN-2370 ask 3 method)", () => 
     expectNoLeak(out);
   });
 });
+
+/**
+ * Block-termination fail-opens: a line that ENDS the env/argv block is never
+ * seen by the in-block scanner, because the termination guard runs first. So
+ * any line that wrongly reads as a sibling key re-exposes every value after it
+ * — printing `value: "<redacted>"` for the entries before and the plaintext for
+ * the entries after, which is worse than no scrubber at all because the marker
+ * manufactures assurance.
+ *
+ * Both shapes below were live on `master` at `dc2bfaa4`, on the env block
+ * (credential values) and the argv block (PEN-2431 door #5 material) alike,
+ * because all three block guards share one predicate.
+ */
+describe("scrubYamlText — a line inside a block must not terminate it", () => {
+  const podWith = (interruption: string[]): string =>
+    [
+      "apiVersion: v1",
+      "kind: Pod",
+      "spec:",
+      "  containers:",
+      "  - name: app",
+      "    env:",
+      "    - name: FIRST",
+      `      value: ${LEAK}`,
+      ...interruption,
+      "    - name: SECOND",
+      `      value: ${LEAK}`,
+      "    image: example/app:1.2.3",
+      "    ports:",
+      "    - containerPort: 8080",
+    ].join("\n");
+
+  // YAML permits a comment at any column, including column 0 in the middle of a
+  // nested block. Only a comment at exactly the block indent was held in.
+  it.each([
+    ["column 0", "# a comment at column zero"],
+    ["column 2, shallower than the block", "  # a comment"],
+    ["the block indent", "    # a comment"],
+    ["deeper than the block", "        # a comment"],
+  ])("holds the env block open across a comment at %s", (_label, comment) => {
+    expectNoLeak(scrubYamlText(podWith([comment])));
+  });
+
+  // `leadingIndent` counts spaces, so a tab-indented line measured as indent 0.
+  // YAML forbids tabs in indentation, so such a line is never a sibling key.
+  it("holds the env block open across a tab-indented line", () => {
+    expectNoLeak(scrubYamlText(podWith(["\tsomething: else"])));
+  });
+
+  it("holds the env block open across a comment and a tab line together", () => {
+    expectNoLeak(scrubYamlText(podWith(["# note", "\tsomething: else"])));
+  });
+
+  it("holds the env block open across a column-0 comment with CRLF terminators", () => {
+    expectNoLeak(scrubYamlText(podWith(["# note"]).replace(/\n/g, "\r\n")));
+  });
+
+  it("redacts a block scalar opened after a column-0 comment", () => {
+    expectNoLeak(
+      scrubYamlText(
+        [
+          "spec:",
+          "  containers:",
+          "  - name: app",
+          "    env:",
+          "    - name: A",
+          "# note",
+          "    - name: B",
+          "      value: |",
+          `        ${LEAK}`,
+          "    image: example/app:1.2.3",
+        ].join("\n"),
+      ),
+    );
+  });
+
+  // The argv block carries `--token=…` rather than `value:`, and shares the
+  // same termination predicate, so the same two shapes reopened it.
+  const argvWith = (interruption: string[]): string =>
+    [
+      "spec:",
+      "  containers:",
+      "  - name: app",
+      "    args:",
+      `    - --first=${LEAK}`,
+      ...interruption,
+      `    - --second=${LEAK}`,
+      "    image: example/app:1.2.3",
+    ].join("\n");
+
+  it.each([
+    ["a column-0 comment", "# note"],
+    ["a tab-indented line", "\tsomething: else"],
+  ])("holds the argv block open across %s", (_label, interruption) => {
+    expectNoLeak(scrubYamlText(argvWith([interruption])));
+  });
+
+  // Tab-indented spellings of the value key itself, reachable only once the
+  // block is correctly held open — so these would pass vacuously without the
+  // fix above, and are asserted to keep the widened path honest.
+  it.each([
+    ["a tab-indented `value:` key", "\tvalue: "],
+    ["a tab-indented quoted value key", '\t"value": '],
+  ])("redacts %s inside an env block", (_label, prefix) => {
+    expectNoLeak(
+      scrubYamlText(
+        [
+          "spec:",
+          "  containers:",
+          "  - name: app",
+          "    env:",
+          "    - name: A",
+          `${prefix}${LEAK}`,
+          "    image: example/app:1.2.3",
+        ].join("\n"),
+      ),
+    );
+  });
+
+  it.each([
+    ["a tab-indented KEY=VALUE entry", `\t- A=${LEAK}`],
+    ["a tab-indented flow mapping entry", `\t- {name: A, value: ${LEAK}}`],
+  ])("redacts %s inside an env block", (_label, entry) => {
+    expectNoLeak(
+      scrubYamlText(
+        [
+          "spec:",
+          "  containers:",
+          "  - name: app",
+          "    env:",
+          entry,
+          "    image: example/app:1.2.3",
+        ].join("\n"),
+      ),
+    );
+  });
+
+  it("redacts a deeper-indented continuation of an unmeasurable line", () => {
+    expectNoLeak(
+      scrubYamlText(
+        [
+          "spec:",
+          "  containers:",
+          "  - name: app",
+          "    env:",
+          "    - name: A",
+          "\tsomething: x",
+          `        ${LEAK}`,
+          "    image: example/app:1.2.3",
+        ].join("\n"),
+      ),
+    );
+  });
+});
+
+/**
+ * The counter-direction. Widening what stays inside a block is fail-closed, but
+ * a fail-closed rule that swallows the rest of the container spec removes the
+ * diagnostics the grant exists for — and under-redaction and over-redaction are
+ * both failures of this scrubber, so the limit needs pinning from both sides.
+ *
+ * A tab-indented line has no measurable depth, so it must not set a swallow
+ * threshold either: `leadingIndent` reported 0 for it, which meant "drop every
+ * following line indented deeper than 0" and ate image, ports, resources and
+ * probes as far as the next column-0 key.
+ */
+describe("scrubYamlText — holding a block open does not swallow the spec", () => {
+  const interrupted = scrubYamlText(
+    [
+      "apiVersion: v1",
+      "kind: Pod",
+      "spec:",
+      "  containers:",
+      "  - name: app",
+      "    env:",
+      "    - name: A",
+      `      value: ${LEAK}`,
+      "# column-zero comment",
+      "\ttab: line",
+      "    image: example/app:1.2.3",
+      "    ports:",
+      "    - containerPort: 8080",
+      "    resources:",
+      "      limits:",
+      "        memory: 512Mi",
+      "    livenessProbe:",
+      "      httpGet:",
+      "        path: /healthz",
+      "status:",
+      "  phase: Running",
+      "  containerStatuses:",
+      "  - name: app",
+      "    restartCount: 7",
+    ].join("\n"),
+  );
+
+  it("still redacts the value", () => {
+    expectNoLeak(interrupted);
+  });
+
+  it.each([
+    ["the env variable name", "name: A"],
+    ["the image", "image: example/app:1.2.3"],
+    ["ports", "containerPort: 8080"],
+    ["resource limits", "memory: 512Mi"],
+    ["probes", "path: /healthz"],
+    ["status.phase", "phase: Running"],
+    ["restartCount", "restartCount: 7"],
+  ])("preserves %s", (_label, fragment) => {
+    expect(interrupted).toContain(fragment);
+  });
+
+  it("preserves a valueFrom reference across a column-0 comment", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        "    env:",
+        "    - name: B",
+        "      valueFrom:",
+        "        secretKeyRef:",
+        "          name: my-secret",
+        "          key: token",
+        "# note",
+        "    - name: C",
+        `      value: ${LEAK}`,
+        "    image: example/app:1.2.3",
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("secretKeyRef");
+    expect(out).toContain("name: my-secret");
+    expect(out).toContain("key: token");
+    expect(out).toContain("image: example/app:1.2.3");
+  });
+
+  // A tab is only unmeasurable indentation when it is in the INDENT. A tab
+  // inside a value is content, and must not hold the block open on its own.
+  it("treats a tab inside a value as content, not indentation", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        "    env:",
+        "    - name: D",
+        `      value: ${LEAK}`,
+        "    image: has\ttab:1",
+        "    ports:",
+        "    - containerPort: 9090",
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out).toContain("has\ttab:1");
+    expect(out).toContain("containerPort: 9090");
+  });
+
+  // A real sibling key after an interruption must still close the block,
+  // otherwise the widening grows into swallowing the whole document.
+  it("still ends the block on a real sibling key after a comment", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        "    env:",
+        "    - name: A",
+        "# note",
+        "    image: example/app:9.9.9",
+        "    ports:",
+        "    - containerPort: 1234",
+      ].join("\n"),
+    );
+
+    expect(out).toContain("image: example/app:9.9.9");
+    expect(out).toContain("containerPort: 1234");
+  });
+});
