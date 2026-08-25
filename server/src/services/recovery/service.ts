@@ -9184,6 +9184,20 @@ export function recoveryService(
     };
   }
 
+  /**
+   * A 409 raised by `issuesSvc.update` because an `expectedCurrent*RunId` write
+   * precondition failed — i.e. the row was checked out between the caller reading its lock
+   * state and the update landing. Matched on the precondition keys `update` puts in the
+   * error details rather than on the status alone, so unrelated 409s from the same call
+   * still propagate instead of being silently read as "someone else took the row".
+   */
+  function isExecutionLockPreconditionConflict(error: unknown) {
+    if (!(error instanceof HttpError) || error.status !== 409) return false;
+    const details = error.details;
+    if (!details || typeof details !== "object") return false;
+    return "expectedCheckoutRunId" in details || "expectedExecutionRunId" in details;
+  }
+
   type LivenessBlockerPruneOutcome = {
     /** The fabricated edge was found and cleared. */
     pruned: boolean;
@@ -9427,6 +9441,34 @@ export function recoveryService(
           ).map((row) => [row.id, row] as const),
     );
 
+    // The cancel below takes the escalation's `blocks` edge off with it, inside the same
+    // transaction (`issuesSvc.update` deletes it for this origin kind), so by the time the
+    // residual `removeRecoveryBlockerFromSource` runs there is normally nothing left for it
+    // to report. Read the wired edges NOW, batched alongside the subject rows above, so
+    // `blockerRelationsRemoved` keeps counting what the sweep actually unwired instead of
+    // silently reporting zero once the cancel moved ahead of it.
+    const wiredBlockerEdgeKey = (escalationId: string, subjectId: string) =>
+      `${escalationId}:${subjectId}`;
+    const staleEscalationIds = staleEscalations.map(({ escalation }) => escalation.id);
+    const wiredBlockerEdges = new Set(
+      staleEscalationIds.length === 0
+        ? []
+        : (
+            await db
+              .select({
+                issueId: issueRelations.issueId,
+                relatedIssueId: issueRelations.relatedIssueId,
+              })
+              .from(issueRelations)
+              .where(
+                and(
+                  inArray(issueRelations.issueId, staleEscalationIds),
+                  eq(issueRelations.type, "blocks"),
+                ),
+              )
+          ).map((row) => wiredBlockerEdgeKey(row.issueId, row.relatedIssueId)),
+    );
+
     for (const { escalation, parsed } of staleEscalations) {
       // AC2, and the ordering matters. A dead escalation holding an execution lock
       // strands that run: the issue keeps pointing at it, and
@@ -9453,6 +9495,10 @@ export function recoveryService(
       // predicate. This call re-reads both lock columns and their owner runs FOR UPDATE,
       // so the decision is made on current state. `no_lock` is the cheap answer when
       // there is genuinely no owner.
+      //
+      // This guard is necessary but NOT sufficient: it commits, so it cannot speak for the
+      // window after it returns. The cancel below re-pins the same lock state as a write
+      // precondition, which is what actually makes the decision safe.
       {
         const release = await issuesSvc.releaseExecutionLockIfOwnerReapable(escalation.id);
         if (release.outcome === "live_owner_run") {
@@ -9466,6 +9512,50 @@ export function recoveryService(
       // company, and a subject row from a different one is not this escalation's subject.
       const subject = subjectById.get(parsed.issueId) ?? null;
       const sourceIssue = subject && subject.companyId === parsed.companyId ? subject : null;
+
+      // The cancel goes FIRST, and it is the atomic decision point for the whole row.
+      //
+      // The guard above closes over its own transaction and commits. That leaves a window
+      // between it and this write in which an agent can legitimately check the escalation
+      // out: the guard saw no owner, so it did not skip, and the row is now live. Doing the
+      // comment and the blocker-edge removal before the cancel meant that window ended with
+      // a live worker attached to an issue the sweep had already unwired from its subject
+      // and cancelled underneath it — the same defect as force-releasing a live lock, just
+      // reached one step later.
+      //
+      // `expectedCurrent{Checkout,Execution}RunId: null` pins the exact state the guard
+      // left behind. Drizzle renders a null expectation as `IS NULL`, and `update` re-emits
+      // both into the UPDATE's own WHERE, so under READ COMMITTED a checkout that lands in
+      // the window is serialized against this statement and the predicate is re-evaluated
+      // against its committed row: zero rows matched, `update` raises 409, and the row is
+      // skipped whole — no comment, no edge removal, no cancel. The checkout's own UPDATE is
+      // symmetrically a CAS on `status`, so the reverse interleaving fails on its side
+      // instead. Either way exactly one of the two wins, and the loser touches nothing.
+      //
+      // Ordering the cancel ahead of the edge removal reverses the previous
+      // edge-before-cancel decision, which existed to avoid leaving the subject blocked
+      // behind a cancelled issue. That window is already self-healing: reconciliation drops
+      // closed liveness escalations from blocker relations (covered by "removes closed
+      // liveness escalations from blocker relations during reconciliation"). The reverse
+      // order has no such repair path — an edge removed before a cancel that then loses the
+      // CAS leaves a live escalation silently unwired from its subject, with nothing to put
+      // it back. And for this origin kind the cancel deletes that edge in its own
+      // transaction anyway, so the subject is never observably blocked behind a cancelled
+      // row to begin with.
+      try {
+        await issuesSvc.update(escalation.id, {
+          status: "cancelled",
+          expectedCurrentCheckoutRunId: null,
+          expectedCurrentExecutionRunId: null,
+        });
+      } catch (error) {
+        if (!isExecutionLockPreconditionConflict(error)) throw error;
+        // Checked out inside the window. Same disposition as the guard's `live_owner_run`:
+        // the premise is already false, so nothing is lost by resolving it a tick later,
+        // once that run reaches a terminal status.
+        result.liveRunSkipped += 1;
+        continue;
+      }
 
       await issuesSvc.addComment(
         escalation.id,
@@ -9485,11 +9575,16 @@ export function recoveryService(
         { runId: opts?.runId ?? null },
       );
 
-      if (await removeRecoveryBlockerFromSource(escalation)) {
+      // Residual path: covers the rows the cancel's own edge delete cannot reach — an
+      // origin id the escalation-side parser rejects, or a subject in another company.
+      // Counted exactly once per escalation: the cancel took the edge, or this did.
+      const edgeRemovedByCancel =
+        sourceIssue !== null && wiredBlockerEdges.has(wiredBlockerEdgeKey(escalation.id, sourceIssue.id));
+      const edgeRemovedByResidual = await removeRecoveryBlockerFromSource(escalation);
+      if (edgeRemovedByCancel || edgeRemovedByResidual) {
         result.blockerRelationsRemoved += 1;
       }
 
-      await issuesSvc.update(escalation.id, { status: "cancelled" });
       result.autoResolved += 1;
       result.autoResolvedIssueIds.push(escalation.id);
     }

@@ -63,6 +63,37 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
+/**
+ * Test-controlled seam for the one interleaving the stale-escalation sweep cannot
+ * reproduce with fixture state alone: a checkout that lands AFTER the sweep's ownership
+ * guard has committed and BEFORE its cancel. The guard is the only boundary in that
+ * window, so the hook fires immediately after the real implementation returns.
+ *
+ * Default is null and the wrapper is a pass-through, so every other test in this file
+ * exercises the unmodified service.
+ */
+const guardBoundary = vi.hoisted(() => ({
+  afterExecutionLockGuard: null as null | ((issueId: string) => Promise<void>),
+}));
+
+vi.mock("../services/issues.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/issues.ts")>("../services/issues.ts");
+  return {
+    ...actual,
+    issueService: (db: Parameters<typeof actual.issueService>[0]) => {
+      const svc = actual.issueService(db);
+      return {
+        ...svc,
+        releaseExecutionLockIfOwnerReapable: async (id: string) => {
+          const outcome = await svc.releaseExecutionLockIfOwnerReapable(id);
+          await guardBoundary.afterExecutionLockGuard?.(id);
+          return outcome;
+        },
+      };
+    },
+  };
+});
+
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
@@ -97,6 +128,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    guardBoundary.afterExecutionLockGuard = null;
     runningProcesses.clear();
     await cleanupHeartbeatTestState(db, heartbeatSvc, {
       errorLabel: "heartbeat issue liveness escalation test cleanup",
@@ -1042,6 +1074,11 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.staleEscalationsAutoResolved).toBe(1);
     expect(result.staleEscalationsPremiseStillTrueSkipped).toBe(0);
     expect(result.staleEscalationAutoResolvedIssueIds).toEqual([escalation.id]);
+    // The cancel now removes the blocker edge in its own transaction, ahead of the
+    // residual `removeRecoveryBlockerFromSource`. The counter has to keep reporting the
+    // unwiring rather than silently dropping to zero because the residual path found
+    // nothing left to do.
+    expect(result.staleEscalationBlockerRelationsRemoved).toBe(1);
 
     const closed = await db
       .select()
@@ -1186,6 +1223,95 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(ownerRun.status).toBe("running");
 
     // Nothing was half-done: no auto-resolve comment, and the blocker edge is still wired.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, escalation.id));
+    expect(
+      comments.some((comment) =>
+        comment.body.includes(STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER),
+      ),
+    ).toBe(false);
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.map((row) => row.blockerIssueId)).toContain(escalation.id);
+  });
+
+  /**
+   * The interleaving the two tests above cannot reach, and the one the ownership guard
+   * alone does not cover.
+   *
+   * Both of those start with the lock ALREADY attached, so the guard sees an owner and
+   * decides on state it read itself. This one starts unlocked: the guard returns
+   * `no_lock`, declines to skip, and commits — and only then does an agent check the row
+   * out, exactly as a dispatch landing a millisecond later would. Everything the guard
+   * concluded is stale by the time the sweep acts on it.
+   *
+   * The cancel is what has to catch this, by pinning the lock columns the guard left
+   * behind as a write precondition. If it instead cancels unconditionally, a live worker
+   * is left attached to a cancelled issue that has been unwired from its subject.
+   */
+  it("leaves a stale escalation intact when an agent checks it out inside the guard window", async () => {
+    const { companyId, managerId, blockedIssueId, blockerIssueId, escalation } =
+      await mintEscalation();
+
+    // Precondition that makes this test distinct: no owner at all going in.
+    expect(escalation.executionRunId).toBeNull();
+    expect(escalation.checkoutRunId).toBeNull();
+
+    // Kill the premise, so the ONLY thing standing between this row and auto-resolution
+    // is the checkout that lands mid-window.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: escalation.id },
+    });
+
+    // A real checkout through the public path, not a hand-written lock column update, so
+    // this asserts against the same CAS an actual dispatch would race through.
+    let checkouts = 0;
+    guardBoundary.afterExecutionLockGuard = async (issueId) => {
+      if (issueId !== escalation.id || checkouts > 0) return;
+      checkouts += 1;
+      await issueService(db).checkout(escalation.id, managerId, [escalation.status], runId);
+    };
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    // The window was genuinely exercised — otherwise the assertions below prove nothing.
+    expect(checkouts).toBe(1);
+    expect(result.staleEscalationsAutoResolved).toBe(0);
+    expect(result.staleEscalationsLiveRunSkipped).toBe(1);
+    expect(result.staleEscalationAutoResolvedIssueIds).toEqual([]);
+
+    const untouched = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, escalation.id))
+      .then((rows) => rows[0]!);
+    expect(untouched.status).not.toBe("cancelled");
+    // The lock the checkout took is intact: the sweep did not cancel out from under it.
+    expect(untouched.executionRunId).toBe(runId);
+    expect(untouched.checkoutRunId).toBe(runId);
+
+    // The run the checkout attached is still live.
+    const ownerRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    expect(ownerRun.status).toBe("running");
+
+    // Nothing was half-done: no auto-resolve comment, and the escalation is still wired to
+    // its subject. An unwired-but-open escalation has no repair path.
     const comments = await db
       .select()
       .from(issueComments)
