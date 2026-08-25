@@ -16418,6 +16418,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
       let activityPublish: ActivityPublish | undefined;
+
+      // Serialize parks for one agent before looking for an existing row. The
+      // work identity deliberately excludes the due instant: repeated bare
+      // heartbeat wakes are idempotent, while issue/task retries must retain
+      // distinct identities. Keeping this inside the agent lock prevents two
+      // concurrent failures from both inserting the same parked retry.
+      await tx.execute(
+        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for update`,
+      );
+      const workIdentity = taskKey ?? HEARTBEAT_TASK_KEY;
+      if (workIdentity) {
+        const pendingRetries = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.agentId, run.agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, retryReason),
+          ))
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+        const existingPark = pendingRetries.find(
+          (candidate) => (runTaskKey(candidate) ?? HEARTBEAT_TASK_KEY) === workIdentity,
+        );
+        if (existingPark) {
+          if (existingPark.wakeupRequestId) {
+            const existingWakeup = await tx
+              .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+              .from(agentWakeupRequests)
+              .where(eq(agentWakeupRequests.id, existingPark.wakeupRequestId))
+              .then((rows) => rows[0] ?? null);
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, existingPark.wakeupRequestId));
+          }
+          return {
+            outcome: "scheduled",
+            run: existingPark,
+            reusedExisting: true,
+          };
+        }
+      }
+
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         if (issueId) {
           await tx.execute(
