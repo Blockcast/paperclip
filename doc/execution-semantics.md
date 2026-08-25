@@ -269,9 +269,11 @@ external owner: <who must act — a person, team, or external system>
 external action: <the concrete action they must take>
 ```
 
-Both lines are required; either one alone does not count. Matching is case-insensitive and tolerates leading spaces and tabs, so `External owner: …` is fine — but the `key: value` shape is mandatory. Each value must sit on the same line as its key: `external owner:` with the name on the line below is an incomplete declaration and does not match. A sentence such as "waiting on the CTO to approve the ruleset change" does **not** match, however clearly it names the gate.
+Both lines are required; either one alone does not count. Matching is case-insensitive and tolerates leading spaces and tabs, so `External owner: …` is fine — but the `key: value` shape is mandatory. Each value must sit on the same line as its key: `external owner:` with the name on the line below is an incomplete declaration and does not match. A sentence such as "waiting on the CTO to approve the ruleset change" does **not** match, however clearly it names the gate. Values are stored truncated — the owner to 120 characters and the action to 240 — so keep both short and put any longer explanation in ordinary prose elsewhere in the description.
 
 Use this to park an issue on a gate the issue graph cannot represent: an approval, a credential grant, another team's sign-off. Per the monitor contract, do **not** arm a monitor on a human-only gate — polling does not move it. Declare the external wait instead.
+
+A declaration is also read positively, not just as a suppression: a `blocked` issue with a declared wait and no live monitor is surfaced in the blocked inbox as `external_wait` rather than as a stalled row. The two declaration lines are stripped from the description shown there, and the owner and action values are redacted out of the remaining text — so write them expecting that treatment.
 
 Two limits worth knowing before you rely on it:
 
