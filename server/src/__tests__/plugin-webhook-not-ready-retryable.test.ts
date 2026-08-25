@@ -270,13 +270,24 @@ describe("webhook ingestion: genuine client errors stay 4xx", () => {
     expect(res.body.error).toContain("not-declared");
   }, 20_000);
 
-  it("400s a ready plugin not yet configured for any company", async () => {
+  it("503s a ready plugin not yet configured for any company", async () => {
     mockPlugin({});
     mockRegistry.listConfigCompanyIds.mockResolvedValue([]);
     const { app } = await createApp();
 
     const res = await postAlert(app);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(503);
+    expect(Number(res.headers["retry-after"])).toBeGreaterThan(0);
     expect(res.body.error).toContain("configured for a company");
+  }, 20_000);
+
+  it("400s a ready multi-company plugin when companyId is omitted", async () => {
+    mockPlugin({});
+    mockRegistry.listConfigCompanyIds.mockResolvedValue([COMPANY_ID, "33333333-3333-4333-8333-333333333333"]);
+    const { app } = await createApp();
+
+    const res = await postAlert(app);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('"companyId" query parameter is required');
   }, 20_000);
 });
