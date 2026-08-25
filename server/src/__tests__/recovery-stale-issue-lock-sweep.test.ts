@@ -1550,6 +1550,82 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(result.issueIds).toEqual([issueId]);
     });
 
+    // Why the in-transaction revalidation does NOT need to re-check the busy
+    // ceiling — reviewed and asserted rather than left to inference.
+    //
+    // `currentRunningLockSilent` reads the memoized busy verdict without
+    // re-deriving the ceiling, which reads like a hole: a holder probed at 2h30m
+    // could be past the 3h ceiling by the time the transaction revalidates, and
+    // a memoized "spared" would then preserve a zombie's lock. It cannot,
+    // because being spared and reaching the transaction are mutually exclusive:
+    //
+    //   executionLockExpired = isPreClaimLockExpired(...) || runningLockSilent
+    //   runningLockSilent    = isRunningLockSilent(...) && !isBusySparedRunningHolder(...)
+    //
+    // and a non-cleanable `running` holder that is not expired hits `continue`
+    // before `db.transaction` is ever opened. So a `running` holder only reaches
+    // the transaction when the busy spare returned FALSE, which means the memo
+    // for that run is `false` or absent exactly when the branch is evaluated.
+    // The `=== true` arm is defensive, not load-bearing.
+    //
+    // That guarantee lives in the ordering of two guards ~150 lines apart, and
+    // nothing enforced it. This case does: let a spared holder into the
+    // transaction and the branch stops being a no-op and becomes the bug it is
+    // mistaken for.
+    it("never lets a spared busy holder reach the sweep transaction", async () => {
+      const { companyId, agentId } = await seed();
+      // Spared: busy pod, inside the band.
+      const busy = await seedWedgedRunningIssue({
+        companyId,
+        agentId,
+        lastOutputAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lastUsefulActionAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      });
+      // Control, so the negative assertion below cannot pass vacuously: same
+      // fixture, same band, but no positive busy evidence. This one MUST reach
+      // the transaction and be cleared — proving the hook fires at all.
+      const idle = await seedWedgedRunningIssue({
+        companyId,
+        agentId,
+        lastOutputAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lastUsefulActionAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      });
+      mockProbeAgentPodActivity.mockImplementation(async (runId: string) =>
+        runId === busy.wedgedRunId ? "busy" : "idle",
+      );
+
+      const reachedTransaction: string[] = [];
+      const heartbeat = heartbeatService(db, {
+        beforeStaleIssueLockSweepClearForTest: async (issue) => {
+          reachedTransaction.push(issue.id);
+        },
+      });
+      const result = await heartbeat.sweepStaleIssueLocks();
+
+      // The spared holder is filtered out before the transaction opens.
+      expect(reachedTransaction).not.toContain(busy.issueId);
+      // The control did open a transaction and was cleared.
+      expect(reachedTransaction).toContain(idle.issueId);
+      expect(result.cleared).toBe(1);
+      expect(result.issueIds).toEqual([idle.issueId]);
+
+      // And the spared holder still owns every lock column.
+      const row = await db
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, busy.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: busy.wedgedRunId,
+        executionRunId: busy.wedgedRunId,
+      });
+    });
+
     // Regression guards: a genuinely wedged holder is still reclaimed on the
     // existing schedule. `idle` is positive evidence of wedging; `unknown` is
     // the no-metrics-server case and must degrade to byte-for-byte pre-change
