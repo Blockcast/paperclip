@@ -146,6 +146,7 @@ const NO_EXECUTABLE_TURN_DOMINANT_SHARE = 0.5;
 const COMMENT_POLICY_EXEMPT_ISSUE_COMMENT_STATUS = "not_applicable";
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
+const PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION = "issue.productivity_review_suppressed";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
   "issue.productivity_review_assignment_wake_started";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION =
@@ -2502,12 +2503,74 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       actorType: "system",
       actorId: "system",
       agentId: suppression.sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: suppression.sourceIssue.id,
       details,
     });
     logger.info(details, "productivity review long_active_duration suppressed by pending approval gate");
+  }
+
+  /**
+   * BLO-24022: identity of the monitor wait a suppression is reporting.
+   *
+   * The reconcile re-evaluates every ~30s (`heartbeatSchedulerIntervalMs`) and re-reaches the same
+   * suppression decision each time, because nothing about the wait has changed — the monitor is
+   * still armed for the same future check. Keying on that wait lets us write one audit row per
+   * wait instead of one per tick.
+   *
+   * Deliberately excluded from the key:
+   * - `elapsedMs` — grows monotonically every tick. Including it would make every key unique and
+   *   defeat the dedupe entirely; it is the field that made these rows look like state changes.
+   * - `monitorWakeRequestedAt` — a wake claim expires after
+   *   `ISSUE_MONITOR_WAKE_CLAIM_TTL_MS` (5m) and is re-taken, which would re-open the same churn
+   *   at 12 rows/hour per issue. The claim does not change *which* wait we are suppressing for.
+   *
+   * `monitorLastTriggeredAt` IS in the key: on the just-fired branch `monitorNextCheckAt` is null
+   * (see `MonitorScheduledSuppression`), so it is the only field that distinguishes one fired
+   * window from the next.
+   */
+  function monitorSuppressionWindowKey(details: {
+    monitorNextCheckAt: string | null;
+    monitorScheduledBy: string | null;
+    monitorLastTriggeredAt: string | null;
+  }) {
+    return [
+      details.monitorNextCheckAt ?? "none",
+      details.monitorScheduledBy ?? "none",
+      details.monitorLastTriggeredAt ?? "none",
+    ].join("|");
+  }
+
+  async function latestMonitorScheduledSuppressionKey(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string },
+  ) {
+    const row = await executor
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          eq(activityLog.action, PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row) return null;
+    const details = activityDetails(row.details);
+    // A different suppression reason (approval_pending, terminal source) is a real state change,
+    // so it must not be mistaken for an already-reported monitor wait.
+    if (details.suppressedBy !== "monitor_scheduled") return null;
+    const str = (value: unknown) => (typeof value === "string" ? value : null);
+    return monitorSuppressionWindowKey({
+      monitorNextCheckAt: str(details.monitorNextCheckAt),
+      monitorScheduledBy: str(details.monitorScheduledBy),
+      monitorLastTriggeredAt: str(details.monitorLastTriggeredAt),
+    });
   }
 
   async function recordMonitorScheduledSuppression(suppression: MonitorScheduledSuppression) {
@@ -2522,17 +2585,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorLastTriggeredAt: suppression.monitorLastTriggeredAt?.toISOString() ?? null,
       elapsedMs: suppression.elapsedMs,
     };
+    // BLO-24022: only the first tick of a given monitor wait writes an audit row. Re-suppressing a
+    // wait already on record is not a state change, and emitting it every ~30s drowned the
+    // activity feed (46% of all company activity), which broke agent-health triage.
+    //
+    // Best-effort by design: this is a read-then-write without a lock, so two overlapping
+    // reconciles (see the note on the 30s scheduler overlapping itself) can both miss the existing
+    // row and write. That degrades to a small number of rows per wait rather than ~120/hour, which
+    // is the whole point; an advisory lock is not worth taking for an audit row.
+    const previousKey = await latestMonitorScheduledSuppressionKey(db, {
+      companyId: suppression.sourceIssue.companyId,
+      issueId: suppression.sourceIssue.id,
+    });
+    if (previousKey !== null && previousKey === monitorSuppressionWindowKey(details)) {
+      logger.debug(
+        details,
+        "productivity review long_active_duration suppression already recorded for this monitor wait",
+      );
+      return false;
+    }
     await logActivity(db, {
       companyId: suppression.sourceIssue.companyId,
       actorType: "system",
       actorId: "system",
       agentId: suppression.sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: suppression.sourceIssue.id,
       details,
     });
     logger.info(details, "productivity review long_active_duration suppressed by scheduled monitor");
+    return true;
   }
 
   /**
@@ -4476,7 +4559,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       companyId: evidence.sourceIssue.companyId,
       actorType: "system",
       actorId: "system",
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: evidence.sourceIssue.id,
       agentId: evidence.sourceAgent.id,
