@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   agentWakeupRequests,
   companies,
@@ -14,7 +15,7 @@ import {
   issueDocuments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -218,6 +219,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     issueId: string;
     agentId: string;
     body: string;
+    updatedAt?: Date;
+    sourceTrust?: Record<string, unknown>;
   }) {
     const documentId = randomUUID();
     const revisionId = randomUUID();
@@ -231,6 +234,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       latestRevisionNumber: 1,
       createdByAgentId: input.agentId,
       updatedByAgentId: input.agentId,
+      ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
+      ...(input.sourceTrust ? { sourceTrust: input.sourceTrust as never } : {}),
     });
     await db.insert(documentRevisions).values({
       id: revisionId,
@@ -1939,5 +1944,245 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.status).toBe("succeeded");
     expect(run?.errorCode).toBeNull();
     expect(countExecuteCallsForRun(runId)).toBe(1);
+  });
+
+  // BLO-27639. Only an executing run can rewrite the continuation summary, so a
+  // park-shaped summary that events have overtaken used to wedge the
+  // continuation lineage shut permanently. The park is now honoured only while
+  // the summary is still the most recent word on the issue.
+  describe("continuation park freshness (BLO-27639)", () => {
+    const PARKING_SUMMARY = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- Wait for reviewer feedback or approval before continuing executor work.",
+    ].join("\n");
+
+    async function seedParkedContinuationRetry(input: {
+      title: string;
+      summaryUpdatedAt: Date;
+      sourceTrust?: Record<string, unknown>;
+    }) {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: input.title,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+      await seedContinuationSummary({
+        companyId,
+        issueId,
+        agentId,
+        body: PARKING_SUMMARY,
+        updatedAt: input.summaryUpdatedAt,
+        sourceTrust: input.sourceTrust,
+      });
+      return { companyId, agentId, issueId };
+    }
+
+    async function resumeContinuationRetry(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      expectedStatus: "succeeded" | "cancelled";
+    }) {
+      const { runId } = await seedQueuedRun({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        wakeReason: "issue_continuation_needed",
+        invocationSource: "automation",
+        contextExtras: { retryReason: "issue_continuation_needed" },
+      });
+
+      await heartbeat.resumeQueuedRuns();
+
+      await waitForCondition(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === input.expectedStatus;
+      });
+
+      const run = await db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          startedAt: heartbeatRuns.startedAt,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return { runId, run };
+    }
+
+    // Replays the recorded BLO-22293 shape: summary written 2026-08-14T04:33Z,
+    // CTO ruling comment 26h later clearing the blocker. That retry was
+    // cancelled with `startedAt: null`; it must now execute.
+    it("executes a continuation retry whose parking summary predates the latest issue comment", async () => {
+      const summaryUpdatedAt = new Date("2026-08-14T04:33:51.682Z");
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Blocker cleared after the parking summary was written",
+        summaryUpdatedAt,
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        body: "Ruling: the blocker is removed. Nothing is waiting on review any more — proceed.",
+        createdAt: new Date("2026-08-15T06:31:00.000Z"),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+      expect(run?.startedAt).not.toBeNull();
+    });
+
+    it("executes a continuation retry whose parking summary predates a status change", async () => {
+      const summaryUpdatedAt = new Date("2026-08-14T04:33:51.682Z");
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Status moved after the parking summary was written",
+        summaryUpdatedAt,
+      });
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { status: "in_progress", _previous: { status: "blocked" } },
+        createdAt: new Date("2026-08-15T06:31:00.000Z"),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+    });
+
+    // BLO-16146 / BLO-18643 no-regression: a genuinely review-waiting issue
+    // must still park rather than burn runs.
+    it("still cancels a continuation retry whose parking summary is the most recent word on the issue", async () => {
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Genuinely waiting on review",
+        summaryUpdatedAt: new Date("2026-08-15T09:00:00.000Z"),
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        body: "Handing off to the reviewer.",
+        createdAt: new Date("2026-08-15T08:00:00.000Z"),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+
+      expect(run?.status).toBe("cancelled");
+      expect(run?.errorCode).toBe("issue_continuation_waiting_on_review");
+      expect(run?.startedAt).toBeNull();
+      expect(run?.resultJson).toMatchObject({ timeoutSource: "stale_queued_run_gate" });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
+
+    // The park cancellation posts a system comment (AC3). If system comments
+    // counted as superseding activity, that comment would unpark the next retry
+    // and the gate would disable itself after one firing.
+    it("records the park on the issue without letting its own notice unpark the next retry", async () => {
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Park notice must not self-supersede",
+        summaryUpdatedAt: new Date("2026-08-15T09:00:00.000Z"),
+      });
+
+      const first = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+      expect(first.run?.errorCode).toBe("issue_continuation_waiting_on_review");
+
+      const notices = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.body} like '%Continuation retry%'`,
+        ));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.authorType).toBe("system");
+      expect(notices[0]?.body).toContain("waiting for reviewer feedback or approval");
+      expect(notices[0]?.body).toContain(first.runId);
+
+      // Second retry against the same summary: still cancelled, and the notice
+      // is not duplicated.
+      const second = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+      expect(second.run?.errorCode).toBe("issue_continuation_waiting_on_review");
+
+      const noticesAfter = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.body} like '%Continuation retry%'`,
+        ));
+      expect(noticesAfter).toHaveLength(1);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
+
+    // Preferring the live document over the wake snapshot must not bypass the
+    // snapshot's quarantine redaction: a low-trust summary reads as
+    // `LOW_TRUST_QUARANTINED_BODY`, which has no `Next Action`, so it cannot
+    // park a run (and its raw text cannot reach the run-event payload).
+    it("does not let a quarantined low-trust summary park a continuation retry", async () => {
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Quarantined summary must not park",
+        summaryUpdatedAt: new Date("2026-08-15T09:00:00.000Z"),
+        sourceTrust: { preset: LOW_TRUST_REVIEW_PRESET, disposition: "quarantined" },
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+    });
   });
 });
