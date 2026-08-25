@@ -14,6 +14,7 @@ export const RECOVERY_REASON_KINDS = {
 export const RECOVERY_KEY_PREFIXES = {
   issueGraphLivenessIncident: "harness_liveness",
   issueGraphLivenessLeaf: "harness_liveness_leaf",
+  issueGraphLivenessBoardEscalation: "harness_liveness_board",
   schedulerFailureHeartbeat: "scheduler-heartbeat",
 } as const;
 
@@ -67,6 +68,34 @@ export function buildIssueGraphLivenessLeafKey(input: {
     input.companyId,
     input.state,
     input.leafIssueId,
+  ].join(":");
+}
+
+/**
+ * BLO-24744: coalescing key for the ONE board card a liveness incident is allowed to raise.
+ *
+ * A liveness escalation is minted per *repair target* — `blocked_by_uninvokable_assignee` keys its
+ * incident on the blocker issue, so one paused agent holding N blocker issues mints N escalations,
+ * each legitimately distinct (each blocker needs its own re-home). Since BLO-25878 each of those
+ * status-only runs may file a `request_board_approval`, so without a shared key one pause raises N
+ * cards asking a human the same single question. Measured 2026-08-10: one manual pause of Release
+ * Engineer `c0bccc75` produced 3 escalations in ~53s.
+ *
+ * `rootCauseId` is therefore the thing a human actually decides about, not the leaf the detector
+ * happened to walk: the uninvokable agent when the state names one, else the repair-target issue.
+ * Callers that cannot identify an agent pass the issue and still coalesce repeat filings for that
+ * one incident across runs, which is strictly better than no key at all.
+ */
+export function buildIssueGraphLivenessBoardEscalationKey(input: {
+  companyId: string;
+  state: string;
+  rootCauseId: string;
+}) {
+  return [
+    RECOVERY_KEY_PREFIXES.issueGraphLivenessBoardEscalation,
+    input.companyId,
+    input.state,
+    input.rootCauseId,
   ].join(":");
 }
 
