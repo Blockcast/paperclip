@@ -519,6 +519,11 @@ describe("issue update comment wakeups", () => {
       .send({ status: "cancelled", comment: "cancelling as a duplicate" });
 
     expect(res.status).toBe(200);
+    // The wakeup block is a detached `void (async () => {...})` in the route, so the
+    // response resolves before it runs. Anchor on `findMentionedAgents`, which is called
+    // unconditionally *after* the assignee-wake decision inside that same IIFE — without
+    // it this negative assertion can pass simply by racing ahead of the code it guards.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
       ASSIGNEE_AGENT_ID,
       expect.objectContaining({ reason: "issue_commented" }),
@@ -550,6 +555,9 @@ describe("issue update comment wakeups", () => {
       .send({ status: "done", comment: "shipped, closing this out" });
 
     expect(res.status).toBe(200);
+    // See the note on the agent-closer case above: the negative assertion is only
+    // meaningful once the detached wakeup IIFE has passed the assignee-wake decision.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
       ASSIGNEE_AGENT_ID,
       expect.objectContaining({ reason: "issue_commented" }),
