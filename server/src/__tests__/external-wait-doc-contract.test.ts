@@ -26,10 +26,22 @@ function documentedSnippet(): string {
   const headingIndex = doc.indexOf(heading);
   expect(headingIndex, `"${heading}" is missing from doc/execution-semantics.md`).toBeGreaterThan(-1);
 
-  // First fenced block after the heading is the canonical syntax example.
-  const fence = doc.slice(headingIndex).match(/```\n([\s\S]*?)```/);
-  expect(fence?.[1], "no fenced syntax example under the external-wait heading").toBeTruthy();
-  return fence![1];
+  // Bound the search to this section: stop at the next heading of any level, so a fence
+  // added further down the document can never be picked up by mistake.
+  const rest = doc.slice(headingIndex + heading.length);
+  const nextHeading = rest.search(/\n#{1,6} /);
+  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+
+  // Take the fenced block that actually declares an external wait, rather than whichever
+  // fence happens to come first — an unrelated example added above it must not retarget
+  // this test onto text the matcher was never meant to accept.
+  const fences = [...section.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const snippet = fences.find((body) => /^\s*external owner\s*:/im.test(body));
+  expect(
+    snippet,
+    `no fenced example declaring "external owner:" under "${heading}"`,
+  ).toBeTruthy();
+  return snippet!;
 }
 
 describe("external-wait declaration: doc and matcher agree", () => {
