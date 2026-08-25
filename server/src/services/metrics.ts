@@ -1947,28 +1947,6 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
-export function setOverdueScheduledRetryAgeMetrics(
-  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
-  knownAgentIds: ReadonlySet<string>,
-): void {
-  const gauge = ensureRegistry().overdueScheduledRetryOldestAgeGauge;
-  gauge.reset();
-  const oldestByAgentId = new Map<string, number>();
-  for (const entry of entries) {
-    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
-    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
-    const current = oldestByAgentId.get(agentId);
-    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
-  }
-  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
-  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
-  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
-}
-
-export function setOverdueScheduledRetryAgeMetricsRefreshSuccess(success: boolean): void {
-  ensureRegistry().overdueScheduledRetryAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
-}
-
 /** Publish the maximum booked park horizon for each live scheduled retry. */
 export function setScheduledRetryParkHorizonMetrics(
   entries: ReadonlyArray<{ agentId: string | null | undefined; horizonSeconds: number }>,
