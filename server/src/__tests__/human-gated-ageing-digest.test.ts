@@ -386,6 +386,33 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect(rows[0]?.status).toBe("todo");
   });
 
+  it("reopens a cancelled digest row too, while aged issues remain", async () => {
+    // Deliberate deviation from the Dependabot precedent, where `cancelled` is a
+    // standing "stop re-adjudicating" lever. AC3 requires the digest to be
+    // refreshed if it was closed at all: an escalation that can be retired while
+    // the queue is still ageing is not an escalation. The config flag is the
+    // off-switch, not this row's status.
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-14", createdAt: daysAgo(40) });
+
+    const first = await humanGatedDigestTick(db, { now: NOW, companyId });
+    const digestId = first.outcomes[0]?.issueId as string;
+
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(issues.id, digestId));
+
+    const second = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(second.outcomes[0]?.action).toBe("reopened");
+    expect(second.outcomes[0]?.issueId).toBe(digestId);
+
+    const rows = await digestRow(companyId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("todo");
+    expect(rows[0]?.description ?? "").toContain("HGD-14");
+  });
+
   it("leaves a closed digest row closed when nothing is overdue", async () => {
     const { companyId } = await createCompany();
     await insertHumanGatedIssue({ companyId, identifier: "HGD-10", createdAt: daysAgo(40) });
