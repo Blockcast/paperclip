@@ -300,6 +300,7 @@ import {
   normalizeIsolationMode,
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
+  recordHeartbeatTimerSchedulerExclusion,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -791,6 +792,25 @@ export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
 export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
+
+/**
+ * Choose the durable reason for a timer wake that did not dispatch.
+ *
+ * A dependency-blocked wake is a deferral, not a terminal skip: the retry park
+ * is the evidence that the issue tree is holding the work. Check that marker
+ * before the other suppression fields so both the initial park and later
+ * coalesced parks retain the bounded operational classification instead of
+ * falling through to `other`.
+ */
+export function resolveHeartbeatTimerSchedulerExclusionReason(input: {
+  dependencyBlockedRetryAt: Date | null;
+  providerCapacityDeferred: boolean;
+  durableSkipReason: string | null;
+}): string | null {
+  if (input.dependencyBlockedRetryAt !== null) return "issue_tree_hold_active";
+  if (input.providerCapacityDeferred) return "provider_capacity_deferred";
+  return input.durableSkipReason;
+}
 
 function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
@@ -24833,7 +24853,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
       const runningAgent = await db
         .update(agents)
-        .set({ status: "running", updatedAt: new Date() })
+        .set({ status: "running", errorReason: null, updatedAt: new Date() })
         .where(and(eq(agents.id, agent.id), notInArray(agents.status, [...DIRECT_NON_INVOKABLE_STATUSES])))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -32343,6 +32363,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(eq(agents.id, agent.id));
       };
 
+      const writeTimerCircuitBreakerSkip = async (
+        agent: typeof agents.$inferSelect,
+        reason: "idle_circuit_breaker" | "adapter_failed_circuit_breaker",
+        evidence: Record<string, number>,
+      ) => {
+        await db.transaction(async (tx) => {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            source: "timer",
+            triggerDetail: "system",
+            reason,
+            payload: { heartbeatSkip: { reason, ...evidence } },
+            status: "skipped",
+            requestedByActorType: "system",
+            requestedByActorId: "heartbeat_scheduler",
+            finishedAt: now,
+          });
+          await tx
+            .update(agents)
+            .set({ lastHeartbeatAt: now, updatedAt: now })
+            .where(eq(agents.id, agent.id));
+        });
+      };
+
       const opencodeK8sAgentIds = allAgents
         .filter((agent) => agent.adapterType === "opencode_k8s")
         .map((agent) => agent.id);
@@ -32396,6 +32441,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const stateJson = parseObject(runtimeState?.stateJson);
           const consecutiveIdle = asNumber(stateJson.consecutiveTimerIdleRuns, 0);
           if (consecutiveIdle >= policy.idleAutoPauseAfter) {
+            await writeTimerCircuitBreakerSkip(agent, "idle_circuit_breaker", {
+              consecutiveIdle,
+              threshold: policy.idleAutoPauseAfter,
+            });
+            recordHeartbeatTimerSchedulerExclusion("idle_circuit_breaker");
             logger.debug(
               { agentId: agent.id, agentName: agent.name, consecutiveIdle, threshold: policy.idleAutoPauseAfter },
               "idle circuit breaker: skipping timer wakeup",
@@ -32414,6 +32464,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const stateJson = parseObject(runtimeState?.stateJson);
           const consecutiveFailed = asNumber(stateJson.consecutiveAdapterFailedRuns, 0);
           if (consecutiveFailed >= policy.adapterFailedAutoPauseAfter) {
+            await writeTimerCircuitBreakerSkip(agent, "adapter_failed_circuit_breaker", {
+              consecutiveFailed,
+              threshold: policy.adapterFailedAutoPauseAfter,
+            });
+            recordHeartbeatTimerSchedulerExclusion("adapter_failed_circuit_breaker");
             logger.warn(
               { agentId: agent.id, agentName: agent.name, consecutiveFailed, threshold: policy.adapterFailedAutoPauseAfter },
               "crashloop circuit breaker: skipping timer wakeup due to consecutive adapter_failed runs",
@@ -32425,6 +32480,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (agent.adapterType === "opencode_k8s" && !assignedLiveWorkAgentIds.has(agent.id)) {
           await writeNoInFlightWorkSkip(agent);
+          recordHeartbeatTimerSchedulerExclusion("no_in_flight_work");
           logger.info(
             { agentId: agent.id, agentName: agent.name, adapterType: agent.adapterType, skipped: "no_in_flight_work" },
             "opencode_k8s timer wakeup skipped because agent has no assigned live work",
@@ -32433,6 +32489,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
 
+        const suppression: WakeSuppressionOutcome = {
+          durableSkipReason: null,
+          providerCapacityDeferred: false,
+          dependencyBlockedRetryAt: null,
+        };
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
@@ -32444,9 +32505,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             reason: "interval_elapsed",
             now: now.toISOString(),
           },
-        });
-        if (run) enqueued += 1;
-        else skipped += 1;
+        }, suppression);
+        // A coalesced dependency-blocked wake returns the existing parked run,
+        // but it still did not dispatch work. Classify the suppression before
+        // treating a non-null return as an enqueue so the timer ledger and
+        // exclusion metric describe the same outcome for first and later parks.
+        if (run && suppression.dependencyBlockedRetryAt === null) enqueued += 1;
+        else {
+          recordHeartbeatTimerSchedulerExclusion(resolveHeartbeatTimerSchedulerExclusionReason(suppression));
+          skipped += 1;
+        }
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
