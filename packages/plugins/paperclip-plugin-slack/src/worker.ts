@@ -2255,7 +2255,17 @@ const plugin = definePlugin({
     // Native agent streaming output
     ctx.events.on("plugin.slack.agent-stream-chunk", async (event) => {
       const p = event.payload as Record<string, unknown>;
-      await handleAgentOutput(ctx, token, event.companyId, {
+      // Agent routing itself is credential-free, but this listener posts the
+      // resulting output to Slack. Resolve the delivering company's token at
+      // the side-effect boundary so a native session created for company B can
+      // never reuse the setup-time bootstrap token from company A.
+      const scope = await resolveInteractionScope(
+        ctx,
+        event.companyId,
+        "agent output",
+      );
+      if (!scope) return;
+      await handleAgentOutput(ctx, scope.token, event.companyId, {
         channel: String(p.channel ?? ""),
         threadTs: String(p.threadTs ?? ""),
         text: String(p.text ?? ""),
@@ -2268,7 +2278,15 @@ const plugin = definePlugin({
     // ACP output events (from cross-plugin)
     ctx.events.on(`plugin.paperclip-plugin-acp.output`, async (event) => {
       const p = event.payload as Record<string, unknown>;
-      await handleAgentOutput(ctx, token, event.companyId, {
+      // ACP output is also a Slack side effect; keep it on the same
+      // per-company credential path as native streaming output.
+      const scope = await resolveInteractionScope(
+        ctx,
+        event.companyId,
+        "agent output",
+      );
+      if (!scope) return;
+      await handleAgentOutput(ctx, scope.token, event.companyId, {
         channel: String(p.channel ?? ""),
         threadTs: String(p.threadTs ?? ""),
         text: String(p.text ?? ""),

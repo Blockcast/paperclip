@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import plugin from "../worker.js";
-import { WEBHOOK_KEYS } from "../constants.js";
+import { STATE_KEYS, WEBHOOK_KEYS } from "../constants.js";
 
 // BLO-21083: the scheduled-jobs fix (BLO-20959 / PR #974) resolved each
 // company's Slack config and token per job tick. It deliberately left the
@@ -844,6 +844,96 @@ describe("Slack thread-command router tenant scoping across a 1->2-company trans
     expect(
       storedState.get(`company:${COMPANY_B}:approval-pending-${APPROVAL_B_THREAD}`),
     ).toBeUndefined();
+  });
+
+  it("uses B's token for native agent output, then drops output after B is deconfigured", async () => {
+    const { ctx, fetchCalls, eventHandlers, storedState, companyConfigs } =
+      await bootSingleCompanyThenAddB();
+    const session = {
+      sessionId: "native-session-b",
+      agentId: "agent-b",
+      agentName: "agent-b",
+      agentDisplayName: "Agent B",
+      transport: "native" as const,
+      status: "active" as const,
+      spawnedAt: "2026-08-25T03:00:00.000Z",
+      lastActivityAt: "2026-08-25T03:00:00.000Z",
+    };
+    storedState.set(
+      `company:${COMPANY_B}:${STATE_KEYS.sessionRegistry(CHANNEL, THREAD_TS)}`,
+      [session],
+    );
+
+    const outputHandler = eventHandlers.get("plugin.slack.agent-stream-chunk");
+    expect(outputHandler).toBeDefined();
+
+    // The active native session belongs to B, while setup() still holds A's
+    // bootstrap token. Output must use B's current credential.
+    await outputHandler!({
+      companyId: COMPANY_B,
+      payload: {
+        channel: CHANNEL,
+        threadTs: THREAD_TS,
+        text: "hello from B",
+        agentName: "agent-b",
+        agentDisplayName: "Agent B",
+      },
+    });
+    expect(slackBearers(fetchCalls)).toEqual(["xoxb-b"]);
+    expect(slackBearers(fetchCalls)).not.toContain("xoxb-a");
+
+    // A later config removal must fail closed; it must not revive A's token.
+    delete companyConfigs[COMPANY_B];
+    await outputHandler!({
+      companyId: COMPANY_B,
+      payload: {
+        channel: CHANNEL,
+        threadTs: THREAD_TS,
+        text: "this must not be posted",
+        agentName: "agent-b",
+        agentDisplayName: "Agent B",
+      },
+    });
+    expect(slackBearers(fetchCalls)).toEqual(["xoxb-b"]);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("no stored config"),
+    );
+  });
+
+  it("uses the delivering company's token for ACP agent output", async () => {
+    const { fetchCalls, eventHandlers, storedState } =
+      await bootSingleCompanyThenAddB();
+    storedState.set(
+      `company:${COMPANY_B}:${STATE_KEYS.sessionRegistry(CHANNEL, THREAD_TS)}`,
+      [
+        {
+          sessionId: "acp-session-b",
+          agentId: "agent-b",
+          agentName: "agent-b",
+          agentDisplayName: "Agent B",
+          transport: "acp",
+          status: "active",
+          spawnedAt: "2026-08-25T03:00:00.000Z",
+          lastActivityAt: "2026-08-25T03:00:00.000Z",
+        },
+      ],
+    );
+
+    const outputHandler = eventHandlers.get("plugin.paperclip-plugin-acp.output");
+    expect(outputHandler).toBeDefined();
+    await outputHandler!({
+      companyId: COMPANY_B,
+      payload: {
+        channel: CHANNEL,
+        threadTs: THREAD_TS,
+        text: "ACP output from B",
+        agentName: "agent-b",
+        agentDisplayName: "Agent B",
+      },
+    });
+
+    expect(slackBearers(fetchCalls)).toEqual(["xoxb-b"]);
+    expect(slackBearers(fetchCalls)).not.toContain("xoxb-a");
   });
 
   // NOT a falsification case, deliberately: this one passes against the
