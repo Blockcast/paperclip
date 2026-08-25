@@ -14984,7 +14984,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // before the lock was held.
       const issueLock = issueId
         ? await tx
-          .select({ executionRunId: issues.executionRunId })
+          .select({
+            status: issues.status,
+            executionRunId: issues.executionRunId,
+          })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
           .for("update")
@@ -15005,7 +15008,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           suppressionReason: "pipeline_stage_exited" as const,
         };
       }
-      if (issueId && issueLock?.executionRunId !== lockedSourceRun.id) {
+      if (
+        issueId &&
+        (
+          !issueLock ||
+          TERMINAL_ISSUE_STATUSES.has(issueLock.status) ||
+          issueLock.executionRunId !== lockedSourceRun.id
+        )
+      ) {
         return {
           retryRun: null,
           created: false as const,
