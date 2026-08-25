@@ -1336,6 +1336,35 @@ describe("handleWebhook — resolved", () => {
       expect(mocks.issues.createComment).not.toHaveBeenCalled();
       expect(mocks.state.set).not.toHaveBeenCalled();
     });
+
+    it("re-reads the current holder instead of persisting an unknown marker", async () => {
+      const { ctx, mocks } = mkCtx();
+      mocks.issues.get
+        .mockResolvedValueOnce({
+          id: "issue-existing",
+          status: "in_progress",
+          checkoutRunId: null,
+          executionRunId: null,
+        })
+        .mockResolvedValueOnce({
+          id: "issue-existing",
+          status: "in_progress",
+          checkoutRunId: "new-holder-run",
+          executionRunId: null,
+        });
+
+      await resolveOnce(ctx, mocks, async () => {
+        throw lockConflict();
+      });
+
+      const body = String(mocks.issues.createComment.mock.calls[0]![1]);
+      expect(body).toContain("new-holder-run");
+      expect(body).not.toContain("unknown");
+      expect(mocks.state.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ cancelWithheldForRunId: "new-holder-run" }),
+      );
+    });
   });
 
   it("fails the delivery without marking resolved when issue cancellation fails", async () => {
