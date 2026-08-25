@@ -102,6 +102,12 @@ export interface Config {
   // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
   strandedBlockedIssueReconcilerEnabled: boolean;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
+  // to a durable, human-assigned issue refreshed in place each period. Worker-tier
+  // only, same rationale as the reconcilers above.
+  humanGatedDigestEnabled: boolean;
+  humanGatedDigestIntervalMinutes: number;
+  humanGatedDigestPeriodDays: number;
   // Approval-gate reconciler (BLO-29359): closes board approval cards whose
   // external GitHub gate has terminated, so an approver is never sent to a dead
   // run. Worker-tier only, same rationale as the PR reconciler.
@@ -623,6 +629,28 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
     "strandedBlockedIssueReconcilerIntervalMinutes",
   );
+  // Human-gated ageing digest (BLO-29420). Enabled by default, consistent with
+  // the reconcilers above: BLO-19130's escalation shipped inert and never fired
+  // once, so an opt-in flag would just be a second way to stay silent. The sweep
+  // maintains exactly one durable row per company and rewrites nothing when the
+  // rendered body is unchanged, so a default-on tick is close to free.
+  //
+  // Interval (6h) is deliberately shorter than the period (7d): the period
+  // decides what the digest *reports*, the interval decides how quickly a closed
+  // or stale row is repaired. Refreshes are in-place description writes, so a
+  // shorter interval costs no extra notifications.
+  const humanGatedDigestEnabled =
+    process.env.PAPERCLIP_HUMAN_GATED_DIGEST_ENABLED !== undefined
+      ? process.env.PAPERCLIP_HUMAN_GATED_DIGEST_ENABLED === "true"
+      : true;
+  const humanGatedDigestIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES) || 360,
+  );
+  const humanGatedDigestPeriodDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS) || 7,
+  );
   const approvalGateReconcilerEnabled =
     process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED === "true"
@@ -738,6 +766,9 @@ export function loadConfig(): Config {
     prReconcilerEnrichLoc,
     strandedBlockedIssueReconcilerEnabled,
     strandedBlockedIssueReconcilerIntervalMinutes,
+    humanGatedDigestEnabled,
+    humanGatedDigestIntervalMinutes,
+    humanGatedDigestPeriodDays,
     approvalGateReconcilerEnabled,
     approvalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
