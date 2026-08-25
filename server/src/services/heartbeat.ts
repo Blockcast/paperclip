@@ -19854,6 +19854,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         details: Record<string, unknown>;
       };
 
+  function parseTimestamp(value: string | null | undefined) {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : new Date(parsed);
+  }
+
+  // BLO-27639: the continuation park gate cancels a retry by reading the
+  // summary's `Next Action` text, but only an EXECUTING run can rewrite that
+  // text. A park-shaped summary that events have overtaken therefore wedges the
+  // continuation lineage shut permanently: every retry is cancelled
+  // pre-invocation (`startedAt: null`) on the strength of a statement no
+  // reachable code path can refresh. Measured on BLO-22293, where a summary
+  // written 2026-08-14T04:33Z kept cancelling retries for 41h after the CTO
+  // ruling that cleared the blocker.
+  //
+  // So the park is only honoured while the summary is still the most recent
+  // word on the issue. Anything newer supersedes it and the run is allowed
+  // through to act on it.
+  //
+  // Deliberately NOT `issues.lastActivityAt`: migration 0076 installs a BEFORE
+  // UPDATE trigger mirroring every `issues.updated_at` bump into it, including
+  // the run-finalization write that immediately follows the summary write. That
+  // would make every summary look stale and disable the gate outright,
+  // regressing the BLO-16146 / BLO-18643 churn fix.
+  //
+  // System-authored comments are excluded on purpose. They are notices *about*
+  // the stall (recovery takeovers, and this gate's own cancellation notice),
+  // not new instruction for the executor — counting them would let the gate's
+  // own comment unpark the next retry and disable itself.
+  async function isContinuationParkSuperseded(
+    companyId: string,
+    issueId: string,
+    summaryUpdatedAt: Date | null,
+  ): Promise<boolean> {
+    // An undateable summary cannot be shown to be current. Fail open: the
+    // deadlock is unrecoverable without an executing run, while a spurious
+    // execution is self-limiting — it rewrites the summary and the next gate
+    // decision is made on fresh data.
+    if (!summaryUpdatedAt) return true;
+
+    const newerComment = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, companyId),
+        eq(issueComments.issueId, issueId),
+        isNull(issueComments.deletedAt),
+        or(isNull(issueComments.authorType), ne(issueComments.authorType, "system")),
+        gt(issueComments.createdAt, summaryUpdatedAt),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (newerComment) return true;
+
+    const newerChange = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issueId),
+        gt(activityLog.createdAt, summaryUpdatedAt),
+        or(
+          eq(activityLog.action, "issue.blockers_updated"),
+          and(
+            eq(activityLog.action, "issue.updated"),
+            sql`${activityLog.details} ->> 'status' is not null`,
+          ),
+        ),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(newerChange);
+  }
+
   async function evaluateQueuedRunStaleness(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -19906,26 +19981,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       (wakeReason === "issue_continuation_needed" || retryReason === "issue_continuation_needed")
     ) {
       const queuedWake = parseObject(context.paperclipWake);
-      const queuedContinuationSummary =
-        readNonEmptyString(parseObject(context.paperclipContinuationSummary).body) ??
-        readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
-      const currentContinuationSummary = queuedContinuationSummary
-        ? null
-        : await getIssueContinuationSummaryDocument(db, issueId);
-      const continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
+      const queuedSummary = parseObject(context.paperclipContinuationSummary);
+      const queuedWakeSummary = parseObject(queuedWake.continuationSummary);
+      // BLO-27639: the live document wins over the queued snapshot. The
+      // snapshot is frozen when the run is enqueued, so a retry queued before
+      // an executor refreshed the summary would otherwise be judged against
+      // text that has already been replaced.
+      //
+      // The live body is redacted the same way the snapshot was on its way into
+      // the wake context. Without this, preferring the live document would both
+      // leak raw quarantined text into the run-event payload below and let a
+      // quarantined summary park a run that the snapshot path let through.
+      const liveContinuationSummary = await getIssueContinuationSummaryDocument(db, issueId);
+      const currentContinuationSummary = liveContinuationSummary
+        ? redactQuarantinedBodyForHigherTrust(liveContinuationSummary)
+        : null;
+      const continuationSummaryBody =
+        currentContinuationSummary?.body ??
+        readNonEmptyString(queuedSummary.body) ??
+        readNonEmptyString(queuedWakeSummary.body) ??
+        null;
+      const continuationSummaryUpdatedAt =
+        currentContinuationSummary?.updatedAt ??
+        parseTimestamp(readNonEmptyString(queuedSummary.updatedAt) ?? readNonEmptyString(queuedWakeSummary.updatedAt));
       if (continuationSummaryParksExecutor(continuationSummaryBody)) {
-        return {
-          stale: true,
-          errorCode: "issue_continuation_waiting_on_review",
-          reason:
-            "Cancelled because the continuation summary says the executor should wait for reviewer feedback or approval before more work starts",
-          details: {
-            issueId,
-            wakeReason,
-            retryReason,
-            nextAction: continuationSummaryBody,
-          },
-        };
+        const superseded = await isContinuationParkSuperseded(
+          run.companyId,
+          issueId,
+          continuationSummaryUpdatedAt,
+        );
+        if (!superseded) {
+          return {
+            stale: true,
+            errorCode: "issue_continuation_waiting_on_review",
+            reason:
+              "Cancelled because the continuation summary says the executor should wait for reviewer feedback or approval before more work starts",
+            details: {
+              issueId,
+              wakeReason,
+              retryReason,
+              nextAction: continuationSummaryBody,
+              continuationSummaryUpdatedAt: continuationSummaryUpdatedAt?.toISOString() ?? null,
+            },
+          };
+        }
+        // The park text has been overtaken by events. Let the run execute so it
+        // can act on them and rewrite the summary — the only code path that can.
       }
     }
 
@@ -20076,6 +20177,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: staleness.reason,
       payload: staleness.details,
     });
+
+    // BLO-27639: a continuation park was previously visible only in
+    // `/heartbeat-runs/{id}.resultJson`, so an agent reading the issue saw an
+    // `in_progress` row going silent with no stated cause. Surface it on the
+    // issue once per summary revision — keyed on the summary timestamp, so a
+    // refreshed summary that still parks says so again, while retries against
+    // the same summary stay quiet.
+    if (staleness.errorCode === "issue_continuation_waiting_on_review") {
+      const summaryUpdatedAt = readNonEmptyString(staleness.details.continuationSummaryUpdatedAt) ?? "unknown";
+      await issuesSvc.addComment(
+        issueId,
+        [
+          `Continuation retry \`${run.id}\` was cancelled before it started: the continuation summary`,
+          `(last written ${summaryUpdatedAt}) says executor work is waiting for reviewer feedback or approval.`,
+          "",
+          "Only an executing run can rewrite that summary, so this gate will keep cancelling continuation",
+          "retries until something newer lands on the issue — a non-system comment, a status change, or a",
+          "blocker-set change all release it.",
+        ].join("\n"),
+        { runId: run.id },
+        {
+          authorType: "system",
+          idempotencyKey: `continuation-park-gate:${issueId}:${summaryUpdatedAt}`,
+        },
+      ).catch(() => null);
+    }
 
     return cancelled;
   }
