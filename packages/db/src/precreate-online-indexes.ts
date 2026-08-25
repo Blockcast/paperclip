@@ -101,7 +101,21 @@ export async function ensureOnlineIndexPrerequisites(
   const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
   const results: OnlineIndexPrecreationResult[] = [];
   try {
+    // An empty database reports every migration as pending, but the base
+    // schema (including heartbeat_runs) is created by applyPendingMigrations.
+    // Do not attempt concurrent index DDL until its table exists.
+    const tables = await sql<{ tableName: string }[]>`
+      SELECT table_name AS "tableName"
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'
+    `;
+    const existingTables = new Set(tables.map(({ tableName }) => tableName));
     for (const prereq of applicable) {
+      if (!existingTables.has(prereq.table)) {
+        log(`${prereq.migration}: skipping ${prereq.indexName}; table ${prereq.table} does not exist yet`);
+        continue;
+      }
       results.push(await ensureOnlineIndex(sql, prereq, log));
     }
   } finally {
