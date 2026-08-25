@@ -69,4 +69,27 @@ describe("external-wait declaration: doc and matcher agree", () => {
     expect(externalWaitFromDescription("external owner: CTO")).toBeNull();
     expect(externalWaitFromDescription("external action: Approve the ruleset change")).toBeNull();
   });
+
+  it("rejects a value on the line below the key", () => {
+    // The doc requires each declaration "on a line of its own". The whitespace around
+    // the colon must therefore be horizontal only: `\s*` spans line terminators, which
+    // silently accepted a shape the doc calls invalid.
+    expect(
+      externalWaitFromDescription("external owner:\nCTO\nexternal action: Approve it"),
+    ).toBeNull();
+    expect(
+      externalWaitFromDescription("external owner: CTO\nexternal action:\nApprove it"),
+    ).toBeNull();
+  });
+
+  it("an empty key does not consume the following declaration", () => {
+    // Sharper consequence of the same defect: with a line-spanning `\s*`, an owner key
+    // left blank swallowed the *next* line, so this parsed as
+    // `{ owner: "external action: Approve it", action: "Approve it" }` — a successful
+    // parse carrying a garbage owner, which then reached the redaction path. A blank
+    // value is an incomplete declaration and must not match at all.
+    expect(
+      externalWaitFromDescription("external owner:\nexternal action: Approve it"),
+    ).toBeNull();
+  });
 });
