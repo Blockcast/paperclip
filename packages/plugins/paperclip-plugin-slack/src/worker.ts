@@ -1761,23 +1761,13 @@ const plugin = definePlugin({
       );
       return;
     }
-    // Signing secret for the in-process thread-message router below, which
-    // (like `token`/`config` in this closure) is still bootstrap-snapshot
-    // scoped — see the BLO-21083 follow-up note near `resolveInteractionScope`.
-    // The webhook entrypoint (`onWebhook`) resolves its own signing secret
-    // per delivery via `resolveCompanySigningSecret` and does not use this.
-    let routerSigningSecret: string | null = null;
-    if (config.slackSigningSecretRef) {
-      try {
-        routerSigningSecret = await ctx.secrets.resolve(
-          config.slackSigningSecretRef,
-        );
-      } catch {
-        ctx.logger.warn(
-          "Slack signing secret not configured — webhook signature verification disabled",
-        );
-      }
-    }
+    // BLO-29455: the thread-message router used to resolve a signing secret
+    // here, once, from the setup() snapshot. It now resolves the DELIVERING
+    // company's secret per event via `resolveCompanySigningSecret` — the same
+    // way `onWebhook` already did — so there is deliberately nothing left to
+    // resolve at setup time. Do not reintroduce a bootstrap-scoped secret:
+    // a plugin config change does not restart the worker, so any credential
+    // captured here outlives the tenancy it was resolved for.
 
     // =========================================================================
     // PHASE 1: Escalation - using 3-arg ctx.tools.register with ToolRunContext
@@ -2365,6 +2355,39 @@ const plugin = definePlugin({
         ? (p.files as Array<Record<string, unknown>>)
         : [];
       if (!channel || !threadTs) return;
+      // BLO-29455: resolved from THIS event's own company, never from the
+      // `token`/`config`/`routerSigningSecret` captured by setup(). That
+      // snapshot is only ever populated on a single-company install, and a
+      // plugin config change does NOT restart the worker (the host's restart
+      // path keys off a METHOD_NOT_IMPLEMENTED error the SDK never raises for
+      // a plugin without `onConfigChanged`). So on a 1->2-company transition
+      // the closure keeps company A's bot token AND A's approval allowlist
+      // while `event.companyId` is now B — a cross-tenant authorization
+      // defect, not just a wrong-credential one.
+      //
+      // Lazy + memoized: at most one config read and one secret resolution
+      // per event, and none at all for ordinary thread chatter that only
+      // routes to an agent. Same reasoning as handleReactionEvent, which
+      // defers resolution until it knows the message is an approval card.
+      let scopePromise: Promise<CompanyInteractionScope | null> | undefined;
+      const scopeFor = () =>
+        (scopePromise ??= resolveInteractionScope(
+          ctx,
+          event.companyId,
+          "thread message",
+        ));
+      // Only `kind === "secret"` yields a value: both "not configured" and
+      // "configured but unreadable" must leave the mutating-approval gate
+      // closed. Signature verification itself already happened in onWebhook
+      // against this same company's secret before the event was emitted.
+      let secretPromise: Promise<string | null> | undefined;
+      const signingSecretFor = () =>
+        (secretPromise ??= resolveCompanySigningSecret(
+          ctx,
+          event.companyId,
+        ).then((resolution) =>
+          resolution.kind === "secret" ? resolution.value : null,
+        ));
       // Phase 1 approval interactions: if this thread is an approval card,
       // parse !approve/!reject/!revise/!status and resolve commands, then stop
       // (don't fall through to agent routing for command replies).
@@ -2376,6 +2399,11 @@ const plugin = definePlugin({
       if (approvalId && text) {
         const parsed = parseThreadCommand(text);
         if (parsed.kind === "ignore") return;
+        // Every remaining branch posts to Slack, so the token is needed from
+        // here on. Refuse rather than fall back to another company's.
+        const scope = await scopeFor();
+        if (!scope) return;
+        const { config, token } = scope;
         if (parsed.kind === "usage") {
           await postMessage(ctx, token, channel, { text: parsed.message }, { threadTs });
           return;
@@ -2398,7 +2426,7 @@ const plugin = definePlugin({
             stateKey: STATE_KEYS.approvalPending(approvalId),
           });
           if (resolvedLock || pendingDecision) return;
-          if (!canProcessMutatingApprovalWebhook("freeform_revision", routerSigningSecret)) return;
+          if (!canProcessMutatingApprovalWebhook("freeform_revision", await signingSecretFor())) return;
           await requestRevision(ctx, token, {
             companyId: event.companyId,
             approvalId,
@@ -2435,7 +2463,7 @@ const plugin = definePlugin({
           return;
         }
         // parsed.kind === "decision"
-        if (!canProcessMutatingApprovalWebhook("thread_command", routerSigningSecret)) return;
+        if (!canProcessMutatingApprovalWebhook("thread_command", await signingSecretFor())) return;
         const slackUserId = p.slackUserId ? String(p.slackUserId) : "";
         if (!slackUserId || !isAuthorizedReactor(slackUserId, config)) {
           const text = slackUserId
@@ -2468,9 +2496,11 @@ const plugin = definePlugin({
         const fileId = String(file.id ?? "");
         const mimetype = String(file.mimetype ?? "");
         if (fileId && isMediaFile(mimetype)) {
+          const mediaScope = await scopeFor();
+          if (!mediaScope) break;
           await processMediaFile(
             ctx,
-            token,
+            mediaScope.token,
             event.companyId,
             fileId,
             channel,
@@ -2480,17 +2510,23 @@ const plugin = definePlugin({
       }
       // Phase 4: Check for custom commands
       if (text) {
-        const handled = await tryCustomCommand(
-          ctx,
-          token,
-          event.companyId,
-          channel,
-          threadTs,
-          text,
-        );
-        if (handled) return;
+        const commandScope = await scopeFor();
+        if (commandScope) {
+          const handled = await tryCustomCommand(
+            ctx,
+            commandScope.token,
+            event.companyId,
+            channel,
+            threadTs,
+            text,
+          );
+          if (handled) return;
+        }
       }
-      // Phase 2: Route to agent sessions
+      // Phase 2: Route to agent sessions. Deliberately NOT gated on a
+      // resolvable scope — this path posts nothing to Slack and needs no bot
+      // token, so a company with no Slack credential still gets its thread
+      // replies delivered to the agent session.
       if (text) {
         await routeMessageToAgent(
           ctx,
