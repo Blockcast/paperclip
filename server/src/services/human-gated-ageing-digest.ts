@@ -461,6 +461,20 @@ export async function deliverDigest(
     if (itemCount === 0) {
       return { companyId, issueId: null, identifier: null, action: "skipped_empty", itemCount };
     }
+    // KNOWN LIMITATION — single-replica-safe only, on the create path.
+    //
+    // Unlike the reconcilers this sweep is modelled on, the find-then-create
+    // below is not guarded by a uniqueness constraint, so two workers starting
+    // together could each miss the row and each create one. The worker
+    // StatefulSet runs `replicas: 1` today, so this is latent rather than live,
+    // and every subsequent tick is safe regardless: the find orders newest-first
+    // and refreshes a single row.
+    //
+    // The fix, when the worker tier scales out, is the Dependabot precedent: a
+    // partial unique index over the non-terminal rows (see
+    // `issues_active_dependabot_alert_uq`) plus 23505 handling that re-finds
+    // instead of throwing. That needs a migration, so it is deliberately not
+    // bundled into the wiring change.
     const ownerUserId = await resolveDigestOwnerUserId(db, companyId);
     if (!ownerUserId) {
       // A digest assigned to nobody is the inertness this issue is about, one
