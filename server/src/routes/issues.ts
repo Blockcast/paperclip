@@ -12082,7 +12082,18 @@ export function issueRoutes(
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        const skipAssigneeCommentWake = selfComment || isClosed;
+        // BLO-29821: this must read the POST-update status, not `isClosed` — which is
+        // `existing.status`, i.e. one write behind. A single PATCH that both closes the
+        // issue and posts the closing comment (`{status:"cancelled", comment:"..."}`)
+        // would otherwise slip past this guard and wake the assignee on an issue that is
+        // already terminal by the time the wake is claimed. `isClosed` itself stays
+        // pre-update on purpose: `reopened` above is defined in terms of it.
+        //
+        // Note this suppresses the ASSIGNEE wake only. The @-mention wakes below are
+        // deliberately left unscreened on terminal issues: a wake on work the assignee's
+        // own change just closed is waste, but a mention of a third party is a handoff
+        // and must still be delivered.
+        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
 
         if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
           addWakeup(assigneeId, {
