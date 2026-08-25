@@ -10,6 +10,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  externalRuntimeReservations,
   heartbeatRuns,
   projectWorkspaces,
   projects,
@@ -61,6 +62,7 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await db.delete(workspaceOperations);
+    await db.delete(externalRuntimeReservations);
     await db.delete(executionWorkspaces);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -155,7 +157,7 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
       providerRef: realized.worktreePath,
       metadata: { createdByRuntime: true, cleanupOwnerRunId: runId },
     });
-    return { companyId, projectId, projectWorkspaceId, executionWorkspaceId, runId, repoRoot, realized };
+    return { companyId, projectId, projectWorkspaceId, executionWorkspaceId, agentId, runId, repoRoot, realized };
   }
 
   it("removes and deregisters a clean per-run worktree after normal finalization", async () => {
@@ -280,5 +282,25 @@ describeEmbeddedPostgres("run-scoped execution workspace cleanup", () => {
     expect(secondSweep).toMatchObject({ selected: 1, claimed: 0, cleaned: 0, failed: 0 });
     await expect(firstSweep).resolves.toMatchObject({ selected: 1, claimed: 1, cleaned: 1, failed: 0 });
     await expect(fs.readFile(receiptPath, "utf8")).resolves.toBe("cleanup");
+  });
+
+  it("does not collect a terminal workspace while its external runtime reservation is active", async () => {
+    const fixture = await provisionPersistedWorkspace();
+    await db.insert(externalRuntimeReservations).values({
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      runId: fixture.runId,
+      slotId: 0,
+      state: "launched",
+      jobName: "paperclip-cleanup-test",
+      isolationMode: "run",
+      isolationKey: `run:${fixture.runId}`,
+    });
+
+    const result = await collectDueExecutionWorkspaces({ db, companyId: fixture.companyId });
+
+    expect(result).toMatchObject({ selected: 0, claimed: 0, cleaned: 0, failed: 0 });
+    await expect(fs.access(fixture.realized.cwd)).resolves.toBeUndefined();
   });
 });

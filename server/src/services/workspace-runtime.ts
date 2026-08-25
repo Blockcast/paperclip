@@ -4399,10 +4399,6 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
-  if (warnings.length > 0) {
-    return { cleanedPath: workspacePath, cleaned: false, warnings };
-  }
-
   const finalDirtyWarning = await inspectDirtyWorktree();
   if (finalDirtyWarning) {
     return { cleanedPath: workspacePath, cleaned: false, warnings: [finalDirtyWarning] };

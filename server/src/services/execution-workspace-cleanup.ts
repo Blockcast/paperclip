@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import {
   executionWorkspaces,
+  externalRuntimeReservations,
   heartbeatRuns,
   projectWorkspaces,
   projects,
@@ -99,8 +100,21 @@ async function markTerminalRunScopedWorkspacesEligible(input: { db: Db; companyI
   if (terminalOwnerRuns.length === 0) return 0;
 
   const terminalOwnerRunIds = new Set(terminalOwnerRuns.map((row) => row.id));
+  // A terminal DB row is not proof that an external worker has stopped. The
+  // reservation is released only after the runtime job is quiescent, so keep
+  // its workspace out of the destructive sweep while that reservation lives.
+  const activeReservations = await input.db
+    .select({ runId: externalRuntimeReservations.runId })
+    .from(externalRuntimeReservations)
+    .where(and(
+      inArray(externalRuntimeReservations.runId, [...terminalOwnerRunIds]),
+      isNull(externalRuntimeReservations.releasedAt),
+    ));
+  const externallyActiveRunIds = new Set(activeReservations.map((row) => row.runId));
   const ids = stampedRows
-    .filter((row) => row.cleanupOwnerRunId !== null && terminalOwnerRunIds.has(row.cleanupOwnerRunId))
+    .filter((row) => row.cleanupOwnerRunId !== null
+      && terminalOwnerRunIds.has(row.cleanupOwnerRunId)
+      && !externallyActiveRunIds.has(row.cleanupOwnerRunId))
     .map((row) => row.id);
   if (ids.length === 0) return 0;
   const updated = await input.db
