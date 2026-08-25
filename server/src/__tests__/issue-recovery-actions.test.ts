@@ -566,6 +566,89 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
+  it("does not refund a stale wake reservation after ownership or attempt changes", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stale-refund:fingerprint",
+      nextAction: "Restore a live execution path.",
+      maxAttempts: 5,
+    });
+
+    // A replacement owner can start a fresh sequence at the same count. The old
+    // failed wake must not debit that replacement sequence.
+    await db
+      .update(issueRecoveryActions)
+      .set({ ownerAgentId: coderId, attemptCount: 1 })
+      .where(eq(issueRecoveryActions.id, action.id));
+    await svc.releaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+    });
+
+    let [current] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(current).toMatchObject({ ownerAgentId: coderId, attemptCount: 1 });
+
+    // The owner can also remain the same while a newer reservation advances
+    // the counter. Its refund must not decrement the newer reservation.
+    await db
+      .update(issueRecoveryActions)
+      .set({ ownerAgentId: managerId, attemptCount: action.attemptCount + 1 })
+      .where(eq(issueRecoveryActions.id, action.id));
+    await svc.releaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+    });
+
+    [current] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(current).toMatchObject({ ownerAgentId: managerId, attemptCount: action.attemptCount + 1 });
+  });
+
+  it("refunds a wake reservation when owner and reserved attempt still match", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "matching-refund:fingerprint",
+      nextAction: "Restore a live execution path.",
+      maxAttempts: 5,
+    });
+
+    await svc.releaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+    });
+
+    const [current] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(current).toMatchObject({ ownerAgentId: managerId, attemptCount: 0 });
+  });
+
   it.each([
     ["job_missing", "in_progress"],
     ["job_missing", "todo"],
@@ -1311,12 +1394,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(finalIssue?.assigneeAgentId).toBe(newOwnerId);
   });
 
-  // BLO-20933 (review finding 2): `expectedCurrentAssigneeAgentId` is enforced by a THROWN
-  // 409, not a falsy return, and it fires after the action upsert and the owner wake have
-  // already committed. Unhandled, that throw escapes `reconcileStrandedAssignedIssues`'s
-  // per-issue loop (which has no try/catch) and leaves every remaining stranded issue in
-  // the batch unreconciled. The lost race must degrade to a skip for this one issue.
-  it("skips instead of throwing when the assignee changes mid-escalation", async () => {
+  // Recovery dispatch is post-commit. A reassignment performed by the injected
+  // wake therefore cannot race the transactional issue UPDATE or be overwritten.
+  it("keeps a post-commit reassignment from being overwritten by recovery", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const raceWinnerId = randomUUID();
     await db.insert(agents).values({
@@ -1331,8 +1411,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    // The injected wake runs after the lock-fresh read and before the source-issue UPDATE,
-    // so mutating the assignee here reproduces the lost race deterministically.
+    // The injected wake runs only after the transaction has committed, matching
+    // the production dispatch ordering.
     const enqueueWakeup = vi.fn<
       (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
     >(async () => {
@@ -1360,10 +1440,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       comment: "Automatic continuation recovery failed.",
     })).resolves.not.toThrow();
 
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
     // The reassignment stands; recovery did not clobber it back to the manager.
     const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(finalIssue?.assigneeAgentId).toBe(raceWinnerId);
-    expect(finalIssue?.status).toBe("in_progress");
+    expect(finalIssue?.status).toBe("blocked");
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
   });
 
   // BLO-20933: the regex used to also match the bare words `eviction`, `preempt(ion|ed)`,
@@ -3915,13 +3997,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  it("lets a synchronously claimed source-scoped wake reopen the source issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     // The wake is CLAIMED here — the fixture picks the issue up synchronously — so it is a
-    // delivered wake and must return the queued run. Returning null would model a
-    // non-delivery, which is refunded and spends no budget (BLO-18996 follow-up), and the
-    // `attemptCount: 2` below would then read 0.
+    // delivered wake and must return the queued run. Recovery commits the blocked transition
+    // before dispatching this post-commit wake; the claimed wake then legitimately reopens the
+    // source issue for execution. Returning null would model a non-delivery, which is refunded
+    // and spends no budget (BLO-18996 follow-up), and the `attemptCount: 2` below would then read 0.
     const enqueueWakeup = vi.fn(async () => {
       await db
         .update(issues)
@@ -3951,7 +4034,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    expect(afterFirst?.status).toBe("in_progress");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
 
     const secondLatestRun = {
@@ -3980,7 +4063,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    expect(afterSecond?.status).toBe("in_progress");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);

@@ -76,6 +76,7 @@ import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import {
   checkoutRestoreStatusExpression,
+  lockIssueOwnership,
   restoreCheckoutPromotedStatus,
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
@@ -950,6 +951,23 @@ type IssueUserContextInput = {
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+/**
+ * Serialize mutations to the issue parent/blocker graph for one company.
+ *
+ * Graph writers must take this advisory lock before locking any issue rows so
+ * parent, blocker, and combined updates share one lock order. Recovery uses
+ * the same boundary while it derives a blocker set that it will immediately
+ * persist.
+ */
+export async function lockIssueParentMutationCompany(
+  companyId: string,
+  dbOrTx: Pick<Db, "execute">,
+): Promise<void> {
+  await dbOrTx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
+  );
+}
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -5172,6 +5190,10 @@ export function issueService(db: Db) {
     ) => Promise<T>,
   ) {
     return db.transaction(async (tx) => {
+      // Ownership arbitration must precede every row/relationship lock. The
+      // recovery sweep holds this same transaction-scoped lock while it
+      // performs its dependent mutations on pooled connections.
+      await lockIssueOwnership(tx, companyId, issueId);
       await lockIssueBlockerRelations(tx, companyId, issueId);
       const currentBlockerIssueIds = await tx
         .select({ id: issueRelations.issueId })
@@ -5745,12 +5767,6 @@ export function issueService(db: Db) {
     }
   }
 
-  async function lockIssueParentMutationCompany(companyId: string, dbOrTx: any = db) {
-    await dbOrTx.execute(
-      sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
-    );
-  }
-
   async function assertValidIssueParent(
     companyId: string,
     issueId: string,
@@ -6209,6 +6225,7 @@ export function issueService(db: Db) {
     }))) return null;
 
     return db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, input.companyId, input.issueId);
       const lockedIssue = await tx
         .select({
           id: issues.id,
@@ -6281,11 +6298,13 @@ export function issueService(db: Db) {
 
   async function adoptStaleCheckoutRun(input: {
     issueId: string;
+    companyId: string;
     actorAgentId: string;
     actorRunId: string;
     expectedCheckoutRunId: string;
   }) {
     const result = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, input.companyId, input.issueId);
       const lockedIssue = await tx
         .select({
           id: issues.id,
@@ -6441,10 +6460,12 @@ export function issueService(db: Db) {
 
   async function adoptUnownedCheckoutRun(input: {
     issueId: string;
+    companyId: string;
     actorAgentId: string;
     actorRunId: string;
   }) {
     const adopted = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, input.companyId, input.issueId);
       const lockedIssue = await tx
         .select({
           id: issues.id,
@@ -6620,139 +6641,281 @@ export function issueService(db: Db) {
     };
   }
 
-  async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+  type TerminalIssueRunCleanupMode = "execution" | "checkout" | "both";
+
+  async function withIssueOwnershipTransaction<T>(
+    issueId: string,
+    onMissing: T,
+    operation: (tx: DbTransaction, companyId: string) => Promise<T>,
+  ): Promise<T> {
     return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
-      );
-      const issue = await tx
-        .select({ executionRunId: issues.executionRunId, companyId: issues.companyId })
+      // Read the immutable company scope before taking the row lock. Every
+      // ownership writer acquires the advisory key before its issue row lock;
+      // doing the same here prevents the cleanup/adoption deadlock where one
+      // path holds the row while waiting for the key and the other holds the
+      // key while waiting for the row.
+      const [identity] = await tx
+        .select({ companyId: issues.companyId })
         .from(issues)
         .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue?.executionRunId) return false;
-
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
-      );
-      const run = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.executionRunId))
-        .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
-
-      const updated = await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issueId),
-            eq(issues.executionRunId, issue.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
-
-      if (updated) {
-        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
-      }
-
-      return Boolean(updated);
+        .limit(1);
+      if (!identity) return onMissing;
+      await lockIssueOwnership(tx, identity.companyId, issueId);
+      return operation(tx, identity.companyId);
     });
   }
 
-  async function clearStaleExecutionLock(input: {
+  /**
+   * Clear terminal ownership while the issue arbitration lock is held.
+   *
+   * `checkout` cleanup deliberately clears the bundled execution columns too,
+   * preserving the historical all-or-nothing behavior of
+   * clearCheckoutRunIfTerminal. `both` is the old execution-then-checkout pair
+   * evaluated in one transaction, so a competing adopter cannot commit in the
+   * gap between the two cleanup statements.
+   */
+  async function clearTerminalIssueRunLocksInTx(
+    tx: DbTransaction,
+    issueId: string,
+    mode: TerminalIssueRunCleanupMode,
+    companyId: string,
+  ): Promise<boolean> {
+    const [issue] = await tx
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        companyId: issues.companyId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .limit(1)
+      .for("update");
+    if (!issue) return false;
+
+    const ownerRunIds = [...new Set([
+      issue.checkoutRunId,
+      issue.executionRunId,
+    ].filter((runId): runId is string => Boolean(runId)))].sort();
+    const ownerRuns = ownerRunIds.length > 0
+      ? await tx
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, ownerRunIds))
+          .orderBy(asc(heartbeatRuns.id))
+          .for("update")
+      : [];
+    const runById = new Map(ownerRuns.map((run) => [run.id, run]));
+    const executionRun = issue.executionRunId
+      ? runById.get(issue.executionRunId) ?? null
+      : null;
+    const checkoutRun = issue.checkoutRunId
+      ? runById.get(issue.checkoutRunId) ?? null
+      : null;
+    const executionTerminal = Boolean(issue.executionRunId) && (
+      !executionRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)
+    );
+    const checkoutTerminal = Boolean(issue.checkoutRunId) && (
+      !checkoutRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status)
+    );
+
+    const clearExecution = (mode === "execution" || mode === "both") && executionTerminal;
+    const clearCheckout = (mode === "checkout" || mode === "both") &&
+      checkoutTerminal &&
+      (!issue.executionRunId || issue.executionRunId === issue.checkoutRunId || executionTerminal);
+    // A checkout cleanup historically clears the execution columns as part of
+    // the same mutation, even when executionRunId is already NULL.
+    const clearExecutionColumns = clearExecution || clearCheckout;
+    if (!clearExecutionColumns && !clearCheckout) return false;
+
+    const patch: Partial<typeof issues.$inferInsert> = { updatedAt: new Date() };
+    if (clearCheckout) patch.checkoutRunId = null;
+    if (clearExecutionColumns) {
+      patch.executionRunId = null;
+      patch.executionAgentNameKey = null;
+      patch.executionLockedAt = null;
+    }
+
+    const conditions = [eq(issues.id, issueId), eq(issues.companyId, companyId)];
+    if (clearCheckout) {
+      conditions.push(
+        issue.checkoutRunId
+          ? eq(issues.checkoutRunId, issue.checkoutRunId)
+          : isNull(issues.checkoutRunId),
+      );
+    }
+    if (clearExecutionColumns) {
+      conditions.push(
+        issue.executionRunId
+          ? eq(issues.executionRunId, issue.executionRunId)
+          : isNull(issues.executionRunId),
+      );
+    }
+
+    const updated = await tx
+      .update(issues)
+      .set(patch)
+      .where(and(...conditions))
+      .returning({ id: issues.id })
+      .then((rows) => rows[0] ?? null);
+    if (updated) {
+      await restoreCheckoutPromotedStatus(tx, { issueId, companyId });
+    }
+    return Boolean(updated);
+  }
+
+  async function clearTerminalIssueRunLocks(
+    issueId: string,
+    mode: TerminalIssueRunCleanupMode,
+  ): Promise<boolean> {
+    return withIssueOwnershipTransaction(issueId, false, (tx, companyId) =>
+      clearTerminalIssueRunLocksInTx(tx, issueId, mode, companyId));
+  }
+
+  async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+    return clearTerminalIssueRunLocks(issueId, "execution");
+  }
+
+  // Used by checkout/ownership assertions that historically called the two
+  // cleanup helpers back-to-back. Keep the pair in one transaction so an
+  // adopter cannot commit between the execution and checkout cleanup passes.
+  async function clearTerminalIssueRunLocksPair(issueId: string): Promise<boolean> {
+    return clearTerminalIssueRunLocks(issueId, "both");
+  }
+
+  type StaleExecutionLockInput = {
     issueId: string;
+    companyId: string;
     expectedCheckoutRunId: string | null;
     expectedExecutionRunId: string;
     actorRunId: string | null;
-  }) {
+  };
+
+  async function clearStaleExecutionLockInTx(
+    tx: DbTransaction,
+    input: StaleExecutionLockInput,
+  ): Promise<boolean> {
     // BLO-20321: reap never-started (`queued` / `scheduled_retry`) owners as well
     // as terminal ones. Callers re-acquire the lock and then run
     // cancelStaleIssueContextRuns(keepRunId: <actor run>), which cancels the
     // superseded run — so it cannot start later against a status the assignee has
     // since changed.
-    return db.transaction(async (tx) => {
-      const issue = await tx
-        .select({
+    const [issue] = await tx
+      .select({
+        companyId: issues.companyId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+      .for("update")
+      .limit(1);
+    if (
+      !issue ||
+      issue.executionRunId !== input.expectedExecutionRunId ||
+      issue.checkoutRunId !== input.expectedCheckoutRunId
+    ) return false;
+
+    const ownerRunIds = [...new Set([
+      input.expectedExecutionRunId,
+      input.expectedCheckoutRunId,
+    ].filter((runId): runId is string => Boolean(runId)))].sort();
+    const ownerRuns = await tx
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+      })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, ownerRunIds))
+      .orderBy(asc(heartbeatRuns.id))
+      .for("update");
+    const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+    const executionOwnerRun = ownerRunById.get(input.expectedExecutionRunId) ?? null;
+    const distinctCheckoutOwnerId = input.expectedCheckoutRunId !== null &&
+      input.expectedCheckoutRunId !== input.actorRunId &&
+      input.expectedCheckoutRunId !== input.expectedExecutionRunId
+        ? input.expectedCheckoutRunId
+        : null;
+    const distinctCheckoutOwnerRun = distinctCheckoutOwnerId
+      ? ownerRunById.get(distinctCheckoutOwnerId) ?? null
+      : null;
+    if (distinctCheckoutOwnerId && !isReapableHeartbeatRunRow(distinctCheckoutOwnerRun)) {
+      return false;
+    }
+
+    const cancellation = {
+      reason: "Cancelled because the stale issue execution lock was released",
+      errorCode: "issue_execution_lock_reaped",
+    };
+    if (
+      !(await cancelNeverStartedOwnerRun(tx, executionOwnerRun, cancellation)) ||
+      (distinctCheckoutOwnerId &&
+        !(await cancelNeverStartedOwnerRun(tx, distinctCheckoutOwnerRun, cancellation)))
+    ) return false;
+
+    const cleared = await tx
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(issues.id, input.issueId),
+          eq(issues.companyId, input.companyId),
+          eq(issues.executionRunId, input.expectedExecutionRunId),
+          input.expectedCheckoutRunId
+            ? eq(issues.checkoutRunId, input.expectedCheckoutRunId)
+            : isNull(issues.checkoutRunId),
+        ),
+      )
+      .returning({ id: issues.id })
+      .then((rows) => rows[0] ?? null);
+
+    return cleared != null;
+  }
+
+  async function clearStaleExecutionLock(input: StaleExecutionLockInput): Promise<boolean> {
+    return withIssueOwnershipTransaction(input.issueId, false, (tx) =>
+      clearStaleExecutionLockInTx(tx, input));
+  }
+
+  async function adoptStaleExecutionLock(input: StaleExecutionLockInput & { actorAgentId: string }) {
+    return withIssueOwnershipTransaction(input.issueId, null, async (tx) => {
+      const cleared = await clearStaleExecutionLockInTx(tx, input);
+      if (!cleared) return null;
+
+      return tx
+        .update(issues)
+        .set({
+          checkoutRunId: input.actorRunId,
+          executionRunId: input.actorRunId,
+          executionLockedAt: new Date(),
+          checkoutRestoreStatus: checkoutRestoreStatusExpression,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(issues.id, input.issueId),
+          eq(issues.companyId, input.companyId),
+          eq(issues.status, "in_progress"),
+          eq(issues.assigneeAgentId, input.actorAgentId),
+          isNull(issues.executionRunId),
+          input.expectedCheckoutRunId
+            ? eq(issues.checkoutRunId, input.expectedCheckoutRunId)
+            : isNull(issues.checkoutRunId),
+        ))
+        .returning({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
         })
-        .from(issues)
-        .where(eq(issues.id, input.issueId))
-        .for("update")
         .then((rows) => rows[0] ?? null);
-      if (
-        issue?.executionRunId !== input.expectedExecutionRunId ||
-        issue.checkoutRunId !== input.expectedCheckoutRunId
-      ) return false;
-
-      const ownerRunIds = [...new Set([
-        input.expectedExecutionRunId,
-        input.expectedCheckoutRunId,
-      ].filter((runId): runId is string => Boolean(runId)))].sort();
-      const ownerRuns = await tx
-        .select({
-          id: heartbeatRuns.id,
-          status: heartbeatRuns.status,
-          startedAt: heartbeatRuns.startedAt,
-          wakeupRequestId: heartbeatRuns.wakeupRequestId,
-        })
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.id, ownerRunIds))
-        .orderBy(asc(heartbeatRuns.id))
-        .for("update")
-      const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
-      const executionOwnerRun = ownerRunById.get(input.expectedExecutionRunId) ?? null;
-      const distinctCheckoutOwnerId = input.expectedCheckoutRunId !== null &&
-        input.expectedCheckoutRunId !== input.actorRunId &&
-        input.expectedCheckoutRunId !== input.expectedExecutionRunId
-          ? input.expectedCheckoutRunId
-          : null;
-      const distinctCheckoutOwnerRun = distinctCheckoutOwnerId
-        ? ownerRunById.get(distinctCheckoutOwnerId) ?? null
-        : null;
-      if (distinctCheckoutOwnerId && !isReapableHeartbeatRunRow(distinctCheckoutOwnerRun)) {
-        return false;
-      }
-
-      const cancellation = {
-        reason: "Cancelled because the stale issue execution lock was released",
-        errorCode: "issue_execution_lock_reaped",
-      };
-      if (
-        !(await cancelNeverStartedOwnerRun(tx, executionOwnerRun, cancellation)) ||
-        (distinctCheckoutOwnerId &&
-          !(await cancelNeverStartedOwnerRun(tx, distinctCheckoutOwnerRun, cancellation)))
-      ) return false;
-
-      const cleared = await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, input.issueId),
-            eq(issues.executionRunId, input.expectedExecutionRunId),
-            input.expectedCheckoutRunId
-              ? eq(issues.checkoutRunId, input.expectedCheckoutRunId)
-              : isNull(issues.checkoutRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
-
-      return cleared != null;
     });
   }
 
@@ -6812,70 +6975,7 @@ export function issueService(db: Db) {
   // precondition: a terminal run holds no real claim regardless of who is
   // assigned or what status the issue is currently in.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
-    return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
-      );
-      const issue = await tx
-        .select({
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-          companyId: issues.companyId,
-        })
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue?.checkoutRunId) return false;
-
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
-      );
-      const run = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.checkoutRunId))
-        .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
-
-      if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
-        await tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
-        );
-        const executionRun = await tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, issue.executionRunId))
-          .then((rows) => rows[0] ?? null);
-        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
-      }
-
-      const updated = await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issueId),
-            eq(issues.checkoutRunId, issue.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
-
-      if (updated) {
-        await restoreCheckoutPromotedStatus(tx, { issueId, companyId: issue.companyId });
-      }
-
-      return Boolean(updated);
-    });
+    return clearTerminalIssueRunLocks(issueId, "checkout");
   }
 
   // BLO-27572: `update` needs `addComment` to post the routine cancellation
@@ -10624,8 +10724,7 @@ export function issueService(db: Db) {
         });
       }
 
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
+      await clearTerminalIssueRunLocksPair(id);
 
       if (checkoutRunId) {
         const routineLockOwner = await findOpenRoutineExecutionLockOwnerForIssue(db, issueCompany.companyId, id);
@@ -10838,6 +10937,7 @@ export function issueService(db: Db) {
       ) {
         const staleAdoption = await adoptStaleCheckoutRun({
           issueId: id,
+          companyId: issueCompany.companyId,
           actorAgentId: agentId,
           actorRunId: checkoutRunId,
           expectedCheckoutRunId: current.checkoutRunId,
@@ -10952,6 +11052,7 @@ export function issueService(db: Db) {
       ) {
         const cleared = await clearStaleExecutionLock({
           issueId: id,
+          companyId: issueCompany.companyId,
           expectedCheckoutRunId: current.checkoutRunId,
           expectedExecutionRunId: current.executionRunId,
           actorRunId: checkoutRunId,
@@ -11019,8 +11120,7 @@ export function issueService(db: Db) {
       actorAgentId: string,
       actorRunId: string | null,
     ) => {
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
+      await clearTerminalIssueRunLocksPair(id);
       const loadCurrent = () =>
         db
           .select({
@@ -11086,6 +11186,7 @@ export function issueService(db: Db) {
         if (canAdoptUnownedCheckout(candidate)) {
           const adopted = await adoptUnownedCheckoutRun({
             issueId: id,
+            companyId: candidate.companyId,
             actorAgentId,
             actorRunId: actorRunId!,
           });
@@ -11111,6 +11212,7 @@ export function issueService(db: Db) {
           const previousCheckoutRunId = candidate.checkoutRunId;
           const staleAdoption = await adoptStaleCheckoutRun({
             issueId: id,
+            companyId: candidate.companyId,
             actorAgentId,
             actorRunId,
             expectedCheckoutRunId: previousCheckoutRunId,
@@ -11215,6 +11317,7 @@ export function issueService(db: Db) {
       ) {
         const staleAdoption = await adoptStaleCheckoutRun({
           issueId: id,
+          companyId: current.companyId,
           actorAgentId,
           actorRunId,
           expectedCheckoutRunId: current.checkoutRunId,
@@ -11252,52 +11355,23 @@ export function issueService(db: Db) {
         current.executionRunId &&
         current.executionRunId !== actorRunId
       ) {
-        const cleared = await clearStaleExecutionLock({
+        const adopted = await adoptStaleExecutionLock({
           issueId: id,
+          companyId: current.companyId,
           expectedCheckoutRunId: current.checkoutRunId,
           expectedExecutionRunId: current.executionRunId,
           actorRunId,
+          actorAgentId,
         });
-        if (cleared) {
-          const refreshed = await db
-            .update(issues)
-            .set({
-              checkoutRunId: actorRunId,
-              executionRunId: actorRunId,
-              executionLockedAt: new Date(),
-              checkoutRestoreStatus: checkoutRestoreStatusExpression,
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(issues.id, id),
-                eq(issues.status, "in_progress"),
-                eq(issues.assigneeAgentId, actorAgentId),
-                isNull(issues.executionRunId),
-                current.checkoutRunId
-                  ? eq(issues.checkoutRunId, current.checkoutRunId)
-                  : isNull(issues.checkoutRunId),
-              ),
-            )
-            .returning({
-              id: issues.id,
-              companyId: issues.companyId,
-              status: issues.status,
-              assigneeAgentId: issues.assigneeAgentId,
-              checkoutRunId: issues.checkoutRunId,
-              executionRunId: issues.executionRunId,
-            })
-            .then((rows) => rows[0] ?? null);
-          if (refreshed) {
-            await cancelStaleIssueContextRuns({
-              companyId: refreshed.companyId,
-              issueId: refreshed.id,
-              keepRunId: actorRunId,
-              reason: "Cancelled because the stale issue execution lock was adopted by the current run",
-              errorCode: "issue_execution_lock_adopted",
-            });
-            return { ...refreshed, adoptedFromRunId: current.executionRunId };
-          }
+        if (adopted) {
+          await cancelStaleIssueContextRuns({
+            companyId: adopted.companyId,
+            issueId: adopted.id,
+            keepRunId: actorRunId,
+            reason: "Cancelled because the stale issue execution lock was adopted by the current run",
+            errorCode: "issue_execution_lock_adopted",
+          });
+          return { ...adopted, adoptedFromRunId: current.executionRunId };
         }
       }
 
@@ -11329,8 +11403,7 @@ export function issueService(db: Db) {
       actorAgentId: string,
       actorRunId: string | null,
     ) => {
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
+      await clearTerminalIssueRunLocksPair(id);
       const current = await db
         .select({
           id: issues.id,

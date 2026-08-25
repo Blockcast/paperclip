@@ -318,9 +318,12 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
 } from "./issue-execution-lock.js";
 import {
+  issueLockOwnerStateMatches,
+  lockIssueOwnership,
   releaseIssueRunOwnership,
   restoreCheckoutPromotedStatus,
   restoreCheckoutPromotedStatuses,
+  type IssueLockOwnerState,
 } from "./issue-checkout-status.js";
 import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
@@ -3908,6 +3911,7 @@ interface WakeupOptions {
   contextSnapshot?: Record<string, unknown>;
   retryOfRunId?: string | null;
   scheduledRetryAttempt?: number;
+  expectedLockOwnerState?: IssueLockOwnerState | null;
 }
 
 type UsageTotals = {
@@ -29751,8 +29755,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const writeSkippedRequest = async (
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
+      dbOrTx: Db | DbTransaction = db,
     ) => {
-      await db.insert(agentWakeupRequests).values({
+      await dbOrTx.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
         source,
@@ -30293,6 +30298,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await options.beforeIssueWakeLockForTest?.({ issueId, agentId });
       const outcome = await db.transaction(async (tx) => {
+        await lockIssueOwnership(tx, agent.companyId, issueId);
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
@@ -30312,6 +30318,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // BLO-19063: needed to resolve the same workspaceStrategy overlay the
             // scheduling path applies, so both agree on `per_run`.
             assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+            checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
             createdAt: issues.createdAt,
@@ -30334,6 +30341,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
+          return { kind: "skipped" as const };
+        }
+
+        if (
+          opts.expectedLockOwnerState &&
+          !issueLockOwnerStateMatches(opts.expectedLockOwnerState, {
+            executionRunId: issue.executionRunId,
+            checkoutRunId: issue.checkoutRunId,
+            assigneeAgentId: issue.assigneeAgentId,
+          })
+        ) {
+          await writeSkippedRequest("issue_execution_ownership_changed", {}, tx);
           return { kind: "skipped" as const };
         }
 
