@@ -24,6 +24,7 @@ import {
   createDb,
   heartbeatRuns,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -128,6 +129,7 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
     assigneeAgentId: string | null;
     status?: string;
     title?: string;
+    projectId?: string | null;
   }): Promise<string> {
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -137,6 +139,7 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
       status: input.status ?? "in_progress",
       priority: "high",
       assigneeAgentId: input.assigneeAgentId,
+      projectId: input.projectId ?? null,
     });
     return issueId;
   }
@@ -149,6 +152,8 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
     companyId: string;
     agentId: string;
     issueId?: string | null;
+    /** Overrides the snapshot entirely, for shapes the happy path never writes. */
+    contextSnapshot?: Record<string, unknown>;
   }): Promise<string> {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -161,9 +166,9 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
       errorCode: "provider_quota_exhausted",
       startedAt: new Date(),
       finishedAt: new Date(),
-      contextSnapshot: input.issueId
-        ? { issueId: input.issueId, taskId: input.issueId }
-        : {},
+      contextSnapshot:
+        input.contextSnapshot ??
+        (input.issueId ? { issueId: input.issueId, taskId: input.issueId } : {}),
     });
     return runId;
   }
@@ -311,5 +316,86 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
     // Waking an agent onto work it no longer owns is exactly the second-writer
     // shape this issue exists to remove.
     expect(recovered[0]?.contextIssueId).toBeNull();
+  });
+
+  it("still wakes — unscoped — when the scope itself trips project budget suppression", async () => {
+    const { companyId, agentId } = await seedAgent();
+    // A project paused for budget makes `budgets.getInvocationBlock` return a
+    // block, which `enqueueWakeup` turns into a thrown conflict. Crucially this
+    // gate is only REACHABLE once an issueId is attached: projectId is derived
+    // from the issue, and getInvocationBlock early-returns null on a falsy
+    // candidateProjectId. So this suppression is one the pre-fix unscoped wake
+    // could never hit — it is a hazard introduced by scoping.
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paused for budget",
+      status: "active",
+      pauseReason: "budget",
+      pausedAt: new Date(),
+    });
+    const issueId = await seedIssue({
+      companyId,
+      assigneeAgentId: agentId,
+      projectId,
+      title: "Work inside a budget-paused project",
+    });
+    const runId = await seedParkedRun({ companyId, agentId, issueId });
+
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    await heartbeat.finalizeAgentStatus(agentId, "failed", "quota", {
+      errorCode: "provider_quota_exhausted",
+      runId,
+    });
+
+    const recovered = await waitForRecoveryRuns(agentId, 1);
+    // The regression this guards: without the unscoped retry the scoped wake
+    // throws, the catch logs a warn, and the agent NEVER WAKES — strictly worse
+    // than pre-fix, where it woke unscoped and could work another project's
+    // issue. Waking is the invariant; the scope is only the optimization.
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.contextIssueId).toBeNull();
+  });
+
+  it("resolves an identifier-form context snapshot instead of silently dropping the scope", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const issueId = await seedIssue({
+      companyId,
+      assigneeAgentId: agentId,
+      title: "Parked with an identifier-shaped scope",
+    });
+    // `issueIdFromRunContext` returns `contextSnapshot.issueId ?? .taskId`
+    // verbatim, and canonicalization to a UUID inside `enqueueWakeup` is
+    // conditional, so an identifier can genuinely reach the resolver. issues.id
+    // is a Postgres uuid column: feeding it "BLO-123" raises invalid-input-
+    // syntax (22P02), which the resolver's catch would swallow — silently
+    // reverting to the unscoped fan-in behaviour this PR exists to remove.
+    const identifier = "QRWS-4711";
+    await db.update(issues).set({ identifier }).where(eq(issues.id, issueId));
+    const runId = await seedParkedRun({
+      companyId,
+      agentId,
+      contextSnapshot: { issueId: identifier, taskId: identifier },
+    });
+
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    await heartbeat.finalizeAgentStatus(agentId, "failed", "quota", {
+      errorCode: "provider_quota_exhausted",
+      runId,
+    });
+
+    const recovered = await waitForRecoveryRuns(agentId, 1);
+    expect(recovered).toHaveLength(1);
+    // Scoped, and canonicalized to the UUID rather than the identifier string.
+    expect(recovered[0]?.contextIssueId).toBe(issueId);
   });
 });

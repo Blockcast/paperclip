@@ -1207,6 +1207,24 @@ export const RECOVERABLE_AGENT_STATUS_ERROR_CODES = [
 // stop we should not deepen (BLO-21523).
 const QUOTA_RECOVERY_UNRESUMABLE_ISSUE_STATUSES = new Set<string>(["done", "cancelled"]);
 
+// BLO-28992: the only `enqueueWakeup` skip reasons that attaching a task scope
+// can *itself* unlock. Attaching an issueId makes the wake derive a projectId,
+// which reaches project-scoped budget suppression and the worktree-execution
+// cutoff — neither of which an unscoped wake could ever hit. When one of these
+// declines the scoped wake, retrying unscoped restores the pre-fix behaviour
+// (agent wakes, just without the scope) instead of losing the wake entirely.
+//
+// Deliberately NOT listed: every scope-independent gate (cooldown, company
+// inactive, heartbeat disabled) would decline the retry identically, and
+// `issue_tree_hold_active` is an explicit hold that dropping the scope must not
+// circumvent. The provider-capacity deferral is excluded separately via
+// `providerCapacityDeferred` because it commits a scheduled_retry run before
+// returning null — retrying there would double-wake.
+const QUOTA_RECOVERY_SCOPE_ATTRIBUTABLE_SKIP_REASONS = new Set<string>([
+  "budget.blocked",
+  "heartbeat.worktree_execution_cutoff",
+]);
+
 export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -19671,18 +19689,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
   ): Promise<string | null> {
     if (!runId) return null;
-    const parkedRun = await getRun(runId).catch(() => null);
+    const parkedRun = await getRun(runId).catch((err) => {
+      // Distinguish "unscoped because the lookup broke" from "unscoped because
+      // the run had no task". Both degrade to the same wake, so without this
+      // log there is no way to tell from production whether BLO-28992 is
+      // actually fixed or has silently reverted to the fan-in behaviour.
+      logger.warn(
+        { err, agentId, runId },
+        "quota recovery wake: parked-run lookup failed, falling back to an unscoped wake (BLO-28992)",
+      );
+      return null;
+    });
     if (!parkedRun) return null;
+    // Not a security boundary — the assigneeAgentId check below is the real
+    // guard — but it documents the assumption and fails closed if a future
+    // caller ever passes a runId belonging to another agent.
+    if (parkedRun.agentId !== agentId) {
+      logger.warn(
+        { agentId, runId, parkedRunAgentId: parkedRun.agentId },
+        "quota recovery wake: parked run belongs to a different agent, refusing to scope (BLO-28992)",
+      );
+      return null;
+    }
     const issueId = issueIdFromRunContext(parkedRun.contextSnapshot);
     if (!issueId) return null;
 
+    // `issueIdFromRunContext` returns `contextSnapshot.issueId ?? .taskId`
+    // verbatim, and canonicalization to a UUID inside `enqueueWakeup` is
+    // conditional (it sits behind `if (!projectId && issueId)`), so an
+    // identifier form such as "BLO-123" can reach us here. Match the guarded
+    // lookup shape used at the `enqueueWakeup` site: issues.id is a Postgres
+    // uuid column, so feeding it an identifier raises invalid-input-syntax
+    // (22P02) before the OR is evaluated. Scope by companyId for the same
+    // reason that site does — identifiers can collide across tenants.
+    const lookupIsUuid = isUuidLike(issueId);
+    const idMatch = lookupIsUuid
+      ? or(eq(issues.id, issueId), eq(issues.identifier, issueId.toUpperCase()))
+      : eq(issues.identifier, issueId.toUpperCase());
     const issue = await db
-      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
       .from(issues)
-      .where(eq(issues.id, issueId))
+      .where(and(eq(issues.companyId, parkedRun.companyId), idMatch))
       .limit(1)
       .then((rows) => rows[0] ?? null)
-      .catch(() => null);
+      .catch((err) => {
+        logger.warn(
+          { err, agentId, runId, issueId },
+          "quota recovery wake: issue lookup failed, falling back to an unscoped wake (BLO-28992)",
+        );
+        return null;
+      });
 
     // Unreadable or vanished issue: fall back to unscoped rather than pinning
     // the recovered run to an id we could not verify.
@@ -19701,7 +19761,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       return null;
     }
-    return issueId;
+    // Canonicalize: the lookup above accepts an identifier form, so return the
+    // UUID rather than whatever shape the context snapshot happened to hold.
+    return issue.id;
   }
 
   /**
@@ -19893,21 +19955,116 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const resumeIssueId = await resolveQuotaRecoveryWakeIssueId(
             hookRunId,
             hookAgentId,
-          ).catch(() => null);
-          return enqueueWakeup(hookAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "provider_quota_exhausted_recovered",
-            requestedByActorType: "system",
-            requestedByActorId: "quota-exhausted-hook",
-            // Omitted entirely when there is no resumable scope, so a run that
-            // parked without a task still wakes unscoped exactly as before.
-            ...(resumeIssueId ? { contextSnapshot: { issueId: resumeIssueId } } : {}),
-          })
+          ).catch((err) => {
+            logger.warn(
+              { err, agentId: hookAgentId, runId: hookRunId },
+              "quota recovery wake: scope resolution threw, falling back to an unscoped wake (BLO-28992)",
+            );
+            return null;
+          });
+
+          const wake = (issueId: string | null, suppression?: WakeSuppressionOutcome) =>
+            enqueueWakeup(
+              hookAgentId,
+              {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "provider_quota_exhausted_recovered",
+                requestedByActorType: "system",
+                requestedByActorId: "quota-exhausted-hook",
+                // Omitted entirely when there is no resumable scope, so a run
+                // that parked without a task still wakes unscoped exactly as
+                // before.
+                ...(issueId ? { contextSnapshot: { issueId } } : {}),
+              },
+              suppression,
+            );
+
+          if (!resumeIssueId) {
+            return wake(null)
+              .then(() => undefined)
+              .catch((err) => {
+                logger.warn(
+                  { err, agentId: hookAgentId, issueId: null },
+                  "failed to wake agent after quota-exhausted hook",
+                );
+              });
+          }
+
+          // Attaching an issueId makes `enqueueWakeup` derive a projectId
+          // (:30041), which newly exposes this wake to *project*-scoped
+          // suppression that the pre-fix unscoped wake could never reach:
+          // `budgets.getInvocationBlock` early-returns null on a falsy
+          // candidateProjectId (budgets.ts:1068). So a paused or over-hard-stop
+          // project would make the scoped enqueue throw `conflict(...)` — and
+          // the agent would not wake AT ALL, where before it woke unscoped and
+          // could have worked any other project's issue. The worktree-execution
+          // cutoff gate has the same shape but quieter: it `return null`s rather
+          // than throwing, so nothing is enqueued and no catch fires.
+          //
+          // Apply this fix's own stated principle — a stale or unusable scope
+          // degrades to today's unscoped behaviour — to suppression too. Waking
+          // the agent is the invariant; the scope is only the optimization.
+          //
+          // Retry ONLY on the gates the scope itself unlocked. A blanket
+          // retry-on-falsy would be a double-wake bug: the provider-capacity
+          // gate returns null *after committing a scheduled_retry run*
+          // (:30402), and that gate is especially likely here because we are
+          // recovering from a provider park. Every other `return null` is
+          // scope-independent (cooldown, company inactive, heartbeat disabled),
+          // so an unscoped retry would be declined identically — no reason to
+          // spend the call. `issue_tree_hold_active` is scope-dependent but
+          // deliberately excluded: an explicit tree pause hold should not be
+          // circumvented by dropping the scope.
+          const suppression: WakeSuppressionOutcome = {
+            durableSkipReason: null,
+            providerCapacityDeferred: false,
+            dependencyBlockedRetryAt: null,
+          };
+          let scopedFailure: unknown = null;
+          try {
+            const queued = await wake(resumeIssueId, suppression);
+            if (queued) return undefined;
+            scopedFailure = new Error(
+              `scoped wake was suppressed (${suppression.durableSkipReason ?? "no durable skip reason"})`,
+            );
+          } catch (err) {
+            scopedFailure = err;
+          }
+
+          const scopeAttributable =
+            !suppression.providerCapacityDeferred &&
+            suppression.durableSkipReason !== null &&
+            QUOTA_RECOVERY_SCOPE_ATTRIBUTABLE_SKIP_REASONS.has(suppression.durableSkipReason);
+
+          if (!scopeAttributable) {
+            logger.warn(
+              {
+                err: scopedFailure,
+                agentId: hookAgentId,
+                issueId: resumeIssueId,
+                durableSkipReason: suppression.durableSkipReason,
+                providerCapacityDeferred: suppression.providerCapacityDeferred,
+              },
+              "failed to wake agent after quota-exhausted hook",
+            );
+            return undefined;
+          }
+
+          logger.warn(
+            {
+              err: scopedFailure,
+              agentId: hookAgentId,
+              issueId: resumeIssueId,
+              durableSkipReason: suppression.durableSkipReason,
+            },
+            "quota recovery wake: scoped wake hit a scope-only gate, retrying unscoped (BLO-28992)",
+          );
+          return wake(null)
             .then(() => undefined)
             .catch((err) => {
               logger.warn(
-                { err, agentId: hookAgentId, issueId: resumeIssueId ?? null },
+                { err, agentId: hookAgentId, issueId: resumeIssueId },
                 "failed to wake agent after quota-exhausted hook",
               );
             });
