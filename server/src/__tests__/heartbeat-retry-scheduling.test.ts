@@ -1434,6 +1434,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.scheduledRetryReason, INTERACTION_CONTINUATION_INFRA_RETRY_REASON),
+        inArray(heartbeatRuns.retryOfRunId, [runId, secondSourceRunId]),
       ));
     expect(retries).toHaveLength(2);
     expect(retries.map((retry) => retry.attempt).sort()).toEqual([1, 2]);
