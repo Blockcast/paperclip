@@ -42,6 +42,15 @@ import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../provider-capacity-horizon-bound.js";
+// BLO-30087: the stale-lock sweeper below is the second consumer of the
+// "output silence means the holder is dead" heuristic. k8s-job-liveness is a
+// leaf module (k8s client + logger + redactor only), so importing it here adds
+// no cycle — heartbeat.ts imports THIS module, so the dependency cannot run the
+// other way.
+import {
+  AGENT_POD_BUSY_MAX_STALE_MS,
+  probeAgentPodActivity,
+} from "../k8s-job-liveness.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -11885,11 +11894,65 @@ export function recoveryService(
       return Date.now() - basis.getTime() >= STALE_RUNNING_ISSUE_LOCK_MS;
     };
 
+    // BLO-30087: silence alone is no longer sufficient evidence that a `running`
+    // holder is dead. PR #1465 taught the hard-stale reaper to SPARE a run whose
+    // pod is demonstrably burning CPU, up to AGENT_POD_BUSY_MAX_STALE_MS (3h) —
+    // but that probe is a read at decision time and writes no activity column,
+    // so lastOutputAt / lastUsefulActionAt stay frozen at the original silence
+    // timestamp. This sweeper reads exactly those frozen columns.
+    //
+    // Net effect before this guard: between STALE_RUNNING_ISSUE_LOCK_MS (2h) and
+    // AGENT_POD_BUSY_MAX_STALE_MS (3h) the reaper kept the run alive while the
+    // sweeper freed its issue lock. A sibling then took a legitimate clean
+    // acquire on an issue whose holder was still writing, and in
+    // `shared_workspace` mode both runs held the same cwd — two live writers
+    // interleaving into one file. Before #1465 the 45min reaper always killed
+    // first, so the state was unreachable and the reaper was an accidental
+    // mutual-exclusion backstop. Extending the liveness signal to this consumer
+    // is what replaces it.
+    //
+    // Fails CLOSED, matching #1465's own posture: only positive "busy" evidence
+    // spares a lock. With no metrics-server every probe returns "unknown" and
+    // behaviour is byte-for-byte pre-change.
+    //
+    // The probe is memoized per run and performed HERE, in the pre-transaction
+    // candidate scan. The in-transaction revalidation below reads the memo
+    // synchronously — issuing a k8s metrics call inside `db.transaction` would
+    // hold a Postgres transaction open across a network round-trip.
+    const busySparedByRunId = new Map<string, boolean>();
+    const isBusySparedRunningHolder = async (runId: string | null, lockedAt: Date | null) => {
+      if (!runId) return false;
+      const basis = runningLockStaleBasis(runId, lockedAt);
+      if (!basis) return false;
+      const silentMs = Date.now() - basis.getTime();
+      // Only holders that have actually crossed the sweeper's bound matter here;
+      // anything younger is kept by the bound itself and must not cost a probe.
+      if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
+      const memoized = busySparedByRunId.get(runId);
+      if (memoized !== undefined) return memoized;
+      // Past the shared ceiling a busy pod is a CPU-burning zombie and loses its
+      // lock regardless, exactly as the reaper kills it regardless — so the
+      // BLO-19941 reclamation guarantee still has a bound.
+      const spared = silentMs < AGENT_POD_BUSY_MAX_STALE_MS
+        && (await probeAgentPodActivity(runId)) === "busy";
+      busySparedByRunId.set(runId, spared);
+      if (spared) {
+        logger.info(
+          { runId, silentMs, staleBoundMs: STALE_RUNNING_ISSUE_LOCK_MS, ceilingMs: AGENT_POD_BUSY_MAX_STALE_MS },
+          "sweepStaleIssueLocks: keeping issue lock — holder pod is executing a live subprocess (BLO-30087)",
+        );
+      }
+      return spared;
+    };
+
     for (const issue of candidates) {
       const runningLockSilent = isRunningLockSilent(
         issue.executionRunId,
         issue.executionLockedAt,
-      );
+      ) && !(await isBusySparedRunningHolder(
+        issue.executionRunId,
+        issue.executionLockedAt,
+      ));
       // BLO-21309: distinguishes a parked-retry release from an unclaimed-`queued`
       // release in the audit trail below. Both go through the same 6h bound, but
       // only this one implies a provider-capacity park whose `scheduledRetryAt`
@@ -12029,7 +12092,15 @@ export function recoveryService(
         const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
           const basis = currentRunningLockStaleBasis(runId, lockedAt);
           if (!basis) return false;
-          return Date.now() - basis.getTime() >= STALE_RUNNING_ISSUE_LOCK_MS;
+          if (Date.now() - basis.getTime() < STALE_RUNNING_ISSUE_LOCK_MS) return false;
+          // BLO-30087: mirror of the busy-pod spare in the pre-transaction scan.
+          // Reads the memo rather than probing, so this stays synchronous and no
+          // k8s round-trip happens while this transaction holds `issues` and
+          // `heartbeat_runs` FOR UPDATE. Safe to key by runId alone: the
+          // concurrent-bump bailouts above already guarantee
+          // currentIssue.executionRunId === issue.executionRunId here.
+          if (runId && busySparedByRunId.get(runId) === true) return false;
+          return true;
         };
         const currentExecutionLockExpired = currentPreClaimLockExpired(
           currentIssue.executionRunId,

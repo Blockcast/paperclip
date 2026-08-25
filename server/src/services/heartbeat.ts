@@ -203,6 +203,8 @@ import {
   matchExactAgentJob,
   probeAgentPodActivity,
   readAgentJobRunStatusByName,
+  AGENT_POD_HARD_STALE_MS,
+  AGENT_POD_BUSY_MAX_STALE_MS,
   type AgentJobRunStatus,
   type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
@@ -2033,26 +2035,14 @@ const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // with zero output. 45 min keys the destructive kill well past any healthy
 // quiet gap (which bumps lastUsefulActionAt) while still reclaiming the slot
 // and node CPU long before the multi-hour manual-reap point.
-const EXTERNAL_LIFECYCLE_HARD_STALE_MS = 45 * 60 * 1000;
-// BLO-20251: absolute ceiling on how long a demonstrably-busy pod may defer its
-// hard-stale kill. Without it, a run wedged in a CPU-burning spin loop would
-// look "busy" forever and hold its agent's dispatch slot indefinitely — the
-// exact starvation BLO-12996 introduced the force-reap to prevent. Four times
-// the hard-stale floor (3h) is comfortably longer than any real dependency
-// install, test suite, or image build we have observed, while still bounding
-// the damage of a busy-looking zombie to one afternoon rather than forever.
 //
-// Parsed defensively: a malformed override must not yield NaN here, because
-// every `silentMs >= NaN` comparison is false — the ceiling would silently
-// vanish and a busy-looking zombie really would hold its slot forever. That is
-// the one direction this file must never fail in, so an unusable value falls
-// back to the default rather than being passed through.
-const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = (() => {
-  const fallback = 4 * EXTERNAL_LIFECYCLE_HARD_STALE_MS;
-  const override = Number(process.env.PAPERCLIP_EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS);
-  if (!Number.isFinite(override) || override <= 0) return fallback;
-  return Math.max(EXTERNAL_LIFECYCLE_HARD_STALE_MS, override);
-})();
+// BLO-30087: hoisted into k8s-job-liveness.ts (the leaf module that owns
+// probeAgentPodActivity) so the stale-lock sweeper in recovery/service.ts
+// resolves the SAME bounds. heartbeat.ts imports recovery/service.js, so
+// recovery cannot import back — see the rationale on the constants there.
+// Re-aliased to the existing local names to keep this file's call sites stable.
+const EXTERNAL_LIFECYCLE_HARD_STALE_MS = AGENT_POD_HARD_STALE_MS;
+const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = AGENT_POD_BUSY_MAX_STALE_MS;
 // BLO-18030: bound on confirming a hard-stale-killed Job has actually quiesced
 // before its reviewer-evidence probe is trusted (see
 // confirmStaleKilledJobQuiesced). The Background-propagation delete returns
