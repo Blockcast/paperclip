@@ -477,6 +477,26 @@ spec:
             summary: "Paperclip overdue-scheduled_retry age metric refresh is failing"
             description: "The most recent /metrics overdue-scheduled_retry-age database refresh failed (BLO-22094), so overdue-parked ages may be stale and PaperclipOverdueScheduledRetry is intentionally gated off. Note this can fail independently of the sibling queued-run-age refresh -- a healthy paperclip_queued_run_age_metrics_refresh_success does not vouch for this one. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty park queue."
             runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
+        - alert: PaperclipScheduledRetryParkHorizonImplausible
+          # BLO-25036: distinct from the overdue detector because this measures
+          # the booked future horizon before scheduled_retry_at has passed.
+          expr: max by (agent_id) (paperclip_scheduled_retry_park_horizon_seconds and on(instance) (paperclip_scheduled_retry_park_horizon_refresh_success == 1)) > {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}
+          for: {{ .Values.prometheusRule.scheduledRetryParkHorizonFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has an implausibly long scheduled_retry park horizon"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has a live scheduled_retry row booked {{`{{ $value }}`}}s from heartbeat creation to its future due time, exceeding {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}s (BLO-25036). This is a park-horizon signal, not the BLO-22094 overdue-against-due-time signal. Inspect the retry/capacity decision for the parked row."
+            runbook_url: {{ .Values.prometheusRule.scheduledRetryParkHorizonRunbookUrl | quote }}
+        - alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed
+          expr: paperclip_scheduled_retry_park_horizon_refresh_success == 0
+          for: {{ .Values.prometheusRule.scheduledRetryParkHorizonRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip scheduled-retry park-horizon metric refresh is failing"
+            description: "The most recent /metrics scheduled-retry park-horizon database refresh failed (BLO-25036), so PaperclipScheduledRetryParkHorizonImplausible is gated off and its snapshot may be stale. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty scheduled_retry population."
+            runbook_url: {{ .Values.prometheusRule.scheduledRetryParkHorizonRunbookUrl | quote }}
     - name: paperclip-plugin-lifecycle
       rules:
         - alert: PaperclipPluginCriticalErrored

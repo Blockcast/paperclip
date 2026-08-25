@@ -659,6 +659,37 @@ test("PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed exposes a stale snap
   );
 });
 
+test("PaperclipScheduledRetryParkHorizonImplausible has an independent horizon threshold and freshness alert (BLO-25036)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipScheduledRetryParkHorizonImplausible\n[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.match(
+    expr ?? "",
+    /^max by \(agent_id\) \(paperclip_scheduled_retry_park_horizon_seconds and on\(instance\) \(paperclip_scheduled_retry_park_horizon_refresh_success == 1\)\) > (\d+)$/,
+  );
+  const [, threshold] = expr.match(/> (\d+)$/) ?? [];
+  assert.equal(threshold, "5400");
+  assert.match(
+    rendered,
+    /alert: PaperclipScheduledRetryParkHorizonImplausible[\s\S]*?runbook_url: "[^\"]*runbooks\/queued-run-stranded\.md#scheduled-retry-park-horizon-blo-25036"/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_scheduled_retry_park_horizon_refresh_success == 0\n/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/queued-run-stranded\.md#scheduled-retry-park-horizon-blo-25036"/,
+  );
+});
+
 test("PaperclipPlugin{Critical,}Errored key on the boolean gauge, split severity by plugin_key, and preserve error!=disabled (BLO-21092)", () => {
   const rendered = execFileSync(
     "helm",

@@ -24,6 +24,15 @@ from `heartbeat_runs.created_at` to `scheduled_retry_at` for live
 `status='scheduled_retry'` rows. `PaperclipScheduledRetryParkHorizonImplausible`
 fires when that future-due horizon exceeds 5,400 seconds, based on the
 observed seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s).
+`PaperclipScheduledRetryParkHorizonMetricsRefreshFailed` is the companion
+alert for a failed gauge refresh; while it is firing, the horizon alert is
+gated off and its last snapshot is not trustworthy.
+
+The Helm rule is a mirror only: Blockcast production loads the corresponding
+rules from the lockstep `onprem-k8s` Prometheus ConfigMap/CRD pair, not this
+chart's disabled-by-default `PrometheusRule`. A merged chart rule is therefore
+not proof that the production alert is live; verify the authoritative rules and
+the `monitoring-rules` Argo sync before closing an incident.
 
 This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
 

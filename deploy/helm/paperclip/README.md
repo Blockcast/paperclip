@@ -198,6 +198,10 @@ kubectl -n paperclip exec paperclip-0 -- \
 | prometheusRule.enabled | bool | `false` | Create a PrometheusRule with Paperclip runtime alerts. |
 | prometheusRule.labels | object | `{}` | Extra labels so a Prometheus `ruleSelector` can adopt it (e.g. `{release: kube-prometheus-stack}`). |
 | prometheusRule.namespace | string | `""` | Namespace for the PrometheusRule. Empty renders it into the release namespace. |
+| prometheusRule.scheduledRetryParkHorizonFor | string | `"5m"` | Scrape-flap tolerance for the scheduled-retry park-horizon alert (BLO-25036). |
+| prometheusRule.scheduledRetryParkHorizonRefreshFailureFor | string | `"5m"` | Alert hold for failed scheduled-retry park-horizon metric refreshes (BLO-25036). |
+| prometheusRule.scheduledRetryParkHorizonRunbookUrl | string | `"https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#scheduled-retry-park-horizon-blo-25036"` | Runbook URL for scheduled-retry park-horizon and freshness alerts. |
+| prometheusRule.scheduledRetryParkHorizonSeconds | int | `5400` | Maximum observed-population-derived booked scheduled-retry horizon before warning (BLO-25036). |
 | prometheusRule.processLostElevatedFor | string | `"10m"` | How long the elevated process_lost daily count must persist before warning. |
 | prometheusRule.processLostLivenessNullWindowCount | int | `5` | Warn when the reaper gets more than this many null kube Job-status lists in 15m (blind-to-kube denominator guard: a low process_lost count is untrustworthy while this fires). |
 | prometheusRule.processLostPageFor | string | `"2h"` | How long the high process_lost daily count must be sustained before paging. |
