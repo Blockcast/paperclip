@@ -2130,3 +2130,104 @@ describe("scrubYamlText — holding a block open does not swallow the spec", () 
     expect(out).toContain("containerPort: 1234");
   });
 });
+
+/**
+ * The argv half of the over-redaction guard above (Ally review, PR #1501).
+ *
+ * `swallowFrom` was applied to the three env arms but not to either argv arm,
+ * so a tab-indented line inside `command:`/`args:` still set a threshold of 0 —
+ * "drop every following line indented deeper than 0" — and ate the rest of the
+ * container spec to the next column-0 key. Both argv arms had it, not just the
+ * unrecognized-line one the review named:
+ *
+ * - the sequence-entry arm, because `SEQUENCE_DASH` is `\s`-based and matches a
+ *   tab-indented `- token`;
+ * - the unrecognized-line fall-through, for any other tab-indented shape.
+ *
+ * The token stays redacted in both directions — this was diagnostic loss, not a
+ * leak — but over-redaction is a failure of this scrubber too, so it is pinned
+ * from both sides exactly as the env path is.
+ */
+describe("scrubYamlText — a tab inside an argv block does not swallow the spec", () => {
+  const argvInterrupted = (interruption: string): string =>
+    scrubYamlText(
+      [
+        "apiVersion: v1",
+        "kind: Pod",
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        "    args:",
+        `    - --first=${LEAK}`,
+        interruption,
+        `    - --second=${LEAK}`,
+        "    image: example/app:1.2.3",
+        "    ports:",
+        "    - containerPort: 8080",
+        "    resources:",
+        "      limits:",
+        "        memory: 512Mi",
+        "    livenessProbe:",
+        "      httpGet:",
+        "        path: /healthz",
+        "status:",
+        "  phase: Running",
+      ].join("\n"),
+    );
+
+  // The two arms, driven by whether the tab-indented line parses as a sequence
+  // entry. Both set the bogus 0 threshold before the fix.
+  const interruptions: ReadonlyArray<readonly [string, string]> = [
+    ["a tab-indented sequence entry", `\t- --tabbed=${LEAK}`],
+    ["a tab-indented plain line", "\tsomething: else"],
+  ];
+
+  it.each(interruptions)(
+    "still redacts every argv token across %s",
+    (_label, interruption) => {
+      expectNoLeak(argvInterrupted(interruption));
+    },
+  );
+
+  describe.each(interruptions)("across %s", (_label, interruption) => {
+    const out = argvInterrupted(interruption);
+
+    it.each([
+      ["the image", "image: example/app:1.2.3"],
+      ["ports", "containerPort: 8080"],
+      ["resource limits", "memory: 512Mi"],
+      ["probes", "path: /healthz"],
+      ["status.phase", "phase: Running"],
+    ])("preserves %s", (_fragmentLabel, fragment) => {
+      expect(out).toContain(fragment);
+    });
+  });
+
+  // Skipping the swallow is only safe because the argv in-block default is
+  // REDACT. A continuation line that is no longer swallowed must therefore be
+  // redacted individually rather than passed through — otherwise this fix
+  // would have traded over-redaction for the leak it was guarding against.
+  it.each([
+    ["a tab-indented sequence entry", "\t- --tabbed=x"],
+    ["a tab-indented plain line", "\tsomething: else"],
+    ["a block scalar opened on a tab-indented entry", "\t- |"],
+  ])(
+    "redacts a deeper continuation of %s rather than passing it through",
+    (_label, interruption) => {
+      const out = scrubYamlText(
+        [
+          "spec:",
+          "  containers:",
+          "  - name: app",
+          "    args:",
+          interruption,
+          `        ${LEAK}`,
+          "    image: example/app:1.2.3",
+        ].join("\n"),
+      );
+
+      expectNoLeak(out);
+      expect(out).toContain("image: example/app:1.2.3");
+    },
+  );
+});

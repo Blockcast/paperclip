@@ -263,10 +263,12 @@ function continuesBlock(line: string, blockIndent: number): boolean {
  *   the rest of the container spec — image, ports, resources, probes — and with
  *   it the diagnostics the grant exists for.
  *
- * Skipping the swallow is safe precisely here: inside an env block the default
- * is already REDACT, so a continuation line that is no longer swallowed still
- * reaches the fail-closed arm and is redacted individually rather than dropped.
- * The swallow is a legibility measure in this block, not the security boundary.
+ * Skipping the swallow is safe precisely here: inside an env or argv block the
+ * default is already REDACT, so a continuation line that is no longer swallowed
+ * still reaches the fail-closed arm and is redacted individually rather than
+ * dropped. The swallow is a legibility measure in these blocks, not the
+ * security boundary — which is why every arm that sets a threshold from a line
+ * of unknown shape must set it through `swallowFrom`.
  */
 function hasTabIndent(line: string): boolean {
   for (const ch of line) {
@@ -728,7 +730,13 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         // content must be strictly deeper than the key; a sequence entry is not
         // that shape. A sibling entry sits at exactly `indent`, so `> indent`
         // still lets it through.
-        swallowDeeperThan = indent;
+        //
+        // Through `swallowFrom` for the same reason the env arms use it: a
+        // tab-indented entry has no measurable depth and `leadingIndent`
+        // reports 0 for it, so assigning the threshold directly would mean
+        // "drop every following line indented deeper than 0" and eat the rest
+        // of the container spec.
+        swallowDeeperThan = swallowFrom(line, indent);
         continue;
       }
 
@@ -739,9 +747,16 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
       // `command:` (no dash, hence no swallow ever armed) was emitted verbatim.
       // argv has no schema-closed key set to allowlist, so there is nothing
       // here that can legally be passed through.
+      //
+      // The threshold goes through `swallowFrom` for the same reason the env
+      // arms do: an unmeasurable (tab-indented) line must not set one at all.
+      // Skipping it is fail-closed here exactly as it is there — the argv
+      // in-block default is REDACT, and this arm *is* that default, so a
+      // continuation line that is no longer swallowed is redacted individually
+      // rather than dropped along with the spec around it.
       const indent = leadingIndent(line);
       redact(`${" ".repeat(indent)}"${REDACTED}"`, index);
-      swallowDeeperThan = indent;
+      swallowDeeperThan = swallowFrom(line, indent);
       continue;
     }
 
