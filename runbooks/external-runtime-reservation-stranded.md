@@ -107,11 +107,13 @@ wedged and someone must intervene.*
    ```
 
 4. **Did the agent's `adapterType` change recently?** That is the known cause.
-   Since BLO-28865 it should self-heal: the adapter-type change now cancels
-   the in-flight run, which tears down the old-named Job and lets the reaper
+   Since BLO-28865 it should self-heal: the adapter-type change now deletes
+   the persisted old-named Job, cancels the in-flight run, and lets the reaper
    release the reservation within one cycle. **A firing alert with a recent
-   adapter-type change therefore means the cascade did not run** — check the
-   API logs for `cancelActiveForAgent: cascade Job delete failed`.
+   adapter-type change therefore means teardown failed or did not run** — check
+   the API logs for `adapter-type change: reservation-holder teardown failed`,
+   `cancelRun: cascade Job delete failed`, or
+   `cancelExternalRuntimeReservationHoldersForAgent: failed to tear down reservation holder`.
 
 ## Do not do this
 

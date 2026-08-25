@@ -34491,7 +34491,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    */
   async function cancelExternalRuntimeReservationHoldersForAgent(agentId: string, reason: string) {
     const holders = await db
-      .select({ runId: heartbeatRuns.id })
+      .select({
+        runId: heartbeatRuns.id,
+        jobName: externalRuntimeReservations.jobName,
+        jobUid: externalRuntimeReservations.jobUid,
+      })
       .from(heartbeatRuns)
       .innerJoin(
         externalRuntimeReservations,
@@ -34506,15 +34510,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
 
     let cancelled = 0;
-    for (const { runId } of holders) {
+    for (const { runId, jobName, jobUid } of holders) {
       try {
+        if (!jobName || !jobUid) {
+          throw new Error("reservation has no persisted Job identity");
+        }
+
+        // Delete using the reservation's persisted identity before cancelling
+        // the run. Cancellation can release the reservation and make a later
+        // lookup lose the only safe handle to the pre-migration Job.
+        const deleted = await deleteAgentJobExact({
+          runId,
+          agentId,
+          name: jobName,
+          uid: jobUid,
+        });
+        if (deleted !== "deleted" && deleted !== "missing") {
+          throw new Error(`exact Job deletion did not complete: ${deleted ?? "unavailable"}`);
+        }
         await cancelRunInternal(runId, reason);
         cancelled += 1;
       } catch (error) {
         // One wedged run must not stop the others from being unwedged.
         logger.warn(
           { agentId, runId, error: error instanceof Error ? error.message : String(error) },
-          "cancelExternalRuntimeReservationHoldersForAgent: failed to cancel reservation holder",
+          "cancelExternalRuntimeReservationHoldersForAgent: failed to tear down reservation holder",
         );
       }
     }
