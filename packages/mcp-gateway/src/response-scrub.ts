@@ -281,6 +281,17 @@ function hasTabIndent(line: string): boolean {
 /**
  * The swallow threshold to set from `line`, or `null` when its indentation is
  * unmeasurable and no threshold can honestly be computed. See `hasTabIndent`.
+ *
+ * ONLY for arms that redact into a block whose default is REDACT — the `env:`
+ * and `command:`/`args:` bodies. Returning `null` means "swallow nothing", so
+ * the following lines are re-scanned; that is fail-closed exactly where the
+ * re-scan lands on a default-redact arm, and fail-OPEN anywhere else.
+ *
+ * The `containers:` arm is the measured counter-example: it opens a block that
+ * merely gates argv, so dropping its swallow emits the wrapped remainder of a
+ * flow value in the clear. It keeps its raw threshold deliberately. Do not
+ * "make this uniform" — uniformity here is a leak, and the asymmetry is the
+ * rule rather than an oversight.
  */
 function swallowFrom(line: string, computed: number): number | null {
   return hasTabIndent(line) ? null : computed;
@@ -840,6 +851,15 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
       // not parse. Fail closed on the whole value, and open the block so that
       // any content which does follow is guarded rather than emitted.
       redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+      // NOT through `swallowFrom`, and this is the one arm where that would be
+      // wrong. Skipping the swallow on an unmeasurable line is fail-closed only
+      // where the block being opened defaults to REDACT — true of `env:` and
+      // `command:`/`args:` below, false here. `containersBlockIndent` only gates
+      // whether argv keys are honored; it does not redact its own contents. So
+      // a tab-indented `containers: [{...}` whose flow value wraps onto the next
+      // line would emit that continuation in the clear. Measured: it does —
+      // dropping the swallow here leaks the wrapped remainder. An over-swallow
+      // on a tab-indented `containers:` is the acceptable failure; a leak is not.
       swallowDeeperThan = ownIndent;
       containersBlockIndent = ownIndent;
       argvBlockIndent = null;
@@ -865,7 +885,7 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         // parse. Fail closed on the whole value, and open the block too so that
         // any content which does follow is guarded rather than emitted.
         redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
-        swallowDeeperThan = ownIndent;
+        swallowDeeperThan = swallowFrom(line, ownIndent);
         argvBlockIndent = ownIndent;
         continue;
       }
@@ -907,7 +927,7 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
       // open the block as well, so that if content does follow (a shape we did
       // not anticipate) it is still guarded rather than emitted in the clear.
       redact(`${indent}${dash}${quote}env${quote}: "${REDACTED}"`, index);
-      swallowDeeperThan = ownIndent;
+      swallowDeeperThan = swallowFrom(line, ownIndent);
       envBlockIndent = ownIndent;
       refSubtreeIndent = null;
       continue;
