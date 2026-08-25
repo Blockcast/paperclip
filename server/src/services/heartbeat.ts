@@ -1196,6 +1196,14 @@ export const RECOVERABLE_AGENT_STATUS_ERROR_CODES = [
   "provider_quota",
 ] as const;
 
+// BLO-28992: issue statuses whose scope must NOT be re-delivered on a
+// quota-recovery wake. `done`/`cancelled` are terminal — resuming a run onto
+// one manufactures work on a closed row. Every other status (including
+// `blocked`) is deliberately resumable: the parked run may be exactly what is
+// needed to move it, and a `blocked` row with no blocker edges is a dispatch
+// stop we should not deepen (BLO-21523).
+const QUOTA_RECOVERY_UNRESUMABLE_ISSUE_STATUSES = new Set<string>(["done", "cancelled"]);
+
 export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -19617,6 +19625,72 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * BLO-28992: resolve the task scope a quota-parked run should be re-woken
+   * with, so `provider_quota_exhausted_recovered` stops arriving unscoped.
+   *
+   * Why this exists: the recovery wake used to carry no issue at all, and the
+   * documented agent behaviour on an unscoped wake is to call `inboxLite` and
+   * take the top actionable row. That ranking collapses to a *singleton* for a
+   * given agent, so it is not a probabilistic collision — when a throttle parks
+   * N runs of one agent and capacity returns, every one of them is aimed at the
+   * same issue by construction. Observed with a 169-row and an 84-row inbox;
+   * inbox size does not help because the pick is deterministic. Two runs then
+   * share one workspace (BLO-28442 interleaved writes into `erasure/tracker.go`
+   * and transiently produced a file that would not compile).
+   *
+   * Each parked run already knows its own issue — `contextSnapshot.issueId`,
+   * exposed as the generated `contextIssueId` column — so no new persisted
+   * field and no migration is needed. Note the hook fires `onSuccess` per
+   * caller even on its debounced/in-flight branches, so each parked run runs
+   * *its own* closure and therefore re-delivers *its own* scope.
+   *
+   * Returns null (leaving the wake unscoped, exactly as before) when the run
+   * had no task, or when the scope is no longer safe to resume. That last check
+   * is the load-bearing one: the hook can take 60s+ to recover, and in that
+   * window the issue may have been completed, cancelled, or reassigned. Waking
+   * an agent onto an issue it no longer owns would be a new defect, not a fix,
+   * so a stale scope degrades to today's unscoped behaviour rather than being
+   * carried blindly.
+   */
+  async function resolveQuotaRecoveryWakeIssueId(
+    runId: string | null,
+    agentId: string,
+  ): Promise<string | null> {
+    if (!runId) return null;
+    const parkedRun = await getRun(runId).catch(() => null);
+    if (!parkedRun) return null;
+    const issueId = issueIdFromRunContext(parkedRun.contextSnapshot);
+    if (!issueId) return null;
+
+    const issue = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null)
+      .catch(() => null);
+
+    // Unreadable or vanished issue: fall back to unscoped rather than pinning
+    // the recovered run to an id we could not verify.
+    if (!issue) return null;
+    if (QUOTA_RECOVERY_UNRESUMABLE_ISSUE_STATUSES.has(issue.status)) {
+      logger.info(
+        { agentId, runId, issueId, issueStatus: issue.status },
+        "quota recovery wake: dropping task scope, issue reached a terminal status while parked (BLO-28992)",
+      );
+      return null;
+    }
+    if (issue.assigneeAgentId !== agentId) {
+      logger.info(
+        { agentId, runId, issueId, assigneeAgentId: issue.assigneeAgentId },
+        "quota recovery wake: dropping task scope, issue was reassigned while parked (BLO-28992)",
+      );
+      return null;
+    }
+    return issueId;
+  }
+
+  /**
    * Derive and persist the agent's status after a run reached a terminal state.
    *
    * BLO-19722 added `options.requireOwnership` and a typed return. Without it
@@ -19787,28 +19861,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (recoverable) {
       const hookAgentId = existing.id;
       const hookCompanyId = existing.companyId;
+      // BLO-28992: the run that drove this transition is the one being parked,
+      // so its id is what lets the recovery wake resume the same task. This was
+      // previously hardcoded `null` even though `options.runId` was already in
+      // scope, which is why the recovery wake had nothing to scope itself with.
+      const hookRunId = options?.runId ?? null;
       void runQuotaExhaustedHook({
         db,
         agentId: hookAgentId,
         companyId: hookCompanyId,
-        runId: null,
+        runId: hookRunId,
         adapterType: existing.adapterType,
         errorCode: options?.errorCode ?? "provider_quota_exhausted",
-        onSuccess: () =>
-          enqueueWakeup(hookAgentId, {
+        onSuccess: async () => {
+          // Resolve scope at wake time, not park time: the issue's state can
+          // change while the hook runs, and this is where we can still see it.
+          const resumeIssueId = await resolveQuotaRecoveryWakeIssueId(
+            hookRunId,
+            hookAgentId,
+          ).catch(() => null);
+          return enqueueWakeup(hookAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "provider_quota_exhausted_recovered",
             requestedByActorType: "system",
             requestedByActorId: "quota-exhausted-hook",
+            // Omitted entirely when there is no resumable scope, so a run that
+            // parked without a task still wakes unscoped exactly as before.
+            ...(resumeIssueId ? { contextSnapshot: { issueId: resumeIssueId } } : {}),
           })
             .then(() => undefined)
             .catch((err) => {
               logger.warn(
-                { err, agentId: hookAgentId },
+                { err, agentId: hookAgentId, issueId: resumeIssueId ?? null },
                 "failed to wake agent after quota-exhausted hook",
               );
-            }),
+            });
+        },
       }).catch((err) => {
         logger.warn(
           { err, agentId: hookAgentId },
@@ -33750,6 +33839,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // a plugin-host or route wrapper.
     enqueueWakeup,
     reconcileDetachedQueuedRuns,
+
+    // BLO-28992: exposed so the quota-recovery wake's task-scoping behaviour can
+    // be driven directly. The alternative is finalizing a run through a full
+    // adapter dispatch, which cannot pin down which parked run's scope was
+    // re-delivered — the exact property under test.
+    finalizeAgentStatus,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
