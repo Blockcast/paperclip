@@ -610,8 +610,16 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // reports its non-delivery paths (capacity deferral, tree hold, cooldown, disabled wake).
   // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
   // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
-  // Scoped to active statuses and matched on company so it cannot touch a resolved row.
-  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
+  // The owner and attempt count are the reservation token captured by the caller. Keep both
+  // in the UPDATE predicate so a refund from an older wake is an atomic no-op after ownership
+  // changes or a newer reservation. Scoped to active statuses and matched on company so it
+  // cannot touch a resolved row.
+  async function releaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+  }): Promise<void> {
     await db
       .update(issueRecoveryActions)
       .set({
@@ -622,6 +630,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         and(
           eq(issueRecoveryActions.id, input.actionId),
           eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+          eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
           inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
         ),
       );

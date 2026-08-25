@@ -251,13 +251,12 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
     expect(victim?.executionRunId).toBe(actorRunId);
   });
 
-  it("records what the inline-refresh path actually leaves behind when it loses the key", async () => {
-    // The other three cases all conflict inside a single transaction. This one
-    // does not, and that is the point: `clearStaleExecutionLock` COMMITS the
-    // reap of the victim's own dead lock, and only then does the separate
-    // refresh write raise 23505. So the victim's row does change even though the
-    // call fails — "not half-applied" is true of the unowned-adoption path and
-    // false here.
+  it("rolls back stale cleanup when the atomic adoption loses the key", async () => {
+    // Stale cleanup and adoption share one ownership transaction now. The
+    // trigger below attempts to let the sibling take the unique key at the
+    // exact point where the victim's dead lock would be cleared. The unique
+    // violation must abort that whole transaction: neither the cleanup nor the
+    // sibling's competing lock may survive the failed adoption.
     //
     // Both rows cannot hold the key at seed time (the partial index forbids it),
     // so the sibling's acquisition is injected with a trigger that fires exactly
@@ -268,11 +267,11 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
     const routineId = randomUUID();
     const fingerprint = "shared-dispatch-fingerprint";
 
-    const deadRunId = await seedRun(companyId, agentId, "failed");
-    await db
-      .update(heartbeatRuns)
-      .set({ finishedAt: new Date() })
-      .where(eq(heartbeatRuns.id, deadRunId));
+    // `queued` is reapable by stale-lock adoption but is not terminal, so the
+    // initial terminal-cleanup prepass leaves it in place. That puts the
+    // trigger inside the atomic stale-cleanup-plus-adoption transaction rather
+    // than in the earlier standalone cleanup transaction.
+    const deadRunId = await seedRun(companyId, agentId, "queued");
 
     // The victim holds the key via its OWN dead run, so it is the row the
     // inline-refresh path reaps.
@@ -349,18 +348,17 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
           details?: { ownerIssueId?: string | null };
         });
 
-      // Still a 409, not the 500 this PR removes — and specifically the
-      // routine-lock 409, so the assertions below cannot be satisfied by some
-      // other conflict path that never reached the inline refresh.
+      // Still a 409, not the 500 this PR removes. The sibling write happened
+      // inside the same transaction and therefore rolled back too, so there is
+      // no committed owner to name.
       expect(error?.status).toBe(409);
-      expect(error?.message).toBe("Routine execution already locked by another open issue");
-      expect(error?.details?.ownerIssueId).toBe(ownerIssueId);
+      expect(error?.message).toBe("Routine execution dispatch lock is contended; retry the request");
+      expect(error?.details?.ownerIssueId).toBeNull();
 
       const victim = await readIssueLockState(victimIssueId);
-      // The committed reap survives the failed refresh. This is the residual
-      // state, asserted rather than assumed: the dead run's lock is gone and the
-      // victim now holds nothing.
-      expect(victim?.executionRunId, "the reap already committed").toBeNull();
+      // The stale lock is still present because its cleanup rolled back with the
+      // failed adoption. A later ordinary cleanup can safely reap it.
+      expect(victim?.executionRunId, "stale cleanup must roll back").toBe(deadRunId);
       expect(victim?.checkoutRunId).toBeNull();
       expect(victim?.status).toBe("in_progress");
 
@@ -372,10 +370,10 @@ describeEmbeddedPostgres("checkout adoption vs open routine-execution lock (PEN-
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, deadRunId))
         .then((rows) => rows[0] ?? null);
-      expect(deadRun?.status).toBe("failed");
+      expect(deadRun?.status).toBe("queued");
 
       const owner = await readIssueLockState(ownerIssueId);
-      expect(owner?.executionRunId, "the sibling holds the key it took").toBe(ownerRunId);
+      expect(owner?.executionRunId, "the competing sibling write must roll back").toBeNull();
     } finally {
       await db.execute(sql`drop trigger if exists pen2395_take_lock_on_release on issues`);
       await db.execute(sql`drop function if exists pen2395_take_lock_on_release()`);

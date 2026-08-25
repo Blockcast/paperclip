@@ -50,8 +50,19 @@ import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "../issue-tree-control.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
-import { releaseIssueRunOwnership, restoreCheckoutPromotedStatus } from "../issue-checkout-status.js";
+import {
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  externalWaitFromDescription,
+  issueService,
+  lockIssueParentMutationCompany,
+} from "../issues.js";
+import {
+  issueLockOwnerStateMatches,
+  lockIssueOwnership,
+  releaseIssueRunOwnership,
+  restoreCheckoutPromotedStatus,
+  type IssueLockOwnerState,
+} from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
   derivePersistedMonitorState,
@@ -101,6 +112,33 @@ import {
 } from "./zero-token-startup-failure.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+/**
+ * The recovery transaction has already upserted its source-scoped action when
+ * the issue UPDATE reports no match. That result is a lost write precondition,
+ * not a successful no-op: returning from the transaction callback would commit
+ * the action/comment/activity rows without the matching issue mutation. Throw a
+ * private sentinel so Drizzle rolls the transaction back, then translate it
+ * back to the normal "another writer won" null result at the boundary.
+ */
+class RecoveryEscalationRollback extends Error {
+  constructor() {
+    super("Recovery escalation rolled back because the issue update matched no row");
+    this.name = "RecoveryEscalationRollback";
+  }
+}
+
+/**
+ * The provider-quota monitor is created after the escalation transaction commits,
+ * so a failed action CAS must abort the monitor transaction as well. Returning
+ * from the transaction callback would commit an orphaned wake/run pair.
+ */
+class ProviderQuotaMonitorRollback extends Error {
+  constructor() {
+    super("Provider-quota recovery monitor action changed before it could be updated");
+    this.name = "ProviderQuotaMonitorRollback";
+  }
+}
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -471,6 +509,7 @@ type RecoveryWakeupOptions = {
   contextSnapshot?: Record<string, unknown>;
   retryOfRunId?: string | null;
   scheduledRetryAttempt?: number;
+  expectedLockOwnerState?: IssueLockOwnerState | null;
 };
 
 type RecoveryWakeup = (
@@ -569,19 +608,6 @@ export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean 
   if (latestRun.errorCode === "k8s_job_deleted_externally") return true;
   if (latestRun.errorCode !== "claude_truncated") return false;
   return /pod is gone|pod was removed/i.test(latestRun.error ?? "");
-}
-
-// BLO-20933: `issuesSvc.update` enforces `expectedCurrentAssigneeAgentId` by THROWING a 409
-// (both from the pre-read snapshot check and from the zero-matched-rows path), never by
-// returning falsy. A recovery escalation that loses the assignee race must treat that as
-// "another writer won, skip this issue" rather than letting it propagate: the caller's
-// per-issue loop would otherwise abort the whole batch. Matched on the precondition detail
-// we set ourselves so unrelated 409s still surface.
-function isAssigneePreconditionConflict(error: unknown): boolean {
-  if (!(error instanceof HttpError) || error.status !== 409) return false;
-  const details = error.details;
-  if (!details || typeof details !== "object") return false;
-  return "expectedAssigneeAgentId" in details;
 }
 
 function resolveStrandedRecoveryCause(
@@ -998,22 +1024,6 @@ function isTerminalDispatchRaceRun(
     latestRun?.status === "cancelled" &&
     readNonEmptyString(latestRun.errorCode) === ISSUE_TERMINAL_STATUS_ERROR_CODE
   );
-}
-
-// BLO-19160: the three issue columns adoption rewrites — the execution lock pair
-// plus the owner. Captured fresh when a handover marker is observed and used as
-// a compare-and-set precondition on every recovery mutation that observation
-// leads to.
-type IssueLockOwnerState = {
-  executionRunId: string | null;
-  checkoutRunId: string | null;
-  assigneeAgentId: string | null;
-};
-
-function issueLockOwnerStateMatches(a: IssueLockOwnerState, b: IssueLockOwnerState) {
-  return a.executionRunId === b.executionRunId &&
-    a.checkoutRunId === b.checkoutRunId &&
-    a.assigneeAgentId === b.assigneeAgentId;
 }
 
 // BLO-19160: the outcome of observing a checkout-handover marker when the
@@ -2469,6 +2479,7 @@ export function recoveryService(
         ...(input.extraContext ?? {}),
       }, "normal_model"),
       retryOfRunId: input.retryOfRunId,
+      expectedLockOwnerState: input.expectedLockOwnerState,
       scheduledRetryAttempt:
         typeof input.extraContext?.scheduledRetryAttempt === "number"
           ? input.extraContext.scheduledRetryAttempt
@@ -2501,6 +2512,7 @@ export function recoveryService(
         wakeReason: "issue_assigned",
         source: "issue.assigned_todo_liveness_dispatch",
       }, "normal_model"),
+      expectedLockOwnerState,
     });
   }
 
@@ -5027,6 +5039,7 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     hasNewActivitySinceLastAttempt: boolean;
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
     if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
     if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
@@ -5053,11 +5066,15 @@ export function recoveryService(
     // horizon in `strandedRecoveryWakeAttemptsExhausted`, which no sweep rewrites and which
     // does not depend on `attemptCount` moving at all. Attempts bound delivered-but-
     // unproductive wakes; the horizon bounds wall-clock regardless of delivery.
+    const reservedOwnerAgentId = input.action.ownerAgentId;
+    const reservedAttemptCount = input.action.attemptCount;
     const refundUnspentWakeAttempt = async (cause: "enqueue_threw" | "enqueue_not_delivered", error?: unknown) => {
       const release = () =>
         recoveryActionsSvc.releaseWakeAttempt({
           companyId: input.issue.companyId,
           actionId: input.action.id,
+          expectedOwnerAgentId: reservedOwnerAgentId,
+          expectedAttemptCount: reservedAttemptCount,
         });
       try {
         await release();
@@ -5137,6 +5154,7 @@ export function recoveryService(
           recoveryCause: input.recoveryCause,
           suppressedNonAssigneeWake: true,
         }, "status_only"),
+        expectedLockOwnerState: input.expectedLockOwnerState,
       });
       return;
     }
@@ -5171,6 +5189,7 @@ export function recoveryService(
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause: input.recoveryCause,
       }, "status_only"),
+      expectedLockOwnerState: input.expectedLockOwnerState,
     });
   }
 
@@ -5195,88 +5214,187 @@ export function recoveryService(
     actionId: string;
     agentId: string;
   }) {
-    const existing = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.companyId, input.issue.companyId),
-        eq(heartbeatRuns.agentId, input.agentId),
-        eq(heartbeatRuns.status, "scheduled_retry"),
-        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
-      ))
-      .orderBy(desc(heartbeatRuns.scheduledRetryAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (existing) return existing;
-
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
-    return db.transaction(async (tx) => {
-      const wakeup = await tx
-        .insert(agentWakeupRequests)
-        .values({
-          companyId: input.issue.companyId,
-          agentId: input.agentId,
-          source: "automation",
-          triggerDetail: "system",
-          reason: "provider_quota_recovery",
-          payload: withRecoveryModelProfileHint({
-            issueId: input.issue.id,
-            retryOfRunId: input.latestRun?.id ?? null,
-            retryReason: "provider_quota_recovery",
-            providerQuotaRetryNotBefore: retryAt.toISOString(),
-          }, "normal_model"),
-          status: "queued",
-          requestedByActorType: "system",
-          requestedByActorId: null,
-          idempotencyKey: `provider_quota_recovery:${input.issue.id}:${retryAt.toISOString()}`,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]!);
-      const scheduledRun = await tx
-        .insert(heartbeatRuns)
-        .values({
-          companyId: input.issue.companyId,
-          agentId: input.agentId,
-          invocationSource: "automation",
-          triggerDetail: "system",
-          status: "scheduled_retry",
-          wakeupRequestId: wakeup.id,
-          retryOfRunId: input.latestRun?.id ?? null,
-          scheduledRetryAt: retryAt,
-          scheduledRetryAttempt: 1,
-          scheduledRetryReason: "provider_quota_recovery",
-          contextSnapshot: withRecoveryModelProfileHint({
-            issueId: input.issue.id,
-            taskId: input.issue.id,
-            wakeReason: "provider_quota_recovery",
-            retryReason: "provider_quota_recovery",
-            providerQuotaRetryNotBefore: retryAt.toISOString(),
-          }, "normal_model"),
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]!);
-      await tx
-        .update(agentWakeupRequests)
-        .set({ runId: scheduledRun.id, updatedAt: now })
-        .where(eq(agentWakeupRequests.id, wakeup.id));
-      await tx
-        .update(issueRecoveryActions)
-        .set({
-          monitorPolicy: {
-            type: "wait_recovery",
-            retryAgentId: input.agentId,
-            scheduledRunId: scheduledRun.id,
-            retryAt: retryAt.toISOString(),
+    try {
+      return await db.transaction(async (tx) => {
+        // The escalation has committed, so this second transaction must prove that
+        // the issue is still the exact post-escalation state that authorized the
+        // monitor. Adoption, reassignment, resolution, or another recovery writer
+        // can otherwise leave a retry attached to stale recovery state.
+        await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
+        const [freshIssue] = await tx
+          .select()
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, input.issue.companyId),
+            eq(issues.id, input.issue.id),
+          ))
+          .limit(1)
+          .for("update");
+        if (!freshIssue || freshIssue.status !== input.issue.status || !issueLockOwnerStateMatches(
+          {
+            executionRunId: input.issue.executionRunId,
+            checkoutRunId: input.issue.checkoutRunId,
+            assigneeAgentId: input.issue.assigneeAgentId,
           },
-          timeoutAt: retryAt,
-          updatedAt: now,
-        })
-        .where(eq(issueRecoveryActions.id, input.actionId));
-      return scheduledRun;
-    });
+          {
+            executionRunId: freshIssue.executionRunId,
+            checkoutRunId: freshIssue.checkoutRunId,
+            assigneeAgentId: freshIssue.assigneeAgentId,
+          },
+        )) {
+          return null;
+        }
+
+        // Lock the action before checking its routing/evidence. The action is
+        // deliberately narrower than ACTIVE_RECOVERY_ACTION_STATUSES here:
+        // `escalated` is a terminal human-attention state and must not receive a
+        // scheduler monitor as a side effect of an old post-commit callback.
+        const [action] = await tx
+          .select()
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.id, input.actionId),
+            eq(issueRecoveryActions.companyId, freshIssue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, freshIssue.id),
+          ))
+          .limit(1)
+          .for("update");
+        if (!action || action.status !== "active" || action.cause !== "provider_quota" ||
+          action.ownerAgentId !== null || action.returnOwnerAgentId !== input.agentId) {
+          return null;
+        }
+
+        // A recovery action records the run that supplied its evidence. If that
+        // evidence is present, the post-commit monitor callback must still be for
+        // the same run; an older callback must not arm a retry for a newer action
+        // generation. Older rows may lack either field, so absent evidence remains
+        // compatible with the pre-evidence schema.
+        const actionEvidence = parseObject(action.evidence);
+        const actionLatestRunId = readNonEmptyString(actionEvidence.latestRunId);
+        const actionLatestRunAgentId = readNonEmptyString(actionEvidence.latestRunAgentId);
+        if (
+          (actionLatestRunId !== null && actionLatestRunId !== input.latestRun?.id) ||
+          (actionLatestRunAgentId !== null && actionLatestRunAgentId !== input.latestRun?.agentId)
+        ) {
+          return null;
+        }
+
+        const existing = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, freshIssue.companyId),
+            eq(heartbeatRuns.agentId, input.agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' = ${action.id}`,
+              // Compatibility for monitors created before the stable action key
+              // was introduced. The reason and issue scope keep this fallback
+              // from matching unrelated scheduled retries for the same issue.
+              and(
+                sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is null`,
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${freshIssue.id}`,
+              ),
+            ),
+          ))
+          .orderBy(desc(heartbeatRuns.scheduledRetryAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) return existing;
+
+        const recoveryActionId = action.id;
+        const stableIdempotencyKey = `provider_quota_recovery:${recoveryActionId}`;
+        const wakeup = await tx
+          .insert(agentWakeupRequests)
+          .values({
+            companyId: freshIssue.companyId,
+            agentId: input.agentId,
+            source: "automation",
+            triggerDetail: "system",
+            reason: "provider_quota_recovery",
+            payload: withRecoveryModelProfileHint({
+              issueId: freshIssue.id,
+              recoveryActionId,
+              retryOfRunId: input.latestRun?.id ?? null,
+              retryReason: "provider_quota_recovery",
+              providerQuotaRetryNotBefore: retryAt.toISOString(),
+            }, "normal_model"),
+            status: "queued",
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            idempotencyKey: stableIdempotencyKey,
+            updatedAt: now,
+          })
+          .returning()
+          .then((rows) => rows[0]!);
+        const scheduledRun = await tx
+          .insert(heartbeatRuns)
+          .values({
+            companyId: freshIssue.companyId,
+            agentId: input.agentId,
+            invocationSource: "automation",
+            triggerDetail: "system",
+            status: "scheduled_retry",
+            wakeupRequestId: wakeup.id,
+            retryOfRunId: input.latestRun?.id ?? null,
+            scheduledRetryAt: retryAt,
+            scheduledRetryAttempt: 1,
+            scheduledRetryReason: "provider_quota_recovery",
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: freshIssue.id,
+              taskId: freshIssue.id,
+              recoveryActionId,
+              wakeReason: "provider_quota_recovery",
+              retryReason: "provider_quota_recovery",
+              providerQuotaRetryNotBefore: retryAt.toISOString(),
+            }, "normal_model"),
+            updatedAt: now,
+          })
+          .returning()
+          .then((rows) => rows[0]!);
+        await tx
+          .update(agentWakeupRequests)
+          .set({ runId: scheduledRun.id, updatedAt: now })
+          .where(eq(agentWakeupRequests.id, wakeup.id));
+        const [updatedAction] = await tx
+          .update(issueRecoveryActions)
+          .set({
+            monitorPolicy: {
+              type: "wait_recovery",
+              retryAgentId: input.agentId,
+              recoveryActionId,
+              scheduledRunId: scheduledRun.id,
+              retryAt: retryAt.toISOString(),
+            },
+            timeoutAt: retryAt,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueRecoveryActions.id, action.id),
+            eq(issueRecoveryActions.companyId, freshIssue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, freshIssue.id),
+            eq(issueRecoveryActions.status, "active"),
+            eq(issueRecoveryActions.cause, "provider_quota"),
+            isNull(issueRecoveryActions.ownerAgentId),
+            eq(issueRecoveryActions.returnOwnerAgentId, input.agentId),
+            ...(actionLatestRunId === null
+              ? []
+              : [sql`${issueRecoveryActions.evidence} ->> 'latestRunId' = ${actionLatestRunId}`]),
+            ...(actionLatestRunAgentId === null
+              ? []
+              : [sql`${issueRecoveryActions.evidence} ->> 'latestRunAgentId' = ${actionLatestRunAgentId}`]),
+          ))
+          .returning();
+        if (!updatedAction) throw new ProviderQuotaMonitorRollback();
+        return scheduledRun;
+      });
+    } catch (error) {
+      if (error instanceof ProviderQuotaMonitorRollback) return null;
+      throw error;
+    }
   }
 
   function buildRecoveryIssueInPlaceEscalationComment(input: {
@@ -5315,47 +5433,85 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
-    // BLO-19160: see `escalateStrandedAssignedIssue` — a handover-derived
-    // escalation must not commit if the lock/owner moved under it.
-    if (await issueLockOwnerStateChanged(input.issue.id, input.expectedLockOwnerState)) return null;
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
-    if (!updated) return null;
+    const result = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
 
-    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
-    await issuesSvc.addComment(
-      input.issue.id,
-      buildRecoveryIssueInPlaceEscalationComment({
-        issue: input.issue,
-        previousStatus: input.previousStatus,
-        latestRun: input.latestRun,
-        prefix,
-      }),
-      {},
-    );
+      // Acquire the graph lock before the issue row. `issuesSvc.update` takes
+      // this order for status mutations that touch the issue graph; retaining
+      // the same order here avoids an inversion with a concurrent blocker
+      // update while still keeping the handover decision and its side effects
+      // in one transaction.
+      await lockIssueParentMutationCompany(input.issue.companyId, tx);
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .limit(1)
+        .for("update");
+      if (!fresh || fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
+      if (
+        input.expectedLockOwnerState &&
+        !issueLockOwnerStateMatches(input.expectedLockOwnerState, {
+          executionRunId: fresh.executionRunId,
+          checkoutRunId: fresh.checkoutRunId,
+          assigneeAgentId: fresh.assigneeAgentId,
+        })
+      ) return null;
 
-    await logActivity(db, {
-      companyId: input.issue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: null,
-      runId: null,
-      action: "issue.updated",
-      entityType: "issue",
-      entityId: input.issue.id,
-      details: {
-        identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
-        source: "recovery.reconcile_stranded_recovery_issue",
-        latestRunId: input.latestRun?.id ?? null,
-        latestRunStatus: input.latestRun?.status ?? null,
-        latestRunErrorCode: input.latestRun?.errorCode ?? null,
-        originKind: input.issue.originKind,
-        originId: input.issue.originId,
-      },
+      const updated = await issuesSvc.update(
+        fresh.id,
+        {
+          status: "blocked",
+          expectedCurrentStatus: fresh.status,
+          expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
+          expectedCurrentCheckoutRunId: fresh.checkoutRunId,
+          expectedCurrentExecutionRunId: fresh.executionRunId,
+        },
+        tx,
+      );
+      if (!updated) return null;
+
+      const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      await issuesSvc.addComment(
+        fresh.id,
+        buildRecoveryIssueInPlaceEscalationComment({
+          issue: fresh,
+          previousStatus: input.previousStatus,
+          latestRun: input.latestRun,
+          prefix,
+        }),
+        {},
+        { authorType: "system" },
+        tx,
+      );
+
+      const publish = await logActivity(tx as unknown as Db, {
+        companyId: fresh.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fresh.id,
+        details: {
+          identifier: fresh.identifier,
+          status: "blocked",
+          previousStatus: input.previousStatus,
+          source: "recovery.reconcile_stranded_recovery_issue",
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          originKind: fresh.originKind,
+          originId: fresh.originId,
+        },
+      }, { deferPublish: true });
+
+      return { updated, publish };
     });
-
-    return updated;
+    if (!result) return null;
+    result.publish();
+    return result.updated;
   }
 
   function isWaitingOnReviewContinuationRun(latestRun: LatestIssueRun) {
@@ -5382,23 +5538,28 @@ export function recoveryService(
     return monitor?.status === "triggered";
   }
 
+  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "lost_race" | "failed";
+
   async function parkReviewWaitingContinuationIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
     expectedLockOwnerState?: IssueLockOwnerState | null;
-  }) {
-    return await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
-      );
+  }): Promise<ReviewWaitingParkOutcome> {
+    const result = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
 
       const [fresh] = await tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
-        .limit(1);
-      if (!fresh || fresh.status !== "in_progress" || !hasActiveMonitorPath(fresh)) return null;
+        .limit(1)
+        .for("update");
+      if (!fresh) return { outcome: "lost_race" as const };
+      if (fresh.status === "in_review") return { outcome: "already_parked" as const };
+      if (fresh.status !== input.previousStatus || !hasActiveMonitorPath(fresh)) {
+        return { outcome: "lost_race" as const };
+      }
 
       // BLO-19160: parking to `in_review` is a status mutation on the handover
       // path just as much as an escalation is, so it takes the same CAS.
@@ -5410,11 +5571,29 @@ export function recoveryService(
           assigneeAgentId: fresh.assigneeAgentId,
         })
       ) {
-        return null;
+        return { outcome: "lost_race" as const };
       }
 
-      const updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
-      if (!updated) return null;
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(
+          fresh.id,
+          {
+            status: "in_review",
+            expectedCurrentStatus: input.previousStatus,
+            expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
+            expectedCurrentCheckoutRunId: fresh.checkoutRunId,
+            expectedCurrentExecutionRunId: fresh.executionRunId,
+          },
+          tx,
+        );
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 409) {
+          return { outcome: "lost_race" as const };
+        }
+        throw error;
+      }
+      if (!updated) return { outcome: "lost_race" as const };
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -5425,7 +5604,7 @@ export function recoveryService(
           "Continuation retry was intentionally cancelled because the issue is waiting on review/CI, and the source issue has an active monitor path.",
       }, tx);
 
-      await logActivity(db, {
+      const publish = await logActivity(tx as unknown as Db, {
         companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
@@ -5444,18 +5623,22 @@ export function recoveryService(
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
           recoveryActionId: activeRecoveryAction?.id ?? null,
         },
-      });
+      }, { deferPublish: true });
 
-      return updated;
+      return { outcome: "parked" as const, publish };
     });
+    if (result.outcome === "parked") {
+      result.publish();
+      return "parked";
+    }
+    return result.outcome;
   }
-
-  type ReviewWaitingParkOutcome = "parked" | "already_parked" | "failed";
 
   async function parkNoDependencyReviewWaitingIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "in_progress";
     latestRun: LatestIssueRun;
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }): Promise<ReviewWaitingParkOutcome> {
     // BLO-16146: a continuation that deliberately parked for review/approval, with no
     // dependency to convert into a `blocked` wait (resolveContinuationWaitingOnReview
@@ -5467,31 +5650,26 @@ export function recoveryService(
     // parkReviewWaitingContinuationIssue minus the monitor-path requirement, plus a
     // plain-language comment (no monitor path guarantees a re-poke, so the wait must be
     // visible in the thread).
-    return await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
-      );
+    const result = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
 
       const [fresh] = await tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
-        .limit(1);
-      if (!fresh) return "failed";
+        .limit(1)
+        .for("update");
+      if (!fresh) return "lost_race";
       if (fresh.status === "in_review") return "already_parked";
-      if (fresh.status !== "in_progress") return "failed";
+      if (fresh.status !== input.previousStatus) return "lost_race";
 
-      // BLO-19160: deliberately NO lock-owner CAS here, unlike the sibling
-      // parks/escalations. Two reasons, in order:
-      //   1. `ReviewWaitingParkOutcome` has no "took no action" variant, and a
-      //      lost race must not map to "failed" — the caller treats "failed" as
-      //      a genuine park failure and falls through to `blocked` escalation,
-      //      i.e. exactly the clobber a CAS is supposed to prevent. Guarding
-      //      here without a new outcome variant is worse than not guarding.
-      //   2. It is unreachable on the handover path anyway: the only call site
-      //      is gated on `isWaitingOnReviewContinuationRun(latestRun)`, which
-      //      requires `latestRun?.status === "cancelled"`, and the handover
-      //      path sets `latestRun` to null.
+      if (input.expectedLockOwnerState && !issueLockOwnerStateMatches(input.expectedLockOwnerState, {
+        executionRunId: fresh.executionRunId,
+        checkoutRunId: fresh.checkoutRunId,
+        assigneeAgentId: fresh.assigneeAgentId,
+      })) {
+        return "lost_race";
+      }
 
       // The in_review transition runs an evidence gate (issues.ts) that throws
       // `unprocessable` when the issue has no reviewable evidence yet (analysis-only
@@ -5501,15 +5679,26 @@ export function recoveryService(
       // Any other transient failure degrades the same safe way.
       let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
       try {
-        updated = await issuesSvc.update(fresh.id, { status: "in_review" }, tx);
+        updated = await issuesSvc.update(
+          fresh.id,
+          {
+            status: "in_review",
+            expectedCurrentStatus: input.previousStatus,
+            expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
+            expectedCurrentCheckoutRunId: fresh.checkoutRunId,
+            expectedCurrentExecutionRunId: fresh.executionRunId,
+          },
+          tx,
+        );
       } catch (err) {
+        if (err instanceof HttpError && err.status === 409) return "lost_race";
         logger.warn(
           { err, issueId: fresh.id, identifier: fresh.identifier },
           "parkNoDependencyReviewWaitingIssue: in_review park rejected; escalating instead",
         );
         return "failed";
       }
-      if (!updated) return "failed";
+      if (!updated) return "lost_race";
 
       const activeRecoveryAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: fresh.companyId,
@@ -5532,7 +5721,7 @@ export function recoveryService(
         tx,
       );
 
-      await logActivity(db, {
+      const publish = await logActivity(tx as unknown as Db, {
         companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
@@ -5551,10 +5740,12 @@ export function recoveryService(
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
           recoveryActionId: activeRecoveryAction?.id ?? null,
         },
-      });
+      }, { deferPublish: true });
 
-      return "parked";
+      return { outcome: "parked" as const, publish };
     });
+    if (typeof result === "object" && result.outcome === "parked") result.publish();
+    return typeof result === "string" ? result : result.outcome;
   }
 
   async function existingBlockerIssueIds(companyId: string, issueId: string) {
@@ -5575,12 +5766,13 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     blockerIssueIds: string[],
+    dbOrTx: Db | DbTransaction = db,
   ) {
     const candidates = new Set(blockerIssueIds);
     const cycleForming = new Set<string>();
     if (candidates.size === 0) return cycleForming;
 
-    const rows = await db
+    const rows = await dbOrTx
       .select({
         blockerIssueId: issueRelations.issueId,
         blockedIssueId: issueRelations.relatedIssueId,
@@ -5673,8 +5865,12 @@ export function recoveryService(
     });
   }
 
-  async function existingUnresolvedBlockerIssues(companyId: string, issueId: string) {
-    return db
+  async function existingUnresolvedBlockerIssues(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Db | DbTransaction = db,
+  ) {
+    return dbOrTx
       .select({ id: issues.id, identifier: issues.identifier })
       .from(issueRelations)
       .innerJoin(
@@ -5704,113 +5900,143 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     expectedLockOwnerState?: IssueLockOwnerState | null,
   ) {
-    const existingBlockers = await existingUnresolvedBlockerIssues(issue.companyId, issue.id);
-    const openChildren = await db
-      .select({ id: issues.id, identifier: issues.identifier })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, issue.companyId),
-          eq(issues.parentId, issue.id),
-          visibleIssueCondition(),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      );
-    const blockerRowsById = new Map<string, { id: string; identifier: string | null; source: string }>();
-    for (const row of existingBlockers) {
-      blockerRowsById.set(row.id, { ...row, source: "existing_unresolved_blocker" });
-    }
-    for (const row of openChildren) {
-      if (!blockerRowsById.has(row.id)) {
-        blockerRowsById.set(row.id, { ...row, source: "open_child" });
+    const result = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, issue.companyId, issue.id);
+      // All issue-graph writers take this company lock before issue row locks.
+      // Holding it across blocker discovery, cycle filtering, and the update
+      // makes the dependency decision atomic with the relation mutation.
+      await lockIssueParentMutationCompany(issue.companyId, tx);
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
+        .limit(1)
+        .for("update");
+      if (!fresh || fresh.status !== issue.status) return null;
+      if (
+        expectedLockOwnerState &&
+        !issueLockOwnerStateMatches(expectedLockOwnerState, {
+          executionRunId: fresh.executionRunId,
+          checkoutRunId: fresh.checkoutRunId,
+          assigneeAgentId: fresh.assigneeAgentId,
+        })
+      ) return null;
+
+      const existingBlockers = await existingUnresolvedBlockerIssues(fresh.companyId, fresh.id, tx);
+      const openChildren = await tx
+        .select({ id: issues.id, identifier: issues.identifier })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, fresh.companyId),
+            eq(issues.parentId, fresh.id),
+            visibleIssueCondition(),
+            notInArray(issues.status, ["done", "cancelled"]),
+          ),
+        );
+      const blockerRowsById = new Map<string, { id: string; identifier: string | null; source: string }>();
+      for (const row of existingBlockers) {
+        blockerRowsById.set(row.id, { ...row, source: "existing_unresolved_blocker" });
       }
-    }
+      for (const row of openChildren) {
+        if (!blockerRowsById.has(row.id)) {
+          blockerRowsById.set(row.id, { ...row, source: "open_child" });
+        }
+      }
 
-    let blockedByIssueIds = [...blockerRowsById.keys()];
-    if (blockedByIssueIds.length === 0) return null;
-    const cycleFormingBlockerIds = await findCycleFormingBlockerIssueIds(
-      issue.companyId,
-      issue.id,
-      blockedByIssueIds,
-    );
-    if (cycleFormingBlockerIds.size > 0) {
-      const skippedBlockers = [...cycleFormingBlockerIds]
-        .map((id) => blockerRowsById.get(id))
-        .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row));
-      logger.warn(
-        {
-          companyId: issue.companyId,
-          issueId: issue.id,
-          identifier: issue.identifier,
-          skippedBlockerIssueIds: skippedBlockers.map((row) => row.id),
-          skippedBlockerIdentifiers: skippedBlockers.map((row) => row.identifier).filter(Boolean),
-          skippedBlockerSources: skippedBlockers.map((row) => ({ id: row.id, source: row.source })),
-        },
-        "skipping cycle-forming review-wait blocker relations",
-      );
-      blockedByIssueIds = blockedByIssueIds.filter((id) => !cycleFormingBlockerIds.has(id));
+      let blockedByIssueIds = [...blockerRowsById.keys()];
       if (blockedByIssueIds.length === 0) return null;
-    }
+      const cycleFormingBlockerIds = await findCycleFormingBlockerIssueIds(
+        fresh.companyId,
+        fresh.id,
+        blockedByIssueIds,
+        tx,
+      );
+      if (cycleFormingBlockerIds.size > 0) {
+        const skippedBlockers = [...cycleFormingBlockerIds]
+          .map((id) => blockerRowsById.get(id))
+          .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row));
+        logger.warn(
+          {
+            companyId: fresh.companyId,
+            issueId: fresh.id,
+            identifier: fresh.identifier,
+            skippedBlockerIssueIds: skippedBlockers.map((row) => row.id),
+            skippedBlockerIdentifiers: skippedBlockers.map((row) => row.identifier).filter(Boolean),
+            skippedBlockerSources: skippedBlockers.map((row) => ({ id: row.id, source: row.source })),
+          },
+          "skipping cycle-forming review-wait blocker relations",
+        );
+        blockedByIssueIds = blockedByIssueIds.filter((id) => !cycleFormingBlockerIds.has(id));
+        if (blockedByIssueIds.length === 0) return null;
+      }
 
-    // The reachability check above and this write are not atomic: another relation
-    // update can add a path from `issue` to one of these blockers between the read and
-    // this write. The issue service re-validates on write and throws in that case -
-    // catch it here so one race falls through to the caller's existing no-dependency
-    // `in_review` park instead of aborting the whole periodic recovery sweep.
-    let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
-    try {
-      // BLO-19160: re-check the handover lock/owner state immediately before
-      // the mutation. A live adopter committing after the handover observation
-      // must not be blocked out by this path.
-      if (await issueLockOwnerStateChanged(issue.id, expectedLockOwnerState)) return null;
-      updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
-    } catch (error) {
-      if (!isBlockingRelationCycleError(error)) throw error;
-      logger.warn(
-        {
-          companyId: issue.companyId,
-          issueId: issue.id,
-          identifier: issue.identifier,
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(
+          fresh.id,
+          {
+            status: "blocked",
+            blockedByIssueIds,
+            expectedCurrentStatus: fresh.status,
+            expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
+            expectedCurrentCheckoutRunId: fresh.checkoutRunId,
+            expectedCurrentExecutionRunId: fresh.executionRunId,
+          },
+          tx,
+        );
+      } catch (error) {
+        if (!isBlockingRelationCycleError(error)) throw error;
+        logger.warn(
+          {
+            companyId: fresh.companyId,
+            issueId: fresh.id,
+            identifier: fresh.identifier,
+            blockedByIssueIds,
+          },
+          "review-wait blocker write raced a concurrent relation update and formed a cycle; parking without dependency",
+        );
+        return null;
+      }
+      if (!updated) return null;
+
+      const waitingOn = formatIssueLinksForComment(
+        blockedByIssueIds
+          .map((id) => blockerRowsById.get(id))
+          .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row)),
+      );
+      await issuesSvc.addComment(
+        fresh.id,
+        `This task is waiting on ${waitingOn} to finish. ` +
+          "It will continue automatically when that work is done - there's nothing you need to do. " +
+          "(It was paused because the latest run reported it was waiting for review/approval; " +
+          "Paperclip turned that into a normal dependency wait instead of flagging it as stuck.)",
+        {},
+        { authorType: "system" },
+        tx,
+      );
+      const publish = await logActivity(tx as unknown as Db, {
+        companyId: fresh.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: fresh.id,
+        details: {
+          identifier: fresh.identifier,
+          status: "blocked",
+          previousStatus: issue.status,
+          source: "recovery.reconcile_continuation_waiting_on_review",
           blockedByIssueIds,
         },
-        "review-wait blocker write raced a concurrent relation update and formed a cycle; parking without dependency",
-      );
-      return null;
-    }
-    if (!updated) return null;
-
-    const waitingOn = formatIssueLinksForComment(
-      blockedByIssueIds
-        .map((id) => blockerRowsById.get(id))
-        .filter((row): row is { id: string; identifier: string | null; source: string } => Boolean(row)),
-    );
-    await issuesSvc.addComment(
-      issue.id,
-      `This task is waiting on ${waitingOn} to finish. ` +
-        "It will continue automatically when that work is done - there's nothing you need to do. " +
-        "(It was paused because the latest run reported it was waiting for review/approval; " +
-        "Paperclip turned that into a normal dependency wait instead of flagging it as stuck.)",
-      {},
-      { authorType: "system" },
-    );
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: null,
-      runId: null,
-      action: "issue.updated",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        identifier: issue.identifier,
-        status: "blocked",
-        previousStatus: issue.status,
-        source: "recovery.reconcile_continuation_waiting_on_review",
-        blockedByIssueIds,
-      },
+      }, { deferPublish: true });
+      return { updated, publish };
     });
-    return updated;
+    if (!result) return null;
+    result.publish();
+    return result.updated;
   }
 
   // BLO-19954: cancel a routine-execution issue whose only run was suppressed
@@ -5822,10 +6048,8 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
   ) {
-    return await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${issue.companyId} || ':' || ${issue.id}, 0))`,
-      );
+    const result = await db.transaction(async (tx) => {
+      await lockIssueOwnership(tx, issue.companyId, issue.id);
 
       const [fresh] = await tx
         .select()
@@ -5846,7 +6070,7 @@ export function recoveryService(
       );
       if (!updated) return null;
 
-      await logActivity(db, {
+      const publish = await logActivity(tx as unknown as Db, {
         companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
@@ -5863,7 +6087,7 @@ export function recoveryService(
           latestRunId: latestRun?.id ?? null,
           latestRunErrorCode: latestRun?.errorCode ?? null,
         },
-      });
+      }, { deferPublish: true });
 
       await issuesSvc.addComment(
         fresh.id,
@@ -5877,8 +6101,11 @@ export function recoveryService(
         tx,
       );
 
-      return updated;
+      return { updated, publish };
     });
+    if (!result) return null;
+    result.publish();
+    return result.updated;
   }
 
   // BLO-27463: incremented by the dependency-wait gate inside
@@ -5940,21 +6167,29 @@ export function recoveryService(
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
     const escalation = await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
-      );
+      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
 
       // Re-read source issue under the lock so the recovery action records
       // the latest owner/status evidence and repeated sweeps reuse the same
       // source-scoped action instead of creating issue-backed fallbacks.
+      // BLO-19160: the handover decision and every durable mutation that depends on it
+      // must share this transaction. The checkout/adoption paths take the same advisory
+      // lock, so an adoption either commits before this read (and is observed here) or
+      // waits until this transaction commits. The row lock then keeps non-advisory issue
+      // writers from changing the ownership snapshot while the recovery mutation runs.
+      // Keep all issue/action/comment/activity writes on `tx`; using the pooled `db` here
+      // would self-block on the row lock while this callback is awaiting that other query.
+      // Match `issuesSvc.update`'s graph-lock order: ownership arbitration,
+      // company graph lock, then the issue row. Taking the row first here and
+      // the graph lock inside `update` would invert against a concurrent
+      // blocker/parent mutation (which takes the graph lock before its row).
+      await lockIssueParentMutationCompany(input.issue.companyId, tx);
       const freshQuery = tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      const [fresh] = input.expectedReviewStage
-        ? await freshQuery.for("update")
-        : await freshQuery;
+      const [fresh] = await freshQuery.for("update");
       if (!fresh) return null;
       // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
       // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
@@ -6077,30 +6312,10 @@ export function recoveryService(
         return null;
       }
 
-      // BLO-19160: same shape as the status CAS above, for the lock/owner
-      // columns. An adoption that commits between the handover observation and
-      // this transaction means a live run holds this issue's execution lock;
-      // escalating on the evidence read before it would reassign the issue away
-      // from that run and revoke the assignee's write access — the BLO-18860
-      // failure mode through a narrower window. Bail rather than clobber.
-      //
-      // LIMITATION, measured — this NARROWS the window, it does not close it.
-      // `adoptStaleCheckoutRun` (services/issues.ts) takes no advisory lock; it
-      // serializes on a `select … for update` ROW lock of this row, so the two
-      // paths share no mutual-exclusion primitive and an adoption committing
-      // after this comparison is not excluded. The two obvious fixes both
-      // DEADLOCK here and were reverted after being measured:
-      //   * `fresh` → `.for("update")`, and/or
-      //   * routing the mutation below through `tx`
-      // Either one hangs `issue-recovery-actions.test.ts` at the 60s test
-      // timeout, because helpers between the read and the write touch this same
-      // issue row on the pooled `db` connection and block on the tx's lock.
-      // Closing it properly means threading `tx` through those helpers, which is
-      // BLO-18829's scope (`Stranded-escalation side effects escape when the
-      // expectedStatus CAS loses the race` — the identical defect class for the
-      // status CAS directly above). Until then: a *detected* race is side-effect
-      // free, because this check precedes the action upsert, quota monitor and
-      // wake enqueue.
+      // BLO-19160: re-check the handover evidence under the same lock before
+      // creating recovery state. This remains useful for callers whose candidate
+      // snapshot is already stale; the advisory/row lock closes the mutation-time
+      // race with checkout adoption.
       if (
         input.expectedLockOwnerState &&
         !issueLockOwnerStateMatches(input.expectedLockOwnerState, {
@@ -6113,7 +6328,6 @@ export function recoveryService(
       }
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
-      const mutationDb = input.expectedReviewStage ? tx : db;
       const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
@@ -6121,71 +6335,30 @@ export function recoveryService(
         recoveryCause,
         recoveryOwnerAgentId: input.recoveryOwnerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-      }, mutationDb);
+      }, tx);
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
       const {
         blockerIssueIds: blockerIds,
         needsHumanDecision,
-      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id, mutationDb);
+      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id, tx);
 
-      if (!input.expectedReviewStage) {
-        if (isProviderQuotaWait && action.returnOwnerAgentId) {
-          await ensureProviderQuotaWaitRecoveryMonitor({
-            issue: fresh,
-            latestRun: input.latestRun,
-            actionId: action.id,
-            agentId: action.returnOwnerAgentId,
-          });
-        }
-        await enqueueSourceScopedStrandedRecoveryWake({
-          action,
-          issue: fresh,
-          latestRun: input.latestRun,
-          recoveryCause,
-          hasNewActivitySinceLastAttempt,
-        });
-      }
+      // Wakes and quota monitors are intentionally deferred until after commit.
+      // Both can write issue/run state through another pooled connection and must
+      // never publish work for a transaction that later rolls back.
 
       const issueUpdate = {
         status: "blocked" as const,
         blockedByIssueIds: blockerIds,
         assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
-        // Do not overwrite an ordinary reassignment that commits after the
-        // lock-fresh read. The issue service repeats this snapshot in the SQL
-        // WHERE clause, so a blocked UPDATE is rejected against the latest
-        // assignee rather than applying the stale recovery decision.
+        expectedCurrentStatus: fresh.status,
+        // Keep the assignee snapshot as a belt-and-braces write precondition.
         expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
       };
-      // That rejection arrives as a thrown 409, not a falsy return (see
-      // `isAssigneePreconditionConflict`), so it must be caught here. Letting it escape
-      // aborts the caller's whole reconcile batch and leaves every remaining stranded
-      // issue unreconciled — a far larger fault than the one issue we lost the race on.
-      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
-      try {
-        updated = await issuesSvc.update(input.issue.id, issueUpdate, mutationDb);
-      } catch (error) {
-        if (!isAssigneePreconditionConflict(error)) throw error;
-        // Only the non-review path writes through `db`; the review-stage path writes through
-        // `tx`, where swallowing this would commit the action upsert without the matching
-        // issue UPDATE instead of rolling both back. That path also holds a `FOR UPDATE` row
-        // lock on the issue from its lock-fresh read, so a competing assignee write blocks
-        // until we commit and this conflict is unreachable there — but rethrow rather than
-        // trade an atomic rollback for a partial commit on an assumption.
-        if (input.expectedReviewStage) throw error;
-        logger.info(
-          {
-            issueId: fresh.id,
-            companyId: fresh.companyId,
-            expectedAssigneeAgentId: fresh.assigneeAgentId,
-            recoveryActionId: action.id,
-            recoveryCause,
-          },
-          "skipping stranded recovery escalation: assignee changed before the update could be applied",
-        );
-        return null;
-      }
-      if (!updated) return null;
+      // Any failed precondition rolls back the action and comments together with
+      // this issue update, so no partial recovery state escapes the transaction.
+      const updated = await issuesSvc.update(input.issue.id, issueUpdate, tx);
+      if (!updated) throw new RecoveryEscalationRollback();
       if (isProviderQuotaWait) {
         return {
           updated,
@@ -6273,7 +6446,7 @@ export function recoveryService(
         const escalationCommentMarker = announcesReassignment
           ? reassignmentMarker
           : `Recovery action: \`${action.id}\``;
-        const hasEscalationComment = await mutationDb
+        const hasEscalationComment = await tx
           .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
           .from(issueComments)
           .where(and(eq(issueComments.issueId, fresh.id), eq(issueComments.authorType, "system")))
@@ -6292,14 +6465,14 @@ export function recoveryService(
               authorType: "system",
               presentation: notice.presentation,
               metadata: notice.metadata,
-            }, mutationDb);
+            }, tx);
           } else {
             await issuesSvc.addComment(
               fresh.id,
               `${input.comment ?? "Automatic stranded-work recovery needs manual attention."}${recoveryLine}`,
               {},
               { authorType: "system" },
-              mutationDb,
+              tx,
             );
           }
         }
@@ -6334,7 +6507,7 @@ export function recoveryService(
         // is guaranteed to age the marker out and let a later sweep re-announce the same
         // exhaustion. Filtered by issue + author in SQL and capped at one row, so it costs
         // an index seek rather than the 50-row fetch it replaces.
-        const alreadyAnnounced = await mutationDb
+        const alreadyAnnounced = await tx
           .select({ id: issueComments.id })
           .from(issueComments)
           .where(and(
@@ -6375,12 +6548,12 @@ export function recoveryService(
             ].join("\n"),
             {},
             { authorType: "system" },
-            mutationDb,
+            tx,
           );
         }
       }
 
-      const publishEscalationActivity = await logActivity(mutationDb as Db, {
+      const publishEscalationActivity = await logActivity(tx as unknown as Db, {
         companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
@@ -6425,13 +6598,8 @@ export function recoveryService(
           blockerIssueIds: blockerIds,
         },
       }, {
-        // Only the review-stage path passes a transaction as `mutationDb` (see the
-        // `input.expectedReviewStage ? tx : db` binding above). Deferring there hands the
-        // live/plugin publish back to the caller, which fires it after commit; on the
-        // non-review path `mutationDb` is the autocommit connection, so publishing inline
-        // is already correct and deferring would strand the event behind a caller that has
-        // nothing left to commit.
-        deferPublish: Boolean(input.expectedReviewStage),
+        // The activity row is transactional; publish only after its commit.
+        deferPublish: true,
       });
 
       return {
@@ -6449,13 +6617,14 @@ export function recoveryService(
         // marks this as a real strand, distinguishing it from the provider-quota park above.
         schedulerFailureHeartbeat: { prefix },
       };
+    }).catch((error) => {
+      if (error instanceof RecoveryEscalationRollback) return null;
+      throw error;
     });
     if (!escalation) return null;
 
-    // `logActivity` deliberately deferred publication while the review-stage escalation was
-    // transactional. The state is committed now, so publish its live/plugin events before
-    // attempting the independent wake dispatch. A later dispatch failure leaves a durable
-    // recovery action, but must not make the successful escalation activity disappear.
+    // All durable state is committed now. Publish the activity before independent
+    // wake dispatch; a dispatch failure leaves the recovery action for the next sweep.
     escalation.publishEscalationActivity?.();
 
     // The active recovery action committed above is the durable wake intent.
@@ -6463,23 +6632,26 @@ export function recoveryService(
     // issue synchronously, and running it inside this transaction would either
     // self-block or publish work that an eventual rollback made inapplicable.
     // A failed dispatch leaves the action active for the next recovery sweep.
-    if (input.expectedReviewStage && escalation.recoveryCause === "provider_quota" && !escalation.action.ownerAgentId && escalation.action.returnOwnerAgentId) {
+    if (escalation.recoveryCause === "provider_quota" && !escalation.action.ownerAgentId && escalation.action.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
-        issue: escalation.fresh,
+        issue: escalation.updated,
         latestRun: input.latestRun,
         actionId: escalation.action.id,
         agentId: escalation.action.returnOwnerAgentId,
       });
     }
-    if (input.expectedReviewStage) {
-      await enqueueSourceScopedStrandedRecoveryWake({
-        action: escalation.action,
-        issue: escalation.fresh,
-        latestRun: input.latestRun,
-        recoveryCause: escalation.recoveryCause,
-        hasNewActivitySinceLastAttempt: escalation.hasNewActivitySinceLastAttempt,
-      });
-    }
+    await enqueueSourceScopedStrandedRecoveryWake({
+      action: escalation.action,
+      issue: escalation.fresh,
+      latestRun: input.latestRun,
+      recoveryCause: escalation.recoveryCause,
+      hasNewActivitySinceLastAttempt: escalation.hasNewActivitySinceLastAttempt,
+      expectedLockOwnerState: {
+        executionRunId: escalation.updated.executionRunId,
+        checkoutRunId: escalation.updated.checkoutRunId,
+        assigneeAgentId: escalation.updated.assigneeAgentId,
+      },
+    });
     if (escalation.needsHumanDecision) {
       const assigneeAgent = escalation.fresh.assigneeAgentId
         ? await db
@@ -6549,47 +6721,74 @@ export function recoveryService(
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
     latestRun: LatestIssueRun;
+    expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
-    return await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       // Serialize per (company, source-issue) so racing reconcile sweeps don't
       // double-escalate. Xact-scoped advisory lock, same key shape as
       // escalateStrandedAssignedIssue.
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${input.issue.companyId} || ':' || ${input.issue.id}, 0))`,
-      );
+      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
 
       const [fresh] = await tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (!fresh) return null;
       // Peer sweep already escalated this source under the lock.
       if (fresh.status === "blocked") return fresh;
+      if (fresh.status !== input.previousStatus) return null;
+      if (
+        input.expectedLockOwnerState &&
+        !issueLockOwnerStateMatches(input.expectedLockOwnerState, {
+          executionRunId: fresh.executionRunId,
+          checkoutRunId: fresh.checkoutRunId,
+          assigneeAgentId: fresh.assigneeAgentId,
+        })
+      ) return null;
 
-      const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(
+          fresh.id,
+          {
+            status: "blocked",
+            expectedCurrentStatus: fresh.status,
+            expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
+            expectedCurrentCheckoutRunId: fresh.checkoutRunId,
+            expectedCurrentExecutionRunId: fresh.executionRunId,
+          },
+          tx,
+        );
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 409) return null;
+        throw error;
+      }
       if (!updated) return null;
 
       await issuesSvc.addComment(
-        input.issue.id,
+        fresh.id,
         buildZeroTokenStartupFailureComment({
           previousStatus: input.previousStatus,
           latestRun: input.latestRun,
         }),
         {},
+        { authorType: "system" },
+        tx,
       );
 
-      await logActivity(db, {
-        companyId: input.issue.companyId,
+      const publish = await logActivity(tx as unknown as Db, {
+        companyId: fresh.companyId,
         actorType: "system",
         actorId: "system",
         agentId: null,
         runId: null,
         action: "issue.updated",
         entityType: "issue",
-        entityId: input.issue.id,
+        entityId: fresh.id,
         details: {
-          identifier: input.issue.identifier,
+          identifier: fresh.identifier,
           status: "blocked",
           previousStatus: input.previousStatus,
           source: "recovery.reconcile_stranded_assigned_issue.zero_token_startup_failure",
@@ -6598,10 +6797,13 @@ export function recoveryService(
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
           recoveryWrapperSuppressed: true,
         },
-      });
+      }, { deferPublish: true });
 
-      return updated;
+      return { updated, publish };
     });
+    if (!result) return null;
+    if ("publish" in result) result.publish();
+    return "updated" in result ? result.updated : result;
   }
 
   // BLO-10889 (BLO-10866 WS2): defense-in-depth for the zero-token
@@ -7631,6 +7833,7 @@ export function recoveryService(
               issue,
               previousStatus: "todo",
               latestRun,
+              expectedLockOwnerState: adoptionHandoverLockGuard,
             });
             if (updated) {
               result.escalated += 1;
@@ -7745,12 +7948,13 @@ export function recoveryService(
         continue;
       }
       if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue)) {
-        const updated = await parkReviewWaitingContinuationIssue({
+        const parkOutcome = await parkReviewWaitingContinuationIssue({
           issue,
           previousStatus: "in_progress",
           latestRun,
+          expectedLockOwnerState: adoptionHandoverLockGuard,
         });
-        if (updated) {
+        if (parkOutcome === "parked") {
           result.reviewWaitingParked += 1;
           result.issueIds.push(issue.id);
         } else {
@@ -7932,6 +8136,7 @@ export function recoveryService(
             issue,
             previousStatus: "in_progress",
             latestRun,
+            expectedLockOwnerState: adoptionHandoverLockGuard,
           });
           if (updated) {
             result.escalated += 1;
@@ -7981,6 +8186,7 @@ export function recoveryService(
               issue,
               previousStatus: "in_progress",
               latestRun,
+              expectedLockOwnerState: adoptionHandoverLockGuard,
             });
             if (parkOutcome === "parked") {
               result.reviewWaitingParked += 1;
@@ -7993,6 +8199,10 @@ export function recoveryService(
               // guard requires `status === "in_progress"`). Never a stranded escalation:
               // falling through here previously let the second sweep pass clobber a
               // just-parked issue back to `blocked` 21s later.
+              result.skipped += 1;
+              continue;
+            }
+            if (parkOutcome === "lost_race") {
               result.skipped += 1;
               continue;
             }

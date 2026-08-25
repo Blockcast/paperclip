@@ -188,6 +188,64 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
     expect(dispatchFailedRows).toHaveLength(0);
   });
 
+  it("durably skips a recovery wake when issue ownership changes before enqueueWakeup locks it", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const expectedLockOwnerState = {
+      executionRunId: null,
+      checkoutRunId: null,
+      assigneeAgentId: agentId,
+    };
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Ownership changes before recovery wake",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const racingHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeIssueWakeLockForTest: async ({ issueId: lockingIssueId }) => {
+        expect(lockingIssueId).toBe(issueId);
+        await db
+          .update(issues)
+          .set({ assigneeAgentId: null, updatedAt: new Date() })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const run = await racingHeartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assignment_recovery",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assignment_recovery" },
+      expectedLockOwnerState,
+    });
+
+    expect(run).toBeNull();
+    const skippedRows = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, "skipped"),
+      ));
+    expect(skippedRows).toEqual([{ reason: "issue_execution_ownership_changed" }]);
+
+    const issueRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+    expect(issueRuns).toHaveLength(0);
+  });
+
   it("passes a business-rule HttpError straight through with no retry delay and no durable dispatch_failed record", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentStatus: "paused" });
 
