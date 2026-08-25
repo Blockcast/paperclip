@@ -1614,18 +1614,18 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     const { agentId, runId, oldJobName, oldJobUid } =
       await seedMigratingAgentWithLaunchedReservation();
 
-    // The committed half of the PATCH: the agent is now claude_k8s while its
+    // The committed half of the PATCH: the agent is now codex_local while its
     // reservation still describes the opencode_k8s Job. This is exactly the
     // divergence that wedged production.
     await db
       .update(agents)
-      .set({ adapterType: "claude_k8s", updatedAt: new Date() })
+      .set({ adapterType: "codex_local", updatedAt: new Date() })
       .where(eq(agents.id, agentId));
 
     // What routes/agents.ts now invokes from its adapter-type-change block.
     const cancelled = await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
       agentId,
-      "Cancelled because the agent's adapter type changed from opencode_k8s to claude_k8s",
+      "Cancelled because the agent's adapter type changed from opencode_k8s to codex_local",
     );
     expect(cancelled).toBe(1);
 

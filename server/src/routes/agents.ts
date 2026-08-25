@@ -3586,13 +3586,20 @@ export function agentRoutes(
             id,
             `Cancelled because the agent's adapter type changed from ${existing.adapterType} to ${agent.adapterType}`,
           );
-        } catch {
+        } catch (error) {
           // Non-fatal, and deliberately so: the adapter-type change itself has
           // already committed, and refusing to return it would leave the
           // caller believing the migration failed when it did not. The reaper
-          // still reaches this state via the hard-stale path, just slowly --
-          // which is exactly the pre-BLO-28865 behaviour, i.e. this catch
-          // degrades to the old outcome rather than to a worse one.
+          // and alert still expose the stranded state if teardown fails.
+          logger.warn(
+            {
+              err: error,
+              agentId: id,
+              from: existing.adapterType,
+              to: agent.adapterType,
+            },
+            "adapter-type change: reservation-holder teardown failed",
+          );
         }
       }
     }
