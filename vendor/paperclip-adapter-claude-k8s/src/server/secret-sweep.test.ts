@@ -4,6 +4,7 @@ import {
   ADAPTER_TYPE_LABEL,
   createSweepGate,
   DEFAULT_LAUNCH_LEASE_SEC,
+  createLaunchLeaseHeartbeat,
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   deriveOwningJobName,
   LAUNCH_LEASE_ANNOTATION,
@@ -376,6 +377,26 @@ describe("launchLeaseExpiry", () => {
     const result = await sweepOrphanedRunSecrets({ ...h.opts, now: NOW + AGE_FLOOR_MS + 1 });
 
     expect(result.retained).toEqual([{ name: "ac-agent-run-rt-prompt", reason: "launch_in_flight" }]);
+  });
+
+  it("renews a Secret while a launch API call is still stalled", async () => {
+    vi.useFakeTimers();
+    const patchNamespacedSecret = vi.fn().mockResolvedValue({});
+    const heartbeat = createLaunchLeaseHeartbeat({
+      coreApi: { patchNamespacedSecret },
+      leaseMs: 9_000,
+    });
+    heartbeat.add({ name: "ac-agent-run-stalled-prompt", namespace: "paperclip" });
+
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    expect(patchNamespacedSecret).toHaveBeenCalledWith(expect.objectContaining({
+      name: "ac-agent-run-stalled-prompt",
+      namespace: "paperclip",
+      body: { metadata: { annotations: { [LAUNCH_LEASE_ANNOTATION]: expect.any(String) } } },
+    }));
+    heartbeat.stop();
+    vi.useRealTimers();
   });
 });
 

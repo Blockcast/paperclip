@@ -14,6 +14,7 @@ import {
   ADAPTER_TYPE,
   ADAPTER_TYPE_LABEL,
   createSweepGate,
+  createLaunchLeaseHeartbeat,
   DEFAULT_LAUNCH_LEASE_SEC,
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   DEFAULT_SWEEP_INTERVAL_SEC,
@@ -1275,6 +1276,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
+  let stopLaunchLeaseHeartbeat: (() => void) | null = null;
   // runtimeSessionParams and currentSessionIdRaw are also used after the
   // try block (in the result-parsing section) so hoist them here.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -1486,10 +1488,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // or any other — can tell a launch in flight from one that died before it
     // could set an ownerReference (BLO-21857).  Taken once so all three Secrets
     // share a deadline.
+    const launchLeaseMs = Math.max(0, asNumber(config.orphanSecretLaunchLeaseSec, DEFAULT_LAUNCH_LEASE_SEC)) * 1000;
     const launchLease = launchLeaseExpiry(
       Date.now(),
-      Math.max(0, asNumber(config.orphanSecretLaunchLeaseSec, DEFAULT_LAUNCH_LEASE_SEC)) * 1000,
+      launchLeaseMs,
     );
+    const launchLeaseHeartbeat = createLaunchLeaseHeartbeat({
+      coreApi,
+      leaseMs: launchLeaseMs,
+      onError: (err) => onLog("stderr", `[paperclip] Warning: failed to renew launch Secret lease: ${err instanceof Error ? err.message : String(err)}\n`),
+    });
+    stopLaunchLeaseHeartbeat = launchLeaseHeartbeat.stop;
     await onLog("stdout", `[paperclip] Resolved ServiceAccount: ${built.serviceAccountName}\n`);
     if (built.skippedLabels.length > 0) {
       await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
@@ -1537,6 +1546,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: promptSecret.data,
           },
         });
+        launchLeaseHeartbeat.add(promptSecret);
         await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1575,6 +1585,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: envSecret.data,
           },
         });
+        launchLeaseHeartbeat.add(envSecret);
         await onLog("stdout", `[paperclip] Created env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1616,6 +1627,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: mcpConfigSecret.data,
           },
         });
+        launchLeaseHeartbeat.add(mcpConfigSecret);
         await onLog("stdout", `[paperclip] Created mcp-config Secret: ${mcpConfigSecret.name}\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1815,6 +1827,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
   } finally {
+    stopLaunchLeaseHeartbeat?.();
     // Release the per-agent creation mutex so the next queued execute() call
     // can proceed with its guard+create phase (FAR-29).
     _releaseMutex();

@@ -118,6 +118,58 @@ export interface SecretSweepCoreApi {
     items: { metadata?: SecretSweepObjectMeta }[];
   }>;
   deleteNamespacedSecret(req: { name: string; namespace: string }): Promise<unknown>;
+  patchNamespacedSecret?(req: { name: string; namespace: string; body: unknown }): Promise<unknown>;
+}
+
+export interface LaunchLeaseTarget {
+  name: string;
+  namespace: string;
+}
+
+/**
+ * Keep launch leases alive while the launching process is still able to create
+ * the Job. A timestamp by itself is not a coordination boundary: an uncancelled
+ * K8s request can outlive it. Renewing on the Secret makes the claim visible to
+ * every replica, while a process crash naturally stops renewals and lets the
+ * sweep collect the orphan.
+ */
+export function createLaunchLeaseHeartbeat(args: {
+  coreApi: Pick<SecretSweepCoreApi, "patchNamespacedSecret">;
+  leaseMs: number;
+  onError?: (err: unknown) => void | Promise<void>;
+}): {
+  add(target: LaunchLeaseTarget): void;
+  stop(): void;
+} {
+  const targets = new Map<string, LaunchLeaseTarget>();
+  const intervalMs = Math.max(1_000, Math.floor(args.leaseMs / 3));
+  let renewing = false;
+  const renew = async () => {
+    if (renewing || targets.size === 0 || typeof args.coreApi.patchNamespacedSecret !== "function") return;
+    renewing = true;
+    try {
+      const annotation = launchLeaseExpiry(Date.now(), args.leaseMs);
+      await Promise.all([...targets.values()].map((target) =>
+        args.coreApi.patchNamespacedSecret!({
+          name: target.name,
+          namespace: target.namespace,
+          body: {
+            metadata: { annotations: { [LAUNCH_LEASE_ANNOTATION]: annotation } },
+          },
+        }),
+      ));
+    } catch (err) {
+      await args.onError?.(err);
+    } finally {
+      renewing = false;
+    }
+  };
+  const timer = setInterval(() => { void renew(); }, intervalMs);
+  timer.unref?.();
+  return {
+    add(target) { targets.set(`${target.namespace}/${target.name}`, target); },
+    stop() { clearInterval(timer); targets.clear(); },
+  };
 }
 
 export interface SecretSweepBatchApi {
