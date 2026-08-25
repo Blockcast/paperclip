@@ -3188,7 +3188,10 @@ export function pluginRoutes(
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
-   * - 400 if the manifest is missing or lacks the webhooks.receive capability
+   * - 400 if the manifest is missing, lacks the webhooks.receive capability,
+   *   or an explicit companyId is required for a multi-company plugin
+   * - 404 if an explicit companyId is not configured
+   * - 503 (with `Retry-After`) if no company is configured yet
    * - 410 if the plugin has been uninstalled (the endpoint is gone for good)
    * - 503 (with `Retry-After`) if the plugin is not ready but can recover
    * - 502 if the worker is unavailable or the RPC call fails
@@ -3310,11 +3313,18 @@ export function pluginRoutes(
       companyId = requestedCompanyId;
     } else if (configuredCompanyIds.length === 1) {
       companyId = configuredCompanyIds[0]!;
+    } else if (configuredCompanyIds.length === 0) {
+      // Company configuration is operator-controlled and may be written after
+      // the plugin reaches ready. Treat that transient state like readiness so
+      // senders retain the payload instead of classifying it as permanent.
+      res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
+      res.status(503).json({
+        error: "Plugin must be configured for a company before receiving webhooks",
+      });
+      return;
     } else {
       res.status(400).json({
-        error: configuredCompanyIds.length === 0
-          ? "Plugin must be configured for a company before receiving webhooks"
-          : '"companyId" query parameter is required for a multi-company plugin',
+        error: '"companyId" query parameter is required for a multi-company plugin',
       });
       return;
     }
