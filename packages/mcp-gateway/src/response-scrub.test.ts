@@ -2231,3 +2231,84 @@ describe("scrubYamlText — a tab inside an argv block does not swallow the spec
     },
   );
 });
+
+/**
+ * Where `swallowFrom` may be applied, and — more importantly — where it may not.
+ *
+ * Auditing the arms around the two the review named turned up three more that
+ * set a threshold from a regex `(\s*)` capture, which measures a tab as length
+ * 1 rather than 0. Applying the guard uniformly is the obvious move and it is
+ * WRONG: returning `null` means "swallow nothing", so the following lines are
+ * re-scanned, which is fail-closed only when the re-scan lands on a
+ * default-redact arm.
+ *
+ * - `env:` and `command:`/`args:` open blocks whose default IS redact, so
+ *   dropping the swallow downgrades a silent deletion of the rest of the spec
+ *   into a visible per-line redaction. Strictly better: nothing leaks, and the
+ *   structure survives instead of vanishing.
+ * - `containers:` opens a block that merely gates argv and does not redact its
+ *   own contents. Dropping its swallow leaks the wrapped remainder of a flow
+ *   value — measured, not theorized. It keeps its raw threshold.
+ *
+ * The asymmetry is the rule. These tests exist so that a later "make it
+ * consistent" cleanup fails loudly rather than reopening the leak.
+ */
+describe("scrubYamlText — a tab-indented block key fails closed, not open", () => {
+  it("redacts the contents of a tab-indented `env:` flow key instead of deleting them", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        `\tenv: [{name: A, value: ${LEAK}}]`,
+        "    image: example/app:1.2.3",
+        "    ports:",
+        "    - containerPort: 8080",
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    // The lines survive as redactions rather than being swallowed wholesale.
+    // Three input lines followed the key; three lines must still follow it.
+    expect(out.trimEnd().split("\n")).toHaveLength(7);
+  });
+
+  it("redacts the contents of a tab-indented `args:` flow key instead of deleting them", () => {
+    const out = scrubYamlText(
+      [
+        "spec:",
+        "  containers:",
+        "  - name: app",
+        `\targs: [--token=${LEAK}]`,
+        "    image: example/app:1.2.3",
+        "    ports:",
+        "    - containerPort: 8080",
+      ].join("\n"),
+    );
+
+    expectNoLeak(out);
+    expect(out.trimEnd().split("\n")).toHaveLength(7);
+  });
+
+  // The counter-example. `containers:` does not default-redact its body, so it
+  // must keep swallowing — an over-swallow is the acceptable failure here and a
+  // leak is not.
+  it.each([
+    ["a wrapped flow value", `      args: ["--token=${LEAK}"]}]`],
+    ["a plain continuation", `      ${LEAK}`],
+  ])(
+    "does not emit %s after a tab-indented `containers:` key",
+    (_label, continuation) => {
+      expectNoLeak(
+        scrubYamlText(
+          [
+            "spec:",
+            "\tcontainers: [{name: c,",
+            continuation,
+            "  image: example/app:1.2.3",
+          ].join("\n"),
+        ),
+      );
+    },
+  );
+});
