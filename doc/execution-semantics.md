@@ -269,7 +269,7 @@ external owner: <who must act — a person, team, or external system>
 external action: <the concrete action they must take>
 ```
 
-Both lines are required; either one alone does not count. Matching is case-insensitive and tolerates leading whitespace, so `External owner: …` is fine — but the `key: value` shape is mandatory. A sentence such as "waiting on the CTO to approve the ruleset change" does **not** match, however clearly it names the gate.
+Both lines are required; either one alone does not count. Matching is case-insensitive and tolerates leading spaces and tabs, so `External owner: …` is fine — but the `key: value` shape is mandatory. Each value must sit on the same line as its key: `external owner:` with the name on the line below is an incomplete declaration and does not match. A sentence such as "waiting on the CTO to approve the ruleset change" does **not** match, however clearly it names the gate.
 
 Use this to park an issue on a gate the issue graph cannot represent: an approval, a credential grant, another team's sign-off. Per the monitor contract, do **not** arm a monitor on a human-only gate — polling does not move it. Declare the external wait instead.
 

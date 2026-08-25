@@ -4335,11 +4335,17 @@ async function listSuccessfulRunHandoffMapForIssues(
  * description to park an issue on a human gate. Exported so the liveness sweep can see
  * the same signal (BLO-24662) — a gate narrated in prose is still a gate, and without it
  * the `blocked_without_blockers` rule reads deliberate parking as a dead end.
+ *
+ * Whitespace is horizontal-only (`[ \t]`) throughout, because `\s` spans line
+ * terminators and the documented contract is one declaration per line. With `\s*` a
+ * blank key consumed the *next* line, so `external owner:\nexternal action: X` parsed
+ * as `{ owner: "external action: X", action: "X" }` — a successful parse with a garbage
+ * owner that then reached the redaction path (BLO-28618).
  */
 export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
   if (!description) return null;
-  const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
-  const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
+  const owner = description.match(/^[ \t]*external owner[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
+  const action = description.match(/^[ \t]*external action[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
   if (!owner || !action) return null;
   return {
     owner: owner.slice(0, 120),
