@@ -1722,6 +1722,16 @@ export function recoveryService(
         executionLockedAt: Date | null;
       },
     ) => Promise<void> | void;
+    /**
+     * Test-only seam for the review-wait blocker relation write. Production
+     * leaves this unset; tests use it to inject the same cycle error that the
+     * issue service can raise after a concurrent relation update, without
+     * intercepting the recovery transaction itself.
+     */
+    beforeContinuationReviewBlockerUpdateForTest?: (input: {
+      issueId: string;
+      blockedByIssueIds: string[];
+    }) => Promise<void> | void;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -5973,6 +5983,10 @@ export function recoveryService(
 
       let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
       try {
+        await deps.beforeContinuationReviewBlockerUpdateForTest?.({
+          issueId: fresh.id,
+          blockedByIssueIds,
+        });
         updated = await issuesSvc.update(
           fresh.id,
           {
@@ -6054,8 +6068,9 @@ export function recoveryService(
       const [fresh] = await tx
         .select()
         .from(issues)
-        .where(eq(issues.id, issue.id))
-        .limit(1);
+        .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
+        .limit(1)
+        .for("update");
       if (!fresh || isTerminalIssueStatus(fresh.status)) return null;
 
       // BLO-27572: explicitly suppress the scheduler-side failure heartbeat that
@@ -6063,11 +6078,27 @@ export function recoveryService(
       // cancellation that must stay silent: the window is NOT dark, because
       // another open execution issue already owns the dispatch lock and is doing
       // the work. A receipt here would manufacture a false dark-window alarm.
-      const updated = await issuesSvc.update(
-        fresh.id,
-        { status: "cancelled", suppressRoutineSchedulerFailureHeartbeat: true },
-        tx,
-      );
+      let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
+      try {
+        updated = await issuesSvc.update(
+          fresh.id,
+          {
+            status: "cancelled",
+            suppressRoutineSchedulerFailureHeartbeat: true,
+            expectedCurrentStatus: fresh.status,
+            expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
+            expectedCurrentCheckoutRunId: fresh.checkoutRunId,
+            expectedCurrentExecutionRunId: fresh.executionRunId,
+          },
+          tx,
+        );
+      } catch (error) {
+        // A concurrent owner/status writer won after the recovery snapshot. This
+        // duplicate is no longer ours to cancel; importantly, do not append the
+        // cancellation activity or comment for a mutation that did not happen.
+        if (error instanceof HttpError && error.status === 409) return null;
+        throw error;
+      }
       if (!updated) return null;
 
       const publish = await logActivity(tx as unknown as Db, {
@@ -10212,6 +10243,13 @@ export function recoveryService(
           actionLastAttemptAt: issueRecoveryActions.lastAttemptAt,
           issueId: issues.id,
           issueStatus: issues.status,
+          // Preserve the ownership tuple observed with the candidate. The backstop
+          // claims the recovery action before enqueueing, so adoption can commit in
+          // the gap between those operations; enqueueWakeup performs the final
+          // ownership CAS under the issue lock.
+          executionRunId: issues.executionRunId,
+          checkoutRunId: issues.checkoutRunId,
+          assigneeAgentId: issues.assigneeAgentId,
           identifier: issues.identifier,
           totalCount: sql<number>`count(*) over()::int`,
         })
@@ -10390,6 +10428,11 @@ export function recoveryService(
             recoveryCause: candidate.actionCause,
             backstop: "stranded_recovery_wake_backstop",
           }, "status_only"),
+          expectedLockOwnerState: {
+            executionRunId: candidate.executionRunId,
+            checkoutRunId: candidate.checkoutRunId,
+            assigneeAgentId: candidate.assigneeAgentId,
+          },
         });
         if (!wake) {
           result.deferredOrFailed += 1;

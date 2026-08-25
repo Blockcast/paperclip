@@ -6317,27 +6317,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // No reverse `blocks` relation is seeded, so the recovery reachability check
     // (findCycleFormingBlockerIssueIds) will not flag openChildId as cycle-forming - it
     // only sees a cycle at write time, simulating a relation update that lands between
-    // the check and the write. The real write-time check (assertNoBlockingCycles) runs
-    // inside issuesSvc.update's db.transaction(), so the fault is injected on the first
-    // transaction the reconcile pass opens rather than on db.update directly (that
-    // transaction's tx.update/tx.select calls are a separate client, invisible to a
-    // db.update spy).
-    const transactionSpy = vi.spyOn(db, "transaction");
+    // the check and the write. Inject the error at the review-wait helper's actual
+    // blocker-update boundary; mocking `db.transaction` would intercept the outer
+    // recovery transaction introduced for ownership serialization instead of the
+    // relation write that the helper catches.
     let cycleErrorThrown = false;
-    transactionSpy.mockImplementationOnce(async () => {
+    const beforeContinuationReviewBlockerUpdateForTest = vi.fn(async () => {
       cycleErrorThrown = true;
       throw new Error("Blocking relations cannot contain cycles");
     });
 
-    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    heartbeat = createHeartbeat({
+      penstockAvailabilityGate: allowPenstockGate,
+      skipQueuedRunDispatch: true,
+      beforeContinuationReviewBlockerUpdateForTest,
+    });
     let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
-    try {
-      result = await heartbeat.reconcileStrandedAssignedIssues();
-    } finally {
-      transactionSpy.mockRestore();
-    }
+    result = await heartbeat.reconcileStrandedAssignedIssues();
 
     expect(cycleErrorThrown).toBe(true);
+    expect(beforeContinuationReviewBlockerUpdateForTest).toHaveBeenCalledWith({
+      issueId,
+      blockedByIssueIds: [openChildId],
+    });
     expect(result.waitingOnReviewResolved).toBe(0);
     expect(result.reviewWaitingParked).toBe(1);
     expect(result.escalated).toBe(0);

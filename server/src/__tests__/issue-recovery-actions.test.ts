@@ -856,6 +856,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         recoveryActionId: action!.id,
         backstop: "stranded_recovery_wake_backstop",
       },
+      expectedLockOwnerState: {
+        executionRunId: null,
+        checkoutRunId: null,
+        assigneeAgentId: managerId,
+      },
     });
   });
 
