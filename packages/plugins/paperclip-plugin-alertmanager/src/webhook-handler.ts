@@ -875,16 +875,27 @@ export async function handleResolved(
         // state the plugin would then have to reconcile. The holder disposes
         // of the row when it finishes — which is the correct owner of that
         // decision — and a later re-fire refreshes it in place (BLO-24234).
-        cancelWithheldForRunId = holderRunId ?? "unknown";
-        await ensureCancelWithheldComment(
-          ctx,
+        // The diagnostic read above can race with checkout/release. Re-read
+        // after the CAS conflict so a newly acquired owner is notified rather
+        // than persisting a misleading `unknown` marker that would suppress
+        // future notifications for the real holder.
+        const currentIssue = await ctx.issues.get(
           existing.paperclipIssueId,
           existing.paperclipCompanyId,
-          resolvedAt,
-          cancelWithheldForRunId,
         );
+        cancelWithheldForRunId =
+          currentIssue?.executionRunId ?? currentIssue?.checkoutRunId ?? holderRunId;
+        if (cancelWithheldForRunId) {
+          await ensureCancelWithheldComment(
+            ctx,
+            existing.paperclipIssueId,
+            existing.paperclipCompanyId,
+            resolvedAt,
+            cancelWithheldForRunId,
+          );
+        }
         ctx.logger.info(
-          `Alertmanager: withheld resolve-cancel for ${alertname} (${alert.fingerprint}) — issue ${existing.paperclipIssueId} is held by run ${cancelWithheldForRunId}`,
+          `Alertmanager: withheld resolve-cancel for ${alertname} (${alert.fingerprint}) — issue ${existing.paperclipIssueId} is held by run ${cancelWithheldForRunId ?? "an unobserved owner"}`,
         );
         await ctx.metrics.write("alertmanager.resolved.cancel_withheld", 1, {
           alertname,
