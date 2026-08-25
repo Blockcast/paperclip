@@ -209,18 +209,79 @@ function isBlank(line: string): boolean {
  * the first entry. A line at the block indent continues the block only when it
  * opens a sequence entry; anything else at that indent or shallower is a
  * sibling key and ends it.
+ *
+ * Two shapes are held inside the block regardless of their indentation, because
+ * for both of them indentation is not the structural signal it appears to be.
+ * This guard runs *before* the in-block scanner, so a line that ends the block
+ * is never classified by it — which is what made these fail-opens rather than
+ * cosmetic bugs:
+ *
+ * - **A comment line.** YAML comments may sit at any column, including column 0
+ *   in the middle of a nested block. Only a comment at exactly `blockIndent` was
+ *   held in; one at column 0 ended the block from inside it, and every `value:`
+ *   after it missed the in-block default-redact and printed in the clear. The
+ *   comment need not be adjacent to the value, and carries no material itself,
+ *   so keeping it in costs nothing.
+ * - **A tab-indented line.** `leadingIndent` counts spaces, so a tab-indented
+ *   line measures as indent 0 and ended the block from inside it. YAML forbids
+ *   tabs in indentation outright, so such a line is never a legitimate sibling
+ *   key; holding it in hands it to the in-block scanner, which is the fail-closed
+ *   direction. The in-block patterns are `\s`-based and match it, so it is
+ *   classified rather than merely swallowed.
+ *
+ * Both reached `env:` (credential values) and `command:`/`args:` (argv material)
+ * alike, because all three block guards share this predicate.
  */
 function continuesBlock(line: string, blockIndent: number): boolean {
   if (isBlank(line)) return true;
+  if (COMMENT_LINE.test(line)) return true;
+  if (hasTabIndent(line)) return true;
   const indent = leadingIndent(line);
   if (indent > blockIndent) return true;
   if (indent < blockIndent) return false;
-  // At exactly the block indent a sequence entry continues the block — and so
-  // does a comment. Treating a comment as a sibling key closed the block before
-  // the in-block scanner ran, so every entry after it fell through to the final
-  // `emit(line)`: `args:` / `# note` / `- --token=SECRET` printed the token in
-  // the clear. A comment carries nothing itself, so continuing on it is free.
-  return line.slice(indent).startsWith("- ") || COMMENT_LINE.test(line);
+  // At exactly the block indent a sequence entry continues the block. Comments
+  // are already held in above, at any column.
+  return line.slice(indent).startsWith("- ");
+}
+
+/**
+ * True when the line's leading whitespace contains a tab.
+ *
+ * Scanned rather than regex-tested so it stops at the first non-whitespace
+ * character: a tab *inside* a value (`image: has\ttab`) is content, not
+ * indentation, and must not be treated as an unmeasurable line.
+ *
+ * A line whose indentation contains a tab has **no measurable depth**, and both
+ * uses of depth in this scanner have to respect that or they invert:
+ *
+ * - As a block-membership test, an unmeasurable line must NOT end the block.
+ *   `leadingIndent` counts spaces, so a tab-indented line measured as indent 0
+ *   and closed the block from *inside* it, and every `value:` after it missed
+ *   the in-block default-redact and printed in the clear.
+ * - As a swallow threshold, an unmeasurable line must NOT set one. That same
+ *   bogus 0 meant "drop every following line indented deeper than 0", which ate
+ *   the rest of the container spec — image, ports, resources, probes — and with
+ *   it the diagnostics the grant exists for.
+ *
+ * Skipping the swallow is safe precisely here: inside an env block the default
+ * is already REDACT, so a continuation line that is no longer swallowed still
+ * reaches the fail-closed arm and is redacted individually rather than dropped.
+ * The swallow is a legibility measure in this block, not the security boundary.
+ */
+function hasTabIndent(line: string): boolean {
+  for (const ch of line) {
+    if (ch === "\t") return true;
+    if (ch !== " ") return false;
+  }
+  return false;
+}
+
+/**
+ * The swallow threshold to set from `line`, or `null` when its indentation is
+ * unmeasurable and no threshold can honestly be computed. See `hasTabIndent`.
+ */
+function swallowFrom(line: string, computed: number): number | null {
+  return hasTabIndent(line) ? null : computed;
 }
 
 /**
@@ -889,7 +950,7 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         // `value: "<redacted>"` and then the plaintext on the next line, which
         // is worse than not scrubbing at all because the marker manufactures
         // false assurance.
-        swallowDeeperThan = indent!.length + dash.length;
+        swallowDeeperThan = swallowFrom(line, indent!.length + dash.length);
         continue;
       }
 
@@ -902,7 +963,7 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
       if (flowEntry) {
         const [, indent, dash] = flowEntry;
         redact(`${indent}${dash}"${REDACTED}"`, index);
-        swallowDeeperThan = indent!.length + dash!.length;
+        swallowDeeperThan = swallowFrom(line, indent!.length + dash!.length);
         continue;
       }
 
@@ -916,7 +977,7 @@ function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
         ? `${" ".repeat(indent)}${dash}"${keyValue[4]}=${REDACTED}"`
         : `${" ".repeat(indent)}${dash}"${REDACTED}"`;
       redact(replacement, index);
-      swallowDeeperThan = indent + dash.length;
+      swallowDeeperThan = swallowFrom(line, indent + dash.length);
       continue;
     }
 
