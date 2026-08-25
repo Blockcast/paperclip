@@ -1239,6 +1239,12 @@ describe("handleWebhook — resolved", () => {
       ctx: PluginContext,
       mocks: MockClients,
       updateImpl: () => Promise<unknown>,
+      postConflictIssue: unknown = {
+        id: "issue-existing",
+        status: "in_progress",
+        checkoutRunId: HELD_RUN_ID,
+        executionRunId: HELD_RUN_ID,
+      },
     ) => {
       mocks.state.get.mockResolvedValueOnce(heldState());
       mocks.issues.get.mockResolvedValueOnce({
@@ -1247,6 +1253,7 @@ describe("handleWebhook — resolved", () => {
         checkoutRunId: HELD_RUN_ID,
         executionRunId: HELD_RUN_ID,
       });
+      mocks.issues.get.mockResolvedValueOnce(postConflictIssue);
       mocks.issues.update.mockImplementationOnce(updateImpl);
       const envelope = baseEnvelope({
         status: "resolved",
@@ -1339,22 +1346,13 @@ describe("handleWebhook — resolved", () => {
 
     it("re-reads the current holder instead of persisting an unknown marker", async () => {
       const { ctx, mocks } = mkCtx();
-      mocks.issues.get
-        .mockResolvedValueOnce({
-          id: "issue-existing",
-          status: "in_progress",
-          checkoutRunId: null,
-          executionRunId: null,
-        })
-        .mockResolvedValueOnce({
-          id: "issue-existing",
-          status: "in_progress",
-          checkoutRunId: "new-holder-run",
-          executionRunId: null,
-        });
-
       await resolveOnce(ctx, mocks, async () => {
         throw lockConflict();
+      }, {
+        id: "issue-existing",
+        status: "in_progress",
+        checkoutRunId: "new-holder-run",
+        executionRunId: null,
       });
 
       const body = String(mocks.issues.createComment.mock.calls[0]![1]);
@@ -1363,6 +1361,24 @@ describe("handleWebhook — resolved", () => {
       expect(mocks.state.set).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ cancelWithheldForRunId: "new-holder-run" }),
+      );
+    });
+
+    it("does not persist a stale marker when the post-conflict row is unheld", async () => {
+      const { ctx, mocks } = mkCtx();
+
+      await resolveOnce(ctx, mocks, async () => {
+        throw lockConflict();
+      }, null);
+
+      expect(mocks.issues.createComment).not.toHaveBeenCalled();
+      expect(mocks.state.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          resolvedAt: "2026-08-23T15:22:00Z",
+          cancelWithheldForRunId: null,
+          cancelWithheldAt: null,
+        }),
       );
     });
   });
