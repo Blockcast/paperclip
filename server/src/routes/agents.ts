@@ -1849,12 +1849,68 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * The desired-skill keys an agent already carries in its persisted config.
+   *
+   * An unresolvable key cannot be canonicalized — it matches no library row, so
+   * there is nothing to canonicalize it against. A trimmed exact compare against
+   * the stored keys is therefore both the only comparison available and the
+   * correct one: it answers "did *this* write introduce the key?", which is the
+   * distinction the reject-vs-tolerate rule turns on. `readPaperclipSkillSyncPreference`
+   * already trims, so both sides of the compare are normalized identically.
+   */
+  function storedDesiredSkillKeys(adapterConfig: unknown): Set<string> {
+    const config = asRecord(adapterConfig);
+    if (!config) return new Set<string>();
+    return new Set(readPaperclipSkillSyncPreference(config).desiredSkills);
+  }
+
+  /**
+   * Reject desired-skill keys that this write *introduces* and that resolve to
+   * no company-skill row, while continuing to tolerate keys the agent already
+   * carried (BLO-7991).
+   *
+   * Both halves matter. Tolerating everything is how `garrytan/gstack/design-shotgun`
+   * — a key that named a catalog entry which never existed, because the skill was
+   * published upstream five days after the catalog's pinned import ref — was
+   * accepted in silence and then simply failed to materialize at pod start, with
+   * no error on any surface. Tolerating *nothing* is worse: a key whose library
+   * row was deleted after the fact would 422 every subsequent save, so the agent
+   * could neither run nor have the offending key removed, since removing it takes
+   * a successful write. Splitting on "introduced by this write" keeps stale keys
+   * visible and removable and still fails the never-resolvable case at the point
+   * where the caller is present to fix it.
+   */
+  function assertNoUnresolvableNewDesiredSkills(
+    unresolvedKeys: readonly string[],
+    previouslyDesiredKeys: ReadonlySet<string>,
+  ) {
+    const introduced = unresolvedKeys
+      .filter((key) => !previouslyDesiredKeys.has(key))
+      .sort();
+    if (introduced.length === 0) return;
+    throw unprocessable(
+      `Unknown desired skill${introduced.length > 1 ? "s" : ""}: ${introduced.join(", ")}. `
+      + "No matching skill exists in this company's library — import the skill first "
+      + "(POST /api/companies/:companyId/skills/import), then set it as desired.",
+    );
+  }
+
   async function resolveDesiredSkillAssignment(
     companyId: string,
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: AgentDesiredSkillEntry[] | undefined,
-    options: { tolerateUnknownDesiredSkills?: boolean } = {},
+    options: {
+      tolerateUnknownDesiredSkills?: boolean;
+      /**
+       * Keys the agent already carries. When supplied alongside
+       * `tolerateUnknownDesiredSkills`, tolerance narrows to exactly these —
+       * anything else unresolvable is a newly-introduced dangling key and is
+       * rejected instead of silently persisted.
+       */
+      previouslyDesiredKeys?: ReadonlySet<string>;
+    } = {},
   ) {
     if (!requestedDesiredSkills) {
       return {
@@ -1869,6 +1925,12 @@ export function agentRoutes(
       await companySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
         tolerateUnknownReferences: options.tolerateUnknownDesiredSkills,
       });
+    if (options.previouslyDesiredKeys) {
+      assertNoUnresolvableNewDesiredSkills(
+        unresolvedDesiredSkillKeys,
+        options.previouslyDesiredKeys,
+      );
+    }
     // Runtime materialization + version selection only ever consider skills that
     // actually resolve to the company library; stale keys can't be materialized.
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
@@ -2214,8 +2276,13 @@ export function agentRoutes(
         requestedSkills,
         // Toggling a resolvable skill must not fail just because the agent
         // already carries stale desired keys (e.g. a skill removed from the
-        // library). Preserve those keys so they remain visible/removable.
-        { tolerateUnknownDesiredSkills: true },
+        // library). Preserve those keys so they remain visible/removable —
+        // but scope that tolerance to the keys already stored, so this write
+        // cannot introduce a brand-new dangling key (BLO-7991).
+        {
+          tolerateUnknownDesiredSkills: true,
+          previouslyDesiredKeys: storedDesiredSkillKeys(agent.adapterConfig),
+        },
       );
       if (!desiredSkills || !desiredSkillEntries || !runtimeSkillEntries) {
         throw unprocessable("Skill sync requires desiredSkills.");
@@ -3372,6 +3439,27 @@ export function agentRoutes(
         adapterConfig: effectiveAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // PATCH writes `adapterConfig` straight through to the service, so it was
+      // the one skill-writing route with no skill validation at all — hire and
+      // create already resolve strictly, and skills/sync at least resolves. That
+      // gap is the path the BLO-7991 incident actually took: a `desiredSkills`
+      // key naming a skill with no library row persisted with a 200 and then
+      // simply failed to materialize at pod start, silently.
+      //
+      // Only the keys this write introduces are validated; keys already stored
+      // stay tolerated so a since-deleted library row can't wedge the agent.
+      const previouslyDesiredKeys = storedDesiredSkillKeys(existing.adapterConfig);
+      const introducedDesiredSkillKeys = readPaperclipSkillSyncPreference(
+        asRecord(patchData.adapterConfig) ?? {},
+      ).desiredSkills.filter((key) => !previouslyDesiredKeys.has(key));
+      if (introducedDesiredSkillKeys.length > 0) {
+        const { unresolved } = await companySkills.resolveRequestedSkillEntries(
+          existing.companyId,
+          introducedDesiredSkillKeys.map((key) => ({ key, versionId: null })),
+          { tolerateUnknownReferences: true },
+        );
+        assertNoUnresolvableNewDesiredSkills(unresolved, previouslyDesiredKeys);
+      }
     }
     if (requestedRuntimeConfig) {
       const baseAdapterConfig = asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {};

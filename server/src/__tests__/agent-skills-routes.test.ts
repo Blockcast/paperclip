@@ -546,10 +546,20 @@ describe.sequential("agent skill routes", () => {
   });
 
   it("preserves stale desired keys instead of 422-ing when syncing (PAP-13222)", async () => {
-    mockAgentService.getById.mockResolvedValue(makeAgent("acpx_local"));
     // The agent already carries a stale desired key that no longer resolves to a
     // company-library skill. Toggling a resolvable skill must still succeed and
     // keep the stale key so it stays visible/removable in the UI.
+    //
+    // The stale key has to be in the *persisted* config for this to exercise the
+    // tolerate path at all. BLO-7991 narrowed tolerance to keys the agent already
+    // carries, so a key absent from storage is a newly-introduced dangling key and
+    // is now rejected instead — covered by the sibling test below. The original
+    // fixture left `adapterConfig` empty, which made this read as the introduce
+    // case while claiming to test the carry-over case.
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent("acpx_local"),
+      adapterConfig: { paperclipSkillSync: { desiredSkills: ["stale/removed/skill"] } },
+    });
     mockCompanySkillService.resolveRequestedSkillEntries.mockImplementationOnce(
       async (
         _companyId: string,
@@ -598,6 +608,102 @@ describe.sequential("agent skill routes", () => {
     const versionSelections = mockCompanySkillService.listRuntimeSkillEntries.mock.calls.at(-1)?.[1]
       ?.versionSelections as Map<string, unknown> | undefined;
     expect(versionSelections?.has("stale/removed/skill")).toBe(false);
+  });
+
+  // BLO-7991. A `desiredSkills` key naming a skill with no company-library row
+  // used to persist silently and then fail to materialize at pod start, with no
+  // error on any surface the agent or the caller could see. These cover both
+  // halves of the fix: reject what this write introduces, keep tolerating what
+  // the agent already carried.
+  function unresolvableSkillResolver(unresolvableKeys: string[]) {
+    return async (
+      _companyId: string,
+      requested: Array<{ key: string; versionId?: string | null }>,
+    ) => {
+      const resolved: Array<{ key: string; versionId: string | null }> = [];
+      const unresolved: string[] = [];
+      for (const entry of requested) {
+        if (unresolvableKeys.includes(entry.key)) unresolved.push(entry.key);
+        else {
+          resolved.push({
+            key: entry.key === "paperclip" ? "paperclipai/paperclip/paperclip" : entry.key,
+            versionId: entry.versionId ?? null,
+          });
+        }
+      }
+      return { resolved, unresolved };
+    };
+  }
+
+  it("rejects a PATCH that introduces a desired skill with no company-library row (BLO-7991)", async () => {
+    mockAgentService.getById.mockResolvedValue(makeAgent("claude_local"));
+    mockCompanySkillService.resolveRequestedSkillEntries.mockImplementation(
+      unresolvableSkillResolver(["garrytan/gstack/design-shotgun"]),
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterConfig: {
+          paperclipSkillSync: { desiredSkills: ["garrytan/gstack/design-shotgun"] },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    // The offending key must be named — a generic failure is what made the
+    // original incident take three months to diagnose.
+    expect(String(res.body.error)).toContain("garrytan/gstack/design-shotgun");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows a PATCH that keeps an already-stored desired key whose library row was deleted (BLO-7991)", async () => {
+    // The tolerate path: removing a dangling key requires a successful write, so
+    // rejecting this would wedge the agent with no way back.
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent("claude_local"),
+      adapterConfig: { paperclipSkillSync: { desiredSkills: ["stale/removed/skill"] } },
+    });
+    mockCompanySkillService.resolveRequestedSkillEntries.mockImplementation(
+      unresolvableSkillResolver(["stale/removed/skill"]),
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterConfig: {
+          paperclipSkillSync: { desiredSkills: ["stale/removed/skill"] },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("rejects a skills/sync that introduces a desired skill with no company-library row (BLO-7991)", async () => {
+    mockAgentService.getById.mockResolvedValue(makeAgent("acpx_local"));
+    mockCompanySkillService.resolveRequestedSkillEntries.mockImplementation(
+      unresolvableSkillResolver(["garrytan/gstack/design-shotgun"]),
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .post("/api/agents/11111111-1111-4111-8111-111111111111/skills/sync?companyId=company-1")
+      .send({ desiredSkills: ["paperclip", "garrytan/gstack/design-shotgun"] }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(String(res.body.error)).toContain("garrytan/gstack/design-shotgun");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("leaves a PATCH that does not touch desired skills unvalidated (BLO-7991)", async () => {
+    // Guards against making every unrelated PATCH pay a skill-resolution query.
+    mockAgentService.getById.mockResolvedValue(makeAgent("claude_local"));
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({ adapterConfig: { model: "claude-opus-4-8" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.resolveRequestedSkillEntries).not.toHaveBeenCalled();
   });
 
   it("skips runtime materialization when listing persistent skill adapters", async () => {
