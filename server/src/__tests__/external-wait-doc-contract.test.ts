@@ -92,4 +92,27 @@ describe("external-wait declaration: doc and matcher agree", () => {
       externalWaitFromDescription("external owner:\nexternal action: Approve it"),
     ).toBeNull();
   });
+
+  it("tolerates the case and leading whitespace the doc promises", () => {
+    // The doc claims case-insensitivity and leading space/tab tolerance. Nothing
+    // asserted it, so the prose could have drifted from the matcher in the permissive
+    // direction as easily as the strict one.
+    expect(
+      externalWaitFromDescription("\t External Owner :  CTO\n  EXTERNAL ACTION:\tApprove it"),
+    ).toEqual({ owner: "CTO", action: "Approve it" });
+  });
+
+  it("truncates at the caps the doc documents", () => {
+    // The doc now states the 120/240 caps, and those numbers are load-bearing: the
+    // parsed values are the needles `redactExternalWaitDescription` strikes out of the
+    // blocked-inbox description, so anything past a cap survives redaction verbatim.
+    // Without this, editing `slice(0, 120)` would silently make the doc wrong while the
+    // suite stayed green — the same doc-vs-code drift this file exists to catch, just
+    // moved from prose-vs-parser to number-vs-parser.
+    const parsed = externalWaitFromDescription(
+      `external owner: ${"A".repeat(200)}\nexternal action: ${"B".repeat(300)}`,
+    );
+    expect(parsed?.owner).toHaveLength(120);
+    expect(parsed?.action).toHaveLength(240);
+  });
 });
