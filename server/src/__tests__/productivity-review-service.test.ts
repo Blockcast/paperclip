@@ -3414,6 +3414,58 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  it("records one suppression per monitor wait instead of one per reconcile tick", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const svc = productivityReviewService(db);
+    const suppressionRows = () =>
+      db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+
+    const first = await svc.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(first.monitorScheduledSuppressed).toBe(1);
+    expect(await suppressionRows()).toHaveLength(1);
+
+    // Three further ticks 30s apart — the scheduler cadence. `elapsedMs` grows on each one, but
+    // the monitor wait is unchanged, so none of them is a state change worth an audit row.
+    for (const offsetMs of [30_000, 60_000, 90_000]) {
+      const tick = await svc.reconcileProductivityReviews({
+        now: new Date(now.getTime() + offsetMs),
+        companyId: seeded.companyId,
+      });
+      // Still a suppression decision every tick — only the audit write is deduped.
+      expect(tick.monitorScheduledSuppressed).toBe(1);
+    }
+    expect(await suppressionRows()).toHaveLength(1);
+
+    // Re-arming to a different check time is a new wait and must be recorded.
+    const rearmedNextCheckAt = new Date(monitorNextCheckAt.getTime() + 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: rearmedNextCheckAt })
+      .where(eq(issues.id, seeded.issueId));
+
+    const afterRearm = await svc.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 120_000),
+      companyId: seeded.companyId,
+    });
+    expect(afterRearm.monitorScheduledSuppressed).toBe(1);
+    const rows = await suppressionRows();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => (row.details as Record<string, unknown>).monitorNextCheckAt).sort()).toEqual(
+      [monitorNextCheckAt.toISOString(), rearmedNextCheckAt.toISOString()].sort(),
+    );
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("creates long-active productivity reviews when the scheduled monitor has expired", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
