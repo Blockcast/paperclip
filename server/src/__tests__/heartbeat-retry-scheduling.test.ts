@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1435,7 +1435,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.scheduledRetryReason, INTERACTION_CONTINUATION_INFRA_RETRY_REASON),
         inArray(heartbeatRuns.retryOfRunId, [runId, secondSourceRunId]),
-      ));
+      ))
+      .orderBy(asc(heartbeatRuns.scheduledRetryAttempt));
     expect(retries).toHaveLength(2);
     expect(retries.map((retry) => retry.attempt).sort()).toEqual([1, 2]);
     expect(retries.map((retry) => retry.retryOfRunId)).toEqual([runId, secondSourceRunId]);
