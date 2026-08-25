@@ -15,7 +15,11 @@ import {
   issueDocuments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import {
+  ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  LOW_TRUST_REVIEW_PRESET,
+  type SourceTrustMetadata,
+} from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -220,7 +224,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     agentId: string;
     body: string;
     updatedAt?: Date;
-    sourceTrust?: Record<string, unknown>;
+    sourceTrust?: SourceTrustMetadata;
   }) {
     const documentId = randomUUID();
     const revisionId = randomUUID();
@@ -235,7 +239,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       createdByAgentId: input.agentId,
       updatedByAgentId: input.agentId,
       ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
-      ...(input.sourceTrust ? { sourceTrust: input.sourceTrust as never } : {}),
+      ...(input.sourceTrust ? { sourceTrust: input.sourceTrust } : {}),
     });
     await db.insert(documentRevisions).values({
       id: revisionId,
@@ -1962,7 +1966,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     async function seedParkedContinuationRetry(input: {
       title: string;
       summaryUpdatedAt: Date;
-      sourceTrust?: Record<string, unknown>;
+      sourceTrust?: SourceTrustMetadata;
     }) {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
