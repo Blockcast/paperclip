@@ -1075,9 +1075,12 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("releases the execution run held by a stale escalation instead of stranding it", async () => {
     const { companyId, managerId, blockerIssueId, escalation } = await mintEscalation();
 
-    // A live run holding the escalation. This is the branch `retireObsoleteLivenessRecoveryIssues`
-    // refuses to touch (`hasActiveRunForIssueId` -> activeSkipped), and terminal status alone
-    // does NOT clear these columns, so without an explicit release the lock outlives the premise.
+    // A NEVER-STARTED run (`queued`, null startedAt) holding the escalation. This is the
+    // branch `retireObsoleteLivenessRecoveryIssues` refuses to touch
+    // (`hasActiveRunForIssueId` -> activeSkipped), and terminal status alone does NOT clear
+    // these columns, so without an explicit release the lock outlives the premise. Such a
+    // run holds no real claim, so releasing it is safe — contrast the `running` owner
+    // covered above, which is refused.
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -1112,6 +1115,91 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(closed.executionRunId).toBeNull();
     expect(closed.checkoutRunId).toBeNull();
     expect(closed.executionLockedAt).toBeNull();
+  });
+
+  /**
+   * The other branch a happy-path suite would miss, and the inverse of the one above.
+   *
+   * `queued` is a never-started owner: it holds no real claim, so releasing its lock is
+   * safe. A `running` owner with a non-null `startedAt` is a live worker. Detaching its
+   * lock and then cancelling the issue underneath it leaves that worker writing to a row
+   * it no longer owns — and the release primitive it would go through, `adminForceRelease`,
+   * clears both lock columns unconditionally while its follow-up cleanup cancels only
+   * never-started runs. So the live worker survives the release, which is precisely the
+   * combination that must never happen here.
+   *
+   * The premise IS false in this test. Auto-resolution is still refused, because "the
+   * premise is dead" does not license yanking a lock out from under a running process —
+   * the row is simply left for a later tick, once the run reaches a terminal status.
+   */
+  it("leaves a stale escalation untouched while a running owner still holds its lock", async () => {
+    const { companyId, managerId, blockedIssueId, blockerIssueId, escalation } =
+      await mintEscalation();
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: escalation.id },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: runId,
+        checkoutRunId: runId,
+        executionAgentNameKey: "cto",
+        executionLockedAt: new Date(),
+      })
+      .where(eq(issues.id, escalation.id));
+
+    // Kill the premise, so the ONLY thing standing between this row and auto-resolution
+    // is the running owner.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.staleEscalationsLiveRunSkipped).toBe(1);
+    expect(result.staleEscalationsAutoResolved).toBe(0);
+    expect(result.staleEscalationRunsReleased).toBe(0);
+    expect(result.staleEscalationAutoResolvedIssueIds).toEqual([]);
+
+    const untouched = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, escalation.id))
+      .then((rows) => rows[0]!);
+    expect(untouched.status).not.toBe("cancelled");
+    // The lock is intact: the running worker still owns the row it is writing to.
+    expect(untouched.executionRunId).toBe(runId);
+    expect(untouched.checkoutRunId).toBe(runId);
+    expect(untouched.executionLockedAt).not.toBeNull();
+
+    // The run itself was not cancelled out from under the worker.
+    const ownerRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+    expect(ownerRun.status).toBe("running");
+
+    // Nothing was half-done: no auto-resolve comment, and the blocker edge is still wired.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, escalation.id));
+    expect(
+      comments.some((comment) =>
+        comment.body.includes(STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER),
+      ),
+    ).toBe(false);
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.map((row) => row.blockerIssueId)).toContain(escalation.id);
   });
 
   /**

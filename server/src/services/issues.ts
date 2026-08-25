@@ -11664,6 +11664,108 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
+    // BLO-29601: release the execution lock ONLY when no owner run is still executing.
+    //
+    // Deliberately NOT a flag on `adminForceRelease`. That primitive means force: it
+    // clears both lock columns unconditionally, and its follow-up
+    // `cancelStaleIssueContextRuns` only cancels never-started runs — so against a
+    // `running` owner it detaches the lock and leaves the worker alive, writing to a row
+    // whose ownership it no longer holds. That is correct for a board operator breaking a
+    // wedged lock by hand, and wrong for any automated sweep. Reusing the force primitive
+    // in a non-force context is exactly the confusion this separate name exists to stop.
+    //
+    // Reapability is `isReapableHeartbeatRunRow` — terminal, or never-started with a null
+    // `startedAt` — the single source of truth shared with every other ownership path.
+    // Both the issue row and the owner runs are locked FOR UPDATE in one transaction, so
+    // a run cannot transition to `running` between the check and the clear.
+    releaseExecutionLockIfOwnerReapable: async (
+      id: string,
+    ): Promise<
+      | { outcome: "released"; previous: { checkoutRunId: string | null; executionRunId: string | null } }
+      | { outcome: "not_found" }
+      | { outcome: "no_lock" }
+      | { outcome: "live_owner_run"; liveRunIds: string[] }
+    > => {
+      const result = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
+        );
+        const existing = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return { outcome: "not_found" as const };
+
+        const ownerRunIds = [
+          ...new Set(
+            [existing.executionRunId, existing.checkoutRunId].filter(
+              (runId): runId is string => Boolean(runId),
+            ),
+          ),
+        ].sort();
+        if (ownerRunIds.length === 0) return { outcome: "no_lock" as const };
+
+        // Ordered by id and locked, matching `clearStaleExecutionLock`, so two sweeps
+        // touching the same pair of runs cannot deadlock against each other.
+        const ownerRuns = await tx
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, ownerRunIds))
+          .orderBy(asc(heartbeatRuns.id))
+          .for("update");
+        const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+        const liveRunIds = ownerRunIds.filter(
+          (runId) => !isReapableHeartbeatRunRow(ownerRunById.get(runId)),
+        );
+        if (liveRunIds.length > 0) return { outcome: "live_owner_run" as const, liveRunIds };
+
+        const updated = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(issues.id, id))
+          .returning({ id: issues.id, companyId: issues.companyId })
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return { outcome: "not_found" as const };
+
+        return {
+          outcome: "released" as const,
+          companyId: updated.companyId,
+          issueId: updated.id,
+          previous: {
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          },
+        };
+      });
+
+      if (result.outcome === "released") {
+        await cancelStaleIssueContextRuns({
+          companyId: result.companyId,
+          issueId: result.issueId,
+          reason: "Cancelled because the issue execution lock was released as reapable",
+          errorCode: "issue_execution_lock_released",
+        });
+        return { outcome: "released", previous: result.previous };
+      }
+      return result;
+    },
+
     adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) => {
       const result = await db.transaction(async (tx) => {
         await tx.execute(
