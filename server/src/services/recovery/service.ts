@@ -6470,6 +6470,7 @@ export function recoveryService(
         recoveryOwnerAgentId: action.ownerAgentId ?? null,
         isProviderQuotaWait,
         blockerIssueIds: blockerIds,
+        recoveryCause,
       });
 
       const issueUpdate = {

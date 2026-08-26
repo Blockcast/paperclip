@@ -47,6 +47,8 @@ export type StrandedEscalationStatusInput = {
   isProviderQuotaWait: boolean;
   /** Unresolved `blocks` edges. Non-empty means `blocked` is honest. */
   blockerIssueIds: readonly string[];
+  /** Manual-repair causes have no autonomous path and must remain parked. */
+  recoveryCause: string;
 };
 
 export type StrandedEscalationStatusDecision = {
@@ -75,7 +77,10 @@ export type StrandedEscalationStatusDecision = {
 export function resolveStrandedEscalationStatus(
   input: StrandedEscalationStatusInput,
 ): StrandedEscalationStatusDecision {
-  const hasNoRecoveryPath = !input.recoveryOwnerAgentId &&
+  const isManualRepairCause = input.recoveryCause === "workspace_validation_failed" ||
+    input.recoveryCause === "configuration_incomplete";
+  const hasNoRecoveryPath = !isManualRepairCause &&
+    !input.recoveryOwnerAgentId &&
     !input.isProviderQuotaWait &&
     input.blockerIssueIds.length === 0;
 
