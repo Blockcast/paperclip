@@ -991,6 +991,86 @@ describe.sequential("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
+  it("blocks agent-authenticated hires when normalization creates a secret binding", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockResolvedValue({
+      env: {
+        API_TOKEN: {
+          type: "secret_ref",
+          secretId: "33333333-3333-4333-8333-333333333333",
+          version: "latest",
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({
+        name: "Injected",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: { env: { API_TOKEN: "plain-secret" } },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("secret bindings");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
+      companyId,
+      expect.any(Object),
+      expect.objectContaining({ actor: expect.objectContaining({ type: "agent", agentId }) }),
+    );
+  });
+
+  it("blocks agent-authenticated direct creation when normalization creates a secret binding", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockResolvedValue({
+      env: {
+        API_TOKEN: {
+          type: "secret_ref",
+          secretId: "33333333-3333-4333-8333-333333333333",
+          version: "latest",
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "Injected",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: { env: { API_TOKEN: "plain-secret" } },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("secret bindings");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
+      companyId,
+      expect.any(Object),
+      expect.objectContaining({ actor: expect.objectContaining({ type: "agent", agentId }) }),
+    );
+  });
+
   it("blocks direct agent creation for authenticated company members without agent create permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 

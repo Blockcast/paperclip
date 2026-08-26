@@ -2849,6 +2849,7 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
+    const actor = getActorInfo(req);
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
@@ -2887,7 +2888,9 @@ export function agentRoutes(
       companyId,
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      actor: req.actor,
     });
+    assertNoAgentAdapterConfigMutation(req, normalizedAdapterConfig);
     const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig, hireInput.adapterType);
     assertExternalLifecycleConcurrencyPolicy(hireInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
@@ -2924,8 +2927,6 @@ export function agentRoutes(
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
-    const actor = getActorInfo(req);
-
     if (requiresApproval) {
       const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
       // Deliberately the generic redactor, matching what is already stored:
@@ -3051,6 +3052,7 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    const actor = getActorInfo(req);
 
     const company = await db
       .select()
@@ -3103,7 +3105,9 @@ export function agentRoutes(
       companyId,
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      actor: req.actor,
     });
+    assertNoAgentAdapterConfigMutation(req, normalizedAdapterConfig);
     const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(createInput.runtimeConfig, createInput.adapterType);
     assertExternalLifecycleConcurrencyPolicy(createInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
@@ -3129,7 +3133,6 @@ export function agentRoutes(
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
