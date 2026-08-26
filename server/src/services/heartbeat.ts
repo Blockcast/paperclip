@@ -26012,7 +26012,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // sweeps get a structured signal with no schema change.
       context.paperclipUnmaterializedSkills = {
         declaredCount: runtimeSkillPreference.desiredSkillEntries.length,
-        materializedCount: runtimeSkillEntries.length,
+        materializedCount: runtimeSkillEntries.length - unmaterializedDesiredSkills.filter(
+          (entry) => entry.reason === "unresolved_source",
+        ).length,
         missing: unmaterializedDesiredSkills,
       };
       const notice = buildUnmaterializedSkillNoticeMarkdown(

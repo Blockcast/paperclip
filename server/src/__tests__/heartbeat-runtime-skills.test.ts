@@ -283,6 +283,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const presentKey = `company/${companyId}/present-skill`;
+    const missingSourceKey = `company/${companyId}/missing-source-skill`;
     // Never imported into `companySkills`, so `listRuntimeSkillEntries` cannot
     // even enter its loop for this key. This is the design-shotgun shape.
     const danglingKey = `company/${companyId}/never-imported-skill`;
@@ -312,6 +313,21 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       fileInventory: [{ path: "SKILL.md", kind: "skill" }],
       metadata: { sourceKind: "local_path" },
     });
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: missingSourceKey,
+      slug: "missing-source-skill",
+      name: "Missing Source Skill",
+      description: null,
+      markdown: "# Missing Source\n\nBody.\n",
+      sourceType: "local_path",
+      sourceLocator: path.join(skillDir, "does-not-exist"),
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -320,7 +336,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       status: "idle",
       adapterType: TEST_ADAPTER_TYPE,
       adapterConfig: {
-        paperclipSkillSync: { desiredSkills: [presentKey, danglingKey] },
+        paperclipSkillSync: { desiredSkills: [presentKey, missingSourceKey, danglingKey] },
       },
       runtimeConfig: {},
       permissions: {},
@@ -336,21 +352,28 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     // The delta is real: the dangling key is genuinely absent from what the pod
     // receives, while the resolvable sibling came through. Without this the
     // assertion below could pass on a warning about nothing.
-    expect(captured!.skills.map((entry) => entry.key)).toEqual([presentKey]);
+    expect(captured!.skills.map((entry) => entry.key)).toEqual([presentKey, missingSourceKey]);
+    expect(captured!.skills.find((entry) => entry.key === missingSourceKey)).toMatchObject({
+      sourceStatus: "missing",
+    });
 
     const taskMarkdown = String(captured!.context.paperclipTaskMarkdown ?? "");
     expect(taskMarkdown).toContain(danglingKey);
-    expect(taskMarkdown).toContain("2 skills configured, 1 available");
+    expect(taskMarkdown).toContain("3 skills configured, 1 available");
     expect(taskMarkdown).toContain("not in the company skill library");
+    expect(taskMarkdown).toContain("library entry exists but its files are not on the runtime volume");
     // Resolvable skills must not be named as missing.
     expect(taskMarkdown).not.toContain(`\`${presentKey}\``);
 
     // Structured mirror, persisted to the run row via `contextSnapshot`, so a
     // health sweep can key off it without parsing prose.
     expect(captured!.context.paperclipUnmaterializedSkills).toMatchObject({
-      declaredCount: 2,
+      declaredCount: 3,
       materializedCount: 1,
-      missing: [{ key: danglingKey, reason: "absent" }],
+      missing: [
+        { key: missingSourceKey, reason: "unresolved_source" },
+        { key: danglingKey, reason: "absent" },
+      ],
     });
   });
 
