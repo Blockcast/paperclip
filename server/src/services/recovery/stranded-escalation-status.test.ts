@@ -18,6 +18,7 @@ describe("resolveStrandedEscalationStatus", () => {
     recoveryOwnerAgentId: "agent-1",
     isProviderQuotaWait: false,
     blockerIssueIds: [] as string[],
+    recoveryCause: "stranded_assigned_issue",
   };
 
   describe("keeps parking in `blocked` where a path exists", () => {
@@ -110,4 +111,15 @@ describe("resolveStrandedEscalationStatus", () => {
       recoveryOwnerAgentId: "agent-1",
     })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
   });
+
+  it.each(["workspace_validation_failed", "configuration_incomplete"])(
+    "keeps %s parked for manual repair without an owner or blocker",
+    (recoveryCause) => {
+      expect(resolveStrandedEscalationStatus({
+        ...owned,
+        recoveryOwnerAgentId: null,
+        recoveryCause,
+      })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
+    },
+  );
 });
