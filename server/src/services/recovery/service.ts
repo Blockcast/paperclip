@@ -66,6 +66,7 @@ import {
 } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
+  buildIssueMonitorClearedPatch,
   derivePersistedMonitorState,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -5517,6 +5518,11 @@ export function recoveryService(
         fresh.id,
         {
           status: "blocked",
+          ...buildIssueMonitorClearedPatch({
+            issue: fresh,
+            policy: normalizeIssueExecutionPolicy(fresh.executionPolicy ?? null),
+            clearReason: "suppressed_by_status",
+          }),
           expectedCurrentStatus: fresh.status,
           expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
           expectedCurrentCheckoutRunId: fresh.checkoutRunId,
@@ -5577,6 +5583,7 @@ export function recoveryService(
   }
 
   function hasActiveMonitorPath(issue: typeof issues.$inferSelect) {
+    if (issue.status === "blocked") return false;
     if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()) return true;
 
     // BLO-18643: a monitor that has already fired (`status: "triggered"`) but has not
@@ -6830,6 +6837,11 @@ export function recoveryService(
           fresh.id,
           {
             status: "blocked",
+            ...buildIssueMonitorClearedPatch({
+              issue: fresh,
+              policy: normalizeIssueExecutionPolicy(fresh.executionPolicy ?? null),
+              clearReason: "suppressed_by_status",
+            }),
             expectedCurrentStatus: fresh.status,
             expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
             expectedCurrentCheckoutRunId: fresh.checkoutRunId,
