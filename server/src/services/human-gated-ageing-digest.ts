@@ -617,24 +617,12 @@ export async function deliverDigest(
       };
     }
 
-    // Unchanged body on a live row: rewriting would be a no-op write and, worse,
-    // a bumped `updatedAt` that makes the row look freshly handled.
-    if (!wasTerminal && existing.description === body) {
-      return {
-        companyId,
-        issueId: existing.id,
-        identifier: existing.identifier,
-        action: "unchanged",
-        itemCount,
-      };
-    }
-
-    const patch: Parameters<ReturnType<typeof issueService>["update"]>[1] = { description: body };
-
-    if (wasTerminal) {
-      if (!hasContent) {
-        // Closed and no producer has anything to report: leave it closed. The
-        // sweep only refuses a close while work or an error is still present.
+    if (wasTerminal && !hasContent) {
+      // A terminal row still needs reconciliation when its last actionable
+      // candidate resolves. Keeping the old body would leave a closed digest
+      // claiming that already-resolved work is overdue forever. Preserve the
+      // terminal status while replacing only the stale report when needed.
+      if (existing.description === body) {
         return {
           companyId,
           issueId: existing.id,
@@ -643,6 +631,69 @@ export async function deliverDigest(
           itemCount,
         };
       }
+      await issueService(txDb).update(existing.id, { description: body });
+      return {
+        companyId,
+        issueId: existing.id,
+        identifier: existing.identifier,
+        action: "refreshed",
+        itemCount,
+      };
+    }
+
+    const patch: Parameters<ReturnType<typeof issueService>["update"]>[1] = { description: body };
+
+    if (!wasTerminal) {
+      // Validate the live owner before the unchanged-body fast path. A body
+      // can remain byte-for-byte identical while its recorded human member is
+      // revoked; returning unchanged in that case strands the escalation on a
+      // user who can no longer receive or act on it.
+      const ownerStillActive =
+        existing.assigneeUserId !== null &&
+        (await isActiveCompanyMember(txDb, companyId, existing.assigneeUserId));
+      if (!ownerStillActive) {
+        const ownerUserId = await resolveDigestOwnerUserId(txDb, companyId);
+        if (!ownerUserId) {
+          // Keep the actionable row in the digest population so a later sweep
+          // can assign it when a human member returns, but never leave it
+          // visibly assigned to a revoked member.
+          if (existing.assigneeUserId !== null) {
+            await issueService(txDb).update(existing.id, {
+              assigneeAgentId: null,
+              assigneeUserId: null,
+            });
+          }
+          logger.warn(
+            { companyId, issueId: existing.id, staleAssigneeUserId: existing.assigneeUserId },
+            "human-gated ageing digest has no active human member for its live row; clearing stale owner",
+          );
+          return {
+            companyId,
+            issueId: existing.id,
+            identifier: existing.identifier,
+            action: "skipped_no_owner",
+            itemCount,
+          };
+        }
+        patch.assigneeUserId = ownerUserId;
+        patch.assigneeAgentId = null;
+      }
+
+      // Unchanged body on a live row: rewriting would be a no-op write and,
+      // worse, a bumped `updatedAt` that makes the row look freshly handled.
+      // If owner repair populated `patch`, the write is still required.
+      if (existing.description === body && patch.assigneeUserId === undefined) {
+        return {
+          companyId,
+          issueId: existing.id,
+          identifier: existing.identifier,
+          action: "unchanged",
+          itemCount,
+        };
+      }
+    }
+
+    if (wasTerminal) {
       // AC3: refresh it if it was closed. A digest an agent can retire while the
       // queue is still ageing is not an escalation — the config flag is the
       // off-switch, not this row's status.

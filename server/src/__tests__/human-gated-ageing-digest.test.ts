@@ -415,7 +415,7 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect(rows[0]?.description ?? "").toContain("HGD-14");
   });
 
-  it("leaves a closed digest row closed when nothing is overdue", async () => {
+  it("refreshes a closed digest body when its final candidate resolves", async () => {
     const { companyId } = await createCompany();
     await insertHumanGatedIssue({ companyId, identifier: "HGD-10", createdAt: daysAgo(40) });
     const first = await humanGatedDigestTick(db, { now: NOW, companyId });
@@ -426,8 +426,15 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     await db.update(issues).set({ status: "done" }).where(eq(issues.identifier, "HGD-10"));
 
     const second = await humanGatedDigestTick(db, { now: NOW, companyId });
-    expect(second.outcomes[0]?.action).toBe("unchanged");
+    expect(second.outcomes[0]?.action).toBe("refreshed");
     expect((await digestRow(companyId))[0]?.status).toBe("done");
+    expect((await digestRow(companyId))[0]?.description ?? "").toContain(
+      "### Nothing overdue this period",
+    );
+    expect((await digestRow(companyId))[0]?.description ?? "").not.toContain("HGD-10");
+
+    const repeat = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(repeat.outcomes[0]?.action).toBe("unchanged");
   });
 
   it("reconciles an existing digest in a global sweep after its final candidate resolves", async () => {
@@ -644,6 +651,38 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     // The revoked member must not keep the escalation just because the field
     // was non-null; first delivery would never have picked them.
     expect(row?.assigneeUserId).toBe("user_successor_owner");
+  });
+
+  it("repairs a revoked owner even when the live digest body is unchanged", async () => {
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-23", createdAt: daysAgo(40) });
+
+    const created = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(created.outcomes[0]?.action).toBe("created");
+    const before = (await digestRow(companyId))[0];
+    const digestId = before?.id;
+    const body = before?.description;
+
+    await db
+      .update(companyMemberships)
+      .set({ status: "revoked" })
+      .where(eq(companyMemberships.principalId, HUMAN_USER_ID));
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "user_live_successor",
+      status: "active",
+      membershipRole: "admin",
+    });
+
+    const repaired = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(repaired.outcomes[0]?.action).toBe("refreshed");
+    expect(repaired.outcomes[0]?.issueId).toBe(digestId);
+
+    const row = (await digestRow(companyId))[0];
+    expect(row?.status).toBe("todo");
+    expect(row?.assigneeUserId).toBe("user_live_successor");
+    expect(row?.description).toBe(body);
   });
 
   it("leaves a digest retired when its owner is revoked and nobody active can take it", async () => {
