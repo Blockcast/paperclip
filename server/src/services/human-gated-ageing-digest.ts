@@ -32,7 +32,7 @@
  * assembled from N registered producers. That is what lets a second ageing
  * source join the same seam without re-deciding the channel.
  */
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, companyMemberships, issueComments, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
@@ -234,6 +234,11 @@ async function latestHumanActivityAt(
  */
 const EXCLUDE_DIGEST_ROWS = sql`${issues.originKind} IS DISTINCT FROM ${HUMAN_GATED_DIGEST_ORIGIN_KIND}`;
 
+export type LoadHumanGatedIssuesOptions = {
+  /** Hold candidate issue rows through the caller's surrounding transaction. */
+  lockRows?: boolean;
+};
+
 /**
  * Load the open, human-gated issues for one company with their human clock
  * populated — the input `human-gated-ageing.ts` was written against and has
@@ -242,8 +247,9 @@ const EXCLUDE_DIGEST_ROWS = sql`${issues.originKind} IS DISTINCT FROM ${HUMAN_GA
 export async function loadHumanGatedIssues(
   db: Db,
   companyId: string,
+  options: LoadHumanGatedIssuesOptions = {},
 ): Promise<HumanGatedIssue[]> {
-  const rows = await db
+  const query = db
     .select({
       id: issues.id,
       identifier: issues.identifier,
@@ -262,7 +268,18 @@ export async function loadHumanGatedIssues(
         sql`${issues.assigneeUserId} IS NOT NULL`,
         EXCLUDE_DIGEST_ROWS,
       ),
-    );
+    )
+    // Acquire candidate locks in a stable order. The delivery transaction
+    // already serializes digest ticks, while human writes do not take that
+    // advisory lock; deterministic ordering avoids avoidable lock inversions
+    // with other multi-row maintenance operations.
+    .orderBy(asc(issues.id));
+  let rows: Awaited<typeof query>;
+  if (options.lockRows) {
+    rows = await query.for("update");
+  } else {
+    rows = await query;
+  }
 
   if (rows.length === 0) return [];
 
@@ -301,7 +318,10 @@ export async function loadHumanGatedIssues(
 export const humanGatedAgeingProducer: DigestProducer = {
   key: "human-gated-ageing",
   collect: async ({ db, companyId, now }) => {
-    const candidates = await loadHumanGatedIssues(db, companyId);
+    // Collection runs inside the company delivery transaction. Keep the
+    // candidate rows locked through the digest decision so a concurrent human
+    // resolution cannot commit between the ageing snapshot and its delivery.
+    const candidates = await loadHumanGatedIssues(db, companyId, { lockRows: true });
     if (candidates.length === 0) return null;
 
     const report = selectAgedHumanGatedIssues(candidates, {
