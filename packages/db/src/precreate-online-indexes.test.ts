@@ -59,6 +59,37 @@ afterEach(async () => {
 }, 60_000);
 
 describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
+  it("skips index DDL during an empty-database bootstrap", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-empty-");
+    cleanups.push(database.cleanup);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+
+    // Recreate the state seen by a fresh database before the first migration:
+    // no application tables and no migration journal, while Postgres itself
+    // is already available for the deploy-time helper to connect to.
+    await sql.unsafe(`
+      DROP SCHEMA public CASCADE;
+      CREATE SCHEMA public;
+      DROP SCHEMA drizzle CASCADE;
+    `);
+
+    const results = await ensureOnlineIndexPrerequisites(database.connectionString);
+    expect(results).toEqual([]);
+
+    const [table] = await sql<{ exists: boolean }[]>`
+      SELECT to_regclass('public.heartbeat_runs') IS NOT NULL AS exists
+    `;
+    const [index] = await sql<{ exists: boolean }[]>`
+      SELECT to_regclass('public.heartbeat_runs_recovery_dispatch_idx') IS NOT NULL AS exists
+    `;
+    expect(table?.exists).toBe(false);
+    expect(index?.exists).toBe(false);
+
+    await applyPendingMigrations(database.connectionString);
+    expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
+  }, 60_000);
+
   it("precreates a pending migration's index on a populated table so the migration no longer crash-loops", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-");
     cleanups.push(database.cleanup);
