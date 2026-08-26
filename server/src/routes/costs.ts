@@ -368,34 +368,52 @@ export function costRoutes(
 
     assertBoard(req);
 
-    const updated = await agents.update(agentId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
+    const actor = getActorInfo(req);
+    const updated = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const txAgents = agentService(txDb);
+      const txBudgets = budgetService(txDb, budgetHooks);
+      const txUpdated = await txAgents.update(
+        agentId,
+        { budgetMonthlyCents: req.body.budgetMonthlyCents },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "budgets-patch",
+          },
+        },
+      );
+      if (!txUpdated) return null;
+
+      await logActivity(txDb, {
+        companyId: txUpdated.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "agent.budget_updated",
+        entityType: "agent",
+        entityId: txUpdated.id,
+        details: { budgetMonthlyCents: txUpdated.budgetMonthlyCents },
+      });
+
+      await txBudgets.upsertPolicy(
+        txUpdated.companyId,
+        {
+          scopeType: "agent",
+          scopeId: txUpdated.id,
+          amount: txUpdated.budgetMonthlyCents,
+          windowKind: "calendar_month_utc",
+        },
+        req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      );
+
+      return txUpdated;
+    });
     if (!updated) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: updated.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "agent.budget_updated",
-      entityType: "agent",
-      entityId: updated.id,
-      details: { budgetMonthlyCents: updated.budgetMonthlyCents },
-    });
-
-    await budgets.upsertPolicy(
-      updated.companyId,
-      {
-        scopeType: "agent",
-        scopeId: updated.id,
-        amount: updated.budgetMonthlyCents,
-        windowKind: "calendar_month_utc",
-      },
-      req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    );
 
     res.json(updated);
   });
