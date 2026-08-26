@@ -1,0 +1,434 @@
+import { randomUUID } from "node:crypto";
+import { sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { activityLog, companies, createDb, pluginEventOutbox } from "@paperclipai/db";
+import type { Db } from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import {
+  logActivity,
+  resetPluginEventOutboxDbForTests,
+  setPluginEventOutboxDb,
+} from "../services/activity-log.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres activity-log transactional publish tests: ${
+      embeddedPostgresSupport.reason ?? "unsupported"
+    }`,
+  );
+}
+
+/**
+ * `approval.created` is a real member of PLUGIN_EVENT_TYPES, so logging it takes
+ * the plugin-outbox path. That is the leg that matters here: a rolled-back
+ * transaction must not leave the worker-tier poller an event to emit for an
+ * entity that never committed.
+ */
+const PLUGIN_MAPPED_ACTION = "approval.created";
+
+describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const companyId = randomUUID();
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-activity-tx-publish-");
+    db = createDb(tempDb.connectionString);
+    // Mirrors app boot: the outbox handle used whenever a caller does not supply one.
+    setPluginEventOutboxDb(db);
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+  });
+
+  afterEach(async () => {
+    await db.delete(pluginEventOutbox);
+    await db.delete(activityLog);
+  });
+
+  afterAll(async () => {
+    resetPluginEventOutboxDbForTests();
+    await tempDb?.cleanup();
+  });
+
+  function activityInput(entityId: string) {
+    return {
+      companyId,
+      actorType: "system" as const,
+      actorId: "test",
+      action: PLUGIN_MAPPED_ACTION,
+      entityType: "approval",
+      entityId,
+      details: { hello: "world" },
+    };
+  }
+
+  function captureLiveEvents() {
+    const seen: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      seen.push(event.type);
+    });
+    return { seen, unsubscribe };
+  }
+
+  function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
+  }
+
+  it("enqueues no plugin event when the enclosing transaction rolls back", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    await expect(
+      db.transaction(async (tx) => {
+        await logActivity(tx as unknown as Db, activityInput(entityId), {
+          enlistPluginOutbox: true,
+        });
+        throw new Error("caller rolled back after logging activity");
+      }),
+    ).rejects.toThrow("caller rolled back after logging activity");
+
+    live.unsubscribe();
+
+    // Give any escaped fire-and-forget write a chance to land before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const outboxRows = await db.select().from(pluginEventOutbox);
+    const activityRows = await db.select().from(activityLog);
+
+    // The activity row rolled back, so the event describing it must have too.
+    expect(activityRows).toHaveLength(0);
+    expect(outboxRows).toHaveLength(0);
+
+    // Characterizing the residual gap deliberately rather than leaving it
+    // unasserted: enlisting WITHOUT deferring binds the outbox row to the
+    // transaction but cannot un-send the in-memory live event, so a phantom
+    // `activity.logged` refresh hint does escape this rollback. The next test
+    // is the composition that closes it.
+    expect(live.seen).toEqual(["activity.logged"]);
+  });
+
+  it("enlisted + deferred publishes nothing at all when the transaction rolls back", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    await expect(
+      db.transaction(async (tx) => {
+        const publish = await logActivity(tx as unknown as Db, activityInput(entityId), {
+          enlistPluginOutbox: true,
+          deferPublish: true,
+        });
+        // Proves the enqueue already happened on the transaction handle: the
+        // deferred callback is never reached, yet the row below is still absent
+        // because it rolled back with the transaction rather than never existing.
+        void publish;
+        throw new Error("caller rolled back after logging activity");
+      }),
+    ).rejects.toThrow("caller rolled back after logging activity");
+
+    live.unsubscribe();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+    expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+    // The point of the composition: no phantom live event either.
+    expect(live.seen).toEqual([]);
+  });
+
+  it("enlisted + deferred enqueues inside the transaction but publishes live after commit", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    const publish = await db.transaction(async (tx) => {
+      const deferred = await logActivity(tx as unknown as Db, activityInput(entityId), {
+        enlistPluginOutbox: true,
+        deferPublish: true,
+      });
+      // Enqueued on the transaction handle, so it is already visible to this
+      // transaction before commit -- that is what makes it atomic.
+      expect(await tx.select().from(pluginEventOutbox)).toHaveLength(1);
+      return deferred;
+    });
+
+    // Committed, but publication was withheld: no live event has escaped yet.
+    expect(live.seen).toEqual([]);
+
+    await publish();
+    live.unsubscribe();
+
+    expect(live.seen).toEqual(["activity.logged"]);
+    const outboxRows = await db.select().from(pluginEventOutbox);
+    // Still exactly one: the deferred callback must not re-enqueue on the global
+    // handle for an event the transaction already carried.
+    expect(outboxRows).toHaveLength(1);
+    expect(outboxRows[0]?.eventType).toBe(PLUGIN_MAPPED_ACTION);
+    expect(await db.select().from(activityLog)).toHaveLength(1);
+  });
+
+  it("does not enqueue on a caller db when the plugin outbox is not configured", async () => {
+    resetPluginEventOutboxDbForTests();
+    try {
+      await logActivity(db, activityInput(randomUUID()));
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+      expect(await db.select().from(activityLog)).toHaveLength(1);
+    } finally {
+      setPluginEventOutboxDb(db);
+    }
+  });
+
+  it("uses an explicitly enlisted transaction handle without a global outbox db", async () => {
+    const entityId = randomUUID();
+    resetPluginEventOutboxDbForTests();
+    try {
+      await db.transaction(async (tx) => {
+        await logActivity(tx as unknown as Db, activityInput(entityId), {
+          enlistPluginOutbox: true,
+        });
+
+        // The explicit transaction handle is authoritative even though the
+        // boot-time/global outbox handle is intentionally unset.
+        expect(await tx.select().from(pluginEventOutbox)).toHaveLength(1);
+      });
+
+      const outboxRows = await db.select().from(pluginEventOutbox);
+      expect(outboxRows).toHaveLength(1);
+      expect(outboxRows[0]?.eventType).toBe(PLUGIN_MAPPED_ACTION);
+      expect(outboxRows[0]?.payload).toMatchObject({ entityId });
+    } finally {
+      setPluginEventOutboxDb(db);
+    }
+  });
+
+  it("enqueues the plugin event when the enclosing transaction commits", async () => {
+    const entityId = randomUUID();
+
+    await db.transaction(async (tx) => {
+      await logActivity(tx as unknown as Db, activityInput(entityId), {
+        enlistPluginOutbox: true,
+      });
+    });
+
+    const outboxRows = await db.select().from(pluginEventOutbox);
+    expect(outboxRows).toHaveLength(1);
+    expect(outboxRows[0]?.eventType).toBe(PLUGIN_MAPPED_ACTION);
+    expect(await db.select().from(activityLog)).toHaveLength(1);
+  });
+
+  it("rejects and rolls back the activity row when the enlisted outbox insert fails", async () => {
+    const entityId = randomUUID();
+    const constraintName = "plugin_event_outbox_reject_approval_created_test";
+    const live = captureLiveEvents();
+
+    await db.execute(sql.raw(`
+      ALTER TABLE "plugin_event_outbox"
+      ADD CONSTRAINT "${constraintName}"
+      CHECK ("event_type" <> '${PLUGIN_MAPPED_ACTION}')
+    `));
+
+    try {
+      let rejection: unknown = null;
+      try {
+        await db.transaction(async (tx) => {
+          await logActivity(tx as unknown as Db, activityInput(entityId), {
+            enlistPluginOutbox: true,
+          });
+        });
+      } catch (err) {
+        rejection = err;
+      }
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toContain("plugin_event_outbox");
+
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+      expect(live.seen).not.toContain("activity.logged");
+    } finally {
+      live.unsubscribe();
+      await db.execute(sql.raw(`
+        ALTER TABLE "plugin_event_outbox"
+        DROP CONSTRAINT IF EXISTS "${constraintName}"
+      `));
+    }
+  });
+
+  it("keeps unannotated transaction outbox failures best-effort on the global handle", async () => {
+    const entityId = randomUUID();
+    let markEnqueueStarted!: () => void;
+    const enqueueStarted = new Promise<void>((resolve) => {
+      markEnqueueStarted = resolve;
+    });
+    const rejectingOutboxDb = {
+      insert: () => ({
+        values: () => {
+          markEnqueueStarted();
+          return Promise.reject(new Error("global outbox rejected the test event"));
+        },
+      }),
+    } as unknown as Db;
+
+    setPluginEventOutboxDb(rejectingOutboxDb);
+    try {
+      await db.transaction(async (tx) => {
+        await expect(logActivity(tx as unknown as Db, activityInput(entityId))).resolves.toEqual(
+          expect.any(Function),
+        );
+      });
+      await withTimeout(enqueueStarted, 1_000, "unannotated transaction global outbox enqueue");
+
+      const activityRows = await db.select().from(activityLog);
+      expect(activityRows).toHaveLength(1);
+      expect(activityRows[0]?.entityId).toBe(entityId);
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+    } finally {
+      setPluginEventOutboxDb(db);
+    }
+  });
+
+  it("keeps ordinary Db outbox failures best-effort after the activity row commits", async () => {
+    const entityId = randomUUID();
+    const constraintName = "plugin_event_outbox_reject_plain_db_test";
+
+    await db.execute(sql.raw(`
+      ALTER TABLE "plugin_event_outbox"
+      ADD CONSTRAINT "${constraintName}"
+      CHECK (
+        "event_type" <> '${PLUGIN_MAPPED_ACTION}'
+        OR "payload"->>'entityId' <> '${entityId}'
+      )
+    `));
+
+    try {
+      await expect(logActivity(db, activityInput(entityId))).resolves.toEqual(expect.any(Function));
+
+      const activityRows = await db.select().from(activityLog);
+      expect(activityRows).toHaveLength(1);
+      expect(activityRows[0]?.entityId).toBe(entityId);
+      const matchingOutboxRows = (await db.select().from(pluginEventOutbox)).filter(
+        (row) => row.eventType === PLUGIN_MAPPED_ACTION && row.payload.entityId === entityId,
+      );
+      expect(matchingOutboxRows).toHaveLength(0);
+    } finally {
+      await db.execute(sql.raw(`
+        ALTER TABLE "plugin_event_outbox"
+        DROP CONSTRAINT IF EXISTS "${constraintName}"
+      `));
+    }
+  });
+
+  it("deferPublish withholds both the live event and the outbox row until after commit", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    const publish = await db.transaction(async (tx) => {
+      const deferred = await logActivity(tx as unknown as Db, activityInput(entityId), {
+        deferPublish: true,
+      });
+      // Still inside the transaction: nothing may have escaped yet.
+      expect(live.seen).toHaveLength(0);
+      expect(await db.select().from(pluginEventOutbox)).toHaveLength(0);
+      return deferred;
+    });
+
+    await publish();
+    // The deferred publish runs post-commit on the global handle, so poll for it.
+    const deadline = Date.now() + 2_000;
+    let outboxRows: Awaited<ReturnType<typeof db.select>> = [];
+    while (Date.now() < deadline) {
+      outboxRows = await db.select().from(pluginEventOutbox);
+      if (outboxRows.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    live.unsubscribe();
+
+    expect(outboxRows).toHaveLength(1);
+    expect(live.seen).toContain("activity.logged");
+  });
+
+  it("returns deferred live-event listener failures to the caller", async () => {
+    const entityId = randomUUID();
+    const publish = await db.transaction(async (tx) =>
+      logActivity(tx as unknown as Db, activityInput(entityId), {
+        deferPublish: true,
+      }),
+    );
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, () => {
+      throw new Error("live listener exploded");
+    });
+
+    try {
+      await expect(publish()).rejects.toThrow("live listener exploded");
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("waits for a plain Db global outbox enqueue before resolving", async () => {
+    const entityId = randomUUID();
+    let markEnqueueStarted!: () => void;
+    let releaseEnqueue: (() => void) | null = null;
+    let pending: ReturnType<typeof logActivity> | null = null;
+    const enqueueStarted = new Promise<void>((resolve) => {
+      markEnqueueStarted = resolve;
+    });
+    const blockedEnqueue = new Promise<void>((resolve) => {
+      releaseEnqueue = resolve;
+    });
+    const blockedOutboxDb = {
+      insert: () => ({
+        values: () => {
+          markEnqueueStarted();
+          return blockedEnqueue;
+        },
+      }),
+    } as unknown as Db;
+
+    setPluginEventOutboxDb(blockedOutboxDb);
+    try {
+      pending = logActivity(db, activityInput(entityId));
+      await withTimeout(enqueueStarted, 1_000, "plain Db global outbox enqueue");
+
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      releaseEnqueue?.();
+      await expect(pending).resolves.toEqual(expect.any(Function));
+    } finally {
+      releaseEnqueue?.();
+      await pending?.catch(() => undefined);
+      setPluginEventOutboxDb(db);
+    }
+  });
+
+  it("still publishes inline for a caller outside any transaction", async () => {
+    const entityId = randomUUID();
+    const live = captureLiveEvents();
+
+    await logActivity(db, activityInput(entityId));
+
+    live.unsubscribe();
+    expect(await db.select().from(pluginEventOutbox)).toHaveLength(1);
+    expect(live.seen).toContain("activity.logged");
+  });
+});

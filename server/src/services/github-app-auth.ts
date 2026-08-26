@@ -158,7 +158,10 @@ export function githubAppCredentialsConfigured(): boolean {
  * Return a cached or freshly-minted installation access token, or null when
  * creds are absent or the GitHub API call fails.
  */
-export async function getInstallationTokenResult(nowMs: number = Date.now()): Promise<GitHubInstallationTokenResult> {
+export async function getInstallationTokenResult(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<GitHubInstallationTokenResult> {
   if (cachedInstallationToken && cachedInstallationToken.expiresAtMs - TOKEN_REFRESH_SKEW_MS > nowMs) {
     return { ok: true, token: cachedInstallationToken.token };
   }
@@ -177,6 +180,7 @@ export async function getInstallationTokenResult(nowMs: number = Date.now()): Pr
     res = await ghFetch(url, {
       method: "POST",
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${jwt}` },
+      signal: options.signal,
     });
   } catch {
     return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
