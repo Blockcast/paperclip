@@ -620,6 +620,62 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
     });
   });
 
+  it("terminalizes an assignee-less recovery intent instead of retrying it forever (BLO-30320)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const intentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Detached recovery with no assignee",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await db.insert(detachedQueuedRunRecoveries).values({
+      id: intentId,
+      companyId,
+      issueId,
+      sourceRunId,
+      status: "pending",
+      pendingAt: new Date(),
+    });
+
+    const first = await heartbeat.reconcileDetachedQueuedRuns({ companyId });
+
+    expect(first).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 1, failed: 0 });
+    const cancelled = await db
+      .select({
+        status: detachedQueuedRunRecoveries.status,
+        attemptCount: detachedQueuedRunRecoveries.attemptCount,
+        lastError: detachedQueuedRunRecoveries.lastError,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.id, intentId))
+      .then((rows) => rows[0]);
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      attemptCount: 1,
+      lastError: "Detached queued-run recovery issue has no assignee agent",
+    });
+
+    const second = await heartbeat.reconcileDetachedQueuedRuns({ companyId });
+    expect(second).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 });
+  });
+
   it("coalesces concurrent dispatches of the same pending recovery intent (BLO-21621 Ally suggestion)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
