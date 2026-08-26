@@ -24,6 +24,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo }
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import type { BudgetEnforcementScope } from "../services/budgets.js";
 
 export function parseCostDateRange(query: Record<string, unknown>) {
   const fromRaw = query.from as string | undefined;
@@ -369,10 +370,18 @@ export function costRoutes(
     assertBoard(req);
 
     const actor = getActorInfo(req);
+    const deferredCancellations: BudgetEnforcementScope[] = [];
     const updated = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       const txAgents = agentService(txDb);
-      const txBudgets = budgetService(txDb, budgetHooks);
+      // Process termination is irreversible and uses the outer DB connection.
+      // Defer it until the transaction has committed so a failed policy write
+      // cannot leave work cancelled for a cap change that rolled back.
+      const txBudgets = budgetService(txDb, {
+        cancelWorkForScope: async (scope) => {
+          deferredCancellations.push(scope);
+        },
+      });
       const txUpdated = await txAgents.update(
         agentId,
         { budgetMonthlyCents: req.body.budgetMonthlyCents },
@@ -410,6 +419,9 @@ export function costRoutes(
 
       return txUpdated;
     });
+    for (const scope of deferredCancellations) {
+      await budgetHooks.cancelWorkForScope(scope);
+    }
     if (!updated) {
       res.status(404).json({ error: "Agent not found" });
       return;
