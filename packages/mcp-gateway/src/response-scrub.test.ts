@@ -1009,6 +1009,40 @@ describe("scrubJsonValue — env entries that are not objects", () => {
       expect(scrubJsonValue({ env: `*${LEAK}` })).toEqual({ env: REDACTED });
     });
 
+    /**
+     * Reported by Ally on #1518, reproduced on `origin/master` as well — the
+     * name-preservation branch predates this PR and was never sound.
+     *
+     * "Has a name to preserve" was implemented as `indexOf("=") !== -1`, which
+     * is a different question. `[LEAKED]=x` contains an `=`, so slicing at the
+     * first one promoted the material into the name position and printed it
+     * beside its own redaction marker — the exact "false assurance" failure
+     * design note 4 of this module names as worse than no scrubber at all.
+     */
+    for (const [label, prefix] of [
+      ["flow sequence", "[%s]"],
+      ["flow mapping", "{k: %s}"],
+      ["alias", "*%s"],
+      ["literal block", "|%s"],
+      ["folded block", ">%s"],
+    ] as const) {
+      it(`does not promote an indicator-led ${label} into the name position when a later = exists`, () => {
+        const scalar = `${prefix.replace("%s", LEAK)}=x`;
+
+        expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+        expectNoLeak(scrubYamlText(`env: ${scalar}`));
+      });
+    }
+
+    it("still preserves a real variable name that contains the legal name characters", () => {
+      // The counterweight to the five tests above: validating the prefix must
+      // not become "redact every scalar", or the diagnostic value of knowing
+      // WHICH variable is set (design note 2) is gone.
+      expect(scrubJsonValue({ env: `my.app-name_2=${LEAK}` })).toEqual({
+        env: `my.app-name_2=${REDACTED}`,
+      });
+    });
+
     it("still passes prose through on both paths, so the gate did not widen to everything", () => {
       // The negative control. Without it, `env: REDACTED` unconditionally
       // would satisfy every assertion above while destroying the diagnostic
