@@ -3,6 +3,7 @@ import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   applyIssueExecutionPolicyTransition,
   applyIssueMonitorPolicyTransition,
+  buildIssueMonitorClearedPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
@@ -1577,6 +1578,30 @@ describe("issue execution policy transitions", () => {
       expect(result.patch.monitorNotes).toBeNull();
       expect(result.patch.executionState).toMatchObject({
         monitor: { status: "cleared" },
+      });
+    });
+
+    it("records status suppression when recovery blocks an issue", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z", scheduledBy: "assignee" },
+      })!;
+      const result = buildIssueMonitorClearedPatch({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+        },
+        policy,
+        clearReason: "suppressed_by_status",
+      });
+      expect(result.monitorNextCheckAt).toBeNull();
+      expect(result.executionPolicy).toBeNull();
+      expect(result.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "suppressed_by_status" },
       });
     });
 
