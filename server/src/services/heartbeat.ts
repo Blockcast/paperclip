@@ -10240,6 +10240,10 @@ export interface HeartbeatServiceOptions {
   beforeDetachedQueuedRunRecoveryEnqueueForTest?: (
     input: { intentId: string; issueId: string; sourceRunId: string },
   ) => Promise<void> | void;
+  /** Test-only barrier immediately before the assignee-less recovery decision. */
+  beforeDetachedQueuedRunAssigneeCheckForTest?: (
+    input: { intentId: string; issueId: string },
+  ) => Promise<void> | void;
   /** Test-only signal immediately before an issue wake attempts to lock its issue row. */
   beforeIssueWakeLockForTest?: (
     input: { issueId: string; agentId: string },
@@ -22659,7 +22663,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null);
         if (!claimedIntent) continue;
 
-        const currentIssue = await db
+        let currentIssue = await db
           .select({
             companyId: issues.companyId,
             status: issues.status,
@@ -22695,25 +22699,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (!activeRun) {
           if (!currentIssue.assigneeAgentId) {
-            // An assignee-less issue has no valid recovery destination. Keep
-            // this deterministic condition out of the retry loop; assignment
-            // and subsequent issue wakeups are handled independently.
-            const cancelled = await db
-              .update(detachedQueuedRunRecoveries)
-              .set({
-                status: "cancelled",
-                completedAt: attemptAt,
-                lastError: "Detached queued-run recovery issue has no assignee agent",
-                updatedAt: attemptAt,
-              })
-              .where(and(
-                eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
-                eq(detachedQueuedRunRecoveries.status, "pending"),
-              ))
-              .returning({ id: detachedQueuedRunRecoveries.id })
-              .then((rows) => rows[0] ?? null);
-            if (cancelled) result.skipped += 1;
-            continue;
+            await options.beforeDetachedQueuedRunAssigneeCheckForTest?.({
+              intentId: claimedIntent.id,
+              issueId: claimedIntent.issueId,
+            });
+            const assigneeDecision = await db.transaction(async (tx) => {
+              const lockedIssue = await tx
+                .select({
+                  companyId: issues.companyId,
+                  status: issues.status,
+                  assigneeAgentId: issues.assigneeAgentId,
+                })
+                .from(issues)
+                .where(eq(issues.id, claimedIntent.issueId))
+                .for("update")
+                .then((rows) => rows[0] ?? null);
+              if (!lockedIssue || TERMINAL_ISSUE_STATUSES.has(lockedIssue.status)) {
+                return { kind: "cancelled" as const, issue: lockedIssue };
+              }
+              if (lockedIssue.assigneeAgentId) return { kind: "assigned" as const, issue: lockedIssue };
+
+              const cancelled = await tx
+                .update(detachedQueuedRunRecoveries)
+                .set({
+                  status: "cancelled",
+                  completedAt: attemptAt,
+                  lastError: "Detached queued-run recovery issue has no assignee agent",
+                  updatedAt: attemptAt,
+                })
+                .where(and(
+                  eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+                  eq(detachedQueuedRunRecoveries.status, "pending"),
+                ))
+                .returning({ id: detachedQueuedRunRecoveries.id })
+                .then((rows) => rows[0] ?? null);
+              return { kind: cancelled ? "cancelled" as const : "lost" as const, issue: lockedIssue };
+            });
+            if (assigneeDecision.kind === "assigned") {
+              currentIssue = { ...currentIssue, assigneeAgentId: assigneeDecision.issue.assigneeAgentId };
+            } else if (assigneeDecision.kind === "cancelled") {
+              result.skipped += 1;
+              continue;
+            } else {
+              continue;
+            }
           }
           await options.beforeDetachedQueuedRunRecoveryEnqueueForTest?.({
             intentId: claimedIntent.id,
