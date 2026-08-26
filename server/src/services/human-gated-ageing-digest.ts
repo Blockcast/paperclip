@@ -42,6 +42,7 @@ import {
   DEFAULT_MAX_ESCALATED,
   HUMAN_GATED_OPEN_STATUSES,
   formatHumanGatedAgeingSections,
+  sanitizeRenderedField,
   selectAgedHumanGatedIssues,
   type HumanGatedIssue,
 } from "./human-gated-ageing.js";
@@ -68,6 +69,8 @@ const DAY_MS = 86_400_000;
 const AGGREGATE_CHUNK_SIZE = 500;
 
 const DIGEST_TITLE = "[user-cover] Human-gated work is ageing past its escalation threshold";
+const UNKNOWN_PRODUCER = "(unknown producer)";
+const UNKNOWN_FAILURE_REASON = "(no reason provided)";
 
 type DigestLogger = {
   info: (obj: unknown, msg?: string) => void;
@@ -362,7 +365,11 @@ export function buildDigestBody(input: DigestBodyInput): string {
       `> ⚠ ${input.failures.length} producer${input.failures.length === 1 ? "" : "s"} failed this period and ${input.failures.length === 1 ? "is" : "are"} NOT represented below — this digest is incomplete, not an all-clear.`,
     );
     for (const failure of input.failures) {
-      lines.push(`> - \`${failure.key}\`: ${failure.reason}`);
+      // Producer keys and thrown messages are untrusted: this body is fed to a
+      // governance-agent prompt, so keep both fields bounded and on this row.
+      const key = sanitizeRenderedField(failure.key, UNKNOWN_PRODUCER);
+      const reason = sanitizeRenderedField(failure.reason, UNKNOWN_FAILURE_REASON);
+      lines.push(`> - \`${key}\`: ${reason}`);
     }
     lines.push("");
   }
