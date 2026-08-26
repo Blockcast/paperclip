@@ -617,6 +617,7 @@ export async function recordExpectedExternalRuntimeJobName(
     // "this reservation moved on", which is retryable and routine.
     if (
       active.state === "launched"
+      && active.expectedJobName !== null
       && active.expectedJobName !== input.jobName
     ) {
       recordExternalRuntimeReservationEvent("name_mismatch");
