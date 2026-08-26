@@ -1064,6 +1064,51 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not mutate an ownerless action on repeated sweep passes", async () => {
+    const { coderId, managerId, sourceIssue } = await seedCompany();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    const [firstAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(firstAction).toMatchObject({ ownerAgentId: null, attemptCount: 1, cause: "stranded_assigned_issue" });
+
+    const [sweepIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sweepIssue!,
+      previousStatus: "todo",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    const [secondAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(secondAction).toMatchObject({ id: firstAction!.id, ownerAgentId: null, attemptCount: 1 });
+  });
+
   it("re-dispatches an issue reopened after terminal dispatch cancellation", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const queuedRunId = randomUUID();
