@@ -94,14 +94,17 @@ export async function publishPluginDomainEvent(
   event: PluginEvent,
   options: { db?: Db | null; enlisted?: boolean } = {},
 ): Promise<void> {
-  if (!_outboxDb) {
+  // An explicitly supplied handle is authoritative. In particular, an
+  // enlisted transaction must still be able to carry its outbox row during a
+  // boot/test window where the module-global worker handle has not been wired.
+  const outboxDb = options.db ?? _outboxDb;
+  if (!outboxDb) {
     logger.warn(
       { eventType: event.eventType, eventId: event.eventId },
       "plugin event outbox db not set; dropping event",
     );
     return;
   }
-  const outboxDb = options.db ?? _outboxDb;
   const enlisted = options.enlisted === true;
   const values = {
     eventId: event.eventId,

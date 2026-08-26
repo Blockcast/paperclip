@@ -194,6 +194,29 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     }
   });
 
+  it("uses an explicitly enlisted transaction handle without a global outbox db", async () => {
+    const entityId = randomUUID();
+    resetPluginEventOutboxDbForTests();
+    try {
+      await db.transaction(async (tx) => {
+        await logActivity(tx as unknown as Db, activityInput(entityId), {
+          enlistPluginOutbox: true,
+        });
+
+        // The explicit transaction handle is authoritative even though the
+        // boot-time/global outbox handle is intentionally unset.
+        expect(await tx.select().from(pluginEventOutbox)).toHaveLength(1);
+      });
+
+      const outboxRows = await db.select().from(pluginEventOutbox);
+      expect(outboxRows).toHaveLength(1);
+      expect(outboxRows[0]?.eventType).toBe(PLUGIN_MAPPED_ACTION);
+      expect(outboxRows[0]?.payload).toMatchObject({ entityId });
+    } finally {
+      setPluginEventOutboxDb(db);
+    }
+  });
+
   it("enqueues the plugin event when the enclosing transaction commits", async () => {
     const entityId = randomUUID();
 
