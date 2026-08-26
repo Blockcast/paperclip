@@ -8834,6 +8834,8 @@ export function recoveryService(
       const recentlyCancelled = await db
         .select({
           id: issues.id,
+          identifier: issues.identifier,
+          status: issues.status,
           completedAt: issues.completedAt,
           updatedAt: issues.updatedAt,
         })
@@ -8867,7 +8869,13 @@ export function recoveryService(
         Number.isFinite(cancelledAtMs) &&
         cancelledAtMs >= now.getTime() - cooldownMs
       ) {
-        return { id: recentlyCancelled.id, reason: "cooldown" as const };
+        return {
+          id: recentlyCancelled.id,
+          identifier: recentlyCancelled.identifier,
+          status: recentlyCancelled.status,
+          resolvedAtMs: cancelledAtMs,
+          reason: "cooldown" as const,
+        };
       }
     }
 
