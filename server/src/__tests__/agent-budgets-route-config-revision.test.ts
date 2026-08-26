@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { asc, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -114,8 +114,27 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
     return db
       .select()
       .from(agentConfigRevisions)
-      .where(eq(agentConfigRevisions.agentId, agentId))
-      .orderBy(asc(agentConfigRevisions.createdAt));
+      .where(eq(agentConfigRevisions.agentId, agentId));
+  }
+
+  function chainFrom(
+    revisions: Awaited<ReturnType<typeof revisionsFor>>,
+    initialBudgetMonthlyCents: number,
+  ) {
+    const chain = [];
+    const visited = new Set<string>();
+    let budgetMonthlyCents = initialBudgetMonthlyCents;
+    while (true) {
+      const revision = revisions.find(
+        (row) =>
+          !visited.has(row.id)
+          && row.beforeConfig.budgetMonthlyCents === budgetMonthlyCents,
+      );
+      if (!revision) return chain;
+      visited.add(revision.id);
+      chain.push(revision);
+      budgetMonthlyCents = revision.afterConfig.budgetMonthlyCents as number;
+    }
   }
 
   it("writes exactly one attributed budgetMonthlyCents revision per cap change", async () => {
@@ -172,21 +191,22 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
 
     const revisions = await revisionsFor(agent.id);
     expect(revisions).toHaveLength(3);
-    expect(revisions.map((row) => row.beforeConfig.budgetMonthlyCents)).toEqual([0, 500_000, 800_000]);
-    expect(revisions.map((row) => row.afterConfig.budgetMonthlyCents)).toEqual([
+    const chain = chainFrom(revisions, 0);
+    expect(chain.map((row) => row.beforeConfig.budgetMonthlyCents)).toEqual([0, 500_000, 800_000]);
+    expect(chain.map((row) => row.afterConfig.budgetMonthlyCents)).toEqual([
       500_000,
       800_000,
       1_100_000,
     ]);
     // Every row's `before` equals the prior row's `after` — the property whose
     // absence is how the gap was originally detected.
-    for (let i = 1; i < revisions.length; i += 1) {
-      expect(revisions[i]!.beforeConfig.budgetMonthlyCents).toBe(
-        revisions[i - 1]!.afterConfig.budgetMonthlyCents,
+    for (let i = 1; i < chain.length; i += 1) {
+      expect(chain[i]!.beforeConfig.budgetMonthlyCents).toBe(
+        chain[i - 1]!.afterConfig.budgetMonthlyCents,
       );
     }
-    expect(revisions.every((row) => row.source === "budgets-patch")).toBe(true);
-    expect(revisions.every((row) => row.createdByUserId === "board-user")).toBe(true);
+    expect(chain.every((row) => row.source === "budgets-patch")).toBe(true);
+    expect(chain.every((row) => row.createdByUserId === "board-user")).toBe(true);
   });
 
   it("serializes concurrent cap changes across the mirror, policy, and revision chain", async () => {
@@ -211,10 +231,12 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
     const revisions = await revisionsFor(agent.id);
 
     expect(revisions).toHaveLength(2);
-    expect(revisions[1]!.beforeConfig.budgetMonthlyCents).toBe(
-      revisions[0]!.afterConfig.budgetMonthlyCents,
+    const chain = chainFrom(revisions, 500_000);
+    expect(chain).toHaveLength(2);
+    expect(chain[1]!.beforeConfig.budgetMonthlyCents).toBe(
+      chain[0]!.afterConfig.budgetMonthlyCents,
     );
-    expect(revisions[1]!.afterConfig.budgetMonthlyCents).toBe(storedAgent!.budgetMonthlyCents);
+    expect(chain[1]!.afterConfig.budgetMonthlyCents).toBe(storedAgent!.budgetMonthlyCents);
     expect(policy!.amount).toBe(storedAgent!.budgetMonthlyCents);
   });
 
