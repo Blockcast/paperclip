@@ -493,16 +493,19 @@ spec:
           # with a templated severity label, so severity is visible directly
           # in the rule file rather than hidden behind Go-template
           # conditionals evaluated per-series at fire time. Critical: plugins
-          # matching pluginErrorCriticalKeyRegex (default lucitra.plugin-secrets,
-          # the exact plugin BLO-20410 found dead for 9+ hours). Everything
-          # else pages warning below.
+          # matching pluginErrorCriticalKeyRegex (lucitra.plugin-secrets, the
+          # exact plugin BLO-20410 found dead for 9+ hours, and
+          # paperclip-plugin-alertmanager, whose failure suppresses the very
+          # notification reporting it -- see PEN-2590 and the two-naming-
+          # convention hazard documented at the value). Everything else pages
+          # warning below.
           expr: paperclip_plugin_error{plugin_key=~{{ .Values.prometheusRule.pluginErrorCriticalKeyRegex | quote }}} == 1
           for: {{ .Values.prometheusRule.pluginErrorFor }}
           labels:
             severity: critical
           annotations:
             summary: "Paperclip critical plugin {{`{{ $labels.plugin_key }}`}} has been in status='error' for {{ .Values.prometheusRule.pluginErrorFor }}+"
-            description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092). This plugin key matches the critical plugin allow-list (pluginErrorCriticalKeyRegex) because losing it is not merely a missing feature -- BLO-20410 found lucitra.plugin-secrets dead in this exact state for 9+ hours with the pod 1/1 Running and nothing alerting. status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
+            description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092) and matches the critical plugin allow-list (pluginErrorCriticalKeyRegex), so it pages out-of-band rather than filing through Paperclip. The keys on that list are there for different reasons: losing lucitra.plugin-secrets is not merely a missing feature -- BLO-20410 found it dead in this exact state for 9+ hours with the pod 1/1 Running and nothing alerting -- while paperclip-plugin-alertmanager is the transport for every non-critical alert, so at warning its own failure would suppress the notification reporting it (PEN-2590/PEN-2581). status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
             runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
         - alert: PaperclipPluginErrored
           expr: paperclip_plugin_error{plugin_key!~{{ .Values.prometheusRule.pluginErrorCriticalKeyRegex | quote }}} == 1
