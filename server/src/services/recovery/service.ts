@@ -105,6 +105,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { resolveStrandedEscalationStatus } from "./stranded-escalation-status.js";
 import {
   isLegacySessionUnavailableAdapterMismatch,
   isZeroTokenStartupFailureRun,
@@ -6454,8 +6455,25 @@ export function recoveryService(
       // Both can write issue/run state through another pooled connection and must
       // never publish work for a transaction that later rolls back.
 
+      // BLO-27635: the `blocked`-with-no-blocker signature. See
+      // `resolveStrandedEscalationStatus` for the full rationale; in short, a strand
+      // with no recovery owner, no quota-monitor park, and no blocker edge is a
+      // CAPACITY condition rather than a dependency, and writing `blocked` for it
+      // froze a transient state into a permanent park that neither
+      // `reconcileStrandedAssignedIssues` (status filter) nor the BLO-21523
+      // reconciler (active-recovery-action suppression) will ever drain. Leave such a
+      // row dispatchable so it self-heals when capacity returns, and keep every other
+      // escalation side effect (recovery action, board-escalation comment, activity
+      // record) so the strand stays visible.
+      const { status: escalatedStatus, hasNoRecoveryPath } = resolveStrandedEscalationStatus({
+        currentStatus: fresh.status,
+        recoveryOwnerAgentId: action.ownerAgentId ?? null,
+        isProviderQuotaWait,
+        blockerIssueIds: blockerIds,
+      });
+
       const issueUpdate = {
-        status: "blocked" as const,
+        status: escalatedStatus,
         blockedByIssueIds: blockerIds,
         assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
         expectedCurrentStatus: fresh.status,
@@ -6537,6 +6555,14 @@ export function recoveryService(
           "",
           `- Recovery action: \`${action.id}\` (cause \`${recoveryCause}\`, attempt ${action.attemptCount})`,
           "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
+          // BLO-27635: say which status this left behind. When there is no owner AND no
+          // blocker edge the row is deliberately NOT parked in `blocked` — it stays
+          // dispatchable so it resumes on its own once an owner becomes invokable.
+          ...(hasNoRecoveryPath
+            ? [
+              `- Issue status: left \`${escalatedStatus}\` rather than \`blocked\`, because no owner and no blocker edge means a \`blocked\` park here would never be re-swept or drained. It will dispatch again on its own once an invokable owner with budget exists.`,
+            ]
+            : []),
           "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
         ].join("\n");
 
@@ -6673,8 +6699,17 @@ export function recoveryService(
         entityId: fresh.id,
         details: {
           identifier: fresh.identifier,
-          status: "blocked",
+          status: escalatedStatus,
           previousStatus: input.previousStatus,
+          // BLO-27635: the before/after pair for THIS write. `previousStatus` above is
+          // the caller's classification of how the row was categorised on entry, not the
+          // row's own prior status, so it cannot answer "what did this escalation
+          // change". `recoveryPathAbsent` makes the rows diverted away from `blocked`
+          // queryable without re-deriving the three-way predicate from owner/blocker
+          // fields.
+          statusBefore: fresh.status,
+          statusAfter: escalatedStatus,
+          recoveryPathAbsent: hasNoRecoveryPath,
           source: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
             ? "recovery.reconcile_successful_run_handoff_missing_state"
             : recoveryCause === "workspace_validation_failed"
