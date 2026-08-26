@@ -368,10 +368,28 @@ const REF_SUBTREE_KEY = new RegExp(
 const SEQUENCE_DASH = /^\s*(-\s+)/;
 const BARE_SEQUENCE_DASH = /^\s*-\s*$/;
 /**
+ * A shell/OCI environment-variable name. Defined once because both the YAML
+ * sequence-entry rule and the JSON scalar rule must agree on what counts as a
+ * name they may print in the clear — the whole point of preserving a name is
+ * that it is a name and not material.
+ */
+const ENV_VAR_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
+/**
  * The OCI/Docker `KEY=VALUE` env entry shape. The name is kept and only the
  * value dropped, matching design note 2 and the JSON path.
  */
-const ENV_KEY_VALUE_ENTRY = /^(\s*)(-\s+)(["']?)([A-Za-z_][A-Za-z0-9_.-]*)=/;
+const ENV_KEY_VALUE_ENTRY = new RegExp(`^(\\s*)(-\\s+)(["']?)(${ENV_VAR_NAME})=`);
+/**
+ * The same `KEY=VALUE` shape as a bare scalar, with no sequence introducer —
+ * what a string-valued `env` key holds on the JSON path.
+ *
+ * This exists so that "does this scalar have a name worth preserving?" is
+ * answered by matching a name, not by `indexOf("=") !== -1`. The difference is
+ * load-bearing: `[LEAKED]=x` contains an `=`, so slicing at the first one
+ * promotes material into the name position and prints it beside its own
+ * redaction marker. Only a validated name survives.
+ */
+const ENV_KEY_VALUE_SCALAR = new RegExp(`^(${ENV_VAR_NAME})=`);
 /**
  * An `env:` scalar that can carry material: a flow collection, an alias (which
  * may resolve to an anchor we never scrubbed), a block scalar, or the
@@ -1155,10 +1173,14 @@ function scrubJsonValueTracked(
     // close the class, not the spelling).
     if (isEnvKey(key) && typeof value === "string" && MATERIAL_BEARING_ENV_SCALAR.test(value)) {
       ctx.changed = true;
-      const eq = value.indexOf("=");
-      // Keep the variable name for the OCI/Docker `KEY=VALUE` encoding. The
-      // indicator-led shapes carry no name to preserve, so they redact whole.
-      result[key] = eq === -1 ? REDACTED : `${value.slice(0, eq)}=${REDACTED}`;
+      // Keep the variable name ONLY where the scalar really is `KEY=VALUE`.
+      // Testing `indexOf("=") !== -1` is not that test: `[LEAKED]=x` contains
+      // an `=`, so slicing at it promotes `[LEAKED]` into the name position
+      // and emits it in the clear next to a redaction marker. Validate the
+      // prefix against the same name charset the YAML sequence-entry rule
+      // uses; anything else has no name to keep and redacts whole.
+      const named = ENV_KEY_VALUE_SCALAR.exec(value);
+      result[key] = named ? `${named[1]}=${REDACTED}` : REDACTED;
       continue;
     }
     if (typeof value === "string") {
