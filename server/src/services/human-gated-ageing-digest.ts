@@ -423,6 +423,36 @@ export async function resolveDigestOwnerUserId(
   return rows[0]?.userId ?? null;
 }
 
+/**
+ * Is this user still an active human member of the company?
+ *
+ * First delivery refuses to assign a digest to anyone who is not — the query
+ * above filters on `status = 'active'` — so every later assignment decision has
+ * to apply the same test. A membership can be revoked between a digest being
+ * retired and the next actionable period reopening it, and retaining the
+ * recorded id across that gap hands the escalation to someone who cannot act on
+ * it while still reading as owned.
+ */
+async function isActiveCompanyMember(
+  db: Db,
+  companyId: string,
+  userId: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: companyMemberships.id })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}
+
 async function findDigestIssue(db: Db, companyId: string) {
   return db
     .select({
@@ -465,24 +495,35 @@ export type DigestDeliveryOutcome = {
   itemCount: number;
 };
 
+/** What the producers had to say for one company, in one period. */
+export type DigestCollection = {
+  body: string;
+  itemCount: number;
+  /** True when a producer returned a meaningful section, including zero items. */
+  hasContent: boolean;
+  failures: readonly { key: string; reason: string }[];
+};
+
 export async function deliverDigest(
   db: Db,
   input: {
     companyId: string;
-    body: string;
-    itemCount: number;
-    /** True when a producer returned a meaningful section, including zero items. */
-    hasContent?: boolean;
-    failures?: readonly { key: string; reason: string }[];
+    /**
+     * Produce the digest body. Invoked **inside** the delivery transaction with
+     * the company lock already held, so the snapshot the body is rendered from
+     * cannot move between being read and being written.
+     *
+     * Collecting before the lock is what let a human resolve the last overdue
+     * candidate in the gap and still get a digest created — or a retired one
+     * reopened — naming work that was no longer overdue. The lock serializes
+     * digest-row writes; it only makes the *decision* sound if the read that
+     * feeds it happens under the same lock.
+     */
+    collect: (txDb: Db) => Promise<DigestCollection>;
     logger: DigestLogger;
   },
 ): Promise<DigestDeliveryOutcome> {
-  const { companyId, body, itemCount, logger } = input;
-  const failures = input.failures ?? [];
-  // A non-null producer section is meaningful even when it contains zero
-  // escalated items (for example, a malformed-input warning). Producer
-  // failures are likewise durable signal, not an empty sweep.
-  const hasContent = input.hasContent ?? (itemCount > 0 || failures.length > 0);
+  const { companyId, logger } = input;
 
   return db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
@@ -492,6 +533,8 @@ export async function deliverDigest(
     await tx.execute(
       sql`select pg_advisory_xact_lock(hashtextextended(${DIGEST_DELIVERY_LOCK_PREFIX + companyId}, 0))`,
     );
+
+    const { body, itemCount, hasContent } = await input.collect(txDb);
 
     const existing = await findDigestIssue(txDb, companyId);
 
@@ -586,12 +629,34 @@ export async function deliverDigest(
       patch.status = "todo";
       patch.completedAt = null;
       patch.cancelledAt = null;
-      if (!existing.assigneeUserId) {
+      // Reassign when the row is unowned *or* when the recorded owner has since
+      // been deactivated or removed. Checking only for null would let a reopen
+      // deliver to an inactive member, which first delivery explicitly refuses
+      // to do — the two paths have to agree on what a valid owner is.
+      const ownerStillActive =
+        existing.assigneeUserId !== null &&
+        (await isActiveCompanyMember(txDb, companyId, existing.assigneeUserId));
+      if (!ownerStillActive) {
         const ownerUserId = await resolveDigestOwnerUserId(txDb, companyId);
-        if (ownerUserId) {
-          patch.assigneeUserId = ownerUserId;
-          patch.assigneeAgentId = null;
+        if (!ownerUserId) {
+          // Symmetric with creation: rather than reopen an escalation named on
+          // nobody (or on someone who can no longer act), leave it terminal and
+          // say so. A later period reopens the same durable row once the company
+          // has an active human again.
+          logger.warn(
+            { companyId, issueId: existing.id, staleAssigneeUserId: existing.assigneeUserId },
+            "human-gated ageing digest has no active human member to reopen against; leaving retired",
+          );
+          return {
+            companyId,
+            issueId: existing.id,
+            identifier: existing.identifier,
+            action: "skipped_no_owner",
+            itemCount,
+          };
         }
+        patch.assigneeUserId = ownerUserId;
+        patch.assigneeAgentId = null;
       }
     }
 
@@ -656,6 +721,50 @@ async function selectDigestCompanyIds(db: Db): Promise<string[]> {
  * must exercise. Calling the pure `selectAgedHumanGatedIssues` directly is what
  * passed for two years of green CI while the escalation never fired.
  */
+/**
+ * Run every registered producer and render the body.
+ *
+ * `db` here is the *transaction-scoped* handle supplied by `deliverDigest`, so
+ * the snapshot this reads is the one the delivery decision is made against.
+ */
+async function collectDigest(input: {
+  db: Db;
+  companyId: string;
+  now: Date;
+  periodKey: string;
+  producers: readonly DigestProducer[];
+  logger: DigestLogger;
+}): Promise<DigestCollection> {
+  const { db, companyId, now, periodKey, producers, logger } = input;
+  const sections: DigestSection[] = [];
+  const failures: { key: string; reason: string }[] = [];
+
+  for (const producer of producers) {
+    try {
+      const section = await producer.collect({ db, companyId, now, logger });
+      if (section) sections.push(section);
+    } catch (err) {
+      // A thrown producer must not read as a clean section. Record it so the
+      // rendered body says the digest is incomplete.
+      failures.push({
+        key: producer.key,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      logger.error({ err, companyId, producer: producer.key }, "digest producer failed");
+    }
+  }
+
+  return {
+    body: buildDigestBody({ periodKey, now, sections, failures }),
+    itemCount: sections.reduce((sum, section) => sum + section.itemCount, 0),
+    // A non-null producer section is meaningful even when it contains zero
+    // escalated items (for example, a malformed-input warning). Producer
+    // failures are likewise durable signal, not an empty sweep.
+    hasContent: sections.length > 0 || failures.length > 0,
+    failures,
+  };
+}
+
 export async function humanGatedDigestTick(
   db: Db,
   input: HumanGatedDigestTickInput = {},
@@ -670,34 +779,15 @@ export async function humanGatedDigestTick(
   const outcomes: DigestDeliveryOutcome[] = [];
 
   for (const companyId of companyIds) {
-    const sections: DigestSection[] = [];
-    const failures: { key: string; reason: string }[] = [];
-
-    for (const producer of producers) {
-      try {
-        const section = await producer.collect({ db, companyId, now, logger });
-        if (section) sections.push(section);
-      } catch (err) {
-        // A thrown producer must not read as a clean section. Record it so the
-        // rendered body says the digest is incomplete.
-        failures.push({
-          key: producer.key,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-        logger.error({ err, companyId, producer: producer.key }, "digest producer failed");
-      }
-    }
-
-    const itemCount = sections.reduce((sum, section) => sum + section.itemCount, 0);
-    const body = buildDigestBody({ periodKey, now, sections, failures });
     outcomes.push(
       await deliverDigest(db, {
         companyId,
-        body,
-        itemCount,
-        hasContent: sections.length > 0 || failures.length > 0,
-        failures,
         logger,
+        // Deliberately a callback rather than a value: it runs under the
+        // company lock inside the delivery transaction, so a candidate cannot
+        // be resolved between the snapshot and the write it justifies.
+        collect: (txDb) =>
+          collectDigest({ db: txDb, companyId, now, periodKey, producers, logger }),
       }),
     );
   }
