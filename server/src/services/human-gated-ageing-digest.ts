@@ -269,17 +269,13 @@ export async function loadHumanGatedIssues(
         EXCLUDE_DIGEST_ROWS,
       ),
     )
-    // Acquire candidate locks in a stable order. The delivery transaction
-    // already serializes digest ticks, while human writes do not take that
-    // advisory lock; deterministic ordering avoids avoidable lock inversions
-    // with other multi-row maintenance operations.
+    // Acquire candidate locks in a stable order. Human-clock mutation triggers
+    // take FOR SHARE on the same rows, while comment foreign keys take the
+    // compatible FOR KEY SHARE mode. This makes the aggregate snapshot atomic
+    // without introducing a lock inversion for bulk comment inserts.
     .orderBy(asc(issues.id));
-  let rows: Awaited<typeof query>;
-  if (options.lockRows) {
-    rows = await query.for("update");
-  } else {
-    rows = await query;
-  }
+
+  const rows = options.lockRows ? await query.for("no key update") : await query;
 
   if (rows.length === 0) return [];
 

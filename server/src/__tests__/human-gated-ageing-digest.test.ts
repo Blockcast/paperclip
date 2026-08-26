@@ -600,6 +600,77 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect((await digestRow(companyId))[0]?.description ?? "").toContain("HGD-16");
   });
 
+  it("coordinates human activity inserts with the human-clock snapshot", async () => {
+    const { companyId } = await createCompany();
+    const candidateId = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-24",
+      createdAt: daysAgo(40),
+    });
+
+    let signalSnapshotReady!: () => void;
+    const snapshotReady = new Promise<void>((resolve) => {
+      signalSnapshotReady = resolve;
+    });
+    let releaseSnapshot!: () => void;
+    const snapshotRelease = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    let activityFinished = false;
+
+    // The real producer locks candidate issue rows before it aggregates the
+    // human clock. The activity_log coordination trigger takes FOR SHARE on
+    // that same issue, so a concurrent human touch must wait for delivery
+    // rather than commit into the gap between the aggregate read and digest
+    // write.
+    const pausingProducer: DigestProducer = {
+      key: humanGatedAgeingProducer.key,
+      collect: async (context) => {
+        const section = await humanGatedAgeingProducer.collect(context);
+        signalSnapshotReady();
+        await snapshotRelease;
+        return section;
+      },
+    };
+
+    const tickPromise = humanGatedDigestTick(db, {
+      now: NOW,
+      companyId,
+      producers: [pausingProducer],
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    await snapshotReady;
+
+    const activityPromise = db
+      .insert(activityLog)
+      .values({
+        companyId,
+        actorType: "user",
+        actorId: HUMAN_USER_ID,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: candidateId,
+        createdAt: daysAgo(1),
+      })
+      .then(() => {
+        activityFinished = true;
+      });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(activityFinished).toBe(false);
+
+    releaseSnapshot();
+    await tickPromise;
+    await activityPromise;
+
+    // The touch was serialized after the first delivery, so the next pass must
+    // reconcile the durable row instead of preserving the pre-touch report.
+    expect((await digestRow(companyId))[0]?.description ?? "").toContain("HGD-24");
+    const reconciled = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(reconciled.outcomes[0]?.action).toBe("retired");
+    expect((await digestRow(companyId))[0]?.description ?? "").not.toContain("HGD-24");
+  });
+
   it("skips delivery when the company has no active human member", async () => {
     const { companyId } = await createCompany();
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
