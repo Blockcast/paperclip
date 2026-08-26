@@ -675,6 +675,69 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it.each(["done", "cancelled"] as const)(
+    "does not wake a mentioned agent from a terminal %s issue",
+    async (status) => {
+      const existing = makeIssue({
+        status,
+        assigneeAgentId: null,
+        assigneeUserId: "local-board",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: `comment-terminal-mention-${status}`,
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "@mentioned please take another look",
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: "@mentioned please take another look" });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["done", "cancelled"] as const)(
+    "does not emit an execution-stage approver wake for terminal %s issues",
+    async (status) => {
+      const existing = makeIssue({
+        status: "in_review",
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        executionState: {
+          status: "pending",
+          currentStageId: "stage-1",
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: MENTIONED_AGENT_ID },
+          returnAssignee: { type: "agent", agentId: ASSIGNEE_AGENT_ID },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+        },
+      });
+      const updated = makeIssue({
+        ...existing,
+        status,
+        executionState: existing.executionState,
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue(updated);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${existing.id}`)
+        .send({ status });
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    },
+  );
+
   it("replays an unprocessed idempotent top-level comment through post-insert side effects", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
