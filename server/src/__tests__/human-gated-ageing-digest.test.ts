@@ -27,6 +27,7 @@ import {
 import {
   DEFAULT_DIGEST_PERIOD_DAYS,
   HUMAN_GATED_DIGEST_ORIGIN_KIND,
+  buildDigestBody,
   digestPeriodKey,
   humanGatedDigestOriginId,
   humanGatedDigestTick,
@@ -452,9 +453,8 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
 
   // -- A failing producer must not read as an all-clear -----------------------
 
-  it("reports a throwing producer as an incomplete digest rather than omitting it", async () => {
+  it("delivers and reopens a failure-only digest", async () => {
     const { companyId } = await createCompany();
-    await insertHumanGatedIssue({ companyId, identifier: "HGD-11", createdAt: daysAgo(40) });
 
     const exploding: DigestProducer = {
       key: "exploding-producer",
@@ -470,19 +470,38 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
       logger: { info: () => {}, warn: () => {}, error: () => {} },
     });
 
-    expect(result.outcomes[0]?.action).toBe("skipped_empty");
+    expect(result.outcomes[0]?.action).toBe("created");
+    expect(await digestRow(companyId)).toHaveLength(1);
+    expect((await digestRow(companyId))[0]?.description ?? "").toContain("exploding-producer");
+    expect((await digestRow(companyId))[0]?.description ?? "").toContain("not an all-clear");
 
-    // With an existing row, the failure has to be visible on it.
-    await humanGatedDigestTick(db, { now: NOW, companyId });
-    await humanGatedDigestTick(db, {
+    const digestId = (await digestRow(companyId))[0]?.id;
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, digestId!));
+
+    const reopened = await humanGatedDigestTick(db, {
       now: NOW,
       companyId,
       producers: [exploding],
       logger: { info: () => {}, warn: () => {}, error: () => {} },
     });
-    const body = (await digestRow(companyId))[0]?.description ?? "";
-    expect(body).toContain("exploding-producer");
-    expect(body).toContain("not an all-clear");
+    expect(reopened.outcomes[0]?.action).toBe("reopened");
+    expect((await digestRow(companyId))[0]?.status).toBe("todo");
+  });
+
+  it("serializes concurrent first deliveries into one digest row", async () => {
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-15", createdAt: daysAgo(40) });
+
+    const [first, second] = await Promise.all([
+      humanGatedDigestTick(db, { now: NOW, companyId }),
+      humanGatedDigestTick(db, { now: NOW, companyId }),
+    ]);
+
+    expect([first.outcomes[0]?.action, second.outcomes[0]?.action].sort()).toEqual([
+      "created",
+      "unchanged",
+    ]);
+    expect(await digestRow(companyId)).toHaveLength(1);
   });
 
   it("skips delivery when the company has no active human member", async () => {
@@ -530,6 +549,23 @@ describe("digestPeriodKey", () => {
 
   it("rejects a non-positive period", () => {
     expect(() => digestPeriodKey(new Date(), 0)).toThrow(/positive finite/);
+  });
+});
+
+describe("buildDigestBody", () => {
+  it("keeps the rendered body stable when the clock moves within a period", () => {
+    const sections = [{ key: "example", markdown: "### Example", itemCount: 1 }];
+    const periodKey = digestPeriodKey(NOW);
+    const first = buildDigestBody({ periodKey, now: NOW, sections, failures: [] });
+    const later = buildDigestBody({
+      periodKey,
+      now: new Date(NOW.getTime() + 60 * 60 * 1000),
+      sections,
+      failures: [],
+    });
+
+    expect(later).toBe(first);
+    expect(later).not.toContain(NOW.toISOString());
   });
 });
 
