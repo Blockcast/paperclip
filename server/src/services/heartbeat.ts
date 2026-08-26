@@ -12312,6 +12312,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         durableSkipReason: null,
         providerCapacityDeferred: false,
         dependencyBlockedRetryAt: null,
+        alreadyDelivered: false,
       };
       await enqueueWakeup(targetAgentId, {
         source: input.source,
@@ -20199,6 +20200,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             durableSkipReason: null,
             providerCapacityDeferred: false,
             dependencyBlockedRetryAt: null,
+            alreadyDelivered: false,
           };
           let scopedFailure: unknown = null;
           try {
@@ -32465,6 +32467,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(
             and(
               eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agent.id),
               eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
               inArray(agentWakeupRequests.status, IDEMPOTENT_WAKE_DELIVERED_STATUSES),
               isNotNull(agentWakeupRequests.runId),
@@ -34869,6 +34872,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           durableSkipReason: null,
           providerCapacityDeferred: false,
           dependencyBlockedRetryAt: null,
+          alreadyDelivered: false,
         };
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
