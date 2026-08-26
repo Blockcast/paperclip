@@ -973,6 +973,51 @@ describe("scrubJsonValue — env entries that are not objects", () => {
     expect(JSON.stringify(out)).toContain("see config");
   });
 
+  /**
+   * The assertion above is true of `"see config"` and was read as true in
+   * general — the JSON path gated on `value.includes("=")` while the YAML path
+   * gated on a constant that ALSO matches a leading `[`, `{`, `*`, `|` or `>`.
+   * Five shapes were redacted as YAML and returned verbatim as JSON.
+   *
+   * Assert the agreement differentially, over both paths, rather than pinning
+   * one more fixture per path: a fixture list re-checks the spellings someone
+   * already thought of, and this defect was born from exactly that.
+   */
+  describe("env scalars agree across the JSON and YAML paths", () => {
+    const INDICATOR_LED = [
+      ["flow sequence", `[${LEAK}]`],
+      ["flow mapping", `{k: ${LEAK}}`],
+      ["alias", `*${LEAK}`],
+      ["literal block", `|${LEAK}`],
+      ["folded block", `>${LEAK}`],
+      ["OCI KEY=VALUE", `OPENAI_API_KEY=${LEAK}`],
+    ] as const;
+
+    for (const [label, scalar] of INDICATOR_LED) {
+      it(`redacts a ${label} env scalar on BOTH paths`, () => {
+        expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+        expectNoLeak(scrubYamlText(`env: ${scalar}`));
+      });
+    }
+
+    it("keeps the variable name only where there is one to keep", () => {
+      // `KEY=VALUE` names its variable; an indicator-led scalar does not, so
+      // inventing a name there would be worse than redacting whole.
+      expect(scrubJsonValue({ env: `OPENAI_API_KEY=${LEAK}` })).toEqual({
+        env: `OPENAI_API_KEY=${REDACTED}`,
+      });
+      expect(scrubJsonValue({ env: `*${LEAK}` })).toEqual({ env: REDACTED });
+    });
+
+    it("still passes prose through on both paths, so the gate did not widen to everything", () => {
+      // The negative control. Without it, `env: REDACTED` unconditionally
+      // would satisfy every assertion above while destroying the diagnostic
+      // value the scrubber exists to preserve.
+      expect(scrubJsonValue({ env: "see config" })).toEqual({ env: "see config" });
+      expect(scrubYamlText("env: see config")).toContain("see config");
+    });
+  });
+
   it("leaves a null entry untouched rather than inventing a redaction", () => {
     expect(JSON.stringify(scrubJsonValue({ env: [null] }))).toBe('{"env":[null]}');
   });
