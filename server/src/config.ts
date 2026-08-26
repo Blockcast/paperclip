@@ -282,6 +282,11 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  approvalGateReconcilerIntervalMinutes: {
+    fallback: 10,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
   recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
   recoveryActionTimeoutMs: {
@@ -301,6 +306,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   databaseBackupIntervalMinutes: 60_000,
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  approvalGateReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
@@ -613,9 +619,12 @@ export function loadConfig(): Config {
   // the observed gate lifetimes that produced this defect were hours, not minutes.
   // Each sweep costs one GitHub REST call per pending gate card, so the population
   // (pending cards carrying a gate) bounds the rate-limit exposure, not the cadence.
-  const approvalGateReconcilerIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES) || 10,
+  // That accounting is what makes an unbounded period dangerous here rather than
+  // merely wrong: the 1 ms coercion turns the per-card cost into a REST flood.
+  const approvalGateReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.approvalGateReconcilerIntervalMinutes,
+    "approvalGateReconcilerIntervalMinutes",
   );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
