@@ -1448,6 +1448,7 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    actor?: { userId?: string | null; agentId?: string | null };
   }): Promise<Record<string, unknown>> {
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
@@ -1455,6 +1456,7 @@ export function agentRoutes(
       {
         strictMode: strictSecretsMode,
         adapterType: input.adapterType ?? null,
+        actor: input.actor,
       },
     );
     await assertAdapterConfigConstraints(
@@ -3570,6 +3572,13 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        actor: req.actor,
+      });
+      // Normalization can turn a plain schema-secret value into a managed
+      // secret_ref. Check the result as well as the raw request so that a
+      // mediated binding cannot bypass the agent mutation guard.
+      assertNoAgentAdapterConfigMutation(req, normalizedEffectiveAdapterConfig, "adapterConfig", {
+        existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
       // PATCH writes `adapterConfig` straight through to the service, so it was

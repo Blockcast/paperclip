@@ -1391,6 +1391,11 @@ export function secretService(db: Db) {
     if (value === REDACTED_SENTINEL) {
       throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`);
     }
+    if (input.actor?.agentId) {
+      throw forbidden(
+        `Agent-authenticated callers cannot introduce a plain secret schema field: ${input.key}`,
+      );
+    }
     const id = randomUUID();
     const adapterPart = normalizeSecretKey(input.adapterType ?? "adapter");
     const fieldPart = normalizeSecretKey(input.key);
