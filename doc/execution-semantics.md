@@ -260,28 +260,6 @@ An external wait counts as a live or waiting path only when the next move surviv
 - a first-class blocker or `blocked` disposition that declares the external owner and concrete action required to unblock the issue, using the exact two-line syntax in [Declaring an external wait](#declaring-an-external-wait)
 - a delegated child issue with a responsible owner and its own healthy action path, plus a blocker edge when the source issue must wait for that child; `parentId` alone is not a dependency
 
-#### Declaring an external wait
-
-Naming the gate in prose does not register. Paperclip recognises an external wait only when the issue **description** contains both of the following lines, each on a line of its own:
-
-```
-external owner: <who must act — a person, team, or external system>
-external action: <the concrete action they must take>
-```
-
-Both lines are required; either one alone does not count. Matching is case-insensitive and tolerates leading spaces and tabs, so `External owner: …` is fine — but the `key: value` shape is mandatory. Each value must sit on the same line as its key: `external owner:` with the name on the line below is an incomplete declaration and does not match. A sentence such as "waiting on the CTO to approve the ruleset change" does **not** match, however clearly it names the gate.
-
-Use this to park an issue on a gate the issue graph cannot represent: an approval, a credential grant, another team's sign-off. Per the monitor contract, do **not** arm a monitor on a human-only gate — polling does not move it. Declare the external wait instead.
-
-A declaration is also read positively, not just as a suppression: a `blocked` issue with a declared wait and no live monitor is surfaced in the blocked inbox as `external_wait` rather than as a stalled row. The two declaration lines are stripped from the description shown there, and the parsed owner and action values are then struck out of whatever prose remains.
-
-**Keep both values short — the owner under 120 characters and the action under 240.** Those caps are not a display nicety: the parsed values are the exact needles used to redact the remaining prose, so any part of an owner or action beyond its cap is not redacted and stays visible in the blocked inbox. A 145-character owner leaves its last 25 characters in the clear.
-
-Two limits worth knowing before you rely on it:
-
-- **`description` only.** The same text in a comment, or in `monitorNotes`, is not scanned.
-- **It silences one rule, not all of them.** The declaration clears the dead-end rule behind the `blocked_without_blockers` finding. It does not exempt the issue from the other liveness invariants, so a `blocked` row that also has, say, an uninvokable assignee still raises that separate finding.
-
 A one-shot issue monitor consumes its persisted `nextCheckAt` when it dispatches the assignee wake. If that monitor-consuming run is lost before it records a new disposition or future monitor, Paperclip restores exactly one bounded continuation using the existing process-loss retry limit; if that continuation is also lost, the normal recovery-action escalation owns the next step instead of creating another monitor loop.
 
 An unmanaged local process is not a durable action path. Shell jobs started with `&`, `nohup`, local polling loops, detached PTY sessions, adapter child processes, or similar background watchers do not keep an issue live unless Paperclip persists them as a run or pairs a managed runtime service with a monitor, scheduled wake, blocker, or delegated issue that owns the next check. A PID, session id, log file, comment, or promise to check later is evidence only. The process may be killed when the adapter invocation or heartbeat exits and cannot be assumed observable or recoverable by another worker.
@@ -298,6 +276,28 @@ Recovery from an invalid external wait is bounded and idempotent:
 4. New durable source activity may produce a new recovery fingerprint, but unchanged killed/local-watcher evidence must not create an infinite wake/recovery loop.
 
 This rule is intentionally conservative: local watcher evidence can help the recovery owner decide what happened, but only persisted control-plane state can prove that the work will move again.
+
+#### Declaring an external wait
+
+Naming the gate in prose does not register. Paperclip recognises an external wait only when the issue **description** contains both of the following lines, each on a line of its own:
+
+```
+external owner: <who must act — a person, team, or external system>
+external action: <the concrete action they must take>
+```
+
+Both lines are required; either one alone does not count. Matching is case-insensitive and tolerates leading spaces and tabs, so `External owner: …` is fine — but the `key: value` shape is mandatory. Each value must sit on the same line as its key: `external owner:` with the name on the line below is an incomplete declaration and does not match. A sentence such as "waiting on the CTO to approve the ruleset change" does **not** match, however clearly it names the gate.
+
+Use this to park an issue on a gate the issue graph cannot represent: an approval, a credential grant, another team's sign-off. Per the monitor contract, do **not** arm a monitor on a human-only gate — polling does not move it. Declare the external wait instead.
+
+A declaration is also read positively, not just as a suppression: a `blocked` issue with a declared wait and no live monitor is surfaced in the blocked inbox as `external_wait` rather than as a stalled row. The two declaration lines are stripped from the description shown there, and the parsed owner and action values are then struck out of whatever prose remains.
+
+**Keep both values short — the owner at 120 characters or fewer and the action at 240 characters or fewer.** Those caps are not a display nicety: the parsed values are the exact needles used to redact the remaining prose, so any part of an owner or action beyond its cap is not redacted and stays visible in the blocked inbox. A 145-character owner leaves its last 25 characters in the clear.
+
+Two limits worth knowing before you rely on it:
+
+- **`description` only.** The same text in a comment, or in `monitorNotes`, is not scanned.
+- **It silences one rule, not all of them.** The declaration clears the dead-end rule behind the `blocked_without_blockers` finding. It does not exempt the issue from the other liveness invariants, so a `blocked` row that also has, say, an uninvokable assignee still raises that separate finding.
 
 ### Comment and document activity wake sources
 

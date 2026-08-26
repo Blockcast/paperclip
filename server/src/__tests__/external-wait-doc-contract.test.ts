@@ -109,10 +109,12 @@ describe("external-wait declaration: doc and matcher agree", () => {
     // Without this, editing `slice(0, 120)` would silently make the doc wrong while the
     // suite stayed green — the same doc-vs-code drift this file exists to catch, just
     // moved from prose-vs-parser to number-vs-parser.
+    const owner = Array.from({ length: 200 }, (_, index) => String(index % 10)).join("");
+    const action = Array.from({ length: 300 }, (_, index) => String((index + 3) % 10)).join("");
     const parsed = externalWaitFromDescription(
-      `external owner: ${"A".repeat(200)}\nexternal action: ${"B".repeat(300)}`,
+      `external owner: ${owner}\nexternal action: ${action}`,
     );
-    expect(parsed?.owner).toHaveLength(120);
-    expect(parsed?.action).toHaveLength(240);
+    expect(parsed?.owner).toBe(owner.slice(0, 120));
+    expect(parsed?.action).toBe(action.slice(0, 240));
   });
 });
