@@ -3344,6 +3344,28 @@ export function agentRoutes(
       return;
     }
 
+    // This route wrote `agents.budget_monthly_cents` — the display mirror — and
+    // never the budget policy that actually enforces the cap
+    // (`pauseScopeForBudget` reads the policy, not the column). It returned 200,
+    // echoed the new value and recorded a config revision, so a cap raise made
+    // here was indistinguishable from one that took effect while binding
+    // nothing. It is also the only agent-reachable budget write, so the failure
+    // absorbed real allocation decisions: two separate raises landed here and
+    // silently did not apply.
+    //
+    // Rejecting rather than writing through on purpose. Write-through would
+    // hand every agent the ability to raise its own enforcing cap, which is the
+    // boundary `assertBoard` on the budgets route exists to hold — the fix has
+    // to narrow what agents can write, never widen it. BLO-27626.
+    if (hasOwn(req.body as object, "budgetMonthlyCents")) {
+      res.status(422).json({
+        error:
+          "Use PATCH /api/agents/:agentId/budgets to change a monthly budget cap. "
+          + "This route writes only the display mirror and would not change enforcement.",
+      });
+      return;
+    }
+
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;

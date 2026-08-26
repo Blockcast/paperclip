@@ -846,7 +846,14 @@ export function AgentDetail() {
       (policy) => policy.scopeType === "agent" && policy.scopeId === (agent?.id ?? routeAgentRef),
     );
     if (matched) return matched;
-    const budgetMonthlyCents = agent?.budgetMonthlyCents ?? 0;
+    // No policy row in the overview — either the agent has no enforcing policy,
+    // or `budgets/overview` is still loading or forbidden for this viewer. Fall
+    // back to the enforcing amount carried on the agent read model, NOT to
+    // `agent.budgetMonthlyCents`: that column is a display mirror and can be
+    // stale, and rendering it here is what let a drifted cap read as the real
+    // one. `null`/absent means no active policy, i.e. uncapped — which is the
+    // safe thing to show when we do not know the cap. BLO-27626.
+    const budgetMonthlyCents = agent?.enforcedBudgetMonthlyCents ?? 0;
     const spentMonthlyCents = agent?.spentMonthlyCents ?? 0;
     return {
       policyId: "",
