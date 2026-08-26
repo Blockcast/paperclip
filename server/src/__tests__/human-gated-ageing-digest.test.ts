@@ -29,6 +29,7 @@ import {
   HUMAN_GATED_DIGEST_ORIGIN_KIND,
   buildDigestBody,
   digestPeriodKey,
+  humanGatedAgeingProducer,
   humanGatedDigestOriginId,
   humanGatedDigestTick,
   loadHumanGatedIssues,
@@ -529,6 +530,67 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
       "unchanged",
     ]);
     expect(await digestRow(companyId)).toHaveLength(1);
+  });
+
+  it("holds candidate locks until the default producer's digest delivery commits", async () => {
+    const { companyId } = await createCompany();
+    const candidateId = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-16",
+      createdAt: daysAgo(40),
+    });
+
+    let signalSnapshotReady!: () => void;
+    const snapshotReady = new Promise<void>((resolve) => {
+      signalSnapshotReady = resolve;
+    });
+    let releaseSnapshot!: () => void;
+    const snapshotRelease = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+
+    // Pause after the real producer has collected its rows. Without FOR UPDATE,
+    // the concurrent resolution below completes during this pause and this
+    // regression fails.
+    const pausingProducer: DigestProducer = {
+      key: humanGatedAgeingProducer.key,
+      collect: async (context) => {
+        const section = await humanGatedAgeingProducer.collect(context);
+        signalSnapshotReady();
+        await snapshotRelease;
+        return section;
+      },
+    };
+
+    const tickPromise = humanGatedDigestTick(db, {
+      now: NOW,
+      companyId,
+      producers: [pausingProducer],
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    await snapshotReady;
+
+    let resolutionFinished = false;
+    const resolutionPromise = db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.id, candidateId))
+      .then(() => {
+        resolutionFinished = true;
+      });
+
+    await Promise.race([
+      resolutionPromise,
+      new Promise((resolve) => setTimeout(resolve, 100)),
+    ]);
+    const resolutionWasBlocked = !resolutionFinished;
+
+    releaseSnapshot();
+    await tickPromise;
+    await resolutionPromise;
+    expect(resolutionWasBlocked).toBe(true);
+    expect(resolutionFinished).toBe(true);
+    expect((await digestRow(companyId))[0]?.description ?? "").toContain("HGD-16");
   });
 
   it("skips delivery when the company has no active human member", async () => {
