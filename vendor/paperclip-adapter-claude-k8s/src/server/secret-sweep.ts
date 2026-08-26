@@ -143,32 +143,34 @@ export function createLaunchLeaseHeartbeat(args: {
 } {
   const targets = new Map<string, LaunchLeaseTarget>();
   const intervalMs = Math.max(1_000, Math.floor(args.leaseMs / 3));
-  let renewing = false;
+  // Track requests per Secret. A hung patch for one target must not suppress
+  // renewals for the other targets or later timer ticks.
+  const renewing = new Set<string>();
   const renew = async () => {
-    if (renewing || targets.size === 0 || typeof args.coreApi.patchNamespacedSecret !== "function") return;
-    renewing = true;
-    try {
-      const annotation = launchLeaseExpiry(Date.now(), args.leaseMs);
-      await Promise.all([...targets.values()].map((target) =>
-        args.coreApi.patchNamespacedSecret!({
-          name: target.name,
-          namespace: target.namespace,
-          body: {
-            metadata: { annotations: { [LAUNCH_LEASE_ANNOTATION]: annotation } },
-          },
-        }),
-      ));
-    } catch (err) {
-      await args.onError?.(err);
-    } finally {
-      renewing = false;
+    if (targets.size === 0 || typeof args.coreApi.patchNamespacedSecret !== "function") return;
+    const annotation = launchLeaseExpiry(Date.now(), args.leaseMs);
+    for (const target of targets.values()) {
+      const key = `${target.namespace}/${target.name}`;
+      if (renewing.has(key)) continue;
+      renewing.add(key);
+      void args.coreApi.patchNamespacedSecret({
+        name: target.name,
+        namespace: target.namespace,
+        body: {
+          metadata: { annotations: { [LAUNCH_LEASE_ANNOTATION]: annotation } },
+        },
+      }).catch(async (err) => {
+        await args.onError?.(err);
+      }).finally(() => {
+        renewing.delete(key);
+      });
     }
   };
   const timer = setInterval(() => { void renew(); }, intervalMs);
   timer.unref?.();
   return {
     add(target) { targets.set(`${target.namespace}/${target.name}`, target); },
-    stop() { clearInterval(timer); targets.clear(); },
+    stop() { clearInterval(timer); targets.clear(); renewing.clear(); },
   };
 }
 
