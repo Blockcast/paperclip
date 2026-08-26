@@ -377,6 +377,12 @@ const ENV_KEY_VALUE_ENTRY = /^(\s*)(-\s+)(["']?)([A-Za-z_][A-Za-z0-9_.-]*)=/;
  * may resolve to an anchor we never scrubbed), a block scalar, or the
  * `KEY=VALUE` encoding. A plain scalar without `=` is prose in some other
  * body this proxy carries, not a Kubernetes env value.
+ *
+ * Shared by the YAML scanner and the structural JSON walker on purpose. Both
+ * decide the same question — "can this env scalar carry material?" — and when
+ * they answered it with two separate expressions they disagreed on every
+ * indicator-led shape. Keep it one constant; a second spelling is a second
+ * rule.
  */
 const MATERIAL_BEARING_ENV_SCALAR = /^[[{*|>]|=/;
 /**
@@ -1137,12 +1143,22 @@ function scrubJsonValueTracked(
       continue;
     }
     // An `env` serialized as a single scalar rather than a list or a mapping.
-    // Same discriminator as the YAML path: `KEY=VALUE` carries material, a
-    // plain string does not and belongs to some other body this proxy carries.
-    if (isEnvKey(key) && typeof value === "string" && value.includes("=")) {
+    // Gated by `MATERIAL_BEARING_ENV_SCALAR` — the *same constant* the YAML
+    // path uses, not a second spelling of it. This branch previously tested
+    // `value.includes("=")` under a comment claiming it was "the same
+    // discriminator as the YAML path". It was not: the YAML constant also
+    // matches a leading `[`, `{`, `*`, `|` or `>`, so five env-scalar shapes
+    // were redacted on the YAML path and returned verbatim here. Two
+    // independently-maintained spellings of one rule drift silently and the
+    // comment asserting they agree is what stops the next reader checking, so
+    // the constant is now shared rather than restated (PEN-2370 ask 3 (b2):
+    // close the class, not the spelling).
+    if (isEnvKey(key) && typeof value === "string" && MATERIAL_BEARING_ENV_SCALAR.test(value)) {
       ctx.changed = true;
       const eq = value.indexOf("=");
-      result[key] = `${value.slice(0, eq)}=${REDACTED}`;
+      // Keep the variable name for the OCI/Docker `KEY=VALUE` encoding. The
+      // indicator-led shapes carry no name to preserve, so they redact whole.
+      result[key] = eq === -1 ? REDACTED : `${value.slice(0, eq)}=${REDACTED}`;
       continue;
     }
     if (typeof value === "string") {
