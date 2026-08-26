@@ -1528,6 +1528,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // PodSpec limit).  The Secret is cleaned up in the finally block.
     if (promptSecret) {
       try {
+        // Register before awaiting creation. If the API accepts the Secret
+        // but the response stalls, the heartbeat must already renew it.
+        launchLeaseHeartbeat.add(promptSecret);
         await coreApi.createNamespacedSecret({
           namespace: promptSecret.namespace,
           body: {
@@ -1546,7 +1549,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: promptSecret.data,
           },
         });
-        launchLeaseHeartbeat.add(promptSecret);
         await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1567,6 +1569,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // clean it up in the finally block. Never log envSecret.data (values).
     if (envSecret) {
       try {
+        launchLeaseHeartbeat.add(envSecret);
         await coreApi.createNamespacedSecret({
           namespace: envSecret.namespace,
           body: {
@@ -1585,7 +1588,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: envSecret.data,
           },
         });
-        launchLeaseHeartbeat.add(envSecret);
         await onLog("stdout", `[paperclip] Created env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1609,6 +1611,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // — never a literal env var. Never log mcpConfigSecret.data (values).
     if (mcpConfigSecret) {
       try {
+        launchLeaseHeartbeat.add(mcpConfigSecret);
         await coreApi.createNamespacedSecret({
           namespace: mcpConfigSecret.namespace,
           body: {
@@ -1627,7 +1630,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: mcpConfigSecret.data,
           },
         });
-        launchLeaseHeartbeat.add(mcpConfigSecret);
         await onLog("stdout", `[paperclip] Created mcp-config Secret: ${mcpConfigSecret.name}\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
