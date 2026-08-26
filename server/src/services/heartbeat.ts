@@ -23006,6 +23006,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // excludes `src/__tests__`, so a test can pass the field either way and
     // cannot pin this. The production callers above are what keep it honest.
     unchangedTargetSuppressionMs?: number;
+    /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
+    abandonedRecoveryMs?: number;
   }) {
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
