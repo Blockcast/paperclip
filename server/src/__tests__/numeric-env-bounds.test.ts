@@ -27,6 +27,8 @@ const SETTINGS = {
   prReconcilerWindowDays: "PAPERCLIP_PR_RECONCILER_WINDOW_DAYS",
   strandedBlockedIssueReconcilerIntervalMinutes:
     "PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES",
+  humanGatedDigestIntervalMinutes: "PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES",
+  humanGatedDigestPeriodDays: "PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS",
   // Added by the ratchet below, not by the original survey: this site landed on
   // master in e73698f7 (2026-08-20), after the eight-site sweep, and reached this
   // branch through a rebase. The `config.ts` offender list going red is what
