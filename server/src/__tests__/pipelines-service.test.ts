@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -41,6 +41,7 @@ import {
 import { routineService } from "../services/routines.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3045,6 +3046,49 @@ describeEmbeddedPostgres("pipelineService", () => {
         events.seen[0]!.valueAtPublish,
         "the bumped revision must already be visible to other connections when the event fires",
       ).resolves.toBe(revisionAfter);
+    });
+
+    it("observes and logs a throwing live-event subscriber after the env update commits", async () => {
+      const { company, pipeline, stageId } = await seedAutomatedStage();
+      const warning = "failed to publish pipeline.stage_automation_env_updated activity event";
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      const unsubscribe = subscribeCompanyLiveEvents(company.id, (event) => {
+        if (
+          event.type === "activity.logged" &&
+          (event.payload as Record<string, unknown>).action === "pipeline.stage_automation_env_updated"
+        ) {
+          throw new Error("pipeline live subscriber exploded");
+        }
+      });
+      let warningCalls: unknown[][] = [];
+
+      try {
+        await svc.updateStageAutomationEnv({
+          companyId: company.id,
+          pipelineId: pipeline.id,
+          stageId,
+          env: null,
+          actor: userActor,
+        });
+        warningCalls = warnSpy.mock.calls.map((call) => [...call]);
+      } finally {
+        unsubscribe();
+        warnSpy.mockRestore();
+      }
+
+      expect(
+        warningCalls,
+        "the post-commit publisher must be awaited so subscriber failures reach the existing logger",
+      ).toEqual(expect.arrayContaining([
+        [
+          expect.objectContaining({
+            err: expect.objectContaining({ message: "pipeline live subscriber exploded" }),
+            companyId: company.id,
+            stageId,
+          }),
+          warning,
+        ],
+      ]));
     });
   });
 });

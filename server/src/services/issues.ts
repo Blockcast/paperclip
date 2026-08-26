@@ -151,7 +151,10 @@ import {
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
-import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import {
+  ACTIVE_RECOVERY_ACTION_STATUSES,
+  BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
+} from "./issue-recovery-actions.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 
@@ -4077,7 +4080,14 @@ export async function listBlockedIssueAutoResumeSuppressions(
       and(
         eq(issueRecoveryActions.companyId, companyId),
         inArray(issueRecoveryActions.sourceIssueId, uniqueIssueIds),
-        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        // NOT `ACTIVE_RECOVERY_ACTION_STATUSES` — `escalated` is deliberately excluded.
+        // An escalated action is definitionally wake-exhausted, so suppressing here would
+        // pin the issue `blocked` with nothing able to re-enter it. See the constant's doc
+        // comment (BLO-21523).
+        inArray(
+          issueRecoveryActions.status,
+          [...BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES],
+        ),
       ),
     );
   for (const row of recoveryRows) {
@@ -4335,11 +4345,17 @@ async function listSuccessfulRunHandoffMapForIssues(
  * description to park an issue on a human gate. Exported so the liveness sweep can see
  * the same signal (BLO-24662) — a gate narrated in prose is still a gate, and without it
  * the `blocked_without_blockers` rule reads deliberate parking as a dead end.
+ *
+ * Whitespace is horizontal-only (`[ \t]`) throughout, because `\s` spans line
+ * terminators and the documented contract is one declaration per line. With `\s*` a
+ * blank key consumed the *next* line, so `external owner:\nexternal action: X` parsed
+ * as `{ owner: "external action: X", action: "X" }` — a successful parse with a garbage
+ * owner that then reached the redaction path (BLO-28618).
  */
 export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
   if (!description) return null;
-  const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
-  const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
+  const owner = description.match(/^[ \t]*external owner[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
+  const action = description.match(/^[ \t]*external action[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
   if (!owner || !action) return null;
   return {
     owner: owner.slice(0, 120),

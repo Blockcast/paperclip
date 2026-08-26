@@ -98,7 +98,7 @@ describe("approvalService resolution idempotency", () => {
     mockAgentService.activatePendingApproval.mockResolvedValue({ agent: { id: "agent-1" }, activated: true });
     mockAgentService.create.mockResolvedValue({ id: "agent-1" });
     mockAgentService.terminate.mockResolvedValue(undefined);
-    mockLogActivity.mockResolvedValue(undefined);
+    mockLogActivity.mockResolvedValue(async () => {});
     mockNotifyHireApproved.mockResolvedValue(undefined);
   });
 

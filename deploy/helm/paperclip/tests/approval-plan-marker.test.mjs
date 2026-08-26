@@ -71,7 +71,12 @@ function renderApiDeployment(extraArgs = []) {
   return parseYaml(yaml);
 }
 
-function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
+function stampApiDeployment(
+  deployment,
+  marker = SAMPLE,
+  deployedCommit = "",
+  deploymentName = "paperclip-api",
+) {
   const yaml = execFileSync(
     "bash",
     ["scripts/stamp-paperclip-api-approval-plan.sh"],
@@ -81,6 +86,7 @@ function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
       input: JSON.stringify(deployment),
       env: {
         ...process.env,
+        PAPERCLIP_API_DEPLOYMENT: deploymentName,
         PAPERCLIP_APPROVAL_PLAN_SHA256: marker,
         PAPERCLIP_DEPLOYED_COMMIT: deployedCommit,
         PAPERCLIP_DEPLOY_NAMESPACE: DEPLOY_NAMESPACE,
@@ -224,6 +230,16 @@ test("trusted post-renderer stamps an unstamped legacy chart without other chang
   const marker = markerFor(unstamped);
   const stamped = stampApiDeployment(unstamped, marker);
 
+  assert.equal(stamped.spec.template.metadata.annotations[MARKER], marker);
+  assert.deepEqual(stripMarker(stamped), unstamped);
+});
+
+test("trusted post-renderer stamps the Helm-resolved API Deployment name", () => {
+  const unstamped = renderApiDeployment(["--set", "fullnameOverride=paperclip-production"]);
+  const marker = markerFor(unstamped);
+  const stamped = stampApiDeployment(unstamped, marker, "", "paperclip-production-api");
+
+  assert.equal(stamped.metadata.name, "paperclip-production-api");
   assert.equal(stamped.spec.template.metadata.annotations[MARKER], marker);
   assert.deepEqual(stripMarker(stamped), unstamped);
 });

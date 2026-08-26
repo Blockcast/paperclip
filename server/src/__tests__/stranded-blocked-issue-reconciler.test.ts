@@ -327,6 +327,90 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(await statusOf(stranded)).toBe("blocked");
   });
 
+  it("sweeps an issue whose stranded-run recovery action has ESCALATED (wake-exhausted, so it pins nothing)", async () => {
+    // BLO-21523: `escalated` stays inside ACTIVE_RECOVERY_ACTION_STATUSES so it keeps holding
+    // the active-source uniqueness slot, but it is definitionally wake-exhausted — every wake
+    // path drops it at `strandedRecoveryWakeAttemptsExhausted`. Suppressing the sweep on it
+    // preserved no repair path and left the row permanently unreachable.
+    const { companyId, agentId } = await createCompany("SB7E");
+    const stranded = await insertIssue({ companyId, identifier: "SB7E-1", status: "blocked" });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: stranded,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:${agentId}`,
+      nextAction: "Restore a live execution path.",
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(1);
+    expect(await statusOf(stranded)).toBe("todo");
+  });
+
+  it("leaves the escalated recovery action itself untouched when it sweeps the issue", async () => {
+    // The sweep decides dispatchability only. Resolving the action would free
+    // `issue_recovery_actions_active_source_uq` and let a fresh action be minted with a new
+    // budget and horizon — the unbounded re-fire loop BLO-18996 closed.
+    const { companyId, agentId } = await createCompany("SB7F");
+    const stranded = await insertIssue({ companyId, identifier: "SB7F-1", status: "blocked" });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: stranded,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:${agentId}`,
+      nextAction: "Restore a live execution path.",
+    });
+
+    await reconcileStrandedBlockedIssues(db);
+
+    const actions = await db
+      .select({ status: issueRecoveryActions.status, resolvedAt: issueRecoveryActions.resolvedAt })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, stranded));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.status).toBe("escalated");
+    expect(actions[0]?.resolvedAt).toBeNull();
+  });
+
+  it("cannot have an active action masked by an escalated one: the partial unique index forbids coexistence", async () => {
+    // This pins the invariant the narrowing above depends on. `issue_recovery_actions_active_source_uq`
+    // is unique on (company_id, source_issue_id) WHERE status IN ('active','escalated'), so an issue
+    // has AT MOST ONE action in either state. That is what makes "suppress on active only" safe:
+    // there is no case where dropping `escalated` from the predicate hides a live `active` action on
+    // the same issue. If this index is ever narrowed to 'active' alone, coexistence becomes possible
+    // and the suppression predicate must be revisited — this test is the tripwire.
+    const { companyId, agentId } = await createCompany("SB7G");
+    const stranded = await insertIssue({ companyId, identifier: "SB7G-1", status: "blocked" });
+    const base = {
+      companyId,
+      sourceIssueId: stranded,
+      kind: "stranded_assigned_issue" as const,
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      nextAction: "Restore a live execution path.",
+    };
+    await db.insert(issueRecoveryActions).values({
+      ...base,
+      status: "escalated",
+      fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:escalated`,
+    });
+
+    await expect(
+      db.insert(issueRecoveryActions).values({
+        ...base,
+        status: "active",
+        fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:active`,
+      }),
+    ).rejects.toThrow();
+  });
+
   it("does not sweep edge-less blocked issues with explicit pending interactions or approvals", async () => {
     const { companyId, agentId } = await createCompany("SBI");
     const waitingOnInteraction = await insertIssue({

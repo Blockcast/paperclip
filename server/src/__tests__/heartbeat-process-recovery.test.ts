@@ -2769,6 +2769,154 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(handoffWakeups).toHaveLength(0);
   });
 
+  // PEN-2421: agent Jobs set `ttlSecondsAfterFinished`, so a Job is
+  // correctly garbage-collected minutes after a *successful* agent exits. If the
+  // adapter owner died before finalizing, this sweep then finds no Job and used
+  // to record `job_missing` over a run that had succeeded -- corrupting run
+  // statistics and rescheduling already-delivered work. The agent's own terminal
+  // result survives on the shared data PVC and is now consulted.
+  describe("TTL-collected Job with a surviving terminal result artifact", () => {
+    async function withPodLogArtifact(
+      input: { companyId: string; agentId: string; runId: string; isolationKey?: string },
+      lines: string[],
+    ) {
+      const base = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pod-log-"));
+      const dir = input.isolationKey
+        ? path.join(base, input.companyId, input.agentId, "isolated", input.isolationKey)
+        : path.join(base, input.companyId, input.agentId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, `${input.runId}.pod.ndjson`), lines.join("\n"), "utf-8");
+      const previous = process.env.RUN_LOG_BASE_PATH;
+      process.env.RUN_LOG_BASE_PATH = base;
+      return () => {
+        if (previous === undefined) delete process.env.RUN_LOG_BASE_PATH;
+        else process.env.RUN_LOG_BASE_PATH = previous;
+      };
+    }
+
+    async function reapVanishedJob(jobName: string) {
+      mockListManagedAgentJobs.mockResolvedValueOnce([]);
+      mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+        phase: "missing",
+        reason: "NotFound",
+        name: jobName,
+      });
+      return heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    }
+
+    async function seedVanishedRun(jobName: string) {
+      const fixture = await seedRunFixture({
+        adapterType: "claude_k8s",
+        agentStatus: "idle",
+        externalRunId: jobName,
+      });
+      await seedAdapterInvokeEvent(fixture);
+      await seedLaunchedReservation({ ...fixture, jobName });
+      return fixture;
+    }
+
+    it("preserves a successful outcome recovered from the run's own output artifact", async () => {
+      const jobName = "agent-claude-ttl-collected-success";
+      const fixture = await seedVanishedRun(jobName);
+      // Deliberately the same generic progress artifact the neighbouring
+      // "does not treat generic run artifacts" case uses: on its own it must not
+      // rescue the run. What is different here is the authoritative terminal
+      // verdict below -- and it is also what makes the run "productive" enough
+      // for the existing corrective handoff to be relevant.
+      await db.insert(issueComments).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        authorAgentId: fixture.agentId,
+        createdByRunId: fixture.runId,
+        body: "Progress update written before the lifecycle Job was TTL-collected.",
+      });
+      const restoreEnv = await withPodLogArtifact(fixture, [
+        JSON.stringify({ type: "system", subtype: "init" }),
+        JSON.stringify({ type: "assistant", message: { content: "working" } }),
+        JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 119 }),
+      ]);
+      try {
+        const result = await reapVanishedJob(jobName);
+
+        expect(result.runIds).toContain(fixture.runId);
+        const run = await heartbeat.getRun(fixture.runId);
+        expect(run).toMatchObject({ status: "succeeded", errorCode: null });
+        expect(
+          (run?.resultJson as Record<string, any> | null)?.externalLifecycleRecovery,
+        ).toMatchObject({
+          reason: "job_missing_recorded_outcome_preserved",
+          recoveredFrom: "pod_terminal_result",
+          recoveredResultSubtype: "success",
+        });
+        // The run succeeded but may never have written its issue disposition, so
+        // the existing status-only corrective wake must still fire.
+        const handoffWakeups = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.agentId, fixture.agentId),
+            eq(agentWakeupRequests.reason, "finish_successful_run_handoff"),
+          ));
+        expect(handoffWakeups).toHaveLength(1);
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    it("recovers the artifact written under the isolated-run layout", async () => {
+      const jobName = "agent-claude-ttl-collected-isolated";
+      const fixture = await seedVanishedRun(jobName);
+      const restoreEnv = await withPodLogArtifact(
+        { ...fixture, isolationKey: "issue-1234" },
+        [JSON.stringify({ type: "result", subtype: "success", is_error: false })],
+      );
+      try {
+        await reapVanishedJob(jobName);
+        expect(await heartbeat.getRun(fixture.runId)).toMatchObject({
+          status: "succeeded",
+          errorCode: null,
+        });
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    it("keeps the run failed when the artifact reports an error", async () => {
+      const jobName = "agent-claude-ttl-collected-error";
+      const fixture = await seedVanishedRun(jobName);
+      const restoreEnv = await withPodLogArtifact(fixture, [
+        JSON.stringify({ type: "result", subtype: "success", is_error: true }),
+      ]);
+      try {
+        await reapVanishedJob(jobName);
+        expect(await heartbeat.getRun(fixture.runId)).toMatchObject({
+          status: "failed",
+          errorCode: "job_missing",
+        });
+      } finally {
+        restoreEnv();
+      }
+    });
+
+    it("keeps the run failed when the artifact was truncated before its result event", async () => {
+      const jobName = "agent-claude-ttl-collected-truncated";
+      const fixture = await seedVanishedRun(jobName);
+      const restoreEnv = await withPodLogArtifact(fixture, [
+        JSON.stringify({ type: "system", subtype: "init" }),
+        JSON.stringify({ type: "assistant", message: { content: "killed mid-run" } }),
+      ]);
+      try {
+        await reapVanishedJob(jobName);
+        expect(await heartbeat.getRun(fixture.runId)).toMatchObject({
+          status: "failed",
+          errorCode: "job_missing",
+        });
+      } finally {
+        restoreEnv();
+      }
+    });
+  });
+
   it("keeps a fresh ownerless run when the exact Job lookup is inconclusive", async () => {
     const jobName = "agent-opencode-inventory-inconclusive";
     const { companyId, agentId, runId } = await seedRunFixture({
@@ -9961,6 +10109,175 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: agentId });
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.some((wake) => wake.status === "queued")).toBe(false);
+  });
+
+  // BLO-29604. BLO-19123's F2 (`3830d7bc`) added an arm keyed on
+  // `errorCode === "issue_dependencies_blocked" && (status === "in_review" || !agentInvokable)`
+  // that `continue`s before the review-participant block. Both of that arm's outputs need a
+  // blocker row: `blocked` needs an unresolved one, and its wake is keyed on
+  // `blockerIssueIds[0]`. With ZERO blocker rows it was a no-op that still `continue`d, so a
+  // review-stage strand got no recovery action, no blockers-resolved wake, and no scheduler
+  // dispatch (an `in_review` issue with a pending stage is never re-dispatched).
+  //
+  // That zero-blocker shape is the common one, not the edge case: it is 24/24 of the
+  // escalations BLO-27463 measured 2026-08-09..18, because provider rate-limit/quota parks
+  // are finalized carrying this error code on issues that never had a dependency at all.
+  //
+  // These three cases are the whole ladder — requeue while the reviewer can run, escalate
+  // when it cannot, escalate once the requeue itself has failed.
+  async function seedZeroBlockerReviewDependencyStrand() {
+    const fixture = await seedInReviewParticipantRunFixture();
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } = fixture;
+    const sourceAssigneeAgentId = randomUUID();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    const providerCapacityError =
+      "Latest retry failure: provider rate-limit/quota window — the provider advertised " +
+      "availability no earlier than 2026-08-13T01:17:00.262Z (surfaced as `issue_dependencies_blocked`).";
+
+    await db.insert(agents).values({
+      id: sourceAssigneeAgentId,
+      companyId,
+      name: "CodexImplementor",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({
+      assigneeAgentId: sourceAssigneeAgentId,
+      executionRunId: null,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId, userId: null },
+        returnAssignee: { type: "agent", agentId: sourceAssigneeAgentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    // Deliberately no issueRelations row: readiness is true and the blocker set is empty.
+    await db.update(heartbeatRuns).set({
+      status: "cancelled",
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+      errorCode: "issue_dependencies_blocked",
+      error: providerCapacityError,
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "cancelled",
+      claimedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt,
+      updatedAt: finishedAt,
+      error: "provider rate-limit/quota window (surfaced as `issue_dependencies_blocked`)",
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    return { ...fixture, sourceAssigneeAgentId };
+  }
+
+  it("requeues a zero-blocker in_review dependency-blocked participant instead of leaving it untouched (BLO-29604)", async () => {
+    const { companyId, agentId, issueId, runId, stageId, sourceAssigneeAgentId } =
+      await seedZeroBlockerReviewDependencyStrand();
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    // The dispatcher's refusal has expired — readiness is satisfied — so the reviewer is
+    // exactly who should run. Requeue rather than parking the stage `blocked` under a
+    // manager who cannot submit the decision.
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const retryRun = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.find((row) => row.id !== runId) ?? null);
+    expect(["queued", "running"]).toContain(retryRun?.status);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      wakeReason: "execution_review_participant_recovery",
+      retryReason: "execution_review_participant_recovery",
+      currentStageId: stageId,
+      reviewRecoveryInstruction: expect.stringContaining("Submit the review decision now"),
+    });
+
+    // F2's guarantee is intact: no ownership transfer, no takeover artifact, and the review
+    // stage is still pending rather than laundered into `blocked`.
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after).toMatchObject({ status: "in_review", assigneeAgentId: sourceAssigneeAgentId });
+    expect(await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.sourceIssueId, issueId),
+    ))).toHaveLength(0);
+  });
+
+  it("escalates a zero-blocker in_review dependency-blocked strand whose participant cannot be invoked (BLO-29604)", async () => {
+    const { companyId, agentId, issueId, sourceAssigneeAgentId } =
+      await seedZeroBlockerReviewDependencyStrand();
+    // The `!agentInvokable` half of F2's arm. Requeueing is impossible here, so the
+    // acceptance criterion's other limb applies: an action attributed to the participant
+    // stage. Note the action's `ownerAgentId` is NOT the participant — it cannot be, that
+    // is the premise — so `cause` is what carries the attribution. What matters is that
+    // the strand stops being silence.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+    const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const actions = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.sourceIssueId, issueId),
+    ));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      cause: "execution_review_participant_recovery",
+      returnOwnerAgentId: sourceAssigneeAgentId,
+    });
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.status).toBe("blocked");
+  });
+
+  it("escalates a zero-blocker in_review dependency-blocked strand once its own requeue has failed (BLO-29604)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedZeroBlockerReviewDependencyStrand();
+    const heartbeat = createHeartbeat();
+
+    expect((await heartbeat.reconcileStrandedAssignedIssues()).reviewParticipantRequeued).toBe(1);
+
+    // Fail the requeued run the same way. `didAutomaticRecoveryFail` keys on the stamped
+    // retryReason, so the ladder terminates here instead of requeueing forever.
+    const failedAt = new Date("2026-03-19T00:15:00.000Z");
+    const retryRun = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.find((row) => row.id !== runId) ?? null);
+    expect(retryRun).toBeTruthy();
+    await db.update(heartbeatRuns).set({
+      status: "cancelled",
+      finishedAt: failedAt,
+      updatedAt: failedAt,
+      errorCode: "issue_dependencies_blocked",
+    }).where(eq(heartbeatRuns.id, retryRun!.id));
+    await db.update(agentWakeupRequests).set({
+      status: "cancelled",
+      finishedAt: failedAt,
+      updatedAt: failedAt,
+    }).where(eq(agentWakeupRequests.runId, retryRun!.id));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(second.reviewParticipantRequeued).toBe(0);
+    expect(second.escalated).toBe(1);
+    const actions = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.sourceIssueId, issueId),
+    ));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ cause: "execution_review_participant_recovery" });
   });
 
   // BLO-1498/BLO-5691: when an in-progress run fails with a non-retryable

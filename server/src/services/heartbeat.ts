@@ -185,6 +185,7 @@ import {
   matchesTaskKey,
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
+import { readOrphanedRunTerminalResult } from "./orphaned-run-terminal-result.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -11427,7 +11428,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         manualWakeTriggerDetail: input.triggerDetail,
         manualWakeReason: input.reason,
       };
-      publishes.push(() => {
+      publishes.push(async () => {
         clearHeartbeatRunRuntimeStatus(cancelled.id);
         publishLiveEvent({
           companyId: cancelled.companyId,
@@ -17795,6 +17796,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
       let activityPublish: ActivityPublish | undefined;
+
+      // Serialize parks for one agent before looking for an existing row. The
+      // work identity deliberately excludes the due instant: repeated bare
+      // heartbeat wakes are idempotent, while issue/task retries must retain
+      // distinct identities. Keeping this inside the agent lock prevents two
+      // concurrent failures from both inserting the same parked retry.
+      await tx.execute(
+        sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for update`,
+      );
+      const workIdentity = taskKey ?? HEARTBEAT_TASK_KEY;
+      // Continuation retries have a stricter identity: source run and attempt.
+      // Let their dedicated lookup below enforce those fields instead of
+      // reusing a generic park for a different continuation attempt.
+      if (workIdentity && !requiresIssueExecutionRetryLock(retryReason) &&
+        retryReason !== INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
+        const pendingRetries = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.agentId, run.agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, retryReason),
+          ))
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+        const existingPark = pendingRetries.find(
+          (candidate) => (runTaskKey(candidate) ?? HEARTBEAT_TASK_KEY) === workIdentity,
+        );
+        if (existingPark) {
+          if (existingPark.wakeupRequestId) {
+            const existingWakeup = await tx
+              .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+              .from(agentWakeupRequests)
+              .where(eq(agentWakeupRequests.id, existingPark.wakeupRequestId))
+              .then((rows) => rows[0] ?? null);
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, existingPark.wakeupRequestId));
+          }
+          return {
+            outcome: "scheduled",
+            run: existingPark,
+            reusedExisting: true,
+          };
+        }
+      }
+
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         if (issueId) {
           await tx.execute(
@@ -18119,7 +18171,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               entityType: "execution_workspace",
               entityId: failedWorkspace.id,
               details: quarantine,
-            }, { deferPublish: true });
+            }, {
+              enlistPluginOutbox: true,
+              deferPublish: true,
+            });
             detachWorkspaceFromIssue = issueWorkspace.executionWorkspaceId === failedExecutionWorkspaceId;
           }
         }
@@ -18156,7 +18211,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // transaction that didn't commit.
     if (scheduleResult.outcome === "scheduled" && scheduleResult.activityPublish) {
       try {
-        scheduleResult.activityPublish();
+        await scheduleResult.activityPublish();
       } catch (err) {
         logger.warn(
           { err, runId: run.id, issueId },
@@ -20488,6 +20543,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleKill?: boolean;
   }) {
     let preserveRecordedOutcome = false;
+    // PEN-2421: set when the run's own pod-written terminal result
+    // is what rescued the outcome, so the run record distinguishes an
+    // agent-self-reported success from the PR-review evidence path below.
+    let recoveredTerminalResult: { subtype: string | null } | null = null;
     let prReviewIncompleteOverride: {
       errorCode: string;
       errorMessage: string;
@@ -20554,6 +20613,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reviewEvidence.status === "archived_repo_skipped" ||
         reviewEvidence.status === "self_review_skipped";
     }
+    // PEN-2421: a TTL-collected Job is not evidence that its run
+    // died. Agent Jobs set `ttlSecondsAfterFinished`, so the Job object is
+    // correctly GC'd minutes after a *successful* agent exits; if the adapter
+    // owner died before finalizing, this sweep then finds no Job and records
+    // `job_missing` over a run that had succeeded. That both corrupts run
+    // statistics (failure counts contain successes) and manufactures the waste
+    // it reports, because the run is rescheduled and already-delivered work is
+    // re-done.
+    //
+    // The agent's own terminal verdict survives on the shared data PVC, so
+    // consult it before concluding the run was lost. Deliberately last and
+    // additive: it runs only when the BLO-18106 PR-review evidence path neither
+    // preserved the outcome nor found a review incomplete, so no existing
+    // finalization decision changes. Only an explicit `is_error: false` terminal
+    // event can rescue a run -- an absent, empty, or truncated artifact stays
+    // `job_missing`, which is what keeps a genuinely destroyed run failed.
+    if (
+      !input.staleKill && !input.jobStatus && !preserveRecordedOutcome && !prReviewIncompleteOverride
+    ) {
+      const recovered = await readOrphanedRunTerminalResult({
+        companyId: input.run.companyId,
+        agentId: input.run.agentId,
+        runId: input.run.id,
+      });
+      const rescued = recovered.outcome === "found" && recovered.succeeded;
+      if (rescued) {
+        preserveRecordedOutcome = true;
+        recoveredTerminalResult = { subtype: recovered.subtype };
+      }
+      await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: rescued
+          ? "Recovered a successful terminal result from the run's own output artifact during missing-Job recovery"
+          : `Missing-Job recovery found no successful terminal result artifact: ${
+            recovered.outcome === "found" ? `reported ${recovered.subtype ?? "failure"}` : recovered.reason
+          }`,
+        payload: {
+          outcome: recovered.outcome,
+          ...(recovered.outcome === "found"
+            ? { succeeded: recovered.succeeded, subtype: recovered.subtype }
+            : { reason: recovered.reason }),
+        },
+      });
+    }
     const baseTerminalOutcome = input.staleKill
       ? {
           status: "failed" as const,
@@ -20618,6 +20723,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }
               : {}),
             ...(adapterInvocationStarted !== null ? { adapterInvocationStarted } : {}),
+            ...(recoveredTerminalResult
+              ? {
+                  recoveredFrom: "pod_terminal_result",
+                  recoveredResultSubtype: recoveredTerminalResult.subtype,
+                }
+              : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
           },
         },
@@ -22996,6 +23107,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // excludes `src/__tests__`, so a test can pass the field either way and
     // cannot pin this. The production callers above are what keep it honest.
     unchangedTargetSuppressionMs?: number;
+    /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
+    abandonedRecoveryMs?: number;
   }) {
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -31393,7 +31506,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 resolvedStrategy,
                 hasResolvablePriorSessionWorkspace,
               },
-            }, { deferPublish: true });
+            }, {
+              enlistPluginOutbox: true,
+              deferPublish: true,
+            });
             // Deferred: this "skipped" outcome carries the publisher out of the
             // transaction rather than firing inline (see the `outcome.kind`
             // switch right after `db.transaction` below), so a rollback throws
@@ -31928,7 +32044,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       for (const publish of manualCapacityActivityPublishes) {
         try {
-          publish();
+          await publish();
         } catch (err) {
           logger.warn(
             { err, issueId, agentId },
@@ -31942,7 +32058,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // event is never published for a transaction that didn't commit.
       if ("activityPublish" in outcome && outcome.activityPublish) {
         try {
-          outcome.activityPublish();
+          await outcome.activityPublish();
         } catch (err) {
           logger.warn(
             { err, issueId, agentId },
@@ -32252,7 +32368,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const publish of manualCapacityActivityPublishes) {
       try {
-        publish();
+        await publish();
       } catch (err) {
         logger.warn(
           { err, issueId, agentId },
