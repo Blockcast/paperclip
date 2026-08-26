@@ -59,5 +59,21 @@ export function dashboardRoutes(db: Db) {
     res.json(report);
   });
 
+  router.get("/companies/:companyId/recovery-actions", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const ownerAgentId = typeof req.query.ownerAgentId === "string" ? req.query.ownerAgentId : undefined;
+    const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+    const limit = parsePositiveNumber(req.query.limit, 100, 500);
+    const actions = await recoveryObservability.listActions(companyId, {
+      ownerAgentId,
+      kind,
+      status,
+      limit,
+    });
+    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, actions });
+  });
+
   return router;
 }
