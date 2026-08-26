@@ -8022,7 +8022,7 @@ export async function buildPaperclipWakePayload(input: {
   exposeLowTrustRaw?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const requestedCommentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
   const continuationSummary = input.continuationSummary ?? null;
@@ -8042,6 +8042,23 @@ export async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
+  const latestIssueComment = issueId && requestedCommentIds.length > 0
+    ? await input.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, input.companyId),
+        eq(issueComments.issueId, issueId),
+        isNull(issueComments.deletedAt),
+      ))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(1)
+      .then((rows) => rows[0]?.id ?? null)
+    : null;
+  // Coalesced wakes can outlive the comment that originally triggered them. At
+  // payload construction, inline only the current newest comment so an agent
+  // never receives an hours-old answer while retaining a freshness anchor.
+  const commentIds = latestIssueComment ? [latestIssueComment] : requestedCommentIds;
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
