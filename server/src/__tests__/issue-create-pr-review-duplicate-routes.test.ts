@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
@@ -31,6 +31,13 @@ import {
   parsePullRequestRefs,
   taskKeysMatch,
 } from "../services/pr-review-duplicate-issue-guard.js";
+
+// This suite exercises duplicate-review admission, not assignment wake
+// delivery. Keep the route's fire-and-forget assignment side effect out of the
+// embedded database so teardown cannot race its activity/issue lock triggers.
+vi.mock("../services/issue-assignment-wakeup.js", () => ({
+  queueIssueAssignmentWakeup: vi.fn(),
+}));
 
 const REPO = "Blockcast/pim-multicast-gateway";
 const NORMALIZED_REPO = REPO.toLowerCase();
