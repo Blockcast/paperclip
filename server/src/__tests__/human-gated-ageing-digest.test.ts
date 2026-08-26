@@ -545,8 +545,98 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect(await digestRow(companyId)).toHaveLength(0);
   });
 
-  it("sweeps every company with candidates when none is named", async () => {
-    const a = await createCompany("HGA");
+  // -- Reopen must apply the same active-owner test as first delivery ---------
+
+  it("reassigns a reopened digest when its recorded owner is no longer active", async () => {
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-20", createdAt: daysAgo(40) });
+
+    const created = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(created.outcomes[0]?.action).toBe("created");
+    expect((await digestRow(companyId))[0]?.assigneeUserId).toBe(HUMAN_USER_ID);
+
+    // Close the digest, then revoke the assigned human and stand up a successor.
+    const digestId = (await digestRow(companyId))[0]?.id;
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, digestId!));
+    await db
+      .update(companyMemberships)
+      .set({ status: "revoked" })
+      .where(eq(companyMemberships.principalId, HUMAN_USER_ID));
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "user_successor_owner",
+      status: "active",
+      membershipRole: "admin",
+    });
+
+    const reopened = await humanGatedDigestTick(db, {
+      now: NOW,
+      companyId,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    expect(reopened.outcomes[0]?.action).toBe("reopened");
+    const row = (await digestRow(companyId))[0];
+    expect(row?.status).toBe("todo");
+    // The revoked member must not keep the escalation just because the field
+    // was non-null; first delivery would never have picked them.
+    expect(row?.assigneeUserId).toBe("user_successor_owner");
+  });
+
+  it("leaves a digest retired when its owner is revoked and nobody active can take it", async () => {
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-21", createdAt: daysAgo(40) });
+
+    await humanGatedDigestTick(db, { now: NOW, companyId });
+    const digestId = (await digestRow(companyId))[0]?.id;
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, digestId!));
+    await db
+      .update(companyMemberships)
+      .set({ status: "revoked" })
+      .where(eq(companyMemberships.principalId, HUMAN_USER_ID));
+
+    const result = await humanGatedDigestTick(db, {
+      now: NOW,
+      companyId,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    expect(result.outcomes[0]?.action).toBe("skipped_no_owner");
+    // Reopening onto a revoked member would read as owned while nobody can act.
+    expect((await digestRow(companyId))[0]?.status).toBe("done");
+  });
+
+  // -- Producer collection must happen under the delivery lock ----------------
+
+  it("collects producer output inside the delivery lock, so two ticks cannot interleave", async () => {
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-22", createdAt: daysAgo(40) });
+
+    const events: string[] = [];
+    const slowProducer: DigestProducer = {
+      key: "slow-producer",
+      collect: async () => {
+        events.push("enter");
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        events.push("exit");
+        return { key: "slow-producer", markdown: "slow section", itemCount: 1 };
+      },
+    };
+
+    await Promise.all([
+      humanGatedDigestTick(db, { now: NOW, companyId, producers: [slowProducer] }),
+      humanGatedDigestTick(db, { now: NOW, companyId, producers: [slowProducer] }),
+    ]);
+
+    // Collected before the lock, both ticks would enter the producer before
+    // either finished — the snapshot race Ally flagged. Under the lock the two
+    // collections are strictly serialized.
+    expect(events).toEqual(["enter", "exit", "enter", "exit"]);
+    expect(await digestRow(companyId)).toHaveLength(1);
+  });
+
+  it("sweeps every company with candidates when none is named", async () => {    const a = await createCompany("HGA");
     const b = await createCompany("HGB");
     await insertHumanGatedIssue({ companyId: a.companyId, identifier: "HGA-1", createdAt: daysAgo(40) });
     await insertHumanGatedIssue({ companyId: b.companyId, identifier: "HGB-1", createdAt: daysAgo(40) });
