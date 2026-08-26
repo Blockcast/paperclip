@@ -17,7 +17,7 @@ Two alerts fire off the same series, split by `plugin_key`:
 
 | alert | selector | severity |
 |---|---|---|
-| `PaperclipPluginCriticalErrored` | `plugin_key` matches `pluginErrorCriticalKeyRegex` (default `lucitra\.plugin-secrets`) | critical |
+| `PaperclipPluginCriticalErrored` | `plugin_key` matches `pluginErrorCriticalKeyRegex` (`lucitra\.plugin-secrets\|paperclip-plugin-alertmanager`) | critical |
 | `PaperclipPluginErrored` | everything else | warning |
 
 The split exists because a dead `lucitra.plugin-secrets` is not the same
@@ -25,6 +25,32 @@ incident as a dead example plugin: it is the secrets subsystem, and
 [BLO-20410](https://github.com/Blockcast/paperclip/issues) found it dead for
 **9+ hours** with the pod `1/1 Running`, `restarts=0`, node CPU 44%, and
 nothing alerting — the exact gap this metric closes.
+
+`paperclip-plugin-alertmanager` is on the critical list for a different and
+less obvious reason (PEN-2590): **not** because it matters more, but because
+at `warning` the alert about it is structurally undeliverable. The
+Alertmanager route tree sends `severity=~"critical|page"` to `slack-relay`
+(out-of-band, independent of Paperclip's DB and plugins) and routes
+everything else — `warning` included — to the `paperclip` webhook catch-all
+*only*. That receiver's endpoint is gated on this plugin's readiness, so a
+`warning` saying "the alertmanager plugin is in error" gets posted into the
+receiver that is returning 400 *because* the alertmanager plugin is in error.
+PEN-2581 measured ~96% of webhook notifications destroyed over 4 sustained
+days. Promoting this one key keeps the fix narrow: widening the whole
+`warning` tier to Slack would make that path noisy enough to be ignored,
+which is the same failure in a different costume.
+
+> **Adding a key to the critical tier?** `plugin_key` is the plugin's
+> `manifest.id` verbatim. The two keys above use different conventions and
+> both are correct — externally published plugins carry a dotted namespace
+> (`lucitra.plugin-secrets`), local workspace plugins a bare hyphenated id
+> (`paperclip-plugin-alertmanager`). Read the id out of the manifest rather
+> than inferring it from a package name, and remember a selector that matches
+> nothing is a permanently-inert rule, not a visible failure (PEN-2579).
+> The **live** selector is the rendered literal in
+> `monitoring/prometheus-configmap.yaml` in `Blockcast/onprem-k8s`, not this
+> chart's Helm value — this cluster has no prometheus-operator, so editing
+> the chart alone changes nothing that pages.
 
 **`status='error'` is not `status='disabled'`.** An operator who deliberately
 disabled a plugin never sets this gauge to 1 and never pages. If you are
