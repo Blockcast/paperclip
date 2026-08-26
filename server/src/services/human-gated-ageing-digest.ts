@@ -333,6 +333,11 @@ export const DEFAULT_DIGEST_PRODUCERS: readonly DigestProducer[] = Object.freeze
 
 export type DigestBodyInput = {
   periodKey: string;
+  /**
+   * Kept in the input shape for callers that already provide the sweep time.
+   * The timestamp is deliberately not rendered: the description is also the
+   * idempotency representation for a period and must not change on every tick.
+   */
   now: Date;
   sections: readonly DigestSection[];
   failures: readonly { key: string; reason: string }[];
@@ -342,7 +347,7 @@ export function buildDigestBody(input: DigestBodyInput): string {
   const lines: string[] = [
     periodMarker(input.periodKey),
     "",
-    `_Refreshed ${input.now.toISOString()} — period \`${input.periodKey}\`._`,
+    `_Digest period \`${input.periodKey}\`._`,
     "",
     "This row is refreshed in place by the human-gated ageing sweep (BLO-29420).",
     "It is measured on the **human clock** — the newest `issue_comments.author_type = 'user'`",
@@ -436,6 +441,8 @@ async function findDigestIssue(db: Db, companyId: string) {
 
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["done", "cancelled"]);
 
+const DIGEST_DELIVERY_LOCK_PREFIX = "paperclip:human-gated-ageing-digest:";
+
 export type DigestDeliveryOutcome = {
   companyId: string;
   issueId: string | null;
@@ -450,85 +457,74 @@ export async function deliverDigest(
     companyId: string;
     body: string;
     itemCount: number;
+    /** True when a producer returned a meaningful section, including zero items. */
+    hasContent?: boolean;
+    failures?: readonly { key: string; reason: string }[];
     logger: DigestLogger;
   },
 ): Promise<DigestDeliveryOutcome> {
   const { companyId, body, itemCount, logger } = input;
-  const existing = await findDigestIssue(db, companyId);
+  const failures = input.failures ?? [];
+  // A non-null producer section is meaningful even when it contains zero
+  // escalated items (for example, a malformed-input warning). Producer
+  // failures are likewise durable signal, not an empty sweep.
+  const hasContent = input.hasContent ?? (itemCount > 0 || failures.length > 0);
 
-  if (!existing) {
-    // Nothing overdue and no row yet: do not mint an empty escalation.
-    if (itemCount === 0) {
-      return { companyId, issueId: null, identifier: null, action: "skipped_empty", itemCount };
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Db;
+    // Serialize the complete read/decide/create-or-update lifecycle. There is
+    // no matching uniqueness constraint for this origin shape, so every digest
+    // writer must acquire this company-scoped lock before its first read.
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${DIGEST_DELIVERY_LOCK_PREFIX + companyId}, 0))`,
+    );
+
+    const existing = await findDigestIssue(txDb, companyId);
+
+    if (!existing) {
+      // A clean run with no producer output must not mint an empty escalation.
+      if (!hasContent) {
+        return { companyId, issueId: null, identifier: null, action: "skipped_empty", itemCount };
+      }
+
+      const ownerUserId = await resolveDigestOwnerUserId(txDb, companyId);
+      if (!ownerUserId) {
+        // A digest assigned to nobody is the inertness this issue is about, one
+        // layer up. Say so loudly rather than creating an unowned row.
+        logger.warn(
+          { companyId },
+          "human-gated ageing digest has no active human member to assign; skipping delivery",
+        );
+        return { companyId, issueId: null, identifier: null, action: "skipped_no_owner", itemCount };
+      }
+      const created = await issueService(txDb).create(companyId, {
+        title: DIGEST_TITLE,
+        description: body,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: null,
+        assigneeUserId: ownerUserId,
+        originKind: HUMAN_GATED_DIGEST_ORIGIN_KIND,
+        originId: humanGatedDigestOriginId(companyId),
+        originFingerprint: humanGatedDigestOriginId(companyId),
+        // The recent-open-title guard would suppress the *first* re-create after
+        // a manual delete; the origin lookup above is this row's real dedupe.
+        allowDuplicate: true,
+      });
+      return {
+        companyId,
+        issueId: created.id,
+        identifier: created.identifier,
+        action: "created",
+        itemCount,
+      };
     }
-    // KNOWN LIMITATION — single-replica-safe only, on the create path.
-    //
-    // Unlike the reconcilers this sweep is modelled on, the find-then-create
-    // below is not guarded by a uniqueness constraint, so two workers starting
-    // together could each miss the row and each create one. The worker
-    // StatefulSet runs `replicas: 1` today, so this is latent rather than live,
-    // and every subsequent tick is safe regardless: the find orders newest-first
-    // and refreshes a single row.
-    //
-    // The fix, when the worker tier scales out, is the Dependabot precedent: a
-    // partial unique index over the non-terminal rows (see
-    // `issues_active_dependabot_alert_uq`) plus 23505 handling that re-finds
-    // instead of throwing. That needs a migration, so it is deliberately not
-    // bundled into the wiring change.
-    const ownerUserId = await resolveDigestOwnerUserId(db, companyId);
-    if (!ownerUserId) {
-      // A digest assigned to nobody is the inertness this issue is about, one
-      // layer up. Say so loudly rather than creating an unowned row.
-      logger.warn(
-        { companyId },
-        "human-gated ageing digest has no active human member to assign; skipping delivery",
-      );
-      return { companyId, issueId: null, identifier: null, action: "skipped_no_owner", itemCount };
-    }
-    const created = await issueService(db).create(companyId, {
-      title: DIGEST_TITLE,
-      description: body,
-      status: "todo",
-      priority: "high",
-      assigneeAgentId: null,
-      assigneeUserId: ownerUserId,
-      originKind: HUMAN_GATED_DIGEST_ORIGIN_KIND,
-      originId: humanGatedDigestOriginId(companyId),
-      originFingerprint: humanGatedDigestOriginId(companyId),
-      // The recent-open-title guard would suppress the *first* re-create after
-      // a manual delete; the (originKind, originId) lookup above is this row's
-      // real dedupe and it already ran.
-      allowDuplicate: true,
-    });
-    return {
-      companyId,
-      issueId: created.id,
-      identifier: created.identifier,
-      action: "created",
-      itemCount,
-    };
-  }
 
-  const wasTerminal = TERMINAL_STATUSES.has(existing.status);
+    const wasTerminal = TERMINAL_STATUSES.has(existing.status);
 
-  // Unchanged body on a live row: rewriting would be a no-op write and, worse,
-  // a bumped `updatedAt` that makes the row look freshly handled.
-  if (!wasTerminal && existing.description === body) {
-    return {
-      companyId,
-      issueId: existing.id,
-      identifier: existing.identifier,
-      action: "unchanged",
-      itemCount,
-    };
-  }
-
-  const patch: Parameters<ReturnType<typeof issueService>["update"]>[1] = { description: body };
-
-  if (wasTerminal) {
-    if (itemCount === 0) {
-      // Closed and nothing overdue: leave it closed. The sweep only refuses a
-      // close while work is actually still ageing.
+    // Unchanged body on a live row: rewriting would be a no-op write and, worse,
+    // a bumped `updatedAt` that makes the row look freshly handled.
+    if (!wasTerminal && existing.description === body) {
       return {
         companyId,
         issueId: existing.id,
@@ -537,29 +533,45 @@ export async function deliverDigest(
         itemCount,
       };
     }
-    // AC3: refresh it if it was closed. A digest an agent can retire while the
-    // queue is still ageing is not an escalation — the config flag is the
-    // off-switch, not this row's status.
-    patch.status = "todo";
-    patch.completedAt = null;
-    patch.cancelledAt = null;
-    if (!existing.assigneeUserId) {
-      const ownerUserId = await resolveDigestOwnerUserId(db, companyId);
-      if (ownerUserId) {
-        patch.assigneeUserId = ownerUserId;
-        patch.assigneeAgentId = null;
+
+    const patch: Parameters<ReturnType<typeof issueService>["update"]>[1] = { description: body };
+
+    if (wasTerminal) {
+      if (!hasContent) {
+        // Closed and no producer has anything to report: leave it closed. The
+        // sweep only refuses a close while work or an error is still present.
+        return {
+          companyId,
+          issueId: existing.id,
+          identifier: existing.identifier,
+          action: "unchanged",
+          itemCount,
+        };
+      }
+      // AC3: refresh it if it was closed. A digest an agent can retire while the
+      // queue is still ageing is not an escalation — the config flag is the
+      // off-switch, not this row's status.
+      patch.status = "todo";
+      patch.completedAt = null;
+      patch.cancelledAt = null;
+      if (!existing.assigneeUserId) {
+        const ownerUserId = await resolveDigestOwnerUserId(txDb, companyId);
+        if (ownerUserId) {
+          patch.assigneeUserId = ownerUserId;
+          patch.assigneeAgentId = null;
+        }
       }
     }
-  }
 
-  await issueService(db).update(existing.id, patch);
-  return {
-    companyId,
-    issueId: existing.id,
-    identifier: existing.identifier,
-    action: wasTerminal ? "reopened" : "refreshed",
-    itemCount,
-  };
+    await issueService(txDb).update(existing.id, patch);
+    return {
+      companyId,
+      issueId: existing.id,
+      identifier: existing.identifier,
+      action: wasTerminal ? "reopened" : "refreshed",
+      itemCount,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -639,7 +651,16 @@ export async function humanGatedDigestTick(
 
     const itemCount = sections.reduce((sum, section) => sum + section.itemCount, 0);
     const body = buildDigestBody({ periodKey, now, sections, failures });
-    outcomes.push(await deliverDigest(db, { companyId, body, itemCount, logger }));
+    outcomes.push(
+      await deliverDigest(db, {
+        companyId,
+        body,
+        itemCount,
+        hasContent: sections.length > 0 || failures.length > 0,
+        failures,
+        logger,
+      }),
+    );
   }
 
   return { periodKey, companiesScanned: companyIds.length, outcomes };
