@@ -938,6 +938,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("skips an at-rest recovery action at its exact budget", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: null,
+      fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:exact-budget`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: defaultRecoveryActionMaxAttempts,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date("2026-12-31T00:00:00.000Z"),
+      lastAttemptAt: new Date("2026-05-01T00:00:00.000Z"),
+    }).returning();
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: new Date("2026-08-26T00:00:00.000Z"),
+      cooldownMs: 30 * 60 * 1000,
+    });
+
+    expect(result).toMatchObject({ checked: 1, exhaustedSkipped: 1, healed: 0, issueIds: [] });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(unchanged).toMatchObject({
+      status: "active",
+      attemptCount: defaultRecoveryActionMaxAttempts,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+    });
+    expect(unchanged?.lastAttemptAt).toEqual(new Date("2026-05-01T00:00:00.000Z"));
+  });
+
   it("publishes the committed review-stage escalation activity", async () => {
     const { companyId, managerId, sourceIssueId, stageId, issue, latestRun } = await seedPendingReviewRecovery();
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
