@@ -5016,6 +5016,19 @@ export function recoveryService(
     const hasNewActivitySinceLastAttempt = !previousAttemptAt
       || input.issue.lastActivityAt > previousAttemptAt;
 
+    // An ownerless action has no wake budget to spend. Reuse the unchanged action so a
+    // sweepable no-owner issue cannot increment attemptCount on every sweep. A changed cause
+    // or newly resolved owner still uses the normal upsert path below.
+    if (existingAction && !ownerAgentId && !existingAction.ownerAgentId &&
+      existingAction.cause === recoveryCause &&
+      existingAction.fingerprint === strandedRecoveryActionFingerprint({
+        issue: input.issue,
+        recoveryCause,
+        latestRun: input.latestRun,
+      })) {
+      return { action: existingAction, hasNewActivitySinceLastAttempt, unchangedOwnerless: true };
+    }
+
     const action = await actionSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -5092,7 +5105,7 @@ export function recoveryService(
       lastAttemptAt: now,
     });
 
-    return { action, hasNewActivitySinceLastAttempt };
+    return { action, hasNewActivitySinceLastAttempt, unchangedOwnerless: false };
   }
 
   async function enqueueSourceScopedStrandedRecoveryWake(input: {
@@ -6436,7 +6449,7 @@ export function recoveryService(
       }
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
-      const { action, hasNewActivitySinceLastAttempt } = await ensureSourceScopedStrandedRecoveryAction({
+      const { action, hasNewActivitySinceLastAttempt, unchangedOwnerless } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
@@ -6444,6 +6457,7 @@ export function recoveryService(
         recoveryOwnerAgentId: input.recoveryOwnerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
       }, tx);
+      if (unchangedOwnerless) return null;
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
       const {
