@@ -448,7 +448,8 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     const second = await humanGatedDigestTick(db, { now: NOW });
     expect(second.companiesScanned).toBe(1);
     expect(second.outcomes[0]?.companyId).toBe(companyId);
-    expect(second.outcomes[0]?.action).toBe("refreshed");
+    expect(second.outcomes[0]?.action).toBe("retired");
+    expect((await digestRow(companyId))[0]?.status).toBe("done");
     expect((await digestRow(companyId))[0]?.description ?? "").toContain(
       "### Nothing overdue this period",
     );
