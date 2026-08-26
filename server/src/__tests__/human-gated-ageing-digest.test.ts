@@ -429,6 +429,32 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect((await digestRow(companyId))[0]?.status).toBe("done");
   });
 
+  it("reconciles an existing digest in a global sweep after its final candidate resolves", async () => {
+    const { companyId } = await createCompany();
+    const candidateId = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-11",
+      createdAt: daysAgo(40),
+    });
+
+    const first = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(first.outcomes[0]?.action).toBe("created");
+
+    // The candidate is resolved after the first delivery. The next pass is
+    // deliberately unscoped: this catches a population query that only sees
+    // current candidates and therefore never reaches the existing digest.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, candidateId));
+
+    const second = await humanGatedDigestTick(db, { now: NOW });
+    expect(second.companiesScanned).toBe(1);
+    expect(second.outcomes[0]?.companyId).toBe(companyId);
+    expect(second.outcomes[0]?.action).toBe("refreshed");
+    expect((await digestRow(companyId))[0]?.description ?? "").toContain(
+      "### Nothing overdue this period",
+    );
+    expect((await digestRow(companyId))[0]?.description ?? "").not.toContain("HGD-11");
+  });
+
   // -- AC3: bounded -----------------------------------------------------------
 
   it("honours DEFAULT_MAX_ESCALATED and reports the remainder as a count", async () => {

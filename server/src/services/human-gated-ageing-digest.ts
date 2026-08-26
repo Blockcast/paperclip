@@ -32,7 +32,7 @@
  * assembled from N registered producers. That is what lets a second ageing
  * source join the same seam without re-deciding the channel.
  */
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, companyMemberships, issueComments, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
@@ -589,7 +589,7 @@ export type HumanGatedDigestTickInput = {
   now?: Date;
   periodDays?: number;
   producers?: readonly DigestProducer[];
-  /** Restrict the sweep to one company. Omitted means every company with candidates. */
+  /** Restrict the sweep to one company. Omitted means every candidate/digest company. */
   companyId?: string;
   logger?: DigestLogger;
 };
@@ -601,8 +601,10 @@ export type HumanGatedDigestTickResult = {
 };
 
 /**
- * Companies with at least one open, human-gated issue. Bounds the sweep to the
- * population that can actually produce a digest.
+ * Companies with either an open, human-gated issue or an existing digest row.
+ * Existing rows must remain in the population after the last candidate is
+ * resolved, otherwise an open digest stays stale forever and a terminal row
+ * can never be reconciled.
  */
 async function selectDigestCompanyIds(db: Db): Promise<string[]> {
   const rows = await db
@@ -611,9 +613,14 @@ async function selectDigestCompanyIds(db: Db): Promise<string[]> {
     .where(
       and(
         isNull(issues.hiddenAt),
-        inArray(issues.status, [...HUMAN_GATED_OPEN_STATUSES]),
-        sql`${issues.assigneeUserId} IS NOT NULL`,
-        EXCLUDE_DIGEST_ROWS,
+        or(
+          and(
+            inArray(issues.status, [...HUMAN_GATED_OPEN_STATUSES]),
+            sql`${issues.assigneeUserId} IS NOT NULL`,
+            EXCLUDE_DIGEST_ROWS,
+          ),
+          eq(issues.originKind, HUMAN_GATED_DIGEST_ORIGIN_KIND),
+        ),
       ),
     );
   return rows.map((row) => row.companyId);
