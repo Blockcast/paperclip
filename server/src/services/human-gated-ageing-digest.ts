@@ -454,7 +454,14 @@ export type DigestDeliveryOutcome = {
   companyId: string;
   issueId: string | null;
   identifier: string | null;
-  action: "created" | "refreshed" | "reopened" | "unchanged" | "skipped_no_owner" | "skipped_empty";
+  action:
+    | "created"
+    | "refreshed"
+    | "reopened"
+    | "retired"
+    | "unchanged"
+    | "skipped_no_owner"
+    | "skipped_empty";
   itemCount: number;
 };
 
@@ -528,6 +535,24 @@ export async function deliverDigest(
     }
 
     const wasTerminal = TERMINAL_STATUSES.has(existing.status);
+
+    if (!wasTerminal && !hasContent) {
+      // Once every producer is clean and has nothing to report, an open digest
+      // is no longer an escalation. Retire it instead of leaving an assigned
+      // `todo` row that says there is no overdue work and gets rewritten every
+      // period. A later actionable pass will reopen this same durable row.
+      await issueService(txDb).update(existing.id, {
+        description: body,
+        status: "done",
+      });
+      return {
+        companyId,
+        issueId: existing.id,
+        identifier: existing.identifier,
+        action: "retired",
+        itemCount,
+      };
+    }
 
     // Unchanged body on a live row: rewriting would be a no-op write and, worse,
     // a bumped `updatedAt` that makes the row look freshly handled.
