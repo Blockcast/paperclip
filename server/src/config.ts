@@ -300,6 +300,12 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  humanGatedDigestIntervalMinutes: {
+    fallback: 360,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  humanGatedDigestPeriodDays: { fallback: 7, min: 1, max: 365 },
   approvalGateReconcilerIntervalMinutes: {
     fallback: 10,
     min: 1,
@@ -324,6 +330,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   databaseBackupIntervalMinutes: 60_000,
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  humanGatedDigestIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
@@ -643,13 +650,15 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_HUMAN_GATED_DIGEST_ENABLED !== undefined
       ? process.env.PAPERCLIP_HUMAN_GATED_DIGEST_ENABLED === "true"
       : true;
-  const humanGatedDigestIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES) || 360,
+  const humanGatedDigestIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.humanGatedDigestIntervalMinutes,
+    "humanGatedDigestIntervalMinutes",
   );
-  const humanGatedDigestPeriodDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS) || 7,
+  const humanGatedDigestPeriodDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS],
+    NUMERIC_SETTING_BOUNDS.humanGatedDigestPeriodDays,
+    "humanGatedDigestPeriodDays",
   );
   const approvalGateReconcilerEnabled =
     process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
