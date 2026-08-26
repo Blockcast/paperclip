@@ -6940,6 +6940,51 @@ describeEmbeddedPostgres("github-webhook route", () => {
     ).toHaveLength(2);
   });
 
+  it("classifies findings after the context clamp and writes feedback for a blocked issue", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "blocked" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const longReviewBody = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "Reviewed head: f78f3dcd8818ed2bf9b7550965c96c614f433987",
+      "",
+      "Prior review context:",
+      "x".repeat(4100),
+      "",
+      "### Critical Issues (0)",
+      "",
+      "### Important Issues (1)",
+      "- The remaining issue is actionable.",
+    ].join("\n");
+    expect(Buffer.byteLength(longReviewBody, "utf8")).toBeGreaterThan(4096);
+
+    const response = await sendReviewSubmitted(
+      app,
+      reviewSubmittedFeedbackPayload({
+        prNumber: 850,
+        reviewId: 333,
+        state: "commented",
+        headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+        identifier: "PEN-1126",
+        body: longReviewBody,
+      }),
+      "delivery-blocked-long-review",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.reopened).toEqual([]);
+    expect(response.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const feedbackComments = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(feedbackComments).toHaveLength(1);
+    expect((feedbackComments[0]!.metadata as Record<string, unknown>).kind).toBe(
+      "github_pr_review_feedback",
+    );
+  });
+
   // BLO-23267: real-world reproduction of the same defect via the
   // COMMENT-shaped path (issue_comment, not pull_request_review.submitted) --
   // the shape Ally's consolidated review actually takes. Payload bodies and

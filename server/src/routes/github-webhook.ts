@@ -729,6 +729,10 @@ interface ResolvedEventContext {
   // so the assignee wake's prompt carries the reviewer's findings without
   // needing a separate `gh pr view` shellout.
   reviewBody?: string | null;
+  // Classification must use the raw review body. reviewBody is deliberately
+  // clamped for heartbeat context size, but a findings heading can occur
+  // after the clamp boundary (as in frr#61 review 4968003838).
+  reviewHasActionableFeedback?: boolean;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
   // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
@@ -1229,6 +1233,7 @@ function resolveEventContextRaw(
         headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
+        reviewHasActionableFeedback: hasActionablePrReviewFeedback(rawReviewBody, reviewState),
         reviewState,
         reviewId,
         reviewAuthorLogin,
@@ -3313,6 +3318,7 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
+  if (context.reviewHasActionableFeedback !== undefined) return context.reviewHasActionableFeedback;
   return hasActionablePrReviewFeedback(context.reviewBody, context.reviewState);
 }
 
