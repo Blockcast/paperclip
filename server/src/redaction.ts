@@ -108,6 +108,32 @@ const ENV_DUMP_SECRET_ASSIGNMENT_RE = new RegExp(
   String.raw`(^|[\r\n\x00])((?:export\s+|declare\s+-x\s+)?${ENV_DUMP_SECRET_KEY_RE.source}=)("[^"\r\n\x00]*"|'[^'\r\n\x00]*'|[^\r\n\x00]*)`,
   "gi",
 );
+// PEN-2370: a connection string carries its credential in the *value*, so it
+// has to be reachable even when the surrounding text contains none of the
+// name-shaped hints below (`redis://u:p@cache:6379` has no hint word and no
+// dot). Gating on the scheme separator keeps URI-bearing text eligible.
+const URI_SEPARATOR_HINT = "://";
+// Value-shaped, deliberately name-blind: `scheme://user:secret@host`. The
+// name-based allowlist in ENV_DUMP_SECRET_KEY_RE only reaches a DSN when the
+// variable happens to be spelled *BASE_URL -- DATABASE_URL matches purely
+// because it contains the substring "BASE_URL", while REDIS_URL and AMQP_URL
+// do not match at all, and a DSN quoted inline in prose is not an assignment
+// so no name rule can see it. Matching the value closes the class.
+// The user component is preserved: knowing *which* principal is configured is
+// the diagnostic value; the password after it is the secret.
+//
+// The userinfo quantifier is `*`, not `+`, and that is load-bearing rather than
+// defensive: RFC 3986 makes the user optional, and `redis://:secret@host` is the
+// ORDINARY spelling for Redis and AMQP, which authenticate with a password and
+// no username at all (`requirepass`). A `+` here matches the textbook
+// `user:pass@` form and misses the shape those two services actually emit --
+// i.e. it would leak precisely the DSNs this rule was added for. Found by
+// probing the rule for a way around it rather than re-reading it.
+//
+// The trailing `@` is what keeps this from over-matching: a credential-free
+// URL (`https://example.com:8080/path`) has no `@`, and a bare userinfo URL
+// (`https://user@host`) has no `:` before it, so neither can match.
+const URI_CREDENTIAL_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s:/@]*):([^\s/@]+)@/gi;
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -134,7 +160,9 @@ export const REDACTED_EVENT_VALUE = "***REDACTED***";
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
-  return SECRET_TEXT_HINTS.some((hint) => lower.includes(hint)) || input.includes(".");
+  return SECRET_TEXT_HINTS.some((hint) => lower.includes(hint))
+    || lower.includes(URI_SEPARATOR_HINT)
+    || input.includes(".");
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -595,7 +623,8 @@ export function redactSensitiveText(input: string): string {
   return redactCommandText(
     envRedacted
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
-      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
+      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
+      .replace(URI_CREDENTIAL_RE, `$1$2:${REDACTED_EVENT_VALUE}@`),
     REDACTED_EVENT_VALUE,
   );
 }
