@@ -22695,7 +22695,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (!activeRun) {
           if (!currentIssue.assigneeAgentId) {
-            throw new Error("Detached queued-run recovery issue has no assignee agent");
+            // An assignee-less issue has no valid recovery destination. Keep
+            // this deterministic condition out of the retry loop; assignment
+            // and subsequent issue wakeups are handled independently.
+            const cancelled = await db
+              .update(detachedQueuedRunRecoveries)
+              .set({
+                status: "cancelled",
+                completedAt: attemptAt,
+                lastError: "Detached queued-run recovery issue has no assignee agent",
+                updatedAt: attemptAt,
+              })
+              .where(and(
+                eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+                eq(detachedQueuedRunRecoveries.status, "pending"),
+              ))
+              .returning({ id: detachedQueuedRunRecoveries.id })
+              .then((rows) => rows[0] ?? null);
+            if (cancelled) result.skipped += 1;
+            continue;
           }
           await options.beforeDetachedQueuedRunRecoveryEnqueueForTest?.({
             intentId: claimedIntent.id,
