@@ -4026,6 +4026,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("treats an at-rest action at its exact budget as exhausted", () => {
+    const action = {
+      attemptCount: defaultRecoveryActionMaxAttempts,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: null,
+    };
+
+    expect(strandedRecoveryWakeAttemptsExhausted(action)).toBe(false);
+    expect(strandedRecoveryWakeAttemptsExhausted(action, new Date(), false)).toBe(true);
+  });
+
   it("lets a synchronously claimed source-scoped wake reopen the source issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));

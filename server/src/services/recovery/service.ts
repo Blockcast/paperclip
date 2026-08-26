@@ -521,9 +521,14 @@ function escapeLikePattern(value: string): string {
 export function strandedRecoveryWakeAttemptsExhausted(
   action: { attemptCount: number; maxAttempts: number | null; timeoutAt?: Date | string | null },
   now: Date = new Date(),
+  attemptAlreadyReserved = true,
 ) {
   if (action.maxAttempts === null) return false;
-  if (action.attemptCount > action.maxAttempts) return true;
+  // Most callers check after reserving the next attempt. The backstop reads a
+  // persisted row without reserving, so an exact budget is exhausted there.
+  if (attemptAlreadyReserved ? action.attemptCount > action.maxAttempts : action.attemptCount >= action.maxAttempts) {
+    return true;
+  }
   if (!action.timeoutAt) return false;
   const horizon = action.timeoutAt instanceof Date ? action.timeoutAt : new Date(action.timeoutAt);
   return Number.isFinite(horizon.getTime()) && horizon.getTime() <= now.getTime();
@@ -10751,7 +10756,7 @@ export function recoveryService(
         attemptCount: candidate.actionAttemptCount,
         maxAttempts: candidate.actionMaxAttempts,
         timeoutAt: candidate.actionTimeoutAt,
-      }, now)) {
+      }, now, false)) {
         result.exhaustedSkipped += 1;
         continue;
       }
