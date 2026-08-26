@@ -139,38 +139,63 @@ export function createLaunchLeaseHeartbeat(args: {
   onError?: (err: unknown) => void | Promise<void>;
 }): {
   add(target: LaunchLeaseTarget): void;
+  markCreated(target: LaunchLeaseTarget): void;
+  assertLaunchSafe(): Promise<void>;
   stop(): void;
 } {
   const targets = new Map<string, LaunchLeaseTarget>();
   const intervalMs = Math.max(1_000, Math.floor(args.leaseMs / 3));
+  const requestTimeoutMs = Math.max(1_000, Math.min(intervalMs - 1, 10_000));
   // Track requests per Secret. A hung patch for one target must not suppress
   // renewals for the other targets or later timer ticks.
-  const renewing = new Set<string>();
+  const renewing = new Map<string, symbol>();
+  const created = new Set<string>();
+  const renewTarget = async (target: LaunchLeaseTarget): Promise<boolean> => {
+    if (typeof args.coreApi.patchNamespacedSecret !== "function") return true;
+    const key = `${target.namespace}/${target.name}`;
+    if (renewing.has(key)) return false;
+    const renewalToken = Symbol(key);
+    renewing.set(key, renewalToken);
+    const request = Promise.resolve(args.coreApi.patchNamespacedSecret({
+      name: target.name,
+      namespace: target.namespace,
+      body: { metadata: { annotations: { [LAUNCH_LEASE_ANNOTATION]: launchLeaseExpiry(Date.now(), args.leaseMs) } } },
+    }));
+    request.catch(() => undefined);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        request,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`lease renewal timed out after ${requestTimeoutMs}ms`)), requestTimeoutMs);
+        }),
+      ]);
+      return true;
+    } catch (err) {
+      await args.onError?.(err);
+      return false;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (renewing.get(key) === renewalToken) renewing.delete(key);
+    }
+  };
   const renew = async () => {
     if (targets.size === 0 || typeof args.coreApi.patchNamespacedSecret !== "function") return;
-    const annotation = launchLeaseExpiry(Date.now(), args.leaseMs);
-    for (const target of targets.values()) {
-      const key = `${target.namespace}/${target.name}`;
-      if (renewing.has(key)) continue;
-      renewing.add(key);
-      void args.coreApi.patchNamespacedSecret({
-        name: target.name,
-        namespace: target.namespace,
-        body: {
-          metadata: { annotations: { [LAUNCH_LEASE_ANNOTATION]: annotation } },
-        },
-      }).catch(async (err) => {
-        await args.onError?.(err);
-      }).finally(() => {
-        renewing.delete(key);
-      });
-    }
+    await Promise.all([...targets.values()].map((target) => renewTarget(target)));
   };
   const timer = setInterval(() => { void renew(); }, intervalMs);
   timer.unref?.();
   return {
     add(target) { targets.set(`${target.namespace}/${target.name}`, target); },
-    stop() { clearInterval(timer); targets.clear(); renewing.clear(); },
+    markCreated(target) { created.add(`${target.namespace}/${target.name}`); },
+    async assertLaunchSafe() {
+      for (const key of created) {
+        const target = targets.get(key);
+        if (!target) continue;
+        if (!(await renewTarget(target))) throw new Error(`launch lease renewal failed for ${key}`);
+      }
+    },
+    stop() { clearInterval(timer); targets.clear(); created.clear(); renewing.clear(); },
   };
 }
 
