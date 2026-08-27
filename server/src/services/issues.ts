@@ -6900,6 +6900,7 @@ export function issueService(db: Db) {
     return clearTerminalIssueRunLocks(issueId, "both");
   }
 
+  /**
    * Diagnostic detail for a 409 raised after the reap ladder above has already
    * declined to release the lock (BLO-28219).
    *
