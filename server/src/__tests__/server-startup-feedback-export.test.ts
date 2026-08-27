@@ -76,6 +76,7 @@ const {
     reconcileResolvedBlockerDependents: vi.fn(async () => ({ woken: 0, failed: 0 })),
     reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
+    publishAgentLivenessGauges: vi.fn(async () => {}),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
@@ -394,8 +395,8 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
