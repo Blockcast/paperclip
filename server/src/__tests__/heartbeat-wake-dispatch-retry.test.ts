@@ -2015,5 +2015,61 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       expect(marker?.status).toBe("dispatch_retrying");
       expect(marker?.claimedAt?.getTime()).toBe(stolenClaimAt.getTime());
     });
+
+    it("does not commit a run after its retry-marker lease is reclaimed before enqueue", async () => {
+      // A completion fence alone is too late: a stale reconciler could commit a
+      // replacement run and only then discover it no longer owned the marker.
+      // The enqueue transaction must validate the claim before either insert.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_opened",
+              payload: { taskKey: "pr_review:Blockcast/test#25726-stale-enqueue" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      const replacementClaimAt = new Date(now.getTime() + 60_000);
+      let reclaimed = 0;
+      const stalePass = heartbeatService(db, {
+        skipQueuedRunDispatch: true,
+        beforeWakeRedeliveryEnqueueForTest: async (row) => {
+          if (reclaimed > 0 || row.id !== markerId) return;
+          reclaimed += 1;
+          await db
+            .update(agentWakeupRequests)
+            .set({ status: "dispatch_retrying", claimedAt: replacementClaimAt })
+            .where(eq(agentWakeupRequests.id, markerId));
+        },
+      });
+
+      const result = await stalePass.reconcileFailedWakeDispatches(now);
+
+      expect(reclaimed).toBe(1);
+      expect(result.recovered).toBe(0);
+      expect(await runsForAgent(agentId)).toHaveLength(0);
+      const [marker] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, markerId));
+      expect(marker?.status).toBe("dispatch_retrying");
+      expect(marker?.claimedAt?.getTime()).toBe(replacementClaimAt.getTime());
+    });
   });
 });

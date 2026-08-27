@@ -3958,6 +3958,13 @@ const IDEMPOTENT_WAKE_DELIVERED_STATUSES = ["queued", "claimed", "deferred_issue
  */
 const WAKE_REDELIVERY_TOKEN_KEY = "__wakeRedeliveryOf";
 
+class WakeDispatchClaimLostError extends Error {
+  constructor(wakeupRequestId: string) {
+    super(`Wake dispatch claim lost for ${wakeupRequestId}`);
+    this.name = "WakeDispatchClaimLostError";
+  }
+}
+
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -4013,6 +4020,8 @@ interface WakeupOptions {
    * rolling deploy.
    */
   dedupeDeliveryToken?: string | null;
+  /** Lease ownership to validate atomically before committing a redelivery. */
+  dispatchRetryClaim?: { wakeupRequestId: string; claimedAt: Date } | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -10451,6 +10460,10 @@ export interface HeartbeatServiceOptions {
    * before the second one selects, so the test passes with the claim removed.
    */
   beforeWakeDispatchClaimForTest?: (
+    row: typeof agentWakeupRequests.$inferSelect,
+  ) => Promise<void> | void;
+  /** Test-only interleave immediately before a retry enters enqueueWakeup. */
+  beforeWakeRedeliveryEnqueueForTest?: (
     row: typeof agentWakeupRequests.$inferSelect,
   ) => Promise<void> | void;
 }
@@ -32336,6 +32349,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
 
+      if (opts.dispatchRetryClaim) {
+        const claim = await tx
+          .select({ status: agentWakeupRequests.status, claimedAt: agentWakeupRequests.claimedAt })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, opts.dispatchRetryClaim.wakeupRequestId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (
+          !claim ||
+          claim.status !== "dispatch_retrying" ||
+          !claim.claimedAt ||
+          claim.claimedAt.getTime() !== opts.dispatchRetryClaim.claimedAt.getTime()
+        ) {
+          throw new WakeDispatchClaimLostError(opts.dispatchRetryClaim.wakeupRequestId);
+        }
+      }
+
       if (manualUserWake) {
         const supersession = await supersedeCapacityRetryForManualWake({
           tx,
@@ -33117,6 +33147,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // claim lease above deliberately re-selects such a row rather than
         // stranding it). Opting into the enqueue-time claim is what makes the
         // re-drive return that run instead of committing a second one.
+        await options.beforeWakeRedeliveryEnqueueForTest?.(row);
         const recoveredRun = await enqueueWakeup(
           row.agentId,
           {
@@ -33128,6 +33159,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // token, so it finds the previous owner's committed run instead of
             // queueing a second one.
             dedupeDeliveryToken: row.id,
+            dispatchRetryClaim: { wakeupRequestId: row.id, claimedAt: now },
           },
           suppression,
         );
@@ -33204,6 +33236,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           recordGithubReviewRequestDelivery({ state: "queued", reason: githubReviewReason });
         }
       } catch (err) {
+        if (err instanceof WakeDispatchClaimLostError) {
+          logger.info(
+            { wakeupRequestId: row.id, agentId: row.agentId },
+            "wake dispatch lease was reclaimed before enqueue could commit; skipping stale redelivery (BLO-25726)",
+          );
+          continue;
+        }
         if (err instanceof HttpError) {
           const fenced = await finishClaimedRow({
             status: "dispatch_superseded",
