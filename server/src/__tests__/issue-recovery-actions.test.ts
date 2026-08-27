@@ -6470,6 +6470,48 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         );
       });
 
+      it("fails closed when one prior run and a delayed following run cannot bound the interval", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const triggeredAt = new Date("2026-08-19T00:07:26.722Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          siblingTriggeredAt: [new Date("2026-08-17T00:07:26.722Z")],
+          followingTriggeredAt: [new Date("2026-08-20T12:07:26.722Z")],
+          issueNumber: 517,
+        });
+        // The receipt belongs to an intervening window. With only one prior
+        // row, the delayed following row cannot establish a trustworthy bound.
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-18T00:00:00.000Z:missed_window",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId))
+          .then((rows) => rows.filter((row) => row.idempotencyKey?.startsWith("scheduler-heartbeat:")));
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+      });
+
       // A receipt keyed to a *later* window cannot vouch for this one either.
       it("does not let a following window's receipt suppress this window", async () => {
         const { companyId, managerId, coderId, prefix } = await seedCompany();
