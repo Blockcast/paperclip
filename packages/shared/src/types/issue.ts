@@ -21,6 +21,7 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionOwnerType,
   IssueRecoveryActionStatus,
+  IssueRecoveryActionRetiringBound,
   IssueWorkMode,
   ModelProfileKey,
   IssueThreadInteractionContinuationPolicy,
@@ -510,8 +511,10 @@ export interface IssueRecoveryAction {
   wakePolicy: Record<string, unknown> | null;
   monitorPolicy: Record<string, unknown> | null;
   attemptCount: number;
+  nonDeliverySweepCount: number;
   maxAttempts: number | null;
   timeoutAt: Date | string | null;
+  retiringBound: IssueRecoveryActionRetiringBound | null;
   lastAttemptAt: Date | string | null;
   outcome: IssueRecoveryActionOutcome | null;
   resolutionNote: string | null;

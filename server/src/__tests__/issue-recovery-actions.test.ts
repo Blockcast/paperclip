@@ -127,8 +127,10 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
     wakePolicy: null,
     monitorPolicy: null,
     attemptCount: 1,
+    nonDeliverySweepCount: 0,
     maxAttempts: null,
     timeoutAt: null,
+    retiringBound: null,
     lastAttemptAt: now,
     outcome: null,
     resolutionNote: null,
@@ -973,9 +975,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
     const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
     expect(unchanged).toMatchObject({
-      status: "active",
+      status: "escalated",
       attemptCount: defaultRecoveryActionMaxAttempts,
       maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: "attempt_budget",
     });
     expect(unchanged?.lastAttemptAt).toEqual(new Date("2026-05-01T00:00:00.000Z"));
   });
@@ -2589,9 +2592,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRow).toMatchObject({
-      status: "active",
+      status: "escalated",
       attemptCount: Math.min(ESCALATIONS, defaultRecoveryActionMaxAttempts),
       maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: "attempt_budget",
     });
 
     const commentBodies = await db
@@ -2761,7 +2765,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
-    expect(exhaustedAction).toMatchObject({ status: "active", ownerAgentId: managerId });
+    expect(exhaustedAction).toMatchObject({
+      status: "escalated",
+      ownerAgentId: managerId,
+      retiringBound: "attempt_budget",
+    });
     // BLO-19124: the counter FREEZES at the delivered-wake count. It used to read
     // `toBeGreaterThan(maxAttempts)` because the exhaustion gate returned without refunding
     // the unconditional reserve, so every post-exhaustion sweep added +1 forever — after
@@ -2810,9 +2818,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(reassignedAction).toMatchObject({
-      status: "active",
+      status: "escalated",
       ownerAgentId: secondManagerId,
       attemptCount: 1,
+      retiringBound: "attempt_budget",
     });
     expect(wakesTo(secondManagerId)).toBe(1);
 

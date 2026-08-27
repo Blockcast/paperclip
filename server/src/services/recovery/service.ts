@@ -5599,6 +5599,11 @@ export function recoveryService(
     // re-trips this same gate before any enqueue — so the delivered-wake ceiling is unchanged
     // at exactly `maxAttempts`, and `timeoutAt` still bounds wall-clock independently.
     if (strandedRecoveryWakeAttemptsExhausted(input.action)) {
+      await recoveryActionsSvc.retireWakeAction({
+        companyId: input.issue.companyId,
+        actionId: input.action.id,
+        retiringBound: "attempt_budget",
+      });
       await refundUnspentWakeAttempt("attempts_exhausted");
       return;
     }
@@ -12146,6 +12151,13 @@ export function recoveryService(
         maxAttempts: candidate.actionMaxAttempts,
         timeoutAt: candidate.actionTimeoutAt,
       }, now, false)) {
+        const attemptBudgetReached = candidate.actionMaxAttempts !== null &&
+          candidate.actionAttemptCount >= candidate.actionMaxAttempts;
+        await recoveryActionsSvc.retireWakeAction({
+          companyId: candidate.companyId,
+          actionId: candidate.actionId,
+          retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
+        });
         result.exhaustedSkipped += 1;
         continue;
       }
@@ -12178,7 +12190,10 @@ export function recoveryService(
       // cooldown expires and the same durable action is eligible on the next pass.
       const claimed = await db
         .update(issueRecoveryActions)
-        .set({ lastAttemptAt: now, updatedAt: now })
+        .set({
+          lastAttemptAt: now,
+          updatedAt: now,
+        })
         .where(and(
           eq(issueRecoveryActions.id, candidate.actionId),
           eq(issueRecoveryActions.companyId, candidate.companyId),
@@ -12229,6 +12244,12 @@ export function recoveryService(
           },
         });
         if (!wake) {
+          await recoveryActionsSvc.recordNonDeliverySweep({
+            companyId: candidate.companyId,
+            actionId: candidate.actionId,
+            expectedOwnerAgentId: ownerAgentId,
+            expectedLastAttemptAt: deliveryAttemptAt,
+          });
           result.deferredOrFailed += 1;
           continue;
         }
@@ -12256,6 +12277,12 @@ export function recoveryService(
           },
         });
       } catch (err) {
+        await recoveryActionsSvc.recordNonDeliverySweep({
+          companyId: candidate.companyId,
+          actionId: candidate.actionId,
+          expectedOwnerAgentId: ownerAgentId,
+          expectedLastAttemptAt: deliveryAttemptAt,
+        });
         result.deferredOrFailed += 1;
         result.enqueueFailed += 1;
         logger.warn(
