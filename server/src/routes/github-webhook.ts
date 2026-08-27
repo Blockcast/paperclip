@@ -55,6 +55,7 @@ import {
 } from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
+import { redactSensitiveText } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   extractPaperclipIdentifiers,
@@ -728,6 +729,10 @@ interface ResolvedEventContext {
   // so the assignee wake's prompt carries the reviewer's findings without
   // needing a separate `gh pr view` shellout.
   reviewBody?: string | null;
+  // Classification must use the raw review body. reviewBody is deliberately
+  // clamped for heartbeat context size, but a findings heading can occur
+  // after the clamp boundary (as in frr#61 review 4968003838).
+  reviewHasActionableFeedback?: boolean;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
   // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
@@ -771,13 +776,40 @@ interface ResolvedEventContext {
 // fetch the full body via `gh pr view`.
 const REVIEW_BODY_MAX_BYTES = 4096;
 
+/**
+ * PEN-2370 (door #7): scrub an externally-authored GitHub body before it is
+ * mirrored into Paperclip. Null-preserving so call sites keep their
+ * `string | null` contract.
+ */
+function redactExternalBody(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  return redactSensitiveText(value);
+}
+
 function clampReviewBody(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
+  // PEN-2370 (door #7): this is the single normalization choke point for every
+  // externally-authored review/comment body that gets mirrored into an
+  // `authorType: "system"` issue comment, so it is where scrubbing belongs --
+  // patching the individual comment builders would leave the next mirror site
+  // to rediscover the problem.
+  //
+  // Redact BEFORE clamping, never after -- and on BOTH branches. Every rule in
+  // `redactSensitiveText` is anchored on a terminator that sits to the *right*
+  // of the secret: `URI_CREDENTIAL_RE` needs the trailing `@`, the env-dump
+  // rules need the line end. Truncation deletes exactly that terminator while
+  // leaving the head of the value visible, so a clamp-then-redact ordering does
+  // not merely miss the secret -- it destroys the pattern that would have
+  // caught it. The result is a body that carries a partial credential *and* a
+  // `…(truncated)` marker implying the scrubber ran: a fail-open that reads as
+  // coverage, which is the failure mode this ticket exists to stop.
   const trimmed = value.trim();
   if (trimmed.length === 0) return null;
-  if (Buffer.byteLength(trimmed, "utf8") <= REVIEW_BODY_MAX_BYTES) return trimmed;
+  // One redaction pass over the FULL body, before any length decision.
+  const redacted = redactSensitiveText(trimmed);
+  if (Buffer.byteLength(redacted, "utf8") <= REVIEW_BODY_MAX_BYTES) return redacted;
   // Byte-length truncation so UTF-8 multibyte characters don't split.
-  const buf = Buffer.from(trimmed, "utf8");
+  const buf = Buffer.from(redacted, "utf8");
   let cut = buf.subarray(0, REVIEW_BODY_MAX_BYTES).toString("utf8");
   // `toString("utf8")` replaces split surrogates with U+FFFD; strip a
   // trailing replacement char to avoid a visible glyph in the directive.
@@ -1201,6 +1233,7 @@ function resolveEventContextRaw(
         headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
+        reviewHasActionableFeedback: hasActionablePrReviewFeedback(rawReviewBody, reviewState),
         reviewState,
         reviewId,
         reviewAuthorLogin,
@@ -1264,7 +1297,9 @@ function resolveEventContextRaw(
         prAdditions: typeof pr?.additions === "number" ? (pr.additions as number) : null,
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
         prBranch: (head?.ref as string | undefined) ?? null,
-        prBody: (pr?.body as string | undefined) ?? null,
+        // PEN-2370: externally-authored, same exposure shape as reviewBody /
+        // commentBody. It bypasses clampReviewBody, so it needs the scrub here.
+        prBody: redactExternalBody(pr?.body as string | undefined),
         prAction: action,
       };
     }
@@ -3283,6 +3318,7 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
+  if (context.reviewHasActionableFeedback !== undefined) return context.reviewHasActionableFeedback;
   return hasActionablePrReviewFeedback(context.reviewBody, context.reviewState);
 }
 

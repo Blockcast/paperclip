@@ -751,6 +751,59 @@ async function ensureResolutionComment(
   await ctx.issues.createComment(issueId, body, companyId);
 }
 
+/**
+ * BLO-29908: the resolve-driven cancel pins both execution-lock columns to
+ * `null`, so a row a live run holds fails the precondition instead of being
+ * cancelled. `updateIssue` answers that with a 409 whose message is one of
+ * three "…before the update could be applied" variants (checkout owner,
+ * execution owner, or the in-transaction precondition catch-all).
+ *
+ * Matching the shared suffix is deliberate: those are the ONLY preconditions
+ * this call sets, so any of them failing means exactly one thing — a lock
+ * appeared or was already held. Anything else is a real fault and must
+ * propagate so the delivery fails and Alertmanager retries, rather than being
+ * silently reported as a withheld cancel.
+ */
+function isExecutionLockPreconditionFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes("before the update could be applied");
+}
+
+/**
+ * Marker line keyed on the holding run, not on `resolvedAt`. A flapping
+ * fingerprint resolves twice an hour (BLO-29905 / BLO-29393), so keying the
+ * idempotency on the timestamp would append a near-identical comment on every
+ * cycle. One notification per holding run is the useful signal: it tells the
+ * run that its subject cleared, once.
+ */
+function cancelWithheldMarker(runId: string): string {
+  return `<!-- alertmanager:cancel-withheld:${runId} -->`;
+}
+
+async function ensureCancelWithheldComment(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  resolvedAt: string,
+  runId: string,
+) {
+  const marker = cancelWithheldMarker(runId);
+  const comments = await ctx.issues.listComments(issueId, companyId);
+  if (comments.some((comment) => comment.body.includes(marker))) return;
+  const body = [
+    marker,
+    `**Alert resolved at ${resolvedAt} — auto-cancel withheld.**`,
+    "",
+    `This issue is held by execution run \`${runId}\`, so \`paperclip-plugin-alertmanager\` left`,
+    "the status untouched rather than cancelling the row and clearing the execution lock.",
+    "",
+    "- The underlying alert is no longer firing. If your investigation is done, close this issue yourself.",
+    "- The lock is intact: nothing was released out from under the holding run.",
+    "- Cancelling here is the holder's decision, not the bridge's ([BLO-29908](/BLO/issues/BLO-29908)).",
+  ].join("\n");
+  await ctx.issues.createComment(issueId, body, companyId);
+}
+
 export async function handleResolved(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
@@ -780,6 +833,7 @@ export async function handleResolved(
 
   const resolvedAt = alert.endsAt || new Date().toISOString();
   const alertname = existing.alertname;
+  let cancelWithheldForRunId: string | null = null;
 
   if (config.autoCloseOnResolve !== false) {
     const issue = await ctx.issues.get(
@@ -787,11 +841,70 @@ export async function handleResolved(
       existing.paperclipCompanyId,
     );
     if (issue && issue.status !== "done" && issue.status !== "cancelled") {
-      await ctx.issues.update(
-        existing.paperclipIssueId,
-        { status: "cancelled" },
-        existing.paperclipCompanyId,
-      );
+      // Read for the diagnostic only. The *authorization* is the pair of
+      // preconditions below, evaluated inside the update's transaction — this
+      // snapshot is racy by construction and must never be the thing that
+      // decides whether the cancel is safe.
+      try {
+        await ctx.issues.update(
+          existing.paperclipIssueId,
+          {
+            status: "cancelled",
+            // BLO-29908. A resolve used to cancel unconditionally, and
+            // `updateIssue` clears checkoutRunId/executionRunId/
+            // executionAgentNameKey/executionLockedAt on any transition out of
+            // `in_progress` — so the bridge silently evicted whatever run held
+            // the row. Observed 46s after a live run wrote its findings
+            // document, twice an hour per alert while a fingerprint flaps.
+            //
+            // Pinning BOTH columns to null is what makes the cancel safe:
+            // `executionRunId` alone is not enough, because an issue can be
+            // held via `checkoutRunId` with `executionRunId` still null
+            // (BLO-19749), which is precisely the window a lock-holder check
+            // on one column would miss.
+            expectedCurrentCheckoutRunId: null,
+            expectedCurrentExecutionRunId: null,
+          },
+          existing.paperclipCompanyId,
+        );
+      } catch (err) {
+        if (!isExecutionLockPreconditionFailure(err)) throw err;
+        // Stated choice (BLO-29908 acceptance criterion b): leave the status
+        // untouched and annotate, rather than deferring the cancel behind new
+        // state the plugin would then have to reconcile. The holder disposes
+        // of the row when it finishes — which is the correct owner of that
+        // decision — and a later re-fire refreshes it in place (BLO-24234).
+        // The diagnostic read above can race with checkout/release. Re-read
+        // after the CAS conflict so a newly acquired owner is notified rather
+        // than persisting a misleading `unknown` marker that would suppress
+        // future notifications for the real holder.
+        const currentIssue = await ctx.issues.get(
+          existing.paperclipIssueId,
+          existing.paperclipCompanyId,
+        );
+        // Only use an owner confirmed by the post-conflict read. The initial
+        // snapshot may describe a run that released before the CAS reached the
+        // transaction; falling back to it would create a stale marker that can
+        // suppress notification for a later holder.
+        cancelWithheldForRunId =
+          currentIssue?.executionRunId ?? currentIssue?.checkoutRunId ?? null;
+        if (cancelWithheldForRunId) {
+          await ensureCancelWithheldComment(
+            ctx,
+            existing.paperclipIssueId,
+            existing.paperclipCompanyId,
+            resolvedAt,
+            cancelWithheldForRunId,
+          );
+        }
+        ctx.logger.info(
+          `Alertmanager: withheld resolve-cancel for ${alertname} (${alert.fingerprint}) — issue ${existing.paperclipIssueId} is held by run ${cancelWithheldForRunId ?? "an unobserved owner"}`,
+        );
+        await ctx.metrics.write("alertmanager.resolved.cancel_withheld", 1, {
+          alertname,
+          severity: existing.severity,
+        });
+      }
     }
   } else {
     await ensureResolutionComment(
@@ -815,6 +928,8 @@ export async function handleResolved(
     resolvedAt,
     nextEscalationAt: null,
     escalationComplete: true,
+    cancelWithheldForRunId,
+    cancelWithheldAt: cancelWithheldForRunId ? resolvedAt : null,
   };
   await ctx.state.set(stateRef, updated);
 
@@ -826,6 +941,7 @@ export async function handleResolved(
       alertname,
       paperclipIssueId: existing.paperclipIssueId,
       resolvedAt,
+      cancelWithheldForRunId,
     },
   );
 

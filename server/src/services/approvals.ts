@@ -33,6 +33,17 @@ export function approvalService(db: Db) {
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
   type CreateWithIdempotencyOptions = {
     afterCreate?: (txDb: Db, approval: ApprovalRecord) => Promise<void>;
+    /**
+     * Who the key collides against. Default `"requester"` — two agents filing similar asks never
+     * collide, one agent retrying always does.
+     *
+     * `"company"` is for SERVER-DERIVED keys only (BLO-24744). A liveness incident can hand the
+     * same root-cause key to escalation runs owned by different agents, and the question on the
+     * card is the incident's, not the filer's — so requester scoping would mint one card per owner
+     * for one human decision. Never widen a caller-supplied key this way: the requester scoping is
+     * what stops one agent's key from swallowing another's unrelated ask.
+     */
+    dedupeScope?: "requester" | "company";
   };
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
@@ -350,8 +361,15 @@ export function approvalService(db: Db) {
         throw unprocessable("Approval idempotency key requires an authenticated requester");
       }
 
+      // A company-scoped key is one incident's, not one filer's, so both the read and the advisory
+      // lock must drop the requester — leaving it in the lock would let two owners of the same
+      // incident run the read concurrently and both insert.
+      const companyScoped = options.dedupeScope === "company";
+
       return db.transaction(async (tx) => {
-        const guardKey = `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
+        const guardKey = companyScoped
+          ? `approval-create:idempotency:${companyId}:${idempotencyKey}`
+          : `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
 
         const existing = await tx
@@ -361,7 +379,7 @@ export function approvalService(db: Db) {
             and(
               eq(approvals.companyId, companyId),
               eq(approvals.idempotencyKey, idempotencyKey),
-              eq(requesterColumn, requesterValue),
+              ...(companyScoped ? [] : [eq(requesterColumn, requesterValue)]),
               inArray(approvals.status, resolvableStatuses),
             ),
           )

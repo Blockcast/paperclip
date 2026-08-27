@@ -112,6 +112,7 @@ import {
   type ExecutionWorkspace,
   type ExecutionWorkspaceConfig,
   type HeartbeatRunStatusPhase,
+  type HeartbeatRunRetrySuccessor,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
@@ -33995,6 +33996,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .limit(1)
         .then((rows) => rows[0] ?? null);
       return row?.message ?? null;
+    },
+
+    /**
+     * BLO-29312: resolve a run's OUTBOUND retry edge -- the park (or immediate
+     * re-queue) created because this run ended.
+     *
+     * Every persisted `scheduledRetry*` column on the run points the other way:
+     * it describes the park that produced this row, not one this row's failure
+     * produced. So a `failed` run carrying `scheduledRetryAt: null` has not
+     * been shown to be unretried, and one carrying a past `scheduledRetryAt`
+     * has not been shown to be retried. Both misreadings have happened, in
+     * production, on this exact field (BLO-28734 + its re-verification, ~6
+     * agent runs and one fully mis-diagnosed defect between them).
+     *
+     * `state` is returned as an assertion rather than a nullable object
+     * precisely because the original failure was a caller interpreting a null.
+     * `not_retried` means "terminal, and no successor row exists"; a run that
+     * has not finished yet is `not_applicable`, because nothing could have been
+     * created from its failure. Successor-exists wins over both, so a run that
+     * is somehow still live with a successor already recorded still reads
+     * `retried` rather than claiming the question does not apply.
+     *
+     * Read-only. This resolves the same `retryOfRunId` edge the writers already
+     * maintain; it does not create, alter, or infer any park.
+     */
+    getRetrySuccessor: async (
+      run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status">,
+    ): Promise<HeartbeatRunRetrySuccessor> => {
+      const successor = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        // Served by heartbeat_runs_retry_successor_idx (migration 0225).
+        // companyId is redundant against a globally unique run id and is kept
+        // only as a company-boundary guard, matching the existing reverse
+        // lookup in recoverProcessLostRun.
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
+        // Not uniquely constrained, so pin the choice rather than leaving it to
+        // physical row order: the first successor is the one the retry chain
+        // actually followed.
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (!successor) {
+        return {
+          state: TERMINAL_RUN_STATUSES.has(run.status) ? "not_retried" : "not_applicable",
+          runId: null,
+          status: null,
+          scheduledRetryAt: null,
+          scheduledRetryAttempt: null,
+          scheduledRetryReason: null,
+          createdAt: null,
+        };
+      }
+
+      return {
+        state: "retried",
+        runId: successor.id,
+        status: successor.status as HeartbeatRunRetrySuccessor["status"],
+        scheduledRetryAt: successor.scheduledRetryAt ?? null,
+        scheduledRetryAttempt: successor.scheduledRetryAttempt ?? null,
+        scheduledRetryReason: successor.scheduledRetryReason ?? null,
+        createdAt: successor.createdAt,
+      };
     },
 
     readLog: async (

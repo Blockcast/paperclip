@@ -1722,6 +1722,21 @@ function buildLivenessEscalationDescription(finding: IssueLivenessFinding) {
     finding.recommendedAction,
     "",
     "Resolve the blocked chain, then mark this escalation issue done so the original issue can resume when all blockers are cleared.",
+    "",
+    // BLO-24744: this issue is worked by a cheap status-only run, and the repair it asks for is
+    // sometimes not one an agent can perform (a `pauseReason: manual` pause is a human's decision).
+    // Without naming the one channel that class of run may use, the honest options left were all
+    // bad: file nothing, poll a human decision, or close unresolved. Name it here — the reader is
+    // the run, and this text is the only instruction it gets.
+    "## If only a human can resolve this",
+    "",
+    "Do not poll it, and do not close this unresolved. File a board escalation from this run: " +
+    "`POST /api/companies/:companyId/approvals` with `type: \"request_board_approval\"` and " +
+    "`issueIds: [\"<this escalation issue id>\"]` — that is the one approval a status-only recovery " +
+    "run may create, and linking it to this issue is required. Paperclip supplies the idempotency " +
+    "key, so every escalation raised for this same root cause replays the one existing card " +
+    "(response `deduplicated: true`) instead of adding another. Record the approval id here, then " +
+    "leave this issue blocked on that decision.",
   ].join("\n");
 }
 

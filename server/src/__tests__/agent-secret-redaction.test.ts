@@ -392,15 +392,15 @@ describe("agent secret redaction on mutating responses", () => {
   });
 
   // The reported case: a patch that touches no credential field at all.
-  it("PATCH /agents/:id redacts secrets on a budget-only patch", async () => {
-    mockAgentService.update.mockResolvedValue({ ...baseAgent, budgetMonthlyCents: 123_456 });
+  it("PATCH /agents/:id redacts secrets on a patch touching no credential field", async () => {
+    mockAgentService.update.mockResolvedValue({ ...baseAgent, spentMonthlyCents: 123_456 });
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 123_456 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 123_456 });
 
     expect(res.status).toBe(200);
     // The patch itself still has to work.
-    expect(res.body.budgetMonthlyCents).toBe(123_456);
+    expect(res.body.spentMonthlyCents).toBe(123_456);
     expect(res.body.adapterConfig.env).toEqual({
       OPENAI_API_KEY: "***",
       ANTHROPIC_API_KEY: "***",
@@ -462,7 +462,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(refAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(JSON.stringify(res.body)).not.toContain("\"value\"");
@@ -492,13 +492,13 @@ describe("agent secret redaction on mutating responses", () => {
       },
     };
     mockAgentService.getById.mockResolvedValue(nestedAgent);
-    mockAgentService.update.mockResolvedValue({ ...nestedAgent, budgetMonthlyCents: 42 });
+    mockAgentService.update.mockResolvedValue({ ...nestedAgent, spentMonthlyCents: 42 });
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 42 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 42 });
 
     expect(res.status).toBe(200);
-    expect(res.body.budgetMonthlyCents).toBe(42);
+    expect(res.body.spentMonthlyCents).toBe(42);
     const profile = res.body.runtimeConfig.modelProfiles.cheap.adapterConfig;
     // Non-credential config stays readable; only the bindings are masked.
     expect(profile.model).toBe("openai/gpt-5.6-sol");
@@ -522,7 +522,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(nestedAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env).toEqual({
@@ -543,7 +543,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(nestedAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig.cwd).toBe("/workspace");
@@ -577,7 +577,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(refAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env.FOO).toEqual({
