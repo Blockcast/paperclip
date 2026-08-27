@@ -233,7 +233,7 @@ export function derivePersistedMonitorState(input: {
   const notes = scheduledMonitor?.notes ?? normalizeMonitorNotes(input.issue.monitorNotes) ?? fromState?.notes ?? null;
   const scheduledByRaw = input.issue.monitorScheduledBy ?? scheduledMonitor?.scheduledBy ?? fromState?.scheduledBy ?? null;
   const scheduledBy =
-    scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
+    scheduledByRaw === "assignee" || scheduledByRaw === "board" || scheduledByRaw === "manager" ? scheduledByRaw : null;
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
   // BLO-18294: convergence bookkeeping has no dedicated columns, so it only
   // survives via executionState. Carry it across every derived shape.

@@ -1999,8 +1999,12 @@ function monitorPoliciesEqual(left: NormalizedExecutionPolicy | null, right: Nor
 function applyActorMonitorScheduledBy(
   policy: NormalizedExecutionPolicy | null,
   actorType: "agent" | "user",
+  managerMonitorRearmAuthorized = false,
 ) {
-  return setIssueExecutionPolicyMonitorScheduledBy(policy, actorType === "user" ? "board" : "assignee");
+  return setIssueExecutionPolicyMonitorScheduledBy(
+    policy,
+    actorType === "user" ? "board" : managerMonitorRearmAuthorized ? "manager" : "assignee",
+  );
 }
 
 async function assertCanManageIssueMonitor(
@@ -10983,6 +10987,7 @@ export function issueRoutes(
       const requestedExecutionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
+        managerMonitorRearmAuthorized,
       );
       // A manager-chain re-arm is authorized to restore a *timer*, not to
       // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a

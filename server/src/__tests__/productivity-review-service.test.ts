@@ -110,7 +110,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     status?: "todo" | "in_progress" | "done" | "cancelled";
     startedAt?: Date;
     monitorNextCheckAt?: Date | null;
-    monitorScheduledBy?: "assignee" | "board" | null;
+    monitorScheduledBy?: "assignee" | "board" | "manager" | null;
     monitorLastTriggeredAt?: Date | null;
     monitorWakeRequestedAt?: Date | null;
     parentId?: string | null;
@@ -5677,6 +5677,23 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("suppresses long-active reviews for manager-scheduled future monitor waits", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+      monitorScheduledBy: "manager",
+    });
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
   });
 
   it("closes open long-active productivity reviews when the source has a deliberate future monitor", async () => {
