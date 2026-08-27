@@ -1222,7 +1222,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .then((rows) => rows[0]!);
     expect(ownerRun.status).toBe("running");
 
-    // Nothing was half-done: no auto-resolve comment, and the blocker edge is still wired.
+    // Nothing was half-done: no auto-resolve comment, and the real blocker relation remains
+    // the only edge. Current master deliberately does not fabricate an escalation edge.
     const comments = await db
       .select()
       .from(issueComments)
@@ -1236,7 +1237,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.map((row) => row.blockerIssueId)).toContain(escalation.id);
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
   });
 
   /**
@@ -1310,8 +1311,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .then((rows) => rows[0]!);
     expect(ownerRun.status).toBe("running");
 
-    // Nothing was half-done: no auto-resolve comment, and the escalation is still wired to
-    // its subject. An unwired-but-open escalation has no repair path.
+    // Nothing was half-done: no auto-resolve comment, and the real blocker relation remains
+    // the only edge. Current master deliberately does not fabricate an escalation edge.
     const comments = await db
       .select()
       .from(issueComments)
@@ -1325,7 +1326,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
-    expect(blockers.map((row) => row.blockerIssueId)).toContain(escalation.id);
+    expect(blockers.map((row) => row.blockerIssueId)).toEqual([blockerIssueId]);
   });
 
   /**
