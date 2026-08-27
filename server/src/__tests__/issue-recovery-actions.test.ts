@@ -2411,7 +2411,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRow).toMatchObject({
       status: "active",
-      attemptCount: ESCALATIONS,
+      attemptCount: Math.min(ESCALATIONS, defaultRecoveryActionMaxAttempts),
       maxAttempts: defaultRecoveryActionMaxAttempts,
     });
 
