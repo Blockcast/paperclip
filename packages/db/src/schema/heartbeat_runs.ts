@@ -40,6 +40,16 @@ export const heartbeatRuns = pgTable(
     lastOutputSeq: integer("last_output_seq").notNull().default(0),
     lastOutputStream: text("last_output_stream"),
     lastOutputBytes: bigint("last_output_bytes", { mode: "number" }),
+    // The INBOUND edge of a retry chain: the run whose ending caused this row
+    // to be created. Set by every park/re-queue writer that succeeds a specific
+    // run. Deliberately absent on admission-gate parks (`ccrotate_capacity`,
+    // `dependency_blocked`), which refuse a wake *before* dispatch and so
+    // succeed no run at all.
+    //
+    // There is no matching outbound column, and adding one is not planned: the
+    // successor is found by looking this column up in reverse
+    // (`where retry_of_run_id = <run id>`), which
+    // heartbeat_runs_retry_successor_idx (migration 0230) exists to serve.
     retryOfRunId: uuid("retry_of_run_id").references((): AnyPgColumn => heartbeatRuns.id, {
       onDelete: "set null",
     }),
@@ -78,6 +88,26 @@ export const heartbeatRuns = pgTable(
     crashRecoveryAttempts: integer("crash_recovery_attempts"),
     crashRecoveryNextAttemptAt: timestamp("crash_recovery_next_attempt_at", { withTimezone: true }),
     crashRecoveryLastError: text("crash_recovery_last_error"),
+    // BLO-29312: these three columns are INBOUND. They describe the park that
+    // PRODUCED this row -- when the hold this run was released from was due,
+    // which attempt of that chain this run is, and why the chain started. They
+    // do NOT record a park created because THIS run failed.
+    //
+    // That park is a separate row carrying `retryOfRunId` = this row's id (see
+    // the note there), and nothing about it is ever written back here. A
+    // promoted retry also keeps its park on the row -- promoteDueScheduledRetry
+    // writes only status/error/updatedAt -- so these values survive into
+    // `queued`/`running`/terminal states as a durable record of this attempt's
+    // origin.
+    //
+    // The failure mode this comment exists to stop: on a `failed` run,
+    // `scheduledRetryAt: null` reads as "the system declined to retry it" and a
+    // past `scheduledRetryAt` reads as "a retry was promised and never fired".
+    // Both readings are wrong, both were made in production (BLO-28734 and its
+    // re-verification, ~6 agent runs), and neither column can answer the
+    // question they were being asked. For "was this run retried?", resolve the
+    // outbound edge instead -- `heartbeat.getRetrySuccessor`, surfaced as
+    // `retrySuccessor` on GET /api/heartbeat-runs/:runId.
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
