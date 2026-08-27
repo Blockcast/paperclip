@@ -27,7 +27,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS } from "../services/heartbeat.js";
+import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   normalizeIssueExecutionPolicy,
@@ -294,13 +294,20 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     issueStatus?: "in_progress" | "in_review";
     attemptCount?: number;
     monitorStateOverrides?: Record<string, unknown>;
+    /**
+     * BLO-29606: `timeoutAt` is optional on the monitor policy and defaults to
+     * null, and the arming shape agents are instructed to use omits it. Pass null
+     * here to seed that shape — the one every `tickExpiredIssueMonitors` case
+     * used to skip, because the fixture hardcoded a non-null timeout.
+     */
+    timeoutAt?: Date | null;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const lastTriggeredAt = new Date("2026-04-10T00:00:00.000Z");
-    const timeoutAt = new Date("2026-04-11T00:00:00.000Z");
+    const timeoutAt = input?.timeoutAt === undefined ? new Date("2026-04-11T00:00:00.000Z") : input.timeoutAt;
     const attemptCount = input?.attemptCount ?? 3;
 
     await db.insert(companies).values({
@@ -362,7 +369,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
           scheduledBy: "assignee",
           serviceName: "Deploy provider",
           externalRef: null,
-          timeoutAt: timeoutAt.toISOString(),
+          timeoutAt: timeoutAt?.toISOString() ?? null,
           maxAttempts: null,
           recoveryPolicy: "wake_owner",
           clearedAt: null,
@@ -1238,7 +1245,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("recovers a monitor stuck triggered past its timeout with a null nextCheckAt", async () => {
     const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
     const heartbeat = createHeartbeat();
-    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+    const tickAt = new Date(timeoutAt!.getTime() + 60 * 60 * 1000);
 
     const result = await heartbeat.tickTimers(tickAt);
 
@@ -1276,7 +1283,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("does not recover the same expired monitor twice across repeated ticks", async () => {
     const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
     const heartbeat = createHeartbeat();
-    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+    const tickAt = new Date(timeoutAt!.getTime() + 60 * 60 * 1000);
 
     await heartbeat.tickTimers(tickAt);
     await heartbeat.tickTimers(new Date(tickAt.getTime() + 60 * 1000));
@@ -1307,7 +1314,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       },
     });
     const heartbeat = createHeartbeat();
-    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+    const tickAt = new Date(timeoutAt!.getTime() + 60 * 60 * 1000);
 
     await heartbeat.tickTimers(tickAt);
 
@@ -1330,7 +1337,96 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("leaves a triggered monitor alone until its timeout actually passes", async () => {
     const { issueId, timeoutAt } = await seedExpiredTriggeredFixture();
     const heartbeat = createHeartbeat();
-    const tickAt = new Date(timeoutAt.getTime() - 60 * 60 * 1000);
+    const tickAt = new Date(timeoutAt!.getTime() - 60 * 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+  });
+
+  // BLO-29606: `timeoutAt` is optional and defaults to null, and the re-arm shape
+  // the fleet is instructed to use omits it. Such a monitor fell through BOTH
+  // sweeps — tickDueIssueMonitors skips it (nextCheckAt already nulled on
+  // dispatch) and the BLO-25865 sweep skipped it (no timeoutAt to expire) — so it
+  // sat `triggered` forever with no wake source, which is what trips
+  // in_review_without_action_path. It must now expire against the grace window.
+  it("recovers a triggered monitor with no timeoutAt once the stall grace passes", async () => {
+    const { issueId, agentId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    const monitorState = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(monitorState).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+    expect(monitorState?.clearedAt).not.toBeNull();
+
+    // AC2: wake_owner actually fires, so the row regains a wake source. A queued
+    // wake request is itself an explicit waiting path in the liveness detector.
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(1);
+    expect(recoveryWakeups[0]?.payload).toMatchObject({
+      issueId,
+      clearReason: "trigger_stalled",
+    });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_exhausted");
+    expect(activity).toContain("issue.monitor_recovery_wake_queued");
+  });
+
+  // Control for the false-positive half of BLO-29606: inside the grace window the
+  // trigger is simply outstanding — a live run may still be working it — so the
+  // sweep must not clear it or burn an owner wake. This is the case a
+  // happy-path-only test misses.
+  it("leaves a triggered monitor with no timeoutAt alone inside the stall grace", async () => {
+    const { issueId, agentId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS - 60 * 1000);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+    expect(issue.monitorWakeRequestedAt).toBeNull();
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(0);
+  });
+
+  // Regression guard: an operator-supplied deadline stays authoritative. A monitor
+  // whose timeoutAt is still in the future is NOT pre-empted by the grace window,
+  // even once the trigger is older than the grace.
+  it("does not let the stall grace pre-empt a future explicit timeoutAt", async () => {
+    const { issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({
+      timeoutAt: new Date(new Date("2026-04-10T00:00:00.000Z").getTime() + 30 * 24 * 60 * 60 * 1000),
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000);
 
     await heartbeat.tickTimers(tickAt);
 
@@ -1347,7 +1443,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   ])("does not recover an expired monitor when %s races the claim", async (_label, mutation) => {
     const { issueId, agentId, timeoutAt } = await seedExpiredTriggeredFixture();
     const heartbeat = createHeartbeatWithClaimRace(issueId, mutation);
-    const tickAt = new Date(timeoutAt.getTime() + 60 * 60 * 1000);
+    const tickAt = new Date(timeoutAt!.getTime() + 60 * 60 * 1000);
 
     await heartbeat.tickTimers(tickAt);
 
