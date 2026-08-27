@@ -295,7 +295,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     expect(runs[0]?.id).toBe(runId);
   });
 
-  it("batches deferred comment wakes and forwards the ordered batch to the next run", async () => {
+  it("retains deferred comment identity while forwarding only the newest comment", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -464,6 +464,10 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       const deferredContext = (deferredWake?.payload as Record<string, unknown> | null)?._paperclipWakeContext as
         | Record<string, unknown>
         | undefined;
+      // The deferred request retains the complete ordered wake identity for
+      // deduplication and auditability, but payload construction deliberately
+      // forwards only the newest live comment. Older comments may already be
+      // stale by the time a running issue is released.
       expect(deferredContext?.wakeCommentIds).toEqual([comment2.id, comment3.id]);
 
       gateway.releaseFirstWait();
@@ -484,11 +488,11 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       expect(secondPayload.paperclip).toBeUndefined();
       const secondWake = parseWakePayloadFromMessage(secondPayload.message);
       expect(secondWake).toMatchObject({
-        commentIds: [comment2.id, comment3.id],
+        commentIds: [comment3.id],
         latestCommentId: comment3.id,
       });
-      expect(String(secondPayload.message ?? "")).toContain("Second comment");
       expect(String(secondPayload.message ?? "")).toContain("Third comment");
+      expect(String(secondPayload.message ?? "")).not.toContain("Second comment");
       expect(String(secondPayload.message ?? "")).not.toContain("First comment");
     } finally {
       gateway.releaseFirstWait();
