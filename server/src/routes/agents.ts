@@ -1473,6 +1473,7 @@ export function agentRoutes(
     adapterType: string,
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
+    actor?: { userId?: string | null; agentId?: string | null },
   ): Promise<Record<string, unknown>> {
     const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
     if (entries.length === 0) return runtimeConfig;
@@ -1490,6 +1491,7 @@ export function agentRoutes(
         companyId,
         adapterType,
         adapterConfig: entry.adapterConfig,
+        actor,
         constraintAdapterConfig: {
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
@@ -2898,6 +2900,7 @@ export function agentRoutes(
       hireInput.adapterType,
       requestedRuntimeConfig,
       normalizedAdapterConfig,
+      req.actor,
     );
     const normalizedHireInput = {
       ...hireInput,
@@ -3115,6 +3118,7 @@ export function agentRoutes(
       createInput.adapterType,
       requestedRuntimeConfig,
       normalizedAdapterConfig,
+      req.actor,
     );
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
@@ -3635,6 +3639,7 @@ export function agentRoutes(
         requestedAdapterType,
         requestedRuntimeConfig,
         baseAdapterConfig,
+        req.actor,
       );
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
