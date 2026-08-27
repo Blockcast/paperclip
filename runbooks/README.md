@@ -68,8 +68,8 @@ platform cannot resolve automatically. Each runbook should be:
   — you are adjudicating an open productivity review and the reviewed issue's
   monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
   run): the supported one-call repair path, and why the `PATCH {status:
-  "todo"}` bounce is superseded. Trigger: review evidence reads `monitor
-  lapsed at …, never re-armed`.
+  "todo"}` bounce is superseded. Trigger: review evidence reads
+  `monitor lapsed at …, never re-armed`.
 - [`plugin-error.md`](plugin-error.md) — an installed plugin has sat at
   `plugins.status='error'` past the grace period, distinct from an
   operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
