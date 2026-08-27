@@ -83,10 +83,13 @@ function dispositionClause(
  * most recent prior rows therefore provide an observed-spacing cap: when the
  * immediately preceding row skipped one or more missing fires, use the
  * narrower of that row and one observed gap before the current window. With
- * only one prior row, that row is the narrowest reliable boundary. With no
- * prior row, mirror the next-run gap, but floor the result at routine creation;
- * with neither neighbour, routine creation is the finite floor. A receipt from
- * before the routine existed cannot describe one of its windows.
+ * only one prior row, use the following run's observed spacing when it exists.
+ * If no adjacent history can bound the interval, fail closed for suppression
+ * by returning the current run's time: an uncertain window may produce an
+ * extra diagnostic receipt, but an old receipt must never silence a genuinely
+ * dark window. With no prior row, mirror the next-run gap and floor the result
+ * at routine creation. A receipt from before the routine existed cannot
+ * describe one of its windows.
  *
  * Stated limit: if two runs of the same routine trigger close enough together
  * to share one runbook slot (a catch-up burst), the later run's interval is too
@@ -116,13 +119,27 @@ async function resolveWindowStartExclusive(db: Db, input: {
   const [previousRun, previousPreviousRun] = previousRuns;
   if (previousRun) {
     const previousRunAt = previousRun.triggeredAt.getTime();
-    const lowerBound = previousPreviousRun
-      ? Math.max(
+    if (!previousPreviousRun) {
+      const nextRunAt = await db
+        .select({ triggeredAt: routineRuns.triggeredAt })
+        .from(routineRuns)
+        .where(and(scope, gt(routineRuns.triggeredAt, input.windowAt)))
+        .orderBy(asc(routineRuns.triggeredAt))
+        .limit(1)
+        .then((rows) => rows[0]?.triggeredAt ?? null);
+      if (!nextRunAt) return new Date(input.windowAt);
+      const observedSpacing = nextRunAt.getTime() - input.windowAt.getTime();
+      return new Date(Math.max(
+        input.routineCreatedAt.getTime(),
         previousRunAt,
-        input.windowAt.getTime() -
-          (previousRunAt - previousPreviousRun.triggeredAt.getTime()),
-      )
-      : previousRunAt;
+        input.windowAt.getTime() - observedSpacing,
+      ));
+    }
+    const lowerBound = Math.max(
+      previousRunAt,
+      input.windowAt.getTime() -
+        (previousRunAt - previousPreviousRun.triggeredAt.getTime()),
+    );
     return new Date(Math.max(input.routineCreatedAt.getTime(), lowerBound));
   }
 

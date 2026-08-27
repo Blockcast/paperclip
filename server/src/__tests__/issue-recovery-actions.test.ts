@@ -6536,6 +6536,47 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         );
       });
 
+      it("does not let one stale prior run suppress an intervening dark window", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+        });
+        const triggeredAt = new Date("2026-08-19T00:07:26.722Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          siblingTriggeredAt: [new Date("2026-08-17T00:07:26.722Z")],
+          issueNumber: 514,
+        });
+        // This receipt belongs to the skipped intervening window. Accepting the
+        // one prior row as an uncapped lower bound would suppress this window.
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-18T00:00:00.000Z:missed_window",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId))
+          .then((rows) => rows.filter((row) => row.idempotencyKey?.startsWith("scheduler-heartbeat:")));
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+      });
+
       // The true positive must stay true. This is the live BLO-20930 shape:
       // window `2026-08-02T12:07:15.190Z`, nothing keyed inside it. The
       // pre-convention emissions that fill the alert surface before
