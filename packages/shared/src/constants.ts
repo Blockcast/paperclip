@@ -500,6 +500,11 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "timeout_exceeded",
   "max_attempts_exhausted",
   "convergence_stalled",
+  // BLO-29606: a monitor that fired and whose woken run never called back, on a
+  // policy that carries no `timeoutAt` to expire against. Distinct from
+  // `timeout_exceeded` on purpose — nothing timed out, the trigger stalled — so
+  // the two stranding shapes stay separable in activity logs and dashboards.
+  "trigger_stalled",
 ] as const;
 export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_CLEAR_REASONS)[number];
 
