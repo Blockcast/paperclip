@@ -1592,7 +1592,10 @@ describe("agent issue mutation checkout ownership", () => {
       issueId,
       expect.objectContaining({
         executionPolicy: expect.objectContaining({
-          monitor: expect.objectContaining({ notes: "manager restored lapsed monitor" }),
+          monitor: expect.objectContaining({
+            notes: "manager restored lapsed monitor",
+            scheduledBy: "manager",
+          }),
         }),
       }),
     );

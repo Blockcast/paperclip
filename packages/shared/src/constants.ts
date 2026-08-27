@@ -466,7 +466,7 @@ export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[num
 export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];
 
-export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
+export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board", "manager"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];
 
 export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;

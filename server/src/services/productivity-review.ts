@@ -445,7 +445,7 @@ type EnqueueWakeup = (
   },
 ) => Promise<unknown | null>;
 
-const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board"]);
+const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board", "manager"]);
 
 // A linked approval in one of these statuses means the issue's next move belongs to a human.
 // Deliberately `pending` only: `revision_requested` hands the ball back to the *agent*, so a
