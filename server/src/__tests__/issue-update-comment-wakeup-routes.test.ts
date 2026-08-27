@@ -292,6 +292,44 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it.each(["done", "cancelled"] as const)("does not wake an agent assigned to a %s issue", async (status) => {
+    const existing = makeIssue({
+      status,
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+    });
+    const updated = makeIssue({
+      status,
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: `comment-terminal-assignment-${status}`,
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "recording the closed-work handoff",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        comment: "recording the closed-work handoff",
+      });
+
+    expect(res.status).toBe(200);
+    // The wakeups run in a detached task. This lookup occurs after assignment-wake
+    // selection, so waiting for it makes the negative assertion non-vacuous.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_assigned" }),
+    );
+  });
+
   it("interrupts the active run and wakes the newly assigned agent with handoff context", async () => {
     const existing = makeIssue({
       assigneeAgentId: PREVIOUS_AGENT_ID,
