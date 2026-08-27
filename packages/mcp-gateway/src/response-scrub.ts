@@ -389,11 +389,33 @@ const ENV_VAR_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
  *
  * What distinguishes them is that base64 padding is *terminal*: a real value
  * follows the `=`, padding does not. So reject when nothing but `=` padding
- * (and an optional closing quote) remains to end of line. A legitimate but
- * empty `KEY=` is rejected too and redacts whole — over-redacting a name is the
- * safe direction, and the diagnostic loss is a name whose value was empty.
+ * (and an optional closing quote) remains.
+ *
+ * "Remains" has to mean *to the end of the value*, not to the end of the line.
+ * Its first spelling meant the latter, and an inline YAML comment is line
+ * content that is not value content: `- dGhpc2lz…= # note` put the material
+ * straight back into the name position with a five-character suffix, and the
+ * quoted form did the same past its closing quote. That is this same defect in
+ * its third spelling — twice now the guard has been correct about the property
+ * (padding is terminal) and wrong about where the line ends.
+ *
+ * Whitespace is required before a `#` that ends an *unquoted* value, because
+ * that is precisely when YAML starts a comment: `TOKEN=pa#ss` and `TOKEN=#hash`
+ * are plain scalars whose value contains a `#`, and both keep their name. Past
+ * a closing quote the requirement is dropped, because there nothing but a
+ * comment can follow and `- "dGhpc2lz="# c` is otherwise a fourth spelling of
+ * the same defect — found by sweeping the suffix space after the comment clause
+ * was written, which is the method ask 3 names as the control.
+ *
+ * A legitimate but empty `KEY=` is rejected and redacts whole — over-redacting
+ * a name is the safe direction, and the diagnostic loss is a name whose value
+ * was empty. The comment clause makes that same trade once more on the JSON
+ * path, where `#` has no comment meaning and `TOKEN= #x` is a real value, so it
+ * over-redacts there. One guard that is slightly conservative on one path is
+ * the (b2) trade this constant exists to make: a per-path spelling tuned to
+ * each caller is the drift that produced the defect it is guarding against.
  */
-const REQUIRE_VALUE_AFTER_EQ = `(?!=*["']?\\s*$)`;
+const REQUIRE_VALUE_AFTER_EQ = `(?!=*(?:["']\\s*(?:#|$)|\\s*$|\\s+#))`;
 /**
  * The OCI/Docker `KEY=VALUE` env entry shape. The name is kept and only the
  * value dropped, matching design note 2 and the JSON path.

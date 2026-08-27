@@ -1075,15 +1075,35 @@ describe("scrubJsonValue — env entries that are not objects", () => {
         ["name chars only, empty value", `${LEAK}=`],
       ] as const;
 
+      /**
+       * The second axis, and the one the first version of this test was missing.
+       * Material shape is not the only way to spell this defect: the guard reads
+       * "nothing but padding remains", and what counts as "remains" depends on
+       * where the *value* ends, not where the *line* ends. An inline YAML comment
+       * is line content that is not value content, so ` # note` was five
+       * characters that put the material straight back into the name position —
+       * past a closing quote too. Crossed with the material list rather than
+       * added as two more fixtures, because a fixture list only ever covers the
+       * combinations someone sat down and enumerated.
+       */
+      const NON_VALUE_SUFFIXES = ["", " # note", "\t# note", "   # note"] as const;
+
       for (const [label, scalar] of NAME_SHAPED_MATERIAL) {
         it(`redacts ${label} whole on every path that preserves names`, () => {
           // JSON string-valued `env`, and the OCI/Docker `Config.Env` sequence
           // entry — the two paths that print a name. Asserted together so they
           // cannot drift apart again.
           expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
-          expectNoLeak(scrubYamlText(`Env:\n  - ${scalar}`));
-          expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"`));
-          expectNoLeak(scrubYamlText(`env: ${scalar}`));
+          for (const suffix of NON_VALUE_SUFFIXES) {
+            expectNoLeak(scrubYamlText(`Env:\n  - ${scalar}${suffix}`));
+            expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"${suffix}`));
+            expectNoLeak(scrubYamlText(`Env:\n  - '${scalar}'${suffix}`));
+            expectNoLeak(scrubYamlText(`env: ${scalar}${suffix}`));
+          }
+          // No whitespace before the `#`. Only legal past a closing quote, and
+          // the one route left open by the first draft of the comment clause —
+          // found by sweeping the suffix space rather than re-reading it.
+          expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"# note`));
         });
       }
 
@@ -1121,6 +1141,27 @@ describe("scrubJsonValue — env entries that are not objects", () => {
         expect(scrubYamlText(`Env:\n  - TOKEN=${LEAK}==`)).toContain(
           `TOKEN=${REDACTED}`,
         );
+      });
+
+      it("a value that merely contains a `#` still keeps its name", () => {
+        // The counterweight for the comment clause specifically. YAML starts a
+        // comment at a `#` that follows whitespace; a `#` anywhere else is value
+        // content. Without this, "treat `#` as end-of-value" degenerates into
+        // redacting every entry whose value happens to contain a hash — which
+        // satisfies the suffix cases above and quietly drops real names.
+        for (const value of [`pa#ss${LEAK}`, `#${LEAK}`]) {
+          expect(scrubJsonValue({ env: `TOKEN=${value}` })).toEqual({
+            env: `TOKEN=${REDACTED}`,
+          });
+          expect(scrubYamlText(`Env:\n  - TOKEN=${value}`)).toContain(
+            `TOKEN=${REDACTED}`,
+          );
+          // And the quoted arm, which drops the whitespace requirement past a
+          // closing quote — it must not also drop it *before* one.
+          expect(scrubYamlText(`Env:\n  - "TOKEN=${value}"`)).toContain(
+            `TOKEN=${REDACTED}`,
+          );
+        }
       });
     });
 
