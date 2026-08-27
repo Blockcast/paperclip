@@ -1284,24 +1284,6 @@ function ensureRegistry(): {
       registers: [registry],
     });
     queuedRunAgeMetricsRefreshSuccess.set(0);
-    queuedRunOldestAge = new Gauge({
-      name: QUEUED_RUN_OLDEST_AGE_METRIC,
-      help: "Age in seconds of the oldest queued heartbeat run, by agent.",
-      labelNames: ["agent_id"],
-      registers: [registry],
-    });
-    overdueScheduledRetryOldestAge = new Gauge({
-      name: OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC,
-      help: "Age in seconds of the oldest scheduled_retry row past its due time, by agent.",
-      labelNames: ["agent_id"],
-      registers: [registry],
-    });
-    overdueScheduledRetryAgeMetricsRefreshSuccess = new Gauge({
-      name: OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC,
-      help: "1 when the overdue scheduled_retry age database refresh succeeded, otherwise 0.",
-      registers: [registry],
-    });
-    overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
     scheduledRetryParkHorizon = new Gauge({
       name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
       help: "Booked scheduled_retry park horizon in seconds, by agent.",
