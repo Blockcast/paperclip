@@ -162,6 +162,7 @@ export async function resolveTerminalGate(input: {
   gateSignals: readonly string[];
   readPullRequestGate: ReadPullRequestGate;
   gateCache?: Map<string, PullRequestGateResult>;
+  maxPullRequestReads?: number;
 }): Promise<TerminalGateVerdict> {
   const signals = [...input.gateSignals].sort();
   if (signals.length === 0) return { kind: "unresolved", reason: "no_gate_signals" };
@@ -183,6 +184,12 @@ export async function resolveTerminalGate(input: {
     const key = pullRequestKey(gate.repoFullName, gate.prNumber);
     let result = cache.get(key);
     if (!result) {
+      if (
+        input.maxPullRequestReads !== undefined &&
+        cache.size >= Math.max(1, input.maxPullRequestReads)
+      ) {
+        return { kind: "unresolved", reason: "pull_request_read_cap" };
+      }
       result = await input.readPullRequestGate({
         repoFullName: gate.repoFullName,
         prNumber: gate.prNumber,
@@ -431,19 +438,13 @@ export async function reconcileTerminalGates(
   const gateCache = new Map<string, PullRequestGateResult>();
   let resolved = 0;
   for (const entry of pending) {
-    if (gateCache.size >= maxReads) {
-      log.info(
-        { scanned: candidates.length, resolved, pullRequestReads: gateCache.size },
-        "terminal-gate reconciler hit its per-pass PR read cap; remaining candidates deferred to the next pass (BLO-27515)",
-      );
-      break;
-    }
     if (!dependencyReady.has(entry.candidate.id)) continue;
 
     const verdict = await resolveTerminalGate({
       gateSignals: entry.signals,
       readPullRequestGate,
       gateCache,
+      maxPullRequestReads: maxReads,
     });
     if (verdict.kind !== "satisfied") continue;
 

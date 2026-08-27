@@ -1815,6 +1815,7 @@ export async function startServer(): Promise<StartedServer> {
       );
       startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
     }
+  }
   // Terminal-gate reconciler (BLO-27515). Worker-tier singleton. Re-reads the
   // pull-request gates a *terminated* monitor declared (`gateSignals`), so a
   // gate that resolves after the monitor's last poll — because the convergence

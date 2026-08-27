@@ -316,6 +316,11 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  terminalGateReconcilerIntervalMinutes: {
+    fallback: 10,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
   recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
   recoveryActionTimeoutMs: {
@@ -337,6 +342,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
   humanGatedDigestIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
+  terminalGateReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
@@ -689,9 +695,10 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED === "true"
       : true;
-  const terminalGateReconcilerIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES) || 10,
+  const terminalGateReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.terminalGateReconcilerIntervalMinutes,
+    "terminalGateReconcilerIntervalMinutes",
   );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
