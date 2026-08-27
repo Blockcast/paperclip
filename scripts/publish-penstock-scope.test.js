@@ -68,8 +68,13 @@ function createPublishFixture() {
   };
 }
 
-function runPublishScript(fakeNpm, fixture, extraEnv = {}) {
-  return spawnSync(process.execPath, ["scripts/publish-penstock-scope.mjs", "--version", "2026.614.0"], {
+function runPublishScript(fakeNpm, fixture, extraEnv = {}, extraArgs = []) {
+  return spawnSync(process.execPath, [
+    "scripts/publish-penstock-scope.mjs",
+    "--version",
+    "2026.614.0",
+    ...extraArgs,
+  ], {
     cwd: fixture.dir,
     encoding: "utf8",
     env: {
@@ -127,6 +132,28 @@ test("publish-penstock-scope restores manifests when npm publish fails", () => {
     const result = runPublishScript(fakeNpm, fixture, { FAKE_NPM_EXIT: "42" });
     assert.notEqual(result.status, 0);
     assert.equal(readJsonLines(fakeNpm.logPath).length, 1);
+  } finally {
+    assert.equal(readFileSync(fixture.sharedManifestPath, "utf8"), fixture.originalShared);
+    assert.equal(readFileSync(fixture.sdkManifestPath, "utf8"), fixture.originalSdk);
+    rmSync(fixture.dir, { recursive: true, force: true });
+    rmSync(fakeNpm.dir, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap publishes without dry-run or provenance flags", () => {
+  const fakeNpm = createFakeNpm();
+  const fixture = createPublishFixture();
+
+  try {
+    const result = runPublishScript(fakeNpm, fixture, {}, ["--bootstrap", "--provenance"]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Bootstrap mode: local 2FA publish, no provenance/);
+
+    const calls = readJsonLines(fakeNpm.logPath);
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.deepEqual(call.argv, ["publish", "--access", "public"]);
+    }
   } finally {
     assert.equal(readFileSync(fixture.sharedManifestPath, "utf8"), fixture.originalShared);
     assert.equal(readFileSync(fixture.sdkManifestPath, "utf8"), fixture.originalSdk);
