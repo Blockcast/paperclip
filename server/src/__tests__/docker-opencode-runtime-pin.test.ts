@@ -406,8 +406,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     const cases = [
       ["FFMPEG_PULL_TIMEOUT_SECONDS", "0", "must be a positive integer"],
       ["FFMPEG_PULL_TIMEOUT_SECONDS", "601", "must not exceed 600"],
+      ["FFMPEG_PULL_TIMEOUT_SECONDS", "0601", "must not exceed 600"],
       ["FFMPEG_PULL_ATTEMPTS", "0", "must be a positive integer"],
       ["FFMPEG_PULL_ATTEMPTS", "6", "must not exceed 5"],
+      ["FFMPEG_PULL_ATTEMPTS", "08", "must not exceed 5"],
     ] as const;
 
     for (const [name, value, message] of cases) {
@@ -418,6 +420,16 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       expect(pullArgs, `${name}=${value}`).toEqual([]);
       expect(args, `${name}=${value}`).toEqual([]);
     }
+  });
+
+  it("parses leading-zero pull controls as decimal values", () => {
+    const { result, pullAttempts } = runFfmpegProbe("success", {
+      FFMPEG_PULL_TIMEOUT_SECONDS: "0008",
+      FFMPEG_PULL_ATTEMPTS: "04",
+    });
+
+    expect(result.status).toBe(0);
+    expect(pullAttempts).toBe(1);
   });
 
   it("byte-bounds and drains newline-free probe output", () => {

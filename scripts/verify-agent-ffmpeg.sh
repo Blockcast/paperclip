@@ -20,13 +20,17 @@ validate_bounded_positive_integer() {
   local name="$1"
   local value="$2"
   local limit="$3"
-  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+  local normalized
+  if [[ ! "$value" =~ ^0*([1-9][0-9]*)$ ]]; then
     echo "${name} must be a positive integer" >&2
     return 1
   fi
+  normalized="${BASH_REMATCH[1]}"
   # Check the string width before arithmetic so an oversized value cannot
   # wrap before it is rejected.
-  if (( ${#value} > ${#limit} )) || (( value > limit )); then
+  # Force base-10 parsing so values such as 08 and 0601 are not treated as
+  # invalid octal literals by Bash arithmetic.
+  if (( ${#normalized} > ${#limit} )) || (( 10#$normalized > 10#$limit )); then
     echo "${name} must not exceed ${limit}" >&2
     return 1
   fi
