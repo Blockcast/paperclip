@@ -166,7 +166,12 @@ export function parseAgentHealthReceiptWindowKey(idempotencyKey: string | null |
   const datePart = match[1].slice(0, 10);
   const parsed = new Date(`${match[1]}${match[2] ?? "Z"}`);
   if (Number.isNaN(parsed.getTime())) return null;
-  // Date normalizes shape-valid values such as 2026-02-30 into a different
-  // calendar day. Round-trip the captured date before accepting the instant.
-  return parsed.toISOString().startsWith(datePart) ? parsed : null;
+  // Validate the captured calendar date independently of the instant's UTC
+  // date. An explicit offset can legitimately move the instant across UTC
+  // midnight, so comparing `parsed` to `datePart` would reject valid keys.
+  const calendarDate = new Date(`${datePart}T00:00:00Z`);
+  if (Number.isNaN(calendarDate.getTime()) || calendarDate.toISOString().slice(0, 10) !== datePart) {
+    return null;
+  }
+  return parsed;
 }
