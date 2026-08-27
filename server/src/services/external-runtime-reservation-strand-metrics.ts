@@ -12,7 +12,7 @@ import {
  * because `heartbeat.ts` is a ~30k-line module that pulls in the kube client;
  * a metrics refresh that runs on every /metrics scrape must not drag that in.
  */
-const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
+const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 
 /**
  * Silence floor before a NON-terminal run's held reservation counts as

@@ -1892,6 +1892,21 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(await readStrandedGaugeForAgent(agentId)).toBeGreaterThan(0);
   }, 120_000);
 
+  it("counts an interrupted run's recently active reservation as stranded (BLO-28865 AC#5)", async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const { agentId } = await seedReservationForStrandMetrics({
+      runStatus: "interrupted",
+      // Recent liveness is intentional: the terminal-status branch must win
+      // without waiting for the silence cutoff.
+      lastUsefulActionAt: new Date(Date.now() - 30 * 1000),
+      reservedAt: threeHoursAgo,
+    });
+
+    await refreshExternalRuntimeReservationStrandMetrics(db);
+
+    expect(await readStrandedGaugeForAgent(agentId)).toBeGreaterThan(0);
+  }, 120_000);
+
   it("does NOT count a legitimately long-running, still-active run (BLO-28865 AC#5)", async () => {
     const { agentId } = await seedReservationForStrandMetrics({
       runStatus: "running",
