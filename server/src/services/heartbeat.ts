@@ -33918,8 +33918,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await publishGithubReviewDeadLetterGauge(now);
     await publishAgentWakeupTerminalFailedGauge(now);
-    await publishAgentLivenessGauges(now);
-
     return { recovered, superseded, exhausted, stillFailing };
   }
 
@@ -33927,10 +33925,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Publish the fleet-wide outcome-side agent-liveness gauges (BLO-23413):
    * seconds since lastHeartbeatAt and the agent's own configured intervalSec
    * (for heartbeat.enabled agents), and seconds spent in status='error' (for
-   * every agent). Runs once per reconcileFailedWakeDispatches pass, i.e. once
-   * per heartbeat-scheduler tick (config.heartbeatSchedulerIntervalMs,
-   * default 30s) plus once at startup recovery -- the same cadence the
-   * wake-terminal-failed gauge above already relies on.
+   * every agent). The scheduler invokes this independently once per tick so
+   * suppression or an earlier recovery failure cannot erase the emission.
    *
    * Fleet-wide (no companyId filter), matching every other gauge publisher in
    * this file: this control plane is one Prometheus scrape target for every
@@ -35119,6 +35115,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     decorateActiveRunStatus: decorateHeartbeatRunRuntimeStatus,
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,
     sweepExpiredRuntimeStatuses: sweepExpiredHeartbeatRunRuntimeStatuses,
+    publishAgentLivenessGauges,
 
     getRunLogAccess,
 

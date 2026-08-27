@@ -142,7 +142,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
       updatedAt: now,
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentLivenessGauges(now);
 
     // Must-trip control: a genuinely fresh, healthy agent reads a LOW age
     // (not just "present"), so `age > 3*interval` correctly stays false.
@@ -176,11 +176,11 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
       updatedAt: now,
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentLivenessGauges(now);
     expect(await gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, agentId)).toBe(100);
 
     await db.delete(agents).where(sql`${agents.id} = ${agentId}`);
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentLivenessGauges(now);
     expect(await gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, agentId)).toBeUndefined();
   });
 
@@ -216,7 +216,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       expect(await ageOf(terminated)).toBeUndefined();
       expect(await intervalOf(terminated)).toBeUndefined();
@@ -235,7 +235,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       expect(await ageOf(terminatedNeverRan)).toBeUndefined();
     });
@@ -248,7 +248,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       expect(await ageOf(pending)).toBeUndefined();
       expect(await intervalOf(pending)).toBeUndefined();
@@ -266,7 +266,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: new Date(now.getTime() - 300_000),
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       const age = await ageOf(errored);
       expect(age).toBe(7200);
@@ -291,7 +291,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       expect(await ageOf(neverRan)).toBe(500);
       expect(await intervalOf(neverRan)).toBe(1800);
@@ -322,7 +322,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       expect(await ageOf(paused)).toBeUndefined();
       expect(await ageOf(orphan)).toBeUndefined();
@@ -350,7 +350,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       expect(await ageOf(dormant)).toBeUndefined();
       expect(await gaugeValue(AGENT_ERROR_DURATION_SECONDS_METRIC, dormant)).toBe(0);
@@ -372,7 +372,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
         updatedAt: now,
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentLivenessGauges(now);
 
       const ages = (await (getMetricsRegistry().getSingleMetric(AGENT_HEARTBEAT_AGE_SECONDS_METRIC))!.get()) as {
         values: Array<{ labels: Record<string, string>; value: number }>;

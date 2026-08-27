@@ -1327,6 +1327,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        // Keep the outcome-side health signal independent from scheduling
+        // suppression and the long recovery chain below.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentLivenessGauges(new Date())
+          .catch((err) => {
+            logger.error({ err }, "periodic agent-liveness gauge publication failed");
+          }));
+
         const timerSuppression = await heartbeat.resolveSchedulingSuppression();
         // Re-check AFTER the await, not just before it (BLO-20822). This
         // callback is handed to `setInterval` and is not itself registered with
@@ -1337,6 +1345,7 @@ export async function startServer(): Promise<StartedServer> {
         // register fresh work *after* that barrier, mutating runs and issue
         // locks during shutdown. The pre-await check cannot cover this window.
         if (heartbeatSchedulerStopped) return;
+        if (!timerSuppression.suppressed) {
         if (!timerSuppression.suppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
