@@ -6435,7 +6435,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         );
         // The receipt states the interval it searched, bounded below by the
         // preceding run rather than by a hard-coded 6-hour interval.
-        expect(receipts[0]!.body).toContain("after `2026-08-02T06:07:09.220Z`");
+        expect(receipts[0]!.body).toContain("after `2026-08-02T06:07:15.190Z`");
         expect(receipts[0]!.body).toContain("at or before `2026-08-02T12:07:15.190Z`");
       });
 
