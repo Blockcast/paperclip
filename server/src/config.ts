@@ -138,6 +138,11 @@ export interface Config {
   // run. Worker-tier only, same rationale as the PR reconciler.
   approvalGateReconcilerEnabled: boolean;
   approvalGateReconcilerIntervalMinutes: number;
+  // Terminal-gate reconciler (BLO-27515): re-reads the PR gates a terminated
+  // monitor declared, so a gate that resolves after the last poll is observed
+  // without dispatching an assignee run. Worker-tier only.
+  terminalGateReconcilerEnabled: boolean;
+  terminalGateReconcilerIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -971,6 +976,19 @@ export function loadConfig(): Config {
     0,
     numericEnv(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_GRACE_HOURS, 6),
   );
+  // Terminal-gate reconciler (BLO-27515). Enabled by default for the same
+  // reason: a monitor gate that resolves while nothing is polling it is a
+  // silent reliability defect, not an opt-in feature. 10m default — each pass
+  // costs at most one GitHub read per distinct still-unresolved PR, and reads
+  // stop entirely once a resolution is recorded.
+  const terminalGateReconcilerEnabled =
+    process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED === "true"
+      : true;
+  const terminalGateReconcilerIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES) || 10,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -1090,6 +1108,8 @@ export function loadConfig(): Config {
     prReviewStateMaxPullRequestsPerRepo,
     approvalGateReconcilerEnabled,
     approvalGateReconcilerIntervalMinutes,
+    terminalGateReconcilerEnabled,
+    terminalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
     serveUi:
