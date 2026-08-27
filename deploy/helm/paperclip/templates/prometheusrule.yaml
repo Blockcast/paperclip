@@ -401,29 +401,6 @@ spec:
             summary: "Paperclip queued-run age metric refresh is failing"
             description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
             runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
-    - name: paperclip-external-runtime-reservation-stranded
-      rules:
-        - alert: PaperclipExternalRuntimeReservationStranded
-          # BLO-28865: alert only on a reservation whose run is terminal or
-          # silent past the hard-stale floor. The raw reservation-age gauge
-          # cannot distinguish a healthy long-running job from a strand.
-          expr: max by (agent_id) (paperclip_external_runtime_reservation_stranded_oldest_age_seconds and on(instance) (paperclip_external_runtime_reservation_strand_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.externalRuntimeReservationStrandedAgeSeconds }}
-          for: {{ .Values.prometheusRule.externalRuntimeReservationStrandedFor }}
-          labels:
-            severity: warning
-          annotations:
-            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a stranded external-runtime reservation and cannot launch"
-            description: "Agent {{`{{ $labels.agent_id }}`}} holds an unreleased external_runtime_reservations row whose heartbeat run is terminal or silent past the 45m hard-stale floor (BLO-28865). The row holds the agent's slot, blocking every launch for that agent. The age is trusted only while the strand-metrics refresh gauge is 1. Inspect the reservation and recent adapter-type changes. Do not clear job_name/job_uid: those are the only handle on an orphaned Job."
-            runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
-        - alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed
-          expr: paperclip_external_runtime_reservation_strand_metrics_refresh_success == 0
-          for: {{ .Values.prometheusRule.externalRuntimeReservationStrandMetricsRefreshFailureFor }}
-          labels:
-            severity: warning
-          annotations:
-            summary: "Paperclip stranded-reservation metric refresh is failing"
-            description: "The most recent /metrics stranded-reservation database refresh failed (BLO-28865), so strand ages may be stale and PaperclipExternalRuntimeReservationStranded is intentionally gated off. Check Paperclip logs and database connectivity."
-            runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
     - name: paperclip-overdue-scheduled-retry
       rules:
         - alert: PaperclipOverdueScheduledRetry
