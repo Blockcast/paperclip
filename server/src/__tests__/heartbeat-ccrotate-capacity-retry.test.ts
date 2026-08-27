@@ -534,7 +534,12 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     // is honoured only while it sits inside CCROTATE_CAPACITY_MAX_PARK_MS — so
     // this fixture must be a *near-future* instant rather than a hardcoded past
     // date, which the clamp would (correctly) discard as telling us nothing.
-    const resumeAt = new Date(Date.now() + 60_000);
+    // Leave enough room above the 60s minimum park for the async wake path to
+    // finish before the resolver samples its own clock. At exactly the floor,
+    // that elapsed time can move the floor-based retry past this assertion's
+    // upper bound even though the resolver is behaving correctly.
+    const resumeDelayMs = 90_000;
+    const resumeAt = new Date(Date.now() + resumeDelayMs);
     const heartbeat = heartbeatService(db, {
       penstockAvailabilityGate: denyingGate(resumeAt),
       skipQueuedRunDispatch: true,
@@ -559,7 +564,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     const scheduledMs = retryRun!.scheduledRetryAt!.getTime();
     expect(scheduledMs).toBeGreaterThanOrEqual(resumeAt.getTime());
     expect(scheduledMs).toBeLessThanOrEqual(
-      resumeAt.getTime() + 60_000 * CCROTATE_CAPACITY_PARK_JITTER_RATIO + 1,
+      resumeAt.getTime() + resumeDelayMs * CCROTATE_CAPACITY_PARK_JITTER_RATIO + 1,
     );
     expect(retryRun?.scheduledRetryReason).toBe("ccrotate_capacity");
     // The rate-limit family + retryNotBefore make the existing bounded-retry
