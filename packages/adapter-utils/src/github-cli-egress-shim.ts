@@ -4,11 +4,11 @@
 //
 // Agent-authored review bodies, PR bodies and comments never touch server/
 // TypeScript. Agents shell out to `gh`, which the runtime replaces with a
-// wrapper (deploy/helm/paperclip/templates/statefulset.yaml) that execs
-// `paperclip-github-token-env /usr/bin/gh`. That wrapper is already the single
-// interposition point in front of every GitHub-touching binary in the sandbox
-// (`gh`, `git`, `github-mcp-server`), so it is where a scrub has to live. There
-// is no HTTP layer of ours to hook: the calls leave the pod from `gh` itself.
+// wrapper (deploy/helm/paperclip/templates/statefulset.yaml) that execs this
+// runtime before the image's `/usr/bin/gh` token wrapper. That generated
+// launcher is the single interposition point in front of the GitHub CLI in the
+// sandbox, so it is where a scrub has to live. There is no HTTP layer of ours
+// to hook: the calls leave the pod from `gh` itself.
 //
 // This module holds the pure part — argv in, argv out — so the shell shim
 // stays a few lines and every rule below is unit-testable without a sandbox.
@@ -45,6 +45,29 @@ export interface GitHubCliScrubResult {
   argv: string[];
   redacted: boolean;
   classes: GitHubEgressScrubClass[];
+}
+
+/**
+ * Return true when a GitHub CLI text-file flag asks `gh` to read from stdin.
+ *
+ * The runtime wrapper rejects this form before starting `gh`: stdin is an
+ * agent-authored egress channel too, but a child process cannot be safely
+ * scrubbed after it has already consumed the stream. Keeping this predicate
+ * next to the argv rewrite prevents the shell wrapper and the pure transform
+ * from drifting on which flags carry authored text.
+ */
+export function hasGitHubCliStdinTextFile(argv: readonly string[]): boolean {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] as string;
+    const fused = /^(--[a-z-]+)=([\s\S]*)$/.exec(arg);
+    if (fused) {
+      const [, flag, value] = fused as unknown as [string, string, string];
+      if (FILE_TEXT_FLAGS.has(flag) && value === "-") return true;
+      continue;
+    }
+    if (FILE_TEXT_FLAGS.has(arg) && argv[i + 1] === "-") return true;
+  }
+  return false;
 }
 
 /**
@@ -127,8 +150,8 @@ export function scrubGitHubCliInvocation(
 /**
  * Scrub a body file, returning a replacement path, or null to leave argv alone.
  *
- * `-` means "read stdin"; the shim handles that stream separately, so it is not
- * a path and must not be opened here.
+ * `-` means "read stdin"; the runtime rejects that form before `gh` starts, so
+ * it is not a path and must not be opened here.
  */
 function scrubBodyFile(
   path: string,

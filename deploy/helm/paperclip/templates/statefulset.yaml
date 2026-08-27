@@ -449,7 +449,11 @@ spec:
               EOF
               cat > "${LOCAL_BIN}/gh" <<'EOF'
               #!/bin/sh
-              exec /paperclip/.local/bin/paperclip-github-token-env /usr/bin/gh "$@"
+              # Keep egress scrubbing at the last wrapper before the real GitHub
+              # CLI. /usr/bin/gh is itself the image-level token wrapper, so it
+              # still supplies the live App/seat token after this runtime has
+              # rewritten authored argv and file-backed bodies.
+              exec /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-cli-egress-runtime.js /usr/bin/gh "$@"
               EOF
               cat > "${LOCAL_BIN}/github-mcp-server" <<'EOF'
               #!/bin/sh

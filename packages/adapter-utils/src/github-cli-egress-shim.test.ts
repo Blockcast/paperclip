@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { scrubGitHubCliInvocation, type GitHubCliScrubIo } from "./github-cli-egress-shim.js";
+import {
+  hasGitHubCliStdinTextFile,
+  scrubGitHubCliInvocation,
+  type GitHubCliScrubIo,
+} from "./github-cli-egress-shim.js";
 
 // Synthetic throughout — see github-egress-scrub.test.ts for the standing rule.
 const SYNTHETIC_OPAQUE_VALUE = "s7Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0Tg";
@@ -139,13 +143,20 @@ describe("scrubGitHubCliInvocation", () => {
       expect(io.written[0]).not.toContain("BEGIN RSA PRIVATE KEY");
     });
 
-    it("does not treat `-` as a path — stdin is the shim's job, not a file read", () => {
+    it("identifies stdin-backed body files so the runtime can reject them", () => {
       const io = makeIo();
       const result = scrubGitHubCliInvocation(["pr", "review", "--body-file", "-"], io);
 
       // makeIo throws on any read; reaching here proves none was attempted.
       expect(result.argv).toEqual(["pr", "review", "--body-file", "-"]);
       expect(result.redacted).toBe(false);
+      expect(hasGitHubCliStdinTextFile(result.argv)).toBe(true);
+    });
+
+    it("identifies fused stdin-backed body and notes files", () => {
+      expect(hasGitHubCliStdinTextFile(["pr", "review", "--body-file=-"])).toBe(true);
+      expect(hasGitHubCliStdinTextFile(["pr", "edit", "--notes-file", "-"])).toBe(true);
+      expect(hasGitHubCliStdinTextFile(["pr", "edit", "--body-file", "/tmp/body.md"])).toBe(false);
     });
   });
 
