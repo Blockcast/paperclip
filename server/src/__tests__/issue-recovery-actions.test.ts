@@ -3697,7 +3697,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const [fresh] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       await recovery.escalateStrandedAssignedIssue({
         issue: fresh!,
-        previousStatus: "in_progress",
+        previousStatus: fresh!.status as "todo" | "in_progress" | "in_review",
         latestRun: { ...baseRun, id: randomUUID(), createdAt: new Date() },
         comment: "Automatic continuation recovery failed.",
       });
@@ -3768,7 +3768,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       maxAttempts: defaultRecoveryActionMaxAttempts,
     });
     expect(new Date(rebounded!.timeoutAt as unknown as string).getTime()).toBe(originalHorizonMs);
-    expect(wakesToManager()).toBe(1);
+    // The initial bounded owner wake and the pre-horizon rebound are both delivered;
+    // only the post-horizon sweep is suppressed.
+    expect(wakesToManager()).toBe(2);
     expect(strandedRecoveryWakeAttemptsExhausted(rebounded!, new Date(originalHorizonMs + 1_000))).toBe(true);
 
     const horizonNotices = await db
