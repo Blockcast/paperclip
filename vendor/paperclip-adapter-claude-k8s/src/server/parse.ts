@@ -370,9 +370,21 @@ export type ClaudeUpstreamFailureFamily = "upstream_capacity_exhausted" | "trans
 
 export interface ClaudeUpstreamClassification {
   readonly family: ClaudeUpstreamFailureFamily | null;
-  readonly errorCode: "claude_upstream_capacity_exhausted" | "claude_transient_upstream" | null;
+  readonly errorCode: "claude_upstream_capacity_exhausted" | "claude_transient_upstream" | "skill_not_found" | null;
   /** The penstock exhaustion code, set only when `family === "upstream_capacity_exhausted"`. */
   readonly capacityCode: string | null;
+}
+
+const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s+found\b/i;
+
+function isClaudeSkillNotFoundError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  return [input.errorMessage, input.stdout, input.stderr, input.parsed?.result]
+    .some((value) => typeof value === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(value));
 }
 
 /**
@@ -398,6 +410,11 @@ export function classifyClaudeUpstreamFailure(input: {
 }): ClaudeUpstreamClassification {
   if (!input.failed) {
     return { family: null, errorCode: null, capacityCode: null };
+  }
+  // This is a deterministic configuration failure from Claude's Skill tool,
+  // not an upstream outage. Keep it out of every transient retry family.
+  if (isClaudeSkillNotFoundError(input)) {
+    return { family: null, errorCode: "skill_not_found", capacityCode: null };
   }
   if (input.zeroTokenProgress) {
     const capacityCode = matchClaudeUpstreamCapacityCode(input);

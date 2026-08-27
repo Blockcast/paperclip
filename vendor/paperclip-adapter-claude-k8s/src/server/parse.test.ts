@@ -405,6 +405,26 @@ describe("classifyClaudeUpstreamFailure", () => {
       }),
     ).toEqual({ family: null, errorCode: null, capacityCode: null });
   });
+
+  it("classifies a missing Skill as deterministic configuration failure", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: true,
+        stderr: 'Error: Skill "verification-before-completion" not found',
+      }),
+    ).toEqual({ family: null, errorCode: "skill_not_found", capacityCode: null });
+  });
+
+  it("does not classify a successful output mentioning the error", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: false,
+        zeroTokenProgress: true,
+        stderr: 'Skill "verification-before-completion" not found',
+      }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
+  });
 });
 
 describe("extractClaudeRetryNotBefore", () => {
