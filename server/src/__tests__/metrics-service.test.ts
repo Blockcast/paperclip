@@ -1202,12 +1202,20 @@ describe("backstop metrics (BLO-29763)", () => {
     setBackstopDeferredCandidates("issue_graph_liveness.backstop", 7);
     recordBackstopSweepCompleted("stranded_recovery_wake_backstop");
     recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "not_ready");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "deferred_or_failed");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "enqueue_failed");
     body = (await renderMetrics()).body;
 
     expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 7`);
     expect(body).toContain(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="stranded_recovery_wake_backstop"} 1`);
     expect(body).toContain(
       `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="not_ready"} 1`,
+    );
+    expect(body).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="deferred_or_failed"} 1`,
+    );
+    expect(body).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="enqueue_failed"} 1`,
     );
 
     setBackstopDeferredCandidates("issue_graph_liveness.backstop", 0);

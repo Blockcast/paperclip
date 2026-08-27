@@ -10837,6 +10837,10 @@ export function recoveryService(
         ["not_ready", result.notReadySkipped], ["existing_wake", result.existingWakeSkipped],
         ["live_path", result.livePathSkipped], ["pause_hold", result.pauseHoldSkipped],
         ["interaction", result.interactionSkipped],
+        // These reasons are mutually exclusive: enqueue errors also increment
+        // deferredOrFailed for the aggregate result returned to existing callers.
+        ["deferred_or_failed", result.deferredOrFailed - result.enqueueFailed],
+        ["enqueue_failed", result.enqueueFailed],
       ] as const) {
         for (let i = 0; i < count; i++) recordBackstopCandidateSkipped("issue_graph_liveness.backstop", reason);
       }
