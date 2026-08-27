@@ -99,12 +99,18 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import {
+  BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.ts";
+import {
   ABANDONED_LIVENESS_RECOVERY_MARKER,
   DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS,
   DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS,
   DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
   STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER,
 } from "../services/recovery/service.ts";
+import { recoveryService } from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -128,6 +134,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    __resetMetricsForTest();
     guardBoundary.afterExecutionLockGuard = null;
     runningProcesses.clear();
     await cleanupHeartbeatTestState(db, heartbeatSvc, {
@@ -757,6 +764,14 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.dependencyWakeDeferredOrFailed).toBe(1);
     expect(result.dependencyWakeEnqueueFailed).toBe(0);
 
+    const metrics = (await renderMetrics()).body;
+    expect(metrics).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="deferred_or_failed"} 1`,
+    );
+    expect(metrics).not.toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="enqueue_failed"} 1`,
+    );
+
     const skippedWake = await db
       .select({
         status: agentWakeupRequests.status,
@@ -769,6 +784,25 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       status: "skipped",
       reason: "heartbeat.wakeOnDemand.disabled",
     });
+  });
+
+  it("counts thrown dependency wake enqueues as enqueue failures only", async () => {
+    const { companyId } = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const enqueueWakeup = vi.fn(async () => {
+      throw new Error("wake dispatch unavailable");
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileResolvedDependencyWakeBackstop({ companyId });
+
+    expect(result).toMatchObject({ healed: 0, deferredOrFailed: 1, enqueueFailed: 1 });
+    const metrics = (await renderMetrics()).body;
+    expect(metrics).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="enqueue_failed"} 1`,
+    );
+    expect(metrics).not.toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="deferred_or_failed"} 1`,
+    );
   });
 
   it("does not create recovery issues outside the configured lookback window", async () => {
