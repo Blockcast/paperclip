@@ -46,10 +46,17 @@ function makeFixture(): {
       "#!/usr/bin/env node",
       'import { readFileSync, writeFileSync } from "node:fs";',
       "const argv = process.argv.slice(2);",
-      'const bodyFlag = argv.indexOf("--body-file");',
-      "const bodyPath = bodyFlag >= 0 ? argv[bodyFlag + 1] : undefined;",
-      "const body = bodyPath && bodyPath !== \"-\" ? readFileSync(bodyPath, \"utf8\") : null;",
-      `writeFileSync(${JSON.stringify(record)}, JSON.stringify({ argv, body }));`,
+      'const fileFlag = argv.findIndex((arg) => arg === "--body-file" || arg === "--input");',
+      "const filePath = fileFlag >= 0 ? argv[fileFlag + 1] : undefined;",
+      "const inputBody = filePath && filePath !== \"-\" ? readFileSync(filePath, \"utf8\") : null;",
+      'const fieldArgs = [];',
+      'for (let i = 0; i < argv.length; i += 1) {',
+      '  const arg = argv[i];',
+      '  const match = /^(--raw-field|--field)=([\\s\\S]*)$/.exec(arg);',
+      '  if (match) fieldArgs.push(match[2]);',
+      '  else if (arg === "-f" || arg === "-F" || arg === "--raw-field" || arg === "--field") fieldArgs.push(argv[i + 1]);',
+      '}',
+      `writeFileSync(${JSON.stringify(record)}, JSON.stringify({ argv, inputBody, fieldArgs }));`,
       "",
     ].join("\n"),
     { mode: 0o755 },
@@ -74,7 +81,25 @@ describe("github-cli-egress-runtime", () => {
     );
 
     expect(result.status).toBe(64);
-    expect(result.stderr).toContain("--body-file -/--notes-file - is disabled");
+    expect(result.stderr).toContain("stdin-backed GitHub text/request body is disabled");
+    expect(() => readFileSync(fixture.record, "utf8")).toThrow();
+  });
+
+  it("rejects gh api --input - before the target starts", () => {
+    const fixture = makeFixture();
+
+    const result = spawnSync(
+      process.execPath,
+      ["--import", "tsx", runtimeEntryPoint, fixture.target, "api", "repos/acme/widget/issues/7", "--input", "-"],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        input: `{"body":"comment contains ${syntheticCredential}"}`,
+      },
+    );
+
+    expect(result.status).toBe(64);
+    expect(result.stderr).toContain("stdin-backed GitHub text/request body is disabled");
     expect(() => readFileSync(fixture.record, "utf8")).toThrow();
   });
 
@@ -86,7 +111,7 @@ describe("github-cli-egress-runtime", () => {
         target: fixture.target,
         argv: ["pr", "review", "123", "--body-file", "-"],
       });
-    }).toThrow("--body-file -/--notes-file - is disabled");
+    }).toThrow("stdin-backed GitHub text/request body is disabled");
     expect(() => readFileSync(fixture.record, "utf8")).toThrow();
   });
 
@@ -98,7 +123,19 @@ describe("github-cli-egress-runtime", () => {
         target: fixture.target,
         argv: ["pr", "review", "123", "--body-file=-"],
       });
-    }).toThrow("--body-file -/--notes-file - is disabled");
+    }).toThrow("stdin-backed GitHub text/request body is disabled");
+    expect(() => readFileSync(fixture.record, "utf8")).toThrow();
+  });
+
+  it("rejects a typed gh api field that reads its value from stdin", () => {
+    const fixture = makeFixture();
+
+    expect(() => {
+      prepareGitHubCliInvocation({
+        target: fixture.target,
+        argv: ["api", "repos/acme/widget/issues/7/comments", "--field", "body=@-"],
+      });
+    }).toThrow("stdin-backed GitHub text/request body is disabled");
     expect(() => readFileSync(fixture.record, "utf8")).toThrow();
   });
 
@@ -113,12 +150,50 @@ describe("github-cli-egress-runtime", () => {
 
         const recorded = JSON.parse(readFileSync(fixture.record, "utf8")) as {
           argv: string[];
-          body: string | null;
+          inputBody: string | null;
+          fieldArgs: string[];
         };
         expect(recorded.argv.slice(0, 4)).toEqual(["pr", "review", "123", "--body-file"]);
         expect(recorded.argv[4]).not.toBe(bodyPath);
-        expect(recorded.body).toContain("review text");
-        expect(recorded.body).not.toContain(syntheticCredential);
+        expect(recorded.inputBody).toContain("review text");
+        expect(recorded.inputBody).not.toContain(syntheticCredential);
       });
+  });
+
+  it("scrubs generic gh api input and field values before the target reads them", () => {
+    const fixture = makeFixture();
+    const requestPath = path.join(fixture.directory, "request.json");
+    writeFileSync(requestPath, `{"body":"issue comment ${syntheticCredential}"}`);
+
+    return runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: [
+        "api",
+        "repos/acme/widget/issues/7/comments",
+        "--input",
+        requestPath,
+        "-f",
+        `body=short inline comment ${syntheticCredential}`,
+        "--raw-field",
+        `body=inline comment ${syntheticCredential}`,
+        "--field",
+        `issue[body]=typed comment ${syntheticCredential}`,
+      ],
+    }).then((exitCode) => {
+      expect(exitCode).toBe(0);
+
+      const recorded = JSON.parse(readFileSync(fixture.record, "utf8")) as {
+        argv: string[];
+        inputBody: string | null;
+        fieldArgs: string[];
+      };
+      expect(recorded.argv).toContain("api");
+      expect(recorded.argv).toContain("--input");
+      expect(recorded.argv[recorded.argv.indexOf("--input") + 1]).not.toBe(requestPath);
+      expect(recorded.inputBody).toContain("issue comment");
+      expect(recorded.inputBody).not.toContain(syntheticCredential);
+      expect(recorded.fieldArgs).toHaveLength(3);
+      expect(recorded.fieldArgs.every((value) => !value.includes(syntheticCredential))).toBe(true);
+    });
   });
 });

@@ -160,6 +160,82 @@ describe("scrubGitHubCliInvocation", () => {
     });
   });
 
+  describe("gh api request bodies and fields", () => {
+    it("scrubs raw and typed fields that carry comment text", () => {
+      for (const flag of ["-f", "--raw-field", "-F", "--field"]) {
+        const result = scrubGitHubCliInvocation(
+          [
+            "api",
+            "repos/acme/widget/issues/7/comments",
+            flag,
+            `body=comment text ${"ghp_S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"}`,
+          ],
+          makeIo(),
+        );
+
+        expect(result.redacted, `flag ${flag}`).toBe(true);
+        expect(result.argv[3]).toMatch(/^body=/);
+        expect(result.argv[3]).not.toContain("ghp_");
+      }
+    });
+
+    it("scrubs fused raw and typed field forms", () => {
+      const result = scrubGitHubCliInvocation(
+        [
+          "api",
+          "repos/acme/widget/issues/7",
+          "--raw-field=body=issue text ghp_S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd",
+          "-F=body=PR text ghp_S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd",
+        ],
+        makeIo(),
+      );
+
+      expect(result.argv[2]).toMatch(/^--raw-field=body=/);
+      expect(result.argv[2]).not.toContain("ghp_");
+      expect(result.argv[3]).toMatch(/^-F=body=/);
+      expect(result.argv[3]).not.toContain("ghp_");
+      expect(result.classes).toContain("vendor-key");
+    });
+
+    it("scrubs a generic --input request body without mutating the source file", () => {
+      const original = `{"body":"comment ghp_S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"}`;
+      const io = makeIo({ "/tmp/request.json": original });
+
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/acme/widget/issues/7/comments", "--input", "/tmp/request.json"],
+        io,
+      );
+
+      expect(result.argv[3]).not.toBe("/tmp/request.json");
+      expect(io.written).toHaveLength(1);
+      expect(io.written[0]).toContain('"body":"comment');
+      expect(io.written[0]).not.toContain("ghp_");
+      expect(original).toContain("ghp_");
+    });
+
+    it("scrubs a typed @file field before gh reads it", () => {
+      const io = makeIo({
+        "/tmp/comment.txt": "comment ghp_S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd",
+      });
+
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/acme/widget/issues/7/comments", "-F", "body=@/tmp/comment.txt"],
+        io,
+      );
+
+      expect(result.argv[3]).toBe("body=@/tmp/scrubbed-1");
+      expect(io.written[0]).not.toContain("ghp_");
+    });
+
+    it("recognizes request-body stdin forms as fail-closed inputs", () => {
+      expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "--input", "-"])).toBe(true);
+      expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "--input=-"])).toBe(true);
+      expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "-F", "body=@-"])).toBe(true);
+      expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "--field=body=@-"])).toBe(true);
+      expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "-f", "body=@-"])).toBe(false);
+    });
+  });
+
   it("reports every class it removed across mixed argv", () => {
     const io = makeIo({ "/tmp/r.md": `body ${SYNTHETIC_PEM}` });
     const result = scrubGitHubCliInvocation(
