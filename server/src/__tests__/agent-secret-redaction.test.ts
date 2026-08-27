@@ -886,6 +886,34 @@ describe("agent self-service secret binding guard", () => {
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
+  it("passes the agent actor when normalizing a model-profile schema secret", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "hermes_gateway" });
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(
+      async (_companyId, config, options) => {
+        if (options?.actor?.agentId === agentId) {
+          const error = new Error("agent-authored schema secret refused");
+          (error as Error & { status?: number }).status = 403;
+          throw error;
+        }
+        return config;
+      },
+    );
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          modelProfiles: {
+            cheap: { adapterConfig: { apiKey: "plain-api-key" } },
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
   it("refuses a secret_ref smuggled in outside env", async () => {
     const app = createApp(agentActor);
     const res = await request(app)
