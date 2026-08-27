@@ -284,6 +284,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     const agentId = randomUUID();
     const presentKey = `company/${companyId}/present-skill`;
     const missingSourceKey = `company/${companyId}/missing-source-skill`;
+    const missingVersionId = randomUUID();
     // Never imported into `companySkills`, so `listRuntimeSkillEntries` cannot
     // even enter its loop for this key. This is the design-shotgun shape.
     const danglingKey = `company/${companyId}/never-imported-skill`;
@@ -336,7 +337,12 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       status: "idle",
       adapterType: TEST_ADAPTER_TYPE,
       adapterConfig: {
-        paperclipSkillSync: { desiredSkills: [presentKey, missingSourceKey, danglingKey] },
+        // A stale version pin is deterministic here: ordinary missing local
+        // sources are intentionally recovered from their stored SKILL.md by
+        // the heartbeat runtime path.
+        paperclipSkillSync: {
+          desiredSkills: [presentKey, { key: missingSourceKey, versionId: missingVersionId }, danglingKey],
+        },
       },
       runtimeConfig: {},
       permissions: {},
@@ -352,7 +358,8 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     // The delta is real: the dangling key is genuinely absent from what the pod
     // receives, while the resolvable sibling came through. Without this the
     // assertion below could pass on a warning about nothing.
-    expect(captured!.skills.map((entry) => entry.key)).toEqual([presentKey, missingSourceKey]);
+    // Runtime entries are sorted by key before they reach the adapter.
+    expect(captured!.skills.map((entry) => entry.key)).toEqual([missingSourceKey, presentKey]);
     expect(captured!.skills.find((entry) => entry.key === missingSourceKey)).toMatchObject({
       sourceStatus: "missing",
     });
