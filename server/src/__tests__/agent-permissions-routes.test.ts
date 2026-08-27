@@ -854,7 +854,14 @@ describe.sequential("agent permission routes", () => {
         model: "gpt-5.3-codex-spark",
         env: expect.any(Object),
       }),
-      { strictMode: false, adapterType: "codex_local" },
+      {
+        strictMode: false,
+        adapterType: "codex_local",
+        actor: expect.objectContaining({
+          userId: "board-user",
+          type: "board",
+        }),
+      },
     );
     expect(mockAgentService.update).toHaveBeenCalledWith(
       agentId,
