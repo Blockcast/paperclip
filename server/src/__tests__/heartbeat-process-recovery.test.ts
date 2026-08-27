@@ -11067,7 +11067,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.status, "active"),
       ));
     expect(actions).toHaveLength(1);
-    expect(actions[0]?.attemptCount).toBe(8);
+    expect(actions[0]?.attemptCount).toBe(Math.min(8, defaultRecoveryActionMaxAttempts));
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 

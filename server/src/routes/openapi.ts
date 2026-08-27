@@ -3197,6 +3197,23 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["dashboard"],
+  summary: "List issue recovery actions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      ownerAgentId: z.string().uuid().optional(),
+      kind: z.string().optional(),
+      status: z.string().optional(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
 // ─── Sidebar ─────────────────────────────────────────────────────────────────
 
 registry.registerPath({
