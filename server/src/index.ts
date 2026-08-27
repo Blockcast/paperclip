@@ -1346,7 +1346,6 @@ export async function startServer(): Promise<StartedServer> {
         // locks during shutdown. The pre-await check cannot cover this window.
         if (heartbeatSchedulerStopped) return;
         if (!timerSuppression.suppressed) {
-        if (!timerSuppression.suppressed) {
           trackHeartbeatSchedulerWork(heartbeat
             .tickTimers(new Date())
             .then((result) => {
