@@ -38,6 +38,9 @@ describe("parseAgentHealthReceiptWindowKey", () => {
     // An explicit numeric offset is honoured rather than read as UTC.
     expect(parseAgentHealthReceiptWindowKey("agent-health:2026-08-19T02:00:00+02:00:x")?.toISOString())
       .toBe("2026-08-19T00:00:00.000Z");
+    // An explicit offset may move the instant across UTC midnight.
+    expect(parseAgentHealthReceiptWindowKey("agent-health:2026-08-19T23:00:00-02:00:x")?.toISOString())
+      .toBe("2026-08-20T01:00:00.000Z");
     // A bare local-time form is read as UTC, not as the server's timezone --
     // every observed convention stamps the UTC slot.
     expect(parseAgentHealthReceiptWindowKey("agent-health:2026-08-19T06:00:00.000:x")?.toISOString())
