@@ -12,6 +12,7 @@ import {
   approvalComments,
   approvals,
   assets,
+  budgetPolicies,
   costEvents,
   financeEvents,
   goals,
@@ -494,6 +495,43 @@ export function agentService(db: Db) {
     }));
   }
 
+  // The enforcing monthly cap lives in `budget_policies`, not in the
+  // `agents.budget_monthly_cents` column. The column is a display mirror: every
+  // writer that goes through `budgets.upsertPolicy` keeps it equal to the
+  // policy, but the paths that write the column alone (config-revision restore,
+  // company import, plugin-managed and built-in agent provisioning) can leave
+  // it stale, and a stale mirror reads as authoritative because it is the value
+  // every agent-facing agent read returns.
+  //
+  // Serving the policy amount alongside it means a consumer never has to know
+  // which of the two it is holding. `null` means there is no active enforcing
+  // policy — deliberately distinct from `0`, so "uncapped" cannot be confused
+  // with "capped at zero". BLO-27626.
+  async function getEnforcedBudgetByAgentIds(companyId: string, agentIds: string[]) {
+    if (agentIds.length === 0) return new Map<string, number>();
+    const rows = await db
+      .select({ scopeId: budgetPolicies.scopeId, amount: budgetPolicies.amount })
+      .from(budgetPolicies)
+      .where(
+        and(
+          eq(budgetPolicies.companyId, companyId),
+          eq(budgetPolicies.scopeType, "agent"),
+          inArray(budgetPolicies.scopeId, agentIds),
+          eq(budgetPolicies.metric, "billed_cents"),
+          eq(budgetPolicies.windowKind, "calendar_month_utc"),
+          eq(budgetPolicies.isActive, true),
+        ),
+      );
+    return new Map(rows.map((row) => [row.scopeId, Number(row.amount ?? 0)]));
+  }
+
+  function attachEnforcedBudget<T extends { id: string }>(rows: T[], enforced: Map<string, number>) {
+    return rows.map((row) => ({
+      ...row,
+      enforcedBudgetMonthlyCents: enforced.get(row.id) ?? (null as number | null),
+    }));
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
@@ -501,11 +539,15 @@ export function agentService(db: Db) {
       .where(eq(agents.id, id))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
-    const [companyRows, hydrated] = await Promise.all([
+    const [companyRows, hydrated, enforcedByAgentId] = await Promise.all([
       listCompanyAgentRows(row.companyId),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
+      // Concurrent with the reads already here, so the enforcing amount costs a
+      // query but no extra round-trip on this hot path.
+      getEnforcedBudgetByAgentIds(row.companyId, [row.id]),
     ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    const normalized = normalizeAgentRow(hydrated, companyRows);
+    return attachEnforcedBudget([normalized], enforcedByAgentId)[0]!;
   }
 
   async function requireGetById(id: string) {
@@ -758,8 +800,11 @@ export function agentService(db: Db) {
         db.select().from(agents).where(and(...conditions)),
         listCompanyAgentRows(companyId),
       ]);
-      const hydrated = await hydrateAgentSpend(rows);
-      return normalizeAgentRows(hydrated, allCompanyRows);
+      const [hydrated, enforcedByAgentId] = await Promise.all([
+        hydrateAgentSpend(rows),
+        getEnforcedBudgetByAgentIds(companyId, rows.map((row) => row.id)),
+      ]);
+      return attachEnforcedBudget(normalizeAgentRows(hydrated, allCompanyRows), enforcedByAgentId);
     },
 
     getById,

@@ -68,6 +68,8 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import {
+  ABANDONED_LIVENESS_RECOVERY_MARKER,
+  DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS,
   DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS,
   DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS,
 } from "../services/recovery/service.ts";
@@ -1976,7 +1978,19 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalation?.parentId).toBe(blockerIssueId);
   });
 
-  it("re-escalates immediately after a matching escalation is cancelled", async () => {
+  // BLO-28957 reverses this case deliberately, so the rename is the point.
+  //
+  // It used to assert "re-escalates immediately after a matching escalation is
+  // cancelled", on the reading that a cancelled row was dismissed without being
+  // worked, so the incident still needed attention right now. That reading does
+  // not survive the abandonment bound: `cancelled` is also how the sweep RETIRES
+  // a row, so a `done`-only cooldown left the re-file loop this cooldown exists
+  // to stop wide open -- retire, re-file, repeat (240 of 500 sampled rows on
+  // 2026-08-18). The cooldown now holds `cancelled` too.
+  //
+  // The second half is what keeps this from being a regression: the incident is
+  // held for one cooldown, not dropped.
+  it("holds re-escalation for one cooldown after a matching escalation is cancelled", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
@@ -1995,10 +2009,204 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       completedAt: null,
     });
 
-    const result = await heartbeat.reconcileIssueGraphLiveness({ now });
+    const held = await heartbeat.reconcileIssueGraphLiveness({ now });
 
-    expect(result.escalationsCreated).toBe(1);
-    expect(result.skippedReescalationCooldown).toBe(0);
+    expect(held.escalationsCreated).toBe(0);
+    expect(held.skippedReescalationCooldown).toBe(1);
+
+    // Held, not dropped: once the cooldown expires the finding speaks again.
+    // This is the assertion that separates "cancelled joins the cooldown" from
+    // "cancelled joins the 7-day target-state suppressor" -- the latter would
+    // leave this at 0 and is what makes the narrow, cooldown-only scoping in
+    // `findSuppressingResolvedLivenessRecoveryIssue` load-bearing.
+    const after = await heartbeat.reconcileIssueGraphLiveness({
+      now: new Date(now.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 60 * 1000),
+    });
+
+    expect(after.escalationsCreated).toBe(1);
+  });
+
+  /**
+   * An OPEN recovery row for the seeded chain's own incident, with the row's
+   * activity clock backdated by `idleMs`.
+   *
+   * While open, this row suppresses liveness findings for the source AND the
+   * leaf (`openRecoveryIssues` maps one row onto both ids), with no blocker edge
+   * involved -- which is what makes the wedge in BLO-28957 invisible: the source
+   * is not `blocked`, it is simply never reported.
+   */
+  async function seedOpenRecoveryRow(opts: { idleMs: number }) {
+    const seeded = await seedBlockedChain();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = seeded;
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+    const recoveryIssueId = randomUUID();
+    // Backdate `createdAt` with the activity so the row never has
+    // `updatedAt` < `createdAt` -- an ordering no real row can have, and one
+    // `issueCreatedAtGte` could trip over for reasons unrelated to this
+    // behaviour.
+    const idleAt = new Date(Date.now() - opts.idleMs);
+
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: "Unblock liveness incident",
+      status: "todo",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 7,
+      identifier: `${`P${companyId.replace(/-/g, "").slice(0, 4)}`}-7`,
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: new Date(idleAt.getTime() - 60 * 60 * 1000),
+      updatedAt: idleAt,
+      lastActivityAt: idleAt,
+    });
+
+    return { ...seeded, incidentKey, recoveryIssueId };
+  }
+
+  // BLO-28957 (a). Pre-fix the source-still-open skip has no exit, so this row
+  // is skipped forever (`sourceStillOpenSkipped` 1, `retired` 0) and the source
+  // has no wake path at all while it sits there.
+  it("retires an abandoned recovery row whose source is still open, restoring the source's wake path", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId, recoveryIssueId } = await seedOpenRecoveryRow({
+      idleMs: DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS + 24 * 60 * 60 * 1000,
+    });
+
+    const swept = await heartbeatSvc.reconcileIssueGraphLiveness({ now: new Date() });
+
+    // Behavioural assertion first, so a pre-fix run fails on the defect itself
+    // (the row is never retired) rather than on a counter that does not exist
+    // yet. Pre-fix this reads "todo".
+    const [recovery] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, recoveryIssueId));
+    expect(recovery?.status).toBe("cancelled");
+
+    expect(swept.obsoleteRecoveriesAbandonedRetired).toBe(1);
+    expect(swept.obsoleteRecoveriesSourceStillOpenSkipped).toBe(0);
+    // The row still suppresses its own finding on the sweep that retires it --
+    // findings are collected before the retire runs. That is why the wake path
+    // is restored on the NEXT sweep, not this one (asserted by case (b)).
+    expect(swept.findings).toBe(0);
+
+    // Retiring the row is not a source-status change: the source stays open.
+    const [source] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(["done", "cancelled"]).not.toContain(source?.status);
+
+    // Discoverable without reading sweep logs. The activity row is keyed to the
+    // SOURCE, so "which sources were suppressed by an abandoned row" is a query;
+    // the marker comment explains the cancellation in place.
+    const abandonedActivity = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.liveness_recovery_abandoned"),
+        ),
+      );
+    expect(abandonedActivity).toHaveLength(1);
+    expect(abandonedActivity[0]?.entityId).toBe(blockedIssueId);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, recoveryIssueId));
+    expect(comments.some((row) => row.body.includes(ABANDONED_LIVENESS_RECOVERY_MARKER))).toBe(true);
+  });
+
+  // BLO-28957 (b) -- the load-bearing assertion. An age bound ALONE fails here:
+  // the retire cancels the row, and on a `done`-only cooldown the very next
+  // sweep sees nothing open and re-files, which is the loop BLO-28618 exists to
+  // kill. This pins the bound and the widened cooldown as one change.
+  it("does not re-file an abandoned recovery row on the sweep immediately after retiring it", async () => {
+    await enableAutoRecovery();
+    const { companyId } = await seedOpenRecoveryRow({
+      idleMs: DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS + 24 * 60 * 60 * 1000,
+    });
+
+    const retiredAt = new Date();
+    await heartbeatSvc.reconcileIssueGraphLiveness({ now: retiredAt });
+
+    // Immediately following sweep: the source is reportable again (nothing
+    // suppresses it now) but must NOT get a fresh row.
+    //
+    // Both assertions fail pre-fix, for the two separate reasons this issue
+    // exists: `findings` is 0 because the abandoned row is still open and still
+    // suppressing, and `skippedReescalationCooldown` is 0 because a `done`-only
+    // cooldown would not have held a cancelled row anyway.
+    const following = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now: new Date(retiredAt.getTime() + 60 * 1000),
+    });
+
+    expect(following.findings).toBe(1);
+    expect(following.skippedReescalationCooldown).toBe(1);
+    expect(following.escalationsCreated).toBe(0);
+
+    const stillOpen = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "harness_liveness_escalation"),
+          eq(issues.status, "todo"),
+        ),
+      );
+    expect(stillOpen).toHaveLength(0);
+
+    // Bounded, not dropped: once the cooldown expires the source gets a fresh
+    // row with a fresh owner. This is the "regains a wake path within a bounded,
+    // stated interval" half of the acceptance criteria, and it is also what
+    // proves `cancelled` joined the 60m cooldown rather than the 7d
+    // target-state suppressor.
+    const reescalated = await heartbeatSvc.reconcileIssueGraphLiveness({
+      now: new Date(retiredAt.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 60 * 1000),
+    });
+
+    expect(reescalated.escalationsCreated).toBe(1);
+
+    const refiled = await db
+      .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "harness_liveness_escalation"),
+          eq(issues.status, "todo"),
+        ),
+      );
+    expect(refiled).toHaveLength(1);
+    expect(refiled[0]?.assigneeAgentId).toBeTruthy();
+  });
+
+  // BLO-28957 (c): over-retiring guard. A row someone touched recently is
+  // suppressing legitimately -- an owner slow to pick a row up is not an
+  // abandoned row -- so it must stay open and keep counting as
+  // `sourceStillOpenSkipped`.
+  it("keeps suppressing and does not retire a recovery row with recent activity", async () => {
+    await enableAutoRecovery();
+    const { recoveryIssueId } = await seedOpenRecoveryRow({ idleMs: 60 * 60 * 1000 });
+
+    const swept = await heartbeatSvc.reconcileIssueGraphLiveness({ now: new Date() });
+
+    expect(swept.findings).toBe(0);
+    expect(swept.obsoleteRecoveriesAbandonedRetired).toBe(0);
+    expect(swept.obsoleteRecoveriesSourceStillOpenSkipped).toBe(1);
+    expect(swept.obsoleteRecoveriesRetired).toBe(0);
+
+    const [recovery] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, recoveryIssueId));
+    expect(recovery?.status).toBe("todo");
   });
 
   // BLO-29761: the suppression decision is persisted, so "suppressed by

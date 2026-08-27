@@ -4,6 +4,7 @@ import { agents, approvalComments, approvals, issueApprovals } from "@paperclipa
 import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { REDACTED_EVENT_VALUE, redactApprovalPayloadByType } from "../redaction.js";
 import { agentService } from "./agents.js";
@@ -32,6 +33,17 @@ export function approvalService(db: Db) {
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
   type CreateWithIdempotencyOptions = {
     afterCreate?: (txDb: Db, approval: ApprovalRecord) => Promise<void>;
+    /**
+     * Who the key collides against. Default `"requester"` — two agents filing similar asks never
+     * collide, one agent retrying always does.
+     *
+     * `"company"` is for SERVER-DERIVED keys only (BLO-24744). A liveness incident can hand the
+     * same root-cause key to escalation runs owned by different agents, and the question on the
+     * card is the incident's, not the filer's — so requester scoping would mint one card per owner
+     * for one human decision. Never widen a caller-supplied key this way: the requester scoping is
+     * what stops one agent's key from swallowing another's unrelated ask.
+     */
+    dedupeScope?: "requester" | "company";
   };
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
@@ -349,8 +361,15 @@ export function approvalService(db: Db) {
         throw unprocessable("Approval idempotency key requires an authenticated requester");
       }
 
+      // A company-scoped key is one incident's, not one filer's, so both the read and the advisory
+      // lock must drop the requester — leaving it in the lock would let two owners of the same
+      // incident run the read concurrently and both insert.
+      const companyScoped = options.dedupeScope === "company";
+
       return db.transaction(async (tx) => {
-        const guardKey = `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
+        const guardKey = companyScoped
+          ? `approval-create:idempotency:${companyId}:${idempotencyKey}`
+          : `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
 
         const existing = await tx
@@ -360,7 +379,7 @@ export function approvalService(db: Db) {
             and(
               eq(approvals.companyId, companyId),
               eq(approvals.idempotencyKey, idempotencyKey),
-              eq(requesterColumn, requesterValue),
+              ...(companyScoped ? [] : [eq(requesterColumn, requesterValue)]),
               inArray(approvals.status, resolvableStatuses),
             ),
           )
@@ -575,7 +594,7 @@ export function approvalService(db: Db) {
         activity: Pick<LogActivityInput, "actorType" | "actorId" | "agentId">;
       },
     ) => {
-      return db.transaction(async (tx) => {
+      const { updated, publishWithdrawn } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await getExistingApproval(id, txDb);
         if (existing.status !== "pending") {
@@ -617,7 +636,7 @@ export function approvalService(db: Db) {
           if (boundPendingAgent) await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
-        await logActivity(txDb, {
+        const publishWithdrawn = await logActivity(txDb, {
           companyId: updated.companyId,
           ...actor.activity,
           action: "approval.withdrawn",
@@ -630,10 +649,31 @@ export function approvalService(db: Db) {
           // decided -- a durable phantom for an approval that is in fact still
           // pending. Bind the event to this transaction so it retracts too.
           atomicPluginEvent: true,
+        }, {
+          // ...and defer the in-memory live event past commit, which
+          // `atomicPluginEvent` alone does not cover: it binds the outbox row,
+          // but `publishLiveEvent` is not transactional and would announce a
+          // withdrawal that a failed commit then un-did.
+          deferPublish: true,
         });
 
-        return updated;
+        return { updated, publishWithdrawn };
       });
+
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        await publishWithdrawn();
+      } catch (err) {
+        // The withdrawal itself is committed and durable -- only its live
+        // refresh hint failed. The outbox row committed with the transaction,
+        // so plugins are still told.
+        logger.warn(
+          { err, approvalId: updated.id },
+          "withdrew approval but failed to publish its live activity event",
+        );
+      }
+
+      return updated;
     },
 
     listComments: async (approvalId: string) => {

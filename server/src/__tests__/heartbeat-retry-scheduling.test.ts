@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -355,6 +355,62 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("coalesces bounded retries by agent, work identity, and reason", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2030-04-22T20:00:00.000Z");
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+
+    await seedRetryFixture({
+      companyId,
+      agentId,
+      runId: firstRunId,
+      now,
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: new Date(now.getTime() + 1_000),
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: new Date(now.getTime() + 1_000),
+      createdAt: new Date(now.getTime() + 1_000),
+    });
+
+    const first = await heartbeat.scheduleBoundedRetry(firstRunId, { now, delayMs: 60_000 });
+    const second = await heartbeat.scheduleBoundedRetry(secondRunId, {
+      now: new Date(now.getTime() + 30_000),
+      delayMs: 120_000,
+    });
+
+    expect(first.outcome).toBe("scheduled");
+    expect(second.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
+    expect(second.run.id).toBe(first.run.id);
+    expect(second.run.retryOfRunId).toBe(firstRunId);
+
+    const retryRows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(retryRows).toEqual([{ id: first.run.id }]);
+
+    const wakeup = await db
+      .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, first.run.wakeupRequestId!))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.coalescedCount).toBe(1);
   });
 
   async function seedQueuedRunFixture(input: {
@@ -1302,6 +1358,88 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       coalescedCount: 1,
     });
     expect(wakeups[0]?.idempotencyKey).toContain(`:${issueId}:${runId}:1`);
+  });
+
+  it("does not coalesce distinct interaction continuation attempts", async () => {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture({ issueStatus: "in_review" });
+    const firstInteractionId = randomUUID();
+    const secondSourceRunId = randomUUID();
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: {},
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+          mutation: "interaction",
+          interactionId: firstInteractionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "accepted",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const retryOptions = {
+      retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+      wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+      maxAttempts: 3,
+      random: () => 0.5,
+    };
+    const first = await heartbeat.scheduleBoundedRetry(runId, { now, ...retryOptions });
+    expect(first.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled") return;
+
+    await db.insert(heartbeatRuns).values({
+      id: secondSourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      error: "workspace validation failed before dispatch",
+      errorCode: "workspace_validation_failed",
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_commented",
+        mutation: "interaction",
+        interactionId: randomUUID(),
+        interactionKind: "request_confirmation",
+        interactionStatus: "accepted",
+      },
+      finishedAt: new Date(now.getTime() + 1_000),
+      updatedAt: new Date(now.getTime() + 1_000),
+      createdAt: new Date(now.getTime() + 1_000),
+    });
+
+    const second = await heartbeat.scheduleBoundedRetry(secondSourceRunId, {
+      now: new Date(now.getTime() + 1_000),
+      ...retryOptions,
+    });
+    expect(second.outcome).toBe("scheduled");
+    if (second.outcome !== "scheduled") return;
+    expect(second.run.id).not.toBe(first.run.id);
+    expect(second.run.retryOfRunId).toBe(secondSourceRunId);
+    expect(second.run.scheduledRetryAttempt).toBe(2);
+
+    const retries = await db
+      .select({ id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId, attempt: heartbeatRuns.scheduledRetryAttempt })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.scheduledRetryReason, INTERACTION_CONTINUATION_INFRA_RETRY_REASON),
+        inArray(heartbeatRuns.retryOfRunId, [runId, secondSourceRunId]),
+      ))
+      .orderBy(asc(heartbeatRuns.scheduledRetryAttempt));
+    expect(retries).toHaveLength(2);
+    expect(retries.map((retry) => retry.attempt).sort()).toEqual([1, 2]);
+    expect(retries.map((retry) => retry.retryOfRunId)).toEqual([runId, secondSourceRunId]);
   });
 
   it.each([

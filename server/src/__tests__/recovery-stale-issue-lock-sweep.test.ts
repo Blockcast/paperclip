@@ -593,21 +593,30 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       executionLockedAt: staleLockedAt,
     });
 
-    const heartbeat = heartbeatService(db);
-    let sweepPromise: ReturnType<typeof heartbeat.sweepStaleIssueLocks> | null = null;
-
-    await db.transaction(async (tx) => {
-      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
-      sweepPromise = heartbeat.sweepStaleIssueLocks();
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await tx
-        .update(issues)
-        .set({ executionLockedAt: refreshedLockedAt, updatedAt: refreshedLockedAt })
-        .where(eq(issues.id, issueId));
+    // BLO-29023: this ordering used to be timed, not stated — the sweep was
+    // started inside a transaction holding the row FOR UPDATE, then a
+    // `setTimeout(..., 100)` stood in for "the scan has run". The scan is a
+    // plain non-locking select, so it does not block on that row lock; the test
+    // passed only while the scan's SQL happened to execute inside the 100ms
+    // window. On a 4-way-sharded runner against a shared Postgres it often did
+    // not, the scan then read the *refreshed* timestamp, the row was never a
+    // candidate, and the counter read 0 — reddening whichever innocent PR was
+    // at the merge-queue head.
+    //
+    // Use the seam the neighbouring BLO-19848 tests use instead. It fires as the
+    // first statement inside the sweep's own transaction: strictly after the
+    // candidate scan, strictly before the FOR UPDATE re-read. That is the exact
+    // interleaving this test wants, as a fact rather than a hope.
+    const heartbeat = heartbeatService(db, {
+      beforeStaleIssueLockSweepClearForTest: async (issue) => {
+        if (issue.id !== issueId) return;
+        await db
+          .update(issues)
+          .set({ executionLockedAt: refreshedLockedAt, updatedAt: refreshedLockedAt })
+          .where(eq(issues.id, issueId));
+      },
     });
-
-    expect(sweepPromise).not.toBeNull();
-    const result = await sweepPromise!;
+    const result = await heartbeat.sweepStaleIssueLocks();
 
     expect(result.cleared).toBe(0);
     // BLO-22060: a bump landing on the sweep's own 30s cadence can starve the

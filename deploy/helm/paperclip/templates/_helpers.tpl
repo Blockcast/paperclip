@@ -151,3 +151,27 @@ rendered:
 {{- "Always" }}
 {{- end }}
 {{- end }}
+
+{{/* Fail rendering instead of silently disabling an enabled review-gate producer. */}}
+{{- define "paperclip.validateGithubReviewGate" -}}
+{{- if and ((.Values.githubApp).reviewGateEnabled) (not ((.Values.githubApp).reviewGateCaptureEnabled)) -}}
+{{- fail "githubApp.reviewGateEnabled requires githubApp.reviewGateCaptureEnabled=true" -}}
+{{- end -}}
+{{- if (.Values.githubApp).reviewGateCaptureEnabled -}}
+{{- if not (.Values.githubApp).enabled -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.enabled=true" -}}
+{{- end -}}
+{{- if not (gt (len ((.Values.githubApp).reviewGateRepositories)) 0) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires at least one githubApp.reviewGateRepositories entry" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString ((.Values.githubApp).reviewGateExpectedAppId))) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a numeric githubApp.reviewGateExpectedAppId" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString ((.Values.githubApp).reviewGateExpectedInstallationId))) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a numeric githubApp.reviewGateExpectedInstallationId" -}}
+{{- end -}}
+{{- if empty ((.Values.githubApp).prReviewGateStatusContext) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.prReviewGateStatusContext" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}

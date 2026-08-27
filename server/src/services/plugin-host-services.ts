@@ -760,6 +760,25 @@ export function buildHostServices(
     normalizePluginOriginKind(originKind);
   };
 
+  /**
+   * BLO-29908: normalize an execution-lock write precondition arriving over
+   * JSON-RPC, where a plugin can send any JSON value.
+   *
+   * `undefined` means "no precondition", `null` means "the issue must be
+   * unheld", and a run id pins that specific holder. Anything else is a caller
+   * bug and throws rather than degrading to `undefined` — silently dropping
+   * the guard would restore the exact eviction this precondition prevents,
+   * and it would do so invisibly.
+   */
+  const normalizeExpectedRunId = (value: unknown): string | null | undefined => {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    if (typeof value === "string" && value.length > 0) return value;
+    throw new Error(
+      "Plugin issue execution-lock precondition must be null or a non-empty run id string",
+    );
+  };
+
   const logPluginActivity = async (input: {
     companyId: string;
     action: string;
@@ -1953,11 +1972,26 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        // BLO-29908: execution-lock compare-and-set. These are write
+        // preconditions, not fields, so they are lifted out of `patch` before
+        // it is applied or logged — otherwise they read as attempted column
+        // writes in the activity trail.
+        //
+        // Forwarded explicitly rather than left to ride along in the spread:
+        // a plugin cancelling an issue it does not hold depends on these
+        // reaching `updateIssue`, and an implicit passthrough is one refactor
+        // away from silently dropping the guard and restoring the eviction bug.
+        const expectedCurrentCheckoutRunId = normalizeExpectedRunId(patch.expectedCurrentCheckoutRunId);
+        const expectedCurrentExecutionRunId = normalizeExpectedRunId(patch.expectedCurrentExecutionRunId);
+        delete patch.expectedCurrentCheckoutRunId;
+        delete patch.expectedCurrentExecutionRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
+          ...(expectedCurrentCheckoutRunId === undefined ? {} : { expectedCurrentCheckoutRunId }),
+          ...(expectedCurrentExecutionRunId === undefined ? {} : { expectedCurrentExecutionRunId }),
           actorAgentId,
           actorUserId,
         })) as Issue;
