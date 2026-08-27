@@ -1944,14 +1944,31 @@ export function recordAuthRequest(input: {
  * the very next publish rather than freezing at its last-known value forever.
  *
  * `heartbeatAgeSeconds`/`heartbeatIntervalSeconds` are only set for entries
- * with `heartbeatEnabled: true` -- a heartbeat-disabled agent is expected to
- * be dark, so publishing an ever-growing age for it would just be noise the
- * alert has to filter back out.
+ * with `heartbeatEnabled: true` AND `heartbeatExpected: true` -- an agent that
+ * is expected to be dark must not publish an ever-growing age, because that
+ * age never comes back down and so the consuming alert never clears.
+ *
+ * The two flags are deliberately separate facts, not one:
+ *  - `heartbeatEnabled` is the agent's own `heartbeat.enabled` CONFIG.
+ *  - `heartbeatExpected` is whether the scheduler would ever actually wake it
+ *    (BLO-28861). `heartbeat.enabled` is NOT cleared on termination, so config
+ *    alone says nothing about liveness: a terminated agent keeps
+ *    `enabled: true` forever and its age grows without bound.
+ *
+ * `errorDurationSeconds` is published for EVERY entry regardless of either
+ * flag -- it is a status observation, not a liveness claim, and BLO-28861
+ * explicitly preserves its existing series set.
  */
 export function setAgentLivenessMetrics(
   entries: ReadonlyArray<{
     agentId: string;
     heartbeatEnabled: boolean;
+    /**
+     * Whether this agent is one the heartbeat scheduler would actually wake.
+     * Required rather than optional-defaulting-true so a future caller cannot
+     * silently reintroduce BLO-28861 by forgetting to pass it.
+     */
+    heartbeatExpected: boolean;
     heartbeatAgeSeconds: number | null;
     heartbeatIntervalSeconds: number | null;
     errorDurationSeconds: number;
@@ -1963,7 +1980,7 @@ export function setAgentLivenessMetrics(
   metrics.agentErrorDurationGauge.reset();
   for (const entry of entries) {
     if (typeof entry.agentId !== "string" || entry.agentId.length === 0) continue;
-    if (entry.heartbeatEnabled) {
+    if (entry.heartbeatEnabled && entry.heartbeatExpected) {
       if (Number.isFinite(entry.heartbeatAgeSeconds)) {
         metrics.agentHeartbeatAgeGauge.set({ agent_id: entry.agentId }, Math.max(0, entry.heartbeatAgeSeconds as number));
       }

@@ -29630,19 +29630,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Fleet-wide (no companyId filter), matching every other gauge publisher in
    * this file: this control plane is one Prometheus scrape target for every
    * company it serves, and agent_id is a globally unique key.
+   *
+   * Age/interval are published only for agents the heartbeat scheduler would
+   * actually wake (BLO-28861). `heartbeat.enabled` is NOT cleared on
+   * termination, so config alone is not a liveness predicate: before this
+   * filter, terminated and pending_approval agents exported an age that grows
+   * forever, and the consuming `PaperclipAgentHeartbeatStale` alert would have
+   * fired for 19 of 36 series -- 18 of them permanently false, so the alert
+   * could never clear.
+   *
+   * The predicate is deliberately the SAME `evaluateAgentInvokability` call
+   * the timer scheduler gates on below (see `runHeartbeatScheduler`: `if
+   * (!invokability.invokable) continue;`), plus the same `companies.status =
+   * 'active'` restriction its agent query applies. That is the anti-drift
+   * property: "is this agent expected to heartbeat" is answered by the one
+   * function that decides whether it ever gets woken, so the two cannot
+   * disagree. A hand-written status list here would be a second copy free to
+   * drift.
+   *
+   * Consequences worth naming, because they are wider than a `terminated`
+   * check: `paused` agents and agents with a broken reporting chain
+   * (terminated manager / missing manager / cycle) are also excluded. Both are
+   * skipped by the scheduler, so both are permanently dark by construction and
+   * would be permanently-false pages here. Neither condition is silent --
+   * each has a deterministic cause-side source of truth (agent status, org
+   * chain health) that a liveness alert is the wrong instrument for.
+   *
+   * `error` REMAINS included: an errored agent is still invokable, and a dark
+   * errored agent is precisely the 2026-08-08 incident this metric exists for.
+   *
+   * `errorDurationSeconds` is unaffected -- every agent still gets an entry,
+   * so `paperclip_agent_status_error_duration_seconds` keeps its full series
+   * set. Only the age/interval gauges are gated.
    */
   async function publishAgentLivenessGauges(now: Date) {
     try {
       const rows = await db
         .select({
           id: agents.id,
+          companyId: agents.companyId,
+          name: agents.name,
+          reportsTo: agents.reportsTo,
           status: agents.status,
           runtimeConfig: agents.runtimeConfig,
           lastHeartbeatAt: agents.lastHeartbeatAt,
           updatedAt: agents.updatedAt,
           createdAt: agents.createdAt,
+          companyStatus: companies.status,
         })
-        .from(agents);
+        .from(agents)
+        // leftJoin, not innerJoin: a non-active company must still contribute
+        // its agents' error-duration series. Company status gates
+        // `heartbeatExpected` below rather than dropping the row.
+        .leftJoin(companies, eq(companies.id, agents.companyId));
+
+      // Complete per-company rosters (the select is unfiltered), so the
+      // org-chain walk inside evaluateAgentInvokability sees every ancestor.
+      const agentsByCompany = groupAgentOrgRowsByCompany(rows.map(toAgentOrgRow));
 
       const entries = rows.map((row) => {
         const policy = resolveHeartbeatPolicyForRuntimeConfig(row.runtimeConfig);
@@ -29657,9 +29701,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const errorDurationSeconds = row.status === "error"
           ? Math.max(0, (now.getTime() - new Date(row.updatedAt).getTime()) / 1000)
           : 0;
+        const heartbeatExpected = row.companyStatus === "active"
+          && evaluateAgentInvokability(
+            toAgentOrgRow(row),
+            agentsByCompany.get(row.companyId) ?? [],
+          ).invokable;
         return {
           agentId: row.id,
           heartbeatEnabled: policy.enabled,
+          heartbeatExpected,
           heartbeatAgeSeconds,
           heartbeatIntervalSeconds: policy.enabled ? policy.intervalSec : null,
           errorDurationSeconds,
