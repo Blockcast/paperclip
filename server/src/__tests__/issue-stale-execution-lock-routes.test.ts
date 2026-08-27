@@ -109,7 +109,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         agentId,
         status: staleRunStatus,
         invocationSource: "manual",
-        finishedAt: new Date(),
+        ...(staleRunStatus === "running" ? { startedAt: new Date() } : { finishedAt: new Date() }),
         createdAt: staleRunCreatedAt,
       },
       {
