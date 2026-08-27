@@ -40,13 +40,14 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
   const { target, argv } = options;
   if (!target) throw new GitHubCliEgressRuntimeError("missing GitHub CLI target");
 
-  // `gh --body-file -` and `gh --notes-file -` stream authored text directly
-  // from stdin. Reject them before spawning gh: there is no safe way to let a
-  // child consume the stream while guaranteeing that every byte has passed
+  // `gh --body-file -`, `gh --notes-file -`, and `gh api --input -` stream
+  // authored text directly from stdin. Typed `gh api --field key=@-` has the
+  // same property. Reject them before spawning gh: there is no safe way to let
+  // a child consume the stream while guaranteeing that every byte has passed
   // through the structural scrubber first. This is intentionally fail-closed.
   if (hasGitHubCliStdinTextFile(argv)) {
     throw new GitHubCliEgressRuntimeError(
-      "--body-file -/--notes-file - is disabled; use a file-backed body so it can be scrubbed",
+      "stdin-backed GitHub text/request body is disabled; use file-backed text so it can be scrubbed",
     );
   }
 
