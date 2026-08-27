@@ -22680,7 +22680,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         let recoveryRun: { id: string } | null = null;
 
         if (!activeRun) {
-          if (!currentIssue.assigneeAgentId) {
+          let assigneeAgentId = currentIssue.assigneeAgentId;
+          if (!assigneeAgentId) {
             await options.beforeDetachedQueuedRunAssigneeCheckForTest?.({
               intentId: claimedIntent.id,
               issueId: claimedIntent.issueId,
@@ -22697,6 +22698,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 .for("update")
                 .then((rows) => rows[0] ?? null);
               if (!lockedIssue || TERMINAL_ISSUE_STATUSES.has(lockedIssue.status)) {
+                await tx
+                  .update(detachedQueuedRunRecoveries)
+                  .set({ status: "cancelled", completedAt: attemptAt, lastError: null, updatedAt: attemptAt })
+                  .where(and(
+                    eq(detachedQueuedRunRecoveries.id, claimedIntent.id),
+                    eq(detachedQueuedRunRecoveries.status, "pending"),
+                  ));
                 return { kind: "cancelled" as const, issue: lockedIssue };
               }
               if (lockedIssue.assigneeAgentId) return { kind: "assigned" as const, issue: lockedIssue };
@@ -22718,7 +22726,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               return { kind: cancelled ? "cancelled" as const : "lost" as const, issue: lockedIssue };
             });
             if (assigneeDecision.kind === "assigned") {
-              currentIssue = { ...currentIssue, assigneeAgentId: assigneeDecision.issue.assigneeAgentId };
+              assigneeAgentId = assigneeDecision.issue.assigneeAgentId;
             } else if (assigneeDecision.kind === "cancelled") {
               result.skipped += 1;
               continue;
@@ -22726,12 +22734,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               continue;
             }
           }
+          if (!assigneeAgentId) {
+            result.skipped += 1;
+            continue;
+          }
           await options.beforeDetachedQueuedRunRecoveryEnqueueForTest?.({
             intentId: claimedIntent.id,
             issueId: claimedIntent.issueId,
             sourceRunId: claimedIntent.sourceRunId,
           });
-          const enqueuedRecoveryRun = await enqueueWakeup(currentIssue.assigneeAgentId, {
+          const enqueuedRecoveryRun = await enqueueWakeup(assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "queued_run_detachment_recovery",
