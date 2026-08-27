@@ -4,6 +4,10 @@ set -euo pipefail
 image=${1:?usage: verify-agent-ffmpeg.sh IMAGE}
 probe_timeout=${FFMPEG_PROBE_TIMEOUT_SECONDS:-15}
 probe_output_bytes=${FFMPEG_PROBE_OUTPUT_BYTES:-65536}
+pull_timeout=${FFMPEG_PULL_TIMEOUT_SECONDS:-300}
+pull_attempts=${FFMPEG_PULL_ATTEMPTS:-3}
+pull_timeout_limit=600
+pull_attempts_limit=5
 
 case "$probe_output_bytes" in
   ""|0|*[!0-9]*)
@@ -11,6 +15,29 @@ case "$probe_output_bytes" in
     exit 2
     ;;
 esac
+
+validate_bounded_positive_integer() {
+  local name="$1"
+  local value="$2"
+  local limit="$3"
+  local normalized
+  if [[ ! "$value" =~ ^0*([1-9][0-9]*)$ ]]; then
+    echo "${name} must be a positive integer" >&2
+    return 1
+  fi
+  normalized="${BASH_REMATCH[1]}"
+  # Check the string width before arithmetic so an oversized value cannot
+  # wrap before it is rejected.
+  # Force base-10 parsing so values such as 08 and 0601 are not treated as
+  # invalid octal literals by Bash arithmetic.
+  if (( ${#normalized} > ${#limit} )) || (( 10#$normalized > 10#$limit )); then
+    echo "${name} must not exceed ${limit}" >&2
+    return 1
+  fi
+}
+
+validate_bounded_positive_integer FFMPEG_PULL_TIMEOUT_SECONDS "$pull_timeout" "$pull_timeout_limit" || exit 2
+validate_bounded_positive_integer FFMPEG_PULL_ATTEMPTS "$pull_attempts" "$pull_attempts_limit" || exit 2
 
 if ! declared_volumes=$(
   docker buildx imagetools inspect "$image" --format '{{json .Image.Config.Volumes}}' 2>/dev/null
@@ -25,6 +52,35 @@ case "$declared_volumes" in
     exit 2
     ;;
 esac
+
+# Keep registry latency out of the capability budget. A `docker run` may pull
+# an image before it starts the requested process, so wrapping the whole run in
+# the short probe timeout can misclassify a healthy image as an unsafe probe.
+# Pull the immutable reference separately, with bounded retries, and make the
+# actual probe refuse any further registry access.
+pull_status=1
+attempt=1
+while [ "$attempt" -le "$pull_attempts" ]; do
+  echo "Pulling FFmpeg image ${image} (attempt ${attempt}/${pull_attempts})"
+  if timeout --foreground --kill-after=5s "${pull_timeout}s" docker pull "$image"; then
+    pull_status=0
+    break
+  else
+    pull_status=$?
+  fi
+  if [ "$attempt" -lt "$pull_attempts" ]; then
+    sleep "$attempt"
+  fi
+  attempt=$((attempt + 1))
+done
+if [ "$pull_status" -ne 0 ]; then
+  if [ "$pull_status" -eq 124 ] || [ "$pull_status" -eq 137 ]; then
+    echo "FFmpeg image pull timed out for ${image}" >&2
+  else
+    echo "Unable to pull FFmpeg image ${image} (status ${pull_status})" >&2
+  fi
+  exit 2
+fi
 
 probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperclip-ffmpeg-probe.XXXXXX")
 cidfile="$probe_dir/cid"
@@ -49,7 +105,7 @@ trap 'exit 129' HUP
 
 set +e
 timeout --foreground --kill-after=5s "${probe_timeout}s" \
-  docker run --rm \
+  docker run --pull=never --rm \
     --cidfile "$cidfile" \
     --network none \
     --read-only \

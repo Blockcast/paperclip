@@ -4491,10 +4491,20 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
+    // BLO-29312: the run's own scheduledRetry* columns describe the park that
+    // PRODUCED it, so they cannot answer "was this run retried?". Resolve the
+    // outbound edge here so that question costs one read of this endpoint
+    // rather than a reverse scan of the company run list.
+    const retrySuccessor = await heartbeat.getRetrySuccessor(run);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(
       redactCurrentUserValue(
-        { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          retryExhaustedReason,
+          retrySuccessor,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     );

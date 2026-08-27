@@ -368,15 +368,39 @@ const REF_SUBTREE_KEY = new RegExp(
 const SEQUENCE_DASH = /^\s*(-\s+)/;
 const BARE_SEQUENCE_DASH = /^\s*-\s*$/;
 /**
+ * A shell/OCI environment-variable name. Defined once because both the YAML
+ * sequence-entry rule and the JSON scalar rule must agree on what counts as a
+ * name they may print in the clear — the whole point of preserving a name is
+ * that it is a name and not material.
+ */
+const ENV_VAR_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
+/**
  * The OCI/Docker `KEY=VALUE` env entry shape. The name is kept and only the
  * value dropped, matching design note 2 and the JSON path.
  */
-const ENV_KEY_VALUE_ENTRY = /^(\s*)(-\s+)(["']?)([A-Za-z_][A-Za-z0-9_.-]*)=/;
+const ENV_KEY_VALUE_ENTRY = new RegExp(`^(\\s*)(-\\s+)(["']?)(${ENV_VAR_NAME})=`);
+/**
+ * The same `KEY=VALUE` shape as a bare scalar, with no sequence introducer —
+ * what a string-valued `env` key holds on the JSON path.
+ *
+ * This exists so that "does this scalar have a name worth preserving?" is
+ * answered by matching a name, not by `indexOf("=") !== -1`. The difference is
+ * load-bearing: `[LEAKED]=x` contains an `=`, so slicing at the first one
+ * promotes material into the name position and prints it beside its own
+ * redaction marker. Only a validated name survives.
+ */
+const ENV_KEY_VALUE_SCALAR = new RegExp(`^(${ENV_VAR_NAME})=`);
 /**
  * An `env:` scalar that can carry material: a flow collection, an alias (which
  * may resolve to an anchor we never scrubbed), a block scalar, or the
  * `KEY=VALUE` encoding. A plain scalar without `=` is prose in some other
  * body this proxy carries, not a Kubernetes env value.
+ *
+ * Shared by the YAML scanner and the structural JSON walker on purpose. Both
+ * decide the same question — "can this env scalar carry material?" — and when
+ * they answered it with two separate expressions they disagreed on every
+ * indicator-led shape. Keep it one constant; a second spelling is a second
+ * rule.
  */
 const MATERIAL_BEARING_ENV_SCALAR = /^[[{*|>]|=/;
 /**
@@ -1137,12 +1161,26 @@ function scrubJsonValueTracked(
       continue;
     }
     // An `env` serialized as a single scalar rather than a list or a mapping.
-    // Same discriminator as the YAML path: `KEY=VALUE` carries material, a
-    // plain string does not and belongs to some other body this proxy carries.
-    if (isEnvKey(key) && typeof value === "string" && value.includes("=")) {
+    // Gated by `MATERIAL_BEARING_ENV_SCALAR` — the *same constant* the YAML
+    // path uses, not a second spelling of it. This branch previously tested
+    // `value.includes("=")` under a comment claiming it was "the same
+    // discriminator as the YAML path". It was not: the YAML constant also
+    // matches a leading `[`, `{`, `*`, `|` or `>`, so five env-scalar shapes
+    // were redacted on the YAML path and returned verbatim here. Two
+    // independently-maintained spellings of one rule drift silently and the
+    // comment asserting they agree is what stops the next reader checking, so
+    // the constant is now shared rather than restated (PEN-2370 ask 3 (b2):
+    // close the class, not the spelling).
+    if (isEnvKey(key) && typeof value === "string" && MATERIAL_BEARING_ENV_SCALAR.test(value)) {
       ctx.changed = true;
-      const eq = value.indexOf("=");
-      result[key] = `${value.slice(0, eq)}=${REDACTED}`;
+      // Keep the variable name ONLY where the scalar really is `KEY=VALUE`.
+      // Testing `indexOf("=") !== -1` is not that test: `[LEAKED]=x` contains
+      // an `=`, so slicing at it promotes `[LEAKED]` into the name position
+      // and emits it in the clear next to a redaction marker. Validate the
+      // prefix against the same name charset the YAML sequence-entry rule
+      // uses; anything else has no name to keep and redacts whole.
+      const named = ENV_KEY_VALUE_SCALAR.exec(value);
+      result[key] = named ? `${named[1]}=${REDACTED}` : REDACTED;
       continue;
     }
     if (typeof value === "string") {

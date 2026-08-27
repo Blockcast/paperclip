@@ -1555,6 +1555,13 @@
       "when": 1787743476000,
       "tag": "0229_human_gated_digest_touch_locks",
       "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1787743477000,
+      "tag": "0230_heartbeat_runs_retry_successor_index",
+      "breakpoints": true
     }
   ]
 }

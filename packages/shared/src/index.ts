@@ -972,6 +972,8 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  HeartbeatRunRetrySuccessor,
+  HeartbeatRunRetrySuccessorState,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   AgentRuntimeState,

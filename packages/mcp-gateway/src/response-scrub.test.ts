@@ -973,6 +973,85 @@ describe("scrubJsonValue — env entries that are not objects", () => {
     expect(JSON.stringify(out)).toContain("see config");
   });
 
+  /**
+   * The assertion above is true of `"see config"` and was read as true in
+   * general — the JSON path gated on `value.includes("=")` while the YAML path
+   * gated on a constant that ALSO matches a leading `[`, `{`, `*`, `|` or `>`.
+   * Five shapes were redacted as YAML and returned verbatim as JSON.
+   *
+   * Assert the agreement differentially, over both paths, rather than pinning
+   * one more fixture per path: a fixture list re-checks the spellings someone
+   * already thought of, and this defect was born from exactly that.
+   */
+  describe("env scalars agree across the JSON and YAML paths", () => {
+    const INDICATOR_LED = [
+      ["flow sequence", `[${LEAK}]`],
+      ["flow mapping", `{k: ${LEAK}}`],
+      ["alias", `*${LEAK}`],
+      ["literal block", `|${LEAK}`],
+      ["folded block", `>${LEAK}`],
+      ["OCI KEY=VALUE", `OPENAI_API_KEY=${LEAK}`],
+    ] as const;
+
+    for (const [label, scalar] of INDICATOR_LED) {
+      it(`redacts a ${label} env scalar on BOTH paths`, () => {
+        expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+        expectNoLeak(scrubYamlText(`env: ${scalar}`));
+      });
+    }
+
+    it("keeps the variable name only where there is one to keep", () => {
+      // `KEY=VALUE` names its variable; an indicator-led scalar does not, so
+      // inventing a name there would be worse than redacting whole.
+      expect(scrubJsonValue({ env: `OPENAI_API_KEY=${LEAK}` })).toEqual({
+        env: `OPENAI_API_KEY=${REDACTED}`,
+      });
+      expect(scrubJsonValue({ env: `*${LEAK}` })).toEqual({ env: REDACTED });
+    });
+
+    /**
+     * Reported by Ally on #1518, reproduced on `origin/master` as well — the
+     * name-preservation branch predates this PR and was never sound.
+     *
+     * "Has a name to preserve" was implemented as `indexOf("=") !== -1`, which
+     * is a different question. `[LEAKED]=x` contains an `=`, so slicing at the
+     * first one promoted the material into the name position and printed it
+     * beside its own redaction marker — the exact "false assurance" failure
+     * design note 4 of this module names as worse than no scrubber at all.
+     */
+    for (const [label, prefix] of [
+      ["flow sequence", "[%s]"],
+      ["flow mapping", "{k: %s}"],
+      ["alias", "*%s"],
+      ["literal block", "|%s"],
+      ["folded block", ">%s"],
+    ] as const) {
+      it(`does not promote an indicator-led ${label} into the name position when a later = exists`, () => {
+        const scalar = `${prefix.replace("%s", LEAK)}=x`;
+
+        expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+        expectNoLeak(scrubYamlText(`env: ${scalar}`));
+      });
+    }
+
+    it("still preserves a real variable name that contains the legal name characters", () => {
+      // The counterweight to the five tests above: validating the prefix must
+      // not become "redact every scalar", or the diagnostic value of knowing
+      // WHICH variable is set (design note 2) is gone.
+      expect(scrubJsonValue({ env: `my.app-name_2=${LEAK}` })).toEqual({
+        env: `my.app-name_2=${REDACTED}`,
+      });
+    });
+
+    it("still passes prose through on both paths, so the gate did not widen to everything", () => {
+      // The negative control. Without it, `env: REDACTED` unconditionally
+      // would satisfy every assertion above while destroying the diagnostic
+      // value the scrubber exists to preserve.
+      expect(scrubJsonValue({ env: "see config" })).toEqual({ env: "see config" });
+      expect(scrubYamlText("env: see config")).toContain("see config");
+    });
+  });
+
   it("leaves a null entry untouched rather than inventing a redaction", () => {
     expect(JSON.stringify(scrubJsonValue({ env: [null] }))).toBe('{"env":[null]}');
   });
