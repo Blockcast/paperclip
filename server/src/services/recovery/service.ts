@@ -1408,6 +1408,7 @@ const LIVE_ISSUE_BLOCKERS_RESOLVED_WAKE_STATUSES = new Set([
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
+  "skill_not_found",
   "agent_not_invokable",
   "agent_not_found",
   "budget_blocked",

@@ -81,6 +81,27 @@ describe("recovery classifier boundary", () => {
     expect(classifyIssueGraphLiveness(input)).toEqual(classifyIssueGraphLivenessCompat(input));
   });
 
+  it("does not treat a missing skill as a zero-token startup wedge", () => {
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: "skill_not_found",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
+  });
+
+  it("routes a missing skill to blocked escalation instead of retry", () => {
+    expect(classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_not_found",
+      error: 'Skill "verification-before-completion" not found',
+      resultJson: null,
+    } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+      errorCode: "skill_not_found",
+    });
+  });
+
   it("treats a scheduled monitor as an explicit review action path", () => {
     const findings = classifyIssueGraphLiveness({
       now: "2026-04-30T18:00:00.000Z",
