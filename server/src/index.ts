@@ -1762,6 +1762,28 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Human-gated ageing digest (BLO-29420). Worker-tier singleton. BLO-19130's
+  // ageing module shipped as 683 lines of tested pure functions with zero
+  // production importers, so the escalation it describes had never fired once;
+  // this block is the seam that runs it. Each pass recomputes the digest from
+  // the human clock and refreshes one durable, human-assigned row in place —
+  // no row per fire, and an unchanged body writes nothing.
+  if (config.humanGatedDigestEnabled && config.paperclipNodeRole !== "api") {
+    const { startHumanGatedDigestSweep } = await import(
+      "./services/human-gated-ageing-digest.js"
+    );
+    logger.info(
+      {
+        intervalMinutes: config.humanGatedDigestIntervalMinutes,
+        periodDays: config.humanGatedDigestPeriodDays,
+      },
+      "Human-gated ageing digest enabled (BLO-29420)",
+    );
+    startHumanGatedDigestSweep(db, config.humanGatedDigestIntervalMinutes * 60 * 1000, {
+      periodDays: config.humanGatedDigestPeriodDays,
+    });
+  }
+
   // Approval-gate reconciler (BLO-29359). Closes board approval cards whose
   // external GitHub gate has terminated and announces the death on every linked
   // issue. Worker-tier only and idempotent: each close re-checks that the card is
@@ -2042,8 +2064,8 @@ export async function startServer(): Promise<StartedServer> {
         // Best-effort tunnel shutdown.
       }
 
-      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
-      appShutdown?.();
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void | Promise<void> } }).locals?.paperclipShutdown;
+      await appShutdown?.();
 
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
         writeShutdownBreadcrumb(`stopping embedded PostgreSQL (signal=${signal})`);

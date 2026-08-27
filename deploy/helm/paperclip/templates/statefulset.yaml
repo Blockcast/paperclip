@@ -1,3 +1,4 @@
+{{- include "paperclip.validateGithubReviewGate" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -835,6 +836,26 @@ spec:
             {{- with ((.Values.githubApp).reviewerBotLogin) }}
             - name: PAPERCLIP_PR_REVIEWER_BOT_LOGIN
               value: {{ . | quote }}
+            {{- end }}
+            {{- if ((.Values.githubApp).reviewGateCaptureEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED
+              value: "true"
+            {{- with ((.Values.githubApp).reviewGateRepositories) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedAppId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedInstallationId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if ((.Values.githubApp).reviewGateEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED
+              value: "true"
             {{- end }}
             {{- with ((.Values.githubApp).prReviewGateStatusContext) }}
             - name: PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT

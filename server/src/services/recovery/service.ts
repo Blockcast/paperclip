@@ -55,6 +55,7 @@ import {
   externalWaitFromDescription,
   issueService,
   lockIssueParentMutationCompany,
+  type IssueDependencyReadiness,
 } from "../issues.js";
 import {
   issueLockOwnerStateMatches,
@@ -195,6 +196,35 @@ export const LIVENESS_SUPPRESSION_SCAN_SKEW_MS = 60 * 1000;
  * this" from "a closed row suppressed this" is a single GROUP BY.
  */
 export type LivenessSuppressionReason = "existing_open" | "cooldown" | "unchanged_target";
+
+/**
+ * How long an open liveness recovery row may sit untouched before the sweep
+ * treats it as abandoned and retires it (BLO-28957).
+ *
+ * This is the exit for the `sourceStillOpenSkipped` arm in
+ * `retireObsoleteLivenessRecoveryIssues`. An open row suppresses liveness
+ * findings for its source *and* its leaf (`openRecoveryIssues` ->
+ * `hasExplicitWaitingPath`, which reads no blocker edges), and BLO-28618 made
+ * the retire loop skip any row whose source is still open. Held
+ * unconditionally that skip never ends: a row that is filed and never worked
+ * hides its source forever, and hides it *silently*, because BLO-28618 also
+ * (correctly) stopped forcing the source to `blocked` -- which is what used to
+ * make the wedge visible in a blocked inbox.
+ *
+ * Deliberately much longer than the escalation staleness lookback (24h
+ * default). The bound exists to catch rows nobody is going to work, not rows an
+ * owner is merely slow to pick up, and it matches the ">7 days with no
+ * activity" cohort the BLO-28618 census measured.
+ *
+ * Set to 0 to disable the bound and restore the pre-BLO-28957 unbounded skip.
+ */
+export const DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Stable token on the comment left when a row is retired for abandonment
+ * (BLO-28957). Grep/query on this rather than on the prose around it.
+ */
+export const ABANDONED_LIVENESS_RECOVERY_MARKER = "paperclip:liveness-recovery-abandoned";
 
 type RecoveryActionBoundsConfig = {
   maxAttempts: number;
@@ -1692,6 +1722,21 @@ function buildLivenessEscalationDescription(finding: IssueLivenessFinding) {
     finding.recommendedAction,
     "",
     "Resolve the blocked chain, then mark this escalation issue done so the original issue can resume when all blockers are cleared.",
+    "",
+    // BLO-24744: this issue is worked by a cheap status-only run, and the repair it asks for is
+    // sometimes not one an agent can perform (a `pauseReason: manual` pause is a human's decision).
+    // Without naming the one channel that class of run may use, the honest options left were all
+    // bad: file nothing, poll a human decision, or close unresolved. Name it here — the reader is
+    // the run, and this text is the only instruction it gets.
+    "## If only a human can resolve this",
+    "",
+    "Do not poll it, and do not close this unresolved. File a board escalation from this run: " +
+    "`POST /api/companies/:companyId/approvals` with `type: \"request_board_approval\"` and " +
+    "`issueIds: [\"<this escalation issue id>\"]` — that is the one approval a status-only recovery " +
+    "run may create, and linking it to this issue is required. Paperclip supplies the idempotency " +
+    "key, so every escalation raised for this same root cause replays the one existing card " +
+    "(response `deduplicated: true`) instead of adding another. Record the approval id here, then " +
+    "leave this issue blocked on that decision.",
   ].join("\n");
 }
 
@@ -7172,6 +7217,10 @@ export function recoveryService(
       }
 
       const newestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Memoised per candidate: the dependency-blocked arm below and the
+      // review-participant block can both need readiness for the same issue on
+      // the fall-through path this sweep now has (BLO-29604).
+      let dependencyReadiness: IssueDependencyReadiness | null = null;
       // `issue_terminal_status` means this queued dispatch was correctly
       // cancelled while the issue was terminal. The candidate query above has
       // already established that the issue is non-terminal now, so this is
@@ -7235,11 +7284,35 @@ export function recoveryService(
       const agentInvokable = agent && agent.companyId === issue.companyId
         ? await isAgentInvokable(agent)
         : false;
+      const dependencyBlockedStrand = latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
+        (issue.status === "in_review" || !agentInvokable);
+      if (dependencyBlockedStrand) {
+        dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id);
+      }
+      // BLO-29604: this arm's contract is "keep the owner and let the dependency
+      // machinery do the routing", and BOTH of its outputs need a blocker row to
+      // exist — `blocked` is only honest while one is unresolved, and the wake
+      // below is keyed on `resolvedBlockerIssueId`. With no blocker rows at all
+      // it is provably a no-op that still `continue`s, which is how a
+      // review-stage strand ended up with no recovery action, no
+      // blockers-resolved wake, and no scheduler dispatch (an `in_review` issue
+      // with a pending stage is never re-dispatched). That zero-blocker shape is
+      // the common one, not the edge case: `issue_dependencies_blocked` is also
+      // the code provider rate-limit/quota parks are finalized under, so it
+      // arrives on runs that never had a dependency at all.
+      //
+      // Consume the issue here only when there is something to consume it for;
+      // otherwise fall through and let the review-participant block below own
+      // it. For the `!agentInvokable` assignee lane that fall-through is
+      // behaviour-preserving by construction — the very next guard skips a
+      // non-`in_review` issue whose agent is not invokable — minus the phantom
+      // `issueIds` push a no-op used to record.
       if (
-        latestRun?.errorCode === "issue_dependencies_blocked" &&
-        (issue.status === "in_review" || !agentInvokable)
+        dependencyBlockedStrand && dependencyReadiness &&
+        (dependencyReadiness.unresolvedBlockerCount > 0 ||
+          (dependencyReadiness.blockerIssueIds.length > 0 && issue.assigneeAgentId !== null))
       ) {
-        const readiness = await issuesSvc.getDependencyReadiness(issue.id);
+        const readiness = dependencyReadiness;
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
         // A dependency-ready issue has no blocker wake backstop unless this
         // reconciliation persists one. Do not manufacture a blocked state for
@@ -7560,6 +7633,26 @@ export function recoveryService(
         }
 
         const participantContinuationClassification = classifyContinuationFailure(participantLatestRun);
+        // BLO-29604: `issue_dependencies_blocked` on a participant run is the
+        // dispatcher declining to *start* the reviewer, not the reviewer
+        // failing — `claimQueuedRun`'s dependency gate cancels any queued run
+        // for the issue, participant wakes included. It sits in
+        // NON_RETRYABLE_CONTINUATION_ERROR_CODES so a retry can never burn
+        // attempts against a genuinely open blocker, and while one is open that
+        // is right. Once readiness is satisfied the refusal has expired and the
+        // reviewer is precisely who should run, so treat it as requeueable
+        // instead: escalating parks a pending review stage `blocked` under a
+        // manager who cannot submit the decision, which is the ownership
+        // ratchet BLO-19123 exists to stop. Mirrors the assignee lane's own
+        // readiness re-check (BLO-19124) further down this function.
+        //
+        // Bounded, not a loop: the requeue below stamps retryReason
+        // `execution_review_participant_recovery`, so if that run also ends
+        // terminal the `didAutomaticRecoveryFail` arm escalates on the next
+        // sweep whatever error code it carries.
+        const participantDependencyRefusalExpired =
+          participantContinuationClassification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
+          (dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id)).isDependencyReady;
         const queuedParticipantRecovery = agentInvokable
           ? await hasQueuedExecutionReviewParticipantRecoveryWake(
               issue.companyId,
@@ -7570,7 +7663,8 @@ export function recoveryService(
           : false;
         if (
           isUnsuccessfulTerminalIssueRun(participantLatestRun) &&
-          participantContinuationClassification.kind === "non_retryable"
+          participantContinuationClassification.kind === "non_retryable" &&
+          !participantDependencyRefusalExpired
         ) {
           if (queuedParticipantRecovery) {
             result.skipped += 1;
@@ -8762,6 +8856,94 @@ export function recoveryService(
     // disabled" genuinely free instead of merely inert.
     if (cooldownMs <= 0 && unchangedTargetSuppressionMs <= 0) return null;
 
+    // Retired-row cooldown (BLO-28957). Checked before the `done` lookup below
+    // because it is the cheaper query -- bounded by the cooldown (60m default)
+    // rather than by `max(cooldown, unchangedTarget)` (7d) -- so a hit here
+    // saves the wide scan entirely.
+    //
+    // This exists because retiring a row IS the re-file trigger: the retire
+    // cancels the row, `openRecoveryIssues` then sees nothing open, and the very
+    // next sweep re-files. On a `done`-only cooldown the abandonment bound above
+    // would therefore have converted an unbounded wedge into an unbounded
+    // re-file loop -- the 48% re-file rate (240 of 500 rows, 2026-08-18) that
+    // BLO-28618 exists to kill, just on a timer. The bound and this hold are one
+    // change; neither is safe alone.
+    //
+    // Scoped to the COOLDOWN branch only, and that scoping is load-bearing. The
+    // `unchanged_target` branch below suppresses for up to 7 days on the reading
+    // that a report closed `done` without the leaf being touched should not
+    // re-raise every 75 minutes. A cancellation is not that: it is not a
+    // resolution, and the leaf of an abandoned row is quiet *by construction*
+    // (that is the finding's precondition), so letting `cancelled` reach that
+    // branch would suppress the re-escalation for a week and trade this issue's
+    // unbounded wedge for a 7-day recurring one. Feeding it through the 60m
+    // cooldown instead holds exactly one sweep-cycle's worth of churn and then
+    // lets the finding speak again.
+    //
+    // Kept as a SEPARATE query rather than widening the status filter below, so
+    // BLO-27676 is provably unperturbed. Widening that filter would let a
+    // recently-cancelled row out-sort an older `done` row under the shared
+    // `limit(1)`, which would silently *weaken* the target-state suppressor for
+    // reasons unrelated to this fix.
+    //
+    // Accepted cost, stated so a reviewer can weigh it: when a human cancels a
+    // row they consider bogus, re-escalation is delayed by one cooldown rather
+    // than firing on the next sweep. The end state is identical -- the finding
+    // re-files if it still reproduces -- so this trades ~1h of latency in that
+    // case for closing the loop. First-time detection on an incident sharing
+    // neither key nor leaf fingerprint is unaffected.
+    if (cooldownMs > 0) {
+      const cooldownCutoff = new Date(
+        now.getTime() - cooldownMs - LIVENESS_SUPPRESSION_SCAN_SKEW_MS,
+      );
+      const recentlyCancelled = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          status: issues.status,
+          completedAt: issues.completedAt,
+          updatedAt: issues.updatedAt,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, finding.companyId),
+            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+            or(
+              eq(issues.originId, finding.incidentKey),
+              eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
+            ),
+            visibleIssueCondition(),
+            eq(issues.status, "cancelled"),
+            // Same sargability and skew reasoning as the `done` query below:
+            // filter on bare `updated_at` (servable by
+            // `issues_company_updated_idx`) while comparing on
+            // `coalesce(completed_at, updated_at)`, with slack so a row whose
+            // `completed_at` leads `updated_at` is not dropped at the boundary.
+            gte(issues.updatedAt, cooldownCutoff),
+          ),
+        )
+        .orderBy(desc(sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`), desc(issues.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const cancelledAtMs = (recentlyCancelled?.completedAt ?? recentlyCancelled?.updatedAt)
+        ?.getTime();
+      if (
+        recentlyCancelled &&
+        cancelledAtMs !== undefined &&
+        Number.isFinite(cancelledAtMs) &&
+        cancelledAtMs >= now.getTime() - cooldownMs
+      ) {
+        return {
+          id: recentlyCancelled.id,
+          identifier: recentlyCancelled.identifier,
+          status: recentlyCancelled.status,
+          resolvedAtMs: cancelledAtMs,
+          reason: "cooldown" as const,
+        };
+      }
+    }
+
     // The ORDER BY must be the same expression that `resolvedAtMs` reads below,
     // or the row selected is not the row whose timestamp is compared. Ordering
     // by `updatedAt` alone was wrong in both directions: any post-close edit to
@@ -8790,9 +8972,27 @@ export function recoveryService(
     // result: every branch below already returns null for rows resolved before
     // that horizon (the cooldown branch needs `resolvedAtMs >= now - cooldownMs`;
     // the target branch returns null at `resolvedAtMs <= now -
-    // unchangedTargetSuppressionMs`). Excluding rows can only change WHICH row
-    // the `desc` ORDER BY picks if every candidate is excluded -- and that case
-    // returned null anyway.
+    // unchangedTargetSuppressionMs`).
+    //
+    // That the `desc` ORDER BY still picks the same row is NOT a separate
+    // argument that stands on its own -- it rests entirely on the skew allowance
+    // introduced below, so do not read it as surviving a smaller (or absent)
+    // `LIVENESS_SUPPRESSION_SCAN_SKEW_MS`. The guarantee is the superset
+    // property: GIVEN `completed_at <= updated_at + skew` on every row, any row
+    // with `resolvedAt >= now - horizon` also has `updated_at >= now - horizon -
+    // skew`, and so survives the filter. Every row capable of a non-null result
+    // therefore survives; if the global max `resolvedAt` survives it is still the
+    // max among survivors, and if it does not, no row clears the horizon and the
+    // answer is null either way.
+    //
+    // It is specifically NOT true that only excluding *every* candidate can move
+    // the pick -- excluding a strict subset can. Two `done` rows for one leaf
+    // under a 7d horizon: X at `completed_at = now-1h` / `updated_at = now-8d`,
+    // Y at both `now-3d`. X is dropped and Y is not, the winner flips from X to
+    // Y, and the outcome moves off the cooldown branch onto the leaf-read path,
+    // which can return null where the unfiltered query suppressed. X clears the
+    // invariant above by ~7d, which is exactly the point: it is the invariant,
+    // not the number of rows excluded, that the argument needs.
     //
     // The bound is on `updatedAt` rather than on `resolvedAtExpr` because only
     // the former is sargable. That makes it a superset ONLY up to skew between
@@ -8801,11 +9001,23 @@ export function recoveryService(
     // `services/issues.ts` builds its patch with `updatedAt: new Date()` and only
     // then calls `applyStatusSideEffects`, which sets `completedAt` from a second
     // clock read one request-body later -- so `completed_at >= updated_at` there,
-    // by however long the intervening validation and blocker reads take. (The
-    // escalation-close path below and the other four `update(issues)` sites do
-    // write both from one timestamp, and nothing bumps `updated_at` implicitly:
+    // by however long the intervening validation and blocker reads take. Every
+    // other path that writes `completed_at` runs in the SAFE direction: the
+    // `update(issues)` sites that touch it set `completedAt` and `updatedAt`
+    // from one clock read (the escalation-close path below and the reopen path,
+    // both `input.now`; `productivity-review.ts` stale-close and retire, `now` /
+    // `input.now`; `issue-tree-control.ts` cancel writes it null) -- those are
+    // examples, NOT an inventory -- and the create path (`services/issues.ts`,
+    // `values.completedAt = new Date()`) is an INSERT
+    // where `updated_at` takes `defaultNow()` at DB-write time, so
+    // `completed_at <= updated_at` there. Nothing bumps `updated_at` implicitly:
     // there is no `$onUpdate` on the column, and migration 0076 mirrors
-    // `updated_at` INTO `last_activity_at`, not back.)
+    // `updated_at` INTO `last_activity_at`, not back. Deliberately not stated as
+    // a count of call sites -- an earlier revision of this comment said "the
+    // other four", which was already wrong when written and would rot on the
+    // next refactor. The skew allowance below is what makes the exact inventory
+    // non-load-bearing: it holds for ANY path whose gap stays under it,
+    // including ones added later.
     //
     // Unskewed, that leaves a real hole: a row with
     // `updated_at < cutoff <= completed_at` is dropped by the filter, the
@@ -8847,10 +9059,13 @@ export function recoveryService(
             eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
           ),
           visibleIssueCondition(),
-          // `done` only, deliberately. A `cancelled` escalation means the report
-          // was wrong or was consolidated away -- not that the leaf was given an
-          // action path -- so that shape must re-escalate immediately. Pinned by
-          // "re-escalates immediately after a matching escalation is cancelled".
+          // `done` only, deliberately -- this is the branch that can suppress
+          // for 7 days, and only a genuine resolution earns that. `cancelled`
+          // is handled by the narrow cooldown-only lookup above (BLO-28957);
+          // routing it here instead would hold an abandoned row's source silent
+          // for a week, because such a leaf is quiet by construction. Pinned by
+          // "holds re-escalation for one cooldown after a matching escalation is
+          // cancelled", which asserts the 1h hold AND the release after it.
           eq(issues.status, "done"),
           // Sargable superset of the suppression horizon -- see the note above
           // the query. Restores the bound the 60m cooldown used to provide, and
@@ -9057,7 +9272,20 @@ export function recoveryService(
     return Boolean(contextRun || issueRun);
   }
 
-  async function retireObsoleteLivenessRecoveryIssues(findings: IssueLivenessFinding[]) {
+  async function retireObsoleteLivenessRecoveryIssues(
+    findings: IssueLivenessFinding[],
+    opts?: { now?: Date; abandonedAfterMs?: number },
+  ) {
+    const now = opts?.now ?? new Date();
+    const abandonedAfterMs = Math.max(
+      0,
+      Math.floor(asNumber(opts?.abandonedAfterMs, DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS)),
+    );
+    // 0 disables the bound rather than retiring everything: the
+    // `abandonedAfterMs > 0` guard at the comparison site means a zero restores
+    // the pre-BLO-28957 unbounded skip, which is the conservative reading of
+    // "turned off".
+    const abandonedCutoff = new Date(now.getTime() - abandonedAfterMs);
     const currentIncidentKeys = new Set(findings.map((finding) => finding.incidentKey));
     const currentLeafKeys = new Set(
       findings.map((finding) =>
@@ -9082,9 +9310,11 @@ export function recoveryService(
       retired: 0,
       activeSkipped: 0,
       sourceStillOpenSkipped: 0,
+      abandonedRetired: 0,
       blockerRelationsRemoved: 0,
       blockerPruneRestoreDegraded: 0,
       retiredIssueIds: [] as string[],
+      abandonedRetiredIssueIds: [] as string[],
     };
 
     for (const recovery of openRecoveries) {
@@ -9118,16 +9348,31 @@ export function recoveryService(
       // row and cancels it one sweep later, which is worse than the wedge it
       // replaced.
       //
-      // KNOWN GAP -- BLO-29137: this skip has no exit. The only automatic
-      // retirement path left is the source reaching `done`/`cancelled`, and
-      // suppression is edge-independent, so a row that is filed and never
-      // worked hides its source *and* its leaf indefinitely. Do NOT "fix" this
-      // by adding an age bound here first: retiring a row is itself the
-      // re-file trigger (`openRecoveryIssues` treats only `done`/`cancelled` as
-      // terminal), so a bound applied before BLO-28618 step 2 lands would
-      // re-introduce the amplifier on a timer. `sourceStillOpenSkipped` below
-      // exists to size this population in the meantime.
-      if (sourceIssue && !["done", "cancelled"].includes(sourceIssue.status)) {
+      // BLO-28957 closes that gap, and closes it HERE rather than by loosening
+      // suppression, because the retire is the narrower lever: it needs no
+      // change to `openRecoveryIssues`, so it cannot under-report a first-time
+      // dead end. The skip is now bounded by the ROW's own activity -- a row
+      // nobody has touched in `abandonedAfterMs` is abandoned and falls through
+      // to the retire below.
+      //
+      // `lastActivityAt` is the clock, and it is the right one: migration 0076
+      // mirrors every `updated_at` bump into it (BEFORE UPDATE trigger) and
+      // bumps it on comment insert (AFTER INSERT on `issue_comments`), so any
+      // real work on the row -- a status flip, an assignment change, or a human
+      // merely commenting -- resets the bound. Nothing in this sweep writes to
+      // the recovery row on a non-retiring pass, so the clock is not
+      // self-resetting.
+      //
+      // Safe only because the cooldown now also holds recently-`cancelled`
+      // rows. Retiring a row IS the re-file trigger, so on a `done`-only
+      // cooldown this bound would have converted an unbounded wedge into an
+      // unbounded re-file loop. The two halves are one change.
+      const recoveryLastActivityAt = recovery.lastActivityAt ?? recovery.updatedAt;
+      const abandoned = abandonedAfterMs > 0 && recoveryLastActivityAt <= abandonedCutoff;
+      const sourceStillOpen = Boolean(
+        sourceIssue && !["done", "cancelled"].includes(sourceIssue.status),
+      );
+      if (sourceStillOpen && !abandoned) {
         result.activeSkipped += 1;
         result.sourceStillOpenSkipped += 1;
         continue;
@@ -9146,9 +9391,123 @@ export function recoveryService(
       await issuesSvc.update(recovery.id, { status: "cancelled" });
       result.retired += 1;
       result.retiredIssueIds.push(recovery.id);
+      if (abandoned && sourceStillOpen) {
+        result.abandonedRetired += 1;
+        result.abandonedRetiredIssueIds.push(recovery.id);
+        await annotateAbandonedLivenessRecovery(recovery, parsed, recoveryLastActivityAt, now);
+      }
     }
 
     return result;
+  }
+
+  /**
+   * Record WHY a row was retired, on two surfaces that outlive the sweep.
+   *
+   * This is the answer to "which sources had a recovery row that suppressed them
+   * and was never worked", without reading sweep logs:
+   *
+   *  - an activity row with action `issue.liveness_recovery_abandoned`, keyed to
+   *    the SOURCE issue, carrying the incident key and the idle interval. This
+   *    is the queryable surface -- issue search covers title and description
+   *    only, so a comment alone would not be findable.
+   *  - a comment on the retired row carrying
+   *    `ABANDONED_LIVENESS_RECOVERY_MARKER`, so anyone who opens the row sees
+   *    why it closed rather than an unexplained cancellation.
+   *
+   * Two ordering constraints, both load-bearing:
+   *
+   * 1. This runs strictly AFTER the cancel. Commenting bumps the row's
+   *    `last_activity_at` (AFTER INSERT trigger on `issue_comments`, migration
+   *    0076), so annotate-then-crash would reset the abandonment clock and buy
+   *    the row another full bound of silent suppression -- reintroducing the
+   *    exact defect this fixes. Cancel-then-crash loses only the annotation.
+   * 2. The comment goes on the RECOVERY ROW, never on the source. The
+   *    escalation staleness gate reads `lastActivityAt` on the finding's
+   *    `recoveryIssue`, which is the leaf -- and the leaf IS the source in the
+   *    self-referential dead-end shape. For those findings a "helpful" note on
+   *    the source would push it back inside the staleness lookback and delay the
+   *    very re-escalation this retire exists to unblock.
+   *
+   * Neither surface may fail the retirement: the cancel is the part that
+   * restores the wake path, so annotation failures are logged and swallowed.
+   */
+  async function annotateAbandonedLivenessRecovery(
+    recovery: typeof issues.$inferSelect,
+    parsed: { companyId: string; issueId: string; leafIssueId: string; state: string },
+    lastActivityAt: Date,
+    now: Date,
+  ) {
+    const idleMs = Math.max(0, now.getTime() - lastActivityAt.getTime());
+    const idleDays = Math.floor(idleMs / (24 * 60 * 60 * 1000));
+    logger.warn(
+      {
+        recoveryIssueId: recovery.id,
+        recoveryIdentifier: recovery.identifier,
+        sourceIssueId: parsed.issueId,
+        leafIssueId: parsed.leafIssueId,
+        incidentKey: recovery.originId,
+        lastActivityAt: lastActivityAt.toISOString(),
+        idleMs,
+      },
+      "retired abandoned liveness recovery issue so its source can be re-escalated",
+    );
+    try {
+      await logActivity(db, {
+        companyId: recovery.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.liveness_recovery_abandoned",
+        entityType: "issue",
+        entityId: parsed.issueId,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          recoveryIssueId: recovery.id,
+          recoveryIdentifier: recovery.identifier,
+          incidentKey: recovery.originId,
+          leafIssueId: parsed.leafIssueId,
+          state: parsed.state,
+          lastActivityAt: lastActivityAt.toISOString(),
+          idleMs,
+        },
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, recoveryIssueId: recovery.id },
+        "failed to record abandoned liveness recovery activity; retirement itself still applied",
+      );
+    }
+    try {
+      await issuesSvc.addComment(
+        recovery.id,
+        [
+          `<!-- ${ABANDONED_LIVENESS_RECOVERY_MARKER} -->`,
+          `Retired automatically: this liveness recovery row saw no activity for ${idleDays}d ` +
+            `(last activity ${lastActivityAt.toISOString()}).`,
+          "",
+          `- Source issue: \`${parsed.issueId}\``,
+          `- Leaf issue: \`${parsed.leafIssueId}\``,
+          `- Finding: \`${parsed.state}\``,
+          `- Incident key: \`${recovery.originId ?? "unknown"}\``,
+          "",
+          "While open, this row suppressed liveness findings for both the source and the leaf, so " +
+            "leaving it open indefinitely would have kept the source silently unreportable " +
+            "(BLO-28957). Retiring it restores the source's wake path: the finding re-surfaces on " +
+            "the next sweep and re-escalates to a fresh owner once the re-escalation cooldown " +
+            "expires. Nothing is lost by this cancellation -- if the incident is still live, a " +
+            "fresh row is filed.",
+        ].join("\n"),
+        { runId: null },
+        { authorType: "system" },
+      );
+    } catch (error) {
+      logger.warn(
+        { err: error, recoveryIssueId: recovery.id },
+        "failed to annotate abandoned liveness recovery issue; retirement itself still applied",
+      );
+    }
   }
 
   async function retireDoneLivenessRecoveryBlockers() {
@@ -9407,20 +9766,30 @@ export function recoveryService(
       // Residual divergence, deliberately not modelled here. This list is
       // complete as of this head rather than illustrative -- it is what a reader
       // deciding "is this preview/run gap known or new?" will trust, so it
-      // enumerates every pre-creation exit in
-      // `createIssueGraphLivenessEscalation` that the preview does not reproduce:
+      // enumerates every exit in `createIssueGraphLivenessEscalation` that
+      // CREATES NO ROW and that the preview does not reproduce. Selected by
+      // outcome rather than by position, because a reader checking that question
+      // cares whether a row appeared, not whether the exit happened before or
+      // after the INSERT was attempted:
       //
       //   1. source issue vanished, or crossed companies since collection
       //   2. automatic recovery suppressed by a pause hold
       //   3. recovery issue vanished since collection
       //   4. an OPEN escalation already exists (returns `existing`)
       //   5. no resolvable owner agent
+      //   6. a concurrent run won the unique-violation race: the INSERT throws,
+      //      the conflict resolves to the racing row, and it returns `existing`
+      //      (the `catch` on `isUniqueLivenessRecoveryConflict` below). This is
+      //      (4) reached one step later, and is the reason the list is scoped by
+      //      outcome -- under a "pre-creation exits" scope it would be excluded
+      //      on a technicality while still producing the divergence the note
+      //      exists to account for.
       //
-      // All five are pre-existing and unchanged in magnitude by BLO-27676,
+      // All six are pre-existing and unchanged in magnitude by BLO-27676,
       // unlike the two suppressors above -- which is why they are recorded here
-      // rather than replicated. (4) is additionally rare by construction: an
-      // open escalation contributes a waiting path for its own leaf, so the
-      // finding is usually not collected at all.
+      // rather than replicated. (4) and (6) are additionally rare by
+      // construction: an open escalation contributes a waiting path for its own
+      // leaf, so the finding is usually not collected at all.
       //
       // One attribution nuance, not a count difference: when a finding has BOTH
       // an open escalation and a resolved `done` one, the run books it to
@@ -10519,6 +10888,8 @@ export function recoveryService(
     now?: Date;
     reescalationCooldownMs?: number;
     unchangedTargetSuppressionMs?: number;
+    /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
+    abandonedRecoveryMs?: number;
   }) {
     let findings = await collectIssueGraphLivenessFindings();
     if (opts?.issueCreatedAtGte) {
@@ -10554,7 +10925,13 @@ export function recoveryService(
     // about the default windows (BLO-27676 review).
     const { reescalationCooldownMs, unchangedTargetSuppressionMs } =
       normalizeLivenessSuppressionWindows(opts);
-    const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
+    const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings, {
+      now,
+      abandonedAfterMs: Math.max(
+        0,
+        Math.floor(asNumber(opts?.abandonedRecoveryMs, DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS)),
+      ),
+    });
     const activityByIssueKey = await loadLivenessRecoveryIssueLastActivityByKey(findings);
     const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();
     const result = {
@@ -10573,10 +10950,16 @@ export function recoveryService(
       obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
       // Breakout of the dominant `activeSkipped` arm. `activeSkipped` stays the
       // total so existing consumers keep working; this names the "source is
-      // still open" rows specifically, which is the BLO-29137 population --
-      // rows with no automatic exit. Rows deferred by an in-flight run are
-      // `activeSkipped - sourceStillOpenSkipped`.
+      // still open" rows specifically -- rows still being held. Rows deferred by
+      // an in-flight run are `activeSkipped - sourceStillOpenSkipped`.
       obsoleteRecoveriesSourceStillOpenSkipped: obsoleteRecoveryCleanup.sourceStillOpenSkipped,
+      // Rows that fell THROUGH that skip because the row itself went untouched
+      // past `abandonedRecoveryMs` (BLO-28957). These are the retirements that
+      // hand a source its wake path back, so this is the counter to watch when
+      // asking whether the bound is firing -- and, if it climbs while
+      // `escalationsCreated` climbs with it one cooldown later, whether it is
+      // firing on rows that should have been left alone.
+      obsoleteRecoveriesAbandonedRetired: obsoleteRecoveryCleanup.abandonedRetired,
       obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
       // Edge cleared but the status restore did not land -- the source is left
       // in the `blocked_without_blockers` trigger state. Non-zero means the

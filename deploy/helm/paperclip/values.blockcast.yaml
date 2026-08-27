@@ -414,13 +414,27 @@ githubApp:
   # status, so the context has to be posted at least once before a human can
   # select it. Until then this is observe-only.
   prCommentReviewGateStatusContext: "review/ally-comment"
-  # NOTE: `prReviewGateStatusContext` is intentionally left unset here. Its only
-  # writer posts state=failure (reviewer chain exhausted / ended ambiguously) —
-  # nothing in the server ever posts success for it, and no workflow or script
-  # in this repo posts it either. It is meant to red-flag an already-required
-  # context owned by an external writer (as on onprem-k8s). Marking it required
-  # on this repo would leave every healthy PR at "Expected — waiting for status"
-  # forever. Do not enable + require it here without a success writer.
+  # NOTE: `prReviewGateStatusContext` is shared by the legacy failure status
+  # and the durable review-gate authority below. The latter owns
+  # `review/ally-complete`, including its success writer.
+  # PEN-2073 rollout order:
+  # 1. Freeze review-gate merges.
+  # 2. Deploy this producer migration/code with both flags false; wait for every pod.
+  # 3. Set reviewGateCaptureEnabled=true, keep reviewGateEnabled=false, deploy,
+  #    and wait for every API replica. Deliveries now queue durably without dispatch.
+  # 4. Merge and deploy the Penstock repository_dispatch consumer.
+  # 5. Set reviewGateEnabled=true and deploy Paperclip. Release tooling refuses
+  #    promotion unless the live API Deployment has completed the capture-only
+  #    rollout, so old replicas keep capturing while workers drain the backlog.
+  # 6. Trigger a full reconciliation and verify statuses are authored by App 3966421.
+  # 7. Bind branch protection to review/ally-complete from App 3966421, then lift the freeze.
+  reviewGateCaptureEnabled: false
+  reviewGateEnabled: false
+  reviewGateRepositories:
+    - Blockcast/penstock-llm-proxy-core
+  reviewGateExpectedAppId: "3966421"
+  reviewGateExpectedInstallationId: "138085375"
+  prReviewGateStatusContext: review/ally-complete
 
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service

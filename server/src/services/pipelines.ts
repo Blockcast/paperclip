@@ -4502,12 +4502,15 @@ export function pipelineService(
             routineRevisionId: routineWithRevision.latestRevisionId,
             routineRevisionNumber: routineWithRevision.latestRevisionNumber,
           },
-        }, { deferPublish: true });
+        }, {
+          enlistPluginOutbox: true,
+          deferPublish: true,
+        });
         return { updatedRoutine: routineWithRevision, publish: activityPublish };
       });
       // Reached only on commit; a rollback throws straight past this.
       try {
-        publish();
+        await publish();
       } catch (err) {
         logger.warn(
           { err, companyId: input.companyId, stageId: input.stageId },
