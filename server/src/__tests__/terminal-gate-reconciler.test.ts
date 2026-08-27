@@ -145,6 +145,21 @@ describe("resolveTerminalGate", () => {
     expect(verdict.kind).toBe("satisfied");
     expect(reads).toBe(1);
   });
+
+  it("stops inside one issue when the shared PR read cap is exhausted", async () => {
+    let reads = 0;
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["pr:example/repo#1:merged", "pr:example/repo#2:merged"],
+      maxPullRequestReads: 1,
+      readPullRequestGate: async () => {
+        reads += 1;
+        return { state: "closed", merged: true };
+      },
+    });
+
+    expect(verdict).toEqual({ kind: "unresolved", reason: "pull_request_read_cap" });
+    expect(reads).toBe(1);
+  });
 });
 
 describe("terminalGateResolutionIdempotencyKey", () => {
