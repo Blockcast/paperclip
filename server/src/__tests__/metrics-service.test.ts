@@ -817,6 +817,7 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
       {
         agentId: "agent-enabled",
         heartbeatEnabled: true,
+        heartbeatExpected: true,
         heartbeatAgeSeconds: 120,
         heartbeatIntervalSeconds: 1800,
         errorDurationSeconds: 0,
@@ -824,6 +825,7 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
       {
         agentId: "agent-disabled",
         heartbeatEnabled: false,
+        heartbeatExpected: true,
         heartbeatAgeSeconds: 99999,
         heartbeatIntervalSeconds: 3600,
         errorDurationSeconds: 45,
@@ -845,15 +847,15 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
 
   it("reset-then-sets so an agent dropped from the next snapshot disappears rather than freezing stale", async () => {
     setAgentLivenessMetrics([
-      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
-      { agentId: "agent-b", heartbeatEnabled: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-b", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
     ]);
     let body = (await renderMetrics()).body;
     expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-b"} 20`);
 
     // Next publish: agent-b is gone (deleted, or heartbeat disabled).
     setAgentLivenessMetrics([
-      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
     ]);
     body = (await renderMetrics()).body;
     expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-a"} 40`);
@@ -865,6 +867,7 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
       {
         agentId: "agent-c",
         heartbeatEnabled: true,
+        heartbeatExpected: true,
         heartbeatAgeSeconds: Number.NaN,
         heartbeatIntervalSeconds: -5,
         errorDurationSeconds: -10,
@@ -875,6 +878,41 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
     expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-c"}`);
     expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-c"} 0`);
     expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+  });
+
+  // BLO-28861: `heartbeat.enabled` is not cleared on termination, so config
+  // alone let terminated agents export an age that grows forever and could
+  // never fall back under the alert threshold. `heartbeatExpected` is the
+  // second, independent gate; error duration must survive it untouched.
+  it("suppresses age+interval for a heartbeat-enabled agent that is not expected to heartbeat, while keeping its error duration", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-not-expected",
+        heartbeatEnabled: true,
+        heartbeatExpected: false,
+        heartbeatAgeSeconds: 9_876_543,
+        heartbeatIntervalSeconds: 30,
+        errorDurationSeconds: 77,
+      },
+      {
+        agentId: "agent-expected",
+        heartbeatEnabled: true,
+        heartbeatExpected: true,
+        heartbeatAgeSeconds: 42,
+        heartbeatIntervalSeconds: 1800,
+        errorDurationSeconds: 0,
+      },
+    ]);
+
+    const { body } = await renderMetrics();
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-not-expected"}`);
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-not-expected"}`);
+    // The gate is age/interval-only: error duration is a status observation,
+    // not a liveness claim, and BLO-28861 preserves its series set.
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-not-expected"} 77`);
+    // Control: the gate is not simply suppressing everything.
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-expected"} 42`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-expected"} 1800`);
   });
 });
 

@@ -75,18 +75,22 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
     lastHeartbeatAt?: Date | null;
     createdAt?: Date;
     updatedAt?: Date;
+    reportsTo?: string | null;
+    companyId?: string;
+    name?: string;
   }) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
-      companyId,
-      name: "Test agent",
+      companyId: overrides.companyId ?? companyId,
+      name: overrides.name ?? "Test agent",
       role: "engineer",
       status: overrides.status ?? "idle",
       adapterType: "claude_k8s",
       adapterConfig: {},
       runtimeConfig: overrides.runtimeConfig ?? {},
       permissions: {},
+      reportsTo: overrides.reportsTo ?? null,
       lastHeartbeatAt: overrides.lastHeartbeatAt ?? null,
       createdAt: overrides.createdAt,
       updatedAt: overrides.updatedAt,
@@ -178,5 +182,210 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
     await db.delete(agents).where(sql`${agents.id} = ${agentId}`);
     await heartbeat.reconcileFailedWakeDispatches(now);
     expect(await gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, agentId)).toBeUndefined();
+  });
+
+  // BLO-28861: `heartbeat.enabled` is never cleared on termination, so gating
+  // on config alone exported an unbounded, permanently-over-threshold age for
+  // every agent the scheduler will never wake again. Measured against live
+  // Prometheus before the fix: 19 of 36 series cleared `age > 3*interval`, 18
+  // of them permanently false. The predicate below is the SAME
+  // `evaluateAgentInvokability` gate the timer scheduler uses, so "expected to
+  // heartbeat" and "would actually be woken" cannot drift apart.
+  describe("only publishes age/interval for agents the scheduler would wake", () => {
+    const now = new Date("2026-08-21T12:00:00Z");
+    // Old enough to be over 3x interval for every interval used here, so a
+    // series appearing at all is a false page -- not merely a present series.
+    const ancient = new Date(now.getTime() - 90 * 24 * 3600 * 1000);
+    const enabled30s = { heartbeat: { enabled: true, intervalSec: 30 } };
+    const enabled1800s = { heartbeat: { enabled: true, intervalSec: 1800 } };
+
+    async function ageOf(agentId: string) {
+      return gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, agentId);
+    }
+    async function intervalOf(agentId: string) {
+      return gaugeValue(AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC, agentId);
+    }
+
+    it("(a) excludes a terminated agent with heartbeat.enabled and a stale lastHeartbeatAt, but keeps its error duration", async () => {
+      // Jimmy `d5977650` in production: terminated, enabled:true, intervalSec
+      // 30, lastHeartbeatAt 2026-04-27 -> 114d of age against a 90s threshold.
+      const terminated = await seedAgent({
+        status: "terminated",
+        runtimeConfig: enabled30s,
+        lastHeartbeatAt: ancient,
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await ageOf(terminated)).toBeUndefined();
+      expect(await intervalOf(terminated)).toBeUndefined();
+      // The gate is age/interval-only: AC #4 keeps error-duration series intact.
+      expect(await gaugeValue(AGENT_ERROR_DURATION_SECONDS_METRIC, terminated)).toBe(0);
+    });
+
+    it("(a') excludes a terminated agent that never heartbeated at all", async () => {
+      // Ally 2 `69b4c2f9`: terminated, enabled:true, lastHeartbeatAt NULL, so
+      // the createdAt anchor made its age grow forever from 2026-05-16.
+      const terminatedNeverRan = await seedAgent({
+        status: "terminated",
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 86400 } },
+        lastHeartbeatAt: null,
+        createdAt: ancient,
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await ageOf(terminatedNeverRan)).toBeUndefined();
+    });
+
+    it("(b) excludes a pending_approval agent", async () => {
+      const pending = await seedAgent({
+        status: "pending_approval",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: ancient,
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await ageOf(pending)).toBeUndefined();
+      expect(await intervalOf(pending)).toBeUndefined();
+    });
+
+    it("(c) STILL publishes for a heartbeat-enabled agent in status=error", async () => {
+      // The regression guard the acceptance criteria call out: an errored
+      // agent is invokable, and a dark errored agent is the original
+      // 2026-08-08 incident. Written as an allow-list of only `running`, the
+      // filter would break exactly here.
+      const errored = await seedAgent({
+        status: "error",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: new Date(now.getTime() - 7200_000),
+        updatedAt: new Date(now.getTime() - 300_000),
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      const age = await ageOf(errored);
+      expect(age).toBe(7200);
+      // Still clears the alert threshold -- the agent stays alertable.
+      expect(age!).toBeGreaterThan(3 * 1800);
+      expect(await intervalOf(errored)).toBe(1800);
+      expect(await gaugeValue(AGENT_ERROR_DURATION_SECONDS_METRIC, errored)).toBe(300);
+    });
+
+    it("(d) STILL publishes for a live idle agent that has never heartbeated, anchored on createdAt", async () => {
+      const neverRan = await seedAgent({
+        status: "idle",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: null,
+        createdAt: new Date(now.getTime() - 500_000),
+        updatedAt: now,
+      });
+      const running = await seedAgent({
+        status: "running",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: new Date(now.getTime() - 60_000),
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await ageOf(neverRan)).toBe(500);
+      expect(await intervalOf(neverRan)).toBe(1800);
+      expect(await ageOf(running)).toBe(60);
+    });
+
+    it("(e) excludes a paused agent and an agent reporting through a terminated manager", async () => {
+      // Both are skipped by the scheduler's own `!invokability.invokable`
+      // gate, so both are dark by construction rather than by fault.
+      const paused = await seedAgent({
+        status: "paused",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: ancient,
+        updatedAt: now,
+      });
+      const deadManager = await seedAgent({
+        status: "terminated",
+        name: "Dead manager",
+        runtimeConfig: { heartbeat: { enabled: false } },
+        updatedAt: now,
+      });
+      const orphan = await seedAgent({
+        status: "idle",
+        name: "Orphan",
+        reportsTo: deadManager,
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: ancient,
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await ageOf(paused)).toBeUndefined();
+      expect(await ageOf(orphan)).toBeUndefined();
+      // Still counted for error duration, so neither vanishes from the fleet.
+      expect(await gaugeValue(AGENT_ERROR_DURATION_SECONDS_METRIC, orphan)).toBe(0);
+    });
+
+    it("(f) excludes an otherwise-healthy agent whose company is not active", async () => {
+      // The scheduler's agent query inner-joins `companies` on
+      // status='active', so an agent in a paused company is never woken.
+      const inactiveCompanyId = randomUUID();
+      await db.insert(companies).values({
+        id: inactiveCompanyId,
+        name: "Paused co",
+        issuePrefix: "PAU",
+        status: "paused",
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      const dormant = await seedAgent({
+        companyId: inactiveCompanyId,
+        status: "idle",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: ancient,
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      expect(await ageOf(dormant)).toBeUndefined();
+      expect(await gaugeValue(AGENT_ERROR_DURATION_SECONDS_METRIC, dormant)).toBe(0);
+    });
+
+    it("must-trip control: the whole cohort together fires 1 of 6, not 6 of 6", async () => {
+      // The end-to-end shape of the production defect. Without the filter all
+      // six of these publish an age over 3x interval and the alert can never
+      // clear; with it, only the genuinely-dark live agent does.
+      await seedAgent({ status: "terminated", runtimeConfig: enabled30s, lastHeartbeatAt: ancient, updatedAt: now });
+      await seedAgent({ status: "terminated", runtimeConfig: enabled30s, lastHeartbeatAt: null, createdAt: ancient, updatedAt: now });
+      await seedAgent({ status: "pending_approval", runtimeConfig: enabled1800s, lastHeartbeatAt: ancient, updatedAt: now });
+      await seedAgent({ status: "paused", runtimeConfig: enabled1800s, lastHeartbeatAt: ancient, updatedAt: now });
+      await seedAgent({ status: "idle", runtimeConfig: enabled1800s, lastHeartbeatAt: new Date(now.getTime() - 60_000), updatedAt: now });
+      const genuinelyDark = await seedAgent({
+        status: "idle",
+        runtimeConfig: enabled1800s,
+        lastHeartbeatAt: ancient,
+        updatedAt: now,
+      });
+
+      await heartbeat.reconcileFailedWakeDispatches(now);
+
+      const ages = (await (getMetricsRegistry().getSingleMetric(AGENT_HEARTBEAT_AGE_SECONDS_METRIC))!.get()) as {
+        values: Array<{ labels: Record<string, string>; value: number }>;
+      };
+      const intervals = (await (getMetricsRegistry().getSingleMetric(AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC))!.get()) as {
+        values: Array<{ labels: Record<string, string>; value: number }>;
+      };
+      const intervalById = new Map(intervals.values.map((v) => [v.labels.agent_id, v.value]));
+      const firing = ages.values.filter((v) => v.value > 3 * (intervalById.get(v.labels.agent_id) ?? Infinity));
+
+      expect(firing.map((v) => v.labels.agent_id)).toEqual([genuinelyDark]);
+      // Six seeded, only the two live agents are even eligible to be judged.
+      expect(ages.values).toHaveLength(2);
+    });
   });
 });
