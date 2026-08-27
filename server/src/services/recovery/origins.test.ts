@@ -52,6 +52,10 @@ describe("parseAgentHealthReceiptWindowKey", () => {
     expect(parseAgentHealthReceiptWindowKey("agent-health:")).toBeNull();
     expect(parseAgentHealthReceiptWindowKey("agent-health:not-a-date:x")).toBeNull();
     expect(parseAgentHealthReceiptWindowKey("agent-health:2026-13-45T99:00:00.000Z:x")).toBeNull();
+    // JavaScript normalizes shape-valid dates such as February 30th unless the
+    // parsed date is checked against the captured ISO calendar date.
+    expect(parseAgentHealthReceiptWindowKey("agent-health:2026-02-30T06:00:00Z:x")).toBeNull();
+    expect(parseAgentHealthReceiptWindowKey("agent-health:2026-04-31T06:00:00Z:x")).toBeNull();
     // The scheduler's own receipts must never read as a normal emission, or one
     // receipt would suppress the next sweep's.
     expect(
