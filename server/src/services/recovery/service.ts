@@ -107,6 +107,11 @@ import {
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { resolveStrandedEscalationStatus } from "./stranded-escalation-status.js";
 import {
+  recordBackstopCandidateSkipped,
+  recordBackstopSweepCompleted,
+  setBackstopDeferredCandidates,
+} from "../metrics.js";
+import {
   isLegacySessionUnavailableAdapterMismatch,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
@@ -1798,6 +1803,8 @@ export function recoveryService(
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
   let strandedRecoveryWakeBackstopCandidateCursor: string | null = null;
+  let resolvedDependencyWakeBackstopTail = Promise.resolve();
+  let strandedRecoveryWakeBackstopTail = Promise.resolve();
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -10597,7 +10604,7 @@ export function recoveryService(
     return { kind: "created" as const, escalationIssueId: escalation.id };
   }
 
-  async function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
+  async function reconcileResolvedDependencyWakeBackstopImpl(opts?: ResolvedDependencyWakeBackstopOptions) {
     const result = {
       checked: 0,
       healed: 0,
@@ -10675,6 +10682,9 @@ export function recoveryService(
     const candidates = candidateRows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
     result.checked = candidates.length;
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
+    if (source !== "workspace.finalize") {
+      setBackstopDeferredCandidates("issue_graph_liveness.backstop", result.candidateLimitSkipped);
+    }
     const lastCandidate = candidates[candidates.length - 1] ?? null;
     if (useCursor) {
       resolvedDependencyWakeBackstopCandidateCursor =
@@ -10822,6 +10832,17 @@ export function recoveryService(
       }
     }
 
+    if (source !== "workspace.finalize") {
+      for (const [reason, count] of [
+        ["not_ready", result.notReadySkipped], ["existing_wake", result.existingWakeSkipped],
+        ["live_path", result.livePathSkipped], ["pause_hold", result.pauseHoldSkipped],
+        ["interaction", result.interactionSkipped],
+      ] as const) {
+        for (let i = 0; i < count; i++) recordBackstopCandidateSkipped("issue_graph_liveness.backstop", reason);
+      }
+      if (result.candidateLimitSkipped === 0) recordBackstopSweepCompleted("issue_graph_liveness.backstop");
+    }
+
     if (result.healed > 0) {
       logger.warn(
         { healed: result.healed, issueIds: result.issueIds, source, blockerIssueId: opts?.blockerIssueId ?? null },
@@ -10964,7 +10985,7 @@ export function recoveryService(
    * that classifier only runs when something writes to the issue and the failure mode is
    * that nothing does.
    */
-  async function reconcileStrandedRecoveryWakeBackstop(opts?: {
+  async function reconcileStrandedRecoveryWakeBackstopImpl(opts?: {
     runId?: string | null;
     companyId?: string | null;
     now?: Date;
@@ -11041,6 +11062,7 @@ export function recoveryService(
     const candidates = candidateRows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
     result.checked = candidates.length;
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
+    setBackstopDeferredCandidates("stranded_recovery_wake_backstop", result.candidateLimitSkipped);
     const lastCandidate = candidates[candidates.length - 1] ?? null;
     strandedRecoveryWakeBackstopCandidateCursor =
       result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.actionId : null;
@@ -11280,7 +11302,30 @@ export function recoveryService(
       );
     }
 
+    for (const [reason, count] of [
+      ["no_owner", result.noOwnerSkipped], ["cause", result.causeSkipped],
+      ["exhausted", result.exhaustedSkipped], ["cooldown", result.cooldownSkipped],
+      ["live_path", result.livePathSkipped], ["interaction", result.interactionSkipped],
+      ["pause_hold", result.pauseHoldSkipped], ["claim_lost", result.claimLost],
+      ["deferred_or_failed", result.deferredOrFailed], ["enqueue_failed", result.enqueueFailed],
+    ] as const) {
+      for (let i = 0; i < count; i++) recordBackstopCandidateSkipped("stranded_recovery_wake_backstop", reason);
+    }
+    if (result.candidateLimitSkipped === 0) recordBackstopSweepCompleted("stranded_recovery_wake_backstop");
+
     return result;
+  }
+
+  function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
+    const run = resolvedDependencyWakeBackstopTail.then(() => reconcileResolvedDependencyWakeBackstopImpl(opts));
+    resolvedDependencyWakeBackstopTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  function reconcileStrandedRecoveryWakeBackstop(opts?: Parameters<typeof reconcileStrandedRecoveryWakeBackstopImpl>[0]) {
+    const run = strandedRecoveryWakeBackstopTail.then(() => reconcileStrandedRecoveryWakeBackstopImpl(opts));
+    strandedRecoveryWakeBackstopTail = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   async function reconcileIssueGraphLiveness(opts?: {

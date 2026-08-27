@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   AGENT_NO_USAGE_STREAK_METRIC,
   AUTH_REQUEST_METRIC,
+  BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+  BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+  BACKSTOP_SWEEP_COMPLETED_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   ROUTINE_DISPATCH_METRIC,
@@ -25,9 +28,12 @@ import {
   recordConcurrentRunBlocked,
   recordAgentZeroTokenCompletedRunStreak,
   recordAuthRequest,
+  recordBackstopCandidateSkipped,
+  recordBackstopSweepCompleted,
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
+  setBackstopDeferredCandidates,
   EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
   GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
   KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
@@ -1222,5 +1228,28 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
     const { body } = await renderMetrics();
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
+  });
+});
+
+describe("backstop metrics (BLO-29763)", () => {
+  it("publishes both bounded streams at zero, then records depth, completion, and skips", async () => {
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="stranded_recovery_wake_backstop"} 0`);
+
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 7);
+    recordBackstopSweepCompleted("stranded_recovery_wake_backstop");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "not_ready");
+    body = (await renderMetrics()).body;
+
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 7`);
+    expect(body).toContain(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="stranded_recovery_wake_backstop"} 1`);
+    expect(body).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="not_ready"} 1`,
+    );
+
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 0);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
   });
 });
