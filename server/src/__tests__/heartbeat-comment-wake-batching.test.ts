@@ -1641,7 +1641,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       const secondWake = parseWakePayloadFromMessage(secondPayload.message);
       expect(secondWake).toMatchObject({
         reason: "issue_commented",
-        commentIds: [selfComment.id, humanComment.id],
+        // The self-authored comment remains part of deferred wake identity,
+        // but payload construction forwards the newest live comment only.
+        commentIds: [humanComment.id],
         latestCommentId: humanComment.id,
         issue: {
           id: issueId,
