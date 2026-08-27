@@ -4897,7 +4897,12 @@ export function recoveryService(
     issue: typeof issues.$inferSelect;
     recoveryCause: StrandedRecoveryCause;
     latestRun: LatestIssueRun;
+    blockerIssueIds?: string[];
   }) {
+    const blockerIssueIds = [...new Set(input.blockerIssueIds ?? [])].sort();
+    const blockerSignature = blockerIssueIds.length > 0
+      ? `:blockers=${blockerIssueIds.join(",")}`
+      : "";
     if (input.recoveryCause === "workspace_validation_failed") {
       const workspaceFingerprint = readWorkspaceValidationFingerprint(input.latestRun);
       if (workspaceFingerprint) {
@@ -4907,7 +4912,7 @@ export function recoveryService(
           input.issue.id,
           input.recoveryCause,
           workspaceFingerprint,
-        ].join(":");
+        ].join(":") + blockerSignature;
       }
     }
     return [
@@ -4921,7 +4926,7 @@ export function recoveryService(
       // every sweep of an unresolved failure. The budget resets on a change of
       // `ownerAgentId` instead; see `upsertSourceScopedUnlocked`.
       input.issue.assigneeAgentId ?? "unassigned",
-    ].join(":");
+    ].join(":") + blockerSignature;
   }
 
   function buildStrandedRecoveryActionEvidence(input: {
@@ -4974,6 +4979,7 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    blockerIssueIds?: string[];
   }, dbOrTx: Db | DbTransaction = db) {
     const actionSvc = dbOrTx === db ? recoveryActionsSvc : issueRecoveryActionService(dbOrTx);
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
@@ -5025,6 +5031,7 @@ export function recoveryService(
         issue: input.issue,
         recoveryCause,
         latestRun: input.latestRun,
+        blockerIssueIds: input.blockerIssueIds,
       })) {
       return { action: existingAction, hasNewActivitySinceLastAttempt, unchangedOwnerless: true };
     }
@@ -5042,6 +5049,7 @@ export function recoveryService(
         issue: input.issue,
         recoveryCause,
         latestRun: input.latestRun,
+        blockerIssueIds: input.blockerIssueIds,
       }),
       evidence: {
         ...buildStrandedRecoveryActionEvidence({
@@ -6449,6 +6457,10 @@ export function recoveryService(
       }
 
       const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+      const {
+        blockerIssueIds: blockerIds,
+        needsHumanDecision,
+      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id, tx);
       const { action, hasNewActivitySinceLastAttempt, unchangedOwnerless } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
@@ -6456,14 +6468,11 @@ export function recoveryService(
         recoveryCause,
         recoveryOwnerAgentId: input.recoveryOwnerAgentId,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+        blockerIssueIds: blockerIds,
       }, tx);
       if (unchangedOwnerless) return null;
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
-      const {
-        blockerIssueIds: blockerIds,
-        needsHumanDecision,
-      } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id, tx);
 
       // Wakes and quota monitors are intentionally deferred until after commit.
       // Both can write issue/run state through another pooled connection and must
