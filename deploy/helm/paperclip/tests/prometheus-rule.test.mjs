@@ -952,35 +952,17 @@ test("PaperclipExternalRuntimeReservationStranded gates on strand state, not raw
     /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?\n\s+expr: (.+)\n/,
   ) ?? [];
   assert.ok(expr, "stranded-reservation alert must render an expr");
-
-  // AC#5's load-bearing half: the rule must NOT be a threshold over the
-  // pre-existing raw age gauge. That gauge measures reservation age alone, so
-  // any threshold over it fires on a legitimately long-running run (measured
-  // 7d spread on healthy replicas: ~93 min to ~9.0h). The strand condition --
-  // run terminal, or run silent past the hard-stale floor -- is evaluated
-  // server-side in SQL and published as its own series; asserting the series
-  // name here is what prevents a future edit from "simplifying" the rule back
-  // onto the ambiguous gauge.
   assert.doesNotMatch(
     expr,
     /paperclip_external_runtime_reservation_oldest_age_seconds/,
-    "stranded-reservation alert must not threshold the raw age gauge: it cannot "
-      + "distinguish a stranded reservation from a legitimately long-running run",
+    "stranded-reservation alert must not threshold raw reservation age",
   );
   assert.match(
     expr,
     /^max by \(agent_id\) \(paperclip_external_runtime_reservation_stranded_oldest_age_seconds and on\(instance\) \(paperclip_external_runtime_reservation_strand_metrics_refresh_success == 1\)\) > (\d+)$/,
-    "stranded-reservation alert must be agent-keyed and gate each replica's age "
-      + "against its own refresh result before taking the per-agent max",
   );
-
   const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
-  // Reset-then-set to 0 for every known agent on each refresh, so a strictly
-  // positive threshold is the silent-in-steady-state guarantee.
-  assert.ok(
-    Number(ageThreshold) > 0,
-    "age threshold must be strictly positive so a zero-valued gauge is silent",
-  );
+  assert.ok(Number(ageThreshold) > 0);
 
   const [, forWindow] = rendered.match(
     /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?\n\s+for: (.+)\n/,
@@ -991,29 +973,11 @@ test("PaperclipExternalRuntimeReservationStranded gates on strand state, not raw
     : /^(\d+)h$/.test(forWindow.trim())
       ? Number(forWindow.trim().slice(0, -1)) * 60
       : null;
-  assert.ok(
-    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
-    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
-      + "the ageing belongs in the age-gauge threshold, not here",
-  );
-
-  // The alert only earns its place if it beats the incidental recovery it
-  // replaces. Pre-fix, a wedged agent resolved when the orphaned Job was
-  // force-killed at EXTERNAL_LIFECYCLE_HARD_STALE_MS (45 min). Threshold plus
-  // `for:` is the first real-clock moment this can fire, and it must land
-  // meaningfully inside that boundary -- checking either in isolation is the
-  // gap the BLO-21116 review caught on the sibling rule.
-  assert.ok(
-    Number(ageThreshold) + forMinutes * 60 < 45 * 60,
-    `age threshold ${ageThreshold}s plus for-window ${forWindow} stacks to `
-      + `${Number(ageThreshold) + forMinutes * 60}s, at or past the 2700s (45m) `
-      + "hard-stale boundary the alert exists to pre-empt",
-  );
-
+  assert.ok(forMinutes !== null && forMinutes > 0 && forMinutes <= 10);
+  assert.ok(Number(ageThreshold) + forMinutes * 60 < 45 * 60);
   assert.match(
     rendered,
-    /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?runbook_url: "[^"]*runbooks\/external-runtime-reservation-stranded\.md"/,
-    "stranded-reservation alert must link the runbook from its annotation",
+    /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?runbook_url: "[^\"]*runbooks\/external-runtime-reservation-stranded\.md"/,
   );
 });
 
@@ -1028,11 +992,9 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   assert.match(
     rendered,
     /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_external_runtime_reservation_strand_metrics_refresh_success == 0\n/,
-    "a failed stranded-reservation refresh must have its own alert",
   );
   assert.match(
     rendered,
-    /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/external-runtime-reservation-stranded\.md"/,
-    "the freshness failure alert must route responders to the reservation runbook",
+    /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/external-runtime-reservation-stranded\.md"/,
   );
 });
