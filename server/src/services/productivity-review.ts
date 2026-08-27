@@ -32,6 +32,10 @@ import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
+  listResolvedTerminalGates,
+  readIssueMonitorGateSignals,
+} from "./terminal-gate-reconciler.js";
+import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
@@ -1271,6 +1275,28 @@ function isDependencyBlockedClosableTrigger(trigger: unknown) {
 // closed, matching the single-trigger predicate's treatment of a missing trigger.
 function isDependencyBlockedClosableTriggerSet(triggers: unknown) {
   return Array.isArray(triggers) && triggers.length > 0 && triggers.every(isDependencyBlockedClosableTrigger);
+}
+
+// BLO-27515: which triggers a *resolved* terminal gate excuses. Only
+// `long_active_duration`, and the scoping matters more here than it looks.
+//
+// A satisfied gate explains exactly one thing: the elapsed wall-clock was spent
+// waiting on something that has since happened, and no assignee run was
+// dispatched to notice. It explains nothing about conduct. `high_churn` and
+// `runtime_failure_streak` are records of runs that did execute and did burn
+// cost or fail; a pull request merging does not make either untrue.
+// `no_comment_streak` is excluded too, unlike the dependency-blocked set above:
+// a dependency gate *causes* silence by cancelling queued runs before dispatch,
+// whereas a monitor gate does not stop the assignee from commenting — so
+// silence under a resolved gate is still worth a manager's attention.
+//
+// Set form, and every trigger must be closable: a review that also fired a
+// non-closable trigger still files. That is what keeps this from becoming an
+// evasion — an assignee who armed a monitor on an already-merged PR cannot
+// retire an accountability artifact with it.
+function isTerminalGateClosableTriggerSet(triggers: unknown) {
+  return Array.isArray(triggers) && triggers.length > 0
+    && triggers.every((trigger) => trigger === "long_active_duration");
 }
 
 // Close-path form: the persisted `details.firedTriggers` when the review was
@@ -2616,6 +2642,41 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     });
     logger.info(details, "productivity review long_active_duration suppressed by scheduled monitor");
     return true;
+  }
+
+  /**
+   * BLO-27515: audit the suppression so a silenced review is still legible. The
+   * detector reads only the recorded resolution — the gate itself was re-read
+   * board-side by the terminal-gate reconciler, which also left a comment on
+   * the source issue naming the resolved gate.
+   */
+  async function recordTerminalGateResolvedSuppression(
+    sourceIssue: IssueRow,
+    evidence: ProductivityReviewEvidence,
+  ) {
+    const details = {
+      source: "productivity_review.reconcile",
+      sourceIssueId: sourceIssue.id,
+      trigger: evidence.trigger,
+      firedTriggers: evidence.firedTriggers,
+      suppressedBy: "terminal_gate_resolved",
+      gateSignals: readIssueMonitorGateSignals(sourceIssue.executionState),
+      elapsedMs: evidence.elapsedMs,
+    };
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: sourceIssue.assigneeAgentId,
+      action: "issue.productivity_review_suppressed",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details,
+    });
+    logger.info(
+      details,
+      "productivity review long_active_duration suppressed by an already-resolved terminal gate (BLO-27515)",
+    );
   }
 
   /**
@@ -4593,6 +4654,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorScheduledSuppressed: 0,
       approvalGatedSuppressed: 0,
       dependencyBlockedSuppressed: 0,
+      terminalGateResolvedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
@@ -4687,6 +4749,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     const prefixCache = new Map<string, string>();
+
+    // BLO-27515: sources whose terminated monitor declared pull-request gates
+    // that a board-side re-read has since found satisfied. This is a plain
+    // lookup of an already-recorded result — the detector never reads GitHub
+    // itself. Re-evaluation lives in the terminal-gate reconciler precisely so
+    // that the gate is observed on its own cadence rather than only once an
+    // issue has already crossed the 6h threshold this detector measures.
+    const terminalGateResolutions = await listResolvedTerminalGates(
+      db,
+      candidates.map((candidate) => ({ id: candidate.id, executionState: candidate.executionState })),
+    );
+
     for (const candidate of candidates) {
       if (recoveredReservations.recoveredSourceIssueIds.has(candidate.id)) {
         continue;
@@ -4729,6 +4803,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (isMonitorScheduledSuppression(evidence)) {
         await recordMonitorScheduledSuppression(evidence);
         result.monitorScheduledSuppressed += 1;
+        continue;
+      }
+      // Checked after the approval and monitor gates on purpose. Both of those
+      // describe a gate that is still *live* — a pending approval, a monitor
+      // with a future check — and are the more accurate explanation whenever
+      // they apply. A recorded resolution outlives the monitor that produced
+      // it, so a same-signal re-arm would otherwise be reported here under a
+      // gate that has since been re-opened.
+      if (
+        terminalGateResolutions.has(candidate.id) &&
+        now.getTime() - terminalGateResolutions.get(candidate.id)!.createdAt.getTime() < thresholds.longActiveMs &&
+        isTerminalGateClosableTriggerSet(evidence.firedTriggers)
+      ) {
+        await recordTerminalGateResolvedSuppression(candidate, evidence);
+        result.terminalGateResolvedSuppressed += 1;
         continue;
       }
       if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {

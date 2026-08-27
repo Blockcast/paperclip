@@ -36,6 +36,7 @@ import {
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST } from "../services/pull-request-work-products.js";
+import { terminalGateResolutionIdempotencyKey } from "../services/terminal-gate-reconciler.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -6772,5 +6773,223 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // BLO-27515: the exact BLO-24166 shape. The monitor's declared gate
+  // (`pr:blockcast/paperclip#1281:merged`) was satisfied 16 minutes after its
+  // last poll, polling had already stopped, and the review then fired at the 6h
+  // mark on an issue whose work had landed 2.5 days earlier. The terminal-gate
+  // reconciler records the resolution board-side; generation must consume that
+  // record and file nothing.
+  async function armTerminatedGateMonitor(input: { issueId: string; gateSignals: string[] }) {
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        monitorScheduledBy: "assignee",
+        monitorLastTriggeredAt: new Date("2026-04-28T05:00:00.000Z"),
+        monitorAttemptCount: 3,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "triggered",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-04-28T05:00:00.000Z",
+            attemptCount: 3,
+            notes: "merged=NO",
+            scheduledBy: "assignee",
+            gateSignals: input.gateSignals,
+            gateSource: "gates",
+            convergenceCount: 3,
+            clearedAt: null,
+            clearReason: null,
+          },
+        } as never,
+      })
+      .where(eq(issues.id, input.issueId));
+    for (const signal of input.gateSignals) {
+      const match = /^pr:([^:]+):[a-z0-9_-]+$/.exec(signal);
+      if (!match) continue;
+      await db.insert(issueWorkProducts).values({
+        companyId: (await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, input.issueId)))[0]!.companyId,
+        issueId: input.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: match[1],
+        title: match[1],
+        status: "merged",
+        metadata: { source: "github_pull_request_webhook" },
+        sourceTrust: {
+          preset: "standard",
+          disposition: "promoted",
+          promotedByActorType: "system",
+          promotedByActorId: "github_pull_request_webhook",
+        },
+      });
+    }
+  }
+
+  async function recordTerminalGateResolution(input: {
+    companyId: string;
+    issueId: string;
+    gateSignals: string[];
+  }) {
+    await db.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      authorType: "system",
+      idempotencyKey: terminalGateResolutionIdempotencyKey(input.gateSignals),
+      body: "Terminal gate resolved (test fixture).",
+    });
+  }
+
+  it("does not file a long_active_duration review when the terminal gate is already resolved (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    // Countable on its own, like every other suppression: a silenced review that
+    // is invisible is the failure mode this whole area keeps relearning.
+    expect(result.terminalGateResolvedSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const suppressions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(suppressions).toHaveLength(1);
+    expect((suppressions[0]?.details as { suppressedBy?: string })?.suppressedBy)
+      .toBe("terminal_gate_resolved");
+  });
+
+  it("still files the review when the same monitor gate has NOT been resolved (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await armTerminatedGateMonitor({
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("does not let a resolution recorded for a different gate set suppress the review (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await armTerminatedGateMonitor({
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+    // A re-arm on a new gate leaves the old resolution comment behind. It must
+    // stop matching, or oversight never resumes.
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1400:merged"],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("still files when a non-closable trigger co-fires with long_active_duration under a resolved gate (BLO-27515)", async () => {
+    // A resolved gate explains elapsed wall-clock. It does not explain runs that
+    // executed and burned cost, so `high_churn` evidence must survive it — the
+    // same evasion `isDependencyBlockedClosableTriggerSet` refuses.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("resumes long-active oversight after the terminal-gate quiet window expires (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorType: "system",
+      idempotencyKey: terminalGateResolutionIdempotencyKey(gateSignals),
+      body: "Terminal gate resolved.",
+      createdAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
   });
 });

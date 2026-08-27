@@ -1815,6 +1815,25 @@ export async function startServer(): Promise<StartedServer> {
       );
       startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
     }
+  // Terminal-gate reconciler (BLO-27515). Worker-tier singleton. Re-reads the
+  // pull-request gates a *terminated* monitor declared (`gateSignals`), so a
+  // gate that resolves after the monitor's last poll — because the convergence
+  // guard stopped re-arming, or because an outage killed the run that would
+  // have — is observed board-side instead of waiting for an assignee run that
+  // may never be dispatched. Records the outcome as a comment; deliberately
+  // dispatches nothing and closes nothing.
+  if (config.terminalGateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startTerminalGateReconciler } = await import(
+      "./services/terminal-gate-reconciler.js"
+    );
+    logger.info(
+      { intervalMinutes: config.terminalGateReconcilerIntervalMinutes },
+      "Terminal-gate reconciler enabled (BLO-27515)",
+    );
+    startTerminalGateReconciler(
+      db,
+      config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+    );
   }
 
   // Wait for external adapters to finish loading before accepting requests.
