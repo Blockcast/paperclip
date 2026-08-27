@@ -50,6 +50,7 @@ const SETTINGS = {
   // at all about `Infinity`, which is the direction that matters.
   approvalEnforcementReconcilerIntervalMinutes:
     "PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES",
+  terminalGateReconcilerIntervalMinutes: "PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES",
   heartbeatSchedulerIntervalMs: "HEARTBEAT_SCHEDULER_INTERVAL_MS",
   recoveryActionMaxAttempts: "RECOVERY_ACTION_MAX_ATTEMPTS",
   recoveryActionTimeoutMs: "RECOVERY_ACTION_TIMEOUT_MS",
