@@ -24,10 +24,42 @@ import { describe, expect, it } from "vitest";
  * un-proxyable, or uncovered-with-a-ticket. A new upstream added tomorrow fails
  * here until someone decides which it is — an allowlist, so the unpredicted case
  * fails closed rather than joining the uncovered set in silence.
+ *
+ * ## ⚠️ Scope boundary — read before citing this file as coverage
+ *
+ * An agent's *effective* MCP config is not the seed. It is
+ *
+ *     { ...sharedSeedBaseline, ...adapterConfig.mcpServers }
+ *
+ * merged in `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` and
+ * shipped to the Job pod with `--strict-mcp-config`. This file audits the **first
+ * half only**. The second half is per-agent, lives in the database rather than in
+ * this repo, and no static test can enumerate its contents.
+ *
+ * That half is the *more* dangerous one. Per-agent entries override the baseline
+ * by name, and the documented use of the mechanism is precisely to swap the
+ * read-only k8s upstream for **ns-rw or admin** (job-manifest.ts:1219-1221). Those
+ * are direct `http`/`sse` URLs; nothing routes them through the gateway either.
+ * So an unscrubbed, *higher*-privileged agent-facing upstream can be added by
+ * editing a DB row, touching no file in this repo and leaving this suite green.
+ *
+ * Per PEN-2370's "⛔ no fourth scrubber ticket", that axis is not a new row — it
+ * is tracked on PEN-2429 alongside the seeded upstreams, and it is named here so
+ * it is enumerated rather than invisible. What this file *can* enforce is that the
+ * merge topology still matches the sentence above: `assertMergeTopologyUnchanged`
+ * fails if the baseline stops being merged, if the override direction flips, or if
+ * a gateway hop appears — any of which would make this audit describe a world that
+ * no longer exists. Do not read a green run here as "every agent-facing upstream
+ * is accounted for". It means: every *seeded* one is, and the per-agent axis is
+ * still shaped the way this comment claims.
  */
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
+const jobManifestPath = path.join(
+  repoRoot,
+  "vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts",
+);
 
 /**
  * Hosts that terminate inside `paperclip-mcp-gateway`, where `scrubResponseBody`
@@ -131,6 +163,74 @@ function hostOf(entry: SeedEntry | string): string | null {
   return new URL(entry.url).hostname;
 }
 
+/**
+ * The seed is only half of what an agent actually gets. Pin the other half's
+ * *shape* — not its contents, which are per-agent DB rows this test cannot see.
+ *
+ * Each probe encodes one clause of the scope-boundary comment at the top of this
+ * file. If a clause stops being true, the comment has become a lie about the
+ * system and the classification table below may be auditing the wrong surface —
+ * so fail loudly and directly at the reader who changed it, rather than staying
+ * green while describing a world that no longer exists.
+ */
+function assertMergeTopologyUnchanged(): void {
+  let source: string;
+  try {
+    source = readFileSync(jobManifestPath, "utf8");
+  } catch {
+    throw new Error(
+      `Could not read ${jobManifestPath}. This audit's scope boundary is stated in terms of the ` +
+        "per-agent MCP merge that lives there. If the adapter moved, re-point this probe and " +
+        "re-check whether adapterConfig.mcpServers can still add an unscrubbed agent-facing upstream.",
+    );
+  }
+
+  const probes: readonly { needle: RegExp; clause: string }[] = [
+    {
+      needle: /\{\s*\.\.\.baselineMcpServers,\s*\.\.\.perAgentMcpServers\s*\}/,
+      clause:
+        "the shared seed is merged as the baseline and per-agent entries override it by name " +
+        "(so auditing the seed alone is a partial audit, and per-agent entries can replace a " +
+        "seeded upstream with a higher-privileged one)",
+    },
+    {
+      needle: /--strict-mcp-config/,
+      clause:
+        "the merged file is the only MCP config the agent reads, so this seed is genuinely " +
+        "load-bearing rather than shadowed by something else on disk",
+    },
+  ];
+
+  for (const { needle, clause } of probes) {
+    if (!needle.test(source)) {
+      throw new Error(
+        `The per-agent MCP merge in ${path.relative(repoRoot, jobManifestPath)} no longer matches ` +
+          `this audit's stated scope boundary. Expected to find evidence that ${clause}.\n` +
+          "Update the scope-boundary comment at the top of this file to describe what is now true, " +
+          "and re-check whether the classification table still covers the right surface. " +
+          "PEN-2370 exists because a scrubber kept passing while the traffic moved out from under it.",
+      );
+    }
+  }
+
+  // The per-agent axis must stay ungatewayed for the boundary comment to hold. If
+  // a gateway hop appears here, that is good news — but this file then understates
+  // coverage, and SEED_COVERAGE/SCRUBBING_GATEWAY_HOSTS need revisiting.
+  //
+  // Matched case-insensitively and across separator styles, because the first
+  // draft of this check looked for the literal `mcp-gateway` and sailed straight
+  // past a mutation that introduced `routeThroughMcpGateway(...)`. A detector that
+  // only catches one spelling is the denylist shape PEN-2370 (b2) exists to reject.
+  const gatewayReference = /mcp[-_ ]?gateway|scrubResponseBody/i;
+  if (gatewayReference.test(source)) {
+    throw new Error(
+      `${path.relative(repoRoot, jobManifestPath)} now references the MCP gateway or the scrubber. ` +
+        "This audit assumes per-agent upstreams are dialed directly and unscrubbed. Re-derive the " +
+        "classifications above before assuming the assumption still holds.",
+    );
+  }
+}
+
 describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)", () => {
   const seeded = readSeededMcpServers();
 
@@ -197,5 +297,14 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     const k8sRo = SEED_COVERAGE["k8s-ro"];
     expect(k8sRo.kind).toBe("unscrubbed");
     expect(hostOf(seeded["k8s-ro"]!)).toBe("kubernetes-mcp-server-readonly.paperclip.svc.cluster.local");
+  });
+
+  it("the per-agent override axis this audit does NOT cover is still shaped as documented", () => {
+    // Guards the scope-boundary comment at the top of the file. The seed is half
+    // of what an agent gets; the other half is per-agent adapterConfig.mcpServers,
+    // which can swap k8s readonly for ns-rw/admin without touching this repo.
+    // We cannot enumerate that half — but we can make its shape a tested claim, so
+    // a topology change trips here instead of silently invalidating the audit.
+    expect(() => assertMergeTopologyUnchanged()).not.toThrow();
   });
 });
