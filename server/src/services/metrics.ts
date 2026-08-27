@@ -51,6 +51,20 @@ export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
  * a project has drifted into the ambiguous state and should be re-flagged.
  */
 export const PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC = "paperclip_project_primary_workspace_fallback_total";
+export const BACKSTOP_DEFERRED_CANDIDATES_METRIC = "paperclip_backstop_deferred_candidates";
+export const BACKSTOP_SWEEP_COMPLETED_METRIC = "paperclip_backstop_sweep_completed_total";
+export const BACKSTOP_CANDIDATES_SKIPPED_METRIC = "paperclip_backstop_candidates_skipped_total";
+export const BACKSTOP_SOURCES = [
+  "issue_graph_liveness.backstop",
+  "stranded_recovery_wake_backstop",
+] as const;
+export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
+export const BACKSTOP_SKIP_REASONS = [
+  "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
+  "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
+  "deferred_or_failed", "enqueue_failed",
+] as const;
+export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -1119,6 +1133,9 @@ let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
 let agentErrorDuration: Gauge<"agent_id"> | null = null;
 let projectPrimaryWorkspaceFallback: Counter | null = null;
+let backstopDeferredCandidates: Gauge<"source"> | null = null;
+let backstopSweepCompleted: Counter<"source"> | null = null;
+let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -1154,6 +1171,9 @@ function ensureRegistry(): {
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
   agentErrorDurationGauge: Gauge<"agent_id">;
   projectPrimaryWorkspaceFallbackCounter: Counter;
+  backstopDeferredCandidatesGauge: Gauge<"source">;
+  backstopSweepCompletedCounter: Counter<"source">;
+  backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
 } {
   if (
     !registry
@@ -1189,6 +1209,9 @@ function ensureRegistry(): {
     || !agentHeartbeatInterval
     || !agentErrorDuration
     || !projectPrimaryWorkspaceFallback
+    || !backstopDeferredCandidates
+    || !backstopSweepCompleted
+    || !backstopCandidatesSkipped
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1630,6 +1653,27 @@ function ensureRegistry(): {
       registers: [registry],
     });
     projectPrimaryWorkspaceFallback.inc(0);
+    backstopDeferredCandidates = new Gauge({
+      name: BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+      help: "Current number of backstop candidates deferred beyond the page limit.",
+      labelNames: ["source"],
+      registers: [registry],
+    });
+    backstopSweepCompleted = new Counter({
+      name: BACKSTOP_SWEEP_COMPLETED_METRIC,
+      help: "Completed backstop sweeps, labeled by stream.",
+      labelNames: ["source"],
+      registers: [registry],
+    });
+    backstopCandidatesSkipped = new Counter({
+      name: BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+      help: "Backstop candidates skipped by a bounded decision reason.",
+      labelNames: ["source", "reason"],
+      registers: [registry],
+    });
+    for (const source of BACKSTOP_SOURCES) {
+      backstopDeferredCandidates.set({ source }, 0);
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -1668,6 +1712,9 @@ function ensureRegistry(): {
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
     agentErrorDurationGauge: agentErrorDuration,
     projectPrimaryWorkspaceFallbackCounter: projectPrimaryWorkspaceFallback,
+    backstopDeferredCandidatesGauge: backstopDeferredCandidates,
+    backstopSweepCompletedCounter: backstopSweepCompleted,
+    backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
   };
 }
 
@@ -2317,6 +2364,18 @@ export function recordProjectPrimaryWorkspaceFallback(projectId: string): void {
   );
 }
 
+export function setBackstopDeferredCandidates(source: BackstopSource, value: number): void {
+  ensureRegistry().backstopDeferredCandidatesGauge.set({ source }, Math.max(0, value));
+}
+
+export function recordBackstopSweepCompleted(source: BackstopSource): void {
+  ensureRegistry().backstopSweepCompletedCounter.inc({ source });
+}
+
+export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
+  ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -2385,6 +2444,9 @@ export function __resetMetricsForTest(): void {
   agentHeartbeatInterval = null;
   agentErrorDuration = null;
   projectPrimaryWorkspaceFallback = null;
+  backstopDeferredCandidates = null;
+  backstopSweepCompleted = null;
+  backstopCandidatesSkipped = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();
