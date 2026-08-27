@@ -1548,6 +1548,20 @@
       "when": 1786492207000,
       "tag": "0228_github_review_gate_deliveries",
       "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "version": "7",
+      "when": 1787743476000,
+      "tag": "0229_human_gated_digest_touch_locks",
+      "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1787743477000,
+      "tag": "0230_heartbeat_runs_retry_successor_index",
+      "breakpoints": true
     }
   ]
 }

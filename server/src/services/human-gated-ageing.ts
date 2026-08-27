@@ -531,7 +531,7 @@ const MAX_RENDERED_FIELD_CHARS = 160;
  * never to execute it — that is a property of the caller, and no caller exists
  * yet.
  */
-function sanitizeRenderedField(value: string | null | undefined, fallback: string): string {
+export function sanitizeRenderedField(value: string | null | undefined, fallback: string): string {
   if (typeof value !== "string") return fallback;
   // Codepoint filter rather than a control-char regex: the escapes would be
   // invisible in source and trip `no-control-regex`. Anything below U+0020 plus
