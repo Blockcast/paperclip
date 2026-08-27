@@ -5644,6 +5644,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       companyId: string;
       prefix: string;
       assigneeAgentId: string;
+      routineCreatedAt?: Date;
     }) {
       const alertIssueId = randomUUID();
       await db.insert(issues).values({
@@ -5662,6 +5663,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         parentIssueId: alertIssueId,
         title: "Agent health & stalled-issue check",
         assigneeAgentId: input.assigneeAgentId,
+        // Keep historical test windows after the routine boundary so the
+        // lower-bound floor is exercised against realistic data.
+        createdAt: input.routineCreatedAt ?? new Date("2026-01-01T00:00:00.000Z"),
       });
       return { alertIssueId, routineId };
     }
@@ -5678,6 +5682,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // any test that exercises the receipt-absence predicate against a
       // floored key needs at least the preceding run to exist.
       siblingTriggeredAt?: Date[];
+      // A first run can have only a following row. Keep this separate from
+      // siblingTriggeredAt so the test can reach the mirror-backwards branch.
+      followingTriggeredAt?: Date[];
     }) {
       const routineRunId = randomUUID();
       for (const triggeredAt of input.siblingTriggeredAt ?? []) {
@@ -5698,6 +5705,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         status: "received",
         triggeredAt: input.triggeredAt,
       });
+      for (const triggeredAt of input.followingTriggeredAt ?? []) {
+        await db.insert(routineRuns).values({
+          id: randomUUID(),
+          companyId: input.companyId,
+          routineId: input.routineId,
+          source: "schedule",
+          status: "received",
+          triggeredAt,
+        });
+      }
       const issueId = randomUUID();
       await db.insert(issues).values({
         id: issueId,
@@ -6453,6 +6470,143 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         expect(receipts[0]!.idempotencyKey).toBe(
           `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
         );
+      });
+
+      it("caps the interval when an intervening run row is missing", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+          routineCreatedAt: new Date("2026-08-01T00:00:00.000Z"),
+        });
+        const triggeredAt = new Date("2026-08-19T12:07:15.000Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          // The 06:07 run is absent. The two rows six hours apart let the
+          // scheduler cap the lower bound at the missing run's slot.
+          siblingTriggeredAt: [
+            new Date("2026-08-19T00:07:15.000Z"),
+            new Date("2026-08-18T18:07:15.000Z"),
+          ],
+          issueNumber: 514,
+        });
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: missed window reported.",
+          idempotencyKey: "agent-health:2026-08-19T06:00:00.000Z:missed_window",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId))
+          .then((rows) => rows.filter((row) => row.idempotencyKey?.startsWith("scheduler-heartbeat:")));
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+        expect(receipts[0]!.body).toContain("after `2026-08-19T06:07:15.000Z`");
+      });
+
+      it("floors a first window with no prior run at routine creation", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const routineCreatedAt = new Date("2026-08-19T12:00:00.000Z");
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+          routineCreatedAt,
+        });
+        const triggeredAt = new Date("2026-08-19T12:07:15.000Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          issueNumber: 515,
+        });
+        // This receipt predates the routine and must not vouch for its first
+        // window when there is no neighbouring run to provide a bound.
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: stale receipt from an older routine.",
+          idempotencyKey: "agent-health:2026-08-19T06:00:00.000Z:old_routine",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId));
+        const schedulerReceipts = receipts.filter((row) =>
+          row.idempotencyKey?.startsWith("scheduler-heartbeat:")
+        );
+        expect(schedulerReceipts).toHaveLength(1);
+        expect(schedulerReceipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+        expect(schedulerReceipts[0]!.body).toContain(`after \`${routineCreatedAt.toISOString()}\``);
+      });
+
+      it("floors a first window with only a following run at routine creation", async () => {
+        const { companyId, managerId, coderId, prefix } = await seedCompany();
+        const routineCreatedAt = new Date("2026-08-19T12:00:00.000Z");
+        const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+          companyId,
+          prefix,
+          assigneeAgentId: managerId,
+          routineCreatedAt,
+        });
+        const triggeredAt = new Date("2026-08-19T12:07:15.000Z");
+        const { issue } = await seedRoutineExecutionIssue({
+          companyId,
+          prefix,
+          assigneeAgentId: coderId,
+          routineId,
+          triggeredAt,
+          followingTriggeredAt: [new Date("2026-08-24T12:07:15.000Z")],
+          issueNumber: 516,
+        });
+        // A delayed following run would mirror the lower bound back five
+        // days. This older receipt must stay outside the first window.
+        await db.insert(issueComments).values({
+          id: randomUUID(),
+          companyId,
+          issueId: alertIssueId,
+          authorType: "system",
+          body: "Agent health sweep: stale receipt from an older routine.",
+          idempotencyKey: "agent-health:2026-08-19T06:00:00.000Z:old_routine",
+        });
+
+        await issueService(db).update(issue.id, { status: "cancelled" });
+
+        const receipts = await db
+          .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, alertIssueId));
+        const schedulerReceipts = receipts.filter((row) =>
+          row.idempotencyKey?.startsWith("scheduler-heartbeat:")
+        );
+        expect(schedulerReceipts).toHaveLength(1);
+        expect(schedulerReceipts[0]!.idempotencyKey).toBe(
+          `scheduler-heartbeat:${routineId}:${triggeredAt.toISOString()}`,
+        );
+        expect(schedulerReceipts[0]!.body).toContain(`after \`${routineCreatedAt.toISOString()}\``);
       });
     });
   });

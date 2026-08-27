@@ -79,10 +79,14 @@ function dispositionClause(
  * trigger time would otherwise let the previous window's receipt suppress this
  * one.
  *
- * With no earlier run, fall back to the spacing implied by the *next* run, so a
- * routine's first window is still bounded. With neither neighbour the routine
- * has exactly one run ever, so every `agent-health:` receipt keyed at or before
- * it necessarily belongs to this window and `null` (unbounded below) is right.
+ * `routine_runs` is not guaranteed to contain every fire (BLO-28952). The two
+ * most recent prior rows therefore provide an observed-spacing cap: when the
+ * immediately preceding row skipped one or more missing fires, use the
+ * narrower of that row and one observed gap before the current window. With
+ * only one prior row, that row is the narrowest reliable boundary. With no
+ * prior row, mirror the next-run gap, but floor the result at routine creation;
+ * with neither neighbour, routine creation is the finite floor. A receipt from
+ * before the routine existed cannot describe one of its windows.
  *
  * Stated limit: if two runs of the same routine trigger close enough together
  * to share one runbook slot (a catch-up burst), the later run's interval is too
@@ -97,19 +101,30 @@ async function resolveWindowStartExclusive(db: Db, input: {
   companyId: string;
   routineId: string;
   windowAt: Date;
+  routineCreatedAt: Date;
 }) {
   const scope = and(
     eq(routineRuns.companyId, input.companyId),
     eq(routineRuns.routineId, input.routineId),
   );
-  const previousRunAt = await db
+  const previousRuns = await db
     .select({ triggeredAt: routineRuns.triggeredAt })
     .from(routineRuns)
     .where(and(scope, lt(routineRuns.triggeredAt, input.windowAt)))
     .orderBy(desc(routineRuns.triggeredAt))
-    .limit(1)
-    .then((rows) => rows[0]?.triggeredAt ?? null);
-  if (previousRunAt) return previousRunAt;
+    .limit(2);
+  const [previousRun, previousPreviousRun] = previousRuns;
+  if (previousRun) {
+    const previousRunAt = previousRun.triggeredAt.getTime();
+    const lowerBound = previousPreviousRun
+      ? Math.max(
+        previousRunAt,
+        input.windowAt.getTime() -
+          (previousRunAt - previousPreviousRun.triggeredAt.getTime()),
+      )
+      : previousRunAt;
+    return new Date(Math.max(input.routineCreatedAt.getTime(), lowerBound));
+  }
 
   const nextRunAt = await db
     .select({ triggeredAt: routineRuns.triggeredAt })
@@ -118,8 +133,10 @@ async function resolveWindowStartExclusive(db: Db, input: {
     .orderBy(asc(routineRuns.triggeredAt))
     .limit(1)
     .then((rows) => rows[0]?.triggeredAt ?? null);
-  if (!nextRunAt) return null;
-  return new Date(input.windowAt.getTime() - (nextRunAt.getTime() - input.windowAt.getTime()));
+  if (!nextRunAt) return new Date(input.routineCreatedAt);
+  const mirroredLowerBound = input.windowAt.getTime() -
+    (nextRunAt.getTime() - input.windowAt.getTime());
+  return new Date(Math.max(input.routineCreatedAt.getTime(), mirroredLowerBound));
 }
 
 function isWithinWindow(keyedAt: Date | null, window: {
@@ -205,7 +222,12 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
 
   try {
     const routine = await db
-      .select({ id: routines.id, parentIssueId: routines.parentIssueId, title: routines.title })
+      .select({
+        id: routines.id,
+        parentIssueId: routines.parentIssueId,
+        title: routines.title,
+        createdAt: routines.createdAt,
+      })
       .from(routines)
       .where(and(eq(routines.companyId, issue.companyId), eq(routines.id, issue.originId)))
       .then((rows) => rows[0] ?? null);
@@ -226,6 +248,7 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
       companyId: issue.companyId,
       routineId: routine.id,
       windowAt,
+      routineCreatedAt: routine.createdAt,
     });
 
     const hasNormalEmission = await db

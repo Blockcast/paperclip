@@ -163,6 +163,10 @@ export function parseAgentHealthReceiptWindowKey(idempotencyKey: string | null |
   if (!idempotencyKey) return null;
   const match = AGENT_HEALTH_RECEIPT_WINDOW_KEY_PATTERN.exec(idempotencyKey);
   if (!match) return null;
+  const datePart = match[1].slice(0, 10);
   const parsed = new Date(`${match[1]}${match[2] ?? "Z"}`);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
+  if (Number.isNaN(parsed.getTime())) return null;
+  // Date normalizes shape-valid values such as 2026-02-30 into a different
+  // calendar day. Round-trip the captured date before accepting the instant.
+  return parsed.toISOString().startsWith(datePart) ? parsed : null;
 }
