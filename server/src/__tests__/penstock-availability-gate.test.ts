@@ -574,11 +574,17 @@ describe("createPenstockAvailabilityGate", () => {
   it("still serves one cached verdict to repeat checks on the same credential", async () => {
     // The credential dimension must not defeat caching itself: two agents
     // sharing a token (the common `process.env` fallback) stay on one probe.
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
-        { status: 200 },
-      ),
+    // A factory, not `mockResolvedValue(new Response(...))`: a `Response` body
+    // is single-use, so one shared instance would make a second call fail on
+    // its own drained body rather than on what this test is asserting. The
+    // point here is that the second check never probes at all -- if it ever
+    // does, the failure should say "called twice", not "body already read".
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+          { status: 200 },
+        ),
     );
     const gate = gateWith(fetchMock as unknown as typeof fetch);
     const now = new Date("2026-06-30T08:00:00.000Z");
@@ -598,5 +604,90 @@ describe("createPenstockAvailabilityGate", () => {
     }
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds the cache to credentials still probing, not every credential ever seen", async () => {
+    // PEN-2462. Adding the credential dimension in PEN-2385 made the key space
+    // open-ended over the process lifetime, and this gate is constructed once
+    // per process. Rotate a token repeatedly, one full TTL apart, so each
+    // previous entry is already unreachable by the read path when the next is
+    // written. Residency must track live credentials, not credentials ever seen.
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+          { status: 200 },
+        ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+    const start = Date.parse("2026-06-30T08:00:00.000Z");
+    const rotations = 25;
+
+    for (let rotation = 0; rotation < rotations; rotation += 1) {
+      const result = await gate.checkAdapter({
+        adapterType: "claude_k8s",
+        agentId: "agent-rotating",
+        adapterConfig: {
+          model: "claude-opus-5[1m]",
+          env: {
+            ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" },
+            ANTHROPIC_AUTH_TOKEN: { value: `psk_rotation_${rotation}` },
+          },
+        },
+        now: new Date(start + rotation * 30_000),
+        env: {},
+      });
+      expect(result).toEqual({ allow: true });
+    }
+
+    // Each rotation is a genuine miss, so the retired entries are being
+    // reclaimed rather than quietly served stale.
+    expect(fetchMock).toHaveBeenCalledTimes(rotations);
+    // Only the live credential remains. Without the sweep this is `rotations`
+    // and grows for the life of the process.
+    expect(gate._cacheSizeForTesting?.()).toBe(1);
+  });
+
+  it("keeps every credential still inside the TTL window resident", async () => {
+    // The other half of the bound: the sweep may only reclaim what the read
+    // path can no longer serve. Three credentials probing within one TTL are
+    // all still live, so all three stay cached and none of them re-probes.
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+          { status: 200 },
+        ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+    const start = Date.parse("2026-06-30T08:00:00.000Z");
+    const tokens = ["psk_one", "psk_two", "psk_three"];
+
+    function checkAt(token: string, offsetMs: number) {
+      return gate.checkAdapter({
+        adapterType: "claude_k8s",
+        agentId: "agent-fleet",
+        adapterConfig: {
+          model: "claude-opus-5[1m]",
+          env: {
+            ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" },
+            ANTHROPIC_AUTH_TOKEN: { value: token },
+          },
+        },
+        now: new Date(start + offsetMs),
+        env: {},
+      });
+    }
+
+    // Spread across the window, but all well inside `cacheTtlMs`.
+    for (const [index, token] of tokens.entries()) {
+      expect(await checkAt(token, index * 1_000)).toEqual({ allow: true });
+    }
+    expect(gate._cacheSizeForTesting?.()).toBe(3);
+
+    // The first credential's entry survived two later `set`s and is still served.
+    expect(await checkAt(tokens[0]!, 5_000)).toEqual({ allow: true });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(gate._cacheSizeForTesting?.()).toBe(3);
   });
 });

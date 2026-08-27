@@ -1257,7 +1257,17 @@ export function readHeartbeatRunErrorFamily(
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
 
-  if (run.errorCode === "rate_limit_exhausted") {
+  // PEN-2462: `provider_throttled_no_progress` is tagged
+  // `errorFamily: "rate_limit_exhausted"` at the point of write, in the same
+  // statement and from the same two booleans that set `errorCode` -- so on
+  // every row that exists today the tag above has already answered, and this
+  // is a pure backstop. It is here because the alternative is an invisible
+  // asymmetry: the two codes are interchangeable at write time, and without
+  // this line only one of them survives losing its `resultJson`.
+  if (
+    run.errorCode === "rate_limit_exhausted" ||
+    run.errorCode === "provider_throttled_no_progress"
+  ) {
     return "rate_limit_exhausted";
   }
   // BLO-28924: `provider_quota_exhausted` shares `provider_quota`'s contract —
