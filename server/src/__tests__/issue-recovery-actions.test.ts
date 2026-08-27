@@ -6415,7 +6415,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           assigneeAgentId: coderId,
           routineId,
           triggeredAt: new Date("2026-08-18T00:07:06.458Z"),
-          siblingTriggeredAt: [new Date("2026-08-17T18:07:06.101Z")],
+          siblingTriggeredAt: [
+            new Date("2026-08-17T18:07:06.101Z"),
+            new Date("2026-08-17T12:07:06.101Z"),
+          ],
           issueNumber: 508,
         });
         await db.insert(issueComments).values({
@@ -6454,7 +6457,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           assigneeAgentId: coderId,
           routineId,
           triggeredAt: new Date("2026-08-15T06:07:21.003Z"),
-          siblingTriggeredAt: [new Date("2026-08-15T00:07:18.771Z")],
+          siblingTriggeredAt: [
+            new Date("2026-08-15T00:07:18.771Z"),
+            new Date("2026-08-14T18:07:18.771Z"),
+          ],
           issueNumber: 509,
         });
         await db.insert(issueComments).values({
@@ -6512,7 +6518,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           assigneeAgentId: coderId,
           routineId,
           triggeredAt: new Date("2026-08-03T18:07:04.909Z"),
-          siblingTriggeredAt: [new Date("2026-08-03T12:07:11.010Z")],
+          siblingTriggeredAt: [
+            new Date("2026-08-03T12:07:11.010Z"),
+            new Date("2026-08-03T06:07:11.010Z"),
+          ],
           issueNumber: 510,
         });
         await db.insert(issueComments).values({
@@ -6596,7 +6605,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           assigneeAgentId: coderId,
           routineId,
           triggeredAt,
-          siblingTriggeredAt: [new Date("2026-08-02T06:07:09.220Z")],
+          siblingTriggeredAt: [
+            new Date("2026-08-02T06:07:09.220Z"),
+            new Date("2026-08-02T00:07:09.220Z"),
+          ],
           issueNumber: 511,
         });
         await db.insert(issueComments).values({
