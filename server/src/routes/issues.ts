@@ -2490,6 +2490,7 @@ function diffExecutionParticipants(
 
 function buildExecutionStageWakeup(input: {
   issueId: string;
+  issueStatus: string;
   previousState: ParsedExecutionState | null;
   nextState: ParsedExecutionState | null;
   interruptedRunId: string | null;
@@ -2498,6 +2499,10 @@ function buildExecutionStageWakeup(input: {
 }) {
   const { issueId, previousState, nextState, interruptedRunId } = input;
   if (!nextState) return null;
+
+  // A terminal issue cannot have an actionable execution-stage participant.
+  // Reopened issues carry a non-terminal post-update status at this call site.
+  if (isClosedIssueStatus(input.issueStatus)) return null;
 
   if (nextState.status === "pending") {
     const agentId =
@@ -11950,6 +11955,7 @@ export function issueRoutes(
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
     const executionStageWakeup = buildExecutionStageWakeup({
       issueId: issue.id,
+      issueStatus: issue.status,
       previousState: previousExecutionState,
       nextState: nextExecutionState,
       interruptedRunId,
@@ -12022,7 +12028,12 @@ export function issueRoutes(
 
       if (executionStageWakeup) {
         addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
-      } else if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
+      } else if (
+        assigneeChanged &&
+        issue.assigneeAgentId &&
+        issue.status !== "backlog" &&
+        !isClosedIssueStatus(issue.status)
+      ) {
         addWakeup(issue.assigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
@@ -12089,10 +12100,8 @@ export function issueRoutes(
         // already terminal by the time the wake is claimed. `isClosed` itself stays
         // pre-update on purpose: `reopened` above is defined in terms of it.
         //
-        // Note this suppresses the ASSIGNEE wake only. The @-mention wakes below are
-        // deliberately left unscreened on terminal issues: a wake on work the assignee's
-        // own change just closed is waste, but a mention of a third party is a handoff
-        // and must still be delivered.
+        // Terminal issues are closed work for every agent, including explicitly mentioned
+        // peers. Only an explicit reopen makes the thread actionable again.
         const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
 
         if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
@@ -12143,6 +12152,7 @@ export function issueRoutes(
         }
 
         for (const mentionedId of mentionedIds) {
+          if (isClosedIssueStatus(issue.status) && !reopened) continue;
           if (!commentAuthorCanGrantIssueMention({
             mentionedAgentId: mentionedId,
             issueAssigneeAgentId: issue.assigneeAgentId,
@@ -13990,6 +14000,7 @@ export function issueRoutes(
         }
         commentDecisionStageWakeup = buildExecutionStageWakeup({
           issueId: currentIssue.id,
+          issueStatus: currentIssue.status,
           previousState: currentExecutionState,
           nextState: parseIssueExecutionState(currentIssue.executionState),
           interruptedRunId,
@@ -14256,6 +14267,7 @@ export function issueRoutes(
       }
 
       for (const mentionedId of mentionedIds) {
+        if (isClosedIssueStatus(currentIssue.status) && !reopened) continue;
         if (!commentAuthorCanGrantIssueMention({
           mentionedAgentId: mentionedId,
           issueAssigneeAgentId: currentIssue.assigneeAgentId,

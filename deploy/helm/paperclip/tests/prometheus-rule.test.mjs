@@ -693,11 +693,12 @@ test("PaperclipPlugin{Critical,}Errored key on the boolean gauge, split severity
   assert.match(criticalExpr, /^paperclip_plugin_error\{plugin_key=~"[^"]+"\} == 1$/);
   assert.match(warningExpr, /^paperclip_plugin_error\{plugin_key!~"[^"]+"\} == 1$/);
 
-  // Default critical key regex must select lucitra.plugin-secrets -- the
-  // exact plugin BLO-20410 found dead for 9+ hours with nothing alerting --
-  // and the two alerts' selectors must be exact complements (same regex, one
-  // positive one negative) so a plugin can never dual-fire nor fall through
-  // both.
+  // The critical key regex must select lucitra.plugin-secrets -- the exact
+  // plugin BLO-20410 found dead for 9+ hours with nothing alerting -- and
+  // paperclip-plugin-alertmanager (PEN-2590), whose failure at warning
+  // severity suppresses the very notification reporting it. The two alerts'
+  // selectors must be exact complements (same regex, one positive one
+  // negative) so a plugin can never dual-fire nor fall through both.
   const [, criticalRegex] = criticalExpr.match(/plugin_key=~"([^"]+)"/) ?? [];
   const [, warningRegex] = warningExpr.match(/plugin_key!~"([^"]+)"/) ?? [];
   assert.ok(criticalRegex, "critical alert must render a plugin_key=~ selector");
@@ -710,6 +711,32 @@ test("PaperclipPlugin{Critical,}Errored key on the boolean gauge, split severity
     criticalRegex.includes("plugin-secrets"),
     `default critical key regex ${criticalRegex} must select lucitra.plugin-secrets`,
   );
+  // PEN-2590. Asserted as its own member of the alternation rather than by
+  // substring on the whole regex, because `paperclip-plugin-alertmanager` is
+  // the plugin's manifest id verbatim and the two keys deliberately use
+  // DIFFERENT naming conventions (dotted namespace for externally published
+  // plugins, bare hyphenated id for local workspace ones). A regex written on
+  // the assumption of one convention silently selects nothing for the other,
+  // and a selector matching nothing is a permanently-inert rule rather than a
+  // visible failure -- the PEN-2579 class this guards against.
+  const criticalKeys = criticalRegex.split("|");
+  assert.ok(
+    criticalKeys.includes("paperclip-plugin-alertmanager"),
+    `critical key regex ${criticalRegex} must select paperclip-plugin-alertmanager exactly (PEN-2590): ` +
+      "at warning severity PaperclipPluginErrored's only route is the `paperclip` webhook catch-all, " +
+      "whose endpoint is gated on this plugin's own readiness, so the alert is delivered into the " +
+      "receiver that is failing because this plugin is failing. critical fans out to slack-relay instead.",
+  );
+  // The alternation must stay anchorable: no member may be empty (a stray `|`
+  // yields an empty branch, which Prometheus anchors to `^$` and therefore
+  // matches the EMPTY plugin_key -- quietly promoting label-less series into
+  // the paging tier while looking like a harmless typo).
+  for (const key of criticalKeys) {
+    assert.ok(
+      key.length > 0,
+      `critical key regex ${criticalRegex} has an empty alternation branch, which matches an empty plugin_key`,
+    );
+  }
 
   const [, criticalSeverity] = rendered.match(
     /alert: PaperclipPluginCriticalErrored[\s\S]*?severity: (\w+)/,
