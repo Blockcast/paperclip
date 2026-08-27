@@ -1109,6 +1109,67 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(secondAction).toMatchObject({ id: firstAction!.id, ownerAgentId: null, attemptCount: 1 });
   });
 
+  it("parks a repeated ownerless escalation when a blocker appears between sweeps", async () => {
+    const { companyId, coderId, managerId, sourceIssue, prefix } = await seedCompany();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Restore the missing recovery capacity",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssue.id,
+      type: "blocks",
+    });
+
+    const [sweepIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sweepIssue!,
+      previousStatus: "todo",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(updatedIssue).toMatchObject({ status: "blocked" });
+    const relations = await db
+      .select()
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, sourceIssue.id)));
+    expect(relations).toContainEqual(expect.objectContaining({ issueId: blockerIssueId, type: "blocks" }));
+  });
+
   it("re-dispatches an issue reopened after terminal dispatch cancellation", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const queuedRunId = randomUUID();
