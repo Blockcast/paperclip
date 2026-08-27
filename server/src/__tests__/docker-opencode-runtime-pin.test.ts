@@ -25,9 +25,23 @@ const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/
 const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
 const verifyAgentFfmpegScript = readFileSync(verifyAgentFfmpeg, "utf8");
 
-function runFfmpegProbe(mode: "success" | "missing" | "failed" | "timeout" | "newline-free" | "volume") {
+function runFfmpegProbe(
+  mode:
+    | "success"
+    | "missing"
+    | "failed"
+    | "timeout"
+    | "newline-free"
+    | "volume"
+    | "slow-pull"
+    | "retry-pull"
+    | "pull-failed",
+  overrides: Record<string, string> = {},
+) {
   const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
   const dockerStub = path.join(stubDir, "docker");
+  const pullArgsFile = path.join(stubDir, "docker-pull-args");
+  const pullAttemptsFile = path.join(stubDir, "docker-pull-attempts");
   const runArgsFile = path.join(stubDir, "docker-run-args");
   const cleanupArgsFile = path.join(stubDir, "docker-cleanup-args");
   const cidfileStateFile = path.join(stubDir, "docker-cidfile-state");
@@ -42,6 +56,18 @@ case "$cmd" in
     else
       printf 'null\\n'
     fi
+    ;;
+  pull)
+    printf '%s\\n' "$@" > "$DOCKER_PULL_ARGS_FILE"
+    attempts=$(($(cat "$DOCKER_PULL_ATTEMPTS_FILE" 2>/dev/null || printf '0') + 1))
+    printf '%s\\n' "$attempts" > "$DOCKER_PULL_ATTEMPTS_FILE"
+    case "$DOCKER_STUB_MODE" in
+      pull-failed) exit 42 ;;
+      retry-pull)
+        if [ "$attempts" -eq 1 ]; then exit 42; fi
+        ;;
+      slow-pull) sleep 1 ;;
+    esac
     ;;
   run)
     printf '%s\\n' "$@" > "$DOCKER_RUN_ARGS_FILE"
@@ -58,10 +84,11 @@ case "$cmd" in
       printf 'cidfile already exists\\n' >&2
       exit 125
     fi
-    printf 'missing:%s\\n' "$(stat -c %a "$(dirname "$cidfile")")" > "$DOCKER_CIDFILE_STATE_FILE"
+    mode=$(stat -c %a "$(dirname "$cidfile")" 2>/dev/null || stat -f %Lp "$(dirname "$cidfile")")
+    printf 'missing:%s\\n' "$mode" > "$DOCKER_CIDFILE_STATE_FILE"
     printf 'paperclip-ffmpeg-probe-test\\n' > "$cidfile"
     case "$DOCKER_STUB_MODE" in
-      success)
+      success|slow-pull|retry-pull)
         printf ' E moq_mmt MMTP muxer\\n'
         i=0
         while [ "$i" -lt 5000 ]; do
@@ -92,21 +119,30 @@ esac
       env: {
         ...process.env,
         PATH: `${stubDir}:${process.env.PATH}`,
+        DOCKER_PULL_ARGS_FILE: pullArgsFile,
+        DOCKER_PULL_ATTEMPTS_FILE: pullAttemptsFile,
         DOCKER_RUN_ARGS_FILE: runArgsFile,
         DOCKER_CLEANUP_ARGS_FILE: cleanupArgsFile,
         DOCKER_CIDFILE_STATE_FILE: cidfileStateFile,
         DOCKER_STUB_MODE: mode,
         FFMPEG_PROBE_OUTPUT_BYTES: "256",
-        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" ? "0.5" : "15",
+        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" || mode === "slow-pull" ? "0.5" : "15",
+        FFMPEG_PULL_TIMEOUT_SECONDS: mode === "slow-pull" ? "2" : "15",
+        FFMPEG_PULL_ATTEMPTS: mode === "pull-failed" ? "1" : "3",
+        ...overrides,
       },
       encoding: "utf8",
     });
+    const pullArgs = existsSync(pullArgsFile) ? readFileSync(pullArgsFile, "utf8").trim().split("\n") : [];
+    const pullAttempts = existsSync(pullAttemptsFile)
+      ? Number(readFileSync(pullAttemptsFile, "utf8").trim())
+      : 0;
     const args = existsSync(runArgsFile) ? readFileSync(runArgsFile, "utf8").trim().split("\n") : [];
     const cleanupArgs = existsSync(cleanupArgsFile)
       ? readFileSync(cleanupArgsFile, "utf8").trim().split("\n")
       : [];
     const cidfileState = existsSync(cidfileStateFile) ? readFileSync(cidfileStateFile, "utf8").trim() : "";
-    return { result, args, cleanupArgs, cidfileState };
+    return { result, pullArgs, pullAttempts, args, cleanupArgs, cidfileState };
   } finally {
     rmSync(stubDir, { recursive: true, force: true });
   }
@@ -303,12 +339,13 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("constrains the FFmpeg probe and drains output after finding the muxer", () => {
-    const { result, args, cidfileState } = runFfmpegProbe("success");
+    const { result, pullArgs, args, cidfileState } = runFfmpegProbe("success");
 
     expect(result.status).toBe(0);
     expect(cidfileState).toBe("missing:700");
     expect(args).toEqual([
       "run",
+      "--pull=never",
       "--rm",
       "--cidfile",
       expect.stringMatching(/paperclip-ffmpeg-probe\.[^/]+\/cid$/),
@@ -335,6 +372,52 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       "-hide_banner",
       "-muxers",
     ]);
+    expect(pullArgs).toEqual(["pull", "registry.example/ffmpeg@sha256:test"]);
+  });
+
+  it("keeps a slow image pull outside the short capability budget", () => {
+    const { result, pullArgs, pullAttempts, args } = runFfmpegProbe("slow-pull");
+
+    expect(result.status).toBe(0);
+    expect(pullArgs).toEqual(["pull", "registry.example/ffmpeg@sha256:test"]);
+    expect(pullAttempts).toBe(1);
+    expect(args).toContain("--pull=never");
+  });
+
+  it("retries a transient image pull before probing", () => {
+    const { result, pullAttempts, args } = runFfmpegProbe("retry-pull");
+
+    expect(result.status).toBe(0);
+    expect(pullAttempts).toBe(2);
+    expect(args).toContain("--pull=never");
+  });
+
+  it("fails closed without starting a container when the image pull fails", () => {
+    const { result, pullArgs, pullAttempts, args } = runFfmpegProbe("pull-failed");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("Unable to pull FFmpeg image");
+    expect(pullArgs).toEqual(["pull", "registry.example/ffmpeg@sha256:test"]);
+    expect(pullAttempts).toBe(1);
+    expect(args).toEqual([]);
+  });
+
+  it("rejects invalid or over-limit pull controls before touching Docker", () => {
+    const cases = [
+      ["FFMPEG_PULL_TIMEOUT_SECONDS", "0", "must be a positive integer"],
+      ["FFMPEG_PULL_TIMEOUT_SECONDS", "601", "must not exceed 600"],
+      ["FFMPEG_PULL_ATTEMPTS", "0", "must be a positive integer"],
+      ["FFMPEG_PULL_ATTEMPTS", "6", "must not exceed 5"],
+    ] as const;
+
+    for (const [name, value, message] of cases) {
+      const { result, pullArgs, args } = runFfmpegProbe("success", { [name]: value });
+
+      expect(result.status, `${name}=${value}`).toBe(2);
+      expect(result.stderr, `${name}=${value}`).toContain(message);
+      expect(pullArgs, `${name}=${value}`).toEqual([]);
+      expect(args, `${name}=${value}`).toEqual([]);
+    }
   });
 
   it("byte-bounds and drains newline-free probe output", () => {
