@@ -3671,8 +3671,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // this test needs: the service reads the horizon off `Date.now()`.
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
-      vi.setSystemTime(new Date(originalHorizonMs + 1_000));
+      // Rebinding before the fixed horizon is still allowed. The assertion
+      // below is what proves that the ownerless interlude does not create a
+      // fresh horizon; crossing the original horizon must then stop recovery.
+      vi.setSystemTime(new Date(originalHorizonMs - 1_000));
       await db.update(agents).set({ status: "idle" }).where(eq(agents.id, managerId));
+      await sweep();
+
+      const [reboundedBeforeHorizon] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, bounded!.id));
+      expect(reboundedBeforeHorizon).toMatchObject({
+        ownerAgentId: managerId,
+        maxAttempts: defaultRecoveryActionMaxAttempts,
+      });
+      expect(new Date(reboundedBeforeHorizon!.timeoutAt as unknown as string).getTime())
+        .toBe(originalHorizonMs);
+
+      vi.setSystemTime(new Date(originalHorizonMs + 1_000));
       await sweep();
     } finally {
       vi.useRealTimers();
