@@ -1940,6 +1940,7 @@ export function isLapsedMonitorStillLive(input: {
   if (!input.lastTriggeredAt) return false;
   const triggeredAt = Date.parse(input.lastTriggeredAt);
   if (!Number.isFinite(triggeredAt)) return false;
+  if (triggeredAt > input.now) return false;
   return input.now - triggeredAt < input.graceMs;
 }
 
