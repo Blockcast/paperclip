@@ -798,20 +798,20 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       contextSnapshot: { issueId },
     });
 
-    const lockAcquired = defer();
-    const releaseLock = defer();
-    const holder = db.transaction(async (tx) => {
-      await tx.execute(sql`SELECT id FROM issues WHERE id = ${issueId}::uuid FOR UPDATE`);
-      await tx.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
-      lockAcquired.resolve();
-      await releaseLock.promise;
+    const candidatesSelected = defer();
+    const releaseSelection = defer();
+    const reconcile = reconcileStrandedBlockedIssues(db, {
+      batchSize: 1,
+      afterCandidatesSelected: async (candidateIds) => {
+        expect(candidateIds).toContain(issueId);
+        candidatesSelected.resolve();
+        await releaseSelection.promise;
+      },
     });
-    await lockAcquired.promise;
+    await candidatesSelected.promise;
 
-    const reconcile = reconcileStrandedBlockedIssues(db, { batchSize: 1 });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    releaseLock.resolve();
-    await holder;
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    releaseSelection.resolve();
 
     const result = await reconcile;
 
