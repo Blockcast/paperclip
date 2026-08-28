@@ -18,6 +18,7 @@ const mockListComments = vi.hoisted(() => vi.fn());
 const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
+const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/github-app-auth.js", () => ({
   githubFetchPrHeadSha: mockFetchHeadSha,
@@ -34,6 +35,10 @@ vi.mock("../services/github-app-auth.js", () => ({
         : "";
     return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
   },
+}));
+
+vi.mock("../services/github-status-delivery-outbox.js", () => ({
+  withGithubStatusDeliveryLock: mockStatusDeliveryLock,
 }));
 
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
@@ -61,6 +66,8 @@ beforeEach(() => {
   mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
   mockPostStatus.mockReset();
+  mockStatusDeliveryLock.mockReset();
+  mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation());
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
   mockListReviews.mockResolvedValue([]);
@@ -120,6 +127,26 @@ describe("runPrCommentReviewGateCheck", () => {
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
     expect(mockPostStatus).toHaveBeenCalledTimes(2);
   }, 10_000);
+
+  it("reads and evaluates evidence inside the shared delivery lock", async () => {
+    const events: string[] = [];
+    mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => {
+      events.push("lock");
+      return operation();
+    });
+    mockListComments.mockImplementation(async () => {
+      events.push("fetch-comments");
+      return [blockingCommentFor(TARGET.headSha)];
+    });
+    mockPostStatus.mockImplementation(async () => {
+      events.push("post");
+      return { ok: true, statusCode: 201 };
+    });
+
+    await runPrCommentReviewGateCheck({ ...TARGET, db: {} as never });
+
+    expect(events).toEqual(["lock", "fetch-comments", "post"]);
+  });
 
   it("serializes overlapping evaluations for one PR/context", async () => {
     const events: string[] = [];
