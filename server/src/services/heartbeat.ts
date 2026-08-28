@@ -201,7 +201,10 @@ import {
   listManagedAgentPods,
   listLiveAgentJobRunIds,
   matchExactAgentJob,
+  probeAgentPodActivity,
   readAgentJobRunStatusByName,
+  AGENT_POD_HARD_STALE_MS,
+  AGENT_POD_BUSY_MAX_STALE_MS,
   type AgentJobRunStatus,
   type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
@@ -2032,7 +2035,14 @@ const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // with zero output. 45 min keys the destructive kill well past any healthy
 // quiet gap (which bumps lastUsefulActionAt) while still reclaiming the slot
 // and node CPU long before the multi-hour manual-reap point.
-const EXTERNAL_LIFECYCLE_HARD_STALE_MS = 45 * 60 * 1000;
+//
+// BLO-30087: hoisted into k8s-job-liveness.ts (the leaf module that owns
+// probeAgentPodActivity) so the stale-lock sweeper in recovery/service.ts
+// resolves the SAME bounds. heartbeat.ts imports recovery/service.js, so
+// recovery cannot import back — see the rationale on the constants there.
+// Re-aliased to the existing local names to keep this file's call sites stable.
+const EXTERNAL_LIFECYCLE_HARD_STALE_MS = AGENT_POD_HARD_STALE_MS;
+const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = AGENT_POD_BUSY_MAX_STALE_MS;
 // BLO-18030: bound on confirming a hard-stale-killed Job has actually quiesced
 // before its reviewer-evidence probe is trusted (see
 // confirmStaleKilledJobQuiesced). The Background-propagation delete returns
@@ -21458,6 +21468,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  /**
+   * BLO-20251: should this hard-stale run be spared because its pod is
+   * demonstrably executing a long silent subprocess?
+   *
+   * The reaper's silence signal (externalLifecycleRecentRefTime, above) is fed
+   * by adapter stdout. While the agent sits in a Bash tool call the CLI emits
+   * nothing between tool_use and tool_result, so a legitimate `pnpm install`,
+   * test suite, or image build is byte-for-byte indistinguishable from a wedged
+   * pod. Run cf7f812b on BLO-20088 was force-killed mid-`pnpm install` on
+   * 2026-08-01, destroying ~30 min of completed critical-path work.
+   *
+   * Pod CPU is the corroborating signal (see probeAgentPodActivity for why it
+   * was chosen over workspace mtime, adapter stdout, and a longer grace).
+   *
+   * Deliberately fails CLOSED — anything other than positive "busy" evidence
+   * reaps exactly as it did before BLO-20251, so a cluster without
+   * metrics-server keeps the full BLO-12996 behaviour.
+   */
+  async function shouldDeferHardStaleKillForBusyPod(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
+    >,
+    now: Date,
+  ): Promise<boolean> {
+    const refTime = externalLifecycleRecentRefTime(run);
+    const silentMs = refTime ? now.getTime() - refTime : Number.POSITIVE_INFINITY;
+    // Past the ceiling a busy pod is treated as a CPU-burning zombie and reaped
+    // regardless, so it cannot hold the agent's dispatch slot forever.
+    if (silentMs >= EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS) return false;
+
+    const activity = await probeAgentPodActivity(run.id);
+    if (activity !== "busy") return false;
+
+    logger.info(
+      { runId: run.id, silentMs, activity },
+      "reapOrphanedRuns: deferring hard-stale kill — pod is executing a live subprocess (BLO-20251)",
+    );
+    return true;
+  }
+
   function isExternalLifecycleRunInRecentGrace(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
@@ -22315,6 +22366,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             !preAdapterRefTime ||
             now.getTime() - preAdapterRefTime >= EXTERNAL_LIFECYCLE_HARD_STALE_MS;
           if (preAdapterHardStale) {
+            // BLO-20251: a pre-adapter run is still doing real work during
+            // workspace setup (repo clone, dependency install). Spare it while
+            // its pod is demonstrably busy.
+            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -22422,6 +22477,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // hasActiveJobForAgent gate in startNextQueuedRunForAgent). Force-kill
           // it so newly-queued high-priority work can dispatch.
           if (jobStatus && jobStatus.phase === "active" && isHardStale) {
+            // BLO-20251: silence here may just be a long Bash tool call
+            // (dependency install, test suite, image build). Spare the run
+            // while its pod is demonstrably burning CPU.
+            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -22462,6 +22521,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Below the hard floor we still honor the 2026-05-23 guard and
             // leave a live-but-quiet Job alone.
             if (isHardStale) {
+              // BLO-20251: same deferral as the rich-status path above — the
+              // snapshot says the Job is alive, so a busy pod means a live
+              // subprocess rather than a wedge.
+              if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
               const finalized = await finalizeExternalLifecycleTerminalRun({
                 run,
                 adapterType,

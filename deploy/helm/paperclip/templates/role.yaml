@@ -49,6 +49,19 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Pod metrics (BLO-20251) — the hard-stale reaper in
+  # server/src/services/heartbeat.ts reads pod CPU to tell a run blocked on a
+  # long silent subprocess (pnpm install, test suite, docker build) apart from a
+  # genuinely wedged pod. Without this, both look identical (the agent CLI emits
+  # nothing between tool_use and tool_result) and live work gets force-killed.
+  #
+  # Served by metrics-server, which is an OPTIONAL cluster add-on. Every read
+  # degrades to "unknown" and the reaper falls back to its pre-BLO-20251
+  # output-silence behaviour, so this grant failing (or metrics-server being
+  # absent) is safe — it costs sensitivity, not correctness.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   # Secrets — both adapters create a transient Secret per Job for prompts
   # above LARGE_PROMPT_THRESHOLD_BYTES (256 KiB; below that, the prompt
   # rides as an env var on the init container). Both also patch the Secret
