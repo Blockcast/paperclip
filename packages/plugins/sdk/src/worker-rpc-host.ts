@@ -612,6 +612,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             configPath: options.configPath,
           });
         },
+        async verify(secretRef, presented, options = {}): Promise<boolean> {
+          return callHost("secrets.verify", {
+            secretRef,
+            presented,
+            companyId: options.companyId,
+            configPath: options.configPath,
+          });
+        },
         async list(companyId: string) {
           return callHost("secrets.list" as any, { companyId });
         },
@@ -1411,6 +1419,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           fn: (params: unknown, runCtx: ToolRunContext) => Promise<ToolResult>,
         ): void {
           toolHandlers.set(name, { declaration, fn });
+        },
+      },
+
+      costs: {
+        async recordFinanceEvent(
+          params: WorkerToHostMethods["costs.finance.create"][0],
+        ): Promise<WorkerToHostMethods["costs.finance.create"][1]> {
+          return callHost("costs.finance.create", params);
         },
       },
 

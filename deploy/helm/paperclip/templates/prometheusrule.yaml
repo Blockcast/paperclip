@@ -60,26 +60,19 @@
       PR adds, so it is inert until both land. Same manual `monitoring-rules`
       Argo sync gate as above applies afterwards.
 
-  STATUS of the BLO-21460 runtime-resource-reconciliation-stuck alert, same
-  auditability rule:
+  STATUS of the BLO-21092 plugin-error alert, same auditability rule:
 
-    - NOT yet merged as of 2026-08-12. Open on both authoritative onprem-k8s
-      files as Blockcast/onprem-k8s#2119 (branch
-      platformsre/blo-21460-runtime-resource-reconciliation-alert). Its own
-      PR body deliberately holds merge until this paperclip-side PR lands
-      (the rule reads metrics only this PR adds), then still needs the usual
-      manual `monitoring-rules` Argo sync afterward. Verify current state:
-        gh pr view 2119 --repo Blockcast/onprem-k8s --json state,mergedAt
-
-    - The onprem-k8s expr already includes the scheduler-down / missing-
-      telemetry guard (commit 3faf0da, addressing a review finding that a
-      bare `max(metric) > 0` is silent when the scheduler itself is down and
-      both series go absent rather than reading 0): it ORs in
-      `absent(paperclip_external_runtime_reservations_release_pending)`,
-      `absent(paperclip_environment_leases_orphaned_active)`, and
-      `up{job="paperclip-control-plane"} == 0` (with its own `absent()`
-      guard). The mirror below is kept in lockstep with that fixed expr —
-      do not let it regress to the bare `max(...) > 0` form.
+    - Not yet landed on the onprem-k8s authoritative files as of the PR that
+      introduces this comment. It reads paperclip_plugin_error, a new gauge
+      this same PR adds to server/src/services/metrics.ts -- both the metric
+      and the rule are inert until the server image ships AND the onprem-k8s
+      lockstep pair (monitoring/prometheus-configmap.yaml,
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml) is merged. Verify
+      before treating it as live:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipPluginErrored
+    - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
+      applies after merge -- a merged rule is not a deployed one.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -106,14 +99,56 @@ spec:
           annotations:
             summary: "Paperclip agent has {{ .Values.prometheusRule.zeroTokenStreakThreshold }}+ consecutive zero-token runs"
             description: "Agent {{`{{ $labels.agent_id }}`}} on adapter {{`{{ $labels.adapter }}`}} has completed {{ .Values.prometheusRule.zeroTokenStreakThreshold }} or more consecutive terminal runs with zero token usage. This catches poisoned-session/pre-model throttle loops like BLO-10866 within minutes."
-        - alert: PaperclipAgentJobBackoffLimitExceeded
-          expr: (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason="BackoffLimitExceeded"}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) or (sum by (namespace) (rate(kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }}}[{{ .Values.prometheusRule.backoffLimitExceededWindow }}])) unless on (namespace) sum by (namespace) (kube_job_status_failed{job_name=~{{ .Values.prometheusRule.agentJobNameRegex | quote }},reason=~".+"})))  > 0
-          for: {{ .Values.prometheusRule.backoffLimitExceededFor }}
+        # BLO-23413: PaperclipAgentJobBackoffLimitExceeded REMOVED. Verified
+        # against LIVE series on the Blockcast cluster, not the expression
+        # alone: kube_job_status_failed DOES carry reason="BackoffLimitExceeded"
+        # at failure time (disproving this alert's own original diagnosis),
+        # but every per-Job series carries exactly ONE post-failure scrape
+        # sample before kube-state-metrics stops reporting the Job, and
+        # rate()/increase() need >=2 samples to compute anything -- so this
+        # alert has never been able to fire and cannot be repaired by tuning
+        # the expression. A permanently-inert rule is worse than none.
+        # Superseded by PaperclipAgentHeartbeatStale below, an OUTCOME-side
+        # alert that does not depend on any K8s Job/pod signal surviving.
+        # See BLO-23413 and Blockcast/onprem-k8s#2380 for the full writeup
+        # (this chart copy renders nowhere live, see the file header).
+        - alert: PaperclipAgentHeartbeatStale
+          # BLO-23413 review fix -- two separate defects, both proven against a
+          # live Prometheus rather than by reading the expression:
+          #
+          # 1. PARSE. This was written `age > N * on (agent_id) interval`, which
+          #    binds the `on (agent_id)` modifier to the `*`, whose LEFT operand
+          #    is the scalar N. PromQL allows vector matching only between two
+          #    instant vectors, so the rule failed to parse and evaluated to a
+          #    query error -- i.e. it could never fire, the same
+          #    silently-inert-rule failure this alert exists to replace.
+          #    Control: `up > 3 * on (instance) up` -> HTTP 400 on a metric that
+          #    definitely exists, so the 400 is the shape, not a missing series.
+          #
+          # 2. DUPLICATE MATCH. Simply moving the parens is NOT sufficient here.
+          #    These gauges are published from the reconcileFailedWakeDispatches
+          #    pass, and every control-plane pod that runs it exports its own
+          #    copy: paperclip_agent_wakeup_terminal_failed_unresolved (same
+          #    pass, same registry) is live on 3 pods x 16 agents = 48 series.
+          #    With 3 series per agent_id on both sides, `on (agent_id)` is a
+          #    many-to-many match and errors at RUNTIME:
+          #      wakeup_terminal_failed_unresolved
+          #        > on (agent_id) (3 * wakeup_terminal_failed_unresolved)
+          #    -> HTTP 422 "found duplicate series for the match group".
+          #    `max by (agent_id)` collapses each side to one series per agent
+          #    BEFORE the join, giving a 1:1 match, exactly one alert per dark
+          #    agent, and an alert identity that survives a pod restart (no
+          #    instance/pod label churn). Verified on that same 3-pod metric:
+          #    the aggregated form returns 200, and with the multiplier dropped
+          #    to 0.5 it returns a real series -- so it is genuinely matching,
+          #    not vacuously empty.
+          expr: max by (agent_id) (paperclip_agent_heartbeat_age_seconds) > on (agent_id) ({{ .Values.prometheusRule.agentHeartbeatStaleMultiplier }} * max by (agent_id) (paperclip_agent_heartbeat_interval_seconds))
+          for: {{ .Values.prometheusRule.agentHeartbeatStaleFor }}
           labels:
             severity: warning
           annotations:
-            summary: "Paperclip agent Kubernetes Jobs are hitting BackoffLimitExceeded"
-            description: "One or more ac-* Paperclip agent Jobs in namespace {{`{{ $labels.namespace }}`}} are failing with BackoffLimitExceeded, or this cluster's kube-state-metrics omits Job failure reason labels and an ac-* Job failed. Check the matching Job/Pod logs and the zero-token streak alert for poisoned-session loops."
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has not heartbeated in {{ .Values.prometheusRule.agentHeartbeatStaleMultiplier }}x its configured interval"
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s lastHeartbeatAt is {{`{{ $value | printf \"%.0f\" }}`}}s old, more than {{ .Values.prometheusRule.agentHeartbeatStaleMultiplier }}x its own configured heartbeat.intervalSec (BLO-23413). This is an OUTCOME-side signal: it does not read any K8s Job/pod evidence, so it still fires after the Job that last ran the agent has been reaped. status='error' does NOT block dispatch, so a stuck agent needs a live-execution-path fix, not a status clear."
         - alert: PaperclipAgentPodUnschedulable
           # BLO-16224: keys on kube_pod_status_scheduled{condition="false"} (PodScheduled=False
           # -- the scheduler has not placed the pod) rather than kube_pod_status_unschedulable,
@@ -317,40 +352,6 @@ spec:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
             description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
-        - alert: PaperclipRuntimeResourceReconciliationStuck
-          # BLO-21460 (2026-08-03 incident follow-up). Both series are
-          # measured AFTER each reconciliation pass (reapOrphanedRuns ->
-          # reconcileReleasePendingExternalRuntimeReservations /
-          # reconcileOrphanedEnvironmentLeases, every
-          # heartbeatSchedulerIntervalMs), not the pre-pass candidate count —
-          # so 0 is the only healthy steady-state reading on either series.
-          # Unlike paperclip_external_runtime_reservations_active (expected
-          # to be non-zero whenever anything is genuinely running), a
-          # non-zero reading here means reconciliation itself is failing to
-          # keep up: the scheduler is down (e.g. crash-looping applying a
-          # migration, the incident this ticket follows up), or the kube API
-          # is unreachable so a reservation's Job status cannot be confirmed.
-          # Left unaddressed, held slots/leases exhaust executor capacity.
-          # A bare `max(metric) > 0` is silent for the scheduler-down case
-          # itself: the scrape stops, both series go absent (not zero), and
-          # max() over an empty vector never fires — so this also ORs in an
-          # absent()-on-both-metrics and up{job="paperclip-control-plane"}==0
-          # backstop, matching the fixed onprem-k8s#2119 expr (commit
-          # 3faf0da) this mirror must stay in lockstep with.
-          # See runbooks/cancellation-reservation-lease-leak-and-migration-0209-rollout.md.
-          expr: >
-            max(paperclip_external_runtime_reservations_release_pending) > 0
-            or max(paperclip_environment_leases_orphaned_active) > 0
-            or absent(paperclip_external_runtime_reservations_release_pending)
-            or absent(paperclip_environment_leases_orphaned_active)
-            or absent(up{job="paperclip-control-plane"})
-            or (max by (job) (up{job="paperclip-control-plane"}) == 0)
-          for: 10m
-          labels:
-            severity: warning
-          annotations:
-            summary: "Paperclip cancellation cleanup is not keeping up"
-            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
     - name: paperclip-queued-run-stranded
       rules:
         - alert: PaperclipQueuedRunStranded
@@ -372,16 +373,239 @@ spec:
           # indefinitely while each individual row is young. This gauge
           # carries the server-computed age of the oldest queued row PER
           # AGENT (refreshed on every /metrics scrape from a live
-          # MIN(created_at) aggregate), so `for:` here is only riding out
+          # MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
           # scrape flapping, not standing in for the real age.
-          expr: max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}
+          # The freshness gate is load-bearing: a failed database refresh
+          # leaves the previous gauge value in memory, so stale data must not
+          # qualify a strand alert. Gate each API replica against its own
+          # refresh result before taking the fleet-wide per-agent max; an
+          # `on()` join would let one healthy replica bless another replica's
+          # stale age snapshot.
+          expr: max by (agent_id) (paperclip_queued_run_oldest_age_seconds and on(instance) (paperclip_queued_run_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}
           for: {{ .Values.prometheusRule.queuedRunStrandedFor }}
           labels:
             severity: warning
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a queued run stranded for longer than {{ .Values.prometheusRule.queuedRunStrandedAgeSeconds }}s"
-            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest `queued` heartbeat run has been waiting for {{`{{ $value }}`}}s (BLO-21116). The issue it targets looks `in_progress`/assigned with an active run and generates no other alert, but nothing is executing -- and left alone this also manufactures a false productivity-review escalation reading the queue time as unattended active duration. Check whether the agent is at `maxConcurrentRuns` (capacity starvation -- other runs should still be cycling) or fully idle (a scheduler-tick or dispatch-path fault). Query `select id, agent_id, status, created_at, queued_at, now() - coalesce(queued_at, created_at) as age, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'queued' and agent_id = '{{`{{ $labels.agent_id }}`}}' order by coalesce(queued_at, created_at) asc limit 10` to find the specific rows -- ordered and aged by the same coalesce(queued_at, created_at) the gauge itself uses, so a scheduled-retry promotion cannot appear hours older here than the $value that fired. See the runbook for the starvation-vs-dropped triage."
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest `queued` heartbeat run has been waiting for {{`{{ $value }}`}}s since queue entry (BLO-21116). The age is only trusted while paperclip_queued_run_age_metrics_refresh_success is 1. The issue it targets looks `in_progress`/assigned with an active run, but nothing is executing. Query coalesce(queued_at, created_at), not created_at alone: retries promoted from scheduled_retry intentionally reset their dispatch-wait clock. See the runbook for saturation-versus-dispatch triage."
             runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
+        - alert: PaperclipQueuedRunAgeMetricsRefreshFailed
+          # This is deliberately separate from the strand alert. A failed
+          # refresh means the age gauge is not fresh, not that the queue is
+          # empty; page on it so the freshness gate cannot hide a real strand.
+          expr: paperclip_queued_run_age_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.queuedRunAgeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip queued-run age metric refresh is failing"
+            description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
+            runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
+    - name: paperclip-overdue-scheduled-retry
+      rules:
+        - alert: PaperclipOverdueScheduledRetry
+          # BLO-22094. PaperclipQueuedRunStranded above deliberately excludes
+          # `status='scheduled_retry'` rows -- refreshQueuedRunAgeMetrics only
+          # aggregates status='queued' (Ally review, onprem-k8s#2013: without
+          # that exclusion, a retry promoted after hours of backoff would
+          # instantly report that whole backoff as queued-dispatch wait). The
+          # consequence is that a retry which is parked and never promoted was
+          # invisible to any gauge, forever -- a dead/wedged promotion sweep
+          # had nothing to page on. This alert covers exactly that gap: the
+          # server-computed age, past DUE TIME, of the oldest agent row still
+          # sitting at status='scheduled_retry' with scheduled_retry_at < now
+          # (paperclip_overdue_scheduled_retry_oldest_age_seconds, reset to 0
+          # per agent on every /metrics scrape). A run still backing off
+          # toward a future due time contributes nothing -- this only fires on
+          # overshoot past when the promotion sweep should have already acted.
+          #
+          # Threshold derived from the observed park-to-promotion lag
+          # distribution over the 7 days preceding this alert's authorship
+          # (2026-07-31..2026-08-07, n=5253 promotions, queried from
+          # heartbeat_run_events "Scheduled retry became due and was promoted
+          # to the queued run pool"): p50=21.5s, p90=83.7s, p95=131.9s,
+          # p99=1594.8s, max=3567.5s. Zero of the 5253 samples exceeded 3600s.
+          # NOT fitted to the BLO-16366 5-sample table in this issue (those
+          # samples measured due-to-EXECUTION-START lag, which also includes
+          # the separate `queued` dispatch wait PaperclipQueuedRunStranded
+          # already covers -- a different quantity from this alert's
+          # due-to-PROMOTION lag). Set to 5400s (90m), ~50% margin over the
+          # worst observed day's max (3567s) rather than the aggregate p99, so
+          # a bad ccrotate_capacity-contention day (that reason's own p99 was
+          # 2528s) cannot false-page; `for:` below only rides out scrape
+          # flapping on top of that.
+          #
+          # Gated on the companion freshness gauge, exactly as
+          # PaperclipQueuedRunStranded is above, and load-bearing for a
+          # sharper reason here: refreshOverdueScheduledRetryAgeMetrics only
+          # reset-then-sets on its success path, so a failed refresh freezes
+          # the previous per-agent values while /metrics still returns 200.
+          # The frozen value is almost always 0 -- the HEALTHY reading -- so
+          # an ungated alert would sit silently green on top of a dead
+          # detector, which is the invisible-failure mode this whole alert
+          # exists to eliminate. The gate must live inside the `max by
+          # (agent_id)` because `on(instance)` needs the instance label the
+          # aggregation strips. PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed
+          # below is what pages when the gate closes.
+          expr: max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds and on(instance) (paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}
+          for: {{ .Values.prometheusRule.overdueScheduledRetryFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a scheduled_retry row overdue past its due time for longer than {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}s"
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest overdue `scheduled_retry` heartbeat run has been sitting past its due time for {{`{{ $value }}`}}s (BLO-22094). The age is only trusted while paperclip_overdue_scheduled_retry_age_metrics_refresh_success is 1. This row is still parked, not dispatched -- it has never even reached the `queued` state PaperclipQueuedRunStranded covers, so the promotion sweep (promoteScheduledRetryRun) either never ran for it or is systematically wedged. Query `select id, agent_id, scheduled_retry_reason, scheduled_retry_attempt, scheduled_retry_at, now() - scheduled_retry_at as overdue_by, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'scheduled_retry' and scheduled_retry_at < now() and agent_id = '{{`{{ $labels.agent_id }}`}}' order by scheduled_retry_at asc limit 10` to find the specific rows. See the runbook to distinguish a wedged promotion sweep from a gate legitimately re-deferring the row (e.g. issue_dependencies_blocked re-defer, which re-arms scheduled_retry_at further out rather than promoting -- that is designed backoff, not a strand)."
+            runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
+        - alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed
+          # Separate from the overdue alert above for the same reason
+          # PaperclipQueuedRunAgeMetricsRefreshFailed is separate from the
+          # strand alert: a failed refresh means the age gauge is not fresh,
+          # NOT that no row is overdue. Without this, closing the freshness
+          # gate would silently disable the detector.
+          #
+          # Also separate from the sibling's refresh-failed alert rather than
+          # sharing one signal: the two refreshes run different aggregates
+          # behind different indexes (0217 for status='queued', 0224 for the
+          # overdue-parked predicate), so a statement timeout or plan
+          # regression can hit this one alone -- leaving
+          # paperclip_queued_run_age_metrics_refresh_success at 1 while this
+          # gauge is frozen.
+          expr: paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.overdueScheduledRetryAgeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip overdue-scheduled_retry age metric refresh is failing"
+            description: "The most recent /metrics overdue-scheduled_retry-age database refresh failed (BLO-22094), so overdue-parked ages may be stale and PaperclipOverdueScheduledRetry is intentionally gated off. Note this can fail independently of the sibling queued-run-age refresh -- a healthy paperclip_queued_run_age_metrics_refresh_success does not vouch for this one. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty park queue."
+            runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
+        - alert: PaperclipScheduledRetryParkHorizonImplausible
+          # BLO-25036: distinct from the overdue detector because this measures
+          # the booked future horizon before scheduled_retry_at has passed.
+          expr: max by (agent_id) (paperclip_scheduled_retry_park_horizon_seconds and on(instance) (paperclip_scheduled_retry_park_horizon_refresh_success == 1)) > {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}
+          for: {{ .Values.prometheusRule.scheduledRetryParkHorizonFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has an implausibly long scheduled_retry park horizon"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has a live scheduled_retry row booked {{`{{ $value }}`}}s from heartbeat creation to its future due time, exceeding {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}s (BLO-25036). This is a park-horizon signal, not the BLO-22094 overdue-against-due-time signal. Inspect the retry/capacity decision for the parked row."
+            runbook_url: {{ .Values.prometheusRule.scheduledRetryParkHorizonRunbookUrl | quote }}
+        - alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed
+          expr: paperclip_scheduled_retry_park_horizon_refresh_success == 0
+          for: {{ .Values.prometheusRule.scheduledRetryParkHorizonRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip scheduled-retry park-horizon metric refresh is failing"
+            description: "The most recent /metrics scheduled-retry park-horizon database refresh failed (BLO-25036), so PaperclipScheduledRetryParkHorizonImplausible is gated off and its snapshot may be stale. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty scheduled_retry population."
+            runbook_url: {{ .Values.prometheusRule.scheduledRetryParkHorizonRunbookUrl | quote }}
+    - name: paperclip-plugin-lifecycle
+      rules:
+        - alert: PaperclipPluginCriticalErrored
+          # BLO-21092/BLO-20410: paperclip_plugin_error is a boolean-valued
+          # gauge already labeled by plugin_id/plugin_key, re-derived from the
+          # plugins table on every worker-tier collector tick (~30s). Unlike
+          # the wake-terminal-failed alert above, `for:` is safe to use
+          # directly here -- Prometheus tracks alert continuity per resulting
+          # series, and this series is already keyed per plugin, so it cannot
+          # collapse two different plugins' downtime into one continuously-true
+          # expression the way summing an unlabeled count would.
+          #
+          # Split into two alerts on the SAME expr shape rather than one alert
+          # with a templated severity label, so severity is visible directly
+          # in the rule file rather than hidden behind Go-template
+          # conditionals evaluated per-series at fire time. Critical: plugins
+          # matching pluginErrorCriticalKeyRegex (lucitra.plugin-secrets, the
+          # exact plugin BLO-20410 found dead for 9+ hours, and
+          # paperclip-plugin-alertmanager, whose failure suppresses the very
+          # notification reporting it -- see PEN-2590 and the two-naming-
+          # convention hazard documented at the value). Everything else pages
+          # warning below.
+          expr: paperclip_plugin_error{plugin_key=~{{ .Values.prometheusRule.pluginErrorCriticalKeyRegex | quote }}} == 1
+          for: {{ .Values.prometheusRule.pluginErrorFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip critical plugin {{`{{ $labels.plugin_key }}`}} has been in status='error' for {{ .Values.prometheusRule.pluginErrorFor }}+"
+            description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092) and matches the critical plugin allow-list (pluginErrorCriticalKeyRegex), so it pages out-of-band rather than filing through Paperclip. The keys on that list are there for different reasons: losing lucitra.plugin-secrets is not merely a missing feature -- BLO-20410 found it dead in this exact state for 9+ hours with the pod 1/1 Running and nothing alerting -- while paperclip-plugin-alertmanager is the transport for every non-critical alert, so at warning its own failure would suppress the notification reporting it (PEN-2590/PEN-2581). status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+        - alert: PaperclipPluginErrored
+          expr: paperclip_plugin_error{plugin_key!~{{ .Values.prometheusRule.pluginErrorCriticalKeyRegex | quote }}} == 1
+          for: {{ .Values.prometheusRule.pluginErrorFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip plugin {{`{{ $labels.plugin_key }}`}} has been in status='error' for {{ .Values.prometheusRule.pluginErrorFor }}+"
+            description: "Plugin {{`{{ $labels.plugin_key }}`}} (id {{`{{ $labels.plugin_id }}`}}) has sat at status='error' for at least {{ .Values.prometheusRule.pluginErrorFor }} (BLO-21092/BLO-20410 -- the detection gap that let 4 of 11 plugins, including the secrets subsystem, sit dead for 9+ hours with nothing alerting). status='error' is distinct from status='disabled': an operator-disabled plugin never sets this gauge and never pages. Check `select id, plugin_key, status, last_error, updated_at from plugins where plugin_key = '{{`{{ $labels.plugin_key }}`}}'` for the failure reason, then see the runbook."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+        - alert: PaperclipPluginStatusCollectorStale
+          # Review follow-up on BLO-21092: the two alerts above are silent by
+          # construction if the collector itself is dead -- a listInstalled()
+          # rejection on the FIRST tick means paperclip_plugin_error never gets
+          # a single series, and a rejection on any LATER tick just keeps
+          # re-serving the last-known snapshot forever, hiding both a new
+          # error and a recovery. This alert watches the collector's own
+          # heartbeat instead of the plugin data it produces. The gauge is
+          # labeled by a constant role="worker" and only ever .set() by
+          # startPluginStatusCollector itself, right before its first tick --
+          # NOT zero-initialized by ensureRegistry, which runs on every tier.
+          # A bare (zero-label) gauge would auto-publish at 0 the instant
+          # ensureRegistry constructs it, with no .set() call required, so the
+          # label is load-bearing: production scrapes both the `paperclip`
+          # (API) and `paperclip-workers` Services, and the API tier never
+          # starts this collector (app.ts gates plugin lifecycle to
+          # paperclipNodeRole !== "api"), so without the label this series
+          # would render frozen at 0 forever on the API target and
+          # permanently satisfy this expr there. With the label, the series
+          # is simply absent on an API-tier scrape -- `time() - <absent>`
+          # never evaluates -- until the worker tier's first successful tick.
+          expr: (time() - paperclip_plugin_status_collector_last_success_timestamp_seconds{role="worker"}) > {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}
+          for: {{ .Values.prometheusRule.pluginStatusCollectorStaleFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip plugin-status collector has not ticked successfully in over {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}s"
+            description: "paperclip_plugin_status_collector_last_success_timestamp_seconds has not advanced in over {{ .Values.prometheusRule.pluginStatusCollectorStaleSeconds }}s (BLO-21092 review follow-up). While this collector is stuck, PaperclipPluginCriticalErrored/PaperclipPluginErrored are silently unreliable: a plugin that just crashed will not be reflected, and a plugin that just recovered will keep paging. Check worker-tier logs for 'plugin-status-metrics: collector tick failed' to find the listInstalled() failure (most likely a DB connectivity issue on the worker pod), then see the runbook."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
+        - alert: PaperclipPluginStatusCollectorAbsent
+          # BLO-21092 Ally review. PaperclipPluginStatusCollectorStale above is
+          # structurally unable to catch the MOST severe variant of the gap it
+          # was added to close, so it needs this companion rather than a
+          # threshold tweak.
+          #
+          # That alert is `(time() - <gauge>) > 300` with `for: 5m`. It works
+          # for a collector that is stuck while its pod is still alive and
+          # scraped: the series persists at a frozen value, the difference
+          # grows past 300s, and it fires ~10m later. It CANNOT work when the
+          # worker pod is down, crashlooping, or never scraped. There the last
+          # sample was written at ~= time() when scraping stopped, so the
+          # difference is ~= 0 at that instant and only crosses 300s at
+          # t ~= 300s -- which is exactly when Prometheus's 5m lookback delta
+          # drops the series from instant queries. The condition is true for
+          # ~0 seconds, so a 5m `for:` window can never be satisfied. Same
+          # outcome, even more directly, if the collector never started at
+          # all (PAPERCLIP_NODE_ROLE misconfigured on the worker StatefulSet,
+          # or the -workers Service falling out of scrape scope): the series
+          # never exists, and `time() - <absent>` returns an empty vector
+          # rather than a large number.
+          #
+          # absent_over_time() is the correct primitive because it is TRUE on
+          # an empty range -- unlike the subtraction above, it does not need
+          # the series to still be queryable in order to report on it. The
+          # window is deliberately wider than the lookback delta so a single
+          # missed scrape or a rolling worker restart cannot trip it; only a
+          # genuinely gone series does.
+          #
+          # Severity is critical rather than warning: a stuck collector still
+          # leaves the last-known plugin snapshot visible, but an absent one
+          # means paperclip_plugin_error does not exist at all, which is
+          # indistinguishable at the dashboard from "all plugins healthy" --
+          # the precise invisible-failure mode BLO-20410 was.
+          expr: absent_over_time(paperclip_plugin_status_collector_last_success_timestamp_seconds{role="worker"}[{{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }}])
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip plugin-status collector has reported no successful tick for {{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }} (series absent)"
+            description: "paperclip_plugin_status_collector_last_success_timestamp_seconds{role=\"worker\"} has been entirely absent for {{ .Values.prometheusRule.pluginStatusCollectorAbsentFor }} (BLO-21092 Ally review). This is the worker-down / collector-never-started case that PaperclipPluginStatusCollectorStale cannot detect: with no series, `time() - <gauge>` yields an empty vector instead of a growing number, so the staleness rule stays silent forever. While this fires, paperclip_plugin_error is absent too -- which on a dashboard looks identical to every plugin being healthy, exactly the invisible failure BLO-20410 was. Check that a worker-tier pod is Running with PAPERCLIP_NODE_ROLE != 'api', that it is a live Prometheus scrape target (the `paperclip-workers` Service must stay within the ServiceMonitor selector), and grep worker logs for 'plugin-status-metrics'."
+            runbook_url: {{ .Values.prometheusRule.pluginErrorRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

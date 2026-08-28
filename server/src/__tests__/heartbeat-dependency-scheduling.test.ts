@@ -19,13 +19,26 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { DEP_BLOCKED_RETRY_REASON, heartbeatService } from "../services/heartbeat.js";
+import {
+  DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+  DEP_BLOCKED_RETRY_REASON,
+  heartbeatService,
+  resolveHeartbeatTimerSchedulerExclusionReason,
+} from "../services/heartbeat.js";
 import { getDepBlockedMetric, resetDepBlockedMetrics } from "../services/dep-blocked-metrics.js";
 import {
   composeSweepWakeFramePage,
   sweepWakeFrameSlug,
 } from "../services/sweep-wake-preflight.js";
 import { runningProcesses } from "../adapters/index.js";
+
+// Mirrors DEP_BLOCKED_MAX_PARK_AGE_MS in ../services/heartbeat.ts. Deliberately
+// re-stated here rather than imported: importing it would make this file fail to LOAD
+// on a build without the ceiling, whereas the point of these tests is that they fail
+// on the BEHAVIOUR (re-deferring a park that should have been terminated).
+// Derivation lives with the source constant: 12h > the ~10.25h full attempt budget,
+// so this bound can only fire on a park whose attempt counter was reset by churn.
+const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
 
 const mockGbrainCall = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
@@ -164,6 +177,95 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("classifies both first and coalesced timer dependency parks as issue-tree holds", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          intervalSec: 60,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "todo",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked timer work",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const timerWake = {
+      source: "timer" as const,
+      triggerDetail: "system" as const,
+      reason: "heartbeat_timer",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "heartbeat_timer" },
+    };
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    const firstSuppression = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
+    };
+    const firstRun = await heartbeat.enqueueWakeup(agentId, timerWake, firstSuppression);
+    expect(firstRun).toBeNull();
+    expect(firstSuppression.dependencyBlockedRetryAt).toBeInstanceOf(Date);
+    expect(resolveHeartbeatTimerSchedulerExclusionReason(firstSuppression)).toBe("issue_tree_hold_active");
+
+    const secondSuppression = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
+    };
+    const coalescedRun = await heartbeat.enqueueWakeup(agentId, timerWake, secondSuppression);
+    expect(coalescedRun).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryReason: DEP_BLOCKED_RETRY_REASON,
+    });
+    expect(secondSuppression.dependencyBlockedRetryAt).toBeInstanceOf(Date);
+    expect(resolveHeartbeatTimerSchedulerExclusionReason(secondSuppression)).toBe("issue_tree_hold_active");
   });
 
   it("keeps blocked descendants idle until their blockers resolve", async () => {
@@ -1531,6 +1633,13 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(coalescedRequest?.runId).toBe(scheduledRun?.id);
   });
 
+  it("pins the dependency retry budget used before recovery handoff", () => {
+    // Twelve attempts is the intentional roughly ten-hour dependency wait
+    // horizon; exhaustion must leave the issue for dependency recovery rather
+    // than retrying indefinitely.
+    expect(DEP_BLOCKED_MAX_RETRY_ATTEMPTS).toBe(12);
+  });
+
   it("resets dependency-blocked scheduled_retry when the blocker set changes", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1644,6 +1753,234 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     });
     expect(getDepBlockedMetric("dep_blocked_reset")).toBe(1);
     expect(getDepBlockedMetric("dep_blocked_scheduled")).toBe(2);
+  });
+
+  it("terminates a dep-blocked park past the age ceiling instead of re-deferring it", async () => {    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+
+    const parked = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(parked).not.toBeNull();
+    // Attempt stays far below DEP_BLOCKED_MAX_RETRY_ATTEMPTS, so anything that
+    // cancels this row can only be the age ceiling — not the attempt ceiling.
+    expect(parked!.scheduledRetryAttempt).toBeLessThan(DEP_BLOCKED_MAX_RETRY_ATTEMPTS);
+
+    // Deliberately derived from createdAt, not from the new snapshot field: for a row
+    // that has never churned they are the same instant, so this test discriminates on
+    // BEHAVIOUR (terminate vs re-defer) rather than on the field's presence.
+    const firstParkedAt = parked!.createdAt;
+
+    // Still inside the age ceiling → the row must survive as a re-deferred park.
+    await heartbeat.promoteDueScheduledRetries(
+      new Date(firstParkedAt.getTime() + DEP_BLOCKED_MAX_PARK_AGE_MS - 60_000),
+    );
+    const stillParked = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, parked!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(stillParked?.status).toBe("scheduled_retry");
+
+    // Past the age ceiling → terminated, not re-deferred. Promoted well clear of the
+    // re-defer the previous call just applied (backoff caps at DEP_BLOCKED_MAX_DELAY_MS
+    // = 60 min), otherwise the row simply is not due yet and is never examined.
+    await heartbeat.promoteDueScheduledRetries(
+      new Date(firstParkedAt.getTime() + DEP_BLOCKED_MAX_PARK_AGE_MS + 2 * 60 * 60 * 1000),
+    );
+    const expired = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, parked!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(expired?.status).toBe("cancelled");
+    expect(expired?.errorCode).toBe("issue_dependencies_blocked");
+    expect(expired?.error).toContain("maximum age");
+    expect(getDepBlockedMetric("dep_blocked_age_expired")).toBe(1);
+
+    // The issue's execution lock is released so the row cannot strand the issue.
+    const releasedIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(releasedIssue?.executionRunId).toBeNull();
+  });
+
+  it("carries the park age across a blocker-set change so churn cannot reset the ceiling", async () => {
+    // The regression this pins: a blocker-set change cancels the pending row and
+    // inserts a replacement at scheduledRetryAttempt 0. If the age were measured from
+    // the replacement row's own createdAt, an issue whose blockers churn faster than
+    // its backoff would be re-parked forever at ANY attempt ceiling (BLO-29055).
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerAId = randomUUID();
+    const blockerBId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerAId, companyId, title: "Blocker A", status: "in_progress", priority: "high" },
+      { id: blockerBId, companyId, title: "Blocker B", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId: blockerAId, relatedIssueId: blockedIssueId, type: "blocks" },
+      { companyId, issueId: blockerBId, relatedIssueId: blockedIssueId, type: "blocks" },
+    ]);
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const firstRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(firstRun).not.toBeNull();
+    // Origin taken from createdAt so the promotion clock below does not depend on the
+    // new field existing — the assertion that matters is behavioural.
+    const originAt = firstRun!.createdAt;
+
+    // Churn the blocker set, which cancels the park and inserts a fresh one.
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date() })
+      .where(eq(issues.id, blockerAId));
+    await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, resolvedBlockerIssueId: blockerAId },
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        wakeReason: "issue_blockers_resolved",
+        resolvedBlockerIssueId: blockerAId,
+      },
+    });
+
+    const replacement = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(replacement).not.toBeNull();
+    expect(replacement!.id).not.toBe(firstRun!.id);
+    // The attempt budget did reset — that is the existing behaviour this ceiling
+    // has to survive, not something the test is asserting away.
+    expect(replacement!.scheduledRetryAttempt).toBe(0);
+
+    // The ceiling must still fire, measured from the ORIGINAL park. On a build without
+    // the carry, the replacement's own age is ~0 here and it re-defers instead.
+    await heartbeat.promoteDueScheduledRetries(
+      new Date(originAt.getTime() + DEP_BLOCKED_MAX_PARK_AGE_MS + 60_000),
+    );
+    const expired = await db
+      .select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, replacement!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(expired?.status).toBe("cancelled");
+    expect(expired?.error).toContain("maximum age");
+    // And the mechanism that made it possible: the origin was inherited from the
+    // cancelled park, not restamped to the replacement's own creation instant.
+    expect(
+      (replacement!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt,
+    ).toBe((firstRun!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt);
   });
 
   it("runs immediately when the final blocker resolves while a dep-blocked retry exists", async () => {

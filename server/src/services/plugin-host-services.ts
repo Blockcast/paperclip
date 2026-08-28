@@ -8,6 +8,7 @@ import {
   authUsers,
   budgetIncidents,
   costEvents,
+  financeEvents,
   heartbeatRuns,
   invites,
   issues as issuesTable,
@@ -44,6 +45,7 @@ import { createMilestonesService } from "./milestones.js";
 import { documentService } from "./documents.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
+import { financeService } from "./finance.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -758,6 +760,25 @@ export function buildHostServices(
     normalizePluginOriginKind(originKind);
   };
 
+  /**
+   * BLO-29908: normalize an execution-lock write precondition arriving over
+   * JSON-RPC, where a plugin can send any JSON value.
+   *
+   * `undefined` means "no precondition", `null` means "the issue must be
+   * unheld", and a run id pins that specific holder. Anything else is a caller
+   * bug and throws rather than degrading to `undefined` — silently dropping
+   * the guard would restore the exact eviction this precondition prevents,
+   * and it would do so invisibly.
+   */
+  const normalizeExpectedRunId = (value: unknown): string | null | undefined => {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    if (typeof value === "string" && value.length > 0) return value;
+    throw new Error(
+      "Plugin issue execution-lock precondition must be null or a non-empty run id string",
+    );
+  };
+
   const logPluginActivity = async (input: {
     companyId: string;
     action: string;
@@ -1394,6 +1415,11 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         return secretsHandler.resolve({ ...params, companyId });
       },
+      async verify(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return secretsHandler.verify({ ...params, companyId });
+      },
       async list(params) {
         const svc = secretService(db);
         return svc.list(params.companyId);
@@ -1448,6 +1474,83 @@ export function buildHostServices(
           entityId: params.entityId ?? pluginId,
           details: pluginActivityDetails(params.metadata),
         });
+      },
+    },
+
+    costs: {
+      async createFinanceEvent(params) {
+        const companyId = ensureCompanyId(params.companyId);
+
+        // finance_events is the settlement ledger that sits *alongside* the
+        // adapter-written cost_events estimates. Plugins deliberately cannot
+        // reach cost_events: adapters already emit a row per run for the same
+        // traffic, so a second writer there would double-count it.
+        const amountCents = Number(params.amountCents);
+        if (!Number.isFinite(amountCents) || !Number.isSafeInteger(amountCents)) {
+          throw new Error("amountCents must be a safe integer number of cents");
+        }
+        const occurredAt = new Date(params.occurredAt);
+        if (Number.isNaN(occurredAt.getTime())) {
+          throw new Error("occurredAt must be a valid ISO 8601 timestamp");
+        }
+        const biller = String(params.biller ?? "").trim();
+        if (!biller) throw new Error("biller is required");
+        const eventKind = String(params.eventKind ?? "").trim();
+        if (!eventKind) throw new Error("eventKind is required");
+
+        const externalInvoiceId = params.externalInvoiceId?.trim() || null;
+
+        // Idempotency: a scheduled reconciler re-running over the same window
+        // must not accumulate duplicate rows. Callers supply a stable
+        // externalInvoiceId and we treat it as the natural key.
+        //
+        // NOTE: select-then-insert is racy under concurrent writers. It is safe
+        // for the single-scheduled-job case this was built for. Hardening it
+        // needs a partial unique index on
+        // (company_id, external_invoice_id) WHERE external_invoice_id IS NOT NULL
+        // plus ON CONFLICT DO NOTHING — tracked as follow-up.
+        if (externalInvoiceId) {
+          const existing = await db
+            .select({ id: financeEvents.id })
+            .from(financeEvents)
+            .where(
+              and(
+                eq(financeEvents.companyId, companyId),
+                eq(financeEvents.externalInvoiceId, externalInvoiceId),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existing) {
+            logger.debug(
+              { pluginId, companyId, externalInvoiceId },
+              "Plugin finance event already recorded; returning existing row",
+            );
+            return { id: existing.id, created: false };
+          }
+        }
+
+        const event = await financeService(db).createEvent(companyId, {
+          eventKind,
+          biller,
+          provider: params.provider ?? null,
+          model: params.model ?? null,
+          amountCents,
+          currency: params.currency ?? "USD",
+          estimated: params.estimated ?? false,
+          quantity: params.quantity ?? null,
+          unit: params.unit ?? null,
+          externalInvoiceId,
+          description: params.description ?? null,
+          occurredAt,
+          metadataJson: params.metadata ? sanitiseMeta(params.metadata) : null,
+        });
+
+        logger.debug(
+          { pluginId, companyId, biller, amountCents, estimated: params.estimated ?? false },
+          "Plugin finance event recorded",
+        );
+        return { id: event.id, created: true };
       },
     },
 
@@ -1607,7 +1710,10 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
-          isPrimary: true,
+          // BLO-26184: report whether this was an explicit choice or a
+          // fallback guess rather than always claiming "true" — a plugin
+          // reading this as fact previously had no way to tell the two apart.
+          isPrimary: project.primaryWorkspaceSource === "explicit",
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };
@@ -1652,7 +1758,9 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
-          isPrimary: true,
+          // BLO-26184: see getPrimaryWorkspace above — do not claim explicit
+          // choice for a fallback guess.
+          isPrimary: project.primaryWorkspaceSource === "explicit",
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };
@@ -1864,11 +1972,26 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        // BLO-29908: execution-lock compare-and-set. These are write
+        // preconditions, not fields, so they are lifted out of `patch` before
+        // it is applied or logged — otherwise they read as attempted column
+        // writes in the activity trail.
+        //
+        // Forwarded explicitly rather than left to ride along in the spread:
+        // a plugin cancelling an issue it does not hold depends on these
+        // reaching `updateIssue`, and an implicit passthrough is one refactor
+        // away from silently dropping the guard and restoring the eviction bug.
+        const expectedCurrentCheckoutRunId = normalizeExpectedRunId(patch.expectedCurrentCheckoutRunId);
+        const expectedCurrentExecutionRunId = normalizeExpectedRunId(patch.expectedCurrentExecutionRunId);
+        delete patch.expectedCurrentCheckoutRunId;
+        delete patch.expectedCurrentExecutionRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
+          ...(expectedCurrentCheckoutRunId === undefined ? {} : { expectedCurrentCheckoutRunId }),
+          ...(expectedCurrentExecutionRunId === undefined ? {} : { expectedCurrentExecutionRunId }),
           actorAgentId,
           actorUserId,
         })) as Issue;

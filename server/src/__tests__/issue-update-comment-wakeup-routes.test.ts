@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const MANAGER_AGENT_ID = "44444444-4444-4444-8444-444444444444";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -291,6 +292,44 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it.each(["done", "cancelled"] as const)("does not wake an agent assigned to a %s issue", async (status) => {
+    const existing = makeIssue({
+      status,
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+    });
+    const updated = makeIssue({
+      status,
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: `comment-terminal-assignment-${status}`,
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "recording the closed-work handoff",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        comment: "recording the closed-work handoff",
+      });
+
+    expect(res.status).toBe(200);
+    // The wakeups run in a detached task. This lookup occurs after assignment-wake
+    // selection, so waiting for it makes the negative assertion non-vacuous.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_assigned" }),
+    );
+  });
+
   it("interrupts the active run and wakes the newly assigned agent with handoff context", async () => {
     const existing = makeIssue({
       assigneeAgentId: PREVIOUS_AGENT_ID,
@@ -488,6 +527,148 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it("does not wake the assignee when another agent closes the issue with a comment in one PATCH", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "cancelled",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-close-agent",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "cancelling as a duplicate",
+    });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: MANAGER_AGENT_ID,
+      companyId: existing.companyId,
+      source: "agent_key",
+    }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "cancelled", comment: "cancelling as a duplicate" });
+
+    expect(res.status).toBe(200);
+    // The wakeup block is a detached `void (async () => {...})` in the route, so the
+    // response resolves before it runs. Anchor on `findMentionedAgents`, which is called
+    // unconditionally *after* the assignee-wake decision inside that same IIFE — without
+    // it this negative assertion can pass simply by racing ahead of the code it guards.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
+  });
+
+  it("does not wake the assignee when a user closes the issue with a comment in one PATCH", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "done",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-close-user",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "shipped, closing this out",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", comment: "shipped, closing this out" });
+
+    expect(res.status).toBe(200);
+    // See the note on the agent-closer case above: the negative assertion is only
+    // meaningful once the detached wakeup IIFE has passed the assignee-wake decision.
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
+  });
+
+  it("still wakes the assignee when a comment reopens a closed issue", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "done",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "todo",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-reopen",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "this regressed, please pick it back up",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "this regressed, please pick it back up", reopen: true });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+    );
+  });
+
+  it("wakes the assignee when a comment moves a closed issue back to an open status", async () => {
+    // BLO-29821 widening, pinned deliberately: the guard now keys on the post-update
+    // status, so a PATCH that lifts an issue out of a terminal status and comments on it
+    // wakes the assignee. Previously `isClosed` (pre-update) suppressed this whenever the
+    // transition did not land exactly on `todo`, which left the assignee unaware that
+    // reopened work was waiting on them.
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "done",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-unclose",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "reopening, the fix regressed",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "in_progress", comment: "reopening, the fix regressed" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
+  });
+
   it("wakes the assignee on top-level board issue comments", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
@@ -531,6 +712,69 @@ describe("issue update comment wakeups", () => {
       }),
     );
   });
+
+  it.each(["done", "cancelled"] as const)(
+    "does not wake a mentioned agent from a terminal %s issue",
+    async (status) => {
+      const existing = makeIssue({
+        status,
+        assigneeAgentId: null,
+        assigneeUserId: "local-board",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: `comment-terminal-mention-${status}`,
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "@mentioned please take another look",
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: "@mentioned please take another look" });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["done", "cancelled"] as const)(
+    "does not emit an execution-stage approver wake for terminal %s issues",
+    async (status) => {
+      const existing = makeIssue({
+        status: "in_review",
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        executionState: {
+          status: "pending",
+          currentStageId: "stage-1",
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: MENTIONED_AGENT_ID },
+          returnAssignee: { type: "agent", agentId: ASSIGNEE_AGENT_ID },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+        },
+      });
+      const updated = makeIssue({
+        ...existing,
+        status,
+        executionState: existing.executionState,
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue(updated);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${existing.id}`)
+        .send({ status });
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    },
+  );
 
   it("replays an unprocessed idempotent top-level comment through post-insert side effects", async () => {
     const existing = makeIssue({

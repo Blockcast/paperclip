@@ -24,6 +24,7 @@ import {
 import { handleWebhook } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
 import {
+  authenticateWebhook,
   resolveCompanyScope,
   resolveEscalationSweepConfig,
 } from "./config-scope.js";
@@ -83,7 +84,8 @@ export const plugin = definePlugin({
     // carried no companyId, which no retry can fix, so it is dropped.
     const scope = await resolveCompanyScope(ctx, input.companyId);
     if (!scope) return;
-    await handleWebhook(ctx, scope.config, scope.token, input);
+    const authenticated = await authenticateWebhook(ctx, scope.config, input);
+    await handleWebhook(ctx, scope.config, authenticated, input);
   },
 
   async onHealth() {

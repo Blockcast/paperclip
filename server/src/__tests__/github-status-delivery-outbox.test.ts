@@ -27,6 +27,7 @@ vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 
 import { _resetInstallationTokenCache } from "../services/github-app-auth.js";
 import {
+  _classifyReviewerEvidenceError,
   enqueueGithubCommitStatusDelivery,
   pollGitHubCommitStatusDeliveriesOnce,
   resetStaleGitHubCommitStatusDeliveries,
@@ -63,6 +64,50 @@ function clearCreds() {
   h.cfg.githubAppPrivateKey = "";
   h.cfg.prReviewerBotLogin = "allyblockcast[bot]";
 }
+
+// BLO-28968: an evidence-fetch failure is never evidence about the PR, on any
+// surface. These pin the *default* — permanent is the enumerated exception —
+// so a future third evidence surface cannot silently inherit permanent failure.
+// Needs no database: the classifier is pure apart from the mocked config read.
+describe("reviewer-evidence error classification", () => {
+  afterEach(() => {
+    clearCreds();
+  });
+
+  for (const error of ["reviews_http_403", "reviews_http_404", "reviews_http_401"]) {
+    it(`retries \`${error}\` rather than permanently dropping the gate-status delivery`, () => {
+      setCreds();
+      expect(_classifyReviewerEvidenceError(error)).toEqual({
+        retryable: true,
+        reason: `reviewer_evidence_${error}`,
+      });
+    });
+  }
+
+  it("keeps a missing reviewer bot login permanent", () => {
+    setCreds();
+    expect(_classifyReviewerEvidenceError("no_bot_login")).toEqual({
+      retryable: false,
+      reason: "missing_pr_reviewer_bot_login",
+    });
+  });
+
+  it("keeps an absent GitHub App credential set permanent", () => {
+    clearCreds();
+    expect(_classifyReviewerEvidenceError("no_token")).toEqual({
+      retryable: false,
+      reason: "missing_github_app_credentials",
+    });
+  });
+
+  it("retries a token blip when the credentials are configured", () => {
+    setCreds();
+    expect(_classifyReviewerEvidenceError("no_token")).toEqual({
+      retryable: true,
+      reason: "github_app_token_unavailable",
+    });
+  });
+});
 
 describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
   let db!: ReturnType<typeof createDb>;
@@ -476,7 +521,12 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
-  it("does not let an exact-head COMMENTED App review suppress the gate failure", async () => {
+  // BLO-28920: this outbox decides whether to post a "reviewer never finished"
+  // FAILURE status, which is an attestation question, not a merge-authorization
+  // one. An exact-head COMMENTED review proves the reviewer DID finish, so the
+  // red status would be a false alarm. Suppressing it does not authorize a
+  // merge: the required context simply stays unposted/pending (BLO-17456).
+  it("skips the failure write when an exact-head COMMENTED App review exists", async () => {
     setCreds();
     const { delivery } = await seedRun();
     const fetchMock = stubGithub({
@@ -487,8 +537,8 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
 
     await pollGitHubCommitStatusDeliveriesOnce(db);
 
-    expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
-    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(true);
+    expect(await readDelivery(delivery.id)).toMatchObject({ status: "skipped" });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
   });
 
   it("re-checks commit status after reviewer evidence before posting failure", async () => {
@@ -589,6 +639,27 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       status: "queued",
       attempts: 1,
       lastError: "reviewer_evidence_reviews_rate_limited",
+      lastErrorKind: "transient",
+    });
+    expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it("keeps the delivery retryable when the reviews surface 404s", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    stubGithub({
+      latestStatuses: [],
+      reviewsStatus: 404,
+      reviewsBody: { message: "Not Found" },
+    });
+
+    await pollGitHubCommitStatusDeliveriesOnce(db);
+
+    const updated = await readDelivery(delivery.id);
+    expect(updated).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      lastError: "reviewer_evidence_reviews_http_404",
       lastErrorKind: "transient",
     });
     expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());

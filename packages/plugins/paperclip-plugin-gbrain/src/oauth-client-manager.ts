@@ -60,6 +60,19 @@ interface AuthbotCredentialEnvelope {
   value?: unknown;
 }
 
+/**
+ * Thrown when an agentId has no entry in the clients map. Distinct from a
+ * transport/HTTP failure against the token endpoint: this is a permanent
+ * provisioning gap (the agent was never given a gbrain client), not a
+ * transient error, so callers should classify it differently (BLO-23403).
+ */
+export class NoOAuthClientError extends Error {
+  constructor(public readonly agentId: string) {
+    super(`gbrain OAuth: no client configured for agentId ${agentId}`);
+    this.name = "NoOAuthClientError";
+  }
+}
+
 export interface OAuthClientsLoadOptions {
   /** Authbot credential API URL. When set, this source is authoritative. */
   authbotUrl?: string;
@@ -149,7 +162,7 @@ export class OAuthClientManager {
   private async refresh(agentId: string): Promise<string> {
     const entry = this.clients[agentId];
     if (!entry) {
-      throw new Error(`gbrain OAuth: no client configured for agentId ${agentId}`);
+      throw new NoOAuthClientError(agentId);
     }
     const body = new URLSearchParams();
     body.set("grant_type", "client_credentials");

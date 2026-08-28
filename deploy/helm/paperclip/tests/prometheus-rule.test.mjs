@@ -39,7 +39,6 @@ test("Blockcast values do not render a PrometheusRule (paperclip-ci-deploy has n
     "values.blockcast.yaml must keep prometheusRule.enabled=false until paperclip-ci-deploy is granted RBAC on prometheusrules.monitoring.coreos.com",
   );
 });
-
 test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains usable once RBAC exists)", () => {
   const rendered = execFileSync(
     "helm",
@@ -307,24 +306,13 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
   );
 });
 
-test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links its runbook (BLO-21116)", () => {
-  const rendered = execFileSync(
-    "helm",
-    [
-      "template",
-      "paperclip",
-      "deploy/helm/paperclip",
-      "--namespace",
-      "paperclip",
-      "-f",
-      "deploy/helm/paperclip/values.blockcast.yaml",
-      "--show-only",
-      "templates/prometheusrule.yaml",
-      "--set",
-      "prometheusRule.enabled=true",
-    ],
-    { cwd: repoRoot, encoding: "utf8" },
-  );
+test("PaperclipQueuedRunStranded is agent-keyed, freshness-gated, and fires before 30m (BLO-21116)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
 
   assert.match(rendered, /alert: PaperclipQueuedRunStranded/);
   const [, expr] = rendered.match(
@@ -340,9 +328,8 @@ test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links it
   // is young.
   assert.match(
     expr,
-    /^max\(paperclip_queued_run_oldest_age_seconds\) by \(agent_id\) > (\d+)$/,
-    "queued-run-stranded alert must threshold the per-agent age gauge, "
-      + "not a summed count under a long `for:`",
+    /^max by \(agent_id\) \(paperclip_queued_run_oldest_age_seconds and on\(instance\) \(paperclip_queued_run_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "queued-run-stranded alert must gate each replica's age before taking the per-agent max",
   );
 
   const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
@@ -390,51 +377,564 @@ test("PaperclipQueuedRunStranded is agent-keyed, gauge-thresholded, and links it
   );
 });
 
-test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the scheduler-down backstop (BLO-21460)", () => {
+test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_queued_run_age_metrics_refresh_success == 0\n/,
+    "a failed queued-run-age refresh must have its own alert",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
+    "the freshness failure alert must route responders to the queued-run runbook",
+  );
+});
+
+test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
+  // BLO-23413: this alert was verified structurally unable to fire on the
+  // live cluster (kube-state-metrics only ever emits ONE post-failure
+  // sample per ac-* Job before the object is deleted, so rate()/increase()
+  // -- which need >=2 samples -- can never compute a value). It must stay
+  // deleted; a permanently-inert rule is worse than none because its
+  // presence implies coverage that does not exist.
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+  assert.doesNotMatch(
+    rendered,
+    /alert: PaperclipAgentJobBackoffLimitExceeded/,
+    "PaperclipAgentJobBackoffLimitExceeded must not be re-added without a fresh live-series proof (BLO-23413)",
+  );
+});
+
+test("PaperclipAgentHeartbeatStale is an outcome-side per-agent-interval alert (BLO-23413)", () => {
   const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
 
-  assert.match(rendered, /alert: PaperclipRuntimeResourceReconciliationStuck/);
+  assert.match(rendered, /alert: PaperclipAgentHeartbeatStale/);
   const [, expr] = rendered.match(
-    /alert: PaperclipRuntimeResourceReconciliationStuck[\s\S]*?\n\s+expr: >-?\n([\s\S]*?)\n\s+for:/,
+    /alert: PaperclipAgentHeartbeatStale[\s\S]*?\n\s+expr: (.+)\n/,
   ) ?? [];
-  assert.ok(expr, "runtime-resource-reconciliation-stuck alert must render an expr");
+  assert.ok(expr, "heartbeat-stale alert must render an expr");
 
-  // Pin both backlog gauges. Either alone would leave the other resource
-  // type's leak silent -- the 2026-08-03 incident involved both a reservation
-  // and a lease left behind by the same cancelled runs.
+  // Must threshold as a MULTIPLE of the agent's OWN configured interval via
+  // an `on (agent_id)` join, not one fleet-wide constant -- a fleet runs
+  // agents with different heartbeat.intervalSec, and a constant threshold
+  // would be wrong for every agent not on the modal interval.
+  //
+  // BLO-23413 review fix: the multiplier must sit INSIDE the parenthesised
+  // right-hand operand, and both sides must be pre-aggregated with
+  // `max by (agent_id)`. The original form
+  //   age > N * on (agent_id) interval
+  // bound the matching modifier to the `*` (scalar left operand) and failed
+  // to parse; and even with the parens fixed, the un-aggregated form is a
+  // many-to-many match because every control-plane pod exports its own copy
+  // of these gauges. Both were reproduced against live Prometheus (HTTP 400
+  // and HTTP 422 respectively). See the template comment for the full proof.
   assert.match(
     expr,
-    /max\(paperclip_external_runtime_reservations_release_pending\) > 0/,
-    "must page on a stuck release-pending external-runtime reservation",
-  );
-  assert.match(
-    expr,
-    /max\(paperclip_environment_leases_orphaned_active\) > 0/,
-    "must page on an orphaned-active environment lease",
+    /^max by \(agent_id\) \(paperclip_agent_heartbeat_age_seconds\) > on \(agent_id\) \(\d+ \* max by \(agent_id\) \(paperclip_agent_heartbeat_interval_seconds\)\)$/,
+    "heartbeat-stale alert must threshold max-by-agent age against max-by-agent interval*multiplier, joined 1:1 on agent_id",
   );
 
-  // The scheduler-down backstop this test exists to pin: a bare
-  // `max(metric) > 0` per series is silent for the exact failure mode the
-  // alert's own rationale names -- the scheduler crash-loops (as it did
-  // during the incident), the /metrics scrape stops, both series go ABSENT
-  // (not zero), and max() over an empty vector never fires. This paperclip
-  // chart copy regressed to that silent, pre-fix form once already (fixed
-  // alongside this test) after onprem-k8s#2119 added the backstop on review;
-  // catch a second regression here instead of relying on manual diffing
-  // against a PR in a different repo.
+  const [, multiplier] = expr.match(/\((\d+) \* max by/) ?? [];
+  assert.ok(
+    Number(multiplier) >= 3,
+    `heartbeat-stale multiplier ${multiplier} must be at least 3x per the BLO-23413 AC`,
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipAgentHeartbeatStale[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(forWindow, "heartbeat-stale alert must render a for window");
+});
+
+// BLO-23413. The bug this guards against shipped once and the existing
+// per-alert test did not catch it -- worse, that test pinned the broken string
+// as if it were correct, so the regex was actively enforcing the defect.
+//
+// PromQL permits a vector-matching modifier (`on (...)` / `ignoring (...)`)
+// only BETWEEN TWO INSTANT VECTORS. Writing `age > 3 * on (agent_id) interval`
+// binds the modifier to the `*`, whose left operand is the scalar `3`, and the
+// whole rule then fails to parse -- Prometheus returns a query error and the
+// alert can never fire. That is the same silently-inert-rule class this file
+// deleted PaperclipAgentJobBackoffLimitExceeded for, so re-introducing one
+// would be a straight regression of the issue's own premise.
+//
+// SCOPE, stated honestly: this is a targeted structural guard for that one
+// defect class, NOT a PromQL parser. Full parse+evaluation validation needs
+// `promtool check rules` / `promtool test rules`, which requires a promtool
+// binary this job does not install, and which belongs with the copies that
+// actually render live (Blockcast/onprem-k8s) rather than with this chart copy
+// -- the file header notes prometheusRule.enabled=false for Blockcast values,
+// so nothing here reaches a live Prometheus. This guard is cheap, hermetic and
+// catches the specific mistake that was made; it is not a substitute for
+// promtool, and should not be described as one.
+test("no rendered alert applies a vector-matching modifier to a scalar operand (BLO-23413)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const exprs = [...rendered.matchAll(/^\s+expr:\s*(.+?)\s*$/gm)].map(
+    ([, expr]) => expr,
+  );
+  assert.ok(
+    exprs.length > 0,
+    "expected the PrometheusRule to render at least one expr to check",
+  );
+
+  // Match `<operand> <binop> on|ignoring (`; flag it when <operand> is a bare
+  // numeric literal. `metric > on (...)` and `) > on (...)` are both fine.
+  const modifierJoin =
+    /([A-Za-z_:][A-Za-z0-9_:]*|\d+(?:\.\d+)?|\))\s*(\*|\/|%|\^|\+|-|==|!=|>=|<=|>|<)\s*(on|ignoring)\s*\(/g;
+
+  const offenders = [];
+  for (const expr of exprs) {
+    for (const [, lhs, op, mod] of expr.matchAll(modifierJoin)) {
+      if (/^\d/.test(lhs)) {
+        offenders.push(`${expr}\n    (scalar '${lhs}' ${op} ${mod} (...))`);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `vector-matching modifier applied to a scalar operand -- this rule cannot ` +
+      `parse and will never fire. Put the scalar inside the parenthesised ` +
+      `vector operand instead, e.g. 'a > on (l) (3 * b)' not ` +
+      `'a > 3 * on (l) b':\n  ${offenders.join("\n  ")}`,
+  );
+});
+
+// BLO-23413. Second defect found in review of the same alert: fixing the parse
+// error alone is NOT sufficient. These agent gauges are published from the
+// reconcileFailedWakeDispatches pass, and EVERY control-plane pod running that
+// pass exports its own copy -- measured live, the sibling metric from the same
+// pass (paperclip_agent_wakeup_terminal_failed_unresolved) is present on 3 pods
+// x 16 agents = 48 series. With 3 series per agent_id on each side, a bare
+// `on (agent_id)` join is many-to-many and errors at RUNTIME with HTTP 422
+// "found duplicate series for the match group" -- reproduced directly against
+// that metric. Pre-aggregating each side with `max by (agent_id)` collapses it
+// to a 1:1 join, yields exactly one alert per dark agent instead of one per
+// replica, and keeps alert identity stable across pod restarts.
+test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-23413)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const exprs = [...rendered.matchAll(/^\s+expr:\s*(.+?)\s*$/gm)].map(
+    ([, expr]) => expr,
+  );
+
+  const unaggregated = exprs.filter((expr) => {
+    if (!/\bon\s*\(\s*agent_id\s*\)/.test(expr)) return false;
+    // Every bare selector of a per-agent control-plane gauge must be wrapped in
+    // an aggregation that collapses the instance/pod dimension.
+    const bareSelectors = [
+      ...expr.matchAll(/(^|[^)\w])(paperclip_agent_[a-z0-9_]+)/g),
+    ].map(([, , name]) => name);
+    return bareSelectors.some(
+      (name) =>
+        !new RegExp(
+          `(max|min|avg|sum|count)\\s+by\\s*\\(\\s*agent_id\\s*\\)\\s*\\(\\s*${name}\\s*\\)`,
+        ).test(expr),
+    );
+  });
+
+  assert.deepEqual(
+    unaggregated,
+    [],
+    `an alert joins on agent_id without collapsing the per-pod dimension. ` +
+      `Every control-plane replica exports its own copy of these gauges, so a ` +
+      `bare 'on (agent_id)' join is many-to-many and fails at evaluation time ` +
+      `with "found duplicate series for the match group". Wrap each side in ` +
+      `'max by (agent_id) (...)':\n  ${unaggregated.join("\n  ")}`,
+  );
+});
+
+test("PaperclipOverdueScheduledRetry is agent-keyed, gauge-thresholded, and links its runbook (BLO-22094)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipOverdueScheduledRetry/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "overdue-scheduled-retry alert must render an expr");
+
+  // Must threshold the per-agent overdue-parked-age gauge, not a summed
+  // scheduled_retry row count under a long `for:` -- same reasoning as
+  // PaperclipQueuedRunStranded above. The `and on(instance) (... == 1)`
+  // freshness gate is load-bearing and asserted here rather than left
+  // optional: refreshOverdueScheduledRetryAgeMetrics only reset-then-sets on
+  // its success path, so a failed refresh freezes the last per-agent values
+  // while /metrics still returns 200 -- and the frozen value is almost always
+  // 0, the HEALTHY reading. Ungated, this alert would sit silently green on
+  // top of a dead detector, the exact invisible failure BLO-22094 exists to
+  // close. The gate must sit INSIDE the `max by (agent_id)` because
+  // `on(instance)` needs the instance label the aggregation strips.
   assert.match(
     expr,
-    /absent\(paperclip_external_runtime_reservations_release_pending\)/,
-    "must page when the release-pending gauge itself goes missing (scheduler down)",
+    /^max by \(agent_id\) \(paperclip_overdue_scheduled_retry_oldest_age_seconds and on\(instance\) \(paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "overdue-scheduled-retry alert must gate each replica's age on its own "
+      + "freshness gauge before taking the per-agent max",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh
+  // (see setOverdueScheduledRetryAgeMetrics), so a strictly positive
+  // threshold is the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  // `for:` is scrape-flap tolerance only -- the ageing lives in the
+  // threshold above, derived from a 7-day population (see values.yaml
+  // comment), not from `for:` duration.
+  assert.ok(forWindow, "overdue-scheduled-retry alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m); `
+      + "the ageing belongs in the age-gauge threshold, not here",
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#overdue-scheduled-retry-blo-22094"/,
+    "overdue-scheduled-retry alert must link the runbook from its annotation",
+  );
+
+  // A run merely backing off (scheduled_retry_at in the future) must never
+  // read as overdue -- the gauge only ages off rows already past due, so a
+  // strictly-greater-than comparison against a positive threshold is the
+  // only way this alert can stay silent for designed backoff.
+  assert.match(expr, />/, "overdue-scheduled-retry alert must use a strict greater-than comparison");
+});
+
+test("PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it (BLO-22094)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  // Closing the freshness gate on PaperclipOverdueScheduledRetry silences it.
+  // Without a companion alert on the gate itself, that silence is
+  // indistinguishable from a healthy fleet -- the detector would be dead and
+  // nothing would say so.
+  assert.match(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_overdue_scheduled_retry_age_metrics_refresh_success == 0\n/,
+    "a failed overdue-scheduled_retry-age refresh must have its own alert",
   );
   assert.match(
-    expr,
-    /absent\(paperclip_environment_leases_orphaned_active\)/,
-    "must page when the orphaned-lease gauge itself goes missing (scheduler down)",
+    rendered,
+    /alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#overdue-scheduled-retry-blo-22094"/,
+    "the freshness failure alert must route responders to the overdue-scheduled-retry runbook section",
+  );
+
+  // The two refreshes query different aggregates behind different indexes
+  // (0217 for status='queued', 0224 for the overdue-parked predicate), so
+  // this must be its OWN series -- sharing the sibling's freshness gauge
+  // would let a healthy queued-run refresh vouch for a dead one.
+  assert.doesNotMatch(
+    rendered,
+    /alert: PaperclipOverdueScheduledRetry\n[\s\S]*?\n\s+expr: [^\n]*paperclip_queued_run_age_metrics_refresh_success/,
+    "the overdue alert must gate on its own freshness gauge, not the sibling's",
+  );
+});
+
+test("PaperclipScheduledRetryParkHorizonImplausible has an independent horizon threshold and freshness alert (BLO-25036)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipScheduledRetryParkHorizonImplausible\n[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.match(
+    expr ?? "",
+    /^max by \(agent_id\) \(paperclip_scheduled_retry_park_horizon_seconds and on\(instance\) \(paperclip_scheduled_retry_park_horizon_refresh_success == 1\)\) > (\d+)$/,
+  );
+  const [, threshold] = expr.match(/> (\d+)$/) ?? [];
+  assert.equal(threshold, "5400");
+  assert.match(
+    rendered,
+    /alert: PaperclipScheduledRetryParkHorizonImplausible[\s\S]*?runbook_url: "[^\"]*runbooks\/queued-run-stranded\.md#scheduled-retry-park-horizon-blo-25036"/,
   );
   assert.match(
+    rendered,
+    /alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_scheduled_retry_park_horizon_refresh_success == 0\n/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/queued-run-stranded\.md#scheduled-retry-park-horizon-blo-25036"/,
+  );
+});
+
+test("PaperclipPlugin{Critical,}Errored key on the boolean gauge, split severity by plugin_key, and preserve error!=disabled (BLO-21092)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipPluginCriticalErrored/);
+  assert.match(rendered, /alert: PaperclipPluginErrored/);
+
+  // Both alerts key on the boolean gauge with a strict equality, not a
+  // summed/thresholded count -- paperclip_plugin_error is already 0/1 per
+  // plugin, so `== 1` is the whole condition.
+  const [, criticalExpr] = rendered.match(
+    /alert: PaperclipPluginCriticalErrored[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  const [, warningExpr] = rendered.match(
+    /alert: PaperclipPluginErrored[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.match(criticalExpr, /^paperclip_plugin_error\{plugin_key=~"[^"]+"\} == 1$/);
+  assert.match(warningExpr, /^paperclip_plugin_error\{plugin_key!~"[^"]+"\} == 1$/);
+
+  // The critical key regex must select lucitra.plugin-secrets -- the exact
+  // plugin BLO-20410 found dead for 9+ hours with nothing alerting -- and
+  // paperclip-plugin-alertmanager (PEN-2590), whose failure at warning
+  // severity suppresses the very notification reporting it. The two alerts'
+  // selectors must be exact complements (same regex, one positive one
+  // negative) so a plugin can never dual-fire nor fall through both.
+  const [, criticalRegex] = criticalExpr.match(/plugin_key=~"([^"]+)"/) ?? [];
+  const [, warningRegex] = warningExpr.match(/plugin_key!~"([^"]+)"/) ?? [];
+  assert.ok(criticalRegex, "critical alert must render a plugin_key=~ selector");
+  assert.equal(criticalRegex, warningRegex, "critical and warning selectors must be exact complements");
+  // Compare against the raw rendered (PromQL-string-escaped) text rather than
+  // constructing a JS RegExp from it -- criticalRegex is still PromQL/Go
+  // string-literal-escaped (e.g. a literal dot renders as `\\.`), so
+  // re-parsing it as a JS regex source would double-decode the escaping.
+  assert.ok(
+    criticalRegex.includes("plugin-secrets"),
+    `default critical key regex ${criticalRegex} must select lucitra.plugin-secrets`,
+  );
+  // PEN-2590. Asserted as its own member of the alternation rather than by
+  // substring on the whole regex, because `paperclip-plugin-alertmanager` is
+  // the plugin's manifest id verbatim and the two keys deliberately use
+  // DIFFERENT naming conventions (dotted namespace for externally published
+  // plugins, bare hyphenated id for local workspace ones). A regex written on
+  // the assumption of one convention silently selects nothing for the other,
+  // and a selector matching nothing is a permanently-inert rule rather than a
+  // visible failure -- the PEN-2579 class this guards against.
+  const criticalKeys = criticalRegex.split("|");
+  assert.ok(
+    criticalKeys.includes("paperclip-plugin-alertmanager"),
+    `critical key regex ${criticalRegex} must select paperclip-plugin-alertmanager exactly (PEN-2590): ` +
+      "at warning severity PaperclipPluginErrored's only route is the `paperclip` webhook catch-all, " +
+      "whose endpoint is gated on this plugin's own readiness, so the alert is delivered into the " +
+      "receiver that is failing because this plugin is failing. critical fans out to slack-relay instead.",
+  );
+  // The alternation must stay anchorable: no member may be empty (a stray `|`
+  // yields an empty branch, which Prometheus anchors to `^$` and therefore
+  // matches the EMPTY plugin_key -- quietly promoting label-less series into
+  // the paging tier while looking like a harmless typo).
+  for (const key of criticalKeys) {
+    assert.ok(
+      key.length > 0,
+      `critical key regex ${criticalRegex} has an empty alternation branch, which matches an empty plugin_key`,
+    );
+  }
+
+  const [, criticalSeverity] = rendered.match(
+    /alert: PaperclipPluginCriticalErrored[\s\S]*?severity: (\w+)/,
+  ) ?? [];
+  const [, warningSeverity] = rendered.match(
+    /alert: PaperclipPluginErrored[\s\S]*?severity: (\w+)/,
+  ) ?? [];
+  assert.equal(criticalSeverity, "critical");
+  assert.equal(warningSeverity, "warning");
+
+  // Both alerts must render a `for:` grace period so a deploy's brief
+  // activation retry (BLO-978) does not page.
+  for (const alertName of ["PaperclipPluginCriticalErrored", "PaperclipPluginErrored"]) {
+    const [, forWindow] = rendered.match(
+      new RegExp(`alert: ${alertName}[\\s\\S]*?\\n\\s+for: (.+)\\n`),
+    ) ?? [];
+    assert.ok(forWindow, `${alertName} must render a for window`);
+  }
+
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginCriticalErrored[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
+    "critical plugin-error alert must link the runbook",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginErrored[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
+    "plugin-error alert must link the runbook",
+  );
+});
+
+test("PaperclipPluginStatusCollectorStale watches the collector's own heartbeat, not the plugin data it produces (BLO-21092 review follow-up)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipPluginStatusCollectorStale/);
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.match(
     expr,
-    /up\{job="paperclip-control-plane"\}\)\s*==\s*0/,
-    "must page directly on the control-plane scrape target going down, not only via its absent() metrics",
+    /^\(time\(\) - paperclip_plugin_status_collector_last_success_timestamp_seconds\{role="worker"\}\) > \d+$/,
+    "collector-stale alert must key on time() minus the last-success gauge, not on paperclip_plugin_error itself, "
+      + "and must select role=\"worker\" -- Ally review: the gauge is a bare (zero-label) series is what prom-client "
+      + "auto-publishes at 0 from construction alone with no .set() call, so without this label an API-tier pod "
+      + "(which never starts the collector) would freeze the series at 0 and permanently satisfy this expr there",
+  );
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(forWindow, "collector-stale alert must render a for window");
+
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?runbook_url: "[^"]*runbooks\/plugin-error\.md"/,
+    "collector-stale alert must link the runbook",
+  );
+});
+
+test("PaperclipPluginStatusCollectorStale's role label prevents an API-tier target from permanently satisfying the expr (BLO-21092 Ally review: mixed API/worker topology)", () => {
+  // Simulates production's actual mixed topology at the PromQL level, since
+  // this repo's Helm tests render text rather than evaluate rules against
+  // live series (no promtool in this environment). paperclip_plugin_error and
+  // the collector-freshness gauge are worker-tier-only in reality; the API
+  // tier's /metrics registers the SAME metric names (shared registry code)
+  // but, per the Ally fix, never calls the setter that would attach the
+  // role="worker" label -- so an API-tier scrape contributes no series for
+  // this metric name at all. A regex-selected instant vector like
+  // `metric{role="worker"}` is unaffected by unrelated series under the same
+  // name; only an unlabeled/wildcard selector would wrongly match both.
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorStale[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "collector-stale alert must render an expr");
+  assert.doesNotMatch(
+    expr,
+    /paperclip_plugin_status_collector_last_success_timestamp_seconds\s*[)>]/,
+    "the metric selector must not be a bare/unlabeled reference -- a bare gauge is what auto-publishes at 0 on "
+      + "every tier including API, which is exactly the false-fire this alert must not reintroduce",
+  );
+});
+
+test("PaperclipPluginStatusCollectorAbsent covers the worker-down case the staleness rule structurally cannot (BLO-21092 Ally review)", () => {
+  // The staleness rule is `(time() - <gauge>) > N` with a `for:` window. That
+  // shape can only fire while the series is still queryable, so it catches a
+  // collector that is stuck behind a live scrape target and MISSES the worse
+  // case: worker down, crashlooping, or never started. There the last sample
+  // sits at ~= time() when scraping stopped, so the difference is ~= 0 then
+  // and only crosses N at t ~= N -- the same moment Prometheus's lookback
+  // delta drops the series from instant queries. True for ~0s, so `for:`
+  // never completes. absent_over_time() is the required companion because it
+  // reports TRUE on an empty range instead of needing the series to survive.
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipPluginStatusCollectorAbsent/,
+    "an absence guard must accompany the staleness guard, or a dead/never-started collector is silent forever",
+  );
+
+  const [, expr] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorAbsent[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "collector-absent alert must render an expr");
+
+  // Must use absent_over_time over a range -- `absent()` on an instant vector
+  // is subject to the same lookback-delta eviction that defeats the
+  // subtraction form, and a plain `== 0`/threshold cannot represent absence.
+  assert.match(
+    expr,
+    /absent_over_time\(\s*paperclip_plugin_status_collector_last_success_timestamp_seconds\{role="worker"\}\[\d+[smh]\]\s*\)/,
+    "absence must be expressed as absent_over_time(<gauge>{role=\"worker\"}[window]) so it is TRUE on an empty range",
+  );
+
+  // The window must exceed Prometheus's 5m lookback delta, otherwise a single
+  // missed scrape or a rolling worker restart reads as a vanished series.
+  const [, win, unit] = expr.match(/\[(\d+)([smh])\]/) ?? [];
+  const seconds = Number(win) * (unit === "h" ? 3600 : unit === "m" ? 60 : 1);
+  assert.ok(
+    seconds > 300,
+    `absence window must exceed the 5m lookback delta to be unambiguous, got ${win}${unit}`,
+  );
+
+  // Absence is strictly worse than staleness: with no series at all,
+  // paperclip_plugin_error is absent too, which is indistinguishable on a
+  // dashboard from every plugin being healthy -- the BLO-20410 failure mode.
+  const [, block] = rendered.match(
+    /alert: PaperclipPluginStatusCollectorAbsent([\s\S]*?)(?=\n\s+- alert:|\n\s{0,4}\S|$)/,
+  ) ?? [];
+  assert.match(
+    block ?? "",
+    /severity: critical/,
+    "an absent collector must page critical -- it renders the plugin gauges invisible, not merely stale",
   );
 });

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { PostgresJsTransaction } from "drizzle-orm/postgres-js";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues, pluginEventOutbox } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -36,6 +37,7 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
 
 let _pluginEventBus: PluginEventBus | null = null;
 let _outboxDb: Db | null = null;
+let _outboxEnqueueTail: Promise<void> | null = null;
 
 /** Wire the plugin event bus so domain events are forwarded to plugins. */
 export function setPluginEventBus(bus: PluginEventBus): void {
@@ -53,6 +55,10 @@ export function setPluginEventOutboxDb(db: Db): void {
   _outboxDb = db;
 }
 
+export function resetPluginEventOutboxDbForTests(): void {
+  _outboxDb = null;
+}
+
 /** Accessor for the worker-tier outbox poller (the sole emitter). */
 export function getPluginEventBus(): PluginEventBus | null {
   return _pluginEventBus;
@@ -68,53 +74,66 @@ function eventTypeForActivityAction(action: string): PluginEventType | null {
  * in-process: the worker-tier poller (plugin-event-outbox.ts) is the sole
  * emitter, so events raised on any tier (notably the API tier, where plugins
  * are not loaded) reliably reach subscribed plugins. One writer + one emitter
- * ⇒ no double-delivery. Fire-and-forget to keep the signature synchronous.
+ * ⇒ no double-delivery.
+ *
+ * The outbox is enabled only after app boot wires the global handle. Pass `db`
+ * to write the outbox row on a specific handle once enabled. When that handle
+ * is a transaction the enqueue becomes atomic with it, so a rollback takes the
+ * pending event with it instead of leaving the worker to emit an event for a
+ * row that never committed. Omit it (or pass null) to use the boot-time global
+ * handle — correct for callers outside a transaction, and required for callers
+ * publishing *after* commit, where the transaction handle is already released.
+ *
+ * Set `enlisted: true` only for a transaction handle. Enlisted failures reject
+ * so the enclosing transaction fails as one atomic activity/outbox unit.
+ * Ordinary/global-handle publication remains best-effort and only logs
+ * failures. Detached global writes are serialized so their database `seq`
+ * values preserve call order.
  */
-export function publishPluginDomainEvent(event: PluginEvent): void {
-  if (!_outboxDb) {
+export async function publishPluginDomainEvent(
+  event: PluginEvent,
+  options: { db?: Db | null; enlisted?: boolean } = {},
+): Promise<void> {
+  // An explicitly supplied handle is authoritative. In particular, an
+  // enlisted transaction must still be able to carry its outbox row during a
+  // boot/test window where the module-global worker handle has not been wired.
+  const outboxDb = options.db ?? _outboxDb;
+  if (!outboxDb) {
     logger.warn(
       { eventType: event.eventType, eventId: event.eventId },
       "plugin event outbox db not set; dropping event",
     );
     return;
   }
-  void _outboxDb
-    .insert(pluginEventOutbox)
-    .values({
-      eventId: event.eventId,
-      companyId: event.companyId,
-      eventType: event.eventType,
-      payload: event as unknown as Record<string, unknown>,
-    })
-    .catch((err) =>
-      logger.warn({ err, eventType: event.eventType }, "failed to enqueue plugin event to outbox"),
-    );
-}
-
-/**
- * Enqueue through the caller's own db handle -- typically an open transaction --
- * and await it, so the outbox row commits or rolls back with the state change
- * that produced it.
- *
- * `publishPluginDomainEvent` above writes through the module-global `_outboxDb`,
- * a different connection from any caller transaction. That is fine for the
- * common non-transactional caller, but inside a transaction it means the event
- * commits independently: if the transaction then fails, the state change is
- * undone while plugins have already been told it happened. For a terminal
- * approval transition that phantom is durable and drives every plugin mirror.
- *
- * The tradeoff is deliberate: unlike the fire-and-forget path, a failed insert
- * here fails the caller's transaction rather than being swallowed. That is the
- * point -- we would rather refuse the withdrawal than report one that did not
- * happen.
- */
-async function enqueuePluginDomainEventAtomically(db: Db, event: PluginEvent): Promise<void> {
-  await db.insert(pluginEventOutbox).values({
+  const enlisted = options.enlisted === true;
+  const values = {
     eventId: event.eventId,
     companyId: event.companyId,
     eventType: event.eventType,
     payload: event as unknown as Record<string, unknown>,
-  });
+  };
+
+  const insert = () => outboxDb.insert(pluginEventOutbox).values(values);
+  if (enlisted) {
+    await insert();
+    return;
+  }
+  const enqueue = async () => {
+    try {
+      await insert();
+    } catch (err) {
+      logger.warn({ err, eventType: event.eventType }, "failed to enqueue plugin event to outbox");
+    }
+  };
+  // Start the first writer immediately, preserving the original detached timing.
+  // Later calls chain behind it, so they cannot claim an earlier `seq`.
+  const pending = _outboxEnqueueTail
+    ? _outboxEnqueueTail.then(enqueue, enqueue)
+    : enqueue();
+  // Keep an unexpected failure from poisoning the chain or becoming unhandled;
+  // normal insert failures are already logged and swallowed above.
+  _outboxEnqueueTail = pending.catch(() => {});
+  await pending;
 }
 
 export interface LogActivityInput {
@@ -144,8 +163,8 @@ export interface LogActivityInput {
    *
    * Set this when calling logActivity inside a transaction whose rollback must
    * also retract the plugin event -- otherwise the event commits independently
-   * and survives the rollback. See enqueuePluginDomainEventAtomically for the
-   * failure-semantics tradeoff this accepts.
+   * and survives the rollback. This accepts strict failure semantics: a failed
+   * outbox insert rejects the caller instead of being swallowed.
    */
   atomicPluginEvent?: boolean;
 }
@@ -211,14 +230,17 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
 
 /**
  * Emits the side effects of a logged activity: the in-process live event and
- * the cross-tier plugin outbox enqueue. Both escape any enclosing database
- * transaction (the live emitter is in-memory; the outbox writes on its own
- * `_outboxDb` handle), so a caller that logs inside a transaction must defer
- * this until after commit — see `logActivity`'s `deferPublish` option.
+ * the cross-tier plugin outbox enqueue.
+ *
+ * The live emitter is in-memory and so always escapes an enclosing database
+ * transaction; a caller that logs inside one must defer publication until after
+ * commit to keep it honest — see `logActivity`'s `deferPublish` option. The
+ * outbox enqueue is written on the handle passed to `logActivity` only when the
+ * caller explicitly opts into transaction enlistment.
  */
-export type ActivityPublish = () => void;
+export type ActivityPublish = () => Promise<void>;
 
-const NOOP_ACTIVITY_PUBLISH: ActivityPublish = () => {};
+const NOOP_ACTIVITY_PUBLISH: ActivityPublish = async () => {};
 
 /**
  * Writes an activity_log row and publishes the corresponding live/plugin
@@ -230,11 +252,23 @@ const NOOP_ACTIVITY_PUBLISH: ActivityPublish = () => {};
  * visibility, and turns a later commit failure into a phantom event for an
  * activity that never happened. The returned function is a no-op unless
  * `deferPublish` was set, so existing callers can keep ignoring the result.
+ *
+ * A caller that logs inside a transaction can pass `{ enlistPluginOutbox: true }`
+ * so the enqueue runs on `db`, committing and rolling back with the activity row
+ * it describes.
+ *
+ * The two options are orthogonal and compose. `{ enlistPluginOutbox: true }`
+ * alone still lets the in-memory live event escape a later rollback; combine it
+ * with `{ deferPublish: true }` to bind the outbox row to the transaction *and*
+ * withhold the live event until after commit, which is what a transactional
+ * caller of a plugin-mapped action wants. Enlisting without deferring is a
+ * deliberate choice to accept a phantom `activity.logged` refresh hint, not a
+ * silently degraded mode.
  */
 export async function logActivity(
   db: Db,
   input: LogActivityInput,
-  options?: { deferPublish?: boolean },
+  options?: { deferPublish?: boolean; enlistPluginOutbox?: boolean },
 ): Promise<ActivityPublish> {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
@@ -293,11 +327,7 @@ export async function logActivity(
     };
   }
 
-  if (pluginEvent && input.atomicPluginEvent) {
-    await enqueuePluginDomainEventAtomically(db, pluginEvent);
-  }
-
-  const publish: ActivityPublish = () => {
+  const publishLive = (): void => {
     publishLiveEvent({
       companyId: input.companyId,
       type: "activity.logged",
@@ -313,13 +343,56 @@ export async function logActivity(
         details: redactedDetails,
       },
     });
-
-    if (pluginEvent && !input.atomicPluginEvent) {
-      publishPluginDomainEvent(pluginEvent);
-    }
   };
 
-  if (options?.deferPublish) return publish;
-  publish();
+  // Best-effort enqueue on the boot-time global handle. Never rejects, and is
+  // the only correct handle once the caller has committed: `db` is spent by then.
+  const enqueueOnGlobal = async (): Promise<void> => {
+    if (!pluginEvent) return;
+    await publishPluginDomainEvent(pluginEvent, { db: null, enlisted: false });
+  };
+
+  const enlistPluginOutbox = options?.enlistPluginOutbox === true ||
+    input.atomicPluginEvent === true;
+
+  // The enlisted write is deliberately hoisted above BOTH publication paths.
+  // It has to run while `db` is still live, and a live event cannot be rolled
+  // back — so a failed insert must abort before anything is published, whether
+  // publication is inline or deferred.
+  if (pluginEvent && enlistPluginOutbox) {
+    await publishPluginDomainEvent(pluginEvent, { db, enlisted: true });
+  }
+
+  if (options?.deferPublish) {
+    // Enlistment and deferral are orthogonal and compose: the outbox row is
+    // already bound to the caller's transaction above, so all that remains to
+    // withhold until after commit is the in-memory live event. A non-enlisted
+    // plugin event still has to wait, because the global write commits
+    // independently and would outlive a rollback.
+    return async () => {
+      publishLive();
+      if (!enlistPluginOutbox) await enqueueOnGlobal();
+    };
+  }
+
+  publishLive();
+  if (!enlistPluginOutbox) {
+    if (db instanceof PostgresJsTransaction) {
+      // Do not hold a caller's transaction connection while the global outbox
+      // pool acquires its own connection. With a saturated shared pool, awaiting
+      // that insert here deadlocks every transaction before any can commit and
+      // release a slot. This path is explicitly best-effort; enlisted writes
+      // above remain awaited and atomic with the caller's transaction.
+      void enqueueOnGlobal().catch((err) =>
+        logger.warn(
+          { err, eventType: pluginEvent?.eventType ?? null },
+          "failed to enqueue non-enlisted plugin event to outbox",
+        ),
+      );
+    } else {
+      // Preserve the synchronous completion contract for ordinary callers.
+      await enqueueOnGlobal();
+    }
+  }
   return NOOP_ACTIVITY_PUBLISH;
 }

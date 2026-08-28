@@ -51,7 +51,7 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginPerformActionContext } from "./protocol.js";
+import type { PluginPerformActionContext, WorkerToHostMethods } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -690,7 +690,8 @@ export interface PluginHttpClient {
 /**
  * `ctx.secrets` — resolve secret references.
  *
- * Requires `secrets.read-ref` capability.
+ * Resolving plaintext requires `secrets.read-ref`; boolean verification requires
+ * `secrets.verify-ref`.
  *
  * Plugins store shared `{ type: "secret_ref", secretId, version? }` bindings in
  * company-scoped config. This client resolves a bound ref through the
@@ -715,6 +716,40 @@ export interface PluginSecretsClient {
     secretRef: string | EnvSecretRefBinding,
     options?: { companyId?: string; configPath?: string },
   ): Promise<string>;
+
+  /**
+   * Compare a presented credential with a bound secret without returning the
+   * secret value to the worker. Verification is metered on its own budget, so
+   * invalid public requests cannot starve trusted resolution.
+   * Requires `secrets.verify-ref`.
+   *
+   * Intended for authenticating a PUBLIC endpoint — a webhook bearer token —
+   * where `resolve` would be wrong twice over: it would put the secret in the
+   * worker, and an anonymous flood would exhaust the resolution budget that
+   * genuine deliveries need.
+   *
+   * NOT SUPPORTED FOR EVERY SECRET. Verification compares digests, so it works
+   * only where Paperclip holds a digest of the VALUE — secrets it wrote itself
+   * (`local_encrypted`, and provider-managed versions). A version IMPORTED as
+   * an external provider reference stores a fingerprint of the reference
+   * instead, and there is no value digest to compare against. Those reject with
+   * `secret_verifier_unsupported` rather than returning `false`, because a
+   * confident `false` would be indistinguishable from a wrong credential and
+   * would silently reject every genuine one.
+   *
+   * Handle that rejection: it is a permanent configuration fault for the
+   * company, not a failed authentication. Read the code from the thrown error's
+   * `data.code` — `error.code` is the numeric JSON-RPC code, and the message is
+   * prose, not a contract.
+   *
+   * @returns `true` when the presented value matches, `false` when it does not
+   * @throws when the bound secret has no value verifier (`secret_verifier_unsupported`)
+   */
+  verify(
+    secretRef: string | EnvSecretRefBinding,
+    presented: string,
+    options?: { companyId?: string; configPath?: string },
+  ): Promise<boolean>;
 
   /** List all secrets for a company. Requires `secrets.list`. */
   list(companyId: string): Promise<CompanySecret[]>;
@@ -1108,6 +1143,36 @@ export interface PluginLogger {
 // ---------------------------------------------------------------------------
 // Plugin metrics
 // ---------------------------------------------------------------------------
+
+/**
+ * `ctx.costs` — record settlement-side finance events.
+ *
+ * Requires `costs.write` capability.
+ *
+ * This writes `finance_events`, **not** `cost_events`. Execution adapters already
+ * emit a `cost_events` row per run from their own token accounting; a plugin writing
+ * there would double-count the same traffic. `finance_events` is the settlement ledger
+ * that sits alongside those estimates, so an external biller can be reconciled against
+ * what the adapters self-reported.
+ *
+ * @see PLUGIN_SPEC.md §15.1 — Capabilities: Data Write
+ */
+export interface PluginCostsClient {
+  /**
+   * Record a finance event.
+   *
+   * Idempotent on `(companyId, externalInvoiceId)`: calling again with the same
+   * `externalInvoiceId` returns the existing row with `created: false` rather than
+   * inserting a duplicate. Always supply a stable `externalInvoiceId` for anything
+   * a scheduled job may re-run.
+   *
+   * Set `estimated: true` whenever the amount is derived from an estimate rather
+   * than a settled invoice.
+   */
+  recordFinanceEvent(
+    params: WorkerToHostMethods["costs.finance.create"][0],
+  ): Promise<WorkerToHostMethods["costs.finance.create"][1]>;
+}
 
 /**
  * `ctx.metrics` — write plugin-contributed metrics.
@@ -1560,6 +1625,23 @@ export interface PluginIssuesClient {
       blockedByIssueIds?: string[];
       labelIds?: string[];
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      /**
+       * Compare-and-set on the issue's execution-lock columns, evaluated as a
+       * write precondition inside `updateIssue`'s transaction. When the pinned
+       * value does not match, the update applies nothing and throws a 409
+       * whose message ends in "before the update could be applied".
+       *
+       * Pass `null` for both to mean "only apply this if no run holds the
+       * issue". Any plugin that transitions an issue it does not itself hold
+       * should do so: `updateIssue` clears all four lock columns on a
+       * transition out of `in_progress`, so an unguarded status write silently
+       * evicts whatever run was working the row (BLO-29908).
+       *
+       * Pinning one column is not sufficient — an issue can be held via
+       * `checkoutRunId` with `executionRunId` still null (BLO-19749).
+       */
+      expectedCurrentCheckoutRunId?: string | null;
+      expectedCurrentExecutionRunId?: string | null;
     },
     companyId: string,
     actor?: PluginIssueMutationActor,
@@ -2109,7 +2191,7 @@ export interface PluginContext {
   /** Make outbound HTTP requests. Requires `http.outbound`. */
   http: PluginHttpClient;
 
-  /** Resolve secret references. Requires `secrets.read-ref`. */
+  /** Resolve or verify secret references. Requires the corresponding secrets capability. */
   secrets: PluginSecretsClient;
 
   /** Write activity log entries. Requires `activity.log.write`. */
@@ -2177,6 +2259,9 @@ export interface PluginContext {
 
   /** Register agent tool handlers. Requires `agent.tools.register`. */
   tools: PluginToolsClient;
+
+  /** Record settlement-side finance events. Requires `costs.write`. */
+  costs: PluginCostsClient;
 
   /** Write plugin metrics. Requires `metrics.write`. */
   metrics: PluginMetricsClient;

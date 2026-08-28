@@ -28,13 +28,36 @@
  * SAFETY
  * ------
  * Dry-run by default (`npm publish --dry-run`). Pass `--publish` to actually
- * publish; `--provenance` is added only in CI (OIDC). The workflow that calls this
- * is `workflow_dispatch`-only, so nothing publishes on push.
+ * publish. The workflow that calls this is `workflow_dispatch`-only, so nothing
+ * publishes on push.
+ *
+ * PROVENANCE / WHY `--publish` DOES NOT WORK IN CI TODAY
+ * ------------------------------------------------------
+ * `--provenance` is not a switch for whether an attestation is minted. These
+ * packages have a Trusted Publisher configured on npm, and trusted publishing
+ * signs a sigstore provenance statement UNCONDITIONALLY once the CLI can reach an
+ * OIDC token. Verified: run 32354111699 invoked `npm publish --access public`
+ * with no provenance flag and npm still logged "Signed provenance statement with
+ * source and build information from GitHub Actions", then failed:
+ *
+ *   422 Unprocessable Entity - Error verifying sigstore provenance bundle:
+ *   Unsupported GitHub Actions runner environment: "self-hosted".
+ *   Only "github-hosted" runners are supported when publishing with provenance.
+ *
+ * And a GitHub-hosted runner is rejected by scripts/check-github-runner-labels.mjs
+ * (ARC-only ALLOWED_RUNNERS, no exemption). So `--publish` from this repo's CI is
+ * a dead end until either the Trusted Publisher is removed in favour of a token,
+ * or a hosted label is added to that allowlist. Do not re-litigate this by
+ * toggling flags — the flag was already removed and it changed nothing.
+ *
+ * `--bootstrap` is therefore the working release path: it publishes with a local
+ * `npm login` + 2FA and no OIDC, so no attestation is minted and no runner is
+ * involved. It is no longer "one-time"; it is how releases ship.
  *
  * Usage:
  *   node scripts/publish-penstock-scope.mjs --version 2026.614.0            # dry-run (default)
- *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --bootstrap # one-time local 2FA first-publish
- *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --publish --provenance  # CI/OIDC (the workflow)
+ *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --bootstrap # local 2FA publish — THE working path
+ *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --publish   # CI/OIDC — currently 422s on ARC
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -46,11 +69,11 @@ const getArg = (name) => {
   return i >= 0 ? args[i + 1] : undefined;
 };
 const version = getArg("--version");
-// --bootstrap: the one-time FIRST publish of each brand-new @penstock/* package,
-// run locally by a maintainer with `npm login` + 2FA. npm can't OIDC-publish a
-// package that doesn't exist yet, so the first version is published by hand; every
-// release after that goes through the OIDC workflow. Bootstrap = publish WITHOUT
-// provenance (provenance attestation requires the CI OIDC runner).
+// --bootstrap: publish locally with `npm login` + 2FA instead of CI OIDC. Originally
+// this was only for the FIRST publish of a brand-new package (npm can't OIDC-publish
+// a package that doesn't exist yet), but per the provenance note above it is now the
+// only working path for EVERY release from this repo. No OIDC token means no sigstore
+// attestation, which is exactly why it succeeds where the workflow 422s.
 const bootstrap = args.includes("--bootstrap");
 const doPublish = args.includes("--publish") || bootstrap;
 const provenance = args.includes("--provenance") && !bootstrap;

@@ -35,8 +35,13 @@ export {
   clampIssueListLimit,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
+  OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS,
+  OPEN_ISSUE_STATUSES,
   issueService,
   type IssueFilters,
+  type OpenAssignmentCensus,
+  type OpenAssignmentCensusAgentRow,
+  type OpenAssignmentCensusFilters,
 } from "./issues.js";
 export { issueThreadInteractionService } from "./issue-thread-interactions.js";
 export { issueTreeControlService } from "./issue-tree-control.js";

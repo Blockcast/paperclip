@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -20,6 +22,131 @@ const agentRuntimeBake = readFileSync(
 );
 const designerDockerfile = readFileSync(path.join(repoRoot, "packages/services/designer/Dockerfile"), "utf8");
 const designerPackageLock = readFileSync(path.join(repoRoot, "packages/services/designer/package-lock.json"), "utf8");
+const verifyAgentFfmpeg = path.join(repoRoot, "scripts/verify-agent-ffmpeg.sh");
+const verifyAgentFfmpegScript = readFileSync(verifyAgentFfmpeg, "utf8");
+
+function runFfmpegProbe(
+  mode:
+    | "success"
+    | "missing"
+    | "failed"
+    | "timeout"
+    | "newline-free"
+    | "volume"
+    | "slow-pull"
+    | "retry-pull"
+    | "pull-failed",
+  overrides: Record<string, string> = {},
+) {
+  const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
+  const dockerStub = path.join(stubDir, "docker");
+  const pullArgsFile = path.join(stubDir, "docker-pull-args");
+  const pullAttemptsFile = path.join(stubDir, "docker-pull-attempts");
+  const runArgsFile = path.join(stubDir, "docker-run-args");
+  const cleanupArgsFile = path.join(stubDir, "docker-cleanup-args");
+  const cidfileStateFile = path.join(stubDir, "docker-cidfile-state");
+  writeFileSync(
+    dockerStub,
+    `#!/bin/sh
+cmd=$1
+case "$cmd" in
+  buildx)
+    if [ "$DOCKER_STUB_MODE" = "volume" ]; then
+      printf '{"/untrusted":{}}\\n'
+    else
+      printf 'null\\n'
+    fi
+    ;;
+  pull)
+    printf '%s\\n' "$@" > "$DOCKER_PULL_ARGS_FILE"
+    attempts=$(($(cat "$DOCKER_PULL_ATTEMPTS_FILE" 2>/dev/null || printf '0') + 1))
+    printf '%s\\n' "$attempts" > "$DOCKER_PULL_ATTEMPTS_FILE"
+    case "$DOCKER_STUB_MODE" in
+      pull-failed) exit 42 ;;
+      retry-pull)
+        if [ "$attempts" -eq 1 ]; then exit 42; fi
+        ;;
+      slow-pull) sleep 1 ;;
+    esac
+    ;;
+  run)
+    printf '%s\\n' "$@" > "$DOCKER_RUN_ARGS_FILE"
+    cidfile=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--cidfile" ]; then
+        shift
+        cidfile=$1
+      fi
+      shift || break
+    done
+    if [ -e "$cidfile" ]; then
+      printf 'present\\n' > "$DOCKER_CIDFILE_STATE_FILE"
+      printf 'cidfile already exists\\n' >&2
+      exit 125
+    fi
+    mode=$(stat -c %a "$(dirname "$cidfile")" 2>/dev/null || stat -f %Lp "$(dirname "$cidfile")")
+    printf 'missing:%s\\n' "$mode" > "$DOCKER_CIDFILE_STATE_FILE"
+    printf 'paperclip-ffmpeg-probe-test\\n' > "$cidfile"
+    case "$DOCKER_STUB_MODE" in
+      success|slow-pull|retry-pull)
+        printf ' E moq_mmt MMTP muxer\\n'
+        i=0
+        while [ "$i" -lt 5000 ]; do
+          printf ' D unrelated_%s unrelated muxer\\n' "$i"
+          i=$((i + 1))
+        done
+        ;;
+      missing) printf ' E matroska Matroska muxer\\n' ;;
+      failed) exit 42 ;;
+      timeout) sleep 1 ;;
+      newline-free)
+        printf ' E moq_mmt '
+        dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\000' x
+        ;;
+    esac
+    ;;
+  rm)
+    printf '%s\\n' "$@" > "$DOCKER_CLEANUP_ARGS_FILE"
+    ;;
+  *) exit 127 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+
+  try {
+    const result = spawnSync(verifyAgentFfmpeg, ["registry.example/ffmpeg@sha256:test"], {
+      env: {
+        ...process.env,
+        PATH: `${stubDir}:${process.env.PATH}`,
+        DOCKER_PULL_ARGS_FILE: pullArgsFile,
+        DOCKER_PULL_ATTEMPTS_FILE: pullAttemptsFile,
+        DOCKER_RUN_ARGS_FILE: runArgsFile,
+        DOCKER_CLEANUP_ARGS_FILE: cleanupArgsFile,
+        DOCKER_CIDFILE_STATE_FILE: cidfileStateFile,
+        DOCKER_STUB_MODE: mode,
+        FFMPEG_PROBE_OUTPUT_BYTES: "256",
+        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" || mode === "slow-pull" ? "0.5" : "15",
+        FFMPEG_PULL_TIMEOUT_SECONDS: mode === "slow-pull" ? "2" : "15",
+        FFMPEG_PULL_ATTEMPTS: mode === "pull-failed" ? "1" : "3",
+        ...overrides,
+      },
+      encoding: "utf8",
+    });
+    const pullArgs = existsSync(pullArgsFile) ? readFileSync(pullArgsFile, "utf8").trim().split("\n") : [];
+    const pullAttempts = existsSync(pullAttemptsFile)
+      ? Number(readFileSync(pullAttemptsFile, "utf8").trim())
+      : 0;
+    const args = existsSync(runArgsFile) ? readFileSync(runArgsFile, "utf8").trim().split("\n") : [];
+    const cleanupArgs = existsSync(cleanupArgsFile)
+      ? readFileSync(cleanupArgsFile, "utf8").trim().split("\n")
+      : [];
+    const cidfileState = existsSync(cidfileStateFile) ? readFileSync(cidfileStateFile, "utf8").trim() : "";
+    return { result, pullArgs, pullAttempts, args, cleanupArgs, cidfileState };
+  } finally {
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins opencode-ai and asserts the installed version", () => {
@@ -34,8 +161,18 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(prWorkflow).toContain("node scripts/smoke/opencode-responses-replay.mjs");
   });
 
-  it("vendors the claude_k8s adapter commit with runtime isolation, Penstock retry hints, Opus 5, and run-cwd diagnostics", () => {
-    expect(serverDockerfile).toContain("ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875");
+  it("builds the claude_k8s adapter from in-tree vendored source, not a pinned fork clone", () => {
+    // BLO-17980: CLAUDE_K8S_REF is retired. The adapter source lives in this
+    // repo so the credential-injection fix is reviewable under our own CI.
+    expect(serverDockerfile).not.toMatch(/^ARG CLAUDE_K8S_REF=/m);
+    expect(serverDockerfile).not.toContain("clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git");
+    expect(serverDockerfile).toContain("COPY vendor/paperclip-adapter-claude-k8s /vendor/claude-k8s-src");
+    expect(serverDockerfile).toContain("mv paperclip-adapter-claude-k8s-*.tgz /vendor/paperclip-adapter-claude-k8s.tgz");
+    // opencode_k8s still clones, so the gh_token secret must survive.
+    expect(serverDockerfile).toContain("clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git");
+  });
+
+  it("keeps the claude_k8s adapter changelog as the history of the vendored source", () => {
     expect(serverDockerfile).toContain("model-only commit based on the previous");
     expect(serverDockerfile).toContain("without bundling later retry-semantics changes");
     expect(serverDockerfile).toContain("bound the pre-Job live-Job list to 15 seconds");
@@ -139,7 +276,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow).toContain(
       "buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local",
     );
-    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(1);
+    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(3);
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
@@ -176,7 +313,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).toContain("--tmpfs /paperclip:rw,nosuid,size=16m");
     expect(dockerAgentWorkflow).toContain("paperclip-browser-smoke");
     expect(dockerAgentWorkflow).toContain("AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}");
-    expect(dockerAgentWorkflow).toContain("docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"");
+    expect(dockerAgentWorkflow).toContain(
+      "docker buildx imagetools create --tag \"$FLOATING_IMAGE\" \"$CANDIDATE_IMAGE\"",
+    );
 
     const metadataBlock = dockerAgentWorkflow.slice(
       dockerAgentWorkflow.indexOf("name: Docker meta"),
@@ -191,6 +330,146 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       'RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}',
     );
     expect(dockerAgentWorkflow).toContain('FFMPEG_IMAGE=${{ steps.bases.outputs.ffmpeg_image }}');
+    expect(dockerAgentWorkflow).toContain(
+      'ffmpeg_known_good_digest="sha256:be20fcc53b6ca777de62c004ea926bcbb044f766f942e0bbe0eac6ee419a06d1"',
+    );
+    expect(dockerAgentWorkflow).toContain('scripts/verify-agent-ffmpeg.sh "$ffmpeg_image"');
+    expect(dockerAgentWorkflow).toContain("lacks moq_mmt; using last known-good publisher digest");
+    expect(dockerAgentWorkflow).toContain("refusing publisher fallback");
+  });
+
+  it("constrains the FFmpeg probe and drains output after finding the muxer", () => {
+    const { result, pullArgs, args, cidfileState } = runFfmpegProbe("success");
+
+    expect(result.status).toBe(0);
+    expect(cidfileState).toBe("missing:700");
+    expect(args).toEqual([
+      "run",
+      "--pull=never",
+      "--rm",
+      "--cidfile",
+      expect.stringMatching(/paperclip-ffmpeg-probe\.[^/]+\/cid$/),
+      "--network",
+      "none",
+      "--read-only",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--pids-limit",
+      "64",
+      "--cpus",
+      "1",
+      "--memory",
+      "256m",
+      "--memory-swap",
+      "256m",
+      "--user",
+      "65534:65534",
+      "--entrypoint",
+      "ffmpeg",
+      "registry.example/ffmpeg@sha256:test",
+      "-hide_banner",
+      "-muxers",
+    ]);
+    expect(pullArgs).toEqual(["pull", "registry.example/ffmpeg@sha256:test"]);
+  });
+
+  it("keeps a slow image pull outside the short capability budget", () => {
+    const { result, pullArgs, pullAttempts, args } = runFfmpegProbe("slow-pull");
+
+    expect(result.status).toBe(0);
+    expect(pullArgs).toEqual(["pull", "registry.example/ffmpeg@sha256:test"]);
+    expect(pullAttempts).toBe(1);
+    expect(args).toContain("--pull=never");
+  });
+
+  it("retries a transient image pull before probing", () => {
+    const { result, pullAttempts, args } = runFfmpegProbe("retry-pull");
+
+    expect(result.status).toBe(0);
+    expect(pullAttempts).toBe(2);
+    expect(args).toContain("--pull=never");
+  });
+
+  it("fails closed without starting a container when the image pull fails", () => {
+    const { result, pullArgs, pullAttempts, args } = runFfmpegProbe("pull-failed");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("Unable to pull FFmpeg image");
+    expect(pullArgs).toEqual(["pull", "registry.example/ffmpeg@sha256:test"]);
+    expect(pullAttempts).toBe(1);
+    expect(args).toEqual([]);
+  });
+
+  it("rejects invalid or over-limit pull controls before touching Docker", () => {
+    const cases = [
+      ["FFMPEG_PULL_TIMEOUT_SECONDS", "0", "must be a positive integer"],
+      ["FFMPEG_PULL_TIMEOUT_SECONDS", "601", "must not exceed 600"],
+      ["FFMPEG_PULL_TIMEOUT_SECONDS", "0601", "must not exceed 600"],
+      ["FFMPEG_PULL_ATTEMPTS", "0", "must be a positive integer"],
+      ["FFMPEG_PULL_ATTEMPTS", "6", "must not exceed 5"],
+      ["FFMPEG_PULL_ATTEMPTS", "08", "must not exceed 5"],
+    ] as const;
+
+    for (const [name, value, message] of cases) {
+      const { result, pullArgs, args } = runFfmpegProbe("success", { [name]: value });
+
+      expect(result.status, `${name}=${value}`).toBe(2);
+      expect(result.stderr, `${name}=${value}`).toContain(message);
+      expect(pullArgs, `${name}=${value}`).toEqual([]);
+      expect(args, `${name}=${value}`).toEqual([]);
+    }
+  });
+
+  it("parses leading-zero pull controls as decimal values", () => {
+    const { result, pullAttempts } = runFfmpegProbe("success", {
+      FFMPEG_PULL_TIMEOUT_SECONDS: "0008",
+      FFMPEG_PULL_ATTEMPTS: "04",
+    });
+
+    expect(result.status).toBe(0);
+    expect(pullAttempts).toBe(1);
+  });
+
+  it("byte-bounds and drains newline-free probe output", () => {
+    const { result } = runFfmpegProbe("newline-free");
+
+    expect(result.status).toBe(0);
+    expect(verifyAgentFfmpegScript).toContain('head -c "$probe_output_bytes"');
+    expect(verifyAgentFfmpegScript).not.toContain("| awk");
+  });
+
+  it("rejects image-declared writable volumes before starting a container", () => {
+    const { result, args } = runFfmpegProbe("volume");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("declares writable volumes");
+    expect(args).toEqual([]);
+  });
+
+  it("force-removes the probe container after a timeout", () => {
+    const { result, cleanupArgs } = runFfmpegProbe("timeout");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("timed out");
+    expect(cleanupArgs).toEqual(["rm", "-f", "paperclip-ffmpeg-probe-test"]);
+  });
+
+  it("returns the capability-missing status only for a completed negative probe", () => {
+    const { result } = runFfmpegProbe("missing");
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("lacks required moq_mmt muxer");
+  });
+
+  it.each([
+    ["failed", "failed"],
+  ] as const)("fails closed when the FFmpeg probe %s", (mode, message) => {
+    const { result } = runFfmpegProbe(mode);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(message);
   });
 
   it("publishes agent runtime images to Harbor with a secondary GHA cache", () => {

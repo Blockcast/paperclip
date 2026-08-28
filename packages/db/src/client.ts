@@ -46,8 +46,25 @@ export type MigrationState =
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
 
+/**
+ * Connection-pool ceiling for the application client.
+ *
+ * This was previously postgres.js's implicit default (also 10), which meant
+ * callers that must reason about pool capacity had no value to read and could
+ * only restate the number in prose. Declaring it here makes it a single source
+ * of truth: `PR_REVIEWER_WAKE_MAX_CONCURRENCY` in `routes/github-webhook.ts`
+ * derives its bound from this constant so a change here cannot silently
+ * reintroduce the connection deadlock that bound exists to prevent (BLO-21995).
+ *
+ * Passing it explicitly also makes it authoritative: postgres.js resolves
+ * `max` as `explicit option > URL query param > PGMAX env > default`, so a
+ * `?max=` in the connection string can no longer shrink the pool out from
+ * under a caller that derived a bound from it.
+ */
+export const POSTGRES_POOL_MAX = 10;
+
 export function createDb(url: string) {
-  const sql = postgres(url);
+  const sql = postgres(url, { max: POSTGRES_POOL_MAX });
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
   registerTrackedClient(url, sql);

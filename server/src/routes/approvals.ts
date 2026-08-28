@@ -4,6 +4,7 @@ import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  isUuidLike,
   listApprovalsQuerySchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
@@ -22,6 +23,13 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, 
 import { redactApprovalPayloadForDisplay } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  buildIssueGraphLivenessBoardEscalationKey,
+  parseIssueGraphLivenessIncidentKey,
+  RECOVERY_KEY_PREFIXES,
+  RECOVERY_ORIGIN_KINDS,
+} from "../services/recovery/origins.js";
 
 function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
@@ -82,6 +90,12 @@ function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
     context.resumeRequiresNormalModel === false;
 }
 
+type ApprovalRunContextDecision =
+  | { allowed: false }
+  | { allowed: true; boardEscalationCoalesceKey?: string };
+
+const ALLOWED: ApprovalRunContextDecision = { allowed: true };
+
 export function approvalRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
@@ -118,10 +132,10 @@ export function approvalRoutes(
     res: any,
     companyId: string,
     options: { requestedType?: unknown; requestedIssueIds?: unknown } = {},
-  ) {
-    if (req.actor.type !== "agent") return true;
+  ): Promise<ApprovalRunContextDecision> {
+    if (req.actor.type !== "agent") return ALLOWED;
     const runId = req.actor.runId?.trim();
-    if (!runId || !req.actor.agentId) return true;
+    if (!runId || !req.actor.agentId) return ALLOWED;
 
     const run = await db
       .select({
@@ -133,12 +147,12 @@ export function approvalRoutes(
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
-    if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
+    if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return ALLOWED;
     const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
     const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
-    if (!statusOnly && !planningOnly) return true;
+    if (!statusOnly && !planningOnly) return ALLOWED;
 
-    const refuse = (error: string, extra: Record<string, unknown> = {}) => {
+    const refuse = (error: string, extra: Record<string, unknown> = {}): ApprovalRunContextDecision => {
       res.status(403).json({
         error,
         details: {
@@ -147,13 +161,14 @@ export function approvalRoutes(
           ...(statusOnly ? {
             modelProfile: "cheap",
             allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
           } : {}),
           recoveryIntent: planningOnly ? "planning_only" : "status_only",
           resumeRequiresNormalModel: statusOnly,
           ...extra,
         },
       });
-      return false;
+      return { allowed: false };
     };
 
     if (planningOnly) {
@@ -252,7 +267,47 @@ export function approvalRoutes(
       );
     }
 
-    return true;
+    const boardEscalationCoalesceKey = await resolveBoardEscalationCoalesceKey(sourceIssue);
+    return boardEscalationCoalesceKey ? { allowed: true, boardEscalationCoalesceKey } : ALLOWED;
+  }
+
+  /**
+   * The key that makes one incident raise one card (BLO-24744).
+   *
+   * Only liveness escalations get one: they are the run class minted per repair target by a
+   * detector, so N of them can be dispatched for one root cause with no filer able to see the
+   * others. Every other status-only escalation is filed by an agent that chose to file it and can
+   * pass its own `idempotencyKey`.
+   *
+   * For `blocked_by_uninvokable_assignee` the human decides about the AGENT, so that is the key —
+   * one pause, one card, however many of its issues are blocking. The repair-target issue is the
+   * fallback: still enough to collapse repeat filings for that one incident across runs.
+   */
+  async function resolveBoardEscalationCoalesceKey(sourceIssue: {
+    companyId: string;
+    originKind: string | null;
+    originId: string | null;
+  }): Promise<string | null> {
+    if (sourceIssue.originKind !== RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation) return null;
+    const incident = parseIssueGraphLivenessIncidentKey(sourceIssue.originId);
+    if (!incident || incident.companyId !== sourceIssue.companyId) return null;
+
+    // The last key component is `blockerIssueId ?? participantAgentId ?? "none"`, so it is an issue
+    // id for the blocked_by_* states and an agent id (or the "none" sentinel) for the others. Only
+    // look up an id that can be one — `issues.id` is a uuid column and would raise on the sentinel.
+    const repairTarget = isUuidLike(incident.leafIssueId)
+      ? await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, incident.leafIssueId), eq(issues.companyId, sourceIssue.companyId)))
+        .then((rows) => rows[0] ?? null)
+      : null;
+
+    return buildIssueGraphLivenessBoardEscalationKey({
+      companyId: sourceIssue.companyId,
+      state: incident.state,
+      rootCauseId: repairTarget?.assigneeAgentId ?? incident.leafIssueId,
+    });
   }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
@@ -309,10 +364,32 @@ export function approvalRoutes(
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
+    const runContextDecision = await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
       requestedType: req.body.type,
       requestedIssueIds: uniqueIssueIds,
-    }))) return;
+    });
+    if (!runContextDecision.allowed) return;
+    // The coalescing key below is company-scoped, which means it deliberately ignores who filed the
+    // card. That is only safe while the namespace is unforgeable: a caller that could plant a row
+    // under `harness_liveness_board:<company>:<state>:<agent>` would have the next genuine
+    // escalation for that incident silently replay ITS card instead of raising one. The ids are all
+    // guessable by any company agent, so reserve the namespace rather than rely on obscurity.
+    if (
+      !runContextDecision.boardEscalationCoalesceKey &&
+      typeof req.body.idempotencyKey === "string" &&
+      req.body.idempotencyKey.startsWith(`${RECOVERY_KEY_PREFIXES.issueGraphLivenessBoardEscalation}:`)
+    ) {
+      res.status(422).json({
+        error: "`idempotencyKey` may not use the server-reserved liveness board-escalation namespace",
+        details: {
+          reservedPrefix: `${RECOVERY_KEY_PREFIXES.issueGraphLivenessBoardEscalation}:`,
+          remediation:
+            "Choose your own idempotency key. Paperclip derives this key itself for approvals filed " +
+            "from a `harness_liveness_escalation` issue, so that one incident raises one card.",
+        },
+      });
+      return;
+    }
     const { issueIds: _issueIds, ...approvalInput } = req.body;
     const normalizedPayload =
       approvalInput.type === "hire_agent"
@@ -349,6 +426,11 @@ export function approvalRoutes(
           : undefined;
 
     const publishCreatedActivityRef: { current: (() => void) | null } = { current: null };
+    // A liveness escalation's card is the incident's, not the filer's: the detector mints one
+    // escalation per repair target, so the run filing this one cannot see its siblings and cannot
+    // pick a key that collapses with theirs. The server picks it, and overrides any caller key —
+    // deferring to the caller here is exactly how one pause becomes N identical cards (BLO-24744).
+    const coalesceKey = runContextDecision.boardEscalationCoalesceKey;
     const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
@@ -363,7 +445,9 @@ export function approvalRoutes(
       decidedByUserId: null,
       decidedAt: null,
       updatedAt: new Date(),
+      ...(coalesceKey ? { idempotencyKey: coalesceKey } : {}),
     }, {
+      ...(coalesceKey ? { dedupeScope: "company" as const } : {}),
       afterCreate: async (txDb, createdApproval) => {
         if (uniqueIssueIds.length > 0) {
           await issueApprovalService(txDb).linkManyForApproval(createdApproval.id, uniqueIssueIds, {
@@ -519,7 +603,7 @@ export function approvalRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!existing) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId)).allowed) return;
 
     if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
       res.status(403).json({ error: "Only requesting agent can resubmit this approval" });
@@ -567,7 +651,7 @@ export function approvalRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!existing) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId)).allowed) return;
 
     // Scoped exactly like resubmit: a requester may rescind its own ask, but
     // never another agent's. Board actors retain full reach.
@@ -602,7 +686,7 @@ export function approvalRoutes(
     const id = req.params.id as string;
     const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!approval) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId)).allowed) return;
     const actor = getActorInfo(req);
     const comment = await svc.addComment(id, req.body.body, {
       agentId: actor.agentId ?? undefined,

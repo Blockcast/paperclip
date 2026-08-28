@@ -19,6 +19,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { scrubResponseBody } from "./response-scrub.js";
 import {
   CredentialCustodyError,
   applyCustodiedAuthorization,
@@ -539,23 +540,67 @@ function copyHeader(
   }
 }
 
+/**
+ * Per-request audit line: who (source IP) called what (matched prefix +
+ * JSON-RPC method, and tool name for tools/call) through the gateway. This
+ * is the only record of gateway callers — the upstream MCP servers log only
+ * an opaque session id, and `upstreamCallCounts`/session counts are fan-out
+ * artifacts of the aggregate endpoint (one aggregate initialize/tools/list
+ * touches every upstream), not a per-caller count. Emitted exactly once per
+ * inbound HTTP request regardless of outcome; never includes the request
+ * body, `authorization` header value, or tool-call arguments.
+ */
+function logMcpRequest(
+  req: http.IncomingMessage,
+  requestId: string,
+  prefix: string,
+  method: string,
+  tool?: string,
+): void {
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    event: "mcp_gateway_request",
+    requestId,
+    sourceIp: req.socket.remoteAddress ?? "unknown",
+    prefix,
+    method,
+    ...(tool ? { tool } : {}),
+  }));
+}
+
+function jsonRpcMethodLabel(req: http.IncomingMessage, message: JsonRpcRequest | null): string {
+  return message?.method ?? req.method ?? "unknown";
+}
+
 function writeResponse(
   res: http.ServerResponse,
   result: ForwardResult,
   exposedClientSessionId: string | null,
 ): void {
+  // PEN-2370: every proxied response leaves through here, which makes this the
+  // one place a scrubbing pass covers all of them. Applied unconditionally
+  // rather than per-upstream: an opt-in list is another thing to forget when a
+  // new upstream is added, and the scrub is inert for bodies carrying nothing
+  // it redacts.
+  const body = scrubResponseBody(result.body, result.headers.get("content-type"));
+
   res.statusCode = result.status;
   for (const [k, v] of result.headers.entries()) {
     // Replace upstream's session header with the stable client one.
     if (k.toLowerCase() === MCP_SESSION_HEADER) continue;
     // Skip hop-by-hop headers.
     if (k.toLowerCase() === "transfer-encoding" || k.toLowerCase() === "content-encoding") continue;
+    // Scrubbing changes the body length, so the upstream's content-length no
+    // longer describes what we are about to send. Forwarding it would either
+    // truncate the response or hang the client waiting for bytes that never
+    // arrive; Node recomputes it from the buffer we pass to end().
+    if (k.toLowerCase() === "content-length") continue;
     res.setHeader(k, v);
   }
   if (exposedClientSessionId) {
     res.setHeader(MCP_SESSION_HEADER, exposedClientSessionId);
   }
-  res.end(result.body);
+  res.end(body);
 }
 
 async function handleRequest(
@@ -563,6 +608,7 @@ async function handleRequest(
   res: http.ServerResponse,
   state: GatewayState,
 ): Promise<void> {
+  const requestId = randomUUID();
   const url = req.url ?? "/";
   const pathName = url.split("?", 1)[0] ?? "/";
 
@@ -585,7 +631,7 @@ async function handleRequest(
   }
 
   if (pathName === "/mcp" || pathName.startsWith("/mcp/")) {
-    await handleAggregateRequest(req, res, state);
+    await handleAggregateRequest(req, res, state, requestId);
     return;
   }
 
@@ -605,16 +651,36 @@ async function handleRequest(
     const slashIdx = trimmed.indexOf("/");
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
-  await ensurePersistedSessionsLoaded(state);
+  // Body consumption and session-store setup can throw (aborted connection,
+  // stream error, disk error loading persisted sessions) before we've parsed
+  // enough of the request to log it — that would leave exactly the failing
+  // calls unaccounted for in the audit trail. Emit a fallback line (matched
+  // prefix + HTTP method) if anything in here throws, so every request that
+  // reaches this function logs exactly once either way.
+  let body: Buffer;
+  let bodyText: string;
+  let inboundMessage: JsonRpcRequest | null;
+  try {
+    await ensurePersistedSessionsLoaded(state);
+    body = await readBody(req);
+    bodyText = body.toString("utf8");
+    inboundMessage = parseJsonRpcRequest(bodyText);
+  } catch (e) {
+    logMcpRequest(req, requestId, prefix, jsonRpcMethodLabel(req, null));
+    throw e;
+  }
   const store = getOrCreateStore(state, prefix);
   state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
-
-  const body = await readBody(req);
-  const bodyText = body.toString("utf8");
   const clientSessionId = (() => {
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
   })();
+
+  const logMethod = jsonRpcMethodLabel(req, inboundMessage);
+  const logTool = logMethod === "tools/call" && typeof inboundMessage?.params?.name === "string"
+    ? inboundMessage.params.name
+    : undefined;
+  logMcpRequest(req, requestId, prefix, logMethod, logTool);
 
   // Circuit breaker: if this upstream has been failing (hung / OOMing /
   // unreachable), fail fast with 503 instead of forwarding into it and
@@ -657,17 +723,40 @@ async function handleAggregateRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   state: GatewayState,
+  requestId: string,
 ): Promise<void> {
-  await ensurePersistedSessionsLoaded(state);
-  const body = await readBody(req);
-  const bodyText = body.toString("utf8");
-  const message = parseJsonRpcRequest(bodyText);
+  // See the matching comment in handleRequest: log a fallback line if setup
+  // or body consumption throws, so a failure here isn't left unaccounted for.
+  let body: Buffer;
+  let bodyText: string;
+  let message: JsonRpcRequest | null;
+  try {
+    await ensurePersistedSessionsLoaded(state);
+    body = await readBody(req);
+    bodyText = body.toString("utf8");
+    message = parseJsonRpcRequest(bodyText);
+  } catch (e) {
+    logMcpRequest(req, requestId, "*", jsonRpcMethodLabel(req, null));
+    throw e;
+  }
   const inboundSessionId = (() => {
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
   })();
   const clientSessionId = inboundSessionId || randomUUID();
   const initializePayload = looksLikeInitializeRequest(bodyText) ? body : buildDefaultInitializePayload();
+
+  // Exactly one line per inbound request, even for `initialize`/`tools/list`,
+  // which fan out to every upstream below — the requestId (and, for
+  // `tools/call`, the resolved prefix) is what makes that fan-out
+  // attributable to a single caller rather than ten indistinguishable lines.
+  const logMethod = jsonRpcMethodLabel(req, message);
+  const logTool = logMethod === "tools/call" && typeof message?.params?.name === "string"
+    ? message.params.name
+    : undefined;
+  const logToolSeparatorIndex = logTool ? logTool.indexOf("__") : -1;
+  const logPrefix = logToolSeparatorIndex > 0 ? logTool!.slice(0, logToolSeparatorIndex) : "*";
+  logMcpRequest(req, requestId, logPrefix, logMethod, logTool);
 
   if (!message?.method) {
     res.statusCode = 400;

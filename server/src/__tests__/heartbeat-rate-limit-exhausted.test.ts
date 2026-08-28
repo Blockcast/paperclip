@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
 } from "@paperclipai/db";
 import {
+  ZERO_TOKEN_STREAK_SCAN_LIMIT,
   countConsecutiveZeroTokenCompletedRuns,
   isRateLimitExhausted,
   isRetryableK8sCcrotateThrottleResult,
@@ -551,6 +552,57 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
     const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
 
     expect(rows.map((row) => row.status)).toEqual(["cancelled", "failed", "succeeded"]);
+  });
+
+  // BLO-21415: this LIMIT is the zero-token gauge's saturation point, because
+  // countConsecutiveZeroTokenCompletedRuns counts a prefix of these rows. At the
+  // old value of 10 a brief blip and a badly-wedged agent both reported exactly
+  // 10, so the alert carried no severity signal above its own threshold.
+  it("scans far enough past the alert threshold to distinguish a blip from a wedge", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Wedged",
+      role: "engineer",
+      status: "idle",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const wedgedRunCount = ZERO_TOKEN_STREAK_SCAN_LIMIT + 5;
+    const base = Date.parse("2026-07-08T12:00:00Z");
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: wedgedRunCount }, (_, i) => ({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "failed" as const,
+        usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        startedAt: new Date(base + i * 60_000),
+        finishedAt: new Date(base + i * 60_000 + 30_000),
+        createdAt: new Date(base + i * 60_000),
+      })),
+    );
+
+    const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
+    expect(rows).toHaveLength(ZERO_TOKEN_STREAK_SCAN_LIMIT);
+
+    const streak = countConsecutiveZeroTokenCompletedRuns(rows);
+    expect(streak).toBe(ZERO_TOKEN_STREAK_SCAN_LIMIT);
+    // The old ceiling; a wedge must now read strictly above it.
+    expect(streak).toBeGreaterThan(10);
   });
 });
 

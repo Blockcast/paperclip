@@ -1130,6 +1130,12 @@ export const installPluginSchema = z.object({
   version: z.string().min(1).optional(),
   /** Set by loader for local-path installs so the worker can be resolved. */
   packagePath: z.string().min(1).optional(),
+  /**
+   * npm install prefix this plugin was installed into, when it differs from
+   * the shared plugins directory (see BLO-20961). Null clears back to the
+   * shared store; undefined leaves the existing value untouched on repoint.
+   */
+  installDir: z.string().min(1).nullable().optional(),
 });
 
 export type InstallPlugin = z.infer<typeof installPluginSchema>;

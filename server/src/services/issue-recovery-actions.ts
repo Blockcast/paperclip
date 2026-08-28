@@ -10,11 +10,46 @@ import type {
 } from "@paperclipai/shared";
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
+
+/**
+ * Recovery-action statuses that still hold a live repair path, for the purpose of
+ * suppressing blocked-issue auto-resume.
+ *
+ * Deliberately NARROWER than `ACTIVE_RECOVERY_ACTION_STATUSES`, and the asymmetry is
+ * load-bearing (BLO-21523). `escalated` belongs in the wider set — it holds
+ * `issue_recovery_actions_active_source_uq` so a fresh action cannot be minted with a
+ * new budget (BLO-18996), it keeps the handoff comment grant open, and it keeps the
+ * owner able to check the issue out. What it does NOT do is wake anyone:
+ *
+ *   - `escalateExpiredWakeHorizons` is the ONLY writer of `escalated`, and it sets it
+ *     exactly when `maxAttempts !== null && timeoutAt !== null && timeoutAt <= now`.
+ *     `strandedRecoveryWakeAttemptsExhausted` returns true for precisely that condition.
+ *     (`upsertSourceScoped` only ever *preserves* an existing `escalated` — it never
+ *     creates one — so there is no second way in.)
+ *   - So every `escalated` action is already wake-exhausted.
+ *     `reconcileStrandedRecoveryWakeBackstop` selects it and then always drops it at
+ *     `exhaustedSkipped`. Should a later re-upsert ever null out `maxAttempts`, the
+ *     conclusion is unchanged: a null budget is reserved for the causes that never wake
+ *     an owner at all.
+ *
+ * The platform says as much verbatim when it escalates: "Paperclip has stopped waking
+ * anyone for it". Suppressing auto-resume on an `escalated` action therefore preserves
+ * no repair path — it only pins the issue `blocked` with zero unresolved blockers, which
+ * is the exact stranded state the reconciler exists to drain, and which no wake, retry or
+ * monitor will ever re-enter. Measured 2026-08-24: 88 of 106 stranded rows were held this
+ * way, 87 of them with no run, no monitor and no scheduled retry, the oldest 6 weeks old.
+ *
+ * Resolving or cancelling the action remains the way to clear the wider set; this constant
+ * only decides whether the row may return to `todo`.
+ */
+export const BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES = ["active"] as const satisfies readonly IssueRecoveryActionStatus[];
+
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
 // Written by `buildStrandedRecoveryActionEvidence` in recovery/service.ts.
 const LATEST_RUN_AGENT_ID_EVIDENCE_KEY = "latestRunAgentId";
+const LATEST_RUN_ID_EVIDENCE_KEY = "latestRunId";
 
 // How long after a recovery transfer the previous owner keeps the comment-only
 // handoff channel opened by BLO-18906 / #827.
@@ -121,9 +156,25 @@ function withSourceScopedWakeHorizonEvidence(
 // agent holds this grant on an issue at a time, for at most the TTL after the
 // transfer that named them. `createdAt` remains the read-side fallback for rows
 // written before this key existed.
-function readRecoveryHandoffGrantAnchorAt(evidence: unknown): Date | null {
-  if (!isRecord(evidence)) return null;
-  return toValidDate(evidence[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY]);
+//
+// BLO-22127: the read is deliberately TRI-state rather than `Date | null`. "The key is
+// absent" and "the key is present but unparseable" are different claims and must have
+// different outcomes: the first is a legacy row that predates the key and legitimately
+// falls back to `createdAt`; the second is a row whose evidence asserts an anchor we
+// cannot read, where falling back to `createdAt` would silently substitute a DIFFERENT
+// and potentially fresher anchor than the one the row claims. Collapsing them to `null`
+// is fail-open in an authorization path.
+type RecoveryHandoffGrantAnchor =
+  | { kind: "valid"; at: Date }
+  | { kind: "absent" }
+  | { kind: "invalid"; raw: unknown };
+
+function readRecoveryHandoffGrantAnchor(evidence: unknown): RecoveryHandoffGrantAnchor {
+  if (!isRecord(evidence)) return { kind: "absent" };
+  if (!(RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY in evidence)) return { kind: "absent" };
+  const raw = evidence[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY];
+  const at = toValidDate(raw);
+  return at ? { kind: "valid", at } : { kind: "invalid", raw };
 }
 
 /**
@@ -142,13 +193,36 @@ function readLatestRunAgentId(evidence: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/**
+ * The id of the run that failed, per the sweep's own evidence.
+ *
+ * BLO-22127: `readLatestRunAgentId` answers "whose run failed"; this answers "which
+ * run". Both are needed, and neither substitutes for the other. Agent identity
+ * separates replay churn from a newly failed recovery owner; run identity separates a
+ * replay of the SAME failure from a genuinely distinct later failure by the same agent.
+ * Absent or malformed reads as `null`, which suppresses re-anchoring — an
+ * unidentifiable sweep can never extend a grant.
+ */
+function readLatestRunId(evidence: unknown): string | null {
+  if (!isRecord(evidence)) return null;
+  const value = evidence[LATEST_RUN_ID_EVIDENCE_KEY];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 function withRecoveryHandoffGrantAnchorEvidence(
   evidence: unknown,
-  anchorAt: Date | null,
+  anchor: RecoveryHandoffGrantAnchor,
 ): Record<string, unknown> {
   const next = isRecord(evidence) ? { ...evidence } : {};
-  if (anchorAt) {
-    next[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY] = anchorAt.toISOString();
+  if (anchor.kind === "valid") {
+    next[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY] = anchor.at.toISOString();
+  } else if (anchor.kind === "invalid") {
+    // BLO-22127: carry an unreadable anchor through VERBATIM rather than dropping it.
+    // Dropping it would rewrite "present but unparseable" (which the read side denies)
+    // into "absent" (which falls back to `createdAt`), so an ordinary sweep would
+    // launder a fail-closed row back into a fail-open one. The row stays denied until a
+    // genuine transfer writes a fresh anchor over it.
+    next[RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY] = anchor.raw;
   }
   return next;
 }
@@ -159,18 +233,37 @@ function withRecoveryHandoffGrantAnchorEvidence(
  * `createdAt` is the fallback anchor for rows written before the evidence key
  * existed. Those are the 117 rows this ticket was filed about: all far older than
  * the TTL, so they lapse on the first request after deploy, which is the point.
+ *
+ * BLO-22127 hardens two fail-open holes in the original bound:
+ *
+ *   - A future-dated anchor produced a NEGATIVE age, and negative trivially satisfies
+ *     `<= TTL`, so such a grant held until wall-clock caught up — unbounded in the only
+ *     direction that matters. The age is now range-checked at both ends.
+ *   - A present-but-unparseable anchor fell through `??` to `createdAt`, quietly
+ *     honouring an anchor the row never claimed. Only an ABSENT key falls back now.
+ *
+ * The lower bound is strict rather than skew-tolerant. The anchor is written by this
+ * same service on transfer and read on a strictly later request, so a legitimate age is
+ * never negative; allowing a tolerance would reintroduce a fail-open window to buy
+ * nothing, and its failure mode (a brief deny that self-heals on the next request) is
+ * the safe direction for an authorization check.
  */
 export function recoveryHandoffGrantIsWithinTtl(input: {
   evidence: unknown;
   createdAt: Date | string | null;
   now?: Date;
 }): boolean {
-  const anchorAt = readRecoveryHandoffGrantAnchorAt(input.evidence) ?? toValidDate(input.createdAt);
+  const anchor = readRecoveryHandoffGrantAnchor(input.evidence);
+  // Evidence claims an anchor we cannot parse: we cannot show the grant is fresh, and
+  // we must not substitute a different one. Fail closed.
+  if (anchor.kind === "invalid") return false;
+  const anchorAt = anchor.kind === "valid" ? anchor.at : toValidDate(input.createdAt);
   // No usable anchor at all (unparseable `createdAt` on a row with no evidence key)
   // means we cannot show the grant is fresh, so it does not hold. Fail closed.
   if (!anchorAt) return false;
   const now = input.now ?? new Date();
-  return now.getTime() - anchorAt.getTime() <= RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS;
+  const ageMs = now.getTime() - anchorAt.getTime();
+  return ageMs >= 0 && ageMs <= RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS;
 }
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
@@ -380,6 +473,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       // apart. Unknown run agent reads as churn (fail closed: preserve, never refresh).
       const inputPreviousOwnerAgentId = input.previousOwnerAgentId ?? existing.previousOwnerAgentId;
       const failedRunAgentId = readLatestRunAgentId(input.evidence);
+      const latestRunId = readLatestRunId(input.evidence);
+      const existingLatestRunId = readLatestRunId(existing.evidence);
       const isFailedRunByCurrentOwner = failedRunAgentId !== null &&
         failedRunAgentId === input.previousOwnerAgentId;
       const isRecoveryDrivenOwnerChurn = input.previousOwnerAgentId !== null &&
@@ -389,10 +484,35 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       const nextPreviousOwnerAgentId = isRecoveryDrivenOwnerChurn
         ? existing.previousOwnerAgentId
         : inputPreviousOwnerAgentId;
-      const isNewHandoffTransfer = nextPreviousOwnerAgentId !== existing.previousOwnerAgentId;
-      const handoffGrantAnchorAt = isNewHandoffTransfer
-        ? now
-        : readRecoveryHandoffGrantAnchorAt(existing.evidence);
+      const isNewHandoffSubject = nextPreviousOwnerAgentId !== existing.previousOwnerAgentId;
+      // BLO-22127: a change of SUBJECT is sufficient for a fresh anchor but not
+      // necessary. Ownership can return to A out-of-band — a human reassignment, a
+      // manual takeback, anything that is not a recovery sweep — so nothing ever
+      // records an intervening `previousOwnerAgentId = B`. When a distinct A-owned run
+      // then fails and transfers A away AGAIN, the subject is unchanged and the
+      // transfer reads as churn, so A keeps the stale anchor and immediately loses the
+      // handoff channel #827 exists to provide. That is a genuine second transfer and
+      // must re-anchor.
+      //
+      // The discriminator is the failed RUN's id: a re-transfer is a distinct failure,
+      // a replay is the same failure observed twice. Run identity alone would be wrong
+      // as the only test — `reuses the same source-scoped action when latest run IDs
+      // change while the cause stays the same` presents two different run ids for the
+      // same failed agent and must still suppress — which is why this is gated behind
+      // the churn predicate and `isFailedRunByCurrentOwner`: it only speaks for the
+      // case where the agent being transferred away is the one whose run just failed.
+      // Either id unknown reads as a replay, so an unidentifiable sweep still cannot
+      // extend a grant.
+      const isDistinctFailedRunByHandoffSubject =
+        !isRecoveryDrivenOwnerChurn &&
+        isFailedRunByCurrentOwner &&
+        latestRunId !== null &&
+        existingLatestRunId !== null &&
+        latestRunId !== existingLatestRunId;
+      const isNewHandoffTransfer = isNewHandoffSubject || isDistinctFailedRunByHandoffSubject;
+      const handoffGrantAnchor: RecoveryHandoffGrantAnchor = isNewHandoffTransfer
+        ? { kind: "valid", at: now }
+        : readRecoveryHandoffGrantAnchor(existing.evidence);
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
@@ -414,7 +534,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           fingerprint: input.fingerprint,
           evidence: withRecoveryHandoffGrantAnchorEvidence(
             withSourceScopedWakeHorizonEvidence(input.evidence ?? existing.evidence, wakeHorizonAt),
-            handoffGrantAnchorAt,
+            handoffGrantAnchor,
           ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
@@ -486,7 +606,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
               (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
             ),
             // Creating the row IS the transfer, so it anchors the TTL.
-            now,
+            { kind: "valid", at: now },
           ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
@@ -524,8 +644,16 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // reports its non-delivery paths (capacity deferral, tree hold, cooldown, disabled wake).
   // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
   // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
-  // Scoped to active statuses and matched on company so it cannot touch a resolved row.
-  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
+  // The owner and attempt count are the reservation token captured by the caller. Keep both
+  // in the UPDATE predicate so a refund from an older wake is an atomic no-op after ownership
+  // changes or a newer reservation. Scoped to active statuses and matched on company so it
+  // cannot touch a resolved row.
+  async function releaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+  }): Promise<void> {
     await db
       .update(issueRecoveryActions)
       .set({
@@ -536,6 +664,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         and(
           eq(issueRecoveryActions.id, input.actionId),
           eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+          eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
           inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
         ),
       );

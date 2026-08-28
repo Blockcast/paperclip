@@ -41,7 +41,6 @@
     "typecheck": "pnpm run check:migrations && tsc --noEmit",
     "generate": "pnpm run check:migrations && tsc -p tsconfig.json && drizzle-kit generate",
     "migrate": "pnpm run check:migrations && tsx src/migrate.ts",
-    "precreate-online-indexes": "tsx src/precreate-online-indexes-cli.ts",
     "seed": "tsx src/seed.ts"
   },
   "dependencies": {

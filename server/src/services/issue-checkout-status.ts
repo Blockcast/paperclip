@@ -6,6 +6,49 @@ type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
 
 /**
+ * The issue columns that jointly identify the current execution owner.
+ *
+ * Recovery observations carry this snapshot across a few awaits.  Consumers
+ * must compare all three fields after taking the issue ownership lock; a
+ * partial comparison can accept an adopter that changed only one half of the
+ * execution lock pair.
+ */
+export type IssueLockOwnerState = {
+  executionRunId: string | null;
+  checkoutRunId: string | null;
+  assigneeAgentId: string | null;
+};
+
+export function issueLockOwnerStateMatches(
+  expected: IssueLockOwnerState,
+  actual: IssueLockOwnerState,
+): boolean {
+  return expected.executionRunId === actual.executionRunId &&
+    expected.checkoutRunId === actual.checkoutRunId &&
+    expected.assigneeAgentId === actual.assigneeAgentId;
+}
+
+/**
+ * Serialize every mutation that can transfer an issue's execution ownership.
+ *
+ * The recovery sweep and checkout adoption both perform several reads and
+ * writes on pooled connections. A row lock alone cannot coordinate those
+ * paths: recovery deliberately keeps its transaction open while its dependent
+ * side effects use other connections. Keep this key in one helper so both
+ * paths acquire the same transaction-scoped lock before taking the issue row
+ * lock or making an ownership decision.
+ */
+export async function lockIssueOwnership(
+  dbOrTx: Pick<DbOrTransaction, "execute">,
+  companyId: string,
+  issueId: string,
+): Promise<void> {
+  await dbOrTx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${companyId} || ':' || ${issueId}, 0))`,
+  );
+}
+
+/**
  * Clear every issue-ownership column that still points at a terminalizing run.
  *
  * Each column is guarded independently so a stale finalizer cannot erase a

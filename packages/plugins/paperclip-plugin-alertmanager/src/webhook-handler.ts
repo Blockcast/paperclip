@@ -11,6 +11,8 @@ import { timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
+  DEFAULT_OPERATOR_SUPPRESSION_HOURS,
+  MAX_OPERATOR_SUPPRESSION_HOURS,
   WEBHOOK_KEYS,
   alertStateRef,
   legacyInstanceAlertStateRef,
@@ -23,9 +25,8 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId } from "./owner-resolver.js";
+import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
-import { recordCredentialResolution } from "./credential-health.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -86,6 +87,35 @@ export function verifyBearerToken(
   const expected = `Bearer ${expectedToken}`;
   if (raw.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(raw), Buffer.from(expected));
+}
+
+/**
+ * Largest bearer credential worth sending to the host for verification.
+ *
+ * Mirrors the host's own `MAX_PRESENTED_SECRET_BYTES`
+ * (`server/src/services/plugin-secrets-handler.ts`). Anything larger is
+ * rejected there as `presented_secret_invalid` — an error, not a `false` — so
+ * without this cap an oversized `Authorization` header turns a plainly-wrong
+ * credential into a failed delivery that Alertmanager then retries. No secret
+ * budget is spent either way (the host checks size before any database work),
+ * but the retry volume and error rate are anonymous-triggerable, so reject the
+ * over-long credential here and answer 401 instead.
+ */
+const MAX_BEARER_CREDENTIAL_BYTES = 4_096;
+
+export function readBearerCredential(
+  headers: Record<string, string | string[]>,
+): string | null {
+  const raw =
+    pickHeader(headers, "authorization") ??
+    pickHeader(headers, "Authorization");
+  if (!raw?.startsWith("Bearer ")) return null;
+  const credential = raw.slice("Bearer ".length);
+  if (credential.length === 0) return null;
+  // Byte length, matching how the host measures it — a multi-byte UTF-8
+  // credential inside the character limit can still exceed the byte limit.
+  if (Buffer.byteLength(credential, "utf8") > MAX_BEARER_CREDENTIAL_BYTES) return null;
+  return credential;
 }
 
 function pickHeader(
@@ -164,6 +194,148 @@ async function readAlertState(
 }
 
 /**
+ * Milliseconds an operator-closed issue suppresses re-fires, or `null` for
+ * "suppress indefinitely" (`operatorSuppressionHours: 0`, the pre-BLO-24234
+ * behaviour). A negative or non-finite setting is treated as unset rather than
+ * silently disabling suppression in either direction, and an over-large one is
+ * clamped to `MAX_OPERATOR_SUPPRESSION_HOURS` so the millisecond conversion
+ * cannot overflow to `Infinity` (or to a finite-but-geological window) and
+ * re-create the unbounded mute. The clamped value is what the operator-facing
+ * labels report, so a clamped config shows up as the window it actually got.
+ */
+function operatorSuppressionMs(config: AlertmanagerPluginConfig): number | null {
+  const hours = config.operatorSuppressionHours;
+  const effective =
+    typeof hours === "number" && Number.isFinite(hours) && hours >= 0
+      ? Math.min(hours, MAX_OPERATOR_SUPPRESSION_HOURS)
+      : DEFAULT_OPERATOR_SUPPRESSION_HOURS;
+  return effective === 0 ? null : effective * 60 * 60 * 1000;
+}
+
+/**
+ * Decide what a re-fire should do to an issue that already exists for this
+ * fingerprint. Split out from `handleFiring` so the four decision points the
+ * incident review asked for are enumerable in one place, and testable without
+ * driving a whole webhook delivery.
+ *
+ * `terminal + resolvedAt` means the plugin closed it when the alert cleared, so
+ * a re-fire is a genuine recurrence → re-open. `terminal` with no `resolvedAt`
+ * means a human closed it while the alert was still firing → honour that, but
+ * only until the suppression window expires (BLO-24234).
+ */
+type RefireDecision =
+  | { kind: "refresh" }
+  | { kind: "reopen"; reason: "plugin_resolved" | "suppression_expired" }
+  | { kind: "suppressed"; suppressedAt: string; firstObservation: boolean }
+  | { kind: "issue_missing" };
+
+export function decideRefire(
+  issue: { status: string } | null | undefined,
+  existing: Pick<AlertStateRecord, "resolvedAt" | "operatorSuppressedAt">,
+  config: AlertmanagerPluginConfig,
+  nowMs: number,
+): RefireDecision {
+  if (!issue) return { kind: "issue_missing" };
+
+  const terminal = issue.status === "done" || issue.status === "cancelled";
+  if (!terminal) return { kind: "refresh" };
+  if (existing.resolvedAt) return { kind: "reopen", reason: "plugin_resolved" };
+
+  // Operator-closed. Anchor the window on the first re-fire we see against the
+  // closed issue — not on the close itself, which the plugin never observes.
+  const suppressedAt = existing.operatorSuppressedAt ?? new Date(nowMs).toISOString();
+  const firstObservation = !existing.operatorSuppressedAt;
+  const windowMs = operatorSuppressionMs(config);
+  if (windowMs === null) return { kind: "suppressed", suppressedAt, firstObservation };
+
+  const anchorMs = Date.parse(suppressedAt);
+  // An unparseable anchor (hand-edited or corrupted state row) must not mute the
+  // alert forever — re-anchor to now and keep suppressing for one more window.
+  if (!Number.isFinite(anchorMs)) {
+    return {
+      kind: "suppressed",
+      suppressedAt: new Date(nowMs).toISOString(),
+      firstObservation: true,
+    };
+  }
+  if (nowMs - anchorMs >= windowMs) {
+    return { kind: "reopen", reason: "suppression_expired" };
+  }
+  return { kind: "suppressed", suppressedAt, firstObservation };
+}
+
+/**
+ * Human-readable suppression window for log lines and the re-open comment.
+ */
+function operatorSuppressionHoursLabel(config: AlertmanagerPluginConfig): string {
+  const ms = operatorSuppressionMs(config);
+  if (ms === null) return "indefinite";
+  return `${ms / (60 * 60 * 1000)}h`;
+}
+
+/** When the current suppression window runs out, for operator-facing logs. */
+function suppressionExpiryLabel(
+  suppressedAt: string,
+  config: AlertmanagerPluginConfig,
+): string {
+  const ms = operatorSuppressionMs(config);
+  if (ms === null) return "never (operatorSuppressionHours=0)";
+  const anchorMs = Date.parse(suppressedAt);
+  if (!Number.isFinite(anchorMs)) return "unknown (unparseable suppression anchor)";
+  return new Date(anchorMs + ms).toISOString();
+}
+
+/**
+ * Per-delivery memo for the named-fallback owner lookup.
+ *
+ * `resolveFallbackAgentId` is one unwindowed `ctx.agents.list({ companyId })`,
+ * and that call is not cheap on the host side: `server/src/services/agents.ts`
+ * issues two full-table selects for the company (the filtered rows plus the org
+ * chain) and then `hydrateAgentSpend`, which aggregates `costEvents` for the
+ * current month. The fallback rung is also the *common* path — by BLO-20576's
+ * own numbers most firing alerts resolve to no owner — so without a memo every
+ * alert in a batch pays it, and a storm is exactly when the batch is largest
+ * and the host is busiest.
+ *
+ * The resolution is constant for a given `(companyId, fallbackAgentName)`
+ * within a single `handleWebhook` call, so caching it there collapses N host
+ * round-trips to one without changing any semantics. Scoping the memo to the
+ * delivery (rather than the module) is what keeps it correct: a config edit or
+ * an agent being paused takes effect on the very next delivery.
+ */
+export type FallbackOwnerMemo = Map<string, Promise<string | undefined>>;
+
+function resolveFallbackAgentIdMemoized(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  fallbackAgentName: string | undefined,
+  memo: FallbackOwnerMemo | undefined,
+): Promise<string | undefined> {
+  if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
+  // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
+  // operator-supplied config, so any single-character separator could be
+  // embedded in a name to collide with another company's key.
+  const key = JSON.stringify([companyId, fallbackAgentName ?? ""]);
+  const cached = memo.get(key);
+  if (cached) return cached;
+  const pending = resolveFallbackAgentId(
+    ctx,
+    companyId,
+    fallbackAgentName,
+  ).catch((err: unknown) => {
+    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to
+    // `undefined` and IS cached — it is a config fact, stable for the delivery.
+    // A *throw* is a transient host fault, and caching it would let one failed
+    // `agents.list` poison every remaining alert in the batch, converting a
+    // blip that previously cost one alert into a whole-delivery failure.
+    memo.delete(key);
+    throw err;
+  });
+  memo.set(key, pending);
+  return pending;
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -172,6 +344,7 @@ export async function handleFiring(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  fallbackOwnerMemo?: FallbackOwnerMemo,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -206,39 +379,123 @@ export async function handleFiring(
 
   if (existing && existing.paperclipIssueId) {
     // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
-    // re-open if the plugin previously auto-cancelled it on resolve.
+    // re-open if the plugin previously auto-cancelled it on resolve, or if an
+    // operator's close has aged past the suppression window (BLO-24234).
     const newDescription = buildIssueDescription(alert);
+    // Carried out of the try so the state write below records what actually
+    // happened. A decision the RPC then failed to apply must not be persisted
+    // as applied — otherwise a transient issues.update outage would bank the
+    // suppression anchor (or clear it) on the strength of a call that never
+    // landed, and the next re-fire would reason from a fiction.
+    let decision: RefireDecision = { kind: "issue_missing" };
+    let decisionApplied = false;
     try {
       const issue = await ctx.issues.get(
         existing.paperclipIssueId,
         existing.paperclipCompanyId,
       );
-      if (
-        issue &&
-        (issue.status === "done" || issue.status === "cancelled") &&
-        existing.resolvedAt
-      ) {
+      decision = decideRefire(issue, existing, config, Date.now());
+
+      if (decision.kind === "reopen") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { status: "todo", description: newDescription },
           existing.paperclipCompanyId,
         );
+        if (decision.reason === "suppression_expired") {
+          // Say why the close did not stick, on the issue itself — an operator
+          // who closed this yesterday needs to know it re-opened because the
+          // alert never stopped firing, not because something ignored them.
+          try {
+            await ctx.issues.createComment(
+              existing.paperclipIssueId,
+              `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
+              existing.paperclipCompanyId,
+            );
+          } catch (commentErr) {
+            // The re-open is the load-bearing half and has already landed.
+            ctx.logger.warn(
+              `Re-opened issue ${existing.paperclipIssueId} after suppression expiry but could not post the explanatory comment: ${String(commentErr)}`,
+            );
+          }
+          await ctx.metrics.write("alertmanager.firing.suppression_expired", 1, {
+            alertname,
+            severity,
+          });
+        }
         await ctx.metrics.write("alertmanager.firing.reopened", 1, {
           alertname,
           severity,
         });
-      } else if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+      } else if (decision.kind === "refresh") {
         await ctx.issues.update(
           existing.paperclipIssueId,
           { description: newDescription },
           existing.paperclipCompanyId,
         );
+      } else if (decision.kind === "suppressed") {
+        // The whole point of BLO-24234: this path used to be entirely silent,
+        // emitting only `firing.deduped` — indistinguishable from a healthy
+        // re-fire against an open issue. A muted fingerprint must be visible
+        // as muted, every time it fires, or nobody can tell that a delivered
+        // page produced no actionable artifact.
+        if (decision.firstObservation) {
+          ctx.logger.warn(
+            `Alert ${alertname} (${alert.fingerprint}) re-fired against operator-closed issue ${existing.paperclipIssueId}; suppressing re-open until ${suppressionExpiryLabel(decision.suppressedAt, config)}`,
+          );
+        } else {
+          ctx.logger.info(
+            `Alert ${alertname} (${alert.fingerprint}) still suppressed by operator close of issue ${existing.paperclipIssueId} (until ${suppressionExpiryLabel(decision.suppressedAt, config)})`,
+          );
+        }
+        await ctx.metrics.write("alertmanager.firing.suppressed", 1, {
+          alertname,
+          severity,
+        });
+      } else {
+        // `issues.get` returned nothing — the issue was hard-deleted out from
+        // under the state row. Previously this fell through both branches in
+        // silence; say so, since the fingerprint is now tracking a ghost.
+        ctx.logger.warn(
+          `Alert ${alertname} (${alert.fingerprint}) re-fired but its tracked issue ${existing.paperclipIssueId} could not be read; leaving state intact`,
+        );
+        await ctx.metrics.write("alertmanager.firing.issue_missing", 1, {
+          alertname,
+          severity,
+        });
       }
+      decisionApplied = true;
     } catch (err) {
       ctx.logger.warn(
         `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
       );
     }
+
+    // Ladder restart keeps its original trigger — the alert going
+    // resolved → firing — which is independent of the issue's status: an
+    // operator may have re-opened the issue by hand, in which case the branch
+    // above is a plain `refresh` but `handleResolved` has still left
+    // `nextEscalationAt` null and `escalationComplete` true. Gating this on the
+    // re-open would silently disarm escalation for exactly that case.
+    //
+    // A suppression-expiry re-open is the one new trigger: the ladder has been
+    // frozen for the whole suppression window, so the now-visible issue needs a
+    // live deadline or it will never page anyone.
+    const suppressionExpiryReopen =
+      decisionApplied &&
+      decision.kind === "reopen" &&
+      decision.reason === "suppression_expired";
+    const ladderRestart = Boolean(existing.resolvedAt) || suppressionExpiryReopen;
+    // Only a decision we actually applied may move the anchor. `issue_missing`
+    // preserves it: the issue was unreadable, so we learned nothing about
+    // whether the operator's close still stands, and dropping the anchor would
+    // restart the whole window on the next readable re-fire.
+    const suppressionAnchor =
+      !decisionApplied || decision.kind === "issue_missing"
+        ? (existing.operatorSuppressedAt ?? null)
+        : decision.kind === "suppressed"
+          ? decision.suppressedAt
+          : null;
 
     const updated: AlertStateRecord = {
       ...existing,
@@ -246,15 +503,16 @@ export async function handleFiring(
       severity,
       lastFiredAt: nowIso,
       resolvedAt: null,
-      nextEscalationAt: existing.resolvedAt
+      operatorSuppressedAt: suppressionAnchor,
+      nextEscalationAt: ladderRestart
         ? (() => {
             const delay = escalationDeadlineMs(alert, config);
             return delay === null ? null : new Date(Date.now() + delay).toISOString();
           })()
         : existing.nextEscalationAt,
-      escalationAttempt: existing.resolvedAt ? 0 : existing.escalationAttempt,
-      escalationComplete: existing.resolvedAt ? false : existing.escalationComplete,
-      escalationIntervalMs: existing.resolvedAt
+      escalationAttempt: ladderRestart ? 0 : existing.escalationAttempt,
+      escalationComplete: ladderRestart ? false : existing.escalationComplete,
+      escalationIntervalMs: ladderRestart
         ? escalationDeadlineMs(alert, config)
         : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
     };
@@ -279,6 +537,35 @@ export async function handleFiring(
       alertname,
       severity,
     });
+    return;
+  }
+
+  // Creation floor. Deliberately placed *after* the re-fire branch above and
+  // before creation only: an `info` alert that already owns an issue (filed
+  // before this floor existed) keeps being refreshed, and `handleResolved`
+  // still closes it. Gating the whole delivery instead would strand those
+  // legacy issues open forever, which is the resolution behavior this ticket
+  // explicitly excludes from scope.
+  //
+  // Reads the `severity` already computed above rather than re-reading the
+  // label: two normalizations of one value drift the moment either changes.
+  if (severity.trim().toLowerCase() === "info") {
+    ctx.logger.info(
+      `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+    } catch (metricErr) {
+      // Best-effort: this drop is permanent policy, already decided. Letting a
+      // metrics outage throw would mark the delivery failed and make
+      // Alertmanager retry an alert we will drop identically every time.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record issue floor metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     return;
   }
 
@@ -309,6 +596,52 @@ export async function handleFiring(
       : routeHasAssigneeUserId
         ? routeAssigneeUserId
         : assigneeUserId;
+  // Last rung of the owner chain. Before this, an unresolved owner fell through
+  // to a conditional spread on `issues.create` that simply omitted the field —
+  // so the alert landed as an ownerless issue, which nobody is woken for and
+  // which auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438 all did
+  // exactly this on 2026-08-17). Assigning a configured named agent is what
+  // makes an intake issue actionable.
+  const fallbackAssigneeAgentId =
+    createAssigneeAgentId || createAssigneeUserId
+      ? undefined
+      : await resolveFallbackAgentIdMemoized(
+          ctx,
+          companyId,
+          config.fallbackAgentName,
+          fallbackOwnerMemo,
+        );
+  const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
+  if (!finalAssigneeAgentId && !createAssigneeUserId) {
+    // Fail closed. Throwing (rather than returning) is deliberate: this is a
+    // *configuration* fault, not a property of the alert, so the delivery is
+    // genuinely incomplete. handleWebhook collects the fingerprint and answers
+    // non-2xx, Alertmanager keeps retrying, and the alert survives until an
+    // operator fixes `fallbackAgentName`. Returning here would acknowledge the
+    // delivery and destroy the alert silently — the BLO-20467 loss class.
+    ctx.logger.warn(
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, unmatched, ambiguous, or matched only non-invokable agents; refusing ownerless issue creation`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+        alertname,
+        severity,
+      });
+    } catch (metricErr) {
+      // Unlike the policy drops above, this path throws either way — so the
+      // wrapper is not about the delivery outcome, it is about the message.
+      // An unwrapped metrics outage would replace the explicit
+      // "Fallback owner resolution failed" below with an opaque metrics error,
+      // degrading the diagnostic for exactly the misconfiguration this path
+      // exists to surface.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record fallback owner failure metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    throw new Error(
+      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
+    );
+  }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
@@ -317,9 +650,11 @@ export async function handleFiring(
       ? `agent:${resolution.agentId}`
       : resolution.email ?? "(none)";
   const resolvedAssignee =
-    createAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
+    finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}`,
+    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}${
+      fallbackAssigneeAgentId ? " (named fallback)" : ""
+    }`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -344,7 +679,7 @@ export async function handleFiring(
     ...(routeGoalId ? { goalId: routeGoalId } : {}),
     ...(routeStatus ? { status: routeStatus } : {}),
     ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-    ...(createAssigneeAgentId ? { assigneeAgentId: createAssigneeAgentId } : {}),
+    ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
     ...(billingCode ? { billingCode } : {}),
   });
 
@@ -352,7 +687,7 @@ export async function handleFiring(
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
     assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeAgentId: finalAssigneeAgentId ?? null,
     alertname,
     severity,
     firstSeenAt: alert.startsAt || nowIso,
@@ -376,7 +711,7 @@ export async function handleFiring(
     annotations: alert.annotations,
     paperclipIssueId: issue.id,
     assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: createAssigneeAgentId ?? null,
+    assigneeAgentId: finalAssigneeAgentId ?? null,
     reFired: false,
   });
 
@@ -416,6 +751,59 @@ async function ensureResolutionComment(
   await ctx.issues.createComment(issueId, body, companyId);
 }
 
+/**
+ * BLO-29908: the resolve-driven cancel pins both execution-lock columns to
+ * `null`, so a row a live run holds fails the precondition instead of being
+ * cancelled. `updateIssue` answers that with a 409 whose message is one of
+ * three "…before the update could be applied" variants (checkout owner,
+ * execution owner, or the in-transaction precondition catch-all).
+ *
+ * Matching the shared suffix is deliberate: those are the ONLY preconditions
+ * this call sets, so any of them failing means exactly one thing — a lock
+ * appeared or was already held. Anything else is a real fault and must
+ * propagate so the delivery fails and Alertmanager retries, rather than being
+ * silently reported as a withheld cancel.
+ */
+function isExecutionLockPreconditionFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes("before the update could be applied");
+}
+
+/**
+ * Marker line keyed on the holding run, not on `resolvedAt`. A flapping
+ * fingerprint resolves twice an hour (BLO-29905 / BLO-29393), so keying the
+ * idempotency on the timestamp would append a near-identical comment on every
+ * cycle. One notification per holding run is the useful signal: it tells the
+ * run that its subject cleared, once.
+ */
+function cancelWithheldMarker(runId: string): string {
+  return `<!-- alertmanager:cancel-withheld:${runId} -->`;
+}
+
+async function ensureCancelWithheldComment(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  resolvedAt: string,
+  runId: string,
+) {
+  const marker = cancelWithheldMarker(runId);
+  const comments = await ctx.issues.listComments(issueId, companyId);
+  if (comments.some((comment) => comment.body.includes(marker))) return;
+  const body = [
+    marker,
+    `**Alert resolved at ${resolvedAt} — auto-cancel withheld.**`,
+    "",
+    `This issue is held by execution run \`${runId}\`, so \`paperclip-plugin-alertmanager\` left`,
+    "the status untouched rather than cancelling the row and clearing the execution lock.",
+    "",
+    "- The underlying alert is no longer firing. If your investigation is done, close this issue yourself.",
+    "- The lock is intact: nothing was released out from under the holding run.",
+    "- Cancelling here is the holder's decision, not the bridge's ([BLO-29908](/BLO/issues/BLO-29908)).",
+  ].join("\n");
+  await ctx.issues.createComment(issueId, body, companyId);
+}
+
 export async function handleResolved(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
@@ -445,6 +833,7 @@ export async function handleResolved(
 
   const resolvedAt = alert.endsAt || new Date().toISOString();
   const alertname = existing.alertname;
+  let cancelWithheldForRunId: string | null = null;
 
   if (config.autoCloseOnResolve !== false) {
     const issue = await ctx.issues.get(
@@ -452,11 +841,70 @@ export async function handleResolved(
       existing.paperclipCompanyId,
     );
     if (issue && issue.status !== "done" && issue.status !== "cancelled") {
-      await ctx.issues.update(
-        existing.paperclipIssueId,
-        { status: "cancelled" },
-        existing.paperclipCompanyId,
-      );
+      // Read for the diagnostic only. The *authorization* is the pair of
+      // preconditions below, evaluated inside the update's transaction — this
+      // snapshot is racy by construction and must never be the thing that
+      // decides whether the cancel is safe.
+      try {
+        await ctx.issues.update(
+          existing.paperclipIssueId,
+          {
+            status: "cancelled",
+            // BLO-29908. A resolve used to cancel unconditionally, and
+            // `updateIssue` clears checkoutRunId/executionRunId/
+            // executionAgentNameKey/executionLockedAt on any transition out of
+            // `in_progress` — so the bridge silently evicted whatever run held
+            // the row. Observed 46s after a live run wrote its findings
+            // document, twice an hour per alert while a fingerprint flaps.
+            //
+            // Pinning BOTH columns to null is what makes the cancel safe:
+            // `executionRunId` alone is not enough, because an issue can be
+            // held via `checkoutRunId` with `executionRunId` still null
+            // (BLO-19749), which is precisely the window a lock-holder check
+            // on one column would miss.
+            expectedCurrentCheckoutRunId: null,
+            expectedCurrentExecutionRunId: null,
+          },
+          existing.paperclipCompanyId,
+        );
+      } catch (err) {
+        if (!isExecutionLockPreconditionFailure(err)) throw err;
+        // Stated choice (BLO-29908 acceptance criterion b): leave the status
+        // untouched and annotate, rather than deferring the cancel behind new
+        // state the plugin would then have to reconcile. The holder disposes
+        // of the row when it finishes — which is the correct owner of that
+        // decision — and a later re-fire refreshes it in place (BLO-24234).
+        // The diagnostic read above can race with checkout/release. Re-read
+        // after the CAS conflict so a newly acquired owner is notified rather
+        // than persisting a misleading `unknown` marker that would suppress
+        // future notifications for the real holder.
+        const currentIssue = await ctx.issues.get(
+          existing.paperclipIssueId,
+          existing.paperclipCompanyId,
+        );
+        // Only use an owner confirmed by the post-conflict read. The initial
+        // snapshot may describe a run that released before the CAS reached the
+        // transaction; falling back to it would create a stale marker that can
+        // suppress notification for a later holder.
+        cancelWithheldForRunId =
+          currentIssue?.executionRunId ?? currentIssue?.checkoutRunId ?? null;
+        if (cancelWithheldForRunId) {
+          await ensureCancelWithheldComment(
+            ctx,
+            existing.paperclipIssueId,
+            existing.paperclipCompanyId,
+            resolvedAt,
+            cancelWithheldForRunId,
+          );
+        }
+        ctx.logger.info(
+          `Alertmanager: withheld resolve-cancel for ${alertname} (${alert.fingerprint}) — issue ${existing.paperclipIssueId} is held by run ${cancelWithheldForRunId ?? "an unobserved owner"}`,
+        );
+        await ctx.metrics.write("alertmanager.resolved.cancel_withheld", 1, {
+          alertname,
+          severity: existing.severity,
+        });
+      }
     }
   } else {
     await ensureResolutionComment(
@@ -480,6 +928,8 @@ export async function handleResolved(
     resolvedAt,
     nextEscalationAt: null,
     escalationComplete: true,
+    cancelWithheldForRunId,
+    cancelWithheldAt: cancelWithheldForRunId ? resolvedAt : null,
   };
   await ctx.state.set(stateRef, updated);
 
@@ -491,6 +941,7 @@ export async function handleResolved(
       alertname,
       paperclipIssueId: existing.paperclipIssueId,
       resolvedAt,
+      cancelWithheldForRunId,
     },
   );
 
@@ -516,6 +967,14 @@ async function recoverStateFromIssue(
   });
   const issue = matches[0];
   if (!issue) return null;
+  // A terminal issue is deliberately NOT adopted here, which means a lost state
+  // row plus a closed issue files a fresh one rather than reviving the old.
+  // That diverges from the state-present path (which suppresses per
+  // BLO-24234) — on purpose: after a state loss the plugin cannot tell whether
+  // the close was its own resolve or an operator's, and the safe failure mode
+  // for a paging system is a visible duplicate, not a silent mute. Do not
+  // "unify" this branch by returning the terminal issue; that would let a state
+  // loss inherit a suppression nobody chose.
   if (issue.status === "done" || issue.status === "cancelled") return null;
 
   return {
@@ -547,12 +1006,20 @@ async function recoverStateFromIssue(
 }
 
 /**
- * Top-level webhook handler. Pure-ish: takes ctx + config + token + input,
- * returns void. Throws `WebhookUnauthorizedError` when the bearer token
- * fails verification — the worker's onWebhook re-throws this so the host
+ * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
+ * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
+ * verdict is `false` — the worker's onWebhook re-throws this so the host
  * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
  * when any alert in the batch failed to process, so the host records the
  * delivery `failed` and Alertmanager retries it.
+ *
+ * `authenticated` is a verdict, never a credential. `authenticateWebhook`
+ * (config-scope.ts) owns every way a request can authenticate — inline token
+ * and `webhookTokenRef` alike — so this function does no comparison and never
+ * sees a secret. It also records no credential health: given only a verdict it
+ * could not tell "no credential configured" from "wrong bearer presented", and
+ * conflating those is exactly what credential-health.ts exists to prevent
+ * (BLO-20572). `resolveCompanyScope` is the sole recorder.
  *
  * Returning normally is an acknowledgement: it makes the host answer HTTP 200
  * and ends Alertmanager's retries. Only do that when the delivery needs no
@@ -562,7 +1029,7 @@ async function recoverStateFromIssue(
 export async function handleWebhook(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
-  resolvedToken: string | null,
+  authenticated: boolean,
   input: PluginWebhookInput,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
@@ -572,12 +1039,7 @@ export async function handleWebhook(
     return;
   }
 
-  // Config-resolution outcome, not request-auth outcome: this reflects
-  // whether the company has a usable credential configured at all, not
-  // whether THIS request presented it correctly (BLO-20572).
-  recordCredentialResolution(input.companyId, resolvedToken);
-
-  if (!verifyBearerToken(input.headers, resolvedToken)) {
+  if (!authenticated) {
     ctx.logger.warn(
       "paperclip-plugin-alertmanager: rejecting webhook — bearer token missing or invalid",
     );
@@ -605,6 +1067,10 @@ export async function handleWebhook(
   }
 
   const failedFingerprints: string[] = [];
+  // Scoped to this delivery — see FallbackOwnerMemo. A storm is the case that
+  // matters: without it, every ownerless alert in the batch repeats the same
+  // company-wide agent lookup.
+  const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
 
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
@@ -615,10 +1081,98 @@ export async function handleWebhook(
     }
 
     const status = effectiveAlertStatus(alert, body);
+    const alertname = alert.labels.alertname ?? "unknown";
     try {
+      // Rule-level `paperclip_issue` policy, honored before handleFiring so it
+      // precedes every issue-creating and state-writing side effect on the
+      // firing path, at any severity — an opted-out rule must not create an
+      // issue, refresh one, or bank a suppression anchor. Accepted from either
+      // labels or annotations because Prometheus rules commonly carry policy in
+      // annotations.
+      //
+      // BOTH gates it produces — the malformed drop and the opt-out — are
+      // evaluated here but applied only inside the firing branch, and
+      // deliberately do NOT gate the resolved path; see the dispatch below for
+      // why. `paperclip_issue` is a *creation* policy: nothing on the resolved
+      // path reads it, so neither a malformed value nor an explicit opt-out has
+      // any business suppressing the close of an issue that was already filed.
+      const policyValues = [
+        alert.labels.paperclip_issue,
+        alert.annotations.paperclip_issue,
+      ];
+      const malformedPolicy = policyValues.some(
+        (value) => value !== undefined && typeof value !== "string",
+      );
+      const optedOut = policyValues.some(
+        (value) =>
+          typeof value === "string" && value.trim().toLowerCase() === "false",
+      );
       if (status === "firing") {
-        await handleFiring(ctx, config, alert);
+        if (malformedPolicy) {
+          // A non-string here means the rule author wrote something structurally
+          // wrong. Refusing to guess is safer than coercing: `paperclip_issue`
+          // decides whether a page becomes an issue at all.
+          ctx.logger.warn(
+            `paperclip-plugin-alertmanager: dropping alert ${alert.fingerprint} because paperclip_issue must be a string when provided`,
+          );
+          try {
+            await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+              alertname,
+            });
+          } catch (metricErr) {
+            ctx.logger.error(
+              `paperclip-plugin-alertmanager: failed to record malformed alert metric for ${alert.fingerprint}: ${String(metricErr)}`,
+            );
+          }
+          continue;
+        }
+        if (optedOut) {
+          ctx.logger.info(
+            `Alertmanager: ${alertname} opted out via paperclip_issue=false`,
+          );
+          try {
+            await ctx.metrics.write("alertmanager.webhook.issue_opt_out", 1, {
+              alertname,
+            });
+          } catch (metricErr) {
+            // Best-effort for the same reason as the creation floor: a permanent
+            // policy drop must stay acknowledged even if telemetry is down.
+            ctx.logger.error(
+              `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
+            );
+          }
+          continue;
+        }
+        await handleFiring(ctx, config, alert, fallbackOwnerMemo);
       } else if (status === "resolved") {
+        // Reached with BOTH policy gates above deliberately bypassed — this
+        // path is creation-only, exactly like the severity floor in
+        // handleFiring, and for the same reason. Gating it would strand any
+        // issue the rule had *already* filed: handleResolved would never run,
+        // so `state.resolvedAt` would stay null and the issue would never reach
+        // done/cancelled. `advanceIssueLadder` (escalation.ts:377,380) returns
+        // early only on resolvedAt, escalationComplete, or a terminal issue
+        // status — none of which would ever happen — so the sweep would keep
+        // advancing the ladder, waking agents, and eventually file a
+        // [user-cover] board escalation for an alert that had already resolved.
+        //
+        // That is the modal adoption path for the opt-out, not an exotic one:
+        // operators opt a rule out *because* it has been filing noisy issues,
+        // so a tracked issue almost always exists at that moment. An opt-out is
+        // meant to stop new noise, not to wedge the issues it already made.
+        //
+        // The malformed gate reaches the same conclusion by a shorter route: a
+        // non-string `paperclip_issue` is a defect in a *creation* policy, and
+        // dropping the resolve over it would convert a typo — a YAML `true`
+        // where a `"true"` was meant — into a permanently escalating issue for
+        // an alert that has cleared. The firing-side drop already refuses to
+        // guess what the author meant; the resolve never had to guess, because
+        // it does not read the value at all.
+        //
+        // This does not weaken the "no state side effect" guarantee for a rule
+        // opted out from the start: with no issue ever filed there is no state
+        // row, and handleResolved drops an unknown fingerprint without touching
+        // anything.
         await handleResolved(ctx, config, alert);
       } else {
         ctx.logger.warn(

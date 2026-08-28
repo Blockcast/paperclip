@@ -69,6 +69,7 @@ import type {
   PluginEnvironmentDeleteTemplateResult,
   PluginPerformActionActorContext,
   PluginPerformActionContext,
+  WorkerToHostMethods,
 } from "./protocol.js";
 
 export interface TestHarnessOptions {
@@ -150,6 +151,10 @@ export interface TestHarness {
   logs: TestHarnessLogEntry[];
   activity: Array<{ message: string; entityType?: string; entityId?: string; metadata?: Record<string, unknown> }>;
   metrics: Array<{ name: string; value: number; tags?: Record<string, string> }>;
+  /** Finance events recorded via `ctx.costs.recordFinanceEvent`, in call order. */
+  financeEvents: Array<
+    WorkerToHostMethods["costs.finance.create"][0] & { id: string }
+  >;
   telemetry: Array<{ eventName: string; dimensions?: Record<string, string | number | boolean> }>;
   dbQueries: Array<{ sql: string; params?: unknown[] }>;
   dbExecutes: Array<{ sql: string; params?: unknown[] }>;
@@ -490,6 +495,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const logs: TestHarnessLogEntry[] = [];
   const activity: TestHarness["activity"] = [];
   const metrics: TestHarness["metrics"] = [];
+  const financeEvents: TestHarness["financeEvents"] = [];
+  /** `${companyId}::${externalInvoiceId}` -> id, mirroring the host's idempotency guard. */
+  const financeEventKeys = new Map<string, string>();
   const telemetry: TestHarness["telemetry"] = [];
   const dbQueries: TestHarness["dbQueries"] = [];
   const dbExecutes: TestHarness["dbExecutes"] = [];
@@ -903,6 +911,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
       },
+      async verify(secretRef, presented) {
+        requireCapability(manifest, capabilitySet, "secrets.verify-ref");
+        return presented === `resolved:${secretRef}`;
+      },
       async list(_companyId) {
         requireCapability(manifest, capabilitySet, "secrets.list");
         return [];
@@ -1144,6 +1156,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             },
             workspaces: [],
             primaryWorkspace: null,
+            primaryWorkspaceSource: "none" as const,
             managedByPlugin: {
               id: `managed-${projects.size + 1}`,
               pluginId: manifest.id,
@@ -2539,6 +2552,22 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         toolHandlers.set(name, fn);
       },
     },
+    costs: {
+      async recordFinanceEvent(params) {
+        requireCapability(manifest, capabilitySet, "costs.write");
+        const key = params.externalInvoiceId
+          ? `${params.companyId}::${params.externalInvoiceId}`
+          : null;
+        const existing = key ? financeEventKeys.get(key) : undefined;
+        if (existing) {
+          return { id: existing, created: false };
+        }
+        const id = `finance-${financeEvents.length + 1}`;
+        if (key) financeEventKeys.set(key, id);
+        financeEvents.push({ ...params, id });
+        return { id, created: true };
+      },
+    },
     metrics: {
       async write(name, value, tags) {
         requireCapability(manifest, capabilitySet, "metrics.write");
@@ -2690,6 +2719,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     logs,
     activity,
     metrics,
+    financeEvents,
     telemetry,
     dbQueries,
     dbExecutes,

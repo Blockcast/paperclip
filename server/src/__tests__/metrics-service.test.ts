@@ -34,6 +34,8 @@ import {
   KNOWN_WORKFLOW_RUN_CONCLUSIONS,
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+  QUEUED_RUN_OLDEST_AGE_METRIC,
   UNKNOWN_EXTERNAL_ADAPTER,
   UNKNOWN_PROCESS_LOSS_CLASSIFICATION,
   UNKNOWN_PROCESS_LOST_BUCKET,
@@ -55,7 +57,16 @@ import {
   normalizeExternalLifecycleTerminalStatus,
   recordExternalLifecycleRunSilenceGap,
   setQueuedRunOldestAgeMetrics,
+  setQueuedRunAgeMetricsRefreshSuccess,
   QUEUED_RUN_OLDEST_AGE_METRIC,
+  setAgentLivenessMetrics,
+  AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
+  AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
+  AGENT_ERROR_DURATION_SECONDS_METRIC,
+  PLUGIN_ERROR_METRIC,
+  PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
+  setPluginErrorStatus,
+  setPluginStatusCollectorLastSuccessSeconds,
 } from "../services/metrics.js";
 import {
   incrementRoutineDispatchMetric,
@@ -454,6 +465,100 @@ describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
     );
     expect(body).not.toContain("ghost");
   });
+
+  // BLO-21415: `adapter` used to latch. This gauge is written per-agent from
+  // that agent's own heartbeat finalization, so nothing ever retired the child
+  // minted under a previous adapterType -- it stayed frozen at its last value
+  // for the process lifetime and kept firing PaperclipAgentZeroTokenRunStreak
+  // while the agent's live series read healthy.
+  it("retires the previous adapter's series when an agent changes adapter", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 10,
+      knownAgentIds,
+    });
+
+    const before = await renderMetrics();
+    expect(before.body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 10`,
+    );
+
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "claude_k8s",
+      streak: 0,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="claude_k8s"} 0`,
+    );
+    // The orphaned series is gone entirely, not merely zeroed -- a lingering
+    // `opencode_k8s` child at 10 is exactly what fired the alert forever.
+    expect(body).not.toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`,
+    );
+  });
+
+  it("keeps other agents' series when one agent changes adapter", async () => {
+    const knownAgentIds = new Set(["agent-a", "agent-b"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-b",
+      adapter: "opencode_k8s",
+      streak: 7,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 4,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "claude_k8s",
+      streak: 1,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-b",adapter="opencode_k8s"} 7`,
+    );
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="claude_k8s"} 1`,
+    );
+    expect(body).not.toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`,
+    );
+  });
+
+  it("re-recording the same adapter keeps a single series at the newest value", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 2,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 5,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 5`,
+    );
+    expect(
+      body.split("\n").filter((line) => line.startsWith(`${AGENT_NO_USAGE_STREAK_METRIC}{`)),
+    ).toHaveLength(1);
+  });
 });
 
 describe("dep-blocked metrics counters", () => {
@@ -682,6 +787,199 @@ describe("setExternalLifecycleRunningRuns (BLO-16184 denominator #1)", () => {
   });
 });
 
+describe("queued-run age metrics (BLO-21116)", () => {
+  it("publishes explicit queue zeros and a separate refresh-success signal", async () => {
+    const agentA = "11111111-1111-1111-1111-111111111111";
+    const agentB = "22222222-2222-2222-2222-222222222222";
+    const known = new Set([agentA, agentB]);
+
+    setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
+    setQueuedRunAgeMetricsRefreshSuccess(true);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+    expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
+
+    // A successful next refresh with no queued rows resolves the age. A
+    // failed refresh is independently visible rather than being mistaken for
+    // a fresh zero.
+    setQueuedRunOldestAgeMetrics([], known);
+    setQueuedRunAgeMetricsRefreshSuccess(false);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
+  });
+});
+
+describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () => {
+  it("publishes heartbeat age + interval only for heartbeat-enabled agents, and error duration for every agent", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-enabled",
+        heartbeatEnabled: true,
+        heartbeatExpected: true,
+        heartbeatAgeSeconds: 120,
+        heartbeatIntervalSeconds: 1800,
+        errorDurationSeconds: 0,
+      },
+      {
+        agentId: "agent-disabled",
+        heartbeatEnabled: false,
+        heartbeatExpected: true,
+        heartbeatAgeSeconds: 99999,
+        heartbeatIntervalSeconds: 3600,
+        errorDurationSeconds: 45,
+      },
+    ]);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${AGENT_HEARTBEAT_AGE_SECONDS_METRIC} gauge`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-enabled"} 120`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-enabled"} 1800`);
+    // heartbeat-disabled agent is expected to be dark, so it must not appear
+    // on the age/interval gauges at all -- not even as a 0.
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-disabled"}`);
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-disabled"}`);
+    // error duration is published for every agent regardless of heartbeat.enabled.
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-enabled"} 0`);
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-disabled"} 45`);
+  });
+
+  it("reset-then-sets so an agent dropped from the next snapshot disappears rather than freezing stale", async () => {
+    setAgentLivenessMetrics([
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-b", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+    ]);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-b"} 20`);
+
+    // Next publish: agent-b is gone (deleted, or heartbeat disabled).
+    setAgentLivenessMetrics([
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+    ]);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-a"} 40`);
+    expect(body).not.toContain('agent_id="agent-b"');
+  });
+
+  it("clamps negative values to 0 and skips non-finite ages", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-c",
+        heartbeatEnabled: true,
+        heartbeatExpected: true,
+        heartbeatAgeSeconds: Number.NaN,
+        heartbeatIntervalSeconds: -5,
+        errorDurationSeconds: -10,
+      },
+    ]);
+    const { body } = await renderMetrics();
+    // NaN age is skipped entirely (no bogus series), negative interval clamps to 0.
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-c"}`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+  });
+
+  // BLO-28861: `heartbeat.enabled` is not cleared on termination, so config
+  // alone let terminated agents export an age that grows forever and could
+  // never fall back under the alert threshold. `heartbeatExpected` is the
+  // second, independent gate; error duration must survive it untouched.
+  it("suppresses age+interval for a heartbeat-enabled agent that is not expected to heartbeat, while keeping its error duration", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-not-expected",
+        heartbeatEnabled: true,
+        heartbeatExpected: false,
+        heartbeatAgeSeconds: 9_876_543,
+        heartbeatIntervalSeconds: 30,
+        errorDurationSeconds: 77,
+      },
+      {
+        agentId: "agent-expected",
+        heartbeatEnabled: true,
+        heartbeatExpected: true,
+        heartbeatAgeSeconds: 42,
+        heartbeatIntervalSeconds: 1800,
+        errorDurationSeconds: 0,
+      },
+    ]);
+
+    const { body } = await renderMetrics();
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-not-expected"}`);
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-not-expected"}`);
+    // The gate is age/interval-only: error duration is a status observation,
+    // not a liveness claim, and BLO-28861 preserves its series set.
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-not-expected"} 77`);
+    // Control: the gate is not simply suppressing everything.
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-expected"} 42`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-expected"} 1800`);
+  });
+});
+
+describe("setPluginErrorStatus (BLO-21092)", () => {
+  it("registers the gauge and reports 1 for an errored plugin, 0 for a ready one", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+      { id: "22222222-2222-2222-2222-222222222222", pluginKey: "example.plugin", isError: false },
+    ]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PLUGIN_ERROR_METRIC} gauge`);
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 1`,
+    );
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="22222222-2222-2222-2222-222222222222",plugin_key="example.plugin"} 0`,
+    );
+  });
+
+  it("drops a plugin's series once it is no longer in the installed roster (reset-then-set)", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+    ]);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 1`,
+    );
+
+    // Plugin uninstalled: next tick's roster no longer includes it.
+    setPluginErrorStatus([]);
+    body = (await renderMetrics()).body;
+    expect(body).not.toContain("plugin_id=\"11111111-1111-1111-1111-111111111111\"");
+  });
+
+  it("flips an existing plugin's series from error to ready without leaving a stale 1", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+    ]);
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: false },
+    ]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 0`,
+    );
+  });
+});
+
+describe("setPluginStatusCollectorLastSuccessSeconds (BLO-21092 review follow-up)", () => {
+  it("registers no series until first set -- unlike a bare gauge, prom-client does not auto-publish a labeled gauge at 0 (Ally review: this is what keeps the API tier, which never calls this setter, from freezing the series at 0 and permanently satisfying a staleness alert)", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} gauge`);
+    expect(body).not.toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{`);
+  });
+
+  it("reports the exact unix-seconds value passed in under role=\"worker\", and only advances on an explicit call", async () => {
+    setPluginStatusCollectorLastSuccessSeconds(1_700_000_000);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000000`);
+
+    // A second success tick advances it; nothing else can move it backward or forward.
+    setPluginStatusCollectorLastSuccessSeconds(1_700_000_030);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000030`);
+  });
+});
+
 describe("recordProcessLostLivenessNull (BLO-16184 denominator #2)", () => {
   it("registers the counter TYPE line and increments per blind cycle", async () => {
     let body = (await renderMetrics()).body;
@@ -862,6 +1160,22 @@ describe("routine dispatch metrics counters (BLO-23379)", () => {
     expect(body).toContain(`# TYPE ${ROUTINE_DISPATCH_METRIC} counter`);
     expect(body).toContain(
       `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 2`,
+    );
+  });
+
+  // BLO-25692: the stale-run bypass is a sibling label, not a replacement --
+  // both must render, or an operator cannot tell a provider-quota park from an
+  // execution that stalled or overran.
+  it("renders the stale-execution-issue bypass counter alongside the parked one", async () => {
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue");
+    incrementRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_stale_execution_issue"} 1`,
+    );
+    expect(body).toContain(
+      `${ROUTINE_DISPATCH_METRIC}{outcome="routine_dispatch_bypassed_parked_execution_issue"} 1`,
     );
   });
 

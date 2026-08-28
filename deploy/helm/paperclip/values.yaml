@@ -108,6 +108,23 @@ api:
   # 40 lowercase hex, or empty to render no annotation.
   deployedCommit: ""
 
+# -- Singleton worker tier (the `paperclip` StatefulSet). This tier runs
+# `PAPERCLIP_NODE_ROLE=worker`: it drives heartbeat dispatch and hosts the
+# plugin workers. It is NOT optional the way `api` is — the StatefulSet always
+# renders; this block only carries release-job metadata for it.
+worker:
+  # -- Exact Git commit SHA deployed by the release job (BLO-29008), stamped
+  # onto the WORKER pod template as `paperclip.blockcast.net/deployed-commit`.
+  # 40 lowercase hex, or empty to render no annotation.
+  #
+  # Mirrors `api.deployedCommit` and is set from the same `${COMMIT}` in the
+  # same `helm upgrade`, so the two cannot diverge by construction. The deploy
+  # job additionally asserts the LIVE objects agree, which is the check that
+  # actually holds: before BLO-29008 the worker carried no stamp at all, so a
+  # deploy that rolled the api and left the worker on older code reported
+  # `success` and every tier-level signal read green (BLO-28920).
+  deployedCommit: ""
+
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
   # -- Service type. Keep `ClusterIP`; cloudflared or Ingress handle external exposure.
@@ -147,6 +164,20 @@ env:
   # -- Extra environment variables merged verbatim into the container spec.
   # Example: `[{name: NODE_OPTIONS, value: --max-old-space-size=3072}]`.
   extra: []
+  # Deployment requirement, not a default this chart can safely set:
+  # the bundled `claude_k8s` adapter resolves its Job pod ServiceAccount from
+  # the per-agent `serviceAccountName` config field, then from
+  # PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME, and then *refuses to build the Job
+  # manifest* rather than falling through to the namespace `default`
+  # ServiceAccount, which has no cluster-scoped read (BLO-21499/BLO-21812).
+  # So if you run `claude_k8s` agents that have no per-agent value, add to
+  # `env.extra` above:
+  #   - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
+  #     value: <a ServiceAccount that exists in the release namespace>
+  # Left unset here deliberately: the correct account name is cluster-specific
+  # and a wrong-but-present default would fail at pod admission instead of at
+  # Job build, which is the harder failure to read. See
+  # values.blockcast.yaml for the Blockcast overlay that sets it.
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
 # plugins or runtime helpers read from disk (for example Authbot service keys).
@@ -193,6 +224,16 @@ githubApp:
   privateKeyKey: private_key.pem
   # -- GitHub App login used to filter reviews/comments. Must be `<slug>[bot]` or `app/<slug>`; bare user logins are rejected. Empty -> server default ("allyblockcast[bot]").
   reviewerBotLogin: ""
+  # -- Durably capture signed review-gate webhooks without processing them. Roll this out to every API replica before enabling authority.
+  reviewGateCaptureEnabled: false
+  # -- Process captured review-gate deliveries and dispatch reconciliation. Requires capture; the Blockcast release workflow also proves the live capture rollout completed before promotion.
+  reviewGateEnabled: false
+  # -- Repositories whose signed webhook deliveries drive review-gate revocation and reconciliation.
+  reviewGateRepositories: []
+  # -- GitHub App identity allowed to produce the protected review-gate status.
+  reviewGateExpectedAppId: ""
+  # -- Installation identity allowed to produce the protected review-gate status.
+  reviewGateExpectedInstallationId: ""
   # -- Commit-status context to FAIL when a PR-review run exhausts its automatic
   # retries (e.g. "review/ally-complete"). A required status that is never posted
   # reads as "Expected — waiting for status" forever, so an exhausted reviewer
@@ -455,10 +496,10 @@ prometheusRule:
   zeroTokenFor: 2m
   # -- Regex for Kubernetes Job names owned by Paperclip agents.
   agentJobNameRegex: "ac-.*"
-  # -- Rate window for BackoffLimitExceeded Job failures.
-  backoffLimitExceededWindow: 5m
-  # -- How long the BackoffLimitExceeded rate condition must persist before firing.
-  backoffLimitExceededFor: 2m
+  # -- Fire PaperclipAgentHeartbeatStale when an agent's lastHeartbeatAt age exceeds this multiple of its own configured heartbeat.intervalSec (BLO-23413).
+  agentHeartbeatStaleMultiplier: 3
+  # -- How long the stale-heartbeat condition must persist before firing (scrape-flap tolerance only; the ageing lives in the multiplier threshold).
+  agentHeartbeatStaleFor: 2m
   # -- Warn when process_lost reaps exceed this many per rolling 24h (BLO-16184 numerator).
   processLostWarnPerDay: 20
   # -- How long the elevated process_lost daily count must persist before warning.
@@ -495,10 +536,42 @@ prometheusRule:
   queuedRunStrandedAgeSeconds: 1440
   # -- Scrape-flap tolerance only (BLO-21116). The ageing lives in queuedRunStrandedAgeSeconds above; it stacks on top of that threshold rather than testing independently, which is why the threshold is 1440 and not 1800.
   queuedRunStrandedFor: 5m
-  # -- Runbook for the queued-run-stranded alert, linked from its annotation.
+  # -- Alert only after sustained failed refreshes; a one-off failed scrape is logged and retried on the next scrape.
+  queuedRunAgeMetricsRefreshFailureFor: 5m
+  # -- Runbook for the queued-run-stranded and metric-freshness alerts, linked from their annotations.
   queuedRunStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md"
+  # -- How long an agent's oldest overdue `scheduled_retry` heartbeat_runs row (scheduled_retry_at < now(), never promoted) may sit before firing (BLO-22094). Expressed in SECONDS and compared against paperclip_overdue_scheduled_retry_oldest_age_seconds. Derived from the observed park-to-promotion lag distribution over the 7 days preceding this alert's authorship (2026-07-31..2026-08-07, n=5253 promotions from heartbeat_run_events "Scheduled retry became due and was promoted to the queued run pool"): p50=21.5s, p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s -- zero of the 5253 samples exceeded 3600s. NOT fitted to the BLO-16366 5-sample table in the originating issue: that table measured due-to-execution-start lag (due time until the run actually started, which folds in the separate `queued` dispatch wait queuedRunStrandedAgeSeconds above already covers), a different quantity from this alert's due-to-promotion lag. Set to 5400 (90m) -- roughly 50% margin over the worst observed day's max (3567s) rather than over the aggregate p99, because the by-reason breakdown shows ccrotate_capacity alone has its own p99 of 2528s on contention days, and margining off the whole-population p99 would leave that reason's bad days too close to the threshold.
+  overdueScheduledRetryAgeSeconds: 5400
+  # -- Scrape-flap tolerance only (BLO-22094). The ageing lives in overdueScheduledRetryAgeSeconds above; it stacks on top of that threshold rather than testing independently, same reasoning as queuedRunStrandedFor.
+  overdueScheduledRetryFor: 5m
+  # -- Alert only after sustained failed refreshes of the overdue-scheduled_retry age gauge (BLO-22094); a one-off failed scrape is logged and retried on the next scrape. Separate from queuedRunAgeMetricsRefreshFailureFor because the two refreshes query different aggregates behind different indexes and can fail independently.
+  overdueScheduledRetryAgeMetricsRefreshFailureFor: 5m
+  # -- Runbook for the overdue-scheduled-retry alert, linked from its annotation.
+  overdueScheduledRetryRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#overdue-scheduled-retry-blo-22094"
+  # -- Maximum booked interval from heartbeat_runs.created_at to scheduled_retry_at before a future-due park is considered implausible (BLO-25036). Derived from the observed seven-day population: n=5253, p50=21.5s, p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s.
+  scheduledRetryParkHorizonSeconds: 5400
+  # -- Scrape-flap tolerance only (BLO-25036); the horizon age lives in scheduledRetryParkHorizonSeconds.
+  scheduledRetryParkHorizonFor: 5m
+  # -- Alert after sustained failed refreshes of the scheduled-retry park-horizon gauge (BLO-25036).
+  scheduledRetryParkHorizonRefreshFailureFor: 5m
+  # -- Runbook for the scheduled-retry park-horizon and freshness alerts.
+  scheduledRetryParkHorizonRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#scheduled-retry-park-horizon-blo-25036"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
+  # -- How long an installed plugin may sit at status='error' before firing (BLO-21092/BLO-20410). Long enough to ride out a deploy's brief activation retries (BLO-978 makes activation timeouts retry rather than latch), short enough that a genuinely dead plugin -- a bad manifest, an expired credential in `initialize` -- pages within the hour. Unlike the wake-terminal-failed alert above, a plain `for:` is safe here: paperclip_plugin_error already carries plugin_id/plugin_key labels, so Prometheus tracks continuity per plugin series rather than summing plugins together.
+  pluginErrorFor: 10m
+  # -- Prometheus regex (matched against the plugin_key label) for plugins whose downtime pages critical rather than warning. Alternation, fully anchored by Prometheus, so a substring or suffixed key is NOT selected. Two members today. `lucitra.plugin-secrets`: BLO-20410 found the secrets subsystem dead for 9+ hours with nothing alerting. `paperclip-plugin-alertmanager` (PEN-2590): critical for a *routing* reason rather than an importance one -- warning's only route is the `paperclip` webhook catch-all, whose endpoint is gated on this very plugin's readiness, so at warning the alert reporting it broken is delivered into the receiver that is broken because it is broken (PEN-2581 measured ~96% of notifications destroyed over 4 days). critical fans out to slack-relay, which is independent of Paperclip's DB and plugins.
+  # ⚠️ HAZARD when adding a key: plugin_key is `manifest.id` verbatim (server/src/services/plugin-registry.ts does no transformation), and the two conventions in use here are BOTH correct. Externally published plugins carry a dotted namespace (`lucitra.plugin-secrets`, from @lucitra/paperclip-plugin-secrets); local workspace plugins have a bare hyphenated id (`paperclip-plugin-alertmanager`). A regex written on the assumption of one convention silently selects nothing for the other -- and a selector that matches nothing is a permanently-inert rule, not a visible failure (that is the PEN-2579 class). Escape dots; hyphens are regex-literal. Verify a new key against the manifest id, never infer it from the package name.
+  # ⚠️ This Helm value is NOT the live control surface. The cluster runs a vanilla Prometheus with no prometheus-operator, loading rules from monitoring/prometheus-configmap.yaml in Blockcast/onprem-k8s; the rendered PrometheusRule here is an inert review mirror. Editing this value alone changes nothing that pages. Both must move together.
+  pluginErrorCriticalKeyRegex: "lucitra\\.plugin-secrets|paperclip-plugin-alertmanager"
+  # -- Runbook for the plugin-error alert, linked from its annotation.
+  pluginErrorRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/plugin-error.md"
+  # -- Seconds since the plugin-status collector's last successful tick before it counts as stale (BLO-21092 review follow-up). 300s = 10x the collector's ~30s poll interval, well past what a single transient DB hiccup should cost; below this the collector is just between scrapes, not broken.
+  pluginStatusCollectorStaleSeconds: 300
+  # -- How long the staleness condition above must hold before paging. Combined with pluginStatusCollectorStaleSeconds this pages at roughly the same ~10m scale as pluginErrorFor, so a dead collector is not treated as more urgent than the plugin outages it exists to detect.
+  pluginStatusCollectorStaleFor: 5m
+  # -- Lookback window for the companion ABSENCE guard (BLO-21092 Ally review). pluginStatusCollectorStaleSeconds above can only catch a collector that is stuck while still being scraped; it is structurally unable to catch a worker that is down, crashlooping, or never started the collector at all, because `time() - <gauge>` needs the gauge to still be queryable and Prometheus drops it from instant queries at the 5m lookback -- the same instant the difference would first exceed 300s. This window must therefore exceed Prometheus's lookback-delta (5m default) so the absence is unambiguous rather than a scrape-gap artifact.
+  pluginStatusCollectorAbsentFor: 10m
   # -- Additional PrometheusRule groups appended verbatim.
   additionalGroups: []
 

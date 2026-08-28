@@ -40,6 +40,10 @@ import {
   pruneOwnStaleGitWorktree,
 } from "./git-worktree-ownership.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import {
+  buildAgentGitIdentityEnv,
+  ensureCheckoutGitIdentity,
+} from "./git-checkout-identity.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 
@@ -3392,7 +3396,10 @@ function buildWorkspaceCommandEnv(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
 }) {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...buildAgentGitIdentityEnv(input.agent),
+  };
   env.PAPERCLIP_WORKSPACE_CWD = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_PATH = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = input.worktreePath;
@@ -3608,6 +3615,47 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
+/**
+ * Stamp the running agent's git author identity onto a checkout that is about to
+ * be handed to a run, and return the warning (if any) as an array ready to merge
+ * into a `RealizedExecutionWorkspace.warnings` list (BLO-23894).
+ *
+ * This exists for the `project_primary` strategy, which does not go through
+ * `provisionExecutionWorktree`: it runs the agent directly in the base checkout
+ * (or, on the persisted path, in a recorded/rebound one). That strategy is the
+ * *default* -- `asString(rawStrategy.type, "project_primary")` -- so leaving it
+ * unstamped would leave the most common configuration exhibiting exactly the
+ * defect this change is meant to close.
+ *
+ * Never throws: `ensureCheckoutGitIdentity` reports failures as a warning, and a
+ * checkout that could not be stamped is still a usable checkout.
+ */
+async function stampCheckoutIdentity(
+  cwd: string | null | undefined,
+  agent: ExecutionWorkspaceAgentRef,
+): Promise<string[]> {
+  const identity = await ensureCheckoutGitIdentity({ cwd, agent });
+  return identity.warning ? [identity.warning] : [];
+}
+
+/**
+ * Final step of every worktree realization path: attempt the compatibility
+ * checkout stamp (BLO-23894), then run the configured provision command if
+ * there is one. Linked worktrees deliberately skip the local-config write
+ * because it would mutate the common repository; the provision command and the
+ * later adapter invocation receive the authoritative per-run GIT_* environment.
+ *
+ * Identity is applied here rather than at the four `git worktree add` call sites
+ * because this function is the one thing all of them funnel through -- the
+ * create, the attach-existing-branch fallback, the reuse-existing-worktree path,
+ * and the persisted-workspace restore. It also must not be applied at the `add`
+ * sites: their cwd is `repoRoot`, so a `git config` scoped off it would land in
+ * the wrong repository.
+ *
+ * Returns warnings rather than throwing them: a checkout that cannot be stamped
+ * is still a usable checkout, and taking the run down over it would be worse
+ * than a misattributed commit.
+ */
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3618,9 +3666,15 @@ async function provisionExecutionWorktree(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
   recorder?: WorkspaceOperationRecorder | null;
-}) {
+}): Promise<string[]> {
+  const identity = await ensureCheckoutGitIdentity({
+    cwd: input.worktreePath,
+    agent: input.agent,
+  });
+  const warnings = identity.warning ? [identity.warning] : [];
+
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
-  if (!provisionCommand) return;
+  if (!provisionCommand) return warnings;
   const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
   await recordWorkspaceCommandOperation(input.recorder, {
@@ -3647,6 +3701,7 @@ async function provisionExecutionWorktree(input: {
     },
     successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
   });
+  return warnings;
 }
 
 function buildExecutionWorkspaceCleanupEnv(input: {
@@ -3727,13 +3782,16 @@ export async function realizeExecutionWorkspace(input: {
         recorder: input.recorder ?? null,
       });
     }
+    // The default strategy runs the agent directly in the base checkout, so this
+    // is the identity seam for it — there is no worktree funnel on this path.
+    const identityWarnings = await stampCheckoutIdentity(input.base.baseCwd, input.agent);
     return {
       ...input.base,
       strategy: "project_primary",
       cwd: input.base.baseCwd,
       branchName: null,
       worktreePath: null,
-      warnings,
+      warnings: [...warnings, ...identityWarnings],
       created: false,
       baseRefSha: null,
     };
@@ -3834,7 +3892,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       recorder: input.recorder ?? null,
     });
-    await provisionExecutionWorktree({
+    const identityWarnings = await provisionExecutionWorktree({
       strategy: rawStrategy,
       base: input.base,
       repoRoot,
@@ -3858,6 +3916,7 @@ export async function realizeExecutionWorkspace(input: {
         ...baseDrift.warnings,
         ...reuseOwnershipWarnings,
         ...submoduleWarnings,
+        ...identityWarnings,
       ],
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
@@ -3988,7 +4047,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     recorder: input.recorder ?? null,
   });
-  await provisionExecutionWorktree({
+  const identityWarnings = await provisionExecutionWorktree({
     strategy: rawStrategy,
     base: input.base,
     repoRoot,
@@ -4007,7 +4066,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings],
+    warnings: [...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings, ...identityWarnings],
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -4084,6 +4143,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
               cwd: managedCwd,
               warnings: [
                 `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
+                ...(await stampCheckoutIdentity(managedCwd, input.agent)),
               ],
             };
           }
@@ -4093,7 +4153,12 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     if (!await directoryExists(cwd)) {
       return null;
     }
-    return realized;
+    // Persisted `project_primary` reuse: the recorded cwd is handed straight to
+    // the run, so this is the last chance to stamp it (BLO-23894).
+    return {
+      ...realized,
+      warnings: [...realized.warnings, ...(await stampCheckoutIdentity(cwd, input.agent))],
+    };
   }
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
@@ -4166,22 +4231,25 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     });
     realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
     realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
-    if (provisionCommand) {
-      await provisionExecutionWorktree({
-        strategy: {
-          type: "git_worktree",
-          provisionCommand,
-        },
-        base: input.base,
-        repoRoot,
-        worktreePath: realized.worktreePath ?? cwd,
-        branchName: realized.branchName ?? "",
-        issue: input.issue,
-        agent: input.agent,
-        created: false,
-        recorder: input.recorder ?? null,
-      });
-    }
+    // Unconditional, unlike the previous `if (provisionCommand)` guard: this is
+    // the reuse path for an *already existing* worktree, which is exactly the
+    // population BLO-23894 found unstamped. `provisionExecutionWorktree` is a
+    // no-op for the command itself when none is configured.
+    const identityWarnings = await provisionExecutionWorktree({
+      strategy: {
+        type: "git_worktree",
+        ...(provisionCommand ? { provisionCommand } : {}),
+      },
+      base: input.base,
+      repoRoot,
+      worktreePath: realized.worktreePath ?? cwd,
+      branchName: realized.branchName ?? "",
+      issue: input.issue,
+      agent: input.agent,
+      created: false,
+      recorder: input.recorder ?? null,
+    });
+    realized.warnings = [...realized.warnings, ...identityWarnings];
     return realized;
   }
 
@@ -4276,7 +4344,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     skipRefresh: true,
   });
 
-  await provisionExecutionWorktree({
+  const identityWarnings = await provisionExecutionWorktree({
     strategy: {
       type: "git_worktree",
       ...(provisionCommand ? { provisionCommand } : {}),
@@ -4300,6 +4368,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ...restoreRefreshWarnings,
       ...restoreOwnershipWarnings,
       ...baseDrift.warnings,
+      ...identityWarnings,
     ],
     created,
     baseRefSha:

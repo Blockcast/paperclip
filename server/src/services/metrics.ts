@@ -21,6 +21,7 @@
  */
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
+import { logger } from "../middleware/logger.js";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
@@ -37,6 +38,19 @@ export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_
 // zero while a routine is quiet means it is genuinely gated on in-flight work.
 export const ROUTINE_DISPATCH_METRIC = "paperclip_routine_dispatch_total";
 export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
+/**
+ * Project primary-workspace fallback counter (BLO-26184). Incremented once
+ * per resolution of a project that has >=1 workspace but no row flagged
+ * `isPrimary` — i.e. `pickPrimaryWorkspace` fell through to the
+ * earliest-created row instead of an explicit choice. Measured fleet exposure
+ * is 0/80 non-archived projects (see BLO-23599); this counter is the
+ * alertable signal that would have caught that drift on day one. No labels —
+ * cardinality is bounded by call volume, not by project identity (the
+ * offending `project_id` goes on the paired structured log line instead, to
+ * keep this series a plain fleet-wide total). A sustained non-zero rate means
+ * a project has drifted into the ambiguous state and should be re-flagged.
+ */
+export const PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC = "paperclip_project_primary_workspace_fallback_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -74,6 +88,34 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
+export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
+  "paperclip_heartbeat_timer_scheduler_exclusion_total";
+
+export const KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS = [
+  "idle_circuit_breaker",
+  "adapter_failed_circuit_breaker",
+  "no_in_flight_work",
+  "provider_capacity_deferred",
+  "heartbeat.scheduling_suppressed",
+  "company.inactive",
+  "heartbeat.worktree_execution_cutoff",
+  "budget.blocked",
+  "agent.not_invokable",
+  "heartbeat.disabled",
+  "heartbeat.cooldown.active",
+  "heartbeat.timer.no_actionable_work",
+  "issue_tree_hold_active",
+] as const;
+export const UNKNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSION = "other";
+const knownHeartbeatTimerSchedulerExclusionSet: ReadonlySet<string> = new Set(
+  KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS,
+);
+
+export function normalizeHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
+  return typeof reason === "string" && knownHeartbeatTimerSchedulerExclusionSet.has(reason)
+    ? reason
+    : UNKNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSION;
+}
 export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
@@ -86,35 +128,50 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // CONCURRENT_RUN_BLOCKED_METRIC) so `max(...) by (agent_id) > threshold`
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
+export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
 /**
- * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
- * (which count every unreleased reservation, healthy in-flight ones
- * included), these two count only the backlog left AFTER each reconciliation
- * pass — reservations still in `release_pending` (or an orphaned prelaunch
- * state) whose Job was confirmed gone/terminal but the row didn't clear, and
- * the oldest such row's age. In steady state both are 0: the periodic
- * reconciler (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`,
- * every `heartbeatSchedulerIntervalMs`) and cancellation's own inline release
- * should always be able to clear a confirmed-terminal reservation. A
- * sustained non-zero count means reconciliation itself is failing (e.g. the
- * scheduler is down, as it was during the incident, or the kube API is
- * unreachable) and slots are leaking toward executor capacity exhaustion.
- * Alert threshold: any non-zero value sustained >10 min warrants operator
- * attention; page if oldest age exceeds a few multiples of the scheduler
- * interval.
+ * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
+ * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
+ * correct and stays (Ally review, onprem-k8s#2013: without it, a retry
+ * promoted after hours of backoff would instantly report that whole backoff
+ * as queued-dispatch wait). But the consequence is that a retry which is
+ * parked and never promoted is invisible to any gauge, forever. This metric
+ * covers exactly that gap: for `status='scheduled_retry'` rows whose
+ * `scheduled_retry_at` is already in the past (i.e. due and not yet
+ * promoted), the age of the oldest such row past its due time, per agent. A
+ * row that is merely backing off (`scheduled_retry_at` still in the future)
+ * contributes nothing -- this is an overdue-since-due-time clock, not a
+ * parked-since-creation one. Labeled by bounded agent_id, same allow-list
+ * guardrail as {@link QUEUED_RUN_OLDEST_AGE_METRIC}.
  */
-export const EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC = "paperclip_external_runtime_reservations_release_pending";
-export const EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_release_pending_oldest_age_seconds";
+export const OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC = "paperclip_overdue_scheduled_retry_oldest_age_seconds";
 /**
- * BLO-21460. Ephemeral environment leases (`environment_leases.status =
- * 'active'`) whose heartbeat run has already reached a terminal status —
- * i.e. leases cancellation or normal finalization should have released but
- * didn't. Same alerting posture as the release-pending reservation pair
- * above: 0 in steady state, any sustained non-zero count is a leak heading
- * toward environment/executor capacity exhaustion.
+ * Freshness companion for {@link OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC}
+ * (BLO-22094, Ally review on #1184). Exactly the role
+ * {@link QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} plays for the sibling
+ * gauge, and it is load-bearing for the same reason -- more so here, in fact.
+ *
+ * The age gauge is reset-then-set only on the refresh success path, so a
+ * throw leaves the previous per-agent values frozen in the registry while
+ * `/metrics` keeps returning 200. The frozen value is almost always `0`, the
+ * *healthy* reading, which means a dead refresh is indistinguishable from a
+ * healthy fleet on both the dashboard and the alert. That is precisely the
+ * invisible-failure class this whole metric exists to eliminate, so shipping
+ * the detector without its own freshness gate would make the fix for an
+ * unobservable failure itself unobservable.
+ *
+ * A separate gauge from the sibling's rather than a shared one: the two
+ * refreshes run different aggregates against different indexes (0217 for
+ * `status='queued'`, 0224 for the overdue-parked predicate), so a statement
+ * timeout or plan regression can hit one and not the other. Sharing a
+ * freshness signal would let a healthy sibling refresh vouch for a dead one.
  */
-export const ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC = "paperclip_environment_leases_orphaned_active";
-export const ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC = "paperclip_environment_leases_orphaned_oldest_age_seconds";
+export const OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_overdue_scheduled_retry_age_metrics_refresh_success";
+export const SCHEDULED_RETRY_PARK_HORIZON_METRIC =
+  "paperclip_scheduled_retry_park_horizon_seconds";
+export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
+  "paperclip_scheduled_retry_park_horizon_refresh_success";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -365,6 +422,59 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC =
  */
 export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
   "paperclip_agent_wakeup_terminal_failed_oldest_age_seconds";
+
+/**
+ * Restart-safe gauge: 1 while an installed plugin sits in `status = 'error'`,
+ * 0 otherwise (BLO-21092/BLO-20410). One sample per installed plugin, not per
+ * status — the label set is only the plugin's stable identity (`plugin_id`,
+ * `plugin_key`); the error/not-error distinction lives in the gauge value.
+ * Using `status` itself as a label would leave a stale `status="ready"`
+ * series behind the instant a plugin flips to `error` (prom-client never
+ * retires an old label combination on its own), so a query like
+ * `count(paperclip_plugin_status)` would grow every time a plugin's status
+ * ever changed instead of staying pinned at the installed-plugin count.
+ *
+ * Deliberately narrower than the full `PLUGIN_STATUSES` enum: a plugin the
+ * operator disabled is a different signal from one that crashed, and
+ * collapsing them would page on `disabled` maintenance. Re-derived on every
+ * collector tick from the `plugins` table (the worker tier only —
+ * `app.ts` gates plugin lifecycle to `paperclipNodeRole !== "api"`), so a
+ * pod restart republishes the current state instead of starting from a
+ * stale 0. This is the exact gap BLO-20410 exposed: `lucitra.plugin-secrets`
+ * sat in `status='error'` for 9+ hours with the pod `1/1 Running` and
+ * nothing watching the DB row.
+ */
+export const PLUGIN_ERROR_METRIC = "paperclip_plugin_error";
+
+/**
+ * Unix timestamp (seconds) of the plugin-status collector's last successful
+ * tick (BLO-21092 review follow-up). Set ONLY on success, never on failure —
+ * a `listInstalled()` rejection (first tick or any later one) leaves this
+ * value where it was, so `time() - this` grows monotonically while the
+ * collector is stuck and {@link PLUGIN_ERROR_METRIC} silently keeps serving
+ * a stale (or, on a first-tick failure, entirely absent) snapshot. Alerting
+ * on staleness here catches exactly the case a plain `paperclip_plugin_error
+ * == 1` rule cannot: the collector itself is dead, so no plugin is reporting
+ * anything, healthy or not.
+ *
+ * Labeled by a constant `role="worker"` even though the value never varies —
+ * NOT for cardinality, but because prom-client auto-publishes a bare
+ * (zero-label) Gauge at value 0 the moment it is constructed, with no `.set()`
+ * call required (confirmed against prom-client 15.1.3). `ensureRegistry` runs
+ * on every tier, including the API tier, which never starts the collector
+ * (`app.ts` gates it to `paperclipNodeRole !== "api"`), so a bare Gauge here
+ * would auto-publish frozen at 0 on every API pod forever -- and since
+ * production scrapes both the `paperclip` and `paperclip-workers` Services,
+ * `time() - 0 > threshold` would be permanently true on the API target
+ * regardless of worker health. A *labeled* Gauge with no `.set()` call
+ * renders no series at all (also confirmed against prom-client 15.1.3), so
+ * this only ever appears once {@link startPluginStatusCollector} sets it --
+ * which happens only on the tier that can ever make it fresh again. An
+ * API-tier scrape of this series is simply absent, and `time() - <absent>`
+ * correctly never evaluates.
+ */
+export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
+  "paperclip_plugin_status_collector_last_success_timestamp_seconds";
 
 /**
  * Bounded `error_code` allow-list for
@@ -934,6 +1044,44 @@ export function normalizeProcessLossClassification(classification: string | null
     : UNKNOWN_PROCESS_LOSS_CLASSIFICATION;
 }
 
+/**
+ * Outcome-side per-agent liveness gauges (BLO-23413).
+ *
+ * Every alert on this fleet prior to these watched a CAUSE (a K8s Job or pod
+ * failing). None watched the OUTCOME: an agent that has simply stopped
+ * executing. A cause-side alert clears the moment the Job is reaped, so an
+ * agent that dies after its Job/pod signal disappears stays dark with
+ * nothing firing (see the BLO-23413 incident: 12.5h undetected). These three
+ * gauges make that outcome directly observable and alertable without reading
+ * the agent's DB record.
+ *
+ * `agent_id` cardinality here is bounded by the real `agents` table roster
+ * (the publisher iterates committed rows itself), not by caller-supplied
+ * input, so it does not need the normalize-to-"unknown" guard the
+ * request-driven counters above use.
+ */
+export const AGENT_HEARTBEAT_AGE_SECONDS_METRIC = "paperclip_agent_heartbeat_age_seconds";
+/**
+ * The agent's own configured `heartbeat.intervalSec`, republished as a gauge
+ * so an alert can threshold the age metric as a MULTIPLE of each agent's own
+ * interval (`age > N * interval`) with a single PromQL `on(agent_id)` join,
+ * rather than hard-coding one fleet-wide threshold that is wrong for every
+ * agent not running the modal interval.
+ */
+export const AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC = "paperclip_agent_heartbeat_interval_seconds";
+/**
+ * Seconds the agent has continuously held `status = 'error'`, 0 otherwise.
+ * `error` is not a scheduling gate (it is assignable/invokable, see
+ * agent-eligibility.ts) so this is diagnostic time-in-state, not an outage
+ * signal by itself -- it exists to answer "how long has this been true"
+ * fleet-wide from Prometheus rather than by reading each agent record.
+ * `agents` has no dedicated `status`-transition timestamp, so this uses
+ * `updatedAt` as the best-available proxy for when `error` was entered; any
+ * other write to the row while still in `error` would reset the apparent
+ * start, making this a slight underestimate, never an overestimate.
+ */
+export const AGENT_ERROR_DURATION_SECONDS_METRIC = "paperclip_agent_status_error_duration_seconds";
+
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
@@ -947,14 +1095,12 @@ type HeartbeatRunFailedLabel =
 
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
-let externalRuntimeReservationsReleasePending: Gauge | null = null;
-let externalRuntimeReservationReleasePendingOldestAge: Gauge | null = null;
-let environmentLeasesOrphanedActive: Gauge | null = null;
-let environmentLeasesOrphanedOldestAge: Gauge | null = null;
+let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -968,7 +1114,17 @@ let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = 
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
+let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
+let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
+let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
+let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
+let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
+let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
+let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
+let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
+let agentErrorDuration: Gauge<"agent_id"> | null = null;
+let projectPrimaryWorkspaceFallback: Counter | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -976,14 +1132,11 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
-  externalRuntimeReservationsReleasePendingGauge: Gauge;
-  externalRuntimeReservationReleasePendingOldestAgeGauge: Gauge;
-  environmentLeasesOrphanedActiveGauge: Gauge;
-  environmentLeasesOrphanedOldestAgeGauge: Gauge;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
@@ -997,7 +1150,18 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
+  queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
+  overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
+  overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
+  scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
+  scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
+  pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
+  pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   authRequestCounter: Counter<"operation" | "outcome">;
+  agentHeartbeatAgeGauge: Gauge<"agent_id">;
+  agentHeartbeatIntervalGauge: Gauge<"agent_id">;
+  agentErrorDurationGauge: Gauge<"agent_id">;
+  projectPrimaryWorkspaceFallbackCounter: Counter;
 } {
   if (
     !registry
@@ -1005,14 +1169,12 @@ function ensureRegistry(): {
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
+    || !heartbeatTimerSchedulerExclusion
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
-    || !externalRuntimeReservationsReleasePending
-    || !externalRuntimeReservationReleasePendingOldestAge
-    || !environmentLeasesOrphanedActive
-    || !environmentLeasesOrphanedOldestAge
+    || !queuedRunAgeMetricsRefreshSuccess
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -1026,7 +1188,17 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
     || !queuedRunOldestAge
+    || !overdueScheduledRetryOldestAge
+    || !overdueScheduledRetryAgeMetricsRefreshSuccess
+    || !scheduledRetryParkHorizon
+    || !scheduledRetryParkHorizonRefreshSuccess
+    || !pluginError
+    || !pluginStatusCollectorLastSuccess
     || !authRequest
+    || !agentHeartbeatAge
+    || !agentHeartbeatInterval
+    || !agentErrorDuration
+    || !projectPrimaryWorkspaceFallback
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1071,6 +1243,15 @@ function ensureRegistry(): {
       labelNames: ["adapter", "provider"],
       registers: [registry],
     });
+    heartbeatTimerSchedulerExclusion = new Counter({
+      name: HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC,
+      help:
+        "Count of due heartbeat timer ticks excluded before dispatch, labeled by a bounded "
+        + "operational reason. Each increment has durable evidence in agent_wakeup_requests "
+        + "or a scheduled_retry heartbeat run.",
+      labelNames: ["reason"],
+      registers: [registry],
+    });
     agentZeroTokenCompletedRunStreak = new Gauge({
       name: AGENT_NO_USAGE_STREAK_METRIC,
       help:
@@ -1095,32 +1276,26 @@ function ensureRegistry(): {
       help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
       registers: [registry],
     });
-    externalRuntimeReservationsReleasePending = new Gauge({
-      name: EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC,
+    queuedRunAgeMetricsRefreshSuccess = new Gauge({
+      name: QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
       help:
-        "Reservations confirmed releasable (Job gone/terminal) that reconciliation still had "
-        + "not cleared as of the last pass. 0 in steady state; sustained non-zero means "
-        + "reconciliation itself is failing (BLO-21460).",
+        "1 when the most recent queued-run-age database refresh completed before metrics exposition; "
+        + "0 when it failed, so stale queued-run ages cannot be read as fresh.",
       registers: [registry],
     });
-    externalRuntimeReservationReleasePendingOldestAge = new Gauge({
-      name: EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC,
-      help: "Age in seconds of the oldest reservation counted by " + EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC + ".",
+    queuedRunAgeMetricsRefreshSuccess.set(0);
+    scheduledRetryParkHorizon = new Gauge({
+      name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
+      help: "Booked scheduled_retry park horizon in seconds, by agent.",
+      labelNames: ["agent_id"],
       registers: [registry],
     });
-    environmentLeasesOrphanedActive = new Gauge({
-      name: ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC,
-      help:
-        "Ephemeral environment leases still 'active' whose heartbeat run is already terminal. "
-        + "0 in steady state; sustained non-zero means lease release did not run for that run "
-        + "(BLO-21460).",
+    scheduledRetryParkHorizonRefreshSuccess = new Gauge({
+      name: SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC,
+      help: "1 when the scheduled_retry park horizon database refresh succeeded, otherwise 0.",
       registers: [registry],
     });
-    environmentLeasesOrphanedOldestAge = new Gauge({
-      name: ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC,
-      help: "Age in seconds of the oldest lease counted by " + ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC + ".",
-      registers: [registry],
-    });
+    scheduledRetryParkHorizonRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -1347,13 +1522,75 @@ function ensureRegistry(): {
       name: QUEUED_RUN_OLDEST_AGE_METRIC,
       help:
         "Age in seconds of the oldest `queued` heartbeat run for an agent (BLO-21116). "
-        + "Refreshed on scrape from a live MIN(created_at) aggregate, not a Prometheus "
+        + "Refreshed on scrape from a live MIN(coalesce(queued_at, created_at)) aggregate, not a Prometheus "
         + "`for:` clause -- same reasoning as " + AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC
         + ": `for:` measures how long the alert expression has been true, not the age of "
         + "any one row. Reset-then-set every refresh (see setQueuedRunOldestAgeMetrics) so an "
         + "agent whose queue drains to empty reads back an explicit 0 rather than a frozen "
         + "stale value or an absent series. Labeled by bounded agent_id.",
       labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    overdueScheduledRetryOldestAge = new Gauge({
+      name: OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds past due time of the oldest overdue `scheduled_retry` heartbeat "
+        + "run for an agent (BLO-22094). `status='queued'` age is covered by "
+        + QUEUED_RUN_OLDEST_AGE_METRIC + "; that gauge deliberately excludes "
+        + "`scheduled_retry` rows (Ally review, onprem-k8s#2013), so a retry that is "
+        + "parked and never promoted was invisible to any gauge. This one closes that "
+        + "gap: refreshed on scrape from a live MIN(scheduled_retry_at) aggregate over "
+        + "rows where status='scheduled_retry' AND scheduled_retry_at < now(), so a run "
+        + "still backing off (due time in the future) contributes nothing. Reset-then-set "
+        + "every refresh (see setOverdueScheduledRetryAgeMetrics) so an agent with no "
+        + "overdue parked run reads back an explicit 0. Labeled by bounded agent_id.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    overdueScheduledRetryAgeMetricsRefreshSuccess = new Gauge({
+      name: OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent overdue-scheduled_retry-age database refresh completed "
+        + "before metrics exposition; 0 when it failed, so stale overdue-parked ages "
+        + "cannot be read as fresh. Separate from "
+        + QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC
+        + " because the two refreshes run different aggregates against different indexes "
+        + "and can fail independently.",
+      registers: [registry],
+    });
+    overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
+    pluginError = new Gauge({
+      name: PLUGIN_ERROR_METRIC,
+      help:
+        "1 while an installed plugin sits in status='error', 0 otherwise "
+        + "(BLO-21092). Labeled by plugin_id and plugin_key only -- status is "
+        + "deliberately NOT a label, so a plugin flipping status rewrites this "
+        + "series' value instead of orphaning an old status=X series that "
+        + "prom-client would never retire on its own. Re-derived from the "
+        + "plugins table on every worker-tier collector tick; 'disabled' is "
+        + "distinct from 'error' and never sets this to 1, so an operator-"
+        + "disabled plugin does not page.",
+      labelNames: ["plugin_id", "plugin_key"],
+      registers: [registry],
+    });
+    pluginStatusCollectorLastSuccess = new Gauge({
+      name: PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
+      help:
+        "Unix timestamp (seconds) of the plugin-status collector's last "
+        + "successful tick (BLO-21092). Set ONLY on success; a listInstalled() "
+        + "rejection -- first tick or any later one -- leaves this unchanged, so "
+        + PLUGIN_ERROR_METRIC + " can keep serving a stale or (on a first-tick "
+        + "failure) entirely absent snapshot while looking otherwise healthy. "
+        + "Labeled by a constant role=\"worker\" -- not for cardinality, but "
+        + "because a bare (zero-label) Gauge auto-publishes at value 0 the "
+        + "moment ensureRegistry constructs it, with no .set() call required, "
+        + "which would freeze this series at 0 forever on the API tier (which "
+        + "never starts the collector) and permanently false-fire a "
+        + "(time() - this) alert there. A labeled Gauge renders no series "
+        + "until first .set(), which startPluginStatusCollector does once, "
+        + "itself, immediately before its first tick -- so the series exists "
+        + "(and reads maximally stale) only on the tier that can refresh it.",
+      labelNames: ["role"],
       registers: [registry],
     });
     authRequest = new Counter({
@@ -1369,6 +1606,52 @@ function ensureRegistry(): {
         authRequest.inc({ operation, outcome }, 0);
       }
     }
+    agentHeartbeatAge = new Gauge({
+      name: AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
+      help:
+        "Seconds since the agent's lastHeartbeatAt, labeled by agent_id, published only for "
+        + "agents with heartbeat.enabled=true (BLO-23413). Outcome-side: unlike every prior "
+        + "agent alert, this does not depend on any K8s Job/pod signal surviving, so it stays "
+        + "correct even after the Job that last ran the agent has been reaped. Read alongside "
+        + AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC
+        + " to threshold as a multiple of the agent's OWN configured interval rather than one "
+        + "fleet-wide constant.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentHeartbeatInterval = new Gauge({
+      name: AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
+      help:
+        "The agent's own configured heartbeat.intervalSec, republished as a gauge so "
+        + AGENT_HEARTBEAT_AGE_SECONDS_METRIC
+        + " can be thresholded per-agent via `on(agent_id)` join instead of one fleet-wide "
+        + "constant that is wrong for every agent not on the modal interval (BLO-23413).",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentErrorDuration = new Gauge({
+      name: AGENT_ERROR_DURATION_SECONDS_METRIC,
+      help:
+        "Seconds the agent has continuously held status='error', 0 otherwise, labeled by "
+        + "agent_id, for every agent in the fleet (BLO-23413). 'error' is not a scheduling "
+        + "gate -- it is assignable and invokable -- so this is diagnostic time-in-state, not "
+        + "an outage signal on its own. Uses updatedAt as the best-available proxy for when "
+        + "error was entered (agents has no dedicated status-transition timestamp), so a "
+        + "concurrent unrelated write to the row understates rather than overstates the age.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    projectPrimaryWorkspaceFallback = new Counter({
+      name: PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC,
+      help:
+        "Count of project primary-workspace resolutions that fell through to the "
+        + "earliest-created workspace because no row was flagged isPrimary (BLO-26184). "
+        + "Measured fleet exposure is 0/80 non-archived projects; a sustained non-zero "
+        + "rate means a project has drifted into the ambiguous state. The offending "
+        + "project_id is on the paired structured log line, not this series' labels.",
+      registers: [registry],
+    });
+    projectPrimaryWorkspaceFallback.inc(0);
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -1379,14 +1662,12 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
-    externalRuntimeReservationsReleasePendingGauge: externalRuntimeReservationsReleasePending,
-    externalRuntimeReservationReleasePendingOldestAgeGauge: externalRuntimeReservationReleasePendingOldestAge,
-    environmentLeasesOrphanedActiveGauge: environmentLeasesOrphanedActive,
-    environmentLeasesOrphanedOldestAgeGauge: environmentLeasesOrphanedOldestAge,
+    queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -1400,7 +1681,17 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
+    overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
+    overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
+    scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
+    scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
+    pluginErrorGauge: pluginError,
+    pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     authRequestCounter: authRequest,
+    agentHeartbeatAgeGauge: agentHeartbeatAge,
+    agentHeartbeatIntervalGauge: agentHeartbeatInterval,
+    agentErrorDurationGauge: agentErrorDuration,
+    projectPrimaryWorkspaceFallbackCounter: projectPrimaryWorkspaceFallback,
   };
 }
 
@@ -1533,6 +1824,12 @@ export function recordCcrotateCapacityDeferred(
   return labels;
 }
 
+export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
+  const normalized = normalizeHeartbeatTimerSchedulerExclusion(reason);
+  ensureRegistry().heartbeatTimerSchedulerExclusionCounter.inc({ reason: normalized });
+  return normalized;
+}
+
 export interface RecordAgentZeroTokenCompletedRunStreakInput {
   /** Agent id is bounded against the active company roster before emission. */
   agentId: string | null | undefined;
@@ -1544,6 +1841,27 @@ export interface RecordAgentZeroTokenCompletedRunStreakInput {
   knownAgentIds: ReadonlySet<string>;
 }
 
+/**
+ * Last `adapter` label written per `agent_id` for
+ * {@link AGENT_NO_USAGE_STREAK_METRIC} (BLO-21415).
+ *
+ * This gauge is written per-agent from that agent's own heartbeat finalization,
+ * so there is no fleet-wide snapshot pass that could reset-then-set it the way
+ * {@link setQueuedRunOldestAgeMetrics} does. That makes `adapter` a latching
+ * label: `Gauge.set()` mints one child per (agent_id, adapter) pair and never
+ * retires one, so an agent moved between adapters keeps exporting its OLD
+ * adapter's child frozen at whatever value it last held. Frozen at or above the
+ * alert threshold, that orphan fires `PaperclipAgentZeroTokenRunStreak` forever
+ * while the agent's live series reads healthy -- and because the streak
+ * saturates at the `listRecentTerminalRunsForZeroTokenStreak` LIMIT, the orphan
+ * is pinned at exactly the value a maximally-wedged agent reports, so the alert
+ * cannot be told apart from a real incident by its value either.
+ *
+ * Bounded by the same roster that bounds the label itself: at most one entry per
+ * active agent id plus {@link UNKNOWN_AGENT_ID}.
+ */
+const zeroTokenStreakAdapterByAgentId = new Map<string, string>();
+
 export function recordAgentZeroTokenCompletedRunStreak(
   input: RecordAgentZeroTokenCompletedRunStreakInput,
 ): { agent_id: string; adapter: string; streak: number } {
@@ -1552,7 +1870,15 @@ export function recordAgentZeroTokenCompletedRunStreak(
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
   };
   const streak = Number.isFinite(input.streak) ? Math.max(0, Math.floor(input.streak)) : 0;
-  ensureRegistry().zeroTokenCompletedRunStreakGauge.set(labels, streak);
+  const gauge = ensureRegistry().zeroTokenCompletedRunStreakGauge;
+  // Retire the previous adapter's child before minting the new one, so an agent
+  // that changed adapterType stops exporting a frozen series under the old label.
+  const previousAdapter = zeroTokenStreakAdapterByAgentId.get(labels.agent_id);
+  if (previousAdapter !== undefined && previousAdapter !== labels.adapter) {
+    gauge.remove({ agent_id: labels.agent_id, adapter: previousAdapter });
+  }
+  zeroTokenStreakAdapterByAgentId.set(labels.agent_id, labels.adapter);
+  gauge.set(labels, streak);
   return { ...labels, streak };
 }
 
@@ -1574,28 +1900,56 @@ export function setExternalRuntimeReservationMetrics(input: {
 }
 
 /**
- * BLO-21460. Set from the residual backlog measured AFTER each reconciliation
- * pass (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`),
- * not the pre-pass candidate count — see the metric's doc comment for why 0 is
- * the only healthy steady-state value.
+ * Publish the oldest queued-run age per known agent. Reset-then-set is
+ * deliberate: an agent whose queue drains must read 0 rather than retaining a
+ * stale age that would keep the stranded-run alert open forever.
  */
-export function setReleasePendingExternalRuntimeReservationMetrics(input: {
-  count: number;
-  oldestAgeSeconds: number;
-}): void {
-  const metrics = ensureRegistry();
-  metrics.externalRuntimeReservationsReleasePendingGauge.set(Math.max(0, input.count));
-  metrics.externalRuntimeReservationReleasePendingOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+export function setQueuedRunOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().queuedRunOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
 }
 
-/** BLO-21460. Same residual-after-reconciliation convention as above, for leases. */
-export function setOrphanedEnvironmentLeaseMetrics(input: {
-  active: number;
-  oldestAgeSeconds: number;
-}): void {
-  const metrics = ensureRegistry();
-  metrics.environmentLeasesOrphanedActiveGauge.set(Math.max(0, input.active));
-  metrics.environmentLeasesOrphanedOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+/** Mark whether the queued-run age gauge was refreshed from the database. */
+export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/** Publish the maximum booked park horizon for each live scheduled retry. */
+export function setScheduledRetryParkHorizonMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; horizonSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().scheduledRetryParkHorizonGauge;
+  gauge.reset();
+  const maxByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
+    const current = maxByAgentId.get(agentId);
+    if (current === undefined || horizonSeconds > current) maxByAgentId.set(agentId, horizonSeconds);
+  }
+  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, maxByAgentId.get(agentId) ?? 0);
+  const unknownHorizon = maxByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownHorizon !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownHorizon);
+}
+
+export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
+  ensureRegistry().scheduledRetryParkHorizonRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -1862,19 +2216,18 @@ export function recordGithubWorkflowRunConclusion(
 }
 
 /**
- * Snapshot the oldest-`queued`-run age per agent (BLO-21116). Reset-then-set,
- * same reasoning as {@link setExternalLifecycleRunningRuns}: an agent absent
- * from `entries` must read back an explicit 0, not a frozen stale value from
- * before its queue drained -- that explicit 0 is what lets an alert on this
- * series resolve. `knownAgentIds` bounds the label the same way
- * {@link recordConcurrentRunBlocked} does; an id outside that set collapses to
- * `UNKNOWN_AGENT_ID` instead of minting an unbounded series.
+ * Snapshot the oldest-overdue-`scheduled_retry`-row age per agent (BLO-22094).
+ * Same reset-then-set contract as {@link setQueuedRunOldestAgeMetrics}: an
+ * agent absent from `entries` must read back an explicit 0, not a frozen
+ * stale value or an absent series -- that explicit 0 is what lets an alert on
+ * this series resolve once the last overdue parked row is promoted or the
+ * agent has none. `knownAgentIds` bounds the label the same way.
  */
-export function setQueuedRunOldestAgeMetrics(
+export function setOverdueScheduledRetryAgeMetrics(
   entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
   knownAgentIds: ReadonlySet<string>,
 ): void {
-  const gauge = ensureRegistry().queuedRunOldestAgeGauge;
+  const gauge = ensureRegistry().overdueScheduledRetryOldestAgeGauge;
   gauge.reset();
   const oldestByAgentId = new Map<string, number>();
   for (const entry of entries) {
@@ -1890,6 +2243,53 @@ export function setQueuedRunOldestAgeMetrics(
   if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
 }
 
+/**
+ * Mark whether the overdue-scheduled_retry age gauge was refreshed from the
+ * database (BLO-22094). Deliberately separate from
+ * {@link setQueuedRunAgeMetricsRefreshSuccess}: the two refreshes hit
+ * different aggregates behind different indexes, so a healthy sibling refresh
+ * must never vouch for a dead one.
+ */
+export function setOverdueScheduledRetryAgeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().overdueScheduledRetryAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+export interface PluginErrorStatusEntry {
+  /** `plugins.id` (uuid) — the stable DB identity. */
+  id: string;
+  /** `plugins.plugin_key` (e.g. `lucitra.plugin-secrets`) — the alert-routing label. */
+  pluginKey: string;
+  /** True when this row's `status` is `error`. */
+  isError: boolean;
+}
+
+/**
+ * Publish the current plugin error/ready split (BLO-21092). Reset-then-set
+ * with the full currently-installed roster on every collector tick: a
+ * plugin that gets uninstalled drops out of the series entirely instead of
+ * alerting forever on a row that no longer exists, and a plugin that
+ * recovers from `error` writes an explicit 0 -- the value the alert rule
+ * needs to see in order to resolve.
+ */
+export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEntry>): void {
+  const gauge = ensureRegistry().pluginErrorGauge;
+  gauge.reset();
+  for (const entry of entries) {
+    gauge.set({ plugin_id: entry.id, plugin_key: entry.pluginKey }, entry.isError ? 1 : 0);
+  }
+}
+
+/**
+ * Record a successful plugin-status collector tick (BLO-21092 review
+ * follow-up). Callers pass unix seconds, not milliseconds -- the collector
+ * owns the clock so this stays a pure setter and unit-tests deterministically.
+ * The `role="worker"` label is constant (see {@link PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC})
+ * -- this is the only caller, and it only ever runs on the worker tier.
+ */
+export function setPluginStatusCollectorLastSuccessSeconds(unixSeconds: number): void {
+  ensureRegistry().pluginStatusCollectorLastSuccessGauge.set({ role: "worker" }, unixSeconds);
+}
+
 export function recordAuthRequest(input: {
   operation: string | null | undefined;
   outcome: string | null | undefined;
@@ -1900,6 +2300,85 @@ export function recordAuthRequest(input: {
   };
   ensureRegistry().authRequestCounter.inc(labels);
   return labels;
+}
+
+/**
+ * Publish the fleet-wide agent-liveness gauges (BLO-23413). Called once per
+ * heartbeat-scheduler tick with a full snapshot of the current agent roster,
+ * so this is a rewrite of durable state rather than a delta -- same
+ * reset-then-set contract as {@link setExternalLifecycleRunningRuns} and the
+ * wake-terminal-failed gauges: an agent that is deleted, or whose heartbeat
+ * gets disabled, or that leaves `error`, drops (or zeros) out of the gauge on
+ * the very next publish rather than freezing at its last-known value forever.
+ *
+ * `heartbeatAgeSeconds`/`heartbeatIntervalSeconds` are only set for entries
+ * with `heartbeatEnabled: true` AND `heartbeatExpected: true` -- an agent that
+ * is expected to be dark must not publish an ever-growing age, because that
+ * age never comes back down and so the consuming alert never clears.
+ *
+ * The two flags are deliberately separate facts, not one:
+ *  - `heartbeatEnabled` is the agent's own `heartbeat.enabled` CONFIG.
+ *  - `heartbeatExpected` is whether the scheduler would ever actually wake it
+ *    (BLO-28861). `heartbeat.enabled` is NOT cleared on termination, so config
+ *    alone says nothing about liveness: a terminated agent keeps
+ *    `enabled: true` forever and its age grows without bound.
+ *
+ * `errorDurationSeconds` is published for EVERY entry regardless of either
+ * flag -- it is a status observation, not a liveness claim, and BLO-28861
+ * explicitly preserves its existing series set.
+ */
+export function setAgentLivenessMetrics(
+  entries: ReadonlyArray<{
+    agentId: string;
+    heartbeatEnabled: boolean;
+    /**
+     * Whether this agent is one the heartbeat scheduler would actually wake.
+     * Required rather than optional-defaulting-true so a future caller cannot
+     * silently reintroduce BLO-28861 by forgetting to pass it.
+     */
+    heartbeatExpected: boolean;
+    heartbeatAgeSeconds: number | null;
+    heartbeatIntervalSeconds: number | null;
+    errorDurationSeconds: number;
+  }>,
+): void {
+  const metrics = ensureRegistry();
+  metrics.agentHeartbeatAgeGauge.reset();
+  metrics.agentHeartbeatIntervalGauge.reset();
+  metrics.agentErrorDurationGauge.reset();
+  for (const entry of entries) {
+    if (typeof entry.agentId !== "string" || entry.agentId.length === 0) continue;
+    if (entry.heartbeatEnabled && entry.heartbeatExpected) {
+      if (Number.isFinite(entry.heartbeatAgeSeconds)) {
+        metrics.agentHeartbeatAgeGauge.set({ agent_id: entry.agentId }, Math.max(0, entry.heartbeatAgeSeconds as number));
+      }
+      if (Number.isFinite(entry.heartbeatIntervalSeconds)) {
+        metrics.agentHeartbeatIntervalGauge.set(
+          { agent_id: entry.agentId },
+          Math.max(0, entry.heartbeatIntervalSeconds as number),
+        );
+      }
+    }
+    metrics.agentErrorDurationGauge.set(
+      { agent_id: entry.agentId },
+      Number.isFinite(entry.errorDurationSeconds) ? Math.max(0, entry.errorDurationSeconds) : 0,
+    );
+  }
+}
+
+/**
+ * Record a project primary-workspace resolution that fell through to the
+ * earliest-created row (BLO-26184). Callers should invoke this only when the
+ * project has >=1 workspace and none is flagged `isPrimary` — never for a
+ * 0-workspace project (that resolves `null`, not a fallback guess) or a
+ * project with an explicit primary.
+ */
+export function recordProjectPrimaryWorkspaceFallback(projectId: string): void {
+  ensureRegistry().projectPrimaryWorkspaceFallbackCounter.inc();
+  logger.warn(
+    { projectId },
+    "project primary-workspace resolved via earliest-created fallback (no row flagged isPrimary)",
+  );
 }
 
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
@@ -1922,7 +2401,7 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
   ].join("\n");
   const routineDispatchSnapshot = snapshotRoutineDispatchMetrics();
   const routineDispatchBody = [
-    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park.`,
+    `# HELP ${ROUTINE_DISPATCH_METRIC} Count of routine dispatch gating outcomes, labeled by outcome. routine_dispatch_bypassed_parked_execution_issue = a fire proceeded past an execution issue parked on a long-horizon scheduled_retry rather than being silently skipped for the whole park. routine_dispatch_bypassed_stale_execution_issue = a fire proceeded past an execution issue whose run was left queued or running past the run-age horizon.`,
     `# TYPE ${ROUTINE_DISPATCH_METRIC} counter`,
     ...Object.entries(routineDispatchSnapshot).map(
       ([outcome, value]) => `${ROUTINE_DISPATCH_METRIC}{outcome="${outcome}"} ${value}`,
@@ -1941,14 +2420,13 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
+  heartbeatTimerSchedulerExclusion = null;
   agentZeroTokenCompletedRunStreak = null;
+  zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
-  externalRuntimeReservationsReleasePending = null;
-  externalRuntimeReservationReleasePendingOldestAge = null;
-  environmentLeasesOrphanedActive = null;
-  environmentLeasesOrphanedOldestAge = null;
+  queuedRunAgeMetricsRefreshSuccess = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -1962,7 +2440,17 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
   queuedRunOldestAge = null;
+  overdueScheduledRetryOldestAge = null;
+  overdueScheduledRetryAgeMetricsRefreshSuccess = null;
+  scheduledRetryParkHorizon = null;
+  scheduledRetryParkHorizonRefreshSuccess = null;
+  pluginError = null;
+  pluginStatusCollectorLastSuccess = null;
   authRequest = null;
+  agentHeartbeatAge = null;
+  agentHeartbeatInterval = null;
+  agentErrorDuration = null;
+  projectPrimaryWorkspaceFallback = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();

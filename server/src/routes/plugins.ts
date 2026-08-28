@@ -235,6 +235,51 @@ const UUID_REGEX =
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
 const PLUGIN_ACTION_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
 const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
+/**
+ * `Retry-After` advertised when webhook ingestion rejects a delivery because the
+ * plugin is not ready. Long enough that a stuck plugin is not hot-looped by its
+ * senders, short enough that a normal restart re-delivers promptly.
+ */
+const WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS = 30;
+/**
+ * Non-`ready` plugin statuses webhook ingestion answers as *terminal* (410).
+ * Everything else that is not `ready` is treated as recoverable and answers
+ * 503 + `Retry-After`.
+ *
+ * This is a denylist on purpose, and the direction matters more than the
+ * contents. `plugins.status` is `text().$type<PluginStatus>()`
+ * (`packages/db/src/schema/plugins.ts`) — a compile-time brand over an
+ * unconstrained column, with no PG enum and no CHECK behind it. So the set of
+ * values that can actually arrive here is open, not closed: a rolling deploy
+ * where a newer pod writes a status an older image has never heard of is
+ * enough. An allowlist of retryable statuses would send every such unknown
+ * down the 410 path and destroy the payload — reintroducing exactly the
+ * BLO-28659 failure mode behind a narrower door. With a denylist, an
+ * unrecognised status *delays* alerts instead of dropping them, and staying
+ * safe requires no maintenance.
+ *
+ * `uninstalled` is terminal because soft delete keeps the row for 30 days
+ * (`DELETE /plugins/:pluginId` without `purge`) and the resolution path does
+ * not filter by status, so a catch-all `!== "ready"` would answer
+ * `503 + Retry-After` for a deliberately removed plugin until the purge.
+ * Senders would requeue forever with no action able to clear it. Getting back
+ * to `ready` from `uninstalled` requires a *reinstall* — a new lifecycle, not
+ * a retry — so the endpoint is genuinely gone and says so.
+ *
+ * `disabled` is deliberately *not* terminal: an operator disabling a plugin
+ * for maintenance is exactly the person who wants the deliveries made during
+ * the window to land once they re-enable it, and `enable` restores the same
+ * row. The cost is honest — a plugin left disabled for a long time keeps
+ * `AlertmanagerWebhookNotificationsFailing` lit — but that alarm has a real
+ * operator action that clears it, which is the line this partition draws.
+ *
+ * Adding a status here converts delayed alerts into destroyed ones for that
+ * status. Exported so the regression suite can pin the membership rather than
+ * assert the enum against itself.
+ *
+ * @see BLO-28659 — why readiness is retryable at all
+ */
+export const WEBHOOK_TERMINAL_PLUGIN_STATUSES = new Set<PluginStatus>(["uninstalled"]);
 const MEMORY_PLUGIN_KEYWORDS = ["gbrain", "hindsight", "memory", "plugin-secrets"] as const;
 
 type RagHealthBucketCacheEntry = {
@@ -887,9 +932,12 @@ export function pluginRoutes(
   async function validatePluginSecretRefsForCompany(
     companyId: string,
     refs: ReturnType<typeof extractSecretRefBindingsFromConfig>,
+    // Callers inside a transaction pass the tx handle so the existence check
+    // sees the same snapshot as the write it is guarding (BLO-26529).
+    dbOrTx: Db = db,
   ): Promise<void> {
     if (refs.length === 0) return;
-    const secretsSvc = secretService(db);
+    const secretsSvc = secretService(dbOrTx);
     const checked = new Set<string>();
     for (const ref of refs) {
       if (checked.has(ref.secretId)) continue;
@@ -2683,58 +2731,96 @@ export function pluginRoutes(
       delete body.configJson.devUiUrl;
     }
 
-    // Restore any value the caller echoed back as the mask sentinel from the
-    // masked GET (BLO-20794). Must run before validation: `__redacted__` would
-    // otherwise fail a `pattern`/`minLength` constraint on the secret field, and
-    // must run before the secret-ref extraction so bindings are read from the
-    // real stored pointers.
-    const storedConfig = await registry.getConfig(plugin.id, companyId);
-    const merged = mergeMaskedPluginConfig(
-      body.configJson,
-      storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
-      plugin.manifestJson?.instanceConfigSchema,
-    );
-    // A sentinel inside an array that was reordered or had entries removed
-    // cannot be resolved without risking re-homing the credential onto a
-    // different entry. Refuse the write and make the operator re-enter it.
-    if (merged.unresolvedMaskPaths.length > 0) {
-      res.status(400).json({
-        error:
-          "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
-        unresolvedMaskPaths: merged.unresolvedMaskPaths,
-      });
-      return;
-    }
-    const configJson = merged.configJson;
-
-    // Validate configJson against the plugin's instanceConfigSchema (if declared).
-    // This ensures CLI/API callers get the same validation the UI performs client-side.
     const schema = plugin.manifestJson?.instanceConfigSchema;
-    if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(configJson, schema);
-      if (!validation.valid) {
-        res.status(400).json({
-          error: "Configuration does not match the plugin's instanceConfigSchema",
-          fieldErrors: validation.errors,
-        });
-        return;
-      }
-    }
+    const postedConfigJson = body.configJson;
 
     try {
-      const secretRefs = extractSecretRefBindingsFromConfig(configJson, schema);
-      await validatePluginSecretRefsForCompany(companyId, secretRefs);
-      await secretService(db).syncSecretRefsForTarget(
-        companyId,
-        { targetType: "plugin", targetId: plugin.id },
-        secretRefs,
-        { replaceAll: true },
-      );
+      // The mask-restore read and the whole-row write must be one atomic unit
+      // (BLO-26529). Splitting them loses updates: request A rotates a secret
+      // S0 -> S1 and commits inside the window between request B's
+      // `getConfig()` snapshot and B's `upsertConfig()`, so B restores the
+      // stale S0 from its own snapshot and silently reverts the rotation.
+      //
+      // `pg_advisory_xact_lock` rather than `SELECT ... FOR UPDATE` because the
+      // `plugin_config` row does not exist before the first save, and a row
+      // lock on a row that isn't there serialises nothing. The lock is held
+      // until commit/rollback, so the restore always reads the newest committed
+      // config and the sentinel resolves to whatever actually survives — which
+      // is what makes a stale masked response unable to revert a rotation.
+      const outcome = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-config:${plugin.id}:${companyId}`}, 0))`,
+        );
 
-      const result = await registry.upsertConfig(plugin.id, companyId, {
-        companyId,
-        configJson,
+        const txRegistry = pluginRegistryService(txDb);
+
+        // Restore any value the caller echoed back as the mask sentinel from the
+        // masked GET (BLO-20794). Must run before validation: `__redacted__` would
+        // otherwise fail a `pattern`/`minLength` constraint on the secret field, and
+        // must run before the secret-ref extraction so bindings are read from the
+        // real stored pointers.
+        const storedConfig = await txRegistry.getConfig(plugin.id, companyId);
+        const merged = mergeMaskedPluginConfig(
+          postedConfigJson,
+          storedConfig && typeof storedConfig === "object" ? storedConfig.configJson : null,
+          schema,
+        );
+        // A sentinel inside an array that was reordered or had entries removed
+        // cannot be resolved without risking re-homing the credential onto a
+        // different entry. Refuse the write and make the operator re-enter it.
+        if (merged.unresolvedMaskPaths.length > 0) {
+          return {
+            ok: false as const,
+            body: {
+              error:
+                "Masked secret values could not be matched to stored configuration because the surrounding array changed. Re-enter the affected secrets explicitly.",
+              unresolvedMaskPaths: merged.unresolvedMaskPaths,
+            },
+          };
+        }
+        const configJson = merged.configJson;
+
+        // Validate configJson against the plugin's instanceConfigSchema (if declared).
+        // This ensures CLI/API callers get the same validation the UI performs client-side.
+        if (schema && Object.keys(schema).length > 0) {
+          const validation = validateInstanceConfig(configJson, schema);
+          if (!validation.valid) {
+            return {
+              ok: false as const,
+              body: {
+                error: "Configuration does not match the plugin's instanceConfigSchema",
+                fieldErrors: validation.errors,
+              },
+            };
+          }
+        }
+
+        // Secret-ref bindings are synchronised inside the same transaction so
+        // they commit with — and roll back with — the config version that wins.
+        const secretRefs = extractSecretRefBindingsFromConfig(configJson, schema);
+        await validatePluginSecretRefsForCompany(companyId, secretRefs, txDb);
+        await secretService(txDb).syncSecretRefsForTarget(
+          companyId,
+          { targetType: "plugin", targetId: plugin.id },
+          secretRefs,
+          { replaceAll: true },
+        );
+
+        const result = await txRegistry.upsertConfig(plugin.id, companyId, {
+          companyId,
+          configJson,
+        });
+        return { ok: true as const, result, configJson, secretRefs };
       });
+
+      if (!outcome.ok) {
+        res.status(400).json(outcome.body);
+        return;
+      }
+
+      const { result, configJson, secretRefs } = outcome;
+
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2743,6 +2829,9 @@ export function pluginRoutes(
         configKeyCount: Object.keys(configJson).length,
       });
 
+      // Worker notification runs after the transaction commits: it is a network
+      // round-trip to another process, and holding the config lock across it
+      // would stall every other admin save for the duration of an RPC timeout.
       // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
       // If the worker implements onConfigChanged, send the new config via RPC.
       // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
@@ -3099,8 +3188,32 @@ export function pluginRoutes(
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
-   * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 400 if the manifest is missing, lacks the webhooks.receive capability,
+   *   or an explicit companyId is required for a multi-company plugin
+   * - 404 if an explicit companyId is not configured
+   * - 503 (with `Retry-After`) if no company is configured yet
+   * - 410 if the plugin has been uninstalled (the endpoint is gone for good)
+   * - 503 (with `Retry-After`) if the plugin is not ready but can recover
    * - 502 if the worker is unavailable or the RPC call fails
+   *
+   * Readiness is a *transient, server-side* condition, so it answers 503 and
+   * not 4xx: a conforming sender treats 4xx as permanent and discards the
+   * payload outright. Alertmanager did exactly that during the 2026-08-18
+   * outage ("notify retry canceled due to unrecoverable error ... status code
+   * 400"), destroying every alert that fired across a 5.8h window. Keep this
+   * retryable; delayed alerts are recoverable, dropped ones are not.
+   *
+   * "Not ready" is a *partition*, not a negation — see
+   * {@link WEBHOOK_TERMINAL_PLUGIN_STATUSES}. Only statuses named terminal
+   * answer 410 (`uninstalled`: telling a sender to retry a plugin that no
+   * longer exists trades dropped payloads for an unclearable alarm and an
+   * unbounded retry loop); everything else non-ready retries.
+   *
+   * The sibling readiness guard on the plugin-scoped API route above is still
+   * a plain `!== "ready"` catch-all, so it answers 503 for `uninstalled` where
+   * this route answers 410. That drift is known and deliberate for now: its
+   * callers are plugin-authored clients rather than Alertmanager, so the
+   * payload-loss stakes differ. It is the next guard to partition.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -3117,9 +3230,21 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 2: Validate the plugin is in 'ready' state
+    // Step 2: Validate the plugin is in 'ready' state.
+    //
+    // Partition, not negation — and the unknown case falls to the safe side.
+    // Only statuses named terminal answer 410; every other non-ready status,
+    // including one this build has never heard of, answers 503 + Retry-After.
+    // The request is well-formed and the fault is ours.
     if (plugin.status !== "ready") {
-      res.status(400).json({
+      if (WEBHOOK_TERMINAL_PLUGIN_STATUSES.has(plugin.status as PluginStatus)) {
+        res.status(410).json({
+          error: `Plugin has been uninstalled (current status: ${plugin.status})`,
+        });
+        return;
+      }
+      res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
+      res.status(503).json({
         error: `Plugin is not ready (current status: ${plugin.status})`,
       });
       return;
@@ -3188,11 +3313,18 @@ export function pluginRoutes(
       companyId = requestedCompanyId;
     } else if (configuredCompanyIds.length === 1) {
       companyId = configuredCompanyIds[0]!;
+    } else if (configuredCompanyIds.length === 0) {
+      // Company configuration is operator-controlled and may be written after
+      // the plugin reaches ready. Treat that transient state like readiness so
+      // senders retain the payload instead of classifying it as permanent.
+      res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
+      res.status(503).json({
+        error: "Plugin must be configured for a company before receiving webhooks",
+      });
+      return;
     } else {
       res.status(400).json({
-        error: configuredCompanyIds.length === 0
-          ? "Plugin must be configured for a company before receiving webhooks"
-          : '"companyId" query parameter is required for a multi-company plugin',
+        error: '"companyId" query parameter is required for a multi-company plugin',
       });
       return;
     }

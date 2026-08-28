@@ -40,10 +40,74 @@ export const heartbeatRuns = pgTable(
     lastOutputSeq: integer("last_output_seq").notNull().default(0),
     lastOutputStream: text("last_output_stream"),
     lastOutputBytes: bigint("last_output_bytes", { mode: "number" }),
+    // The INBOUND edge of a retry chain: the run whose ending caused this row
+    // to be created. Set by every park/re-queue writer that succeeds a specific
+    // run. Deliberately absent on admission-gate parks (`ccrotate_capacity`,
+    // `dependency_blocked`), which refuse a wake *before* dispatch and so
+    // succeed no run at all.
+    //
+    // There is no matching outbound column, and adding one is not planned: the
+    // successor is found by looking this column up in reverse
+    // (`where retry_of_run_id = <run id>`), which
+    // heartbeat_runs_retry_successor_idx (migration 0230) exists to serve.
     retryOfRunId: uuid("retry_of_run_id").references((): AnyPgColumn => heartbeatRuns.id, {
       onDelete: "set null",
     }),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
+    // BLO-22060: how many times sweepStaleIssueLocks has released an issue
+    // execution lock held by this run. The sweep deliberately does not cancel
+    // the run, so the run survives the release — a `scheduled_retry` park still
+    // has to fire at its deadline — and was previously free to be re-adopted as
+    // the issue's executionRunId by enqueueWakeup's legacy-run fallback,
+    // re-stamping executionLockedAt and resetting the 6h staleness clock on
+    // every wake. This counter is what makes that release durable: adoption
+    // declines once it reaches MAX_SWEPT_ISSUE_LOCK_RELEASES, so total lock
+    // time attributable to one run is bounded no matter how many wakes arrive.
+    //
+    // Counted for every holder the sweep releases — `queued` (BLO-18995),
+    // silent-`running` (BLO-19941) and `scheduled_retry` (BLO-21309) — because
+    // the fallback can select all three, and a released park that is later
+    // promoted arrives there as `queued` still carrying this count.
+    issueLockReleaseCount: integer("issue_lock_release_count").notNull().default(0),
+    // BLO-19722: set once worker-crash recovery has completed every *required*
+    // cleanup step for this run. It is the durable completion marker
+    // `reconcileWorkerCrashedRuns` selects on, and it cannot be inferred from
+    // the existence of a retry child: recovery deliberately completes *without*
+    // a retry when the agent is not invokable, and conversely commits the retry
+    // before the finalization steps that follow it. Only ever written by that
+    // recovery path. See migration 0225.
+    crashRecoveryCompletedAt: timestamp("crash_recovery_completed_at", { withTimezone: true }),
+    // Poison-row backoff. Candidates are drained oldest-first and the batch is
+    // capped, so a run whose required cleanup permanently fails would otherwise
+    // sit at the head of that order and freeze recovery of every newer run.
+    // Recording attempts and a next-attempt time lets such a row fall out of
+    // the candidate window while staying visibly *unresolved* — completion is
+    // never stamped just to drain the batch. Nullable with no default so the
+    // ADD COLUMN stays rewrite-free on this large table; readers coalesce to 0,
+    // as `processLossRetryCount` already is elsewhere.
+    crashRecoveryAttempts: integer("crash_recovery_attempts"),
+    crashRecoveryNextAttemptAt: timestamp("crash_recovery_next_attempt_at", { withTimezone: true }),
+    crashRecoveryLastError: text("crash_recovery_last_error"),
+    // BLO-29312: these three columns are INBOUND. They describe the park that
+    // PRODUCED this row -- when the hold this run was released from was due,
+    // which attempt of that chain this run is, and why the chain started. They
+    // do NOT record a park created because THIS run failed.
+    //
+    // That park is a separate row carrying `retryOfRunId` = this row's id (see
+    // the note there), and nothing about it is ever written back here. A
+    // promoted retry also keeps its park on the row -- promoteDueScheduledRetry
+    // writes only status/error/updatedAt -- so these values survive into
+    // `queued`/`running`/terminal states as a durable record of this attempt's
+    // origin.
+    //
+    // The failure mode this comment exists to stop: on a `failed` run,
+    // `scheduledRetryAt: null` reads as "the system declined to retry it" and a
+    // past `scheduledRetryAt` reads as "a retry was promised and never fired".
+    // Both readings are wrong, both were made in production (BLO-28734 and its
+    // re-verification, ~6 agent runs), and neither column can answer the
+    // question they were being asked. For "was this run retried?", resolve the
+    // outbound edge instead -- `heartbeat.getRetrySuccessor`, surfaced as
+    // `retrySuccessor` on GET /api/heartbeat-runs/:runId.
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
@@ -124,5 +188,23 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    queuedAgeIdx: index("heartbeat_runs_queued_age_idx")
+      .on(table.agentId, sql`coalesce(${table.queuedAt}, ${table.createdAt})`)
+      .where(sql`${table.status} = 'queued'`),
+    // BLO-19722: serves the startup crash-recovery candidate scan, which is
+    // bounded by batch size and ordered oldest-first rather than by wall time.
+    // The partial predicate keeps this index near-empty in steady state — only
+    // crash-marked runs whose recovery has not completed are members, and every
+    // recovered run leaves the index — so the common "nothing to reconcile"
+    // start is an empty index probe.
+    //
+    // On a populated database this index is created out of band with
+    // `CREATE INDEX CONCURRENTLY` (see migration 0226); recovery is correct
+    // without it, degrading to a sequential scan that still finds every
+    // candidate. Declared here so drizzle's schema diff stays clean and so
+    // fresh/bootstrap databases get it automatically.
+    crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
+      .on(table.finishedAt, table.id)
+      .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
   }),
 );

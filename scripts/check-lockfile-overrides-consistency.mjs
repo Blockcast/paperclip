@@ -61,6 +61,19 @@ function unquoteYamlKey(raw) {
   return unquoteYamlScalar(raw);
 }
 
+// BLO-27241: a parser that `break`s out of a block on an unrecognised line
+// returns a *partial* Map that is structurally indistinguishable from a
+// complete parse, and an entry that was never parsed can never mismatch — so
+// the caller reports green on a lockfile it only partly read. Every
+// unexpected shape therefore throws instead of truncating: for a guard,
+// "I could not read this" must never be reported as "this agrees".
+function malformedBlock(blockName, lineNumber, reason) {
+  throw new Error(
+    `Malformed ${blockName}: block at pnpm-lock.yaml line ${lineNumber} ${reason}. ` +
+      `Refusing to report consistency from a partially-parsed lockfile.`,
+  );
+}
+
 // Extracts a flat, 2-space-indented `<blockName>:\n  key: value` mapping from
 // pnpm-lock.yaml. Sufficient for `overrides:` — pnpm never nests values there.
 function parseFlatYamlBlock(lockfileText, blockName) {
@@ -72,9 +85,15 @@ function parseFlatYamlBlock(lockfileText, blockName) {
   for (let i = startIndex + 1; i < lines.length; i += 1) {
     const line = lines[i];
     if (line === "" || line.startsWith("  # ")) continue;
-    if (!line.startsWith("  ") || line.startsWith("   ")) break;
+    if (!line.startsWith("  ")) {
+      // A non-indented line ends the block legitimately; a 1-space-indented
+      // one is a shape we do not understand, not a terminator.
+      if (line.startsWith(" ")) malformedBlock(blockName, i + 1, "has unexpected indentation");
+      break;
+    }
+    if (line.startsWith("   ")) malformedBlock(blockName, i + 1, "has unexpected indentation");
     const separatorIndex = line.indexOf(": ");
-    if (separatorIndex === -1) break;
+    if (separatorIndex === -1) malformedBlock(blockName, i + 1, "has no `: ` key/value separator");
     const key = unquoteYamlKey(line.slice(2, separatorIndex));
     const value = unquoteYamlScalar(line.slice(separatorIndex + 2));
     entries.set(key, value);
@@ -94,19 +113,34 @@ function parsePatchedDependenciesBlock(lockfileText) {
   for (let i = startIndex + 1; i < lines.length; i += 1) {
     const line = lines[i];
     if (line === "") continue;
-    if (!line.startsWith("  ")) break;
+    if (!line.startsWith("  ")) {
+      if (line.startsWith(" ")) malformedBlock("patchedDependencies", i + 1, "has unexpected indentation");
+      break;
+    }
 
     if (line.startsWith("    ")) {
-      if (currentKey === null) break;
-      const separatorIndex = line.indexOf(": ");
-      if (separatorIndex === -1) continue;
+      if (currentKey === null) {
+        malformedBlock("patchedDependencies", i + 1, "carries metadata before any package key");
+      }
+      // Match `field:` followed by end-of-line or a space, rather than the
+      // literal `": "`. The old `indexOf(": ")` treated `hash:x` — and any
+      // future serialisation pnpm might adopt — as a line to skip, which
+      // silently left `hash` undefined and disabled content verification.
+      const separatorIndex = line.indexOf(":");
+      const afterSeparator = separatorIndex === -1 ? undefined : line[separatorIndex + 1];
+      if (separatorIndex === -1 || (afterSeparator !== undefined && afterSeparator !== " ")) {
+        malformedBlock("patchedDependencies", i + 1, "has no `: ` field/value separator");
+      }
       const field = line.slice(4, separatorIndex).trim();
-      const value = unquoteYamlScalar(line.slice(separatorIndex + 2));
+      const value = unquoteYamlScalar(line.slice(separatorIndex + 1));
       entries.get(currentKey)[field] = value;
       continue;
     }
 
-    if (line.startsWith("   ")) break; // 3-space: not a shape we expect.
+    if (line.startsWith("   ")) malformedBlock("patchedDependencies", i + 1, "has unexpected indentation");
+    if (!line.endsWith(":")) {
+      malformedBlock("patchedDependencies", i + 1, "is a package key with no trailing `:`");
+    }
     const key = unquoteYamlKey(line.slice(2, -1));
     currentKey = key;
     entries.set(key, {});
@@ -118,6 +152,10 @@ function parsePatchedDependenciesBlock(lockfileText) {
  * Compares package.json's `pnpm.overrides` / `pnpm.patchedDependencies`
  * against the corresponding blocks in pnpm-lock.yaml. Returns a list of
  * human-readable mismatch descriptions; an empty list means consistent.
+ *
+ * Throws when either block cannot be parsed in full (BLO-27241). An empty
+ * mismatch list is only meaningful if the whole lockfile was read: callers
+ * must let the throw propagate rather than treating it as "no mismatches".
  *
  * When `repoRoot` is given, also verifies each patch file on disk hashes to
  * the value pnpm-lock.yaml recorded for it — catching a patch-content-only
@@ -182,9 +220,23 @@ export function findLockfileOverrideMismatches(packageJsonText, lockfileText, { 
 
     // Path matches, so a stale hash is invisible to every check above —
     // this is the gap a patch-content-only edit falls through (BLO-24169
-    // review follow-up). Only checkable when we have a repoRoot to read the
-    // actual patch file from.
-    if (repoRoot && lockedEntry.hash) {
+    // review follow-up).
+    //
+    // BLO-27241: both of the checks below used to sit behind
+    // `if (repoRoot && lockedEntry.hash)`, so an absent, empty, or unparsed
+    // hash silently skipped *and* disabled the missing-file check, and the
+    // guard reported green. A missing hash is now itself a mismatch, and
+    // file existence is verified independently of it.
+    if (!lockedEntry.hash) {
+      mismatches.push(
+        `pnpm-lock.yaml's patchedDependencies["${key}"] records no non-empty hash, so the content of "${declaredPath}" cannot be verified — run "pnpm install --lockfile-only" and commit the result`,
+      );
+    }
+
+    // Only checkable when we have a repoRoot to read the actual patch file
+    // from. Omitted in tests that only exercise the path/override
+    // comparisons against synthetic fixtures with no files on disk.
+    if (repoRoot) {
       const patchFilePath = path.join(repoRoot, declaredPath);
       let patchContent;
       try {
@@ -196,11 +248,13 @@ export function findLockfileOverrideMismatches(packageJsonText, lockfileText, { 
         );
         continue;
       }
-      const actualHash = computePnpmPatchHash(patchContent);
-      if (actualHash !== lockedEntry.hash) {
-        mismatches.push(
-          `pnpm-lock.yaml's patchedDependencies["${key}"].hash ("${lockedEntry.hash}") doesn't match the content hash of the committed "${declaredPath}" ("${actualHash}") — run "pnpm install --lockfile-only" and commit the result`,
-        );
+      if (lockedEntry.hash) {
+        const actualHash = computePnpmPatchHash(patchContent);
+        if (actualHash !== lockedEntry.hash) {
+          mismatches.push(
+            `pnpm-lock.yaml's patchedDependencies["${key}"].hash ("${lockedEntry.hash}") doesn't match the content hash of the committed "${declaredPath}" ("${actualHash}") — run "pnpm install --lockfile-only" and commit the result`,
+          );
+        }
       }
     }
   }
@@ -221,7 +275,22 @@ function main() {
   const packageJsonText = readFileSync(path.join(repoRoot, "package.json"), "utf8");
   const lockfileText = readFileSync(path.join(repoRoot, "pnpm-lock.yaml"), "utf8");
 
-  const mismatches = findLockfileOverrideMismatches(packageJsonText, lockfileText, { repoRoot });
+  let mismatches;
+  try {
+    mismatches = findLockfileOverrideMismatches(packageJsonText, lockfileText, { repoRoot });
+  } catch (error) {
+    // BLO-27241: a shape this parser cannot read is a hard failure, not a
+    // pass. Reported distinctly from a drift mismatch, because the fix is
+    // different: the parser needs to learn the new shape pnpm emits.
+    console.error("Could not fully parse pnpm-lock.yaml, so consistency could not be verified:");
+    console.error(`  - ${error.message}`);
+    console.error(
+      "\nThis is a guard failure, not a lockfile drift. If pnpm changed how it serialises these blocks, update scripts/check-lockfile-overrides-consistency.mjs to parse the new shape.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   if (mismatches.length === 0) {
     console.log("pnpm-lock.yaml overrides/patchedDependencies match package.json.");
     return;

@@ -11,8 +11,13 @@
 # PREREQUISITE (one-time, npm UI): @penstock/plugin-sdk and @penstock/shared must
 # already exist on npm AND have a Trusted Publisher configured for this repo +
 # workflow. npm cannot do the *first* publish of a brand-new package over OIDC, so
-# the initial version is published manually with 2FA; every release after that is
-# OIDC. (Same bootstrap as @penstock/paperclip-plugin.)
+# the initial version is published manually with 2FA. (Same bootstrap as
+# @penstock/paperclip-plugin.)
+#
+# NOTE: the OIDC publish path below is currently NON-FUNCTIONAL on this repo's ARC
+# runners — trusted publishing always mints provenance, and npm rejects provenance
+# from self-hosted runners. See the note on the publish step. Every release today
+# is a manual --bootstrap publish.
 #
 # MANUAL ONLY: workflow_dispatch — never runs on push. Defaults to dry_run.
 name: Release @penstock-scoped SDK
@@ -47,9 +52,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -75,11 +78,41 @@ jobs:
           pnpm --filter @paperclipai/shared build
           pnpm --filter @paperclipai/plugin-sdk build
 
-      - name: Publish under @penstock (OIDC)
+      # KNOWN BROKEN — this step cannot succeed on ARC. Verified twice, runs
+      # 32295237299 (2026-08-19) and 32354111699 (2026-08-20). Do not "fix" it by
+      # adjusting flags; the constraint is structural:
+      #
+      #   1. These packages have a Trusted Publisher configured on npm, so the CLI
+      #      authenticates over OIDC whenever `id-token: write` is available.
+      #   2. Trusted publishing mints a sigstore provenance attestation
+      #      UNCONDITIONALLY. Dropping `--provenance` does NOT opt out — run
+      #      32354111699 published `npm publish --access public` with no flag and
+      #      npm still logged "Signed provenance statement with source and build
+      #      information from GitHub Actions".
+      #   3. npm refuses an attestation minted on a self-hosted runner:
+      #      422 Unprocessable Entity - Error verifying sigstore provenance bundle:
+      #      Unsupported GitHub Actions runner environment: "self-hosted".
+      #      Only "github-hosted" runners are supported when publishing with provenance.
+      #   4. A GitHub-hosted runner would violate scripts/check-github-runner-labels.mjs,
+      #      whose ALLOWED_RUNNERS set is ARC-only with no exemption path.
+      #
+      # (2) is the load-bearing fact and the one an earlier fix got wrong: the flag
+      # and the attestation are not the same switch.
+      #
+      # Until one of those changes, releases go out via the script's --bootstrap
+      # path, run by hand by a maintainer with `npm login` + 2FA:
+      #   node scripts/publish-penstock-scope.mjs --version YYYY.MMDD.N --bootstrap
+      #
+      # To make CI publishing work again, pick one and do it deliberately:
+      #   a. Remove the Trusted Publisher on npm and publish from ARC with a
+      #      granular access token in a repo secret (reintroduces a long-lived
+      #      token, which npm is actively restricting for 2FA-bypass publishes).
+      #   b. Add a GitHub-hosted label to ALLOWED_RUNNERS for this one job.
+      - name: Publish under @penstock (OIDC — see note above, currently fails on ARC)
         if: ${{ !inputs.dry_run }}
         env:
           VERSION: ${{ inputs.version }}
-        run: node scripts/publish-penstock-scope.mjs --version "$VERSION" --publish --provenance
+        run: node scripts/publish-penstock-scope.mjs --version "$VERSION" --publish
 
       - name: Dry run (pack + validate only)
         if: ${{ inputs.dry_run }}

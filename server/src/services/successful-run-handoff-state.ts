@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns, issues } from "@paperclipai/db";
 import type { SuccessfulRunHandoffState } from "@paperclipai/shared";
 import { logActivity } from "./activity-log.js";
 
@@ -127,6 +127,68 @@ export async function hydrateSuccessfulRunHandoffLiveness(
       // nothing live" (null) from "never hydrated" (absent) — previously both
       // presented as an absent field.
       liveRunId,
+    });
+  }
+
+  return states;
+}
+
+export const SUCCESSFUL_RUN_HANDOFF_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
+
+/**
+ * BLO-16074: a handoff obligation does not outlive its issue.
+ *
+ * The handoff state is derived purely from the latest
+ * `issue.successful_run_handoff_{required,resolved,escalated}` activity row, and
+ * only two writers ever emit `resolved`: an agent run that takes a valid
+ * continuation path, and the explicit route. Neither fires when the issue is
+ * closed by any OTHER route — a human, a different agent, a status PATCH — so a
+ * `required` handoff on a closed issue is permanent. Measured on BLO-23447,
+ * `done` at 2026-08-10T12:35:33Z and still reporting
+ * `successfulRunHandoff.state: "required"` a day later.
+ *
+ * That is the same defect the recovery-action side already fixed, and this is
+ * deliberately the same shape as its first branch
+ * (`classifySourceRecoveryRevalidation`: "became stale because the source issue
+ * reached ${status}"). Doing it as a read projection rather than a backfill or a
+ * sweeper is what makes it heal history — every stale row corrects on its next
+ * read, with no migration and nothing new to schedule.
+ *
+ * Scoped to `required` only. `escalated` is a record that recovery took the
+ * issue over, and is worth keeping legible after closure; `required` is an
+ * outstanding obligation, and on a closed issue there is no one to discharge it.
+ */
+export async function resolveSuccessfulRunHandoffForTerminalIssues(
+  dbOrTx: any,
+  companyId: string,
+  states: Map<string, SuccessfulRunHandoffState>,
+) {
+  const requiredIssueIds = [...states.entries()]
+    .filter(([, state]) => state.state === "required")
+    .map(([issueId]) => issueId);
+  if (requiredIssueIds.length === 0) return states;
+
+  const terminalRows = await dbOrTx
+    .select({ id: issues.id, status: issues.status })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, companyId),
+      inArray(issues.id, requiredIssueIds),
+      inArray(issues.status, [...SUCCESSFUL_RUN_HANDOFF_TERMINAL_ISSUE_STATUSES]),
+    ));
+
+  for (const row of terminalRows as Array<{ id: string; status: string }>) {
+    const state = states.get(row.id);
+    if (!state) continue;
+    states.set(row.id, {
+      ...state,
+      state: "resolved",
+      required: false,
+      // A closed issue has no continuation, so clear both rather than leaving a
+      // reader to reconcile "resolved" against a live-looking run.
+      hasLiveContinuation: false,
+      liveRunId: null,
+      resolvedBySourceIssueStatus: row.status as "done" | "cancelled",
     });
   }
 

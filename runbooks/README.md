@@ -18,12 +18,6 @@ platform cannot resolve automatically. Each runbook should be:
   which nothing re-drives: decide re-review vs accept without double-posting a
   review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
   `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0`.
-- [`cancellation-reservation-lease-leak-and-migration-0209-rollout.md`](cancellation-reservation-lease-leak-and-migration-0209-rollout.md) —
-  cancelled runs leaving external-runtime reservations/environment leases
-  unreleased, and the online-index prerequisite for migrations 0205/0208/0209.
-  Trigger: `paperclip_external_runtime_reservations_release_pending > 0`,
-  `paperclip_environment_leases_orphaned_active > 0`, or a scheduler crash-loop
-  on a database migration at startup.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
@@ -39,8 +33,35 @@ platform cannot resolve automatically. Each runbook should be:
   (not failing) and is silently freezing the `master` merge queue. Trigger:
   `master` hasn't advanced in >90 min with the queue non-empty, or the
   position-1 entry's `merge_group` run shows no state change for that long.
+- [`pr-update-branch-destroys-required-checks.md`](pr-update-branch-destroys-required-checks.md)
+  — an approved PR cannot be enqueued because its head has no checks at all,
+  after `update-branch` (or a hand-merged base) replaced the head with a merge
+  commit that Actions never ran. Trigger: `gh pr merge` answers
+  `Required status check "verify" is expected.` while `gh pr checks` shows
+  nothing at the head.
 - [`queued-run-stranded.md`](queued-run-stranded.md) — a `heartbeat_runs` row
   sitting at `status='queued'` for a long time: the issue it targets looks
   actively in-progress but nothing is executing, and it manufactures false
-  productivity-review escalations. Trigger: alert `PaperclipQueuedRunStranded`,
+  productivity-review escalations. Also covers the case where the row's age
+  snapshot cannot be refreshed safely. Trigger: alert
+  `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
+  a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
+  time, never promoted: the retry-promotion sweep either wedged or is
+  systematically failing this row, and (unlike the alert above) the row never
+  even reached `queued`. Also covers the case where that row's age snapshot
+  cannot be refreshed safely — read a stale snapshot as a detector outage, not
+  an all-clear. Trigger: alert `PaperclipOverdueScheduledRetry`,
+  `PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed`, or
+  `max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`.
+- [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
+  — you are adjudicating an open productivity review and the reviewed issue's
+  monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
+  run): the supported one-call repair path, and why the `PATCH {status:
+  "todo"}` bounce is superseded. Trigger: review evidence reads `monitor
+  lapsed at …, never re-armed`.
+- [`plugin-error.md`](plugin-error.md) — an installed plugin has sat at
+  `plugins.status='error'` past the grace period, distinct from an
+  operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
+  `PaperclipPluginErrored`, or `paperclip_plugin_error == 1`.

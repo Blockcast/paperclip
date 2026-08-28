@@ -23,8 +23,12 @@ function minimalLockfile({ overrides, patches }) {
   const overrideLines = Object.entries(overrides)
     .map(([key, value]) => `  ${key}: ${value}`)
     .join("\n");
+  // A patch entry with `hash: undefined` omits the `hash:` line entirely,
+  // reproducing a lockfile whose entry carries only a path (BLO-27241).
   const patchLines = Object.entries(patches)
-    .map(([key, { hash, path: patchPath }]) => `  ${key}:\n    hash: ${hash}\n    path: ${patchPath}`)
+    .map(([key, { hash, path: patchPath }]) =>
+      [`  ${key}:`, ...(hash === undefined ? [] : [`    hash: ${hash}`]), `    path: ${patchPath}`].join("\n"),
+    )
     .join("\n");
   return [
     "lockfileVersion: '9.0'",
@@ -149,4 +153,142 @@ test("does not flag patch hashes when repoRoot is omitted (path-only fixtures wi
   });
 
   assert.deepEqual(findLockfileOverrideMismatches(packageJson, lockfile), []);
+});
+
+// BLO-27241: everything below covers the guard failing OPEN. The hash
+// comparison and the missing-file check both used to sit behind
+// `if (repoRoot && lockedEntry.hash)`, so an absent, empty, or unparsed hash
+// skipped both and reported green — the one branch in this function that
+// exited without pushing a mismatch. Each case below fails against the
+// pre-fix script; that negative control is the point of the tests.
+
+test("fails closed when a patch entry records no hash at all (BLO-27241)", () => {
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "lockfile-no-hash-"));
+  try {
+    writeFileSync(path.join(fixtureDir, "some-package@1.0.0.patch"), "diff --git a/index.js b/index.js\n");
+
+    const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "some-package@1.0.0.patch" });
+    const lockfile = minimalLockfile({
+      overrides: {},
+      patches: { "some-package@1.0.0": { hash: undefined, path: "some-package@1.0.0.patch" } },
+    });
+
+    const mismatches = findLockfileOverrideMismatches(packageJson, lockfile, { repoRoot: fixtureDir });
+    assert.ok(
+      mismatches.some((m) => m.includes("some-package@1.0.0") && m.includes("no non-empty hash")),
+      `expected a missing-hash mismatch, got: ${JSON.stringify(mismatches)}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when a patch entry records an empty hash (BLO-27241)", () => {
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "lockfile-empty-hash-"));
+  try {
+    writeFileSync(path.join(fixtureDir, "some-package@1.0.0.patch"), "diff --git a/index.js b/index.js\n");
+
+    const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "some-package@1.0.0.patch" });
+    // Emitted as `hash: ""` — a present key whose value unquotes to "".
+    const lockfile = minimalLockfile({
+      overrides: {},
+      patches: { "some-package@1.0.0": { hash: '""', path: "some-package@1.0.0.patch" } },
+    });
+
+    const mismatches = findLockfileOverrideMismatches(packageJson, lockfile, { repoRoot: fixtureDir });
+    assert.ok(
+      mismatches.some((m) => m.includes("some-package@1.0.0") && m.includes("no non-empty hash")),
+      `expected a missing-hash mismatch, got: ${JSON.stringify(mismatches)}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+// Proves the file-existence check is no longer gated behind `hash`: the patch
+// is declared, absent from disk, and the entry carries no hash to trigger the
+// old branch at all.
+test("reports a patch file missing from disk even when the entry has no hash (BLO-27241)", () => {
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "lockfile-missing-patch-"));
+  try {
+    const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "never-written.patch" });
+    const lockfile = minimalLockfile({
+      overrides: {},
+      patches: { "some-package@1.0.0": { hash: undefined, path: "never-written.patch" } },
+    });
+
+    const mismatches = findLockfileOverrideMismatches(packageJson, lockfile, { repoRoot: fixtureDir });
+    assert.ok(
+      mismatches.some((m) => m.includes("never-written.patch") && m.includes("does not exist in the repository")),
+      `expected a missing-patch-file mismatch, got: ${JSON.stringify(mismatches)}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+// The reachable-from-parsing half of BLO-27241: `hash:x` has no `": "`, so the
+// old parser `continue`d past it, leaving hash undefined and silently
+// disabling content verification. Any change in how pnpm serialises this line
+// would have done the same thing fleet-wide, while the guard reported green.
+test("rejects a hash line that does not match the expected separator shape (BLO-27241)", () => {
+  const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "some-package@1.0.0.patch" });
+  const lockfile = [
+    "lockfileVersion: '9.0'",
+    "",
+    "patchedDependencies:",
+    "  some-package@1.0.0:",
+    "    hash:no-space-after-colon",
+    "    path: some-package@1.0.0.patch",
+    "",
+    "importers:",
+    "  .:",
+    "    dependencies: {}",
+    "",
+  ].join("\n");
+
+  assert.throws(
+    () => findLockfileOverrideMismatches(packageJson, lockfile),
+    /Malformed patchedDependencies/,
+    "an unparseable hash line must fail the guard, not be skipped",
+  );
+});
+
+// The same fail-open one layer up (raised on #1340's post-hoc review): a
+// `break` on an unrecognised line returned a *partial* Map, and an entry that
+// was never parsed can never mismatch — so a truncated or oddly-indented block
+// compared green against package.json.
+test("rejects an unexpectedly indented overrides block instead of parsing it partially (BLO-27241)", () => {
+  const packageJson = minimalPackageJson({ rollup: ">=4.59.0" }, {});
+  const lockfile = [
+    "lockfileVersion: '9.0'",
+    "",
+    "overrides:",
+    "   rollup: '>=4.59.0'", // 3-space indent: a shape this parser does not know.
+    "",
+    "importers:",
+    "  .:",
+    "    dependencies: {}",
+    "",
+  ].join("\n");
+
+  assert.throws(
+    () => findLockfileOverrideMismatches(packageJson, lockfile),
+    /Malformed overrides/,
+    "a partially-parsed overrides block must fail the guard, not compare green",
+  );
+});
+
+test("rejects a patchedDependencies package key with no trailing colon (BLO-27241)", () => {
+  const packageJson = minimalPackageJson({}, { "some-package@1.0.0": "some-package@1.0.0.patch" });
+  const lockfile = [
+    "lockfileVersion: '9.0'",
+    "",
+    "patchedDependencies:",
+    "  some-package@1.0.0", // truncated: no trailing `:`.
+    "    path: some-package@1.0.0.patch",
+    "",
+  ].join("\n");
+
+  assert.throws(() => findLockfileOverrideMismatches(packageJson, lockfile), /Malformed patchedDependencies/);
 });

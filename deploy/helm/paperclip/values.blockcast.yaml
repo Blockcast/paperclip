@@ -10,8 +10,17 @@
 image:
   repository: harbor.blockcast.net/paperclip/paperclip
   tag: sha-d1409bf-k8s-vendored
-  pullPolicy: Always
   # Bump this to the kkroo image tag built from this repo when deploying.
+  #
+  # Empty = derive the policy from whether the image is digest-pinned; see
+  # `paperclip.imagePullPolicy` in templates/_helpers.tpl for the reasoning.
+  # Every CI deploy path in .github/workflows/docker.yml passes
+  # `--set-string image.digest=sha256:...`, so production renders IfNotPresent
+  # and a pod restart on a node that already holds that digest no longer needs
+  # Harbor to be serving auth. A manual `helm upgrade` that passes no digest
+  # still renders Always, so the mutable `sha-` tag above keeps being
+  # re-resolved. Do not hardcode `Always` back here — BLO-29306.
+  pullPolicy: ""
 
 imagePullSecrets:
   - name: registry-blockcast-net-pull
@@ -52,6 +61,14 @@ env:
         secretKeyRef:
           name: paperclip-database-url
           key: url
+    # Production PostgreSQL backups are owned by the paperclip-pg-backup
+    # CronJob in Blockcast/onprem-k8s. It writes validated custom-format dumps
+    # to the dedicated backup PVC and authoritative Azure Blob destination,
+    # with freshness/failure alerting from kube-state-metrics. Do not also run
+    # Paperclip's local .sql.gz scheduler against paperclip-data: that creates a
+    # second retention policy and reports stale health for an obsolete path.
+    - name: PAPERCLIP_DB_BACKUP_ENABLED
+      value: "false"
     # Shared bearer token so paperclip-plugin-alertmanager auto-config matches
     # the cluster's monitoring/alertmanager-receivers Secret. Same value, two
     # namespaces. Bootstrap reads this at startup via
@@ -267,7 +284,7 @@ env:
     # Penstock route. `opencode models` also advertises generic/fast/pro/Luna
     # aliases that this route does not currently serve.
     - name: PAPERCLIP_OPENCODE_MODEL_ALLOWLIST
-      value: "openai/gpt-5.6-sol,openai/gpt-5.6-terra,openai/gpt-5.5"
+      value: "openai/gpt-5.6-sol,openai/gpt-5.6-terra,openai/gpt-5.5,anthropic/claude-opus-5"
     - name: PAPERCLIP_CODEX_PROVIDERS
       value: '{"providers":{"penstock":{"name":"Penstock OpenAI gateway","base_url":"https://api.penstock.run/v1","env_key":"OPENAI_API_KEY","wire_api":"responses"}},"model_provider":"penstock"}'
     # BLO-25308 / BLO-21812: fleet default ServiceAccount for claude_k8s agent
@@ -387,6 +404,37 @@ secret:
 # StatefulSet runs the heartbeat executeRun finalization where the check fires.
 githubApp:
   enabled: true
+  # Comment-shaped Ally review gate (BLO-21907 / BLO-26602). Setting this makes
+  # the server publish a success/failure commit status for Ally's consolidated
+  # PR-review comments; it does NOT block anything until the same context is
+  # marked required on the `master` branch-protection rule. That second step is
+  # human-only (agent tokens get 403 on branch protection) and is deliberately
+  # sequenced after this one: GitHub's required-checks picker only offers
+  # contexts it has observed recently, and this repo has never carried a commit
+  # status, so the context has to be posted at least once before a human can
+  # select it. Until then this is observe-only.
+  prCommentReviewGateStatusContext: "review/ally-comment"
+  # NOTE: `prReviewGateStatusContext` is shared by the legacy failure status
+  # and the durable review-gate authority below. The latter owns
+  # `review/ally-complete`, including its success writer.
+  # PEN-2073 rollout order:
+  # 1. Freeze review-gate merges.
+  # 2. Deploy this producer migration/code with both flags false; wait for every pod.
+  # 3. Set reviewGateCaptureEnabled=true, keep reviewGateEnabled=false, deploy,
+  #    and wait for every API replica. Deliveries now queue durably without dispatch.
+  # 4. Merge and deploy the Penstock repository_dispatch consumer.
+  # 5. Set reviewGateEnabled=true and deploy Paperclip. Release tooling refuses
+  #    promotion unless the live API Deployment has completed the capture-only
+  #    rollout, so old replicas keep capturing while workers drain the backlog.
+  # 6. Trigger a full reconciliation and verify statuses are authored by App 3966421.
+  # 7. Bind branch protection to review/ally-complete from App 3966421, then lift the freeze.
+  reviewGateCaptureEnabled: false
+  reviewGateEnabled: false
+  reviewGateRepositories:
+    - Blockcast/penstock-llm-proxy-core
+  reviewGateExpectedAppId: "3966421"
+  reviewGateExpectedInstallationId: "138085375"
+  prReviewGateStatusContext: review/ally-complete
 
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service
@@ -409,13 +457,25 @@ extraVolumes:
   # token (identity app/allyblockcast[bot]) — and it is ALSO the review bot, so a
   # PR authored by the App cannot be formally reviewed by it (GitHub forbids
   # reviewing your own PR; the bot degrades to comment-mode). This separate secret
-  # holds the @allyblockcast USER token (a distinct identity from the [bot] App,
-  # granted write on Blockcast/multicast + the penstock repos). Agents use it to
-  # push the branch + `gh pr create` (so the PR author is the user seat, formally
-  # reviewable by the bot) and for the final `gh pr merge` — see the
-  # github-pr-workflow skill. optional:true so the pod still starts if the secret
-  # is absent. The adapter auto-propagates this main-container secret volume into
-  # agent Job pods (selfPod.secretVolumes).
+  # holds the @allyblockcast USER token (a distinct identity from the [bot] App).
+  #
+  # CORRECTED (BLO-24056): the previous text here claimed agents use this to
+  # "push the branch + `gh pr create` ... and for the final `gh pr merge`". That
+  # was stale and contradicted the github-pr-workflow skill, which documents the
+  # seat as reserved for a dedicated reviewer service and explicitly NOT an
+  # authoring credential. Measurement settled it: across 240 PRs in onprem-k8s,
+  # penstock-llm-proxy-core, paperclip and multicast the seat authored 0 and
+  # pushed 0 — authorship is 100% the App. Anyone auditing intent from the infra
+  # side was being told the opposite of what the deployment does.
+  #
+  # This volume is CONTROL-PLANE ONLY. It is no longer auto-propagated into
+  # agent Job pods: `paperclip-github-merge-token` was removed from
+  # AGENT_SECRET_VOLUME_ALLOWLIST (vendor/paperclip-adapter-claude-k8s). It was
+  # unreachable from an agent anyway — the `gh` wrapper resolves
+  # PAPERCLIP_GITHUB_TOKEN_FILE, pinned above to the App token, and shipped
+  # skills may not name the seat path — while putting a review-clearing
+  # credential on 108 agent Job pods. optional:true so the pod still starts if
+  # the secret is absent.
   - name: github-merge-token
     secret:
       secretName: paperclip-github-merge-token

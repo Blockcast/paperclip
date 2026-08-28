@@ -75,6 +75,7 @@ function createRouteDb(
   runId = "run-1",
   agentId = "agent-1",
   sourceIssue: Record<string, unknown> | null = null,
+  repairTarget: Record<string, unknown> | null = null,
 ) {
   const runRows = [{
     id: runId,
@@ -87,7 +88,14 @@ function createRouteDb(
       from: vi.fn(() => ({
         where: vi.fn(() => ({
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(
-            Object.keys(selection).includes("contextSnapshot") ? runRows : sourceIssue ? [sourceIssue] : [],
+            Object.keys(selection).includes("contextSnapshot")
+              ? runRows
+              // The liveness board-escalation coalesce key looks the incident's repair target up
+              // by id, selecting its assignee alone (BLO-24744). Keyed on the selection shape so a
+              // test that does not seed one gets an empty result rather than the source issue.
+              : Object.keys(selection).join(",") === "assigneeAgentId"
+                ? repairTarget ? [repairTarget] : []
+                : sourceIssue ? [sourceIssue] : [],
           ),
         })),
       })),
@@ -99,6 +107,7 @@ async function createAgentApp(options: {
   runId?: string;
   contextSnapshot?: Record<string, unknown>;
   sourceIssue?: Record<string, unknown> | null;
+  repairTarget?: Record<string, unknown> | null;
 } = {}) {
   const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
     import("../middleware/index.js"),
@@ -122,6 +131,7 @@ async function createAgentApp(options: {
     options.runId ?? "run-1",
     "agent-1",
     options.sourceIssue,
+    options.repairTarget ?? null,
   )));
   app.use(errorHandler);
   return app;
@@ -1132,6 +1142,151 @@ describe("approval routes idempotent retries", () => {
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   });
 
+  // BLO-24744: one pause, one card. The liveness detector mints an escalation per repair target and
+  // picks each one's owner independently, so the run filing this card cannot see its siblings and
+  // cannot pick a key that collapses with theirs. The server keys it on what a human actually
+  // decides about — the uninvokable agent — and dedupes company-wide because the sibling filers are
+  // different agents.
+  const PAUSED_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+  const REPAIR_TARGET_ISSUE_ID = "55555555-5555-4555-8555-555555555555";
+  const LIVENESS_ESCALATION_ISSUE_ID = "66666666-6666-4666-8666-666666666666";
+  const LIVENESS_ESCALATION_ISSUE = {
+    ...SOURCE_ISSUE,
+    id: LIVENESS_ESCALATION_ISSUE_ID,
+    assigneeAgentId: "agent-1",
+    originKind: "harness_liveness_escalation",
+    originId:
+      `harness_liveness:company-1:${SOURCE_ISSUE_ID}:blocked_by_uninvokable_assignee:${REPAIR_TARGET_ISSUE_ID}`,
+  } as const;
+  const LIVENESS_ESCALATION_CONTEXT = {
+    ...STATUS_ONLY_CONTEXT,
+    issueId: LIVENESS_ESCALATION_ISSUE_ID,
+    taskId: LIVENESS_ESCALATION_ISSUE_ID,
+    sourceIssueId: LIVENESS_ESCALATION_ISSUE_ID,
+  } as const;
+
+  async function fileLivenessEscalation(overrides: { idempotencyKey?: string } = {}) {
+    mockEscalationCreate();
+    return await request(await createAgentApp({
+      contextSnapshot: { ...LIVENESS_ESCALATION_CONTEXT },
+      sourceIssue: { ...LIVENESS_ESCALATION_ISSUE },
+      repairTarget: { assigneeAgentId: PAUSED_AGENT_ID },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Release Engineer is paused and blocking its issues" },
+        issueIds: [LIVENESS_ESCALATION_ISSUE_ID],
+        ...overrides,
+      });
+  }
+
+  it("keys a liveness escalation's card to the paused agent and dedupes it company-wide", async () => {
+    const res = await fileLivenessEscalation();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        idempotencyKey: `harness_liveness_board:company-1:blocked_by_uninvokable_assignee:${PAUSED_AGENT_ID}`,
+      }),
+      expect.objectContaining({ dedupeScope: "company" }),
+    );
+  });
+
+  it("overrides a filer-chosen key on a liveness escalation rather than minting a second card", async () => {
+    // Deferring to the caller here is exactly how one pause becomes N identical cards: each
+    // escalation run picks a key from what it can see, which is its own leaf.
+    const res = await fileLivenessEscalation({ idempotencyKey: "unblock-BLO-17740" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        idempotencyKey: `harness_liveness_board:company-1:blocked_by_uninvokable_assignee:${PAUSED_AGENT_ID}`,
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("falls back to the repair target when the incident names no agent to key on", async () => {
+    mockEscalationCreate();
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...LIVENESS_ESCALATION_CONTEXT },
+      sourceIssue: { ...LIVENESS_ESCALATION_ISSUE },
+      // An unassigned repair target — `blocked_by_unassigned_issue` is the shape here.
+      repairTarget: null,
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Blocker has no assignee" },
+        issueIds: [LIVENESS_ESCALATION_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        idempotencyKey:
+          `harness_liveness_board:company-1:blocked_by_uninvokable_assignee:${REPAIR_TARGET_ISSUE_ID}`,
+      }),
+      expect.objectContaining({ dedupeScope: "company" }),
+    );
+  });
+
+  it("leaves a non-liveness status-only escalation's key to the filer", async () => {
+    // Mutation control for the two above: the carve-out is scoped to detector-minted escalations.
+    // A productivity review chose to file, so its own key and the default requester scope stand.
+    mockEscalationCreate();
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+      repairTarget: { assigneeAgentId: PAUSED_AGENT_ID },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unblock owner needed for BLO-22206" },
+        issueIds: [SOURCE_ISSUE_ID],
+        idempotencyKey: "unblock-owner:BLO-22206",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.createWithIdempotency).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ idempotencyKey: "unblock-owner:BLO-22206" }),
+      expect.not.objectContaining({ dedupeScope: expect.anything() }),
+    );
+  });
+
+  it("refuses a caller-supplied key in the reserved liveness board-escalation namespace", async () => {
+    // The coalescing key is company-scoped, so it ignores who filed. That is only safe while the
+    // namespace cannot be squatted: every component of it (company, state, agent id) is guessable
+    // by any company agent, and a planted row would make the next genuine escalation for that
+    // incident replay the squatter's card instead of raising its own.
+    mockEscalationCreate();
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Unrelated ask wearing the incident's key" },
+        issueIds: [SOURCE_ISSUE_ID],
+        idempotencyKey:
+          `harness_liveness_board:company-1:blocked_by_uninvokable_assignee:${PAUSED_AGENT_ID}`,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details?.reservedPrefix).toBe("harness_liveness_board:");
+    expect(mockApprovalService.createWithIdempotency).not.toHaveBeenCalled();
+  });
+
   it("still blocks a status-only recovery run from creating non-escalation approvals", async () => {
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({ title: "Hire an SRE" });
 
@@ -1150,6 +1305,56 @@ describe("approval routes idempotent retries", () => {
     expect(res.body.details.allowedApprovalType).toBe("request_board_approval");
     expect(mockApprovalService.create).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
+  // BLO-25878. `resumeRequiresNormalModel: true` states a real requirement, but read alone it
+  // promises a normal-model retry that a recovery-pinned issue never gets: the cheap profile comes
+  // from the `source_scoped_recovery_action` wake class, and only a recorded disposition clears the
+  // recovery action. Three consecutive runs waited on that promise and filed nothing. The refusal
+  // has to name an exit the refused run can actually take.
+  it("tells a refused status-only run that no normal-model retry is coming, and names the exits", async () => {
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockResolvedValue({ title: "Hire an SRE" });
+
+    const res = await request(await createAgentApp({
+      contextSnapshot: { ...PRODUCTIVITY_REVIEW_CONTEXT },
+      sourceIssue: { ...SOURCE_ISSUE },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: { title: "Hire an SRE" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    // The requirement is still stated...
+    expect(res.body.details.resumeRequiresNormalModel).toBe(true);
+    // ...but it is explicitly not a promise that one will be dispatched.
+    expect(res.body.details.normalModelResumeIsAutomatic).toBe(false);
+    // And both reachable exits are named, so waiting is never the only reading.
+    expect(res.body.details.resumeGuidance).toContain("record a valid issue disposition");
+    expect(res.body.details.resumeGuidance).toContain("request_board_approval");
+  });
+
+  it("does not offer status-only resume guidance to a planning-only run", async () => {
+    const res = await request(await createAgentApp({
+      contextSnapshot: {
+        recoveryIntent: "planning_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: true,
+        resumeRequiresNormalModel: false,
+      },
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Not part of a planning deliverable" },
+        issueIds: [SOURCE_ISSUE_ID],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.resumeRequiresNormalModel).toBe(false);
+    expect(res.body.details).not.toHaveProperty("normalModelResumeIsAutomatic");
+    expect(res.body.details).not.toHaveProperty("resumeGuidance");
   });
 
   it("blocks planning-only recovery from creating even board-escalation approvals", async () => {

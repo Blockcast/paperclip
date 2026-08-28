@@ -721,6 +721,106 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
+  it("stamps the agent git identity on the default project_primary strategy, which has no worktree funnel", async () => {
+    // BLO-23894 gap found while finishing the change: `project_primary` is the
+    // DEFAULT strategy (asString(rawStrategy.type, "project_primary")) and it
+    // returns the base checkout directly, so it never reaches
+    // provisionExecutionWorktree. Stamping only the git_worktree paths would have
+    // left the most common configuration exhibiting the original defect.
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, [
+      "config", "--local", "user.email",
+      "290875700+allyblockcast[bot]@users.noreply.github.com",
+    ]);
+
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {},
+      issue: { id: "issue-1", identifier: "PAP-447", title: "Add Worktree Support" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    });
+
+    expect(realized.strategy).toBe("project_primary");
+    expect(realized.cwd).toBe(repoRoot);
+    await expect(readGit(repoRoot, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("codex-coder@paperclip.blockcast.net");
+    await expect(readGit(repoRoot, ["config", "--local", "--get", "user.name"]))
+      .resolves.toBe("Codex Coder");
+  });
+
+  it("keeps linked-worktree config shared and relies on the run identity env", async () => {
+    // Linked worktrees resolve `git config --local` through the common repo
+    // config. The run-level GIT_* environment is therefore the authority for
+    // attribution; provisioning must not rewrite the shared config.
+    //
+    // The repo is App-stamped first to model the real starting population: the
+    // sweep found 11 checkouts carrying the shared App identity. `createTempRepo`
+    // otherwise seeds `paperclip@example.com`, a developer-shaped address that
+    // provisioning deliberately refuses to overwrite (see the companion test
+    // below), so leaving the fixture as-is would assert the wrong policy.
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, [
+      "config", "--local", "user.email",
+      "290875700+allyblockcast[bot]@users.noreply.github.com",
+    ]);
+
+    const created = await realizeWorktreeForTest(repoRoot, "HEAD");
+    await expect(readGit(created.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("290875700+allyblockcast[bot]@users.noreply.github.com");
+    await expect(readGit(created.cwd, ["config", "--local", "--get", "user.name"]))
+      .resolves.toBe("Paperclip Test");
+    expect(created.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("per-agent git author identity")]),
+    );
+
+    await runGit(created.cwd, [
+      "config", "--local", "user.email",
+      "290875700+allyblockcast[bot]@users.noreply.github.com",
+    ]);
+
+    const reusedWorktree = await realizeWorktreeForTest(repoRoot, "HEAD");
+    expect(reusedWorktree.created).toBe(false);
+    expect(reusedWorktree.cwd).toBe(created.cwd);
+    await expect(readGit(reusedWorktree.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("290875700+allyblockcast[bot]@users.noreply.github.com");
+  });
+
+  it("leaves a developer's own git identity alone when realizing a worktree in their repo", async () => {
+    // The counterweight to the test above, and the reason provisioning only
+    // rewrites addresses paperclip owns (unset, either App form, or its own
+    // @paperclip.blockcast.net namespace).
+    //
+    // `git config --local` inside a *linked worktree* does not write anything
+    // worktree-private: it resolves through the gitdir pointer to the shared
+    // config in the common dir, i.e. the parent repository's `.git/config`.
+    // Stamping unconditionally would therefore rewrite `user.email` for the
+    // whole repository the worktree was cut from -- for a self-hosted paperclip
+    // pointed at a developer's checkout, that is a worse bug than the
+    // misattribution being fixed.
+    const repoRoot = await createTempRepo();
+
+    const created = await realizeWorktreeForTest(repoRoot, "HEAD");
+
+    // Untouched in the worktree and, equivalently, in the repo it shares config
+    // with -- asserted separately because those being the same file is exactly
+    // the hazard under test.
+    await expect(readGit(created.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("paperclip@example.com");
+    await expect(readGit(repoRoot, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("paperclip@example.com");
+    // Skipping is a deliberate policy outcome, not a failure: no warning.
+    expect(created.warnings).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("per-agent git author identity")]),
+    );
+  });
+
   it("bases a fresh worktree on origin/master even when local master has unpushed commits", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const originHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);
@@ -2548,6 +2648,101 @@ describe("realizeExecutionWorkspace", () => {
       expect.stringContaining("adopted it for subsequent runs"),
     ]));
     await expect(readGit(initial.cwd, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 15_000);
+
+  it("re-stamps the agent git identity when a persisted project_primary workspace is reused", async () => {
+    // Companion to the git_worktree case below: the `strategy !== "git_worktree"`
+    // branch of ensurePersistedExecutionWorkspaceAvailable returns the recorded
+    // cwd straight to the run without touching the worktree funnel, so it needs
+    // its own stamp (BLO-23894).
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, [
+      "config", "--local", "user.email",
+      "allyblockcast[bot]@users.noreply.github.com",
+    ]);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-primary-identity",
+        mode: "isolated_workspace",
+        strategyType: "project_primary",
+        cwd: repoRoot,
+        providerRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: null,
+      },
+      issue: { id: "issue-1", identifier: "PAP-447", title: "Add Worktree Support" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    });
+
+    expect(restored?.cwd).toBe(repoRoot);
+    await expect(readGit(repoRoot, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("codex-coder@paperclip.blockcast.net");
+  }, 15_000);
+
+  it("does not rewrite shared config when a persisted linked worktree is reused without a provision command", async () => {
+    // BLO-23894: this reuse branch used to run provisioning only when a
+    // provisionCommand was configured, so the overwhelmingly common
+    // no-provision-command workspace was never stamped at all.
+    const repoRoot = await createTempRepo();
+    const initial = await realizeWorktreeForTest(repoRoot, "HEAD");
+    if (!initial.branchName) throw new Error("expected realized worktree branch name");
+
+    await runGit(initial.cwd, [
+      "config", "--local", "user.email",
+      "allyblockcast[bot]@users.noreply.github.com",
+    ]);
+    await runGit(initial.cwd, ["config", "--local", "user.name", "allyblockcast[bot]"]);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-identity",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: initial.cwd,
+        providerRef: initial.worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: initial.branchName,
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored?.cwd).toBe(initial.cwd);
+    await expect(readGit(initial.cwd, ["config", "--local", "--get", "user.email"]))
+      .resolves.toBe("allyblockcast[bot]@users.noreply.github.com");
+    await expect(readGit(initial.cwd, ["config", "--local", "--get", "user.name"]))
+      .resolves.toBe("allyblockcast[bot]");
   }, 15_000);
 
   it("classifies persisted git worktree branch incoherence as diverged when the checked-out branch is not forward", async () => {

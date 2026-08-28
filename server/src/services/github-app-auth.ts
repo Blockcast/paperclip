@@ -5,8 +5,8 @@
  * heartbeat.ts) is a text heuristic over the agent's free-text summary; it
  * flags `pr_review_output_missing` whenever the summary lacks a recognized
  * posted-review / skip marker. In practice that misfires on legitimate runs
- * (for example, an idempotency skip or a formal App approval) — the PR *was*
- * reviewed, but the phrasing wasn't matched. This module lets the server check
+ * (an idempotency skip, or a comment-shaped review whose phrasing wasn't
+ * matched) — the PR *was* reviewed. This module lets the server check
  * the authoritative source — GitHub — before keeping that `missing` verdict.
  *
  * The server has no ambient GitHub token, so we mint short-lived **installation
@@ -158,7 +158,10 @@ export function githubAppCredentialsConfigured(): boolean {
  * Return a cached or freshly-minted installation access token, or null when
  * creds are absent or the GitHub API call fails.
  */
-export async function getInstallationTokenResult(nowMs: number = Date.now()): Promise<GitHubInstallationTokenResult> {
+export async function getInstallationTokenResult(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<GitHubInstallationTokenResult> {
   if (cachedInstallationToken && cachedInstallationToken.expiresAtMs - TOKEN_REFRESH_SKEW_MS > nowMs) {
     return { ok: true, token: cachedInstallationToken.token };
   }
@@ -177,6 +180,7 @@ export async function getInstallationTokenResult(nowMs: number = Date.now()): Pr
     res = await ghFetch(url, {
       method: "POST",
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${jwt}` },
+      signal: options.signal,
     });
   } catch {
     return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
@@ -202,7 +206,7 @@ export async function getInstallationToken(nowMs: number = Date.now()): Promise<
 }
 
 export type ReviewerEvidenceResult =
-  | { found: true; via: "review" }
+  | { found: true; via: "review" | "comment" }
   | { found: false }
   | { error: string };
 
@@ -238,6 +242,117 @@ export async function githubGetPullRequestGate(input: {
     return { error: "pull_request_state_missing" };
   }
   return { state: body.state, merged: body.merged === true };
+}
+
+/**
+ * Terminal-state lookup for a single Actions run, used to decide whether a board
+ * approval card that points at that run is still worth a human's attention.
+ *
+ * The three outcomes are kept distinct on purpose (BLO-29359). A card must only be
+ * closed on positive evidence that its gate is over: `not_found` is that evidence
+ * (the run is gone), `error` explicitly is NOT — a rate-limited or 5xx lookup must
+ * leave the card alone and retry, or a throttled GitHub would silently retire live
+ * gates.
+ *
+ * A raw 404 is *not* by itself that positive evidence: GitHub returns it for an
+ * inaccessible repository as readily as for a deleted run. `not_found` is therefore
+ * only returned once the repository has been confirmed readable — see
+ * `classifyWorkflowRunNotFound`.
+ */
+export type WorkflowRunLookup =
+  | { outcome: "found"; status: string; conclusion: string | null; htmlUrl: string | null }
+  | { outcome: "not_found" }
+  | { outcome: "error"; retryable: boolean; reason: string };
+
+/**
+ * Disambiguate a 404 on a workflow-run lookup.
+ *
+ * GitHub returns 404 both for a run that has genuinely been deleted *and* for a
+ * repository the installation token cannot see — an App that was never installed on
+ * it, had its access revoked, or a private repo outside the installation. Those are
+ * opposite facts with opposite consequences: `not_found` is the single outcome that
+ * closes an approval card, so treating an access failure as a deleted run would
+ * irreversibly cancel every live gate in that repository, which is exactly the bulk
+ * retirement `githubGetWorkflowRun`'s contract forbids.
+ *
+ * So probe the repository itself. A readable repo makes the run's absence positive
+ * evidence; anything else is ambiguous and must defer instead of closing.
+ */
+async function classifyWorkflowRunNotFound(input: {
+  apiBase: string;
+  repoFullName: string;
+  token: string;
+}): Promise<WorkflowRunLookup> {
+  let res: Response;
+  try {
+    res = await ghFetch(`${input.apiBase}/repos/${input.repoFullName}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${input.token}` },
+    });
+  } catch {
+    return { outcome: "error", retryable: true, reason: "workflow_run_repo_probe_failed" };
+  }
+  // The repo is readable, so the run really is gone.
+  if (res.ok) return { outcome: "not_found" };
+  if (res.status === 404 || res.status === 403 || res.status === 401) {
+    // Not retryable in the sense that waiting will not fix it — it needs an
+    // installation or permission change. Deferring (never closing) is the safe
+    // direction: a stale card costs a queue row, a wrongly-cancelled one costs a
+    // production deploy gate that cannot be un-cancelled.
+    return {
+      outcome: "error",
+      retryable: false,
+      reason: `workflow_run_repo_inaccessible_${res.status}`,
+    };
+  }
+  const classified = await classifyGithubHttpFailure("workflow_run_repo", res);
+  return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+}
+
+export async function githubGetWorkflowRun(input: {
+  repoFullName: string;
+  runId: number;
+}): Promise<WorkflowRunLookup> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) {
+    return { outcome: "error", retryable: tokenResult.retryable, reason: tokenResult.reason };
+  }
+
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  let res: Response;
+  try {
+    res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/actions/runs/${input.runId}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+    });
+  } catch {
+    return { outcome: "error", retryable: true, reason: "workflow_run_fetch_failed" };
+  }
+  if (res.status === 404) {
+    return await classifyWorkflowRunNotFound({
+      apiBase,
+      repoFullName: input.repoFullName,
+      token: tokenResult.token,
+    });
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("workflow_run", res);
+    return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+  }
+  const body = (await res.json().catch(() => null)) as {
+    status?: string;
+    conclusion?: string | null;
+    html_url?: string;
+  } | null;
+  if (typeof body?.status !== "string") {
+    // A 200 without a status is not evidence of anything; treat as retryable so a
+    // malformed response cannot retire a live gate.
+    return { outcome: "error", retryable: true, reason: "workflow_run_status_missing" };
+  }
+  return {
+    outcome: "found",
+    status: body.status,
+    conclusion: typeof body.conclusion === "string" ? body.conclusion : null,
+    htmlUrl: typeof body.html_url === "string" ? body.html_url : null,
+  };
 }
 
 /** Extract the leading 7-40 hex chars of a head SHA, or null. */
@@ -284,18 +399,88 @@ export async function githubFetchPrHeadSha(input: {
 }
 
 /**
- * Authoritatively check whether the reviewer GitHub App approved THIS PR's
- * required head before a claimed PR-review run can complete.
+ * Extract the head SHA a canonical consolidated Ally review attests to reviewing,
+ * or null when the body is not that canonical shape. Requires the server-owned
+ * heading AND exactly one standalone full-SHA `Reviewed head:` line: a request
+ * comment can quote an arbitrary SHA, so a loose substring match is not durable
+ * evidence that the review side effect actually happened.
+ */
+function consolidatedReviewHead(body: string): string | null {
+  if (!/(?:^|\n)\s*## Ally — Consolidated PR Review\s*(?=\n|$)/.test(body)) {
+    return null;
+  }
+  const attestations = Array.from(
+    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*`?([0-9a-f]{40})`?\s*_?\s*(?=\n|$)/gi),
+    (match) => match[1]!.toLowerCase(),
+  );
+  return attestations.length === 1 ? attestations[0]! : null;
+}
+
+/**
+ * Page cap for BOTH evidence surfaces below. Deliberately far smaller than
+ * `GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES` (500), because this predicate runs
+ * on every reviewer-run completion and so its request budget is a hot path,
+ * whereas the comment-review gate that owns that constant runs rarely.
  *
- * Found only when an APPROVED formal review from the configured App is recorded
- * on the exact wake head, or on the PR's resolved current head when the wake
- * omitted it. The same-slug user seat is a separate team-evidence lane; issue
- * comments and descendant reviews cannot satisfy this App gate.
+ * What it DOES share with that constant is the contract that matters: reaching
+ * the cap returns an `{error}`, never a silently truncated `{found:false}`. A
+ * truncated negative here would re-raise `pr_review_output_missing` and post a
+ * false "reviewer never finished" status — i.e. it would reproduce BLO-28920,
+ * merely gated on thread length instead of review state. These threads do get
+ * long (28 stacked marker requests on one PR), so the cap is reachable.
+ */
+const REVIEWER_EVIDENCE_MAX_PAGES = 10;
+
+/**
+ * Authoritatively check whether the reviewer GitHub App actually REVIEWED this
+ * PR's required head — a *run-output attestation*, not a *merge authorization*.
  *
- * Returns `{error}` on invalid configuration, missing creds/token, or any non-OK
- * or failed reviews fetch. Callers fail completion closed with a retryable
- * verification-unavailable error. An unresolved required head returns
- * `{found:false}` and never accepts arbitrary review evidence.
+ * BLO-28920 — READ THIS BEFORE TIGHTENING THE PREDICATE. These two questions
+ * look alike and are not:
+ *
+ *  - *Merge authorization* ("may this PR merge?") legitimately demands an
+ *    `APPROVED` review. That gate lives elsewhere (`githubGetPullRequestGate`).
+ *  - *Run-output attestation* ("did the reviewer run do its job?") must accept
+ *    `COMMENTED`, because that is Ally's correct output for a review carrying
+ *    findings — and because GitHub bars a PR's author from APPROVE /
+ *    REQUEST_CHANGES on its own PR. Agent PRs are authored by the App itself, so
+ *    requiring `APPROVED` here is structurally unsatisfiable for the dominant
+ *    case: n=1,962 App-authored PRs carry zero App approvals (BLO-24056).
+ *
+ * Applying the merge bar to this attestation is exactly the regression that
+ * 4c7e23d9c shipped by collapsing the App-identity branch into the user-seat
+ * branch: reviewer runs that had posted a valid exact-head `COMMENTED` review
+ * were failed `pr_review_output_missing` and retried in a paid loop (~66 runs /
+ * 3h). Every caller of this function asks the attestation question — completion
+ * verification, the stale-kill double-post probe, and the gate-status outbox —
+ * so state, not approval, is what it must key on.
+ *
+ * Found when the configured App identity left EITHER surface at the exact head,
+ * because Ally posts on either and each surface is individually blind to the
+ * other:
+ *  - a formal SUBMITTED review with `commit_id === headSha`, in any submitted
+ *    state (`COMMENTED` / `CHANGES_REQUESTED` / `APPROVED` / `DISMISSED` — a
+ *    dismissed review still happened, it was only disposed of afterwards); or
+ *  - an issue comment carrying the canonical consolidated-review heading and a
+ *    single `Reviewed head:` attestation equal to that head (comment-mode
+ *    reviews file no review object and so carry no `commit_id`).
+ *
+ * Deliberately NOT accepted, so a genuinely missing review still fails:
+ *  - the same-slug bare user seat (a distinct principal — see
+ *    `githubReviewerIdentityMatches`);
+ *  - any review at a head other than the required one;
+ *  - a `PENDING` review. That is an *unsubmitted draft*, returned by GitHub only
+ *    to the identity that created it — which is this App — and it already
+ *    carries a `commit_id`. The MCP review flow is `create pending` → `add
+ *    comments` → `submit`, so a run that dies mid-flow leaves exactly such a
+ *    draft; accepting it would let that run self-attest and would defeat the
+ *    one case this predicate exists to catch.
+ *
+ * Returns `{error}` on invalid configuration, missing creds/token, any non-OK
+ * or failed reviews/comments fetch, or an exhausted pagination cap. Callers fail
+ * completion closed with a retryable verification-unavailable error. An
+ * unresolved required head returns `{found:false}` and never accepts arbitrary
+ * review evidence.
  */
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
@@ -316,10 +501,12 @@ export async function githubHasReviewerEvidenceForPr(input: {
     headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
   if (!headSha) return { found: false };
 
-  // Only a formal APPROVED review from the configured App at the required exact
-  // head can satisfy the protected App lane.
+  // 1) Formal reviews — the configured App at this exact head, in any SUBMITTED
+  // state. `COMMENTED` counts: see the merge-authorization vs attestation note
+  // above. `PENDING` does not: it is an unsubmitted draft visible only to its
+  // creator, which is this App.
   try {
-    for (let page = 1; page <= 10; page += 1) {
+    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const res = await ghFetch(url, { headers });
       if (!res.ok) {
@@ -334,15 +521,38 @@ export async function githubHasReviewerEvidenceForPr(input: {
       for (const review of batch) {
         const authorLogin = review.user?.login ?? "";
         const commitId = headShaHex(review.commit_id);
-        if (githubReviewerIdentityMatches(authorLogin, botLogin)) {
-          if ((review.state ?? "").toUpperCase() !== "APPROVED") continue;
-          if (commitId === headSha) return { found: true, via: "review" };
-        }
+        if (!githubReviewerIdentityMatches(authorLogin, botLogin)) continue;
+        if ((review.state ?? "").toUpperCase() === "PENDING") continue;
+        if (commitId === headSha) return { found: true, via: "review" };
       }
       if (batch.length < 100) break;
+      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: "reviews_pagination_exhausted" };
     }
   } catch {
     return { error: "reviews_fetch_failed" };
+  }
+
+  // 2) Comment-shaped reviews — the second surface. Ally frequently reviews by
+  // posting a consolidated comment and files no review object at all, so a PR it
+  // demonstrably reviewed can report zero reviews on surface (1).
+  try {
+    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
+      const res = await ghFetch(url, { headers });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("comments", res);
+        return { error: classified.reason };
+      }
+      const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string | null }>;
+      for (const comment of batch) {
+        if (!githubReviewerIdentityMatches(comment.user?.login ?? "", botLogin)) continue;
+        if (consolidatedReviewHead(comment.body ?? "") === headSha) return { found: true, via: "comment" };
+      }
+      if (batch.length < 100) break;
+      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: "comments_pagination_exhausted" };
+    }
+  } catch {
+    return { error: "comments_fetch_failed" };
   }
 
   return { found: false };
@@ -421,6 +631,77 @@ export async function githubListIssueCommentsWithTimestamps(input: {
       if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
     }
     return comments;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the submitted-review history for the comment-review gate.
+ *
+ * Ally emits its consolidated review as a `pull_request_review` in the
+ * `COMMENTED` state, not as an issue comment (BLO-29711). `COMMENTED` reviews
+ * are invisible to GitHub's `reviewDecision`, which is exactly why the gate
+ * exists — but they live on `/pulls/{n}/reviews`, so a gate reading only
+ * `/issues/{n}/comments` never observes one. `githubHasReviewerEvidenceForPr`
+ * already reads both surfaces for the same reason.
+ *
+ * `PENDING` reviews are skipped: an unsubmitted draft is visible only to its
+ * creator and carries no `submitted_at`.
+ *
+ * `DISMISSED` reviews are skipped too, and the contrast with
+ * `githubHasReviewerEvidenceForPr` — which deliberately *accepts* them — is the
+ * point rather than an inconsistency (BLO-29711). That function asks whether a
+ * review run happened; a dismissed review still happened. This one supplies the
+ * verdict a merge gate is computed from, and dismissal is precisely an
+ * authorized actor withdrawing a verdict from operation, by hand or via branch
+ * protection's `dismiss_stale_reviews`. GitHub keeps the body but stops counting
+ * it toward `reviewDecision`, so reading it here re-animates a retraction, in
+ * both directions: a dismissed *blocking* review wedges a PR whose only escape
+ * hatch is the dismissal being ignored, and a dismissed *clean* review
+ * dispositions findings it no longer vouches for. Not theoretical —
+ * `Blockcast/paperclip#937` carries six DISMISSED head-attested Ally reviews.
+ *
+ * Returns null on any unreadable page so callers leave the prior status
+ * untouched rather than publishing a verdict from partial history.
+ */
+export async function githubListPrReviewsWithTimestamps(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const reviews: Array<{ login: string | null; body: string; createdAt: string }> = [];
+
+  try {
+    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
+      const response = await ghFetch(url, { headers });
+      if (!response.ok) return null;
+      const batch = (await response.json()) as Array<{
+        user?: { login?: string | null } | null;
+        body?: string | null;
+        state?: string | null;
+        submitted_at?: string | null;
+      }>;
+
+      for (const review of batch) {
+        const state = (review.state ?? "").toUpperCase();
+        if (state === "PENDING" || state === "DISMISSED") continue;
+        if (typeof review.submitted_at !== "string") continue;
+        reviews.push({
+          login: review.user?.login ?? null,
+          body: review.body ?? "",
+          createdAt: review.submitted_at,
+        });
+      }
+
+      if (batch.length < 100) return reviews;
+      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
+    }
+    return reviews;
   } catch {
     return null;
   }

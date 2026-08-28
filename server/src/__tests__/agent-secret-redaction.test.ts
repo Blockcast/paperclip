@@ -392,15 +392,15 @@ describe("agent secret redaction on mutating responses", () => {
   });
 
   // The reported case: a patch that touches no credential field at all.
-  it("PATCH /agents/:id redacts secrets on a budget-only patch", async () => {
-    mockAgentService.update.mockResolvedValue({ ...baseAgent, budgetMonthlyCents: 123_456 });
+  it("PATCH /agents/:id redacts secrets on a patch touching no credential field", async () => {
+    mockAgentService.update.mockResolvedValue({ ...baseAgent, spentMonthlyCents: 123_456 });
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 123_456 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 123_456 });
 
     expect(res.status).toBe(200);
     // The patch itself still has to work.
-    expect(res.body.budgetMonthlyCents).toBe(123_456);
+    expect(res.body.spentMonthlyCents).toBe(123_456);
     expect(res.body.adapterConfig.env).toEqual({
       OPENAI_API_KEY: "***",
       ANTHROPIC_API_KEY: "***",
@@ -462,7 +462,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(refAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(JSON.stringify(res.body)).not.toContain("\"value\"");
@@ -492,13 +492,13 @@ describe("agent secret redaction on mutating responses", () => {
       },
     };
     mockAgentService.getById.mockResolvedValue(nestedAgent);
-    mockAgentService.update.mockResolvedValue({ ...nestedAgent, budgetMonthlyCents: 42 });
+    mockAgentService.update.mockResolvedValue({ ...nestedAgent, spentMonthlyCents: 42 });
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 42 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 42 });
 
     expect(res.status).toBe(200);
-    expect(res.body.budgetMonthlyCents).toBe(42);
+    expect(res.body.spentMonthlyCents).toBe(42);
     const profile = res.body.runtimeConfig.modelProfiles.cheap.adapterConfig;
     // Non-credential config stays readable; only the bindings are masked.
     expect(profile.model).toBe("openai/gpt-5.6-sol");
@@ -522,7 +522,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(nestedAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env).toEqual({
@@ -543,7 +543,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(nestedAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig.cwd).toBe("/workspace");
@@ -577,7 +577,7 @@ describe("agent secret redaction on mutating responses", () => {
     mockAgentService.update.mockResolvedValue(refAgent);
 
     const app = createApp(boardActor);
-    const res = await request(app).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 1 });
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env.FOO).toEqual({
@@ -793,5 +793,291 @@ describe("stripRedactedEnvBindingsFromAdapterConfig — round-trip guard", () =>
       model: "openai/gpt-5.6-sol",
       mcpServers: { gbrain: { headers: {} } },
     });
+  });
+});
+
+// BLO-27991: `PATCH /agents/:id` carrying only `adapterConfig` takes the weak
+// authorization branch (`allow_self`), and the sync path behind it authorizes a
+// binding on same-company membership alone. Without a route guard any agent can
+// bind any company secret to itself. `decide` is mocked allow throughout, so
+// these assert the guard specifically and not the surrounding authorization.
+describe("agent self-service secret binding guard", () => {
+  const otherSecretId = "33333333-3333-4333-8333-333333333333";
+
+  const secretRefBinding = {
+    type: "secret_ref",
+    secretId: otherSecretId,
+    version: "latest",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.getById.mockResolvedValue(baseAgent);
+    mockAgentService.update.mockResolvedValue(baseAgent);
+    mockAgentService.create.mockResolvedValue(baseAgent);
+    mockAgentService.getChainOfCommand.mockResolvedValue([]);
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: baseAgent });
+    mockAccessService.getMembership.mockResolvedValue(null);
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.decide.mockResolvedValue({ allowed: true });
+    mockApprovalService.findOpenHireApprovalForAgent.mockResolvedValue(null);
+    mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
+    mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  it("refuses an agent self-PATCH of adapterConfig.env carrying a secret_ref", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { GITHUB_MERGE_TOKEN: secretRefBinding } } });
+
+    expect(res.status).toBe(403);
+    // Refused, not silently ignored: nothing may reach the service, because the
+    // service is what writes the company_secret_bindings row.
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // The guard is actor-conditional, so the identical request from a board actor
+  // must get past it. It cannot reach 200 in this harness: routes/agents.ts
+  // imports secretService directly rather than through ../services/index.js, so
+  // the real service runs against a db stub that cannot model a company secret
+  // and fails downstream with "Secret must belong to same company". That
+  // downstream failure is itself the evidence — it is only reachable after the
+  // guard has allowed the request through. The board path actually creating a
+  // binding row is covered DB-backed in agents-service-secret-bindings.test.ts.
+  it("does not apply the guard to a board actor making the same request", async () => {
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { GITHUB_MERGE_TOKEN: secretRefBinding } } });
+
+    // 422 specifically: the downstream company check, not a 403 from the guard
+    // and not a 500. `not.toBe(403)` alone would also pass on a crash.
+    expect(res.status).toBe(422);
+    expect(JSON.stringify(res.body)).not.toContain("cannot create, modify, or remove secret bindings");
+  });
+
+  it("refuses an agent self-PATCH carrying a user_secret_ref", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { GITHUB_TOKEN: { type: "user_secret_ref", key: "github_token" } } } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent plain schema-secret value after mediated normalization", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "hermes_gateway" });
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => ({
+      ...config,
+      apiKey: secretRefBinding,
+    }));
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { apiKey: "plain-api-key" } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("passes the agent actor when normalizing a model-profile schema secret", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "hermes_gateway" });
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(
+      async (_companyId, config, options) => {
+        if (options?.actor?.agentId === agentId) {
+          const error = new Error("agent-authored schema secret refused");
+          (error as Error & { status?: number }).status = 403;
+          throw error;
+        }
+        return config;
+      },
+    );
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          modelProfiles: {
+            cheap: { adapterConfig: { apiKey: "plain-api-key" } },
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a secret_ref smuggled in outside env", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { apiKey: secretRefBinding } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // The guard must not break the honest path. A GET masks the top-level `env`
+  // map to the sentinel, which `stripRedactedEnvBindingsFromAdapterConfig`
+  // restores from stored state.
+  it("allows an agent self-PATCH that round-trips the redacted sentinel", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { OPENAI_API_KEY: "***" }, cwd: "/workspace" } });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  // The sentinel is not the only shape an honest round-trip sends back. A
+  // `secret_ref` outside the top-level `env` map is NOT masked — redaction
+  // keeps pointers readable by design — so the agent echoes the literal
+  // binding. Refusing that 403s a caller who changed nothing about it, and
+  // leaves dropping the key as the only way to get a 200, which is itself an
+  // unauthorized deletion. So the guard diffs rather than pattern-matches.
+  it("allows an agent self-PATCH that echoes an unchanged non-env secret_ref", async () => {
+    const boundAgent = {
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, apiKey: secretRefBinding },
+    };
+    mockAgentService.getById.mockResolvedValue(boundAgent);
+    mockAgentService.update.mockResolvedValue(boundAgent);
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { apiKey: secretRefBinding, cwd: "/workspace2" } });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("allows an agent self-PATCH that echoes an unchanged env secret_ref", async () => {
+    // redactAgentConfiguration does not flatten `env`, so this shape is
+    // reachable from a real read too, not only from a hand-written body.
+    //
+    // Asserted the same way as the board-actor control above, and for the same
+    // harness reason: an `env` secret_ref reaches the real secretService, whose
+    // company check (`secrets.ts`, "Secret must belong to same company") cannot
+    // pass against a db stub. 422 is therefore the evidence — it is only
+    // reachable once the route guard has allowed the request through. The
+    // non-env case above touches no env binding and so reaches 200.
+    const boundAgent = {
+      ...baseAgent,
+      adapterConfig: { cwd: "/workspace", env: { GITHUB_MERGE_TOKEN: secretRefBinding } },
+    };
+    mockAgentService.getById.mockResolvedValue(boundAgent);
+    mockAgentService.update.mockResolvedValue(boundAgent);
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { cwd: "/workspace3", env: { GITHUB_MERGE_TOKEN: secretRefBinding } } });
+
+    expect(res.status).toBe(422);
+    expect(JSON.stringify(res.body)).not.toContain("cannot create, modify, or remove secret bindings");
+  });
+
+  // Modifying an existing binding to point somewhere else is a mutation even
+  // though the config path is unchanged.
+  it("refuses an agent self-PATCH that repoints an existing binding at another secret", async () => {
+    const boundAgent = {
+      ...baseAgent,
+      adapterConfig: { cwd: "/workspace", env: { GITHUB_MERGE_TOKEN: secretRefBinding } },
+    };
+    mockAgentService.getById.mockResolvedValue(boundAgent);
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        adapterConfig: {
+          env: {
+            GITHUB_MERGE_TOKEN: { ...secretRefBinding, secretId: "55555555-5555-4555-8555-555555555555" },
+          },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // `syncSecretRefsForTarget` runs `replaceAll: true`, so an env key the request
+  // omits has its binding row deleted. A guard that only inspects what the
+  // request carries cannot see that.
+  it("refuses an agent self-PATCH that drops an existing env binding", async () => {
+    const boundAgent = {
+      ...baseAgent,
+      adapterConfig: { cwd: "/workspace", env: { GITHUB_MERGE_TOKEN: secretRefBinding } },
+    };
+    mockAgentService.getById.mockResolvedValue(boundAgent);
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { env: { PAPERCLIP_API_URL: "http://localhost:3100" } } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent self-PATCH that drops a non-env binding via replaceAdapterConfig", async () => {
+    const boundAgent = {
+      ...baseAgent,
+      adapterConfig: { cwd: "/workspace", apiKey: secretRefBinding },
+    };
+    mockAgentService.getById.mockResolvedValue(boundAgent);
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ replaceAdapterConfig: true, adapterConfig: { cwd: "/workspace" } });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // A shallow merge preserves a key the request omits, so the same omission
+  // without `replaceAdapterConfig` removes nothing and must be allowed.
+  it("allows an agent self-PATCH that merely omits a non-env binding without replace", async () => {
+    const boundAgent = {
+      ...baseAgent,
+      adapterConfig: { cwd: "/workspace", apiKey: secretRefBinding },
+    };
+    mockAgentService.getById.mockResolvedValue(boundAgent);
+    mockAgentService.update.mockResolvedValue(boundAgent);
+
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { cwd: "/workspace4" } });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  // Same missing check, reached without a self-PATCH: an agent holding
+  // canCreateAgents can bind a secret into an agent it creates.
+  it("refuses an agent-authored create that carries a secret_ref", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "Exfil",
+        role: "engineer",
+        adapterType: "claude_local",
+        adapterConfig: { env: { GITHUB_MERGE_TOKEN: secretRefBinding } },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.create).not.toHaveBeenCalled();
   });
 });

@@ -31,21 +31,30 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
   const deployJob = getDeployJobBlock();
   const jobTimeoutMatch = deployJob.match(/^    timeout-minutes:\s*(\d+)\s*$/m);
   const helmTimeoutMatch = deployJob.match(/--wait --timeout\s+(\d+)m\b/);
-  const rolloutTimeoutMatch = deployJob.match(
-    /rollout status deployment\/paperclip-api --timeout=(\d+)m\b/,
-  );
+  // BLO-29008 added a second `rollout status` (statefulset/paperclip). Matching
+  // only the api wait made this assertion blind to exactly the drift it exists
+  // to catch: a new serial tier wait could push the worst case past the job
+  // timeout while this test stayed green. Sum every wait instead, so any future
+  // tier is covered by construction.
+  const rolloutTimeouts = [
+    ...deployJob.matchAll(/rollout status \S+ --timeout=(\d+)m\b/g),
+  ].map((match) => Number(match[1]));
 
   assert.ok(jobTimeoutMatch, "deploy job must declare timeout-minutes");
   assert.ok(helmTimeoutMatch, "deploy job must set helm upgrade --wait --timeout");
-  assert.ok(rolloutTimeoutMatch, "deploy job must bound the post-reconcile rollout wait");
+  assert.ok(rolloutTimeouts.length > 0, "deploy job must bound the post-reconcile rollout wait");
+  assert.ok(
+    rolloutTimeouts.length >= 2,
+    "deploy job must wait on BOTH tiers (api Deployment and worker StatefulSet) — BLO-29008",
+  );
 
   const jobTimeoutMinutes = Number(jobTimeoutMatch[1]);
   const helmTimeoutMinutes = Number(helmTimeoutMatch[1]);
-  const rolloutTimeoutMinutes = Number(rolloutTimeoutMatch[1]);
+  const rolloutTimeoutMinutes = rolloutTimeouts.reduce((sum, minutes) => sum + minutes, 0);
 
   assert.ok(
     jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + 10,
-    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollout (${rolloutTimeoutMinutes}m) + 10m margin`,
+    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + 10m margin`,
   );
 });
 
@@ -136,7 +145,7 @@ test("production deploy is manual-only and environment-protected", () => {
   assert.ok(conditionMatch, "deploy job must declare an if condition");
   assert.equal(
     conditionMatch[1].replace(/\s+/g, " "),
-    "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success'",
+    "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true'",
   );
   assert.match(deployJob, /environment:\n\s+name: paperclip-production/);
   assert.doesNotMatch(workflow, /^  schedule:/m);
@@ -161,6 +170,31 @@ test("Docker deploy binds Helm to the digest built for the approved SHA", () => 
   assert.match(deployJob, /--set-string image\.digest="\$\{DIGEST\}"/);
   assert.match(imageHelper, /if \.Values\.image\.digest/);
   assert.match(imageHelper, /printf "%s@%s" \.Values\.image\.repository \.Values\.image\.digest/);
+});
+
+test("Docker deploy proves live review-gate capture before authority promotion", () => {
+  const deployJob = getDeployJobBlock();
+  const renderedPlan = deployJob.indexOf('> "${unstamped}"');
+  const promotionCheck = deployJob.indexOf('authority_enabled="$(node "${PROMOTION_VERIFY_SCRIPT}"');
+  const approval = deployJob.indexOf("name: Approve exact deploy plan at admission time");
+
+  assert.ok(renderedPlan >= 0, "the target API plan must be rendered before promotion validation");
+  assert.ok(
+    renderedPlan < promotionCheck && promotionCheck < approval,
+    "capture promotion must be checked before approving or applying the target plan",
+  );
+  assert.match(deployJob, /scripts\/verify-review-gate-capture-promotion\.mjs/);
+  assert.match(deployJob, /promotion_verify_script=\$\{promotion_verifier\}/);
+  assert.match(deployJob, /PROMOTION_VERIFY_SCRIPT: \$\{\{ steps\.tooling\.outputs\.promotion_verify_script \}\}/);
+  assert.match(deployJob, /api_deployment="\$\(jq -er '\.metadata\.name/);
+  assert.match(deployJob, /kubectl -n "\$\{NS\}" get deployment "\$\{api_deployment\}" -o json/);
+  assert.match(deployJob, /PAPERCLIP_API_DEPLOYMENT="\$\{api_deployment\}"/);
+  // Current master performs a later two-tier convergence read against the
+  // historical paperclip-api name. The capture/promotion path itself must use
+  // the Helm-resolved name before the admission approval boundary.
+  assert.doesNotMatch(deployJob.slice(0, approval), /get deployment paperclip-api/);
+  assert.match(deployJob, /--target "\$\{unstamped\}" --print-authority/);
+  assert.match(deployJob, /--target "\$\{unstamped\}" --live "\$\{live_capture\}"/);
 });
 
 test("Docker deploy approves the exact stamped plan before Helm mutates production", () => {

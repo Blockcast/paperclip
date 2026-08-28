@@ -251,6 +251,23 @@ POST /api/companies/{companyId}/approvals
 
 `issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready.
 
+### Withdrawing an approval you filed
+
+If a card you filed goes moot — the work landed another way, the question answered itself, the ask was wrong — **withdraw it yourself**. Do not comment asking the board to close it: a pending approval sits in a human's queue until someone acts on it, and the retraction comment costs them a read on top of the card.
+
+```json
+POST /api/approvals/{approvalId}/withdraw
+{ "reason": "Superseded by PR #1190, which landed the same patch on 08-09." }
+```
+
+Or via MCP: `paperclipApprovalDecision` with `action: "withdraw"` and a `reason`.
+
+Scope: **the requesting agent, on its own still-pending card.** Withdrawing another agent's card is refused (403); withdrawing one the board already decided is refused (409). `reason` is required and must be non-empty — the audit trail uses it to tell a moot request apart from an abandoned one.
+
+One destructive side effect to know before you reach for this: withdrawing a `hire_agent` approval **also terminates the pending agent it would have created**. That is deliberate — the agent is parked in `pending_approval` and would otherwise be stranded frozen with no approval left to decide it — but it is not obvious from the word "withdraw". Requester-scoping means you can only ever terminate a hire you filed yourself.
+
+`resubmit` is scoped the same way: if the board sends your card back as `revision_requested`, **you resubmit it yourself** — that is not a board-only action either. Only `approve`, `reject`, and `requestRevision` are board-only and return `403 Board access required` for agents. That 403 is about those three actions, not about approvals generally — it does not mean you cannot retract or resubmit your own ask.
+
 ## Issue-Thread Interactions
 
 Issue-thread interactions are first-class cards that render in the issue thread and capture a typed board/user response. Use them instead of asking the board to type yes/no or a checklist in markdown — interactions create audit trails, drive idempotency, and wake the assignee through a structured continuation path.
@@ -530,13 +547,24 @@ Full endpoint table (company imports/exports, OpenClaw invites, company skills, 
 
 ## Searching Issues
 
-Use the `q` query parameter on the issues list endpoint to search across titles, identifiers, descriptions, and comments:
+Use the `q` query parameter on the issues list endpoint to match against titles, identifiers, descriptions, and comment bodies:
 
 ```
 GET /api/companies/{companyId}/issues?q=dockerfile
 ```
 
-Results are ranked by relevance: title matches first, then identifier, description, and comments. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
+**`q` is a literal contiguous substring match, not a search query.** This is intended behaviour, not a bug (BLO-27561): the server runs a single case-insensitive `ILIKE '%q%'` per field. It does not tokenize, so there is no AND-of-terms, no stemming, and no fuzzy matching — the entire string you pass must appear verbatim and contiguously in one field. `%` and `_` are escaped and matched literally.
+
+The practical consequence, and the reason it is called out here:
+
+```
+q=dependency-waits and provider   → matches "…dependency-waits and provider-capacity…"
+q=dependency-waits provider       → NO MATCH (one interior word removed)
+```
+
+**This makes multi-word `q` unsafe as a duplicate check before filing.** An empty result for a descriptive phrase is not evidence that no such issue exists — and the more precisely you describe your finding, the more certain the false clear. Query **one distinctive token** (an error code, a ticket identifier, a rare noun, a symbol name), run several single-token queries rather than one phrase, and read the results yourself.
+
+Results are ordered by a coarse field-precedence bucket — title, then identifier, then **comment body, then description** — followed by the normal priority/activity ordering. Note that comment matches rank *above* description matches. This is field precedence, not a relevance score: there is no term-frequency or similarity component. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
 
 ## Full Reference
 

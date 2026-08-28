@@ -291,12 +291,21 @@ describeEmbeddedPostgres("pipeline routes", () => {
     await http.delete(`/api/cases/${blocked.body.case.id}/issue-links/${workLink.body.id}`).expect(200);
 
     const [routine] = await db.insert(routines).values({ companyId: company.id, title: "Routine" }).returning();
+    const [blockedCase] = await db
+      .select({
+        stageId: pipelineCases.stageId,
+        stageGeneration: pipelineCases.stageGeneration,
+      })
+      .from(pipelineCases)
+      .where(eq(pipelineCases.id, blocked.body.case.id));
     await db.insert(pipelineAutomationExecutions).values({
       companyId: company.id,
       caseId: blocked.body.case.id,
       automationId: "retry-me",
       triggeringEventId: randomUUID(),
       routineId: routine!.id,
+      stageId: blockedCase!.stageId,
+      stageGeneration: blockedCase!.stageGeneration,
       status: "failed",
       error: "boom",
     });

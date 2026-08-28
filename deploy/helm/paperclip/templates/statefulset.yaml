@@ -1,3 +1,4 @@
+{{- include "paperclip.validateGithubReviewGate" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -25,7 +26,34 @@ spec:
         {{- with .Values.pod.labels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.pod.annotations }}
+      {{- /*
+      BLO-29008: stamp the deployed commit onto the WORKER pod template, the
+      same way deployment-api.yaml stamps the API tier.
+
+      This tier is the one that drives heartbeat dispatch. Before this stamp
+      existed there was no assertable signal for what commit it ran: the deploy
+      job waited only on `deployment/paperclip-api`, so a roll that updated the
+      api and left the worker behind reported `success` while the worker served
+      pre-fix code. In BLO-28920 that cost hours of a live incident with the
+      stated acceptance criterion ("paperclip-api deployed-commit is at or past
+      X") fully satisfied the whole time.
+
+      Kept structurally identical to the API stamp — reserved-key guard, then
+      40-hex validation, then a single merged key — so that setting it changes
+      NOTHING ELSE in the render. That property is what lets the deploy job
+      compare the two tiers' values directly.
+      */}}
+      {{- $podAnnotations := deepCopy (.Values.pod.annotations | default dict) }}
+      {{- if hasKey $podAnnotations "paperclip.blockcast.net/deployed-commit" }}
+      {{- fail "pod.annotations must not set reserved key paperclip.blockcast.net/deployed-commit; use worker.deployedCommit through the release workflow" }}
+      {{- end }}
+      {{- with .Values.worker.deployedCommit }}
+      {{- if not (regexMatch "^[0-9a-f]{40}$" .) }}
+      {{- fail (printf "worker.deployedCommit must be 40 lowercase hex characters, got %q" .) }}
+      {{- end }}
+      {{- $_ := set $podAnnotations "paperclip.blockcast.net/deployed-commit" . }}
+      {{- end }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -50,7 +78,7 @@ spec:
       initContainers:
         - name: seed
           image: {{ include "paperclip.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "paperclip.imagePullPolicy" . }}
           securityContext:
             {{- toYaml .Values.pod.containerSecurityContext | nindent 12 }}
           command:
@@ -315,11 +343,49 @@ spec:
               # from this pod, so gh/git/github-mcp-server read the current
               # App installation token file at process start instead of carrying
               # the env snapshot from Job creation time.
+              #
+              # GH_SEAT_TOKEN_VALUE (BLO-22243): a narrow, explicit per-call
+              # override, mirroring the one scripts/gh-token-wrapper.sh already
+              # documents for the base image's /usr/bin/gh. Before this fix the
+              # override was silently ignored here, because .local/bin precedes
+              # /usr/bin on PATH and this file is the one every agent pod
+              # actually runs. That gap is why the fleet-wide merge-token PAT
+              # mounted at /paperclip/.secrets/github-merge-token/token (covers
+              # repos outside the allyblockcast[bot] App installation, e.g.
+              # user-owned allyblockcast/*) had no wired-in way to reach `gh`
+              # or `git` except a bare 403. Do not make this override the
+              # default token source — it exists so a caller can opt in for one
+              # invocation, not so every call silently gains the PAT's broader
+              # reach.
               LOCAL_BIN="${BASE}/.local/bin"
               mkdir -p "${LOCAL_BIN}"
               cat > "${LOCAL_BIN}/paperclip-github-token-env" <<'EOF'
               #!/bin/sh
               set -eu
+              if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+                TOKEN="${GH_SEAT_TOKEN_VALUE}"
+                while :; do
+                  case "${TOKEN}" in
+                    [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+                    *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+                    *) break ;;
+                  esac
+                done
+                if [ -z "${TOKEN}" ]; then
+                  echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                  exit 64
+                fi
+                case "${TOKEN}" in
+                  *[[:space:]]*)
+                    echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+                    exit 64
+                    ;;
+                esac
+                export GH_TOKEN="${TOKEN}"
+                export GITHUB_TOKEN="${TOKEN}"
+                export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
+                exec "$@"
+              fi
               TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
               if [ ! -r "${TOKEN_FILE}" ]; then
                 echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
@@ -339,10 +405,42 @@ spec:
               #!/bin/sh
               [ "${1:-get}" = "get" ] || exit 0
               INPUT="$(cat)"
-              case "${INPUT}" in
-                *"host=github.com"*) ;;
-                *) exit 0 ;;
-              esac
+              # Require exact "protocol=https" and "host=github.com" lines,
+              # not substrings: git sends one key=value pair per line. A
+              # substring match on the raw blob would also match a line like
+              # "host=github.com.evil.example", handing that attacker-chosen
+              # host the merge-token PAT this override exists to gate. Pinning
+              # protocol=https as well keeps the token off plaintext HTTP,
+              # where an http://github.com/... remote could otherwise send it
+              # unencrypted before any redirect could protect it.
+              if ! printf '%s\n' "${INPUT}" | grep -Fxq 'protocol=https'; then
+                exit 0
+              fi
+              if ! printf '%s\n' "${INPUT}" | grep -Fxq 'host=github.com'; then
+                exit 0
+              fi
+              if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+                TOKEN="${GH_SEAT_TOKEN_VALUE}"
+                while :; do
+                  case "${TOKEN}" in
+                    [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+                    *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+                    *) break ;;
+                  esac
+                done
+                case "${TOKEN}" in
+                  "")
+                    echo "github-token-credential-helper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                    exit 1
+                    ;;
+                  *[[:space:]]*)
+                    echo "github-token-credential-helper: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+                    exit 1
+                    ;;
+                esac
+                printf 'username=x-access-token\npassword=%s\n\n' "${TOKEN}"
+                exit 0
+              fi
               TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
               [ -r "${TOKEN_FILE}" ] || exit 0
               TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
@@ -351,7 +449,11 @@ spec:
               EOF
               cat > "${LOCAL_BIN}/gh" <<'EOF'
               #!/bin/sh
-              exec /paperclip/.local/bin/paperclip-github-token-env /usr/bin/gh "$@"
+              # Keep egress scrubbing at the last wrapper before the real GitHub
+              # CLI. /usr/bin/gh is itself the image-level token wrapper, so it
+              # still supplies the live App/seat token after this runtime has
+              # rewritten authored argv and file-backed bodies.
+              exec /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-cli-egress-runtime.js /usr/bin/gh "$@"
               EOF
               cat > "${LOCAL_BIN}/github-mcp-server" <<'EOF'
               #!/bin/sh
@@ -658,7 +760,7 @@ spec:
       containers:
         - name: paperclip
           image: {{ include "paperclip.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "paperclip.imagePullPolicy" . }}
           securityContext:
             {{- toYaml .Values.pod.containerSecurityContext | nindent 12 }}
           workingDir: /app
@@ -738,6 +840,26 @@ spec:
             {{- with ((.Values.githubApp).reviewerBotLogin) }}
             - name: PAPERCLIP_PR_REVIEWER_BOT_LOGIN
               value: {{ . | quote }}
+            {{- end }}
+            {{- if ((.Values.githubApp).reviewGateCaptureEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED
+              value: "true"
+            {{- with ((.Values.githubApp).reviewGateRepositories) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedAppId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedInstallationId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if ((.Values.githubApp).reviewGateEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED
+              value: "true"
             {{- end }}
             {{- with ((.Values.githubApp).prReviewGateStatusContext) }}
             - name: PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT

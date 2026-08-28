@@ -233,7 +233,7 @@ export function derivePersistedMonitorState(input: {
   const notes = scheduledMonitor?.notes ?? normalizeMonitorNotes(input.issue.monitorNotes) ?? fromState?.notes ?? null;
   const scheduledByRaw = input.issue.monitorScheduledBy ?? scheduledMonitor?.scheduledBy ?? fromState?.scheduledBy ?? null;
   const scheduledBy =
-    scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
+    scheduledByRaw === "assignee" || scheduledByRaw === "board" || scheduledByRaw === "manager" ? scheduledByRaw : null;
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
   // BLO-18294: convergence bookkeeping has no dedicated columns, so it only
   // survives via executionState. Carry it across every derived shape.
@@ -528,7 +528,7 @@ export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
  * monitor with no configured limit remains unbounded.
  */
 export function exhaustedMonitorClearReason(input: {
-  monitor: IssueExecutionMonitorPolicy | null;
+  monitor: Pick<IssueExecutionMonitorPolicy, "timeoutAt" | "maxAttempts"> | null;
   attemptCount: number;
   now: Date;
   defaultMaxAttempts?: number | null;
@@ -1169,6 +1169,24 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   };
 }
 
+/**
+ * PEN-1995: `issues.monitorNotes` describes the monitor that is currently armed.
+ * Every clear path already nulls `monitorNextCheckAt`/`monitorWakeRequestedAt`
+ * but used to leave the notes column populated, so a retired monitor's notes
+ * survived as a live-looking instruction. Observed cost: notes registering a
+ * discriminator to read at a trigger time outlived their monitor by four days,
+ * and the next reader treated them as an active gate. The audit copy lives on
+ * `executionState.monitor.notes` (`buildClearedMonitorState` carries it
+ * forward), so nulling the column loses nothing.
+ *
+ * Applied by every clear site so a future branch cannot forget one.
+ */
+function clearArmedMonitorColumns(patch: Record<string, unknown>) {
+  patch.monitorNextCheckAt = null;
+  patch.monitorWakeRequestedAt = null;
+  patch.monitorNotes = null;
+}
+
 function applyMonitorTransition(
   input: TransitionInput,
   stagePatch: Record<string, unknown>,
@@ -1238,8 +1256,7 @@ function applyMonitorTransition(
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
       patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-      patch.monitorNextCheckAt = null;
-      patch.monitorWakeRequestedAt = null;
+      clearArmedMonitorColumns(patch);
       targetMonitorState = buildClearedMonitorState({
         previous: currentMonitorState,
         clearReason: invalidReason,
@@ -1256,8 +1273,7 @@ function applyMonitorTransition(
           throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
         }
         patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-        patch.monitorNextCheckAt = null;
-        patch.monitorWakeRequestedAt = null;
+        clearArmedMonitorColumns(patch);
         targetMonitorState = buildClearedMonitorState({
           previous: currentMonitorState,
           clearReason: exhaustedReason,
@@ -1288,8 +1304,7 @@ function applyMonitorTransition(
           : null;
         if (convergence?.converged) {
           patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-          patch.monitorNextCheckAt = null;
-          patch.monitorWakeRequestedAt = null;
+          clearArmedMonitorColumns(patch);
           patch.status = "blocked";
           targetMonitorState = buildClearedMonitorState({
             previous: currentMonitorState,
@@ -1313,8 +1328,7 @@ function applyMonitorTransition(
       }
     }
   } else if (previousPolicy?.monitor) {
-    patch.monitorNextCheckAt = null;
-    patch.monitorWakeRequestedAt = null;
+    clearArmedMonitorColumns(patch);
     targetMonitorState = buildClearedMonitorState({
       previous: currentMonitorState,
       clearReason:
@@ -1450,6 +1464,9 @@ export function buildIssueMonitorClearedPatch(input: {
     executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
     monitorNextCheckAt: null,
     monitorWakeRequestedAt: null,
+    // PEN-1995: see clearArmedMonitorColumns — the notes describe the armed
+    // monitor, and the audit copy is on executionState.monitor.notes.
+    monitorNotes: null,
   };
 }
 

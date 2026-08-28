@@ -305,15 +305,108 @@ jobs:
             echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:${{ steps.image_tag.outputs.value }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
-    needs: build-and-push
+  # BLO-26972: GitHub allows only ONE run to sit *pending* per concurrency
+  # group. `deploy`'s group is keyed on the release/namespace, not on this
+  # run, so a second workflow_dispatch that reaches the group while an
+  # earlier one is still parked on the paperclip-production reviewer gate
+  # does not queue behind it — GitHub cancels the earlier, already-waiting
+  # approval outright. `cancel-in-progress: false` does not prevent this: it
+  # only stops a later run from cancelling an earlier run's *in-progress*
+  # job, and a run stuck on environment-approval review is not in progress.
+  # Three consecutive production deploys died this way, unapproved, each
+  # evicted within minutes of the next dispatch.
+  #
+  # This fast pre-check catches the common case in seconds, without waiting
+  # on build-and-push. It is NOT sufficient on its own: it runs ~5 minutes
+  # before `deploy` would enter the concurrency group, so two dispatches
+  # launched inside that build window can both see blocked=false here and
+  # then race at the group gate. guard-pending-deploy-final below is the
+  # authoritative re-check that closes that window.
+  guard-pending-deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' }}
     runs-on: arc-deploy
-    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' }}
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Check for an existing pending production approval
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: .github/scripts/guard-pending-deploy.sh
+
+  # Re-runs the same check immediately before `deploy` enters the
+  # paperclip-production concurrency group, closing the race window the fast
+  # guard above cannot: a sibling dispatch that started its own pending
+  # approval sometime during this run's build-and-push. Costs no extra wall
+  # time — `deploy` already waits out build-and-push, so this rides the same
+  # ~5 minutes rather than adding to it. Skipped (not run) once the fast
+  # guard has already found blocked=true, since re-checking can't change
+  # that outcome.
+  guard-pending-deploy-final:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' }}
+    needs: [build-and-push, guard-pending-deploy]
+    runs-on: arc-deploy
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Re-check for a pending production approval right before deploy
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: .github/scripts/guard-pending-deploy.sh
+
+  deploy:
+    # Both guard results are required (not just their `blocked` outputs) so
+    # a failed/errored guard check — e.g. a GitHub API hiccup — fails closed
+    # into skipping this deploy, rather than silently proceeding with an
+    # unknown pending-approval state. guard-pending-deploy-final is the one
+    # that actually closes the eviction window; guard-pending-deploy alone
+    # only short-circuits the common case fast.
+    needs: [build-and-push, guard-pending-deploy, guard-pending-deploy-final]
+    runs-on: arc-deploy
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
-    # Covers the sequential 30m Helm wait and 30m post-reconcile rollout wait,
-    # plus checkout, approval, final verification, and cleanup margin.
-    timeout-minutes: 70
+    # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
+    # rollout wait (BLO-29008), plus checkout, approval, final verification, and
+    # cleanup margin. scripts/check-docker-deploy-timeout.test.js sums EVERY
+    # `rollout status --timeout=` in this job, so adding a third tier wait
+    # without raising this fails CI rather than silently overrunning the job.
+    timeout-minutes: 85
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -467,6 +560,7 @@ jobs:
           sparse-checkout: |
             scripts/approve-paperclip-api-digest.sh
             scripts/stamp-paperclip-api-approval-plan.sh
+            scripts/verify-review-gate-capture-promotion.mjs
           sparse-checkout-cone-mode: false
 
       - name: Verify release tooling revision
@@ -491,12 +585,14 @@ jobs:
           fi
           script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
           stamper="$(pwd)/.release-tooling/scripts/stamp-paperclip-api-approval-plan.sh"
-          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ]; then
+          promotion_verifier="$(pwd)/.release-tooling/scripts/verify-review-gate-capture-promotion.mjs"
+          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ] || [ ! -r "${promotion_verifier}" ]; then
             echo "Approval release tooling missing or non-executable at trusted revision ${expected}" >&2
             exit 1
           fi
           echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
           echo "stamp_script=${stamper}" >> "$GITHUB_OUTPUT"
+          echo "promotion_verify_script=${promotion_verifier}" >> "$GITHUB_OUTPUT"
 
       - name: Render, stamp, and validate deploy plan
         id: plan
@@ -507,6 +603,7 @@ jobs:
           TAG: ${{ needs.build-and-push.outputs.image_tag }}
           COMMIT: ${{ steps.target.outputs.full }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
+          PROMOTION_VERIFY_SCRIPT: ${{ steps.tooling.outputs.promotion_verify_script }}
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -546,6 +643,26 @@ jobs:
                     ((.spec.template.metadata.annotations // {}) + {($key): $commit})
                 end
               ' > "${unstamped}"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${unstamped}")"
+
+          # A single rolling update cannot safely introduce capture and authority:
+          # old API replicas would still acknowledge without persisting. Trusted
+          # release tooling compares the full capture contract and rollout state
+          # before promotion. GitHub does not auto-redeliver failed webhooks, so
+          # an outage-based Recreate fallback is also unsafe.
+          authority_enabled="$(node "${PROMOTION_VERIFY_SCRIPT}" \
+            --target "${unstamped}" --print-authority)"
+          if [ "${authority_enabled}" = "true" ]; then
+            live_capture="${RUNNER_TEMP}/paperclip-api-live-capture.json"
+            if ! kubectl -n "${NS}" get deployment "${api_deployment}" -o json > "${live_capture}"; then
+              echo "Review-gate authority requires an earlier completed capture-only API rollout" >&2
+              exit 1
+            fi
+            node "${PROMOTION_VERIFY_SCRIPT}" --target "${unstamped}" --live "${live_capture}"
+          elif [ "${authority_enabled}" != "false" ]; then
+            echo "Promotion verifier returned invalid authority state: ${authority_enabled}" >&2
+            exit 1
+          fi
 
           canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
             del(.spec.template.metadata.annotations[$key])
@@ -568,7 +685,8 @@ jobs:
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
-            | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+            | PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
+              PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
               PAPERCLIP_DEPLOYED_COMMIT="${COMMIT}" \
               PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
@@ -579,11 +697,12 @@ jobs:
             --arg marker "${marker}" \
             --arg commit "${COMMIT}" \
             --arg image "${expected_image}" \
-            --arg namespace "${NS}" '
+            --arg namespace "${NS}" \
+            --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
-            .metadata.name == "paperclip-api" and
+            .metadata.name == $name and
             .spec.template.metadata.annotations[$key] == $marker and
             .spec.template.metadata.annotations[$deployedCommitKey] == $commit and
             (.spec.template.spec.containers | all(.image == $image))
@@ -642,6 +761,7 @@ jobs:
           approval_log="${approver_dir}/approval.log"
           deploy_kubeconfig="${KUBECONFIG}"
           approved_server_plan="$(mktemp "${RUNNER_TEMP}/paperclip-api-approved.XXXXXXXX.json")"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${DEPLOY_PLAN}")"
 
           # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
           # failure exiting under `set -e` cannot leave it behind. umask instead
@@ -651,16 +771,17 @@ jobs:
           unset APPROVER_KUBECONFIG
 
           KUBECONFIG="${approver_kubeconfig}" \
+            PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
             PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
             PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
 
-          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" '
+          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
-            .metadata.name == "paperclip-api" and
+            .metadata.name == $name and
             ((.metadata.resourceVersion == null) or
               (.metadata.resourceVersion | type == "string" and length > 0)) and
             .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
@@ -696,12 +817,13 @@ jobs:
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${APPROVED_SERVER_PLAN}")"
           reconcile_approved_api_plan() {
             local attempt live_json reconciled replace_err
             reconciled="$(mktemp "${RUNNER_TEMP}/paperclip-api-reconciled.XXXXXXXX.json")"
             replace_err="$(mktemp "${RUNNER_TEMP}/paperclip-api-replace.XXXXXXXX.err")"
             for attempt in $(seq 1 5); do
-              live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+              live_json="$(kubectl -n "${NS}" get deployment "${api_deployment}" -o json)"
               jq --slurpfile approved "${APPROVED_SERVER_PLAN}" '
                 def release_controlled_metadata_key:
                   startswith("app.kubernetes.io/") or
@@ -790,12 +912,14 @@ jobs:
           }
           trap stop_background_helm EXIT
 
-          helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
+          PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
+            helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
             -n "${NS}" \
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
+            --set-string worker.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
             --atomic --wait --timeout 30m &
           helm_pid=$!
@@ -807,7 +931,7 @@ jobs:
           # marker-bearing intermediate Deployment is left live.
           api_plan_reconciled=""
           while kill -0 "${helm_pid}" 2>/dev/null; do
-            live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+            live_marker="$(kubectl -n "${NS}" get deployment "${api_deployment}" \
               -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
               2>/dev/null || true)"
             if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
@@ -827,7 +951,7 @@ jobs:
           # invocation; only this unconditional post-wait pass guarantees a later
           # three-way merge or failure cannot strand live-only template drift.
           api_plan_reconciled=""
-          live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+          live_marker="$(kubectl -n "${NS}" get deployment "${api_deployment}" \
             -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
             2>/dev/null || true)"
           if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
@@ -843,7 +967,28 @@ jobs:
             exit "${helm_status}"
           fi
 
-          kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
+          kubectl -n "${NS}" rollout status "deployment/${api_deployment}" --timeout=30m
+
+          # BLO-29008: the api Deployment is only ONE of the two tiers this
+          # release rolls. statefulset/paperclip runs PAPERCLIP_NODE_ROLE=worker
+          # -- the singleton that drives heartbeat dispatch and hosts the plugin
+          # workers -- so a release that settles the api and leaves the worker
+          # behind has shipped nothing for every heartbeat-path fix. Waiting on
+          # it here is what makes the job's `success` mean "both tiers are on
+          # this build" instead of "the HTTP tier is".
+          #
+          # 15m, not the api's 30m, and the tighter bound is deliberate: this
+          # wait is serial with the two above it, and
+          # .github/scripts/guard-pending-deploy.sh blocks on ANY non-terminal
+          # docker.yml run -- so a worker that will never converge would hold a
+          # fleet-wide deploy freeze for the whole window. 15m is still clear of
+          # the worst-case cold start: the seed init container runs up to 13
+          # `timeout 45s` plugin-seed calls (~9m45s) and the startup probe budget
+          # is failureThreshold 30 x periodSeconds 10 (5m). Raise this only
+          # alongside that arithmetic, and keep the deploy job's timeout-minutes
+          # covering helm + api + worker + 10m (pinned by
+          # scripts/check-docker-deploy-timeout.test.js).
+          kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=15m
 
           # Use the approver's canonical projection verbatim. Comparing the live
           # object with the handed-off server plan proves the lock can be retired
@@ -857,7 +1002,7 @@ jobs:
           fi
           approved_server_plan_sha256="$(jq -cS "${canonical_jq}" "${APPROVED_SERVER_PLAN}" \
             | sha256sum | awk '{print $1}')"
-          live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+          live_json="$(kubectl -n "${NS}" get deployment "${api_deployment}" -o json)"
           live_server_plan_sha256="$(jq -cS "${canonical_jq}" <<<"${live_json}" \
             | sha256sum | awk '{print $1}')"
           if [ "${live_server_plan_sha256}" != "${approved_server_plan_sha256}" ]; then
@@ -872,6 +1017,66 @@ jobs:
               .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
               (.spec.template.spec.containers | all(.image == $image))
             ' <<<"${live_json}" >/dev/null
+
+          # BLO-29008: two-tier convergence gate. Everything above this point
+          # verifies the api tier only -- against the approved plan, its marker,
+          # its commit and its digest. All of it passed during BLO-28920 while
+          # statefulset/paperclip sat on a 32h-old image, because nothing ever
+          # asked the worker what it was running.
+          #
+          # This block is the assertion that makes a partial roll a FAILURE
+          # rather than a green run. It reads the live objects (not the render),
+          # so it also catches a tier left behind by an out-of-band change --
+          # which is exactly how the BLO-28920 split arose, with no docker.yml
+          # deploy job involved at all.
+          #
+          # It verifies CONVERGENCE, not provenance: a tier that someone
+          # hand-rolled to the correct digest outside Helm passes this gate,
+          # leaving live state right and the Helm release state stale. A green
+          # gate is therefore not proof the release is Helm-consistent.
+          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
+          commit_path='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/deployed-commit}'
+          api_image="$(kubectl -n "${NS}" get deployment paperclip-api \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          worker_image="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          api_commit="$(kubectl -n "${NS}" get deployment paperclip-api -o jsonpath="${commit_path}")"
+          worker_commit="$(kubectl -n "${NS}" get statefulset paperclip -o jsonpath="${commit_path}")"
+          sts_current_revision="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.status.currentRevision}')"
+          sts_update_revision="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.status.updateRevision}')"
+
+          tier_failures=""
+          if [ "${api_image}" != "${expected_image}" ]; then
+            tier_failures="${tier_failures}  api image     ${api_image:-<empty>} != ${expected_image}"$'\n'
+          fi
+          if [ "${worker_image}" != "${expected_image}" ]; then
+            tier_failures="${tier_failures}  worker image  ${worker_image:-<empty>} != ${expected_image}"$'\n'
+          fi
+          if [ "${api_commit}" != "${COMMIT}" ]; then
+            tier_failures="${tier_failures}  api commit    ${api_commit:-<unstamped>} != ${COMMIT}"$'\n'
+          fi
+          if [ "${worker_commit}" != "${COMMIT}" ]; then
+            tier_failures="${tier_failures}  worker commit ${worker_commit:-<unstamped>} != ${COMMIT}"$'\n'
+          fi
+          if [ "${sts_current_revision}" != "${sts_update_revision}" ]; then
+            tier_failures="${tier_failures}  worker revision unsettled: current ${sts_current_revision:-<empty>} != update ${sts_update_revision:-<empty>}"$'\n'
+          fi
+
+          if [ -n "${tier_failures}" ]; then
+            echo "Two-tier convergence check FAILED (BLO-29008)." >&2
+            echo "A partial roll must not report success: the worker tier drives" >&2
+            echo "heartbeat dispatch, so an api-only deploy ships nothing for it." >&2
+            echo "" >&2
+            printf '%s' "${tier_failures}" >&2
+            echo "" >&2
+            echo "  deployment/paperclip-api image:  ${api_image:-<empty>}" >&2
+            echo "  statefulset/paperclip   image:  ${worker_image:-<empty>}" >&2
+            echo "  expected image:                  ${expected_image}" >&2
+            exit 1
+          fi
+          echo "Two-tier convergence OK: api and worker both on ${expected_image} at ${COMMIT}"
 
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
