@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 
+// @ts-expect-error -- plain-JS census script; imported for its own predicate so
+// the retirement description is checked against the real thing, not a copy.
+import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
+
 import {
+  commentReviewGateRetirementDescription,
+  commentReviewGateRetirementStatus,
   commentReviewGateVerdictIsMisreadable,
   evaluateCommentReviewGate,
+  retiredCommentReviewGateContexts,
 } from "../services/pr-comment-review-gate.js";
 
 const OLD_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -622,5 +629,85 @@ describe("evaluateCommentReviewGate", () => {
     });
 
     expect(verdict).toMatchObject({ state: "failure" });
+  });
+});
+
+// BLO-29711 AC#1. The deployed context moved out of the `review/` namespace so
+// a green can no longer be misread as review evidence. Because commit statuses
+// cannot be deleted, the pre-rename rows have to be superseded in place.
+describe("retired context supersede", () => {
+  const LIVE = "gate/ally-comment-findings";
+
+  it("excludes the live context so a retirement pointer cannot overwrite a real verdict", () => {
+    expect(retiredCommentReviewGateContexts(["review/ally-comment", LIVE], LIVE)).toEqual([
+      "review/ally-comment",
+    ]);
+    // Case and padding are how an operator typo actually looks.
+    expect(retiredCommentReviewGateContexts([" Gate/Ally-Comment-Findings "], LIVE)).toEqual([]);
+  });
+
+  it("drops blanks and duplicates", () => {
+    expect(
+      retiredCommentReviewGateContexts(
+        ["review/ally-comment", "  ", "review/ally-comment", ""],
+        LIVE,
+      ),
+    ).toEqual(["review/ally-comment"]);
+    expect(retiredCommentReviewGateContexts(undefined, LIVE)).toEqual([]);
+  });
+
+  it("points at the live context without claiming anything about review", () => {
+    const description = commentReviewGateRetirementDescription(LIVE);
+
+    expect(description).toContain(LIVE);
+    // Asserted against the census's own predicate rather than a copy of its
+    // regex, so the two cannot drift apart: if the census ever broadens what it
+    // treats as a not-evaluated admission, this fails instead of silently
+    // leaving AC#1 failing under the retired context name.
+    expect(admitsNothingEvaluated(description)).toBe(false);
+  });
+
+  // The retired context may still be a *required* check on a deployment that
+  // has not yet switched the requirement to the live context — BLO-26602 is
+  // that migration, and this code cannot read branch protection to find out.
+  // A fixed green here would satisfy the required legacy check while the live
+  // context reports a blocking finding, letting a PR merge with unresolved
+  // Critical/Important findings: the fail-open of this very issue, restored
+  // through the cleanup path.
+  it("never writes a green retirement row while the live verdict is blocking", () => {
+    for (const verdict of [
+      { state: "failure", outcome: "blocking_finding" },
+      { state: "failure", outcome: "carried_finding" },
+    ] as const) {
+      const retirement = commentReviewGateRetirementStatus(LIVE, verdict);
+
+      expect(retirement.state).toBe("failure");
+      expect(retirement.description).toContain(LIVE);
+      // Still a pointer, and still no not-evaluated claim under the retired
+      // `review/`-prefixed name.
+      expect(admitsNothingEvaluated(retirement.description)).toBe(false);
+    }
+  });
+
+  it("mirrors a clean live verdict rather than inventing a state", () => {
+    for (const outcome of ["clean", "not_evaluated"] as const) {
+      const retirement = commentReviewGateRetirementStatus(LIVE, { state: "success", outcome });
+
+      expect(retirement.state).toBe("success");
+      expect(admitsNothingEvaluated(retirement.description)).toBe(false);
+    }
+  });
+
+  it("keeps the pointer intact within GitHub's 140-character description limit", () => {
+    // GitHub truncates at 140. The context name is the whole point of the
+    // pointer, so it must survive rather than being cut mid-name.
+    const longContext = `gate/${"x".repeat(120)}`;
+
+    expect(commentReviewGateRetirementDescription(LIVE).length).toBeLessThanOrEqual(140);
+    expect(commentReviewGateRetirementDescription(longContext).length).toBeLessThanOrEqual(140);
+    expect(commentReviewGateRetirementDescription(LIVE, "failure").length).toBeLessThanOrEqual(140);
+    expect(
+      commentReviewGateRetirementDescription(longContext, "failure").length,
+    ).toBeLessThanOrEqual(140);
   });
 });

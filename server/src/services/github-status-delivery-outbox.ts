@@ -30,13 +30,26 @@ const RETRY_DELAYS_MS = [
   2 * 60 * 60_000,
 ];
 
+/** Serialize the final read and external write for one GitHub status key. */
+export async function withGithubStatusDeliveryLock<T>(
+  db: Db,
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+    return operation();
+  });
+}
+
 export type EnqueueGithubCommitStatusDeliveryInput = {
-  companyId: string;
-  sourceRunId: string;
+  companyId?: string | null;
+  sourceRunId?: string | null;
   repoFullName: string;
   sha: string;
   context: string;
   state: GitHubCommitStatusState;
+  forceWrite?: boolean;
   description: string;
   targetUrl?: string | null;
   prNumber: number;
@@ -149,6 +162,43 @@ async function handleFreshCommitStatusIfPresent(db: Db, row: DeliveryRow): Promi
   return false;
 }
 
+// A forced retirement retry may supersede the status that existed when it was
+// queued, but it must not overwrite any later evaluation of the same head.
+async function handleFreshSuccessForForcedDelivery(db: Db, row: DeliveryRow): Promise<boolean> {
+  if (!row.forceWrite) return false;
+  const latestStatus = await githubGetLatestCommitStatusForContext({
+    repoFullName: row.repoFullName,
+    sha: row.sha,
+    context: row.context,
+  });
+  if (!latestStatus.ok) {
+    if (latestStatus.retryable) {
+      await retryOrFailDelivery(db, row, latestStatus.reason, latestStatus);
+    } else {
+      await failPermanentDelivery(db, row, latestStatus.reason, latestStatus);
+    }
+    return true;
+  }
+
+  const latest = latestStatus.status;
+  const createdAt = latest?.createdAt ? Date.parse(latest.createdAt) : NaN;
+  if (statusCreatedAtOrAfterQueueSecond(createdAt, row.createdAt)) {
+    await markTerminal(
+      db,
+      row,
+      "skipped",
+      "info",
+      `Skipped forced retired-context retry for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because a newer status already exists`,
+      {
+        reason: latest?.state === "success" ? "fresh_success_status_exists" : "newer_status_exists",
+        latestStatus: latest,
+      },
+    );
+    return true;
+  }
+  return false;
+}
+
 async function appendDeliveryRunEvent(
   db: Db,
   row: DeliveryRow,
@@ -156,6 +206,8 @@ async function appendDeliveryRunEvent(
   message: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
+  if (!row.sourceRunId) return;
+
   const run = await db
     .select({
       id: heartbeatRuns.id,
@@ -296,31 +348,35 @@ async function failPermanentDelivery(
 }
 
 async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
-  if (await handleFreshCommitStatusIfPresent(db, row)) return;
+  if (!row.forceWrite) {
+    if (await handleFreshCommitStatusIfPresent(db, row)) return;
 
-  const evidence = await githubHasReviewerEvidenceForPr({
-    repoFullName: row.repoFullName,
-    prNumber: row.prNumber,
-    headSha: row.sha,
-  });
-  if ("found" in evidence && evidence.found) {
-    await markTerminal(
-      db,
-      row,
-      "skipped",
-      "info",
-      `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}#${row.prNumber}; reviewer evidence exists`,
-      { reason: "reviewer_evidence_found", via: evidence.via },
-    );
-    return;
-  }
-  if ("error" in evidence) {
-    const classified = classifyReviewerEvidenceError(evidence.error);
-    if (classified.retryable) {
-      await retryOrFailDelivery(db, row, classified.reason, { evidence });
-    } else {
-      await failPermanentDelivery(db, row, classified.reason, { evidence });
+    const evidence = await githubHasReviewerEvidenceForPr({
+      repoFullName: row.repoFullName,
+      prNumber: row.prNumber,
+      headSha: row.sha,
+    });
+    if ("found" in evidence && evidence.found) {
+      await markTerminal(
+        db,
+        row,
+        "skipped",
+        "info",
+        `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}#${row.prNumber}; reviewer evidence exists`,
+        { reason: "reviewer_evidence_found", via: evidence.via },
+      );
+      return;
     }
+    if ("error" in evidence) {
+      const classified = classifyReviewerEvidenceError(evidence.error);
+      if (classified.retryable) {
+        await retryOrFailDelivery(db, row, classified.reason, { evidence });
+      } else {
+        await failPermanentDelivery(db, row, classified.reason, { evidence });
+      }
+      return;
+    }
+  } else if (await handleFreshSuccessForForcedDelivery(db, row)) {
     return;
   }
 
@@ -332,7 +388,8 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     );
     return;
   }
-  if (await handleFreshCommitStatusIfPresent(db, fencedRow)) return;
+  if (await handleFreshSuccessForForcedDelivery(db, fencedRow)) return;
+  if (!fencedRow.forceWrite && (await handleFreshCommitStatusIfPresent(db, fencedRow))) return;
 
   const postingRow = await refreshDeliveryClaimBeforeExternalWrite(db, fencedRow);
   if (!postingRow) {
@@ -344,7 +401,7 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
   }
   fencedRow = postingRow;
 
-  const posted = await githubPostCommitStatusDetailed({
+  const post = async () => githubPostCommitStatusDetailed({
     repoFullName: fencedRow.repoFullName,
     sha: fencedRow.sha,
     context: fencedRow.context,
@@ -352,6 +409,21 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     description: fencedRow.description,
     targetUrl: fencedRow.targetUrl,
   });
+  const posted = fencedRow.forceWrite
+    ? await withGithubStatusDeliveryLock(
+        db,
+        `${fencedRow.repoFullName}#${fencedRow.sha}`,
+        async () => {
+          // The lock is shared with the live gate evaluation. Re-check inside
+          // it so a clean evaluation that won the lock cannot be overwritten.
+          if (await handleFreshSuccessForForcedDelivery(db, fencedRow)) {
+            return { ok: true as const, skipped: true as const };
+          }
+          return { ...(await post()), skipped: false as const };
+        },
+      )
+    : { ...(await post()), skipped: false as const };
+  if (posted.skipped) return;
   if (posted.ok) {
     await markTerminal(
       db,
@@ -390,6 +462,7 @@ export async function enqueueGithubCommitStatusDelivery(
     sha: input.sha,
     context: input.context,
     state: input.state,
+    forceWrite: input.forceWrite ?? false,
     description: input.description.slice(0, 140),
     targetUrl: input.targetUrl ?? null,
     prNumber: input.prNumber,
@@ -419,6 +492,7 @@ export async function enqueueGithubCommitStatusDelivery(
         prNumber: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
         prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
         state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,
+        forceWrite: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.forceWrite} else ${input.forceWrite ?? false} end`,
         description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${input.description.slice(0, 140)} end`,
         targetUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
         status: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.status} else 'queued' end`,

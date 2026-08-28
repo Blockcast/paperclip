@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, integer, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, integer, jsonb, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 
@@ -10,16 +10,13 @@ export const githubCommitStatusDeliveries = pgTable(
   "github_commit_status_deliveries",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    companyId: uuid("company_id")
-      .notNull()
-      .references(() => companies.id),
-    sourceRunId: uuid("source_run_id")
-      .notNull()
-      .references(() => heartbeatRuns.id, { onDelete: "cascade" }),
+    companyId: uuid("company_id").references(() => companies.id),
+    sourceRunId: uuid("source_run_id").references(() => heartbeatRuns.id, { onDelete: "cascade" }),
     repoFullName: text("repo_full_name").notNull(),
     sha: text("sha").notNull(),
     context: text("context").notNull(),
     state: text("state").notNull().default("failure"),
+    forceWrite: boolean("force_write").notNull().default(false),
     description: text("description").notNull(),
     targetUrl: text("target_url"),
     prNumber: integer("pr_number").notNull(),

@@ -25,12 +25,13 @@ const h = vi.hoisted(() => ({
 
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 
-import { _resetInstallationTokenCache } from "../services/github-app-auth.js";
+import { _resetInstallationTokenCache, githubPostCommitStatusDetailed } from "../services/github-app-auth.js";
 import {
   _classifyReviewerEvidenceError,
   enqueueGithubCommitStatusDelivery,
   pollGitHubCommitStatusDeliveriesOnce,
   resetStaleGitHubCommitStatusDeliveries,
+  withGithubStatusDeliveryLock,
 } from "../services/github-status-delivery-outbox.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -596,6 +597,166 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
     const events = await readRunEvents(runId);
     expect(events.at(-1)?.message).toContain("will retry");
+  });
+
+  it("does not let a forced retirement retry overwrite a fresh clean evaluation", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const queuedAt = new Date(Date.now() - 60_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        context: "review/ally-comment",
+        forceWrite: true,
+        status: "queued",
+        createdAt: queuedAt,
+        nextAttemptAt: queuedAt,
+        updatedAt: queuedAt,
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    const fetchMock = stubGithub({
+      latestStatuses: [
+        {
+          context: "review/ally-comment",
+          state: "success",
+          created_at: new Date().toISOString(),
+        },
+      ],
+      reviews: [],
+      comments: [],
+    });
+
+    await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "skipped",
+      forceWrite: true,
+      lastResult: { reason: "fresh_success_status_exists" },
+    });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
+  });
+
+  it("does not let a stale forced success overwrite a newer blocking evaluation", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const queuedAt = new Date(Date.now() - 60_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        context: "review/ally-comment",
+        state: "success",
+        forceWrite: true,
+        status: "queued",
+        createdAt: queuedAt,
+        nextAttemptAt: queuedAt,
+        updatedAt: queuedAt,
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    const fetchMock = stubGithub({
+      latestStatuses: [
+        {
+          context: "review/ally-comment",
+          state: "failure",
+          created_at: new Date().toISOString(),
+        },
+      ],
+      reviews: [],
+      comments: [],
+    });
+
+    await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "skipped",
+      forceWrite: true,
+      lastResult: { reason: "newer_status_exists" },
+    });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/statuses/${HEAD_SHA}`))).toBe(false);
+  });
+
+  it("lets a clean evaluation win between the retry freshness check and its post", async () => {
+    setCreds();
+    const { delivery } = await seedRun();
+    const queuedAt = new Date(Date.now() - 60_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        context: "review/ally-comment",
+        forceWrite: true,
+        status: "queued",
+        createdAt: queuedAt,
+        nextAttemptAt: queuedAt,
+        updatedAt: queuedAt,
+        description: "stale failure payload",
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    let statusReads = 0;
+    let releaseRetryRead!: () => void;
+    const retryReadStarted = new Promise<void>((resolve) => {
+      releaseRetryRead = resolve;
+    });
+    let releaseRetry!: () => void;
+    const retryReleased = new Promise<void>((resolve) => {
+      releaseRetry = resolve;
+    });
+    const postedBodies: Array<{ state?: string; description?: string }> = [];
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) {
+        statusReads += 1;
+        if (statusReads === 2) {
+          retryReadStarted();
+          await retryReleased;
+          return jsonResponse([]);
+        }
+        if (statusReads === 1) return jsonResponse([]);
+        return jsonResponse([
+          {
+            context: "review/ally-comment",
+            state: "success",
+            created_at: new Date().toISOString(),
+          },
+        ]);
+      }
+      if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
+        if (init?.body) postedBodies.push(JSON.parse(String(init.body)) as { state?: string; description?: string });
+        return jsonResponse({ id: postedBodies.length }, true, 201);
+      }
+      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
+      if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse([]);
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const retry = pollGitHubCommitStatusDeliveriesOnce(db);
+    await retryReadStarted;
+
+    // The newer evaluation shares the same lock and publishes while the
+    // worker is between its first freshness read and lock acquisition.
+    await withGithubStatusDeliveryLock(
+      db,
+      "Blockcast/hang#" + HEAD_SHA,
+      () => githubPostCommitStatusDetailed({
+        repoFullName: "Blockcast/hang",
+        sha: HEAD_SHA,
+        context: "review/ally-comment",
+        state: "success",
+        description: "new clean evaluation",
+        targetUrl: null,
+      }),
+    );
+    releaseRetryRead();
+    await retry;
+
+    expect(postedBodies).toEqual([{ state: "success", description: "new clean evaluation" }]);
+    expect(await readDelivery(delivery.id)).toMatchObject({
+      status: "skipped",
+      lastResult: { reason: "fresh_success_status_exists" },
+    });
   });
 
   it("retries a GitHub rate-limited 403 status write instead of marking it permanent", async () => {

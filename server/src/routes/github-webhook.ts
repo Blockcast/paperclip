@@ -73,6 +73,7 @@ import {
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
+import { enqueueGithubCommitStatusDelivery } from "../services/github-status-delivery-outbox.js";
 import { recoveryService } from "../services/recovery/service.js";
 import {
   GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
@@ -4233,11 +4234,34 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       config.prReviewerBotLogin,
     );
     if (commentReviewGateTrigger) {
-      void (config.runPrCommentReviewGateCheck ?? runPrCommentReviewGateCheck)(commentReviewGateTrigger)
+      const commentReviewGateCheck = config.runPrCommentReviewGateCheck
+        ? config.runPrCommentReviewGateCheck(commentReviewGateTrigger)
+        : runPrCommentReviewGateCheck({ ...commentReviewGateTrigger, db });
+      void commentReviewGateCheck
         .then((result) => {
           // The disabled default must be silent; otherwise every PR webhook in
           // a deployment that has not opted in would emit a warning.
           if (!result.posted && result.reason === "not_configured") return;
+          if (!result.posted && result.retirementDeliveries) {
+            void Promise.all(result.retirementDeliveries.map((delivery) =>
+              enqueueGithubCommitStatusDelivery(db, {
+                repoFullName: commentReviewGateTrigger.repoFullName,
+                sha: delivery.sha,
+                context: delivery.context,
+                state: delivery.state,
+                description: delivery.description,
+                targetUrl: delivery.targetUrl,
+                prNumber: commentReviewGateTrigger.prNumber,
+                prUrl: commentReviewGateTrigger.prUrl,
+                forceWrite: true,
+              }),
+            )).catch((err) => {
+              logger.error(
+                { err, event: eventName, deliveryId, ...commentReviewGateTrigger },
+                "github webhook comment-review retired-context retry enqueue failed",
+              );
+            });
+          }
           logger[result.posted ? "info" : "warn"](
             { deliveryId, event: eventName, ...commentReviewGateTrigger, result },
             "github webhook comment-review gate check completed",
