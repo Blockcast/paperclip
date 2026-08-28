@@ -87,6 +87,18 @@ describe("BLO-24782 lapsed monitor grace bound", () => {
         }),
       ).toBe(true);
     });
+
+    it("reads a future trigger instant as not live", () => {
+      // A clock-skewed or corrupted future timestamp must not make the negative
+      // age appear inside the grace window and protect the monitor indefinitely.
+      expect(
+        isLapsedMonitorStillLive({
+          lastTriggeredAt: new Date(NOW + 60_000).toISOString(),
+          now: NOW,
+          graceMs: GRACE,
+        }),
+      ).toBe(false);
+    });
   });
 
   describe("lapsedMonitorGraceMs config", () => {
