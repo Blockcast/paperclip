@@ -153,6 +153,7 @@ import {
   documentAnnotationThreads,
   documentRevisions,
   issueDocuments,
+  environmentLeases,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -412,6 +413,8 @@ import {
   setExternalLifecycleRunningRuns,
   recordExternalLifecycleRunSilenceGap,
   setAgentLivenessMetrics,
+  setReleasePendingExternalRuntimeReservationMetrics,
+  setOrphanedEnvironmentLeaseMetrics,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -11196,6 +11199,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: `${failedLeases.length} environment lease(s) left unreleased`,
       };
     }
+
+    // A runtime driver can silently skip a row (for example when its
+    // environment disappeared from the provider inventory) without
+    // returning an error. Verify the database state so callers never count
+    // an active lease as successfully released just because the provider
+    // returned an empty result.
+    let remainingActiveLease: { id: string } | undefined;
+    try {
+      remainingActiveLease = await db
+        .select({ id: environmentLeases.id })
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.heartbeatRunId, input.runId),
+            eq(environmentLeases.status, "active"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]);
+    } catch (err) {
+      logger.warn(
+        { err, runId: input.runId },
+        "failed to verify environment lease release for heartbeat run",
+      );
+      return {
+        fullyReleased: false,
+        failureReason: `environment lease release verification failed: ${describeRecoveryError(err)}`,
+      };
+    }
+    if (remainingActiveLease) {
+      logger.warn(
+        { leaseId: remainingActiveLease.id, runId: input.runId },
+        "environment lease remains active after release attempt for heartbeat run",
+      );
+      return {
+        fullyReleased: false,
+        failureReason: "one or more environment leases remain active after release",
+      };
+    }
+
     return { fullyReleased: true, failureReason: null };
   }
 
@@ -21512,6 +21555,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reconcileReleasePendingExternalRuntimeReservations(
     jobRunStatuses: Map<string, AgentJobRunStatus> | null,
     ambiguousRunIds: ReadonlySet<string> = new Set(),
+    onlyRunId?: string,
   ) {
     const pending = await db
       .select({
@@ -21523,6 +21567,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           isNull(externalRuntimeReservations.releasedAt),
+          onlyRunId ? eq(externalRuntimeReservations.runId, onlyRunId) : undefined,
           or(
             eq(externalRuntimeReservations.state, "release_pending"),
             and(
@@ -21631,6 +21676,108 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     }
+  }
+
+  // BLO-21460: environment leases have no DB trigger tying them to
+  // heartbeat_runs.status (unlike external-runtime reservations — see the
+  // migration 0128 trigger) and, before this ticket, no reconciliation path
+  // at all independent of the run's own finalize `finally` block. A lease
+  // left `active` by a crash between `setRunStatus(...cancelled)` and that
+  // block never gets a second chance without this sweep.
+  async function reconcileOrphanedEnvironmentLeases() {
+    const orphanedRows = await db
+      .select({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+      })
+      .from(environmentLeases)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        ),
+      );
+
+    const uniqueRuns = new Map<string, (typeof orphanedRows)[number]>();
+    for (const row of orphanedRows) uniqueRuns.set(row.runId, row);
+
+    let releasedRunCount = 0;
+    for (const run of uniqueRuns.values()) {
+      // A run finalizing right now in this process releases its own leases
+      // in its `finally` block; racing it here risks acting on a status
+      // snapshot from just before that block runs. Let it win.
+      if (activeRunExecutions.has(run.runId)) continue;
+      const releaseResult = await releaseEnvironmentLeasesForRun({
+        runId: run.runId,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      });
+      if (releaseResult.fullyReleased) releasedRunCount += 1;
+    }
+
+    return releasedRunCount;
+  }
+
+  // BLO-21460: observability for the backlog reconciliation could NOT clear
+  // this pass. Measured AFTER reconcileReleasePendingExternalRuntimeReservations
+  // / reconcileOrphanedEnvironmentLeases run (see reapOrphanedRuns), so a
+  // healthy fleet reads 0 on both gauges; a sustained non-zero reading means
+  // reconciliation itself is stuck (scheduler down, kube API unreachable) and
+  // capacity is leaking, not that a normal in-flight resource exists.
+  async function refreshOrphanedRuntimeResourceMetrics(now = new Date()) {
+    const [releasePendingSnapshot] = await db
+      .select({
+        count: sql<number>`count(*)`,
+        oldestUpdatedAt: sql<Date | null>`min(${externalRuntimeReservations.updatedAt})`,
+      })
+      .from(externalRuntimeReservations)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
+      .where(
+        and(
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            eq(externalRuntimeReservations.state, "release_pending"),
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
+          ),
+        ),
+      );
+    const releasePendingOldestMs = releasePendingSnapshot?.oldestUpdatedAt
+      ? new Date(releasePendingSnapshot.oldestUpdatedAt).getTime()
+      : now.getTime();
+    setReleasePendingExternalRuntimeReservationMetrics({
+      count: Number(releasePendingSnapshot?.count ?? 0),
+      oldestAgeSeconds: Math.max(0, (now.getTime() - releasePendingOldestMs) / 1000),
+    });
+
+    const [orphanedLeaseSnapshot] = await db
+      .select({
+        count: sql<number>`count(*)`,
+        oldestAcquiredAt: sql<Date | null>`min(${environmentLeases.acquiredAt})`,
+      })
+      .from(environmentLeases)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        ),
+      );
+    const orphanedLeaseOldestMs = orphanedLeaseSnapshot?.oldestAcquiredAt
+      ? new Date(orphanedLeaseSnapshot.oldestAcquiredAt).getTime()
+      : now.getTime();
+    setOrphanedEnvironmentLeaseMetrics({
+      active: Number(orphanedLeaseSnapshot?.count ?? 0),
+      oldestAgeSeconds: Math.max(0, (now.getTime() - orphanedLeaseOldestMs) / 1000),
+    });
   }
 
   async function cleanupManagedJobsWithoutRun(now: Date, inventory?: Awaited<ReturnType<typeof listManagedAgentJobs>>) {
@@ -22065,6 +22212,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
     await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds);
+    await reconcileOrphanedEnvironmentLeases();
+    await refreshOrphanedRuntimeResourceMetrics(now);
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -34301,10 +34450,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelledRuns.length;
   }
 
+  // BLO-21460: cancellation must idempotently release the run's external
+  // runtime reservation and ephemeral environment lease even when the
+  // process that issued `setRunStatus(..., "cancelled")` crashes before
+  // reaching that cleanup, or when a caller retries cancel on a run that is
+  // already terminal. Both underlying releases are themselves idempotent
+  // (`releaseEnvironmentLeasesForRun` only touches `status = 'active'` rows;
+  // `reconcileReleasePendingExternalRuntimeReservations` only touches
+  // `released_at IS NULL` rows and re-verifies the Job is gone/terminal
+  // before releasing), so calling this repeatedly for the same run is safe
+  // and is exactly how retry/recovery is expected to work — see the
+  // 2026-08-03 incident this ticket follows up. Scoped to a single run
+  // (`onlyRunId`) rather than a full `reapOrphanedRuns` sweep so a cancel
+  // reconciles its own resources without paying for (or racing) a
+  // namespace-wide reservation/Job inventory scan.
+  async function releaseCancelledRunRuntimeResources(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    agent: Pick<typeof agents.$inferSelect, "adapterType"> | null,
+    status: string,
+    failureReason?: string | null,
+  ) {
+    await releaseEnvironmentLeasesForRun({
+      runId: run.id,
+      companyId: run.companyId,
+      agentId: run.agentId,
+      status,
+      failureReason: failureReason ?? undefined,
+    });
+
+    if (agent && hasExternalLifecycle(agent.adapterType)) {
+      try {
+        await reconcileReleasePendingExternalRuntimeReservations(null, undefined, run.id);
+      } catch (error) {
+        logger.warn(
+          { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+          "cancelRun: external-runtime reservation reconciliation failed (will retry on next sweep or cancel)",
+        );
+      }
+    }
+  }
+
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
-    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
+    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) {
+      // Already terminal — most likely a repeated cancel call, or a retry
+      // after a crash between the first call's status update and its
+      // cleanup. Heal any leftover reservation/lease instead of no-op'ing:
+      // this is the only path a stuck resource from a *previous* cancel gets
+      // another chance before the next reconciliation sweep.
+      if (HEARTBEAT_RUN_TERMINAL_STATUSES.includes(run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number])) {
+        await releaseCancelledRunRuntimeResources(run, await getAgent(run.agentId), run.status, run.error);
+      }
+      return run;
+    }
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
     const resultJson = agent
@@ -34392,6 +34591,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // Release the lease and, for external-lifecycle runs, confirm/release the
+    // reservation now rather than waiting for the next dispatch-triggered
+    // sweep — an agent with no more queued work would otherwise never
+    // trigger one (BLO-21460).
+    await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason);
+
     await finalizeAgentStatus(run.agentId, "cancelled");
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
@@ -34466,6 +34671,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
+
+      // BLO-21460: same idempotent lease + reservation release as
+      // cancelRunInternal — see releaseCancelledRunRuntimeResources.
+      await releaseCancelledRunRuntimeResources(run, agent, "cancelled", reason);
     }
 
     return runs.length;
@@ -34880,6 +35089,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    reconcileOrphanedEnvironmentLeases,
+    refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,
 
     /**

@@ -397,6 +397,42 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
   );
 });
 
+test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the worker-down backstop (BLO-21460)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(rendered, /alert: PaperclipRuntimeResourceReconciliationStuck/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipRuntimeResourceReconciliationStuck[\s\S]*?\n\s+expr: >-?\n([\s\S]*?)\n\s+for:/,
+  ) ?? [];
+  assert.ok(expr, "runtime-resource-reconciliation-stuck alert must render an expr");
+
+  assert.match(
+    expr,
+    /max\(paperclip_external_runtime_reservations_release_pending\) > 0/,
+    "must page on a stuck release-pending external-runtime reservation",
+  );
+  assert.match(
+    expr,
+    /max\(paperclip_environment_leases_orphaned_active\) > 0/,
+    "must page on an orphaned-active environment lease",
+  );
+  assert.match(
+    expr,
+    /max\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)\s*==\s*0/,
+    "must page when the worker scrape target is down",
+  );
+  assert.doesNotMatch(
+    expr,
+    /\babsent\(/,
+    "must not use metric-absence branches before the companion gauges are deployed",
+  );
+  assert.doesNotMatch(
+    expr,
+    /max by \(job\)/,
+    "must scope availability to the worker service, not aggregate API and worker targets",
+  );
+});
+
 test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
   // BLO-23413: this alert was verified structurally unable to fire on the
   // live cluster (kube-state-metrics only ever emits ONE post-failure

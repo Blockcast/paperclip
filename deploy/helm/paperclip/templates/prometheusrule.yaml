@@ -73,6 +73,24 @@
           --jq '.content' | base64 -d | grep PaperclipPluginErrored
     - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
       applies after merge -- a merged rule is not a deployed one.
+
+  STATUS of the BLO-21460 runtime-resource-reconciliation-stuck alert, same
+  auditability rule:
+
+    - Proposed in Blockcast/onprem-k8s#2119 (branch
+      platformsre/blo-21460-runtime-resource-reconciliation-alert), currently
+      OPEN as of 2026-08-27 at head `ed177e5a8b7b`; it is not merged or live.
+      Verify the proposed rule before merge:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipRuntimeResourceReconciliationStuck
+
+    - It reads two metrics this PR adds
+      (paperclip_external_runtime_reservations_release_pending,
+      paperclip_environment_leases_orphaned_active). The worker scrape
+      backstop is independently live-capable once the onprem rule merges, but
+      the backlog metrics remain absent until this paperclip PR ships. The
+      onprem PR must merge and the manual `monitoring-rules` Argo app must sync
+      before treating the alert as live; the chart rule below is only a mirror.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -352,6 +370,39 @@ spec:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
             description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
+        - alert: PaperclipRuntimeResourceReconciliationStuck
+          # BLO-21460 (2026-08-03 incident follow-up). Both series are
+          # measured AFTER each reconciliation pass (reapOrphanedRuns ->
+          # reconcileReleasePendingExternalRuntimeReservations /
+          # reconcileOrphanedEnvironmentLeases, every
+          # heartbeatSchedulerIntervalMs), not the pre-pass candidate count —
+          # so 0 is the only healthy steady-state reading on either series.
+          # Unlike paperclip_external_runtime_reservations_active (expected
+          # to be non-zero whenever anything is genuinely running), a
+          # non-zero reading here means reconciliation itself is failing to
+          # keep up: the scheduler is down (e.g. crash-looping applying a
+          # migration, the incident this ticket follows up), or the kube API
+          # is unreachable so a reservation's Job status cannot be confirmed.
+          # Left unaddressed, held slots/leases exhaust executor capacity.
+          # A bare `max(metric) > 0` is silent for the scheduler-down case
+          # itself: the scrape stops, both series go absent (not zero), and
+          # max() over an empty vector never fires. The authoritative proposed
+          # onprem-k8s#2119 expression therefore adds an up=0 backstop scoped
+          # to the worker service, which is the process that runs this sweep;
+          # do not add absent(metric) branches before the companion metrics are
+          # deployed, because they would fire on a healthy pre-deployment
+          # cluster.
+          # See runbooks/cancellation-reservation-lease-leak-and-migration-0209-rollout.md.
+          expr: >
+            max(paperclip_external_runtime_reservations_release_pending) > 0
+            or max(paperclip_environment_leases_orphaned_active) > 0
+            or (max(up{job="paperclip-control-plane", service="paperclip-workers"}) == 0)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip cancellation cleanup is not keeping up"
+            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
     - name: paperclip-queued-run-stranded
       rules:
         - alert: PaperclipQueuedRunStranded
