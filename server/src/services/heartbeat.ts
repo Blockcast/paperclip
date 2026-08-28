@@ -21690,11 +21690,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
+        adapterType: agents.adapterType,
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
       })
       .from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
       .where(
         and(
           eq(environmentLeases.status, "active"),
@@ -21711,6 +21713,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // in its `finally` block; racing it here risks acting on a status
       // snapshot from just before that block runs. Let it win.
       if (activeRunExecutions.has(run.runId)) continue;
+      if (hasExternalLifecycle(run.adapterType)) {
+        // Background Job deletion does not prove that the Job or its
+        // run-labelled pods have stopped. Reuse the same fail-closed probe as
+        // cancellation: an active or unobservable external runtime keeps the
+        // lease until a later reconciliation pass can prove quiescence.
+        const externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
+        if (!externalRuntimeQuiesced) continue;
+      }
       const releaseResult = await releaseEnvironmentLeasesForRun({
         runId: run.runId,
         companyId: run.companyId,

@@ -7326,6 +7326,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(0);
     });
 
+    it("retains an orphaned external lease while its Job is still active", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockReadAgentJobRunStatusByName.mockResolvedValue({
+        phase: "active",
+        name: reservation.jobName,
+        uid: reservation.jobUid,
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+
+      expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(0);
+      expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
+    it("retains an orphaned external lease when Job or pod observation is unavailable", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockReadAgentJobRunStatusByName.mockResolvedValue({
+        phase: "missing",
+        reason: "NotFound",
+        name: reservation.jobName,
+      });
+      mockListManagedAgentPods.mockResolvedValue(null);
+
+      expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(0);
+      expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
+    it("releases an orphaned external lease only after Job and pod quiescence is confirmed", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockReadAgentJobRunStatusByName.mockResolvedValue({
+        phase: "missing",
+        reason: "NotFound",
+        name: reservation.jobName,
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+
+      expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(1);
+      expect((await getLease(leaseId))?.status).toBe("failed");
+    });
+
     it("does not count a lease as released when the environment provider fails", async () => {
       const { companyId, runId, issueId } = await seedRunFixture({
         runStatus: "failed",
