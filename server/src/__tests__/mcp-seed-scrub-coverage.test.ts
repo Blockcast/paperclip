@@ -66,6 +66,16 @@ const jobManifestPath = path.join(
  * runs. Empty today and that is the finding, not an oversight: keeping the list
  * explicit means the day an upstream is moved behind the gateway, flipping it to
  * `gateway-scrubbed` is a one-line change that this file forces to be deliberate.
+ *
+ * ⚠️ This list is the audit's *oracle*, and it is hand-maintained — which host
+ * names actually terminate in the gateway is deployment topology that lives in
+ * `Blockcast/onprem-k8s`, not in this repo, so no test here can derive it. What
+ * the assertions below give you is a binding between a classification and the
+ * host it dials. What they cannot give you is proof that a host is or is not a
+ * gateway. Concretely: a migration that adds a host here and forgets to reclassify
+ * the upstream fails loudly; a migration that reclassifies nothing *and* never
+ * touches this list is invisible to this file. So updating this list is part of
+ * doing the migration, not paperwork after it.
  */
 const SCRUBBING_GATEWAY_HOSTS: readonly string[] = [];
 
@@ -161,6 +171,118 @@ function hostOf(entry: SeedEntry | string): string | null {
   if (typeof entry === "string" || !entry.url) return null;
   if (entry.url.startsWith("<shell:")) return null;
   return new URL(entry.url).hostname;
+}
+
+/**
+ * Every URL that appears literally in a chunk of the init script, split into the
+ * ones we can pin to a host and the ones we cannot.
+ *
+ * Anything still carrying an unexpanded `${VAR}` / `<shell:VAR>` is reported as
+ * *unresolved* rather than guessed at. Callers treat a non-empty `unresolved` as
+ * a failure: an upstream whose host is not knowable from this repo cannot be
+ * asserted to be off the gateway, and "cannot tell" must not read as "fine".
+ */
+function urlsIn(text: string): { hosts: string[]; unresolved: string[] } {
+  const hosts: string[] = [];
+  const unresolved: string[] = [];
+  for (const match of text.matchAll(/https?:\/\/[^\s"'`\\)]+/g)) {
+    const raw = match[0]!;
+    if (raw.includes("${") || raw.includes("<shell:")) {
+      unresolved.push(raw);
+      continue;
+    }
+    try {
+      hosts.push(new URL(raw).hostname);
+    } catch {
+      unresolved.push(raw);
+    }
+  }
+  return { hosts, unresolved };
+}
+
+/**
+ * The right-hand side of every `VAR=` assignment in the init script, with shell
+ * line-continuations followed so a multi-line `$( ... )` is captured whole.
+ *
+ * This is a text scan, not a shell parser — deliberately. It only has to be
+ * *conservative*: if it under-collects, the caller sees zero resolvable hosts
+ * and fails closed. It is never allowed to turn "I did not understand this" into
+ * a pass.
+ */
+function shellAssignmentsOf(varName: string): string[] {
+  const lines = readFileSync(statefulSetPath, "utf8").split("\n");
+  const assignment = new RegExp(`^\\s*${varName}=`);
+  const found: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!assignment.test(lines[i]!)) continue;
+    let statement = lines[i]!;
+    while (/\\\s*$/.test(lines[i]!) && i + 1 < lines.length) {
+      i += 1;
+      statement += `\n${lines[i]!}`;
+    }
+    found.push(statement.slice(statement.indexOf("=") + 1));
+  }
+  return found;
+}
+
+/** One concrete form a seeded entry can take once the pod has booted. */
+type EntryShape = {
+  label: string;
+  hosts: string[];
+  unresolved: string[];
+  declaresCommand: boolean;
+};
+
+/**
+ * Expand a seeded entry into every concrete shape it can have at runtime.
+ *
+ * The seed is not static: `"gbrain": ${GBRAIN_ENTRY}` is one JSON key with *two*
+ * possible expansions (a bridge fallback and a minted-Bearer admin URL), and the
+ * heredoc normaliser above collapses both to a single `<shell:GBRAIN_ENTRY>`
+ * sentinel. Any check that reads a host straight off the sentinel gets `null` and
+ * then *passes vacuously* — which is how a shell-interpolated upstream could be
+ * moved behind the gateway with this audit none the wiser. So resolve the
+ * sentinel back through the init script's own assignments and return one shape
+ * per assignment, so each is asserted on separately.
+ */
+function resolveEntryShapes(name: string, entry: SeedEntry | string): EntryShape[] {
+  const wholeEntrySentinel =
+    typeof entry === "string" ? /^<shell:([A-Za-z_][A-Za-z0-9_]*)>$/.exec(entry) : null;
+
+  if (wholeEntrySentinel) {
+    const varName = wholeEntrySentinel[1]!;
+    const assignments = shellAssignmentsOf(varName);
+    if (assignments.length === 0) {
+      throw new Error(
+        `Upstream '${name}' is seeded as the shell variable ${varName}, but no '${varName}=' ` +
+          `assignment could be found in ${path.relative(repoRoot, statefulSetPath)}. Its runtime ` +
+          "host is therefore unknown, so this audit cannot claim it is off the gateway. Re-point " +
+          "this resolver at wherever the value is now built rather than deleting the check.",
+      );
+    }
+    return assignments.map((rhs, index) => ({
+      label: `${name} (${varName} assignment ${index + 1} of ${assignments.length})`,
+      declaresCommand: /"command"\s*:/.test(rhs),
+      ...urlsIn(rhs),
+    }));
+  }
+
+  const object = typeof entry === "string" ? {} : entry;
+  const { hosts, unresolved } = object.url ? urlsIn(object.url) : { hosts: [], unresolved: [] };
+  // A url with a sentinel *inside* it (`http://<shell:SVC>:8080/mcp`) resolves
+  // through the same assignment scan; if that yields no host it stays unresolved
+  // and the caller fails closed.
+  for (const match of (object.url ?? "").matchAll(/<shell:([A-Za-z_][A-Za-z0-9_]*)>/g)) {
+    for (const rhs of shellAssignmentsOf(match[1]!)) hosts.push(...urlsIn(rhs).hosts);
+  }
+  return [
+    {
+      label: name,
+      hosts,
+      unresolved: hosts.length > 0 ? [] : unresolved,
+      declaresCommand: Boolean(object.command),
+    },
+  ];
 }
 
 /**
@@ -267,6 +389,71 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
       ).toMatch(/^(PEN|BLO)-\d+$/);
       expect(coverage.why.length, `Upstream '${name}' needs a non-trivial rationale`).toBeGreaterThan(20);
     }
+  });
+
+  it("anything claimed 'unscrubbed' really is direct HTTP, and really is not behind the gateway", () => {
+    // The ticket check above is bookkeeping: it proves someone wrote a plausible
+    // sentence, not that the sentence is still true of the deployment. Without a
+    // topology assertion, moving an upstream behind the gateway leaves it marked
+    // `unscrubbed` and this suite stays green — the classification silently
+    // becomes a description of a world that no longer exists. That is the same
+    // fail-open shape as the scrubber that kept passing while the traffic moved
+    // out from under it, which is the whole reason PEN-2370 exists.
+    //
+    // `gateway-scrubbed` and `stdio-not-proxied` were already held to their
+    // topology. This holds the third classification to its own claim: direct HTTP
+    // (so not stdio), to a host that is not a scrubbing gateway.
+    for (const [name, coverage] of Object.entries(SEED_COVERAGE)) {
+      if (coverage.kind !== "unscrubbed") continue;
+
+      for (const shape of resolveEntryShapes(name, seeded[name]!)) {
+        expect(
+          shape.declaresCommand,
+          `Upstream '${shape.label}' is classified unscrubbed — which means direct HTTP — but declares a stdio command. ` +
+            "If it no longer has an HTTP hop, reclassify it as stdio-not-proxied.",
+        ).toBe(false);
+
+        expect(
+          shape.unresolved,
+          `Upstream '${shape.label}' declares URL(s) whose host cannot be resolved from this repo: ${shape.unresolved.join(", ")}. ` +
+            "An upstream whose host is unknown cannot be asserted to be off the gateway. Fail closed rather than assume.",
+        ).toEqual([]);
+
+        expect(
+          shape.hosts.length,
+          `Upstream '${shape.label}' is classified unscrubbed but no concrete host could be resolved for it. ` +
+            "That makes the gateway check below vacuous, so it is a failure, not a pass — teach resolveEntryShapes " +
+            "how to expand this entry, or reclassify it.",
+        ).toBeGreaterThan(0);
+
+        for (const host of shape.hosts) {
+          expect(
+            SCRUBBING_GATEWAY_HOSTS,
+            `Upstream '${shape.label}' dials '${host}', which IS a scrubbing gateway host — but it is still classified ` +
+              "unscrubbed. Its responses are now scrubbed: reclassify it as gateway-scrubbed. Leaving it here " +
+              "understates coverage and keeps a closed hole on the books as open.",
+          ).not.toContain(host);
+        }
+      }
+    }
+  });
+
+  it("shell-interpolated entries are expanded to every shape they can boot as", () => {
+    // Guards the resolver that the test above depends on. `"gbrain": ${GBRAIN_ENTRY}`
+    // normalises to a bare sentinel, so `hostOf` returns null for it; a host check
+    // written against that would pass vacuously forever. Pin the expansion so that
+    // if the resolver ever silently stops resolving, it fails HERE — loudly and at
+    // the person who broke it — rather than quietly draining the assertions above.
+    const shapes = resolveEntryShapes("gbrain", seeded.gbrain!);
+    expect(
+      shapes.length,
+      "GBRAIN_ENTRY has a bridge fallback and a minted-Bearer admin form; both are agent-facing and both must be audited.",
+    ).toBeGreaterThanOrEqual(2);
+
+    const hosts = shapes.flatMap((s) => s.hosts);
+    expect(hosts).toContain("gbrain-mcp-internal.paperclip.svc.cluster.local");
+    expect(hosts).toContain("gbrain-mcp-admin.paperclip.svc.cluster.local");
+    expect(shapes.flatMap((s) => s.unresolved)).toEqual([]);
   });
 
   it("anything claimed as gateway-scrubbed actually resolves to a scrubbing gateway host", () => {
