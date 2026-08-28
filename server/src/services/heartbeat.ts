@@ -34469,7 +34469,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: Pick<typeof agents.$inferSelect, "adapterType"> | null,
     status: string,
     failureReason?: string | null,
+    options: { externalRuntimeQuiesced?: boolean } = {},
   ) {
+    // Background Job deletion does not prove that the pod has stopped. Keep
+    // the lease held until the exact Job and its run-labelled pods are
+    // quiescent; the periodic reconciler will retry this path if observation
+    // is unavailable.
+    if (agent && hasExternalLifecycle(agent.adapterType) && options.externalRuntimeQuiesced === false) {
+      logger.warn(
+        { runId: run.id },
+        "cancelRun: retaining environment lease until external-runtime Job quiesces",
+      );
+      return;
+    }
     await releaseEnvironmentLeasesForRun({
       runId: run.id,
       companyId: run.companyId,
@@ -34500,7 +34512,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // this is the only path a stuck resource from a *previous* cancel gets
       // another chance before the next reconciliation sweep.
       if (HEARTBEAT_RUN_TERMINAL_STATUSES.includes(run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number])) {
-        await releaseCancelledRunRuntimeResources(run, await getAgent(run.agentId), run.status, run.error);
+        const terminalAgent = await getAgent(run.agentId);
+        const externalRuntimeQuiesced = !terminalAgent || !hasExternalLifecycle(terminalAgent.adapterType)
+          ? true
+          : await confirmStaleKilledJobQuiesced(run);
+        await releaseCancelledRunRuntimeResources(run, terminalAgent, run.status, run.error, {
+          externalRuntimeQuiesced,
+        });
       }
       return run;
     }
@@ -34576,11 +34594,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // before dispatching another run: the dispatcher may release the terminal
     // run's reservation, which is the durable name/UID identity required for
     // safe deletion. Best-effort.
+    let externalRuntimeQuiesced = true;
     if (agent && hasExternalLifecycle(agent.adapterType)) {
+      externalRuntimeQuiesced = false;
       try {
         const deleted = await deleteExactExternalRuntimeJob(run);
+        // "mismatch" also covers the benign no-reservation case. Let the
+        // independent Job/pod probe decide quiescence rather than treating
+        // that result as an automatic failure.
+        externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
         logger.info(
-          { runId: run.id, deletionResult: deleted },
+          { runId: run.id, deletionResult: deleted, externalRuntimeQuiesced },
           "cancelRun: cascaded Job deletion for external-lifecycle adapter",
         );
       } catch (error) {
@@ -34589,16 +34613,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "cancelRun: cascade Job delete failed (run still finalized as cancelled)",
         );
       }
+
+      await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason, {
+        externalRuntimeQuiesced,
+      });
+    } else {
+      await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason);
     }
 
-    // Release the lease and, for external-lifecycle runs, confirm/release the
-    // reservation now rather than waiting for the next dispatch-triggered
-    // sweep — an agent with no more queued work would otherwise never
-    // trigger one (BLO-21460).
-    await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason);
-
     await finalizeAgentStatus(run.agentId, "cancelled");
-    await startNextQueuedRunForAgent(run.agentId);
+    // A still-running external Job keeps the agent's execution environment
+    // occupied. Dispatch only after quiescence; the reconciler will retry
+    // cleanup and the next scheduling tick can then promote queued work.
+    if (externalRuntimeQuiesced) {
+      await startNextQueuedRunForAgent(run.agentId);
+    }
     return cancelled;
   }
 
@@ -34674,7 +34703,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       // BLO-21460: same idempotent lease + reservation release as
       // cancelRunInternal — see releaseCancelledRunRuntimeResources.
-      await releaseCancelledRunRuntimeResources(run, agent, "cancelled", reason);
+      let externalRuntimeQuiesced = true;
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        externalRuntimeQuiesced = false;
+        externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
+      }
+      await releaseCancelledRunRuntimeResources(run, agent, "cancelled", reason, {
+        externalRuntimeQuiesced,
+      });
     }
 
     return runs.length;

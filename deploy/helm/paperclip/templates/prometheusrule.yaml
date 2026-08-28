@@ -397,6 +397,7 @@ spec:
             max(paperclip_external_runtime_reservations_release_pending) > 0
             or max(paperclip_environment_leases_orphaned_active) > 0
             or (max(up{job="paperclip-control-plane", service="paperclip-workers"}) == 0)
+            or absent(up{job="paperclip-control-plane", service="paperclip-workers"})
           for: 10m
           labels:
             severity: warning

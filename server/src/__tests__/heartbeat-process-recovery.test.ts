@@ -7070,15 +7070,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(row?.releasedAt).toBeTruthy();
     });
 
-    it("does NOT release the reservation while the Job is still confirmed active (present runtime Job)", async () => {
+    it("does NOT release reservation or lease while the Job is still confirmed active (present runtime Job)", async () => {
       const { companyId, agentId, runId } = await seedRunFixture({
         adapterType: "claude_k8s",
         processPid: null,
         processGroupId: null,
         agentStatus: "running",
-        includeIssue: false,
+        includeIssue: true,
       });
       const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId });
       // deleteExactExternalRuntimeJob's own delete attempt is mocked to
       // "succeed" by the module default, but the independent reconciler
       // re-verifies against the cluster and must refuse to release a slot
@@ -7094,6 +7095,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const row = await getReservation(runId);
       expect(row?.state).toBe("release_pending");
       expect(row?.releasedAt).toBeNull();
+      const lease = await db
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, leaseId))
+        .then((rows) => rows[0] ?? null);
+      expect(lease?.status).toBe("active");
+      expect(lease?.releasedAt).toBeNull();
     });
 
     it("releases the environment lease immediately on cancel", async () => {

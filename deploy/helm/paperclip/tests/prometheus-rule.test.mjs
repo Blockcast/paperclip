@@ -421,10 +421,10 @@ test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and t
     /max\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)\s*==\s*0/,
     "must page when the worker scrape target is down",
   );
-  assert.doesNotMatch(
+  assert.match(
     expr,
-    /\babsent\(/,
-    "must not use metric-absence branches before the companion gauges are deployed",
+    /absent\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)/,
+    "must alert when the worker scrape target disappears entirely",
   );
   assert.doesNotMatch(
     expr,
