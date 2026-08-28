@@ -76,6 +76,15 @@ const jobManifestPath = path.join(
  * the upstream fails loudly; a migration that reclassifies nothing *and* never
  * touches this list is invisible to this file. So updating this list is part of
  * doing the migration, not paperwork after it.
+ *
+ * That obligation is written down on PEN-2370 as a rollout checklist item naming
+ * PEN-2429 (the ticket that performs the migration), rather than only here — an
+ * operator changing topology in `Blockcast/onprem-k8s` has no reason to be
+ * reading a test file in this repo, and a note only they will never see is not a
+ * control. The in-repo half is enforced rather than trusted: the rollout's last
+ * step flips the `k8s-ro` URL in `statefulset.yaml`, which is in this repo, so it
+ * trips the host assertion below and cannot land while this audit still describes
+ * the old topology.
  */
 const SCRUBBING_GATEWAY_HOSTS: readonly string[] = [];
 
@@ -92,6 +101,20 @@ type Coverage =
  *
  * Keep this exhaustive. If you are here because the suite failed after you added
  * an MCP server, that is this test working: choose a `kind` for it and say why.
+ *
+ * `ticket` is the upstream's *owner*, and one ticket per upstream is deliberate.
+ * The first version of this table pointed all five unscrubbed upstreams at
+ * PEN-2429; PEN-2429's owner rejected that (2026-08-27) and re-homed three of
+ * them, because PEN-2429 is `critical` for the `k8s-ro` credential-escalation
+ * shape specifically and parking four upstreams of unassessed severity behind it
+ * would have delayed the critical fix behind the others. Do not re-collapse these
+ * onto one ticket to make the table tidier — the tidiness is what caused it.
+ *
+ * Note also what `unscrubbed` claims: it is a statement about the **transport**,
+ * not a finding about the **contents**. It means nothing scrubs these bodies, not
+ * that anything sensitive is known to be in them. Assessing the contents of
+ * `prometheus`/`tempo`/`linear` is PEN-2630's (b1) audit and is still open, so
+ * their rationales below say "unassessed" rather than guessing at a severity.
  */
 const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
   paperclip: {
@@ -104,23 +127,23 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
   },
   prometheus: {
     kind: "unscrubbed",
-    ticket: "PEN-2429",
-    why: "direct to prometheus-mcp-server; metric bodies are low-risk but still unscrubbed",
+    ticket: "PEN-2630",
+    why: "direct to prometheus-mcp-server; unassessed — whether any metric label or exemplar in this estate carries secret material is the (b1) audit question, not a settled 'low risk'",
   },
   tempo: {
     kind: "unscrubbed",
-    ticket: "PEN-2429",
-    why: "direct to tempo.monitoring; trace attributes can carry request headers",
+    ticket: "PEN-2630",
+    why: "direct to tempo.monitoring; unassessed — span attributes can carry request headers, so what these bodies actually disclose needs demonstrating rather than assuming",
   },
   linear: {
     kind: "unscrubbed",
-    ticket: "PEN-2429",
-    why: "direct to linear-mcp-server; issue bodies are externally authored text",
+    ticket: "PEN-2630",
+    why: "direct to linear-mcp-server; unassessed — issue and comment bodies are agent-authored text, which has historically contained material agents should not have pasted",
   },
   gbrain: {
     kind: "unscrubbed",
-    ticket: "PEN-2429",
-    why: "shell-interpolated entry; both shapes dial gbrain directly, and the admin shape carries a minted Authorization header",
+    ticket: "PEN-2428",
+    why: "shell-interpolated entry; both shapes dial gbrain directly, and the admin shape carries a minted Authorization header for the shared paperclip:Blockcast:CEO OAuth client that PEN-2428 owns",
   },
   "k8s-ro": {
     kind: "unscrubbed",
