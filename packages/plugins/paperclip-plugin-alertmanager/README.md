@@ -17,6 +17,14 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   delivery (constant-time compare).
 - Parses the AM v2 envelope, drops malformed / unsupported-version payloads
   with a 200 (so AM doesn't retry-storm).
+- Drops firing `severity=info` alerts before issue or state mutation and honors
+  `paperclip_issue: "false"` at every severity.
+- Assigns the configured exact `fallbackAgentName` when owner and issue-route
+  resolution find nobody. Missing or ambiguous fallback configuration fails
+  closed instead of creating an ownerless issue.
+- Deduplicates open issue creation by alertname and optional
+  `paperclip_dedupe_domain`. A database unique index makes concurrent first
+  deliveries attach to one winner.
 - Deduplicates by `alert.fingerprint` per spec §5.3 — re-fires bump the
   state row and refresh the issue body, they don't create a second issue.
 - Re-opens issues the plugin auto-cancelled on resolve when the same
@@ -32,6 +40,61 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
 - Emits `plugin.alertmanager.alert.firing` and
   `plugin.alertmanager.alert.resolved` so sibling plugins (status pages,
   paging integrations) can subscribe.
+
+## Recovering an interrupted aggregate firing
+
+The aggregate lifecycle fence intentionally fails closed: if the worker stops
+after it claims a firing fence but before it finishes the delivery, later
+firings and final resolution wait until an operator releases that exact fence.
+The recovery API is board-authenticated and company-scoped:
+
+The examples below use a Paperclip board token in
+`PAPERCLIP_BOARD_TOKEN` (a browser session cookie can be used instead). Keep
+that token in the environment, never in the command itself.
+
+1. List the currently held firing fences. The response is sensitive and is
+   marked `Cache-Control: no-store`; only an authorized board user for the
+   requested company can read it.
+
+   ```sh
+   curl --fail --silent --show-error \
+     -H "Authorization: Bearer $PAPERCLIP_BOARD_TOKEN" \
+     "$PAPERCLIP_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=$COMPANY_ID"
+   ```
+
+   Copy the `aggregateKey` and its matching `firingToken` from the response.
+   The token is bearer-equivalent; do not put it in tickets, chat, shell
+   history, or logs.
+
+2. Release that exact token through the board-authenticated recovery route.
+   The response contains only whether the compare-and-set matched; it never
+   returns the token.
+
+   Keep the token out of shell history by reading it without echo and piping a
+   generated JSON body to curl:
+
+   ```sh
+   read -r -s FIRING_TOKEN
+   printf '\n'
+   jq -n \
+     --arg companyId "$COMPANY_ID" \
+     --arg aggregateKey "$AGGREGATE_KEY" \
+     --arg firingToken "$FIRING_TOKEN" \
+     '{companyId: $companyId, aggregateKey: $aggregateKey, firingToken: $firingToken}' \
+   | curl --fail --silent --show-error \
+     -H "Authorization: Bearer $PAPERCLIP_BOARD_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -X POST \
+     "$PAPERCLIP_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences/recover" \
+     --data-binary @-
+   unset FIRING_TOKEN
+   ```
+
+   A result of `{"recovered":true}` means the exact fence was released.
+   `{"recovered":false}` means the token was stale, already recovered, or
+   replaced by a later firing; obtain a fresh listing before retrying. Recovery
+   activity records the company, aggregate key, and result, but never the
+   token.
 
 ## Configuration
 
@@ -61,7 +124,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
 | `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24, clamped to a 720h (30-day) ceiling. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
-| `fallbackAgentName`  | string  | effectively yes | Exact agent **name** assigned when nothing else resolves an owner. Must match exactly one *invokable* agent. Missing, unmatched, ambiguous, or matching only a non-invokable agent (`paused` / `pending_approval` / broken reporting chain) **fails closed**: the alert creates no issue and the delivery is retried. |
+| `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
 ### Example `AlertmanagerConfig` YAML
@@ -106,6 +169,7 @@ ownerMap:
   team:
     platform:   alice@blockcast.net
     networking: ned@blockcast.net
+fallbackAgentName: Alert Triage
 issueRouteMap:
   class:
     physical_infra_proxmox:
@@ -163,40 +227,13 @@ below.
 
 First hit wins:
 
-1. `alert.labels.paperclip_assignee_email` (explicit override)
-2. `alert.annotations.paperclip_assignee_email` (explicit override)
-3. `issueRouteMap[<label>][<value>].assigneeAgentId` / `.assigneeUserId`
-4. `ownerMap[<label>][<value>]` matched against `alert.labels`
-5. `fallbackAgentName` — the configured named agent
-6. **fail closed** — no issue is created
+1. `alert.labels.paperclip_assignee_email`
+2. `ownerMap[<label>][<value>]` matched against `alert.labels`
+3. `alert.annotations.paperclip_assignee_email`
+4. the exact configured `fallbackAgentName`
 
-Explicit label/annotation overrides outrank the route; the `ownerMap` does
-not — a matching route wins over it.
-
-Step 6 is deliberate. An ownerless alert issue is never routed to anyone, is
-not woken on, and auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438
-all landed `assigneeAgentId: null` on 2026-08-17 and died that way), so the
-plugin refuses to create one. Because that is a *configuration* fault rather
-than a property of the alert, the delivery fails rather than being
-acknowledged: Alertmanager keeps retrying and the alert survives until an
-operator fixes `fallbackAgentName`. Watch `alertmanager.owner.fallback_failed`.
-
-`fallbackAgentName` matches on the agent's name, case-insensitively after
-trimming, and must match **exactly one invokable** agent in the company. Zero
-matches (wrong name) and more than one match (ambiguous) both fail closed.
-
-Invokability is part of the match, not a separate check. `ctx.agents.list`
-filters out only `terminated` agents, so a `paused` or `pending_approval` agent
-can still match a name — and `ctx.agents.invoke` throws on exactly those. An
-issue assigned to one of them has a non-null assignee that can never be woken,
-which reproduces the BLO-27435 harm while the ownerless-issue check reads clean.
-Candidates are therefore filtered through `getAgentWorkEligibility`, which also
-rejects a broken reporting chain, before the exactly-one test — so a leftover
-paused duplicate of the right name does not break an otherwise valid config,
-while a sole paused match fails closed with a log line naming the blocking
-reason (`paused`) rather than reporting the name as unmatched. Budget
-enforcement pauses agents, so this is a live runtime transition, not only a
-config typo.
+If no mapped user, issue-route assignee, or unique fallback agent resolves, the
+delivery emits `alertmanager.owner.fallback_failed` and creates no issue.
 
 Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
@@ -246,6 +283,36 @@ an alert that will be dropped identically every time. A non-string
 | warning  | high     |
 | info     | medium   |
 | (other)  | medium   |
+
+`info` remains explicit for compatibility, but the firing creation floor runs
+first, so it creates no new issue. Accepted `critical`, `warning`, and custom
+severities continue through this mapping.
+
+### Aggregate creation identity
+
+The canonical creation key is
+`alert-aggregate:v1:[<alertname>,<paperclip_dedupe_domain-or-null>]` and is
+stored in `originFingerprint`. Without an explicit domain, distinct label sets
+for one alertname converge on one open issue. Set `paperclip_dedupe_domain` as a
+label or annotation when a rule intentionally needs separate resource domains.
+
+The host enforces one open row per company and aggregate key with
+`issues_active_alertmanager_aggregate_creation_uq`. The plugin also takes a
+short-lived aggregate creation claim before calling issue creation so concurrent
+losers re-check for the winner instead of reaching external identifier
+allocation. Each attached fingerprint is tracked in
+`alertmanager_aggregate_members`; resolving one member closes the shared issue
+only after the last unresolved sibling clears. Same-fingerprint re-fires that
+point at an older terminal issue rebind to the current active aggregate winner.
+
+### Channel precision policy
+
+The target is at least 70% actionable issues, measured as a 14-day cancellation
+rate at or below 30%. The pre-change baseline from
+[BLO-20576](/BLO/issues/BLO-20576) is 73.6% cancelled. If the first 14-day
+cohort remains above 36.8% cancelled, opt the noisiest rules out with
+`paperclip_issue: "false"`, recalibrate their thresholds and dedupe domains,
+and require a replay before restoring issue creation.
 
 ### Observability drill-in links
 

@@ -75,6 +75,15 @@ function buildFakeAlertmanagerStore() {
     namespace: "ns",
     async execute(sql: string, params: unknown[] = []) {
       const text = sql.replace(/\s+/g, " ").trim();
+      if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
+        return { rowCount: 1 };
+      }
+      if (
+        text.includes("alertmanager_aggregate_creation_claims") ||
+        text.includes("alertmanager_aggregate_members")
+      ) {
+        return { rowCount: text.startsWith("INSERT") || text.startsWith("DELETE") ? 1 : 0 };
+      }
       if (text.includes("ON CONFLICT (cover_issue_id, alert_issue_id)")) {
         const [id, coverIssueId, alertIssueId] = params as [string, string, string];
         const key = `${coverIssueId}:${alertIssueId}`;
@@ -144,6 +153,7 @@ function buildFakeAlertmanagerStore() {
     },
     async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
       const text = sql.replace(/\s+/g, " ").trim();
+      if (text.includes("alertmanager_aggregate_members")) return [];
       if (text.startsWith("SELECT DISTINCT cover_issue_id")) {
         const [alertIssueId] = params as [string];
         const ids = new Set<string>();
@@ -359,7 +369,7 @@ describe("alert escalation", () => {
 
   it("does not reset the ladder on repeat firing deliveries", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T01:00:00Z", escalationAttempt: 2 };
-    const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})) }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { warn: vi.fn() } };
+    const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})) }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { warn: vi.fn() }, db: buildFakeAlertmanagerStore().db };
     await handleFiring(mocks as unknown as PluginContext, config(), alert());
     expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:00:00Z" }));
   });
@@ -618,6 +628,7 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
       activity: { log: vi.fn() },
       metrics: { write: vi.fn() },
       logger: { debug: vi.fn(), warn: vi.fn() },
+      db: buildFakeAlertmanagerStore().db,
     };
     const beforeFiring = Date.now();
     await handleFiring(firingMocks as unknown as PluginContext, config({ issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP }), podPendingAlert);

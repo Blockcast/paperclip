@@ -56,6 +56,9 @@ function mkCtx() {
         registered.set(key, handler);
       }),
     },
+    actions: {
+      register: vi.fn(),
+    },
     config: { get: vi.fn(async () => ({})) },
   } as unknown as PluginContext;
 

@@ -139,9 +139,8 @@ export async function resolveOwnerUserId(
 
 /**
  * Combined helper: resolve email from alert → cached Paperclip user id.
- * Returns undefined when nothing matches; the caller then falls back to the
- * configured named agent (`resolveFallbackAgentId`) rather than creating an
- * ownerless issue.
+ * Returns undefined when nothing matches; the caller must resolve the named
+ * fallback agent before creating an issue.
  */
 export async function resolveAssigneeUserId(
   ctx: Pick<PluginContext, "users" | "state" | "logger">,
