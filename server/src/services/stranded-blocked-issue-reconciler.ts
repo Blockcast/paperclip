@@ -164,6 +164,26 @@ async function listLockedBlockedCandidates(
   return rows.filter((row) => row.status === "blocked");
 }
 
+async function listLockedLivePathIssueIds(
+  dbOrTx: Pick<Db, "execute">,
+  candidateIds: string[],
+): Promise<Set<string>> {
+  if (candidateIds.length === 0) return new Set();
+  const rows = await dbOrTx.execute(sql<{ id: string }>`
+    SELECT DISTINCT i.id::text AS id
+    FROM issues i
+    LEFT JOIN heartbeat_runs active_run
+      ON active_run.id IN (i.execution_run_id, i.checkout_run_id)
+      AND active_run.status IN ('queued', 'running', 'scheduled_retry')
+    WHERE i.id IN (${inArray(issues.id, candidateIds)})
+      AND (
+        active_run.id IS NOT NULL
+        OR (i.monitor_next_check_at IS NOT NULL AND i.monitor_next_check_at > now())
+      )
+  `);
+  return new Set(toRows<{ id: string }>(rows).map((row) => row.id));
+}
+
 async function reconcileCandidateBatch(
   tx: Pick<Db, "execute" | "select" | "update">,
   candidates: CandidateRow[],
@@ -173,6 +193,7 @@ async function reconcileCandidateBatch(
 
   const lockedCandidates = await listLockedBlockedCandidates(tx, candidateIds);
   if (lockedCandidates.length === 0) return [];
+  const livePathIds = await listLockedLivePathIssueIds(tx, candidateIds);
 
   const candidatesByCompany = new Map<string, LockedCandidateRow[]>();
   for (const candidate of lockedCandidates) {
@@ -192,6 +213,7 @@ async function reconcileCandidateBatch(
     ]);
 
     for (const candidate of companyCandidates) {
+      if (livePathIds.has(candidate.id)) continue;
       const readiness = readinessMap.get(candidate.id);
       if (!readiness?.isDependencyReady) continue;
       if (suppressions.has(candidate.id)) continue;

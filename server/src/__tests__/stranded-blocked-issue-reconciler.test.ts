@@ -784,6 +784,40 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(result.reconciled).toBe(0);
     expect(await statusOf(issueId)).toBe("in_progress");
   });
+
+  it("does not reconcile when a checkout lock appears after candidate selection", async () => {
+    const { companyId, agentId } = await createCompany("SBRACE");
+    const issueId = await insertIssue({ companyId, identifier: "SBRACE-1", status: "blocked" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: { issueId },
+    });
+
+    const lockAcquired = defer();
+    const releaseLock = defer();
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM issues WHERE id = ${issueId}::uuid FOR UPDATE`);
+      await tx.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+      lockAcquired.resolve();
+      await releaseLock.promise;
+    });
+    await lockAcquired.promise;
+
+    const reconcile = reconcileStrandedBlockedIssues(db, { batchSize: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    releaseLock.resolve();
+    await holder;
+
+    const result = await reconcile;
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+  });
 });
 
 describe("startStrandedBlockedIssueReconciler", () => {
