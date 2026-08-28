@@ -428,6 +428,7 @@ import {
 import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
+  jitterTransientRetryFloor,
   applyCcrotateCapacityDecision,
   resolveCapacityEscalation,
   CAPACITY_ESCALATION_AFTER_MS,
@@ -18131,14 +18132,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
         : null;
     const effectiveRetryNotBefore = clampedTransientRetry?.dueAt ?? transientRetryNotBefore;
-    const schedule =
+    // PEN-2509: the floor is adopted verbatim below, and an advertised floor is
+    // an absolute instant shared by every run that saw the same denial — so
+    // "adopt verbatim" is also "resume in lockstep". Disperse it forward before
+    // it becomes `dueAt`. See `jitterTransientRetryFloor` for why additive-only
+    // is the only safe direction and why the base curve's own jitter does not
+    // cover this path (it is discarded whenever the floor wins, which is
+    // whenever a floor is present).
+    const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
-        ? {
-            ...baseSchedule,
-            dueAt: effectiveRetryNotBefore,
-            delayMs: Math.max(0, effectiveRetryNotBefore.getTime() - now.getTime()),
-          }
-        : baseSchedule;
+        ? jitterTransientRetryFloor({ dueAt: effectiveRetryNotBefore, now, random: opts?.random })
+        : null;
+    const schedule = flooredDueAt
+      ? {
+          ...baseSchedule,
+          dueAt: flooredDueAt.dueAt,
+          delayMs: Math.max(0, flooredDueAt.dueAt.getTime() - now.getTime()),
+        }
+      : baseSchedule;
 
     const requiresIssueGate =
       requiresIssueExecutionRetryLock(retryReason) ||

@@ -773,3 +773,79 @@ export function resolveRoutineScopedRetry(input: {
     clampedFromIso: input.dueAt.toISOString(),
   };
 }
+
+/**
+ * Jitter as a fraction of the remaining delay, applied to a `transient_failure`
+ * retry floor. Mirrors {@link CCROTATE_CAPACITY_PARK_JITTER_RATIO}, which serves
+ * the same purpose on the capacity path.
+ */
+export const TRANSIENT_RETRY_FLOOR_JITTER_RATIO = 0.2;
+
+/**
+ * Ceiling on the jitter window for a transient retry floor (PEN-2509).
+ *
+ * The ratio alone is the wrong control at this scale. A capacity park is capped
+ * at CCROTATE_CAPACITY_MAX_PARK_MS (15m), so 0.2 there spreads a cohort over at
+ * most 3 minutes. A `transient_failure` floor is routinely 4-5h out and bounded
+ * only by MAX_TRANSIENT_RETRY_HORIZON_MS (24h), where the same ratio would add
+ * up to 4.8h to a wait that is already the fleet's slowest — trading a herd for
+ * a stall, which is not the trade this fixes.
+ *
+ * 5 minutes is derived from what the herd actually collides with rather than
+ * picked for roundness. PEN-2499 measured the upstream flapping 0%<->100% with
+ * 26% of *5-minute* samples serving zero requests, so a cohort dispersed across
+ * one such sample window straddles more than one flap state instead of sharing
+ * a single verdict. That is the entire failure mode: 25 runs resuming inside
+ * 1.1s in a zero-serving trough all fail, and all re-park together.
+ *
+ * Cost is bounded and small — worst case 5 minutes added to a multi-hour park
+ * (<2% of a 4.8h floor). Spread across a 25-run cohort it is ~12s of mean
+ * spacing, which is four orders of magnitude more dispersion than the 0ms
+ * spread measured on 2026-08-24 and enough that no two runs share a second.
+ */
+export const TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS = 5 * 60 * 1000;
+
+/**
+ * Spread a cohort of runs that share one `transient_failure` retry floor.
+ *
+ * `scheduleBoundedRetryForRun` treats `retryNotBefore` as a floor and, when it
+ * is later than the computed backoff, adopts it *verbatim* as `dueAt`. Because
+ * that floor is an absolute provider instant, every run holding the same one
+ * lands on the same millisecond — and because it is routinely 4-5h out while
+ * the largest backoff hop is 2h, the floor wins whenever it is present. Both
+ * observed symptoms follow from that single substitution: retries converge to a
+ * shared instant, and they stop varying with attempt count (the attempt-scaled
+ * curve is exactly what the floor discards). Measured 2026-08-24: 25 runs / 5
+ * agents / attempts 2-11 at 0ms spread; 2026-08-25: 23 runs / 7 agents /
+ * attempts 1-12 inside 1.1s.
+ *
+ * Jitter is **additive only**, for the same reason the capacity path's is (see
+ * {@link CCROTATE_CAPACITY_PARK_JITTER_RATIO}): the floor means "not before",
+ * so pulling a retry in front of it would probe a reset the provider asked us
+ * to wait for. Delaying past it is always permitted. That asymmetry is why this
+ * is the correct fix and a *shorter horizon* is not — a shorter horizon moves
+ * the herd without dispersing it, and risks probing early.
+ *
+ * Applied to every floor including `provider_quota`, whose floor is deliberately
+ * never clamped: forward-only jitter cannot violate a contractual boundary, and
+ * a quota cohort herds on a shared reset exactly like any other.
+ */
+export function jitterTransientRetryFloor(input: {
+  dueAt: Date;
+  now: Date;
+  random?: () => number;
+  jitterRatio?: number;
+  maxJitterMs?: number;
+}): { dueAt: Date; jitterMs: number } {
+  const random = input.random ?? Math.random;
+  const ratio = Math.max(0, input.jitterRatio ?? TRANSIENT_RETRY_FLOOR_JITTER_RATIO);
+  const maxJitterMs = Math.max(0, input.maxJitterMs ?? TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS);
+  // Proportional to the delay still to be served, so a floor already in the
+  // past (or one moments away) is not pushed out by a window sized for a
+  // multi-hour park.
+  const delayMs = Math.max(0, input.dueAt.getTime() - input.now.getTime());
+  const windowMs = Math.min(delayMs * ratio, maxJitterMs);
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMs = Math.floor(sample * windowMs);
+  return { dueAt: new Date(input.dueAt.getTime() + jitterMs), jitterMs };
+}
