@@ -845,7 +845,14 @@ export function jitterTransientRetryFloor(input: {
   // multi-hour park.
   const delayMs = Math.max(0, input.dueAt.getTime() - input.now.getTime());
   const windowMs = Math.min(delayMs * ratio, maxJitterMs);
-  const sample = Math.min(1, Math.max(0, random()));
+  // A non-finite draw must degrade to "no jitter", not to an Invalid Date.
+  // `Math.min(1, Math.max(0, NaN))` is NaN, so clamping alone does not survive
+  // a NaN — it propagates through to `new Date(floor + NaN)`, whose getTime()
+  // is NaN, and that would be persisted as `scheduledRetryAt`. Failing to 0
+  // yields the floor verbatim, which is the safe direction: the floor is the
+  // one instant we already know we are allowed to resume at.
+  const rawSample = random();
+  const sample = Number.isFinite(rawSample) ? Math.min(1, Math.max(0, rawSample)) : 0;
   const jitterMs = Math.floor(sample * windowMs);
   return { dueAt: new Date(input.dueAt.getTime() + jitterMs), jitterMs };
 }

@@ -195,7 +195,14 @@ const GATEWAY_503_ERROR_MESSAGE =
   "API Error: 503 Service temporarily unavailable. This is a server-side issue, usually " +
   "temporary — try again in a moment. If it persists, check your inference gateway (api.penstock.run).";
 
-describe("a cohort sharing one advertised floor", () => {
+// `getEmbeddedPostgresTestSupport` is async, and `startEmbeddedPostgresTestDatabase`
+// takes a name PREFIX (not the support object). Resolving support at module scope
+// also lets the suite skip cleanly where embedded Postgres is unavailable, instead
+// of failing the file for an environmental reason.
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
   let db: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   let heartbeat: ReturnType<typeof heartbeatService>;
@@ -204,8 +211,7 @@ describe("a cohort sharing one advertised floor", () => {
   let sharedFloor: Date;
 
   beforeAll(async () => {
-    const support = getEmbeddedPostgresTestSupport();
-    tempDb = await startEmbeddedPostgresTestDatabase(support);
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pen2509-shared-floor-");
     db = createDb(tempDb!.connectionString);
     heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
     sharedFloor = new Date(Date.now() + 4.5 * 60 * 60 * 1000);
@@ -298,10 +304,26 @@ describe("a cohort sharing one advertised floor", () => {
       expect(ms).toBeLessThanOrEqual(sharedFloor.getTime() + TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS);
     }
 
-    // Every row carries the unjittered floor, so the applied jitter stays
-    // derivable from the row alone without a new column.
-    for (const row of parked) {
-      const resultJson = (row.resultJson ?? {}) as Record<string, unknown>;
+    // Provenance lives on the ORIGIN run, not the parked successor.
+    // `readTransientRecoveryContractFromRun` reads the failed run's resultJson,
+    // and the successor is created fresh — it has not executed, so it carries no
+    // adapter result at all. Asserting it here would be asserting `undefined`.
+    //
+    // ⚠️ Worth stating plainly rather than burying: this means the unjittered
+    // floor is NOT recoverable from the parked row alone. An operator auditing
+    // `paperclipListParkedAgents` — which is exactly how this defect was found —
+    // sees the successor, so they can observe that a cohort is dispersed but
+    // cannot recover the instant it was dispersed from. That is an acceptable
+    // trade (dispersion is the goal, and the origin row retains the floor), but
+    // it is a real observability limit and not the "derivable from the row
+    // alone" property an earlier draft of this test claimed.
+    for (const runId of originRunIds) {
+      const origin = await db
+        .select({ resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      const resultJson = (origin?.resultJson ?? {}) as Record<string, unknown>;
       expect(resultJson.retryNotBefore).toBe(sharedFloor.toISOString());
     }
 
