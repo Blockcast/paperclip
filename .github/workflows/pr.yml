@@ -1295,9 +1295,18 @@ jobs:
           PAPERCLIP_E2E_SKIP_LLM: "true"
         run: pnpm run test:e2e
 
+      # Diagnostic-only artifact (retention-days: 1). `if: always()` controls
+      # whether this step RUNS, not whether its failure counts -- so a flaky
+      # upload fails the step, fails the job, fails the merge-group run, and
+      # ejects the PR. That is not hypothetical: it ejected #1512 and #1516 on
+      # 2026-08-27 with every e2e test green (41 passed / 0 failed on #1512).
+      # Nothing downstream consumes this report, so its failure must not gate a
+      # merge. The lockfile upload in `policy` is deliberately left blocking --
+      # downstream jobs install from it. BLO-29023.
       - name: Upload Playwright report
         uses: actions/upload-artifact@v7
         if: always()
+        continue-on-error: true
         with:
           name: playwright-report
           path: |
