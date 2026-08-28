@@ -268,13 +268,23 @@ type EntryShape = {
  * sentinel back through the init script's own assignments and return one shape
  * per assignment, so each is asserted on separately.
  */
-function resolveEntryShapes(name: string, entry: SeedEntry | string): EntryShape[] {
+function resolveEntryShapes(
+  name: string,
+  entry: SeedEntry | string,
+  /**
+   * Seam for the regression tests below. Production callers use the real scan;
+   * the tests inject assignment sets the current seed does not happen to contain,
+   * so this resolver's fail-closed behaviour is pinned by construction rather
+   * than by whatever shapes the init script has today.
+   */
+  assignmentsOf: (varName: string) => string[] = shellAssignmentsOf,
+): EntryShape[] {
   const wholeEntrySentinel =
     typeof entry === "string" ? /^<shell:([A-Za-z_][A-Za-z0-9_]*)>$/.exec(entry) : null;
 
   if (wholeEntrySentinel) {
     const varName = wholeEntrySentinel[1]!;
-    const assignments = shellAssignmentsOf(varName);
+    const assignments = assignmentsOf(varName);
     if (assignments.length === 0) {
       throw new Error(
         `Upstream '${name}' is seeded as the shell variable ${varName}, but no '${varName}=' ` +
@@ -291,21 +301,67 @@ function resolveEntryShapes(name: string, entry: SeedEntry | string): EntryShape
   }
 
   const object = typeof entry === "string" ? {} : entry;
-  const { hosts, unresolved } = object.url ? urlsIn(object.url) : { hosts: [], unresolved: [] };
-  // A url with a sentinel *inside* it (`http://<shell:SVC>:8080/mcp`) resolves
-  // through the same assignment scan; if that yields no host it stays unresolved
-  // and the caller fails closed.
-  for (const match of (object.url ?? "").matchAll(/<shell:([A-Za-z_][A-Za-z0-9_]*)>/g)) {
-    for (const rhs of shellAssignmentsOf(match[1]!)) hosts.push(...urlsIn(rhs).hosts);
-  }
-  return [
-    {
-      label: name,
-      hosts,
-      unresolved: hosts.length > 0 ? [] : unresolved,
-      declaresCommand: Boolean(object.command),
-    },
+  const declaresCommand = Boolean(object.command);
+  const url = object.url ?? "";
+  if (!url) return [{ label: name, hosts: [], unresolved: [], declaresCommand }];
+
+  const direct = urlsIn(url);
+  const sentinels = [
+    ...new Set(Array.from(url.matchAll(/<shell:([A-Za-z_][A-Za-z0-9_]*)>/g), (m) => m[1]!)),
   ];
+  if (sentinels.length === 0) {
+    return [{ label: name, hosts: direct.hosts, unresolved: direct.unresolved, declaresCommand }];
+  }
+
+  // A url with a sentinel *inside* it (`http://<shell:SVC>:8080/mcp`) resolves
+  // through the same assignment scan as the whole-entry case above — and, like it,
+  // fans out to one shape per assignment.
+  //
+  // Fanning out is the load-bearing part, not a tidiness choice. The first version
+  // merged every assignment into a single shape and cleared the unresolved list
+  // whenever *any* host had been pinned (`hosts.length > 0 ? [] : unresolved`).
+  // That let one resolvable assignment vouch for an unresolvable sibling: a var
+  // with a concrete fallback and a computed admin form reported `unresolved: []`,
+  // so the fail-closed assertion downstream passed while half of what the pod can
+  // actually boot as had an unknown host. A merged shape cannot express "pinned
+  // here, unknown there" — it can only report the optimistic half, which is the
+  // fail-open this file exists to reject. Found in review of #1530 by reading the
+  // resolver for the shape it was written to catch (PEN-2370 ask 3's method
+  // clause: audit the fix's own blind spots).
+  //
+  // So each assignment carries its own evidence: the unresolved urls found in that
+  // assignment, plus the seed url itself when that assignment pinned no host at
+  // all. Evidence is never dropped on account of a *different* shape resolving.
+  const shapes: EntryShape[] = [];
+  for (const varName of sentinels) {
+    const assignments = assignmentsOf(varName);
+    if (assignments.length === 0) {
+      // Unknowable from this repo. Not an error as it is for a whole-entry
+      // sentinel (there, nothing at all is known about the upstream); here the
+      // url is reported unresolved and the caller fails closed on it.
+      shapes.push({
+        label: `${name} (${varName}, no assignment found)`,
+        hosts: [],
+        unresolved: [url],
+        declaresCommand,
+      });
+      continue;
+    }
+    assignments.forEach((rhs, index) => {
+      const resolved = urlsIn(rhs);
+      shapes.push({
+        label: `${name} (${varName} assignment ${index + 1} of ${assignments.length})`,
+        hosts: resolved.hosts,
+        unresolved: [...resolved.unresolved, ...(resolved.hosts.length === 0 ? [url] : [])],
+        declaresCommand,
+      });
+    });
+  }
+  // Any concrete url sitting alongside the sentinel is still audited on its own.
+  if (direct.hosts.length > 0) {
+    shapes.push({ label: name, hosts: direct.hosts, unresolved: [], declaresCommand });
+  }
+  return shapes;
 }
 
 /**
@@ -477,6 +533,62 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     expect(hosts).toContain("gbrain-mcp-internal.paperclip.svc.cluster.local");
     expect(hosts).toContain("gbrain-mcp-admin.paperclip.svc.cluster.local");
     expect(shapes.flatMap((s) => s.unresolved)).toEqual([]);
+  });
+
+  it("a resolvable shape never vouches for an unresolvable one", () => {
+    // The regression for the fail-open this resolver shipped with: unresolved
+    // evidence was discarded whenever *any* host had been pinned, so a var with
+    // one concrete assignment and one computed assignment reported a clean bill
+    // and the fail-closed check downstream passed on a half-unknown topology.
+    //
+    // The seed has no url-embedded sentinel today, so this drives the resolver
+    // through its injection seam. That is deliberate: the shapes this must fail
+    // closed on are the ones nobody has written into the init script *yet*, and a
+    // test that only exercises today's seed would go quiet the moment it mattered.
+    const url = "http://<shell:SVC>:8080/mcp";
+    const entry: SeedEntry = { type: "http", url };
+
+    const mixed = resolveEntryShapes("probe", entry, (v) =>
+      v === "SVC" ? ["http://pinned.svc.cluster.local:8080", "${LATE_BOUND_AT_BOOT}"] : [],
+    );
+
+    // The contract every assertion in this file leans on: a shape may only report
+    // "nothing unresolved" if it actually pinned a host. Anything else is the
+    // resolver saying "I cannot tell" in a voice that reads as "fine".
+    for (const shape of mixed) {
+      if (shape.unresolved.length === 0) {
+        expect(
+          shape.hosts.length,
+          `Shape '${shape.label}' claims a clean bill of health while pinning no host. ` +
+            "That is the vacuous pass this resolver exists to prevent.",
+        ).toBeGreaterThan(0);
+      }
+    }
+
+    expect(
+      mixed.flatMap((s) => s.unresolved),
+      "The computed assignment cannot be pinned to a host, so the url must survive as unresolved " +
+        "evidence. A sibling assignment resolving says nothing about this one.",
+    ).toContain(url);
+    expect(mixed.flatMap((s) => s.hosts)).toContain("pinned.svc.cluster.local");
+
+    // Same rule one level down: unresolved urls found *inside* an assignment are
+    // evidence too, and were previously dropped on the floor because only the
+    // assignment's hosts were collected.
+    const withinOneAssignment = resolveEntryShapes("probe", entry, (v) =>
+      v === "SVC" ? ["http://pinned.svc.cluster.local:8080 http://${TENANT}.svc.cluster.local"] : [],
+    );
+    expect(
+      withinOneAssignment.flatMap((s) => s.unresolved),
+      "An assignment that names one pinnable host and one interpolated host is half-unknown, " +
+        "and the half that is unknown must be reported.",
+    ).toContain("http://${TENANT}.svc.cluster.local");
+
+    // And the floor case: a sentinel with no assignment at all is unknowable from
+    // this repo, so the url is unresolved rather than silently host-less.
+    const unassigned = resolveEntryShapes("probe", entry, () => []);
+    expect(unassigned.flatMap((s) => s.hosts)).toEqual([]);
+    expect(unassigned.flatMap((s) => s.unresolved)).toContain(url);
   });
 
   it("anything claimed as gateway-scrubbed actually resolves to a scrubbing gateway host", () => {
