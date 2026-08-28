@@ -329,7 +329,8 @@ export async function ensurePendingConcurrentIndexes(
       }
       if (before === "wrong-definition") {
         throw new Error(
-          `Index ${spec.name} exists and is complete, but does not match ${spec.migration}'s table, access method, `
+          `Index ${spec.name} exists and is complete, but does not match migration ${spec.migration}'s definition: `
+          + `table, access method, `
           + `key columns, sort options, or predicate. Inspect it before running: `
           + `${spec.dropStatement}; ${spec.createStatement}`,
         );
