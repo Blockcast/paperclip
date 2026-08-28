@@ -185,7 +185,7 @@ async function listLockedLivePathIssueIds(
 }
 
 async function reconcileCandidateBatch(
-  tx: Pick<Db, "execute" | "select" | "update">,
+  tx: Pick<Db, "execute" | "insert" | "select" | "update">,
   candidates: CandidateRow[],
 ) {
   const candidateIds = candidates.map((candidate) => candidate.id);
