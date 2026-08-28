@@ -1618,6 +1618,13 @@
       "when": 1788560000000,
       "tag": "0238_heartbeat_runs_status_only_document_write_refused",
       "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1788560060000,
+      "tag": "0239_github_status_webhook_outbox_provenance",
+      "breakpoints": true
     }
   ]
 }

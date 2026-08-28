@@ -235,6 +235,13 @@ export interface Config {
   // Commit-status context for comment-shaped Ally findings. Empty by default:
   // operators must opt in and make the context required in branch protection.
   prCommentReviewGateStatusContext: string;
+  // Contexts this gate used to publish to and has since moved off. GitHub
+  // commit statuses have no delete, so a context left behind by a rename keeps
+  // showing its final write forever. After posting the live status the gate
+  // also writes each of these a retirement pointer, which supersedes the stale
+  // row in place and keeps any repo that still requires the old context
+  // satisfied (BLO-29711).
+  prCommentReviewGateRetiredStatusContexts: string[];
   telemetryEnabled: boolean;
 }
 
@@ -1054,6 +1061,14 @@ export function loadConfig(): Config {
     githubReviewGateExpectedAppId,
     githubReviewGateExpectedInstallationId,
     prReviewGateStatusContext,
+    prCommentReviewGateRetiredStatusContexts: [
+      ...new Set(
+        (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS ?? "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    ],
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

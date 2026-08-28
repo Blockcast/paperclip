@@ -3,8 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
   cfg: {
     prCommentReviewGateStatusContext: "",
+    prCommentReviewGateRetiredStatusContexts: [] as string[],
     prReviewerBotLogin: "allyblockcast[bot]",
-  } as Record<string, string>,
+  } as Record<string, unknown> & {
+    prCommentReviewGateStatusContext: string;
+    prCommentReviewGateRetiredStatusContexts: string[];
+    prReviewerBotLogin: string;
+  },
 }));
 
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
@@ -50,6 +55,7 @@ function blockingCommentFor(headSha: string) {
 
 beforeEach(() => {
   h.cfg.prCommentReviewGateStatusContext = "review/ally-comment-gate";
+  h.cfg.prCommentReviewGateRetiredStatusContexts = [];
   h.cfg.prReviewerBotLogin = "allyblockcast[bot]";
   mockListComments.mockReset();
   mockListReviews.mockReset();
@@ -195,4 +201,93 @@ describe("runPrCommentReviewGateCheck", () => {
     });
     expect(mockPostStatus).not.toHaveBeenCalled();
   }, 10_000);
+});
+
+// BLO-29711 AC#1. The gate moved off `review/ally-comment` to
+// `gate/ally-comment-findings`, but commit statuses cannot be deleted: every
+// head already stamped with the old context keeps showing its fail-open green
+// forever (42 of 43 open penstock PRs, measured 2026-08-22). Only the
+// credential that wrote those rows can overwrite them, which is this App's
+// installation token — so the supersede has to ride the gate's own evaluations.
+describe("retired status contexts", () => {
+  beforeEach(() => {
+    h.cfg.prCommentReviewGateStatusContext = "gate/ally-comment-findings";
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+  });
+
+  function postFor(context: string) {
+    return mockPostStatus.mock.calls.map(([arg]) => arg).find((arg) => arg.context === context);
+  }
+
+  it("supersedes the retired context with a pointer carrying no not-evaluated claim", async () => {
+    // The exact pre-rename state: nothing attests the head, so the live gate
+    // legitimately goes green under `gate/`. The stale `review/` row must stop
+    // asserting that nothing reviewed the head.
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+
+    expect(postFor("gate/ally-comment-findings")).toMatchObject({
+      state: "success",
+      description: "No Ally consolidated-review comment attests to reviewing this head.",
+    });
+
+    const retired = postFor("review/ally-comment");
+    expect(retired).toMatchObject({ sha: TARGET.headSha, state: "success" });
+    // This is what the census greps for. A retirement pointer that still
+    // admitted "nothing attests" would leave AC#1 failing under the old name.
+    expect(retired?.description).not.toMatch(
+      /no Ally consolidated-review comment attests|no head SHA was supplied/i,
+    );
+    expect(retired?.description).toContain("gate/ally-comment-findings");
+    expect(retired?.description.length).toBeLessThanOrEqual(140);
+  });
+
+  it("does not overwrite the live verdict when the live context is also listed as retired", async () => {
+    // A misconfiguration that would otherwise replace a real `failure` with a
+    // green pointer — the exact fail-open this issue exists to remove.
+    h.cfg.prCommentReviewGateRetiredStatusContexts = [
+      "review/ally-comment",
+      "gate/ally-comment-findings",
+    ];
+    mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+
+    const liveWrites = mockPostStatus.mock.calls
+      .map(([arg]) => arg)
+      .filter((arg) => arg.context === "gate/ally-comment-findings");
+    expect(liveWrites).toHaveLength(1);
+    expect(liveWrites[0]).toMatchObject({ state: "failure" });
+  });
+
+  it("reports retirement failure after publishing the live verdict", async () => {
+    // Cleanup of a superseded row must never overwrite the live signal, but a
+    // failed retirement write must remain visible so a later webhook can retry
+    // it instead of silently leaving a required legacy row stale.
+    mockPostStatus.mockImplementation(async ({ context }: { context: string }) =>
+      context === "review/ally-comment"
+        ? { ok: false, retryable: false, reason: "commit_status_write_http_403" }
+        : { ok: true, statusCode: 201 },
+    );
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: false,
+      reason: "post_failed",
+      postFailure: "review/ally-comment: commit_status_write_http_403",
+    });
+    expect(postFor("gate/ally-comment-findings")).toBeDefined();
+  });
+
+  it("writes nothing extra when no context is retired", async () => {
+    h.cfg.prCommentReviewGateRetiredStatusContexts = [];
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+    expect(mockPostStatus).toHaveBeenCalledTimes(1);
+  });
 });

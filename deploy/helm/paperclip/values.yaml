@@ -256,6 +256,12 @@ githubApp:
   # required in branch protection so Critical/Important comment findings block
   # the head they explicitly attest to. Requires `statuses: write`.
   prCommentReviewGateStatusContext: ""
+  # -- Contexts this gate previously published to. Commit statuses cannot be
+  # deleted, so a rename strands the old context on every head that already
+  # carries it. Each name listed here is overwritten with a pointer to the live
+  # context on every evaluation, which supersedes the stale row and keeps a repo
+  # that still requires the old name satisfied. Comma-separated.
+  prCommentReviewGateRetiredStatusContexts: ""
 
 # -- Pod spec knobs.
 pod:

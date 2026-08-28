@@ -12,6 +12,8 @@
  * gate unable to observe any real review (BLO-29711).
  */
 import { loadConfig } from "../config.js";
+import type { Db } from "@paperclipai/db";
+import { withGithubStatusDeliveryLock } from "./github-status-delivery-outbox.js";
 import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
@@ -372,10 +374,11 @@ export function evaluateCommentReviewGate(input: {
  * A green status published under a `review/`-prefixed context reads as "this
  * head was reviewed and was clean". For the `not_evaluated` outcome that
  * reading is false, and no state can fix it: `pending`/`failure` on absence
- * would deadlock every formally-reviewed PR. The only remedy is to publish
- * outside the `review/` namespace, which is a branch-protection-coupled
- * change. Until then this predicate names the condition so it can be asserted
- * against and logged rather than silently shipped (BLO-29711).
+ * would deadlock every formally-reviewed PR. The remedy is to publish outside
+ * the `review/` namespace — done for the Blockcast deployment, whose live
+ * context is now `gate/ally-comment-findings`. This predicate stays as the
+ * assertion point so a future config change cannot silently move the gate back
+ * under `review/` (BLO-29711).
  */
 export function commentReviewGateVerdictIsMisreadable(
   verdict: CommentReviewGateVerdict,
@@ -388,15 +391,108 @@ export function commentReviewGateVerdictIsMisreadable(
   );
 }
 
+/**
+ * Contexts to supersede with a retirement pointer, given the live context.
+ *
+ * The live context is excluded even if an operator also lists it as retired:
+ * writing a retirement pointer over the verdict we just published would
+ * replace a real `failure` with a green, which is the exact fail-open this
+ * issue exists to remove.
+ */
+export function retiredCommentReviewGateContexts(
+  retired: readonly string[] | null | undefined,
+  liveContext: string,
+): string[] {
+  const live = liveContext.trim().toLowerCase();
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of retired ?? []) {
+    const context = raw?.trim();
+    if (!context) continue;
+    const key = context.toLowerCase();
+    if (key === live || seen.has(key)) continue;
+    seen.add(key);
+    result.push(context);
+  }
+  return result;
+}
+
+// GitHub truncates commit-status descriptions at 140 characters. The pointer to
+// the live context is the entire value of a retirement write, so fall back to a
+// shorter phrasing rather than letting the context name be cut in half.
+const MAX_COMMIT_STATUS_DESCRIPTION = 140;
+
+/**
+ * Description for a superseded context. Deliberately carries no claim about
+ * whether anything reviewed the head — that claim under a `review/`-prefixed
+ * green is the defect (BLO-29711) — only a pointer to where the verdict now
+ * lives. `scripts/check-comment-review-gate-census.mjs` flags a green `review/`
+ * status whose description admits nothing was evaluated; this text must not
+ * match that pattern.
+ *
+ * The blocking phrasing exists because the retirement write mirrors the live
+ * state (see `supersedeRetiredContexts`). A red row whose description only said
+ * "retired" would read as the retirement itself having failed.
+ */
+export function commentReviewGateRetirementDescription(
+  liveContext: string,
+  state: CommentReviewGateVerdict["state"] = "success",
+): string {
+  const target = liveContext.trim();
+  const [full, short] =
+    state === "failure"
+      ? [
+          `Retired. Unresolved finding stands; "${target}" carries the verdict.`,
+          `Retired. Unresolved finding; see "${target}".`,
+        ]
+      : [
+          `Retired. Comment-shaped review findings now publish to "${target}".`,
+          `Retired. Findings now publish to "${target}".`,
+        ];
+  if (full.length <= MAX_COMMIT_STATUS_DESCRIPTION) return full;
+  return short.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
+}
+
+/**
+ * The status row to write over a retired context, given the live verdict.
+ *
+ * Split out as a pure function so the mirroring invariant is testable without
+ * standing up the GitHub client: "a blocking live verdict never produces a
+ * green retirement row" is the property that keeps a still-required legacy
+ * context from being satisfied while the live one blocks. See
+ * `supersedeRetiredContexts` for why that case is reachable.
+ */
+export function commentReviewGateRetirementStatus(
+  liveContext: string,
+  verdict: Pick<CommentReviewGateVerdict, "state">,
+): { state: CommentReviewGateVerdict["state"]; description: string } {
+  return {
+    state: verdict.state,
+    description: commentReviewGateRetirementDescription(liveContext, verdict.state),
+  };
+}
+
 export type PrCommentReviewGateCheckResult =
   | { posted: true; verdict: CommentReviewGateVerdict }
-  | { posted: false; reason: "not_configured" | "fetch_failed" | "post_failed"; postFailure?: string };
+  | {
+      posted: false;
+      reason: "not_configured" | "fetch_failed" | "post_failed";
+      postFailure?: string;
+      retirementDeliveries?: Array<{
+        sha: string;
+        context: string;
+        state: CommentReviewGateVerdict["state"];
+        description: string;
+        targetUrl: string | null;
+      }>;
+    };
 
 export interface PrCommentReviewGateCheckInput {
   repoFullName: string;
   prNumber: number;
   headSha?: string | null;
   prUrl?: string | null;
+  db?: Db;
 }
 
 const TRANSIENT_RETRY_DELAYS_MS = [250, 1000];
@@ -510,19 +606,120 @@ async function executeCommentReviewGateCheck(
 
   warnOnceIfMisreadableContext(verdict, context);
 
-  const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
-    () =>
-      githubPostCommitStatusDetailed({
-        repoFullName: input.repoFullName,
-        sha: headSha,
-        context,
-        state: verdict.state,
-        description: verdict.reason,
-        targetUrl: input.prUrl ?? null,
-      }),
-    (result) => !result.ok && result.retryable,
-  );
-  if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
+  const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
+    const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
+      () =>
+        githubPostCommitStatusDetailed({
+          repoFullName: input.repoFullName,
+          sha: headSha,
+          context,
+          state: verdict.state,
+          description: verdict.reason,
+          targetUrl: input.prUrl ?? null,
+        }),
+      (result) => !result.ok && result.retryable,
+    );
+    if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
 
-  return { posted: true, verdict };
+    const retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
+    if (retirementFailures.length > 0) {
+      return {
+        posted: false,
+        reason: "post_failed",
+        postFailure: retirementFailures.map((failure) => `${failure.context}: ${failure.reason}`).join(", "),
+        retirementDeliveries: retirementFailures.map((failure) => ({
+          sha: headSha,
+          context: failure.context,
+          state: failure.state,
+          description: failure.description,
+          targetUrl: input.prUrl ?? null,
+        })),
+      };
+    }
+
+    return { posted: true, verdict };
+  };
+
+  // Serialize the live verdict and retired-context writes with forced retries.
+  return input.db
+    ? withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish)
+    : publish();
+}
+
+/**
+ * Overwrite each retired context with a pointer to the live one.
+ *
+ * Why this is code in the gate rather than a one-shot sweep. GitHub's Commit
+ * Statuses API has create and list but no delete, so renaming the context
+ * cannot retract what was already written under the old name: every head that
+ * carries the old fail-open green keeps carrying it. Measured 2026-08-22, 42 of
+ * 43 open PRs in Blockcast/penstock-llm-proxy-core were in exactly that state.
+ * Only the credential that wrote those rows can overwrite them — the App's own
+ * installation token, the one used here — so an operator script cannot do it.
+ * Riding the gate's existing evaluations reaches each PR the next time it is
+ * evaluated, with no sweep and no human chore.
+ *
+ * State mirrors the live verdict rather than being a fixed `success`. A retired
+ * context is not necessarily a powerless one: an operator may still have it in
+ * required checks while the new context is not yet required (BLO-26602 is
+ * exactly that migration), and this code cannot see branch protection to find
+ * out — the App gets 403 on that endpoint. An unconditional green would then
+ * satisfy the still-required legacy check while the live context reports a
+ * blocking finding, letting a PR with unresolved Critical/Important findings
+ * merge: the same fail-open this issue exists to remove, reintroduced through
+ * the cleanup path. Mirroring costs nothing where the context is already
+ * non-required (the row is informational either way) and preserves the block
+ * where it is not. It also never paints a PR red that the live context is not
+ * already painting red, which was the original argument for a fixed `success`.
+ *
+ * Best-effort by construction: the live verdict is already published, and
+ * failing the check over cleanup of a superseded row would let a retired
+ * context break the live one.
+ */
+async function supersedeRetiredContexts(
+  input: PrCommentReviewGateCheckInput,
+  headSha: string,
+  liveContext: string,
+  config: ReturnType<typeof loadConfig>,
+  verdict: CommentReviewGateVerdict,
+): Promise<Array<{ context: string; reason: string; state: CommentReviewGateVerdict["state"]; description: string }>> {
+  const retiredContexts = retiredCommentReviewGateContexts(
+    config.prCommentReviewGateRetiredStatusContexts,
+    liveContext,
+  );
+  if (retiredContexts.length === 0) return [];
+
+  const retirement = commentReviewGateRetirementStatus(liveContext, verdict);
+  const failures = await Promise.all(
+    retiredContexts.map(async (retiredContext) => {
+      const post = () =>
+        withBoundedRetry<GitHubCommitStatusPostResult>(
+          () =>
+            githubPostCommitStatusDetailed({
+              repoFullName: input.repoFullName,
+              sha: headSha,
+              context: retiredContext,
+              state: retirement.state,
+              description: retirement.description,
+              targetUrl: input.prUrl ?? null,
+            }),
+          (attempt) => !attempt.ok && attempt.retryable,
+        );
+      const result = await post();
+      if (!result.ok) {
+        console.warn(
+          `[pr-comment-review-gate] Could not supersede retired context "${retiredContext}" on ` +
+            `${input.repoFullName}@${headSha.slice(0, 7)}: ${result.reason}. Queuing a durable retry.`,
+        );
+        return {
+          context: retiredContext,
+          reason: result.reason,
+          state: retirement.state,
+          description: retirement.description,
+        };
+      }
+      return null;
+    }),
+  );
+  return failures.filter((failure): failure is NonNullable<typeof failure> => failure !== null);
 }
