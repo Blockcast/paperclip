@@ -1569,6 +1569,13 @@
       "when": 1787874021213,
       "tag": "0231_issue_comment_effects",
       "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1787877823391,
+      "tag": "0232_issue_comment_effects_retry_schedule",
+      "breakpoints": true
     }
   ]
 }

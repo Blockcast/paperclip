@@ -58,7 +58,7 @@ export const issueCommentEffects = pgTable(
      * intent is a no-op instead of a duplicate.
      */
     effectKey: text("effect_key").notNull(),
-    /** queued → processing → processed | failed */
+    /** queued | failed → processing → processed; failed is a retry backoff state. */
     status: text("status").notNull().default("queued"),
     /** Everything the executor needs to run without the originating request. */
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
@@ -70,6 +70,8 @@ export const issueCommentEffects = pgTable(
     result: jsonb("result").$type<Record<string, unknown> | null>(),
     attempts: integer("attempts").notNull().default(0),
     lastError: text("last_error"),
+    /** Database-time gate for a queued or failed effect's next retry. */
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
     /** Ownership token; prevents a stale lease holder completing a reclaimed row. */
     claimToken: uuid("claim_token"),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
@@ -83,7 +85,11 @@ export const issueCommentEffects = pgTable(
       table.commentId,
       table.effectKey,
     ),
-    statusSeqIdx: index("issue_comment_effects_status_seq_idx").on(table.status, table.seq),
+    statusNextAttemptSeqIdx: index("issue_comment_effects_status_next_attempt_seq_idx").on(
+      table.status,
+      table.nextAttemptAt,
+      table.seq,
+    ),
     commentSeqIdx: index("issue_comment_effects_comment_seq_idx").on(table.commentId, table.seq),
   }),
 );
