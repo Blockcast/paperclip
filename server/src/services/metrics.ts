@@ -1056,6 +1056,20 @@ export const OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY = "other";
 
 const trackedWebhookRejectionPluginKeys = new Set<string>();
 
+/** Keep reject-path logs useful without making sender volume a log-volume DoS. */
+const WEBHOOK_REJECTION_LOG_INTERVAL_MS = 60_000;
+type WebhookRejectionLogState = {
+  lastLoggedAt: number;
+  suppressed: number;
+  latest: {
+    pluginId: string;
+    endpointKey: string;
+    pluginStatus: string;
+    httpStatus: number;
+  };
+};
+const webhookRejectionLogState = new Map<string, WebhookRejectionLogState>();
+
 /**
  * Admit `pluginKey` as a label value, or collapse it to
  * {@link OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY}. First-come-first-served up to
@@ -1071,6 +1085,58 @@ export function boundWebhookRejectionPluginKey(pluginKey: string | null | undefi
   }
   trackedWebhookRejectionPluginKeys.add(key);
   return key;
+}
+
+function logPluginWebhookDeliveryRejection(input: {
+  pluginKey: string;
+  pluginId: string;
+  endpointKey: string;
+  pluginStatus: string;
+  responseClass: WebhookRejectionResponseClass;
+  httpStatus: number;
+}): void {
+  const key = `${input.pluginKey}:${input.responseClass}`;
+  const now = Date.now();
+  const previous = webhookRejectionLogState.get(key);
+  const latest = {
+    pluginId: input.pluginId,
+    endpointKey: input.endpointKey,
+    pluginStatus: input.pluginStatus,
+    httpStatus: input.httpStatus,
+  };
+
+  if (previous && now - previous.lastLoggedAt < WEBHOOK_REJECTION_LOG_INTERVAL_MS) {
+    previous.suppressed += 1;
+    previous.latest = latest;
+    return;
+  }
+
+  if (previous?.suppressed) {
+    logger.warn(
+      {
+        pluginKey: input.pluginKey,
+        responseClass: input.responseClass,
+        suppressedCount: previous.suppressed,
+        ...previous.latest,
+      },
+      "plugin webhook rejection log summary",
+    );
+  }
+
+  webhookRejectionLogState.set(key, { lastLoggedAt: now, suppressed: 0, latest });
+  logger.warn(
+    {
+      pluginKey: input.pluginKey,
+      pluginId: input.pluginId,
+      endpointKey: input.endpointKey,
+      pluginStatus: input.pluginStatus,
+      responseClass: input.responseClass,
+      httpStatus: input.httpStatus,
+    },
+    input.responseClass === "retryable"
+      ? "plugin webhook delivery deferred: plugin is not ready, sender told to retry"
+      : "plugin webhook delivery dropped: plugin is gone, sender told not to retry",
+  );
 }
 
 export function classifyAuthOperation(requestUrl: string): AuthOperation {
@@ -3065,19 +3131,7 @@ export function recordPluginWebhookDeliveryRejected(input: {
       "failed to record plugin webhook delivery rejection metric",
     );
   }
-  logger.warn(
-    {
-      pluginKey,
-      pluginId: input.pluginId,
-      endpointKey: input.endpointKey,
-      pluginStatus: input.pluginStatus,
-      responseClass: input.responseClass,
-      httpStatus: input.httpStatus,
-    },
-    input.responseClass === "retryable"
-      ? "plugin webhook delivery deferred: plugin is not ready, sender told to retry"
-      : "plugin webhook delivery dropped: plugin is gone, sender told not to retry",
-  );
+  logPluginWebhookDeliveryRejection({ ...input, pluginKey });
 }
 
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
@@ -3159,6 +3213,7 @@ export function __resetMetricsForTest(): void {
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;
   trackedWebhookRejectionPluginKeys.clear();
+  webhookRejectionLogState.clear();
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();
