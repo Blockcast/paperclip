@@ -41,6 +41,7 @@ import {
   boundWebhookRejectionPluginKey,
   renderMetrics,
 } from "../services/metrics.js";
+import { logger } from "../middleware/logger.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -457,4 +458,30 @@ describe("webhook ingestion: rejected deliveries are recorded", () => {
     // A missing key is bucketed rather than becoming an empty label value.
     expect(boundWebhookRejectionPluginKey(null)).toBe(OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY);
   });
+
+  it("coalesces repeated rejection logs while retaining the metric count", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.useFakeTimers();
+    try {
+      mockPlugin({ status: "error" });
+      const { app } = await createApp();
+
+      await postAlert(app);
+      await postAlert(app);
+      await postAlert(app);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect((await rejectionSeries())[0]!.value).toBe(3);
+
+      vi.advanceTimersByTime(60_000);
+      await postAlert(app);
+
+      expect(warn).toHaveBeenCalledTimes(3);
+      expect(warn.mock.calls[1]![1]).toBe("plugin webhook rejection log summary");
+      expect(warn.mock.calls[1]![0]).toMatchObject({ suppressedCount: 2 });
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  }, 20_000);
 });
