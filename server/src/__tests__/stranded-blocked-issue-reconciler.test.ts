@@ -234,6 +234,34 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     },
   );
 
+  it("does not reconcile an issue held only by a checkout lock", async () => {
+    const { companyId, agentId } = await createCompany("SBC");
+    const stranded = await insertIssue({
+      companyId,
+      identifier: "SBC-1",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: { issueId: stranded },
+    });
+    await db.update(issues)
+      .set({ checkoutRunId })
+      .where(eq(issues.id, stranded));
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(stranded)).toBe("blocked");
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+
   it("does not reconcile an issue with a live monitor", async () => {
     const { companyId } = await createCompany("SBM");
     const stranded = await insertIssue({ companyId, identifier: "SBM-1", status: "blocked" });

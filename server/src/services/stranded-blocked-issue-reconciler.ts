@@ -90,7 +90,7 @@ async function listCandidateRows(
       AND NOT EXISTS (
         SELECT 1
         FROM heartbeat_runs active_run
-        WHERE active_run.id = i.execution_run_id
+        WHERE active_run.id IN (i.execution_run_id, i.checkout_run_id)
           AND active_run.status IN ('queued', 'running', 'scheduled_retry')
       )
       AND NOT (
