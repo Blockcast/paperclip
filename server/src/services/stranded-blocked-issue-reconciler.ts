@@ -175,7 +175,7 @@ async function listLockedLivePathIssueIds(
     LEFT JOIN heartbeat_runs active_run
       ON active_run.id IN (i.execution_run_id, i.checkout_run_id)
       AND active_run.status IN ('queued', 'running', 'scheduled_retry')
-    WHERE i.id IN (${inArray(issues.id, candidateIds)})
+    WHERE i.id IN (${sql.join(candidateIds.map((id) => sql`${id}::uuid`), sql`, `)})
       AND (
         active_run.id IS NOT NULL
         OR (i.monitor_next_check_at IS NOT NULL AND i.monitor_next_check_at > now())
