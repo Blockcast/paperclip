@@ -258,7 +258,12 @@ async function reconcileCandidateBatch(
  */
 export async function reconcileStrandedBlockedIssues(
   db: Db,
-  options: { batchSize?: number; maxIterations?: number; logger?: typeof defaultLogger } = {},
+  options: {
+    batchSize?: number;
+    maxIterations?: number;
+    logger?: typeof defaultLogger;
+    afterCandidatesSelected?: (candidateIds: string[]) => Promise<void>;
+  } = {},
 ): Promise<StrandedBlockedIssueReconcileResult> {
   const batchSize = Math.max(1, options.batchSize ?? RECONCILE_BATCH_SIZE);
   const maxIterations = Math.max(1, options.maxIterations ?? MAX_ITERATIONS);
@@ -272,6 +277,7 @@ export async function reconcileStrandedBlockedIssues(
     const { candidates, flipped } = await db.transaction(async (tx) => {
       const candidates = await listCandidateRows(tx, batchSize, cursor);
       if (candidates.length === 0) return { candidates, flipped: [] };
+      await options.afterCandidatesSelected?.(candidates.map((candidate) => candidate.id));
       return { candidates, flipped: await reconcileCandidateBatch(tx, candidates) };
     });
 
