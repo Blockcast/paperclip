@@ -27,6 +27,8 @@ import {
   heartbeatService,
 } from "../services/heartbeat.js";
 import {
+  CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+  isCapacityGovernedRetryFloor,
   jitterTransientRetryFloor,
   TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
   TRANSIENT_RETRY_FLOOR_JITTER_RATIO,
@@ -130,6 +132,63 @@ describe("jitterTransientRetryFloor", () => {
     const defeated = spreadOf({ jitterRatio: 0 });
     expect(defeated.spreadMs).toBe(0);
     expect(defeated.distinct).toBe(1);
+  });
+});
+
+// Review follow-up. The first cut of this fix dispersed EVERY floor, which
+// silently re-tuned a neighbouring mechanism: a capacity floor's instant is
+// owned by the capacity arithmetic (the resolver arm jitters it, and both arms
+// are bounded by CCROTATE_CAPACITY_MAX_PARK_MS), so a second window here would
+// stack on the one and push the other past that ceiling. Four assertions in
+// heartbeat-provider-capacity-horizon.test.ts caught it by pinning the exact
+// instant, and they still pass unchanged — this predicate is what keeps them
+// passing, so it is pinned directly rather than only through that suite.
+describe("isCapacityGovernedRetryFloor", () => {
+  // Two writers produce a capacity floor and mark it differently. Testing one
+  // marker would answer "not capacity" for half of them, so both are pinned.
+  it("recognises a floor written by applyCcrotateCapacityDecision", () => {
+    expect(
+      isCapacityGovernedRetryFloor({
+        [CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY]: "2026-08-25T02:30:00.000Z",
+      }),
+    ).toBe(true);
+  });
+
+  it("recognises a floor written by the finalize path", () => {
+    // Shape taken from a live row: the finalize path writes no chain-origin
+    // key, so the provenance discriminator is the only marker present.
+    expect(
+      isCapacityGovernedRetryFloor({
+        retryNotBefore: "2026-08-25T06:59:59.000Z",
+        transientRetryNotBefore: "2026-08-25T06:59:59.000Z",
+        penstockCapacityParkClampedFrom: "2026-08-27T10:00:00.000Z",
+        providerCapacityResetProvenance: { source: "server", errorFamily: "rate_limit_exhausted" },
+      }),
+    ).toBe(true);
+  });
+
+  it("leaves a raw advertised transient floor dispersible", () => {
+    // The measured PEN-2509 herd. No capacity marker, so this must stay false
+    // or the fix is inert on the one path it exists to cover.
+    expect(
+      isCapacityGovernedRetryFloor({
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-25T06:59:59.000Z",
+        transientRetryNotBefore: "2026-08-25T06:59:59.000Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects malformed and absent markers rather than guessing", () => {
+    // A non-round-trippable origin is not a usable marker; treating it as one
+    // would suppress dispersion off a corrupt field.
+    expect(isCapacityGovernedRetryFloor({ [CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY]: "nonsense" })).toBe(
+      false,
+    );
+    expect(isCapacityGovernedRetryFloor({ providerCapacityResetProvenance: null })).toBe(false);
+    expect(isCapacityGovernedRetryFloor({})).toBe(false);
+    expect(isCapacityGovernedRetryFloor(null)).toBe(false);
+    expect(isCapacityGovernedRetryFloor("not-an-object")).toBe(false);
   });
 });
 

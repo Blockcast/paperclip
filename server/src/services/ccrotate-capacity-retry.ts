@@ -258,6 +258,43 @@ function readCapacityChainOriginIso(value: unknown): string | null {
 }
 
 /**
+ * Is this run's `retryNotBefore` floor governed by the capacity park mechanism?
+ *
+ * PEN-2509 disperses an advertised floor so a cohort sharing one does not
+ * resume in lockstep. A capacity floor is deliberately excluded, because its
+ * instant is already owned end-to-end by the capacity arithmetic: the resolver
+ * arm adds its own positive jitter ({@link CCROTATE_CAPACITY_PARK_JITTER_RATIO})
+ * and both arms are bounded by {@link CCROTATE_CAPACITY_MAX_PARK_MS}. Adding a
+ * second, independently-sized window on top would stack jitter on the one arm
+ * and push the other past a ceiling this module guarantees — re-tuning another
+ * mechanism's bound as a side effect of dispersing ours.
+ *
+ * The measured PEN-2509 herd was `transient_failure` parks converging on a raw
+ * advertised instant, which is the path this predicate deliberately leaves
+ * dispersible.
+ *
+ * TWO writers produce a capacity floor and they mark it differently, so testing
+ * one marker would silently answer "not capacity" for half of them:
+ *
+ *  - {@link applyCcrotateCapacityDecision} always writes the chain-origin key.
+ *    (`penstockProvider`, `penstockAdvertisedResumeAt` and
+ *    `penstockCapacityParkClampedFrom` are all conditional there, so none of
+ *    them is a sound marker on its own.)
+ *  - the finalize path writes `providerCapacityResetProvenance`, its paired
+ *    discriminator for a server-computed reset park.
+ *
+ * Lives here, beside both markers' contract, so the writers and this reader
+ * cannot drift apart.
+ */
+export function isCapacityGovernedRetryFloor(resultJson: unknown): boolean {
+  if (typeof resultJson !== "object" || resultJson === null) return false;
+  const row = resultJson as Record<string, unknown>;
+  if (readCapacityChainOriginIso(row[CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY]) !== null) return true;
+  const provenance = row.providerCapacityResetProvenance;
+  return typeof provenance === "object" && provenance !== null;
+}
+
+/**
  * The keys above, plus the one that survives them. Exported for the invariant
  * test that pins the exclusion, so the hazard documented above cannot be
  * reintroduced by editing one list and not the other.
