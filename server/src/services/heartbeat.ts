@@ -425,6 +425,7 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   jitterTransientRetryFloor,
+  isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
   resolveCapacityEscalation,
   CAPACITY_ESCALATION_AFTER_MS,
@@ -17999,15 +18000,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // is the only safe direction and why the base curve's own jitter does not
     // cover this path (it is discarded whenever the floor wins, which is
     // whenever a floor is present).
+    //
+    // Only the *verbatim, undispersed* floor is dispersed here. Two floors
+    // reaching this point are already per-run and must be left exactly alone:
+    //
+    //  - A capacity floor. Its instant is owned end-to-end by the capacity
+    //    arithmetic — the resolver arm jitters it, and both arms are bounded by
+    //    `CCROTATE_CAPACITY_MAX_PARK_MS`. A second window here would stack on
+    //    the first and push the other arm past that ceiling, re-tuning another
+    //    mechanism's bound as a side effect of dispersing ours.
+    //  - A horizon-clamped floor. That value is `now + MAX_TRANSIENT_RETRY_
+    //    HORIZON_MS`, and `now` is each run's own park instant, so the cohort is
+    //    dispersed by construction; jitter would buy nothing and would push
+    //    `dueAt` past the ceiling BLO-23438 installed.
+    //
+    // What is left is the case the production census actually caught: a raw
+    // advertised instant, shared verbatim by every run that saw the same
+    // denial, parked as `transient_failure`. That is the only floor that forms
+    // a herd here, and the only one dispersed below.
+    const floorAlreadyDispersed =
+      clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson);
     const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
-        ? jitterTransientRetryFloor({ dueAt: effectiveRetryNotBefore, now, random: opts?.random })
+        ? floorAlreadyDispersed
+          ? effectiveRetryNotBefore
+          : jitterTransientRetryFloor({ dueAt: effectiveRetryNotBefore, now, random: opts?.random })
+              .dueAt
         : null;
     const schedule = flooredDueAt
       ? {
           ...baseSchedule,
-          dueAt: flooredDueAt.dueAt,
-          delayMs: Math.max(0, flooredDueAt.dueAt.getTime() - now.getTime()),
+          dueAt: flooredDueAt,
+          delayMs: Math.max(0, flooredDueAt.getTime() - now.getTime()),
         }
       : baseSchedule;
 
