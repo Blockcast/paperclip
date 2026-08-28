@@ -375,10 +375,54 @@ const BARE_SEQUENCE_DASH = /^\s*-\s*$/;
  */
 const ENV_VAR_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
 /**
+ * A `KEY=VALUE` has a VALUE. Asserted as a lookahead after the `=`, and defined
+ * once for the same reason `ENV_VAR_NAME` is: both name-preserving rules must
+ * agree, and a second spelling is a second rule (PEN-2370 ask 3 (b2)).
+ *
+ * Validating the *name* charset is necessary but not sufficient, because
+ * `ENV_VAR_NAME` is also satisfied by base64: `dGhpc2lz…=` is all name
+ * characters followed by an `=`, so a name-only check promotes an entire
+ * base64-encoded credential into the name position and prints it in the clear
+ * beside its own `<redacted>` marker — the false-assurance shape design note 4
+ * warns about, which is how this module's own fix for `[LEAKED]=x` still leaked
+ * a differently-spelled instance of the same defect.
+ *
+ * What distinguishes them is that base64 padding is *terminal*: a real value
+ * follows the `=`, padding does not. So reject when nothing but `=` padding
+ * (and an optional closing quote) remains.
+ *
+ * "Remains" has to mean *to the end of the value*, not to the end of the line.
+ * Its first spelling meant the latter, and an inline YAML comment is line
+ * content that is not value content: `- dGhpc2lz…= # note` put the material
+ * straight back into the name position with a five-character suffix, and the
+ * quoted form did the same past its closing quote. That is this same defect in
+ * its third spelling — twice now the guard has been correct about the property
+ * (padding is terminal) and wrong about where the line ends.
+ *
+ * Whitespace is required before a `#` that ends an *unquoted* value, because
+ * that is precisely when YAML starts a comment: `TOKEN=pa#ss` and `TOKEN=#hash`
+ * are plain scalars whose value contains a `#`, and both keep their name. Past
+ * a closing quote the requirement is dropped, because there nothing but a
+ * comment can follow and `- "dGhpc2lz="# c` is otherwise a fourth spelling of
+ * the same defect — found by sweeping the suffix space after the comment clause
+ * was written, which is the method ask 3 names as the control.
+ *
+ * A legitimate but empty `KEY=` is rejected and redacts whole — over-redacting
+ * a name is the safe direction, and the diagnostic loss is a name whose value
+ * was empty. The comment clause makes that same trade once more on the JSON
+ * path, where `#` has no comment meaning and `TOKEN= #x` is a real value, so it
+ * over-redacts there. One guard that is slightly conservative on one path is
+ * the (b2) trade this constant exists to make: a per-path spelling tuned to
+ * each caller is the drift that produced the defect it is guarding against.
+ */
+const REQUIRE_VALUE_AFTER_EQ = `(?!=*(?:["']\\s*(?:#|$)|\\s*$|\\s+#))`;
+/**
  * The OCI/Docker `KEY=VALUE` env entry shape. The name is kept and only the
  * value dropped, matching design note 2 and the JSON path.
  */
-const ENV_KEY_VALUE_ENTRY = new RegExp(`^(\\s*)(-\\s+)(["']?)(${ENV_VAR_NAME})=`);
+const ENV_KEY_VALUE_ENTRY = new RegExp(
+  `^(\\s*)(-\\s+)(["']?)(${ENV_VAR_NAME})=${REQUIRE_VALUE_AFTER_EQ}`,
+);
 /**
  * The same `KEY=VALUE` shape as a bare scalar, with no sequence introducer —
  * what a string-valued `env` key holds on the JSON path.
@@ -387,9 +431,11 @@ const ENV_KEY_VALUE_ENTRY = new RegExp(`^(\\s*)(-\\s+)(["']?)(${ENV_VAR_NAME})=`
  * answered by matching a name, not by `indexOf("=") !== -1`. The difference is
  * load-bearing: `[LEAKED]=x` contains an `=`, so slicing at the first one
  * promotes material into the name position and prints it beside its own
- * redaction marker. Only a validated name survives.
+ * redaction marker. Only a validated name followed by a real value survives.
  */
-const ENV_KEY_VALUE_SCALAR = new RegExp(`^(${ENV_VAR_NAME})=`);
+const ENV_KEY_VALUE_SCALAR = new RegExp(
+  `^(${ENV_VAR_NAME})=${REQUIRE_VALUE_AFTER_EQ}`,
+);
 /**
  * An `env:` scalar that can carry material: a flow collection, an alias (which
  * may resolve to an anchor we never scrubbed), a block scalar, or the

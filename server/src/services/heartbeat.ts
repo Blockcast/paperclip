@@ -777,6 +777,29 @@ const MANUAL_CAPACITY_REPROBE_ACTIVITY_ACTION = "heartbeat.capacity_retry_supers
 const MANUAL_CAPACITY_REPROBE_CANCEL_REASON =
   "Cancelled because an explicit manual wake requested a fresh provider-capacity probe";
 export const ISSUE_MONITOR_DISPATCH_LAPSE_MS = 15 * 60 * 1000;
+/**
+ * BLO-29606: how long a `triggered` monitor carrying no `timeoutAt` may sit with
+ * a null `nextCheckAt` before `tickExpiredIssueMonitors` treats its woken run as
+ * never coming back.
+ *
+ * `timeoutAt` is optional and defaults to null, and the re-arm shape the fleet is
+ * actually instructed to use — `{ nextCheckAt, notes, scheduledBy }` — omits it.
+ * So the BLO-25865 sweep's `timeoutAt is not null` gate excluded the *majority*
+ * arming shape, and those monitors had no expiry path at all.
+ *
+ * 4h is chosen to sit well clear of every legitimate reason a trigger is still
+ * outstanding, because a false positive burns an owner wake:
+ *  - a run that never *started* is already re-armed at
+ *    ISSUE_MONITOR_DISPATCH_LAPSE_MS (15m) by the lapse sweep above, which puts a
+ *    fresh `nextCheckAt` back on the row long before this window opens;
+ *  - RUN_STALE_SILENCE_MS (15m) and EXTERNAL_LIFECYCLE_HARD_STALE_MS (45m) bound
+ *    how long a live-but-quiet run is tolerated elsewhere;
+ *  - a capacity-parked retry resumes on the provider's reset (hours at worst),
+ *    but parks while `queued`, so it too is covered by the lapse sweep.
+ * That leaves this window aimed at what it is meant for: a run that started,
+ * consumed the trigger, and died without re-arming or clearing.
+ */
+export const ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS = 4 * 60 * 60 * 1000;
 const ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS = 5 * 60 * 1000;
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
@@ -11983,10 +12006,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     nextAttemptCount: number;
   }) {
     const label = formatIssueIdentifierLink(input.issue.identifier, input.issue.id);
+    // Keep this exhaustive over the reasons the recovery path can actually mint.
+    // It used to be a two-way branch that treated "not timeout_exceeded" as
+    // "max attempts", which silently mislabels any reason added later (BLO-29606).
     const reason =
       input.clearReason === "timeout_exceeded"
         ? "its timeout was reached"
-        : "its maximum attempt count was reached";
+        : input.clearReason === "trigger_stalled"
+          ? "it fired but the woken run never re-armed or cleared it"
+          : "its maximum attempt count was reached";
     return [
       `Paperclip cleared the scheduled external-service monitor for ${label} because ${reason}.`,
       "",
@@ -12921,21 +12949,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * days past their `timeoutAt`.
    *
    * This sweep is the missing second half: it scans for monitors that are
-   * `triggered` (fired, not yet cleared) with a null `nextCheckAt` and a
-   * `timeoutAt` that has passed, and routes them through the exact same
-   * clear-and-recover pipeline `tickDueIssueMonitors` uses for exhaustion — so a
-   * monitor always reaches a terminal `cleared` state with its `recoveryPolicy`
-   * honoured, regardless of whether the run that consumed the last trigger ever
-   * called back. `attemptCount`/`maxAttempts` are deliberately not re-evaluated
-   * here beyond what `exhaustedMonitorClearReason` already does — this sweep
-   * exists to catch a stalled *trigger*, not to retune bounds.
+   * `triggered` (fired, not yet cleared) with a null `nextCheckAt` whose road has
+   * run out, and routes them through the exact same clear-and-recover pipeline
+   * `tickDueIssueMonitors` uses for exhaustion — so a monitor always reaches a
+   * terminal `cleared` state with its `recoveryPolicy` honoured, regardless of
+   * whether the run that consumed the last trigger ever called back.
+   * `attemptCount`/`maxAttempts` are deliberately not re-evaluated here beyond
+   * what `exhaustedMonitorClearReason` already does — this sweep exists to catch
+   * a stalled *trigger*, not to retune bounds.
+   *
+   * BLO-29606: "road has run out" originally meant `timeoutAt is not null AND
+   * timeoutAt <= now`, which excluded the *default* arming shape. `timeoutAt` is
+   * optional and defaults to null, and the re-arm shape agents are instructed to
+   * use omits it, so the common case fell through both sweeps at once and sat
+   * `triggered` forever — the dominant source of `in_review_without_action_path`
+   * liveness escalations. A monitor with no `timeoutAt` now expires against
+   * ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS measured from `monitorLastTriggeredAt`
+   * and clears as `trigger_stalled`. A monitor that *does* carry a `timeoutAt`
+   * still expires only at that instant: an operator-supplied deadline is
+   * authoritative, so a long explicit timeout is honoured rather than pre-empted
+   * by the grace window.
    */
   async function tickExpiredIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const triggeredStallThreshold = new Date(now.getTime() - ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS);
     const expiredMonitorTimeoutCondition = and(
       sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
-      sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is not null`,
-      sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz <= ${now.toISOString()}`,
+      or(
+        // Explicit deadline supplied and passed (BLO-25865, unchanged).
+        and(
+          sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is not null`,
+          sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz <= ${now.toISOString()}`,
+        ),
+        // BLO-29606: no deadline supplied — fall back to how long the trigger has
+        // been outstanding. `monitorLastTriggeredAt` is written atomically with the
+        // triggered state by buildIssueMonitorTriggeredPatch, so it is the same
+        // instant the JSON records; using the column keeps this off a JSON cast.
+        // A null there means we cannot date the trigger, so we leave the row alone
+        // rather than guess — stranding is preferable to a wrong sweep.
+        and(
+          sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is null`,
+          sql`${issues.monitorLastTriggeredAt} is not null`,
+          lte(issues.monitorLastTriggeredAt, triggeredStallThreshold),
+        ),
+      ),
     );
 
     const expiredMonitors = await db
@@ -13012,7 +13069,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           monitor,
           attemptCount: currentMonitorState.attemptCount,
           now,
-        }) ?? "timeout_exceeded";
+        }) ?? (monitor.timeoutAt ? "timeout_exceeded" : "trigger_stalled");
         const recoveryPolicy = monitorRecoveryPolicy(monitor);
 
         await clearIssueMonitorAndRecover({
@@ -33492,19 +33549,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Fleet-wide (no companyId filter), matching every other gauge publisher in
    * this file: this control plane is one Prometheus scrape target for every
    * company it serves, and agent_id is a globally unique key.
+   *
+   * Age/interval are published only for agents the heartbeat scheduler would
+   * actually wake (BLO-28861). `heartbeat.enabled` is NOT cleared on
+   * termination, so config alone is not a liveness predicate: before this
+   * filter, terminated and pending_approval agents exported an age that grows
+   * forever, and the consuming `PaperclipAgentHeartbeatStale` alert would have
+   * fired for 19 of 36 series -- 18 of them permanently false, so the alert
+   * could never clear.
+   *
+   * The predicate is deliberately the SAME `evaluateAgentInvokability` call
+   * the timer scheduler gates on below (see `runHeartbeatScheduler`: `if
+   * (!invokability.invokable) continue;`), plus the same `companies.status =
+   * 'active'` restriction its agent query applies. That is the anti-drift
+   * property: "is this agent expected to heartbeat" is answered by the one
+   * function that decides whether it ever gets woken, so the two cannot
+   * disagree. A hand-written status list here would be a second copy free to
+   * drift.
+   *
+   * Consequences worth naming, because they are wider than a `terminated`
+   * check: `paused` agents and agents with a broken reporting chain
+   * (terminated manager / missing manager / cycle) are also excluded. Both are
+   * skipped by the scheduler, so both are permanently dark by construction and
+   * would be permanently-false pages here. Neither condition is silent --
+   * each has a deterministic cause-side source of truth (agent status, org
+   * chain health) that a liveness alert is the wrong instrument for.
+   *
+   * `error` REMAINS included: an errored agent is still invokable, and a dark
+   * errored agent is precisely the 2026-08-08 incident this metric exists for.
+   *
+   * `errorDurationSeconds` is unaffected -- every agent still gets an entry,
+   * so `paperclip_agent_status_error_duration_seconds` keeps its full series
+   * set. Only the age/interval gauges are gated.
    */
   async function publishAgentLivenessGauges(now: Date) {
     try {
       const rows = await db
         .select({
           id: agents.id,
+          companyId: agents.companyId,
+          name: agents.name,
+          reportsTo: agents.reportsTo,
           status: agents.status,
           runtimeConfig: agents.runtimeConfig,
           lastHeartbeatAt: agents.lastHeartbeatAt,
           updatedAt: agents.updatedAt,
           createdAt: agents.createdAt,
+          companyStatus: companies.status,
         })
-        .from(agents);
+        .from(agents)
+        // leftJoin, not innerJoin: a non-active company must still contribute
+        // its agents' error-duration series. Company status gates
+        // `heartbeatExpected` below rather than dropping the row.
+        .leftJoin(companies, eq(companies.id, agents.companyId));
+
+      // Complete per-company rosters (the select is unfiltered), so the
+      // org-chain walk inside evaluateAgentInvokability sees every ancestor.
+      const agentsByCompany = groupAgentOrgRowsByCompany(rows.map(toAgentOrgRow));
 
       const entries = rows.map((row) => {
         const policy = resolveHeartbeatPolicyForRuntimeConfig(row.runtimeConfig);
@@ -33519,9 +33620,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const errorDurationSeconds = row.status === "error"
           ? Math.max(0, (now.getTime() - new Date(row.updatedAt).getTime()) / 1000)
           : 0;
+        const heartbeatExpected = row.companyStatus === "active"
+          && evaluateAgentInvokability(
+            toAgentOrgRow(row),
+            agentsByCompany.get(row.companyId) ?? [],
+          ).invokable;
         return {
           agentId: row.id,
           heartbeatEnabled: policy.enabled,
+          heartbeatExpected,
           heartbeatAgeSeconds,
           heartbeatIntervalSeconds: policy.enabled ? policy.intervalSec : null,
           errorDurationSeconds,

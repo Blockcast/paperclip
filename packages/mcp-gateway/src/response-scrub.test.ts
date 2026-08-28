@@ -1043,6 +1043,128 @@ describe("scrubJsonValue — env entries that are not objects", () => {
       });
     });
 
+    /**
+     * PEN-2370 ask 3, criteria (a2)/(b2). Found by the method this ticket names
+     * as the control — after #1518 merged, going looking for another route to
+     * the same material rather than re-reading the patch.
+     *
+     * #1518 replaced `indexOf("=") !== -1` with "validate the prefix against
+     * `ENV_VAR_NAME`". That closed the `[LEAKED]=x` spelling and left the same
+     * defect open in another: **base64 is name-shaped**. `dGhpc2lz…=` is
+     * entirely legal name characters followed by an `=`, so a name-only check
+     * promoted a whole base64-encoded credential into the name position and
+     * printed it in the clear beside its own `<redacted>` marker.
+     *
+     * The distinguishing property is not the charset, it is that base64 padding
+     * is *terminal*: a real `KEY=VALUE` has a VALUE after the `=`, padding does
+     * not. `REQUIRE_VALUE_AFTER_EQ` asserts exactly that, once, shared by both
+     * name-preserving rules.
+     *
+     * The test below is written as an invariant rather than a fixture list on
+     * purpose. The test it replaces asserted a general property ("only where
+     * there is one to keep") while checking two spellings — which is why it was
+     * green while this leaked. A spelling list only ever catches the spellings
+     * someone already thought of; that asymmetry is this ticket's whole finding,
+     * and it had already reappeared inside the fix for it.
+     */
+    describe("material cannot reach the preserved-name position", () => {
+      const NAME_SHAPED_MATERIAL = [
+        ["base64, one pad char", `dGhpc2lz${LEAK}=`],
+        ["base64, two pad chars", `dGhpc2lz${LEAK}==`],
+        ["jwt with padding", `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI${LEAK}In0.c2ln=`],
+        ["name chars only, empty value", `${LEAK}=`],
+      ] as const;
+
+      /**
+       * The second axis, and the one the first version of this test was missing.
+       * Material shape is not the only way to spell this defect: the guard reads
+       * "nothing but padding remains", and what counts as "remains" depends on
+       * where the *value* ends, not where the *line* ends. An inline YAML comment
+       * is line content that is not value content, so ` # note` was five
+       * characters that put the material straight back into the name position —
+       * past a closing quote too. Crossed with the material list rather than
+       * added as two more fixtures, because a fixture list only ever covers the
+       * combinations someone sat down and enumerated.
+       */
+      const NON_VALUE_SUFFIXES = ["", " # note", "\t# note", "   # note"] as const;
+
+      for (const [label, scalar] of NAME_SHAPED_MATERIAL) {
+        it(`redacts ${label} whole on every path that preserves names`, () => {
+          // JSON string-valued `env`, and the OCI/Docker `Config.Env` sequence
+          // entry — the two paths that print a name. Asserted together so they
+          // cannot drift apart again.
+          expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+          for (const suffix of NON_VALUE_SUFFIXES) {
+            expectNoLeak(scrubYamlText(`Env:\n  - ${scalar}${suffix}`));
+            expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"${suffix}`));
+            expectNoLeak(scrubYamlText(`Env:\n  - '${scalar}'${suffix}`));
+            expectNoLeak(scrubYamlText(`env: ${scalar}${suffix}`));
+          }
+          // No whitespace before the `#`. Only legal past a closing quote, and
+          // the one route left open by the first draft of the comment clause —
+          // found by sweeping the suffix space rather than re-reading it.
+          expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"# note`));
+        });
+      }
+
+      it("whatever survives in the name position is a name, not material", () => {
+        // The class assertion. `expectNoLeak` catches a marker we planted; this
+        // catches a shape nobody planted, by checking the *structure* of what
+        // was kept rather than comparing against a known-bad list. A new
+        // encoding that slips past the gate fails here even though this test
+        // has never heard of it.
+        const NAME_ONLY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+
+        for (const [, scalar] of NAME_SHAPED_MATERIAL) {
+          const out = scrubJsonValue({ env: scalar }) as { env: string };
+          const kept = out.env.endsWith(REDACTED)
+            ? out.env.slice(0, -REDACTED.length).replace(/=$/, "")
+            : "";
+
+          // Either nothing was kept, or what was kept is a plausible variable
+          // name AND is not simply the input with its padding shaved off.
+          if (kept !== "") {
+            expect(kept).toMatch(NAME_ONLY);
+            expect(scalar.startsWith(kept)).toBe(false);
+          }
+        }
+      });
+
+      it("a real name whose VALUE is base64 still keeps its name", () => {
+        // The counterweight, and the reason the rule is "padding is terminal"
+        // rather than "reject anything containing base64". Without this, the
+        // four tests above are satisfied by redacting every `=`-bearing scalar
+        // whole — which passes them all and destroys design note 2.
+        expect(scrubJsonValue({ env: `TOKEN=${LEAK}==` })).toEqual({
+          env: `TOKEN=${REDACTED}`,
+        });
+        expect(scrubYamlText(`Env:\n  - TOKEN=${LEAK}==`)).toContain(
+          `TOKEN=${REDACTED}`,
+        );
+      });
+
+      it("a value that merely contains a `#` still keeps its name", () => {
+        // The counterweight for the comment clause specifically. YAML starts a
+        // comment at a `#` that follows whitespace; a `#` anywhere else is value
+        // content. Without this, "treat `#` as end-of-value" degenerates into
+        // redacting every entry whose value happens to contain a hash — which
+        // satisfies the suffix cases above and quietly drops real names.
+        for (const value of [`pa#ss${LEAK}`, `#${LEAK}`]) {
+          expect(scrubJsonValue({ env: `TOKEN=${value}` })).toEqual({
+            env: `TOKEN=${REDACTED}`,
+          });
+          expect(scrubYamlText(`Env:\n  - TOKEN=${value}`)).toContain(
+            `TOKEN=${REDACTED}`,
+          );
+          // And the quoted arm, which drops the whitespace requirement past a
+          // closing quote — it must not also drop it *before* one.
+          expect(scrubYamlText(`Env:\n  - "TOKEN=${value}"`)).toContain(
+            `TOKEN=${REDACTED}`,
+          );
+        }
+      });
+    });
+
     it("still passes prose through on both paths, so the gate did not widen to everything", () => {
       // The negative control. Without it, `env: REDACTED` unconditionally
       // would satisfy every assertion above while destroying the diagnostic
