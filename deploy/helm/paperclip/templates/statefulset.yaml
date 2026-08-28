@@ -584,6 +584,19 @@ spec:
               fi
 
               if [ -f "${MCP_BRIDGE_JS}" ]; then
+                # Emit the gbrain key ONLY when a Bearer was actually minted.
+                # Building the fragment here — rather than writing `"gbrain":
+                # null` and stripping it afterwards — means a null-valued entry
+                # is never written to the live file at any instant. The
+                # fail-closed invariant then holds by construction, instead of
+                # depending on a post-write jq pass that could itself fail and
+                # leave the null behind (the exact hole in the first cut of
+                # this change).
+                GBRAIN_JSON=""
+                if [ "${GBRAIN_ENTRY}" != "null" ]; then
+                  GBRAIN_JSON=",
+                  \"gbrain\": ${GBRAIN_ENTRY}"
+                fi
                 # Cluster-internal MCP servers (deployed via kubectl in the
                 # paperclip ns; see .planning/mcp-servers.yaml). All agents
                 # in this instance get the same baseline set:
@@ -639,25 +652,10 @@ spec:
                   "linear": {
                     "type": "http",
                     "url": "http://linear-mcp-server.paperclip.svc.cluster.local:8000/mcp"
-                  },
-                  "gbrain": ${GBRAIN_ENTRY}
+                  }${GBRAIN_JSON}
                 }
               }
               EOF
-                # Drop any mcpServers entry whose value is null. GBRAIN_ENTRY
-                # is `null` whenever the OAuth mint failed (fail-closed, see
-                # above); an MCP client needs the key ABSENT, not present-and-
-                # null. Filter via temp + mv so a jq failure can never leave a
-                # truncated .mcp.json behind — this file is live and consumed
-                # fleet-wide off the shared RWX PVC.
-                if jq '.mcpServers |= with_entries(select(.value != null))' \
-                     "${MCP_FILE}" > "${MCP_FILE}.tmp" 2>/dev/null \
-                   && [ -s "${MCP_FILE}.tmp" ]; then
-                  mv "${MCP_FILE}.tmp" "${MCP_FILE}"
-                else
-                  rm -f "${MCP_FILE}.tmp"
-                  echo "seed: WARNING null-strip failed; ${MCP_FILE} left as written"
-                fi
                 chown 1000:1000 "${MCP_FILE}" 2>/dev/null || true
                 # Report what actually landed rather than a hardcoded list, so
                 # a fail-closed gbrain omission is visible in this same line.
