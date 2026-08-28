@@ -20,7 +20,7 @@
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRelations, issues } from "@paperclipai/db";
+import { activityLog, issueRelations, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import {
   listBlockedIssueAutoResumeSuppressions,
@@ -87,6 +87,16 @@ async function listCandidateRows(
       i.updated_at AS "updatedAt"
     FROM issues i
     WHERE i.status = 'blocked'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM heartbeat_runs active_run
+        WHERE active_run.id = i.execution_run_id
+          AND active_run.status IN ('queued', 'running', 'scheduled_retry')
+      )
+      AND NOT (
+        i.monitor_next_check_at IS NOT NULL
+        AND i.monitor_next_check_at > now()
+      )
       AND ${cursorPredicate}
     ORDER BY i.updated_at ASC, i.id ASC
     LIMIT ${batchSize}
@@ -190,11 +200,30 @@ async function reconcileCandidateBatch(
   }
 
   if (eligibleIds.length === 0) return [];
-  return tx
+  const reconciled = await tx
     .update(issues)
     .set({ status: "todo", updatedAt: new Date() })
     .where(and(inArray(issues.id, eligibleIds), eq(issues.status, "blocked")))
-    .returning({ id: issues.id, identifier: issues.identifier });
+    .returning({ id: issues.id, companyId: issues.companyId, identifier: issues.identifier });
+
+  if (reconciled.length > 0) {
+    await tx.insert(activityLog).values(reconciled.map((row) => ({
+      companyId: row.companyId,
+      actorType: "system" as const,
+      actorId: "stranded-blocked-issue-reconciler",
+      action: "issue.stranded_blocked_reconciled",
+      entityType: "issue",
+      entityId: row.id,
+      details: {
+        identifier: row.identifier,
+        statusBefore: "blocked",
+        statusAfter: "todo",
+        disposition: "unclassified_external_wait_made_visible",
+      },
+    })));
+  }
+
+  return reconciled;
 }
 
 /**
