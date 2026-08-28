@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { companies, createDb, issueComments, issueCommentEffects, issues } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   claimEffect,
   completeEffect,
@@ -16,10 +16,9 @@ import {
   releaseEffect,
   renewEffectLease,
   resetLeaselessProcessing,
-  COMMENT_EFFECT_LOSS_EVENT,
   MAX_EFFECT_ATTEMPTS,
+  startIssueCommentEffectReconciler,
 } from "./issue-comment-effects.js";
-import { logger } from "../middleware/logger.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -88,6 +87,24 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     { effectKind: "comment_activity" as const, effectKey: "comment_activity", payload: {} },
     { effectKind: "wake" as const, effectKey: "wake:agent-a", payload: { agentId: "agent-a" } },
   ];
+
+  async function makeEffectDue(effectId: string) {
+    await db
+      .update(issueCommentEffects)
+      .set({ nextAttemptAt: sql`now() - interval '1 second'` })
+      .where(eq(issueCommentEffects.id, effectId));
+  }
+
+  async function exhaustEffect(effectId: string) {
+    for (let attempt = 1; attempt <= MAX_EFFECT_ATTEMPTS; attempt += 1) {
+      if (attempt > 1) await makeEffectDue(effectId);
+      const claimed = await claimEffect(db as never, effectId);
+      expect(claimed).not.toBeNull();
+      await releaseEffect(db as never, claimed!, new Error("poison"));
+    }
+    const [row] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effectId));
+    return row;
+  }
 
   it("commits comment acceptance and effect intents atomically", async () => {
     companyId = randomUUID();
@@ -214,7 +231,7 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(await listUnfinishedEffects(db as never, commentId)).toHaveLength(3);
   }, 60_000);
 
-  it("retries a released effect and parks it failed once attempts are exhausted", async () => {
+  it("backs off failures without settling the comment, including after the exhausted threshold", async () => {
     await seed();
     await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
     const [effect] = await listUnfinishedEffects(db as never, commentId);
@@ -224,20 +241,26 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     let [row] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effect.id));
     expect(row.status).toBe("queued");
     expect(row.lastError).toContain("wake dispatch rejected");
+    expect(row.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+    expect(await claimEffect(db as never, effect.id)).toBeNull();
 
     // A retryable failure must keep the comment unprocessed — that is the whole
     // point: a swallowed dispatch rejection previously marked it done forever.
     expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(false);
 
-    for (let i = 0; i < MAX_EFFECT_ATTEMPTS; i++) {
+    for (let i = 2; i <= MAX_EFFECT_ATTEMPTS; i += 1) {
+      await makeEffectDue(effect.id);
       const next = await claimEffect(db as never, effect.id);
-      if (!next) break;
-      current = next;
+      expect(next).not.toBeNull();
+      current = next!;
       await releaseEffect(db as never, current, new Error("still failing"));
     }
     [row] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effect.id));
     expect(row.status).toBe("failed");
     expect(await claimEffect(db as never, effect.id)).toBeNull();
+    expect(await listUnfinishedEffects(db as never, commentId)).toContainEqual(
+      expect.objectContaining({ id: effect.id, status: "failed" }),
+    );
     expect(await hasUnsettledEffects(db as never, commentId)).toBe(true);
     expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(false);
   }, 60_000);
@@ -408,105 +431,45 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(await listSettledUnprocessedComments(db as never, 10)).not.toContain(commentId);
   }, 60_000);
 
-  it("settles a comment whose effect exhausted its retries", async () => {
+  it("reconciles an exhausted effect after durable backoff and settles only after recovery", async () => {
     await seed();
-    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
-    const ordered = await listUnfinishedEffects(db as never, commentId);
-
-    // Burn one effect through every attempt so it parks `failed`.
-    for (let attempt = 0; attempt <= MAX_EFFECT_ATTEMPTS; attempt += 1) {
-      const claimed = await claimEffect(db as never, ordered[0].id);
-      if (!claimed) break;
-      await releaseEffect(db as never, claimed, new Error("poison"));
-    }
-    let [parked] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, ordered[0].id));
+    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: [intents[0]] });
+    const [effect] = await listUnfinishedEffects(db as never, commentId);
+    const parked = await exhaustEffect(effect.id);
     expect(parked.status).toBe("failed");
-
-    // A parked effect is terminal and no query hands it out again. If it counted
-    // as outstanding, this comment could never settle and every replay would redo
-    // the whole pipeline forever.
-    for (const effect of ordered.slice(1)) {
-      const claimed = await claimEffect(db as never, effect.id);
-      await completeEffect(db as never, claimed!);
-    }
     expect(await listCommentsWithResumableEffects(db as never, 10)).not.toContain(commentId);
-    expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
-    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
-    expect(comment.idempotencyProcessedAt).not.toBeNull();
-  }, 60_000);
+    expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(false);
+    const [before] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    expect(before.idempotencyProcessedAt).toBeNull();
 
-  it("emits an alertable loss event, exactly once, when settling over a failed effect", async () => {
-    await seed();
-    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
-    const ordered = await listUnfinishedEffects(db as never, commentId);
+    // The durable failure backoff expires. The normal reconciler path must
+    // reclaim the parked row, run its sink, and only then stamp the comment.
+    await makeEffectDue(effect.id);
+    expect(await listCommentsWithResumableEffects(db as never, 10)).toContain(commentId);
 
-    for (let attempt = 0; attempt <= MAX_EFFECT_ATTEMPTS; attempt += 1) {
-      const claimed = await claimEffect(db as never, ordered[0].id);
-      if (!claimed) break;
-      await releaseEffect(db as never, claimed, new Error("poison"));
-    }
-    for (const effect of ordered.slice(1)) {
-      const claimed = await claimEffect(db as never, effect.id);
-      await completeEffect(db as never, claimed!);
-    }
-
-    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
-    try {
-      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
-
-      // The side effect never happened, so settling is real downstream loss.
-      // It has to reach an operator: assert on the structured selector a monitor
-      // would key on, not on the human-readable message.
-      const emitted = errorSpy.mock.calls.filter(
-        ([fields]) =>
-          (fields as { event?: string } | undefined)?.event === COMMENT_EFFECT_LOSS_EVENT,
-      );
-      expect(emitted).toHaveLength(1);
-      const [fields] = emitted[0] as [
-        {
-          commentId: string;
-          failedEffectCount: number;
-          failedEffects: { effectKind: string; lastError: string | null }[];
+    const executed: string[] = [];
+    const stop = startIssueCommentEffectReconciler(
+      db as never,
+      (candidateCommentId) => processCommentEffects(
+        db as never,
+        candidateCommentId,
+        async (candidate) => {
+          executed.push(candidate.id);
+          return { recovered: true };
         },
-      ];
-      expect(fields.commentId).toBe(commentId);
-      expect(fields.failedEffectCount).toBe(1);
-      expect(fields.failedEffects[0].effectKind).toBe(ordered[0].effectKind);
-      // The parked error is the operator's first diagnostic; losing it would
-      // make the alert unactionable.
-      expect(fields.failedEffects[0].lastError).toContain("poison");
-
-      // The settlement sweep re-runs; an alert that repeats every pass gets
-      // muted, and a muted alert is the silence this exists to prevent.
-      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
-      expect(
-        errorSpy.mock.calls.filter(
-          ([f]) => (f as { event?: string } | undefined)?.event === COMMENT_EFFECT_LOSS_EVENT,
-        ),
-      ).toHaveLength(1);
-    } finally {
-      errorSpy.mockRestore();
-    }
-  }, 60_000);
-
-  it("does not emit the loss event when every effect completed", async () => {
-    await seed();
-    await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
-    for (const effect of await listUnfinishedEffects(db as never, commentId)) {
-      const claimed = await claimEffect(db as never, effect.id);
-      await completeEffect(db as never, claimed!);
-    }
-
-    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+      ),
+      1,
+    );
     try {
-      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
-      expect(
-        errorSpy.mock.calls.filter(
-          ([f]) => (f as { event?: string } | undefined)?.event === COMMENT_EFFECT_LOSS_EVENT,
-        ),
-      ).toHaveLength(0);
+      await vi.waitFor(async () => {
+        const [recovered] = await db.select().from(issueCommentEffects).where(eq(issueCommentEffects.id, effect.id));
+        const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+        expect(recovered.status).toBe("processed");
+        expect(comment.idempotencyProcessedAt).not.toBeNull();
+      }, { interval: 10, timeout: 5_000 });
     } finally {
-      errorSpy.mockRestore();
+      await stop();
     }
+    expect(executed).toEqual([effect.id]);
   }, 60_000);
 });

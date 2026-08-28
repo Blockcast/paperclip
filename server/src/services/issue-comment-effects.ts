@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { issueComments, issueCommentEffects, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 
@@ -40,17 +40,27 @@ export interface CommentEffectIntent {
 
 /** How long a claim is held before another worker may reclaim it. */
 export const DEFAULT_CLAIM_LEASE_MS = 60_000;
-/** Attempts after which an effect stops being retried and is parked `failed`. */
+/** Attempts after which an effect uses the slower exhausted-retry backoff. */
 export const MAX_EFFECT_ATTEMPTS = 10;
 
+/** First retry delay for a failed effect. Later normal failures back off exponentially. */
+export const EFFECT_RETRY_BASE_DELAY_MS = 1_000;
+/** Cap for normal exponential retries before the exhausted backoff applies. */
+export const EFFECT_RETRY_MAX_DELAY_MS = 60_000;
+
 /**
- * Structured `event` field emitted when a comment settles with at least one
- * permanently failed effect. Stable by contract: it is an alerting selector
- * (`event = "comment_effect_permanently_failed"`), so renaming it silently
- * disarms whatever monitor is keyed on it. Exported so tests and dashboards
- * reference the same literal rather than each copying the string.
+ * Durable cooling-off period after repeated failures. `failed` remains
+ * reclaimable after this delay; it is deliberately not a terminal state.
  */
-export const COMMENT_EFFECT_LOSS_EVENT = "comment_effect_permanently_failed";
+export const EFFECT_EXHAUSTED_RETRY_DELAY_MS = 5 * 60_000;
+
+export function getEffectRetryDelayMs(attempts: number): number {
+  if (attempts >= MAX_EFFECT_ATTEMPTS) return EFFECT_EXHAUSTED_RETRY_DELAY_MS;
+  return Math.min(
+    EFFECT_RETRY_MAX_DELAY_MS,
+    EFFECT_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempts - 1),
+  );
+}
 
 /**
  * Persist the deterministic effect intents for a comment.
@@ -97,7 +107,7 @@ export async function listUnfinishedEffects(db: Db, commentId: string): Promise<
     .where(
       and(
         eq(issueCommentEffects.commentId, commentId),
-        inArray(issueCommentEffects.status, ["queued", "processing"]),
+        ne(issueCommentEffects.status, "processed"),
       ),
     )
     .orderBy(asc(issueCommentEffects.seq));
@@ -115,10 +125,11 @@ export async function hasCommentEffects(db: Db, commentId: string): Promise<bool
 /**
  * Take exclusive ownership of one effect.
  *
- * The CAS predicate accepts a row that is `queued`, or `processing` with an
- * expired lease (its previous owner died). Returns null when another live
- * claim holds the row — the caller must then skip it rather than run it, which
- * is what stops two concurrent same-key requests from double-executing.
+ * The CAS predicate accepts a due `queued` or `failed` row, or `processing`
+ * with an expired lease (its previous owner died). Returns null when another
+ * live claim holds the row — or when a failure is still in durable backoff —
+ * so the caller must then skip it rather than run it. That is what stops two
+ * concurrent same-key requests from double-executing.
  *
  * Both the stamped lease and the expiry predicate come from database `now()`,
  * never from this process's clock. Mixing the two is not cosmetic: with the
@@ -149,7 +160,10 @@ export async function claimEffect(
       and(
         eq(issueCommentEffects.id, effectId),
         or(
-          eq(issueCommentEffects.status, "queued"),
+          and(
+            inArray(issueCommentEffects.status, ["queued", "failed"]),
+            lte(issueCommentEffects.nextAttemptAt, sql`now()`),
+          ),
           and(
             eq(issueCommentEffects.status, "processing"),
             lt(issueCommentEffects.claimExpiresAt, sql`now()`),
@@ -234,9 +248,9 @@ export async function completeEffect(
 }
 
 /**
- * Release a failed claim back to `queued` so it is retried, or park it `failed`
- * once it has burned through MAX_EFFECT_ATTEMPTS. Parking is what stops a
- * genuinely poisonous effect from pinning a comment permanently unprocessed.
+ * Release a failed claim into durable retry backoff. Repeated failures use the
+ * `failed` state and a longer delay, but every failure remains reclaimable:
+ * treating an unexecuted effect as settled would lose the side effect forever.
  *
  * Returns false when we had already lost ownership, so the caller does not
  * report a retry it did not actually schedule.
@@ -248,16 +262,17 @@ export async function releaseEffect(
 ): Promise<boolean> {
   const claimToken = effect.claimToken;
   if (!claimToken) throw new Error("Cannot release an unclaimed comment effect");
-  const now = new Date();
-  const giveUp = effect.attempts >= MAX_EFFECT_ATTEMPTS;
+  const exhausted = effect.attempts >= MAX_EFFECT_ATTEMPTS;
+  const retryDelayMs = getEffectRetryDelayMs(effect.attempts);
   const rows = await db
     .update(issueCommentEffects)
     .set({
-      status: giveUp ? "failed" : "queued",
+      status: exhausted ? "failed" : "queued",
       lastError: String(err),
+      nextAttemptAt: sql`now() + make_interval(secs => ${retryDelayMs / 1000})`,
       claimExpiresAt: null,
       claimToken: null,
-      updatedAt: now,
+      updatedAt: sql`now()`,
     })
     .where(and(
       eq(issueCommentEffects.id, effect.id),
@@ -287,24 +302,10 @@ export async function getEffectResult(
 }
 
 /**
- * Mark the comment processed iff every one of its effects has settled.
- *
- * `failed` counts as settled. It is terminal — the row is only parked there after
- * MAX_EFFECT_ATTEMPTS, and no query will hand it out again — so treating it as
- * outstanding would pin the comment unprocessed forever while `idempotency`
- * replays redid the entire pipeline on every retry, chasing an effect that can
- * never succeed. That is strictly worse than the pre-ledger behaviour. A parked
- * effect is visible via its `failed` status and `last_error`; settlement is about
- * "is any work still owed", and the answer for a parked effect is no.
- *
- * Settling on a parked effect is nonetheless real downstream loss, so it must
- * never be *silent*: the transition below emits `COMMENT_EFFECT_LOSS_EVENT` at
- * error level, naming the comment and every parked effect. That log line is the
- * operator's alert hook and the entry point for the repair path tracked
- * separately — settlement no longer being blocked is not the same as the work
- * having happened, and only the emission keeps that distinction visible.
- *
- * Returns true when the comment is (now or already) processed.
+ * Mark the comment processed iff every one of its effects is `processed`.
+ * `failed` is a retry backoff state, not settlement: it represents a side effect
+ * that still has not happened and must keep the idempotent comment visibly
+ * unfinished until a later reclaim completes it.
  */
 export async function markCommentProcessedIfSettled(db: Db, commentId: string): Promise<boolean> {
   const outstanding = await db
@@ -313,27 +314,11 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
     .where(
       and(
         eq(issueCommentEffects.commentId, commentId),
-        inArray(issueCommentEffects.status, ["queued", "processing"]),
+        ne(issueCommentEffects.status, "processed"),
       ),
     )
     .limit(1);
   if (outstanding.length > 0) return false;
-
-  const failed = await db
-    .select({
-      id: issueCommentEffects.id,
-      effectKind: issueCommentEffects.effectKind,
-      effectKey: issueCommentEffects.effectKey,
-      attempts: issueCommentEffects.attempts,
-      lastError: issueCommentEffects.lastError,
-    })
-    .from(issueCommentEffects)
-    .where(
-      and(
-        eq(issueCommentEffects.commentId, commentId),
-        eq(issueCommentEffects.status, "failed"),
-      ),
-    );
 
   const stamped = await db
     .update(issueComments)
@@ -347,35 +332,14 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
     )
     .returning({ id: issueComments.id });
 
-  // Emit only on the actual transition. The `isNull(idempotencyProcessedAt)`
-  // predicate makes this update a one-shot, so gating on its result keeps the
-  // alert at exactly one line per lost comment however often the settlement
-  // sweep re-runs — an alert that repeats on every pass gets muted, and a muted
-  // alert is indistinguishable from the silence this exists to prevent.
-  if (stamped.length > 0 && failed.length > 0) {
-    logger.error(
-      {
-        event: COMMENT_EFFECT_LOSS_EVENT,
-        commentId,
-        failedEffectCount: failed.length,
-        failedEffects: failed.map((effect) => ({
-          id: effect.id,
-          effectKind: effect.effectKind,
-          effectKey: effect.effectKey,
-          attempts: effect.attempts,
-          lastError: effect.lastError,
-        })),
-      },
-      "issue-comment-effects: comment stamped processed with permanently failed effects",
-    );
-  }
-  return true;
+  return stamped.length > 0 || outstanding.length === 0;
 }
 
 /**
  * Comments whose effects are still outstanding and are due for another attempt
- * — i.e. `queued`, or `processing` past its lease. This is the reconciler's
- * work list; it is what turns a crashed request into eventual completion.
+ * — i.e. a due `queued` or `failed` row, or `processing` past its lease. This
+ * is the reconciler's work list; it is what turns a crashed request and a
+ * repeated dispatch failure into eventual completion.
  *
  * The lease predicate uses database `now()`, matching `claimEffect`: a
  * reconciler on a fast-running clock would otherwise hand itself work whose
@@ -390,7 +354,10 @@ export async function listCommentsWithResumableEffects(
     .from(issueCommentEffects)
     .where(
       or(
-        eq(issueCommentEffects.status, "queued"),
+        and(
+          inArray(issueCommentEffects.status, ["queued", "failed"]),
+          lte(issueCommentEffects.nextAttemptAt, sql`now()`),
+        ),
         and(
           eq(issueCommentEffects.status, "processing"),
           lt(issueCommentEffects.claimExpiresAt, sql`now()`),
@@ -409,7 +376,13 @@ export async function listCommentsWithResumableEffects(
 export async function resetLeaselessProcessing(db: Db): Promise<number> {
   const rows = await db
     .update(issueCommentEffects)
-    .set({ status: "queued", claimToken: null, updatedAt: new Date() })
+    .set({
+      status: "queued",
+      claimToken: null,
+      claimExpiresAt: null,
+      nextAttemptAt: sql`now()`,
+      updatedAt: sql`now()`,
+    })
     .where(
       and(
         eq(issueCommentEffects.status, "processing"),
@@ -436,7 +409,7 @@ export async function hasUnsettledEffects(db: Db, commentId: string): Promise<bo
 }
 
 /**
- * Comments whose effects have all settled but whose `idempotency_processed_at`
+ * Comments whose effects all completed but whose `idempotency_processed_at`
  * was never stamped.
  *
  * This is a real reachable state, not defensive padding: whenever a worker loses
@@ -461,7 +434,7 @@ export async function listSettledUnprocessedComments(
         sql`not exists (
           select 1 from ${issueCommentEffects} inner_effects
           where inner_effects.comment_id = ${issueCommentEffects.commentId}
-            and inner_effects.status in ('queued', 'processing')
+            and inner_effects.status <> 'processed'
         )`,
       ),
     )
