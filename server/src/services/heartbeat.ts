@@ -1040,15 +1040,18 @@ export const DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS = DEP_BLOCKED_MAX_PARK_AGE_M
  *
  * Two independent guards, because neither is sufficient alone:
  *
- *  1. **Most-recent-terminal-park ordering.** We fetch the single most recently created
- *     cancelled dep-blocked park for this issue+agent and carry its origin ONLY if its
- *     errorCode is the interaction-wake cancel. Parks for one issue are serial (the
- *     issue holds one `executionRunId` at a time), so most-recently-created is the
- *     immediate lineage predecessor. This is what stops the origin outliving an episode
- *     that genuinely ENDED: a `dep_blockers_resolved` cancel, a reassignment reset, or —
- *     critically — an `issue_dependencies_blocked` termination. Without the ordering
- *     rule, an already-age-expired episode would keep re-terminating every subsequent
- *     re-park in a tight loop, since its older interaction-wake cancel would still match.
+ *  1. **Most-recent-predecessor ordering.** We fetch the single most recently created
+ *     dep-blocked predecessor for this issue+agent and carry its origin ONLY if that
+ *     row is cancelled with the interaction-wake error code. Parks for one issue are
+ *     serial (the issue holds one `executionRunId` at a time), so most-recently-created
+ *     is the immediate lineage predecessor. Ordering before checking status is
+ *     essential: a newer row that promoted successfully means the old interaction-wake
+ *     cancel is no longer the predecessor and must not carry its origin into a fresh
+ *     episode. This is also what stops the origin outliving an episode that genuinely
+ *     ENDED: a `dep_blockers_resolved` cancel, a reassignment reset, or — critically —
+ *     an `issue_dependencies_blocked` termination. Without the ordering rule, an
+ *     already-age-expired episode would keep re-terminating every subsequent re-park in
+ *     a tight loop, since its older interaction-wake cancel would still match.
  *
  *  2. **Staleness bound** (DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS). Guard 1 cannot catch
  *     the case this fix is actually about: after an interaction-wake cancel there is no
@@ -1069,6 +1072,7 @@ async function recoverDepBlockedParkOriginAcrossInteractionWake(
 ): Promise<Date | null> {
   const previous = await dbOrTx
     .select({
+      status: heartbeatRuns.status,
       errorCode: heartbeatRuns.errorCode,
       contextSnapshot: heartbeatRuns.contextSnapshot,
       createdAt: heartbeatRuns.createdAt,
@@ -1081,7 +1085,6 @@ async function recoverDepBlockedParkOriginAcrossInteractionWake(
         eq(heartbeatRuns.agentId, params.agentId),
         eq(heartbeatRuns.contextIssueId, params.issueId),
         eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
-        eq(heartbeatRuns.status, "cancelled"),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -1089,8 +1092,15 @@ async function recoverDepBlockedParkOriginAcrossInteractionWake(
     .then((rows) => rows[0] ?? null);
 
   // Guard 1: only the immediate predecessor counts, and only if it was interrupted
-  // rather than ended.
-  if (!previous || previous.errorCode !== DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE) return null;
+  // rather than ended. Check status after ordering so a newer promoted row suppresses
+  // recovery from an older interaction-wake cancel.
+  if (
+    !previous ||
+    previous.status !== "cancelled" ||
+    previous.errorCode !== DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE
+  ) {
+    return null;
+  }
 
   // Guard 2: `finishedAt` is what the inline cancel stamps; coalesce to createdAt so a
   // row missing it degrades to declining rather than to an unbounded carry.

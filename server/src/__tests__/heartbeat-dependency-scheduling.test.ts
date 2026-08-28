@@ -2355,6 +2355,145 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(getDepBlockedMetric("dep_blocked_age_expired")).toBe(0);
   });
 
+  it("does not recover an interaction-wake origin past an intervening promoted predecessor", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const firstPark = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(firstPark).not.toBeNull();
+
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: blockedIssueId,
+      authorUserId: "board-user",
+      body: "Checking in.",
+    });
+    const interactionRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: blockedIssueId, commentId },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        commentId,
+        wakeCommentId: commentId,
+        wakeReason: "issue_commented",
+        source: "issue.comment",
+      },
+    });
+    expect(interactionRun).not.toBeNull();
+
+    // Model a later promotion that genuinely advanced this issue's predecessor.
+    // Recovery must order this row before the older interaction-wake cancellation.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, interactionRun!.id));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      scheduledRetryReason: DEP_BLOCKED_RETRY_REASON,
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "promoted_retry" },
+      createdAt: new Date(Date.now() + 1),
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, blockedIssueId));
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: blockedIssueId },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+    });
+    const replacement = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(replacement).not.toBeNull();
+    expect(replacement!.id).not.toBe(firstPark!.id);
+    expect(
+      (replacement!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt,
+    ).not.toBe((firstPark!.contextSnapshot as Record<string, unknown>).depBlockedFirstParkedAt);
+  });
+
   it("runs immediately when the final blocker resolves while a dep-blocked retry exists", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
