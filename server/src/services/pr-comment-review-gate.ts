@@ -574,39 +574,35 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
-  // Both surfaces, because Ally uses whichever is available to it: a
-  // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
-  // comment. Measured over the 25 most recent PRs in this repo, 33 of 33
-  // consolidated reviews were reviews-API objects and none were issue
-  // comments, so reading only the latter made this gate structurally unable to
-  // observe a review (BLO-29711). Either surface failing to read leaves the
-  // prior status untouched rather than publishing a verdict from half the
-  // history.
-  const [issueComments, prReviews] = await Promise.all([
-    withBoundedRetry(
-      () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
-      (result) => result == null,
-    ),
-    withBoundedRetry(
-      () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
-      (result) => result == null,
-    ),
-  ]);
-  if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
-
-  const verdict = evaluateCommentReviewGate({
-    comments: [...issueComments, ...prReviews].map((comment) => ({
-      authorLogin: comment.login,
-      body: comment.body,
-      createdAt: comment.createdAt,
-    })),
-    headSha,
-    reviewerBotLogin,
-  });
-
-  warnOnceIfMisreadableContext(verdict, context);
-
   const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
+    // Both surfaces, because Ally uses whichever is available to it: a
+    // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
+    // comment. Read and evaluate them inside the shared lock. Otherwise two
+    // API pods can compute against different snapshots and publish an older
+    // verdict after a newer one (BLO-29711).
+    const [issueComments, prReviews] = await Promise.all([
+      withBoundedRetry(
+        () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (result) => result == null,
+      ),
+      withBoundedRetry(
+        () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (result) => result == null,
+      ),
+    ]);
+    if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
+
+    const verdict = evaluateCommentReviewGate({
+      comments: [...issueComments, ...prReviews].map((comment) => ({
+        authorLogin: comment.login,
+        body: comment.body,
+        createdAt: comment.createdAt,
+      })),
+      headSha,
+      reviewerBotLogin,
+    });
+
+    warnOnceIfMisreadableContext(verdict, context);
     const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
       () =>
         githubPostCommitStatusDetailed({
@@ -640,7 +636,8 @@ async function executeCommentReviewGateCheck(
     return { posted: true, verdict };
   };
 
-  // Serialize the live verdict and retired-context writes with forced retries.
+  // Serialize evidence reads, verdict computation, and all status writes with
+  // forced retries. The transaction-scoped lock is the cross-process boundary.
   return input.db
     ? withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish)
     : publish();
