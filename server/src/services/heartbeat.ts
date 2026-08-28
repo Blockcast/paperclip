@@ -34680,6 +34680,82 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return runs.length;
   }
 
+  /**
+   * BLO-28865: cancel only the runs that actually hold an unreleased
+   * external-runtime reservation for this agent. Used by the adapter-type
+   * change path.
+   *
+   * Deliberately narrower than `cancelActiveForAgentInternal`, which cancels
+   * every `queued`/`running`/`scheduled_retry` run. A `queued` run has never
+   * been dispatched, so it holds no reservation and no Job -- it would launch
+   * perfectly well under the NEW adapter, and killing it would be pure
+   * collateral damage from a config edit. Only a run whose reservation is
+   * still open is stranded by the rename, so only that run needs to die.
+   *
+   * Per-run `cancelRunInternal` rather than the bulk path, because the
+   * per-run path is the one that deletes the exact Job by the reservation's
+   * still-correct OLD name/UID and then promotes the next queued run -- which
+   * is precisely how the agent gets moving again without waiting out the
+   * 45-minute hard-stale boundary.
+   */
+  async function cancelExternalRuntimeReservationHoldersForAgent(agentId: string, reason: string) {
+    const holders = await db
+      .select({
+        runId: heartbeatRuns.id,
+        jobName: externalRuntimeReservations.jobName,
+        jobUid: externalRuntimeReservations.jobUid,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(
+        externalRuntimeReservations,
+        eq(externalRuntimeReservations.runId, heartbeatRuns.id),
+      )
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          isNull(externalRuntimeReservations.releasedAt),
+          inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+        ),
+      );
+
+    let cancelled = 0;
+    for (const { runId, jobName, jobUid } of holders) {
+      try {
+        if (!jobName || !jobUid) {
+          throw new Error("reservation has no persisted Job identity");
+        }
+
+        // Delete using the reservation's persisted identity before cancelling
+        // the run. Cancellation can release the reservation and make a later
+        // lookup lose the only safe handle to the pre-migration Job.
+        const deleted = await deleteAgentJobExact({
+          runId,
+          agentId,
+          name: jobName,
+          uid: jobUid,
+        });
+        if (deleted !== "deleted" && deleted !== "missing") {
+          throw new Error(`exact Job deletion did not complete: ${deleted ?? "unavailable"}`);
+        }
+        await cancelRunInternal(runId, reason);
+        cancelled += 1;
+      } catch (error) {
+        // One wedged run must not stop the others from being unwedged.
+        logger.warn(
+          { agentId, runId, error: error instanceof Error ? error.message : String(error) },
+          "cancelExternalRuntimeReservationHoldersForAgent: failed to tear down reservation holder",
+        );
+      }
+    }
+    if (cancelled > 0) {
+      logger.info(
+        { agentId, cancelled, reason },
+        "cancelled external-runtime reservation holders so the agent's launch path is not stranded",
+      );
+    }
+    return cancelled;
+  }
+
   async function cancelPendingWakeupsForAgentsInternal(agentIds: string[], reason: string) {
     const uniqueAgentIds = [...new Set(agentIds)].filter((agentId) => agentId.length > 0);
     if (uniqueAgentIds.length === 0) return 0;
@@ -35436,6 +35512,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       cancelPendingRunsForTaskInternal(agentId, taskKey, reason),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
+    cancelExternalRuntimeReservationHoldersForAgent: (agentId: string, reason: string) =>
+      cancelExternalRuntimeReservationHoldersForAgent(agentId, reason),
 
     cancelInvocationsForAgents: (agentIds: string[], reason: string) =>
       cancelInvocationsForAgentsInternal(agentIds, reason),
