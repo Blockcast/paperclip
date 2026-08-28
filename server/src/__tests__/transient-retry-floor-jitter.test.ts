@@ -285,7 +285,7 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
         .select({
           scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
           scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
-          resultJson: heartbeatRuns.resultJson,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.retryOfRunId, runId))
@@ -304,19 +304,17 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
       expect(ms).toBeLessThanOrEqual(sharedFloor.getTime() + TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS);
     }
 
-    // Provenance lives on the ORIGIN run, not the parked successor.
-    // `readTransientRecoveryContractFromRun` reads the failed run's resultJson,
-    // and the successor is created fresh — it has not executed, so it carries no
-    // adapter result at all. Asserting it here would be asserting `undefined`.
+    // Provenance lives on the ORIGIN run's resultJson, not the successor's:
+    // `readTransientRecoveryContractFromRun` reads the failed run, and the
+    // successor is created fresh, so it carries no adapter result at all.
     //
-    // ⚠️ Worth stating plainly rather than burying: this means the unjittered
-    // floor is NOT recoverable from the parked row alone. An operator auditing
-    // `paperclipListParkedAgents` — which is exactly how this defect was found —
-    // sees the successor, so they can observe that a cohort is dispersed but
-    // cannot recover the instant it was dispersed from. That is an acceptable
-    // trade (dispersion is the goal, and the origin row retains the floor), but
-    // it is a real observability limit and not the "derivable from the row
-    // alone" property an earlier draft of this test claimed.
+    // The unjittered floor is NOT lost, though — the successor preserves it in
+    // `contextSnapshot.transientRetryNotBefore` (pinned by the existing
+    // assertions in heartbeat-retry-scheduling.test.ts, which still compare it
+    // exactly and still pass under jitter). So an operator auditing a parked row
+    // can still recover the instant the cohort was dispersed from; it is simply
+    // in the snapshot rather than the result. Both halves are asserted here so
+    // neither can rot.
     for (const runId of originRunIds) {
       const origin = await db
         .select({ resultJson: heartbeatRuns.resultJson })
@@ -325,6 +323,10 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
         .then((rows) => rows[0] ?? null);
       const resultJson = (origin?.resultJson ?? {}) as Record<string, unknown>;
       expect(resultJson.retryNotBefore).toBe(sharedFloor.toISOString());
+    }
+    for (const row of parked) {
+      const snapshot = (row.contextSnapshot ?? {}) as Record<string, unknown>;
+      expect(snapshot.transientRetryNotBefore).toBe(sharedFloor.toISOString());
     }
 
     // The acceptance criterion, measured the way the census measures it.
