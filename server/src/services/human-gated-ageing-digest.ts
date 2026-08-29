@@ -96,8 +96,15 @@ export const DEFAULT_DIGEST_PERIOD_DAYS = 7;
 
 const DAY_MS = 86_400_000;
 
-/** Rows per `inArray` chunk — keeps each aggregate's parameter list bounded. */
-const AGGREGATE_CHUNK_SIZE = 500;
+/**
+ * Rows per `inArray` chunk — keeps each aggregate's parameter list bounded.
+ *
+ * Exported so a caller reporting the *cost* of a pass derives it from the real
+ * chunk size rather than restating the literal. Every batched query family in
+ * this module runs once per chunk, so the round-trip count is a function of
+ * this constant; a copy of `500` elsewhere would silently stop tracking it.
+ */
+export const AGGREGATE_CHUNK_SIZE = 500;
 
 const DIGEST_TITLE = "[user-cover] Human-gated work is ageing past its escalation threshold";
 const UNKNOWN_PRODUCER = "(unknown producer)";

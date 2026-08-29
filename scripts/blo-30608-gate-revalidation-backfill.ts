@@ -142,13 +142,47 @@ type Acquisition = {
   omitted: number;
 };
 
+/**
+ * Round trips one `--source=db` pass costs, for a population of `population`.
+ *
+ * The DB path runs five *batched* query families plus one unbatched candidate
+ * query:
+ *
+ * - `loadHumanGatedIssues` — 1 candidate `SELECT`, then the two human-clock
+ *   aggregates (`latestHumanCommentAt`, `latestHumanActivityAt`);
+ * - `loadGateEvidence` — blockers, approvals, and interactions.
+ *
+ * Each of the five batched families runs once per `chunkSize`-row chunk, so the
+ * total is `1 + 5 * ceil(population / chunkSize)` — O(ceil(n/chunk)), not O(n),
+ * which is why the probe cap can be raised well past the population without a
+ * cost cliff.
+ *
+ * This is derived rather than stated because a constant cannot be right across
+ * the range. A hard-coded `6` is correct only for `1..chunkSize` rows: it
+ * *understates* a population that spans two or more chunks (the live 746-row
+ * pass costs 11, not 6) and *overstates* an empty one, where `chunk([])` yields
+ * no iterations and the candidate query is the only round trip. Both directions
+ * corrupt the measured cost this backfill exists to report.
+ */
+export function dbRoundTrips(population: number, chunkSize: number): number {
+  if (!Number.isInteger(population) || population < 0) {
+    throw new Error(`population must be a non-negative integer, got ${population}`);
+  }
+  if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+    throw new Error(`chunkSize must be a positive integer, got ${chunkSize}`);
+  }
+  const BATCHED_QUERY_FAMILIES = 5;
+  const CANDIDATE_QUERY = 1;
+  return CANDIDATE_QUERY + BATCHED_QUERY_FAMILIES * Math.ceil(population / chunkSize);
+}
+
 /** Evidence over the exact code path the weekly sweep runs. */
 async function acquireFromDb(companyId: string, now: Date): Promise<Acquisition> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error("DATABASE_URL is required for --source=db");
 
   const { createDb } = await import("@paperclipai/db");
-  const { loadHumanGatedIssues, loadGateEvidence } = await import(
+  const { loadHumanGatedIssues, loadGateEvidence, AGGREGATE_CHUNK_SIZE } = await import(
     "../server/src/services/human-gated-ageing-digest.js"
   );
 
@@ -171,13 +205,12 @@ async function acquireFromDb(companyId: string, now: Date): Promise<Acquisition>
       status: candidate.status,
     })),
   );
-  // 1 candidate query + 2 human-clock aggregates + 3 batched evidence queries
-  // (blockers, approvals, interactions). Each evidence query is one round trip
-  // per 500-row chunk, so this is O(ceil(n/500)) and not O(n) — the reason the
-  // probe cap can be raised well past the population without a cost cliff.
-  // The DB path hands `revalidateGates` the *whole* ranked population and lets
-  // it apply the budget, so it truncates nothing itself and `omitted` is 0.
-  return { evidence, calls: 6, population: candidates.length, omitted: 0 };
+  return {
+    evidence,
+    calls: dbRoundTrips(candidates.length, AGGREGATE_CHUNK_SIZE),
+    population: candidates.length,
+    omitted: 0,
+  };
 }
 
 /** Evidence over the public API, for a reader without database access. */
