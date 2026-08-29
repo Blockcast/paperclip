@@ -37,6 +37,12 @@
  * - **Population.** The hidden-row and digest-row exclusions are reproduced from
  *   the fields the API returns; any future server-side predicate the endpoint
  *   does not expose would not be.
+ * - **Where the budget lands.** The API path applies the probe budget while
+ *   acquiring, because its per-issue approvals call is the only unbounded cost
+ *   in the pass; the DB path hands the whole population to `revalidateGates`
+ *   and lets the classifier cap it. Either way the rows left unexamined are
+ *   reported as `notProbed`, so `population === probed + notProbed` holds on
+ *   both sources and a capped run can never read as a complete one.
  *
  * For a split that *is* the sweep's split, use `--source=db`.
  *
@@ -49,6 +55,8 @@
  *   --all            equivalent to an uncapped pass; use to size the whole queue
  *   --json           emit machine-readable output instead of the text report
  */
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   DEFAULT_MAX_PROBES,
   revalidateGates,
@@ -103,6 +111,20 @@ type Acquisition = {
   calls: number;
   /** Open human-gated rows found, before the probe budget is applied. */
   population: number;
+  /**
+   * Rows inside `population` this pass deliberately acquired *no* evidence for,
+   * because the probe budget ran out during acquisition.
+   *
+   * This exists because `revalidateGates` can only report a row as unexamined
+   * if it was handed the row in the first place: its `notProbed` is
+   * `inputs.length - classified`. An acquisition that applies the budget itself
+   * hands over a pre-trimmed list, so the classifier's `notProbed` is
+   * structurally zero and the report would claim a capped sample was the whole
+   * queue — understating exactly the backlog this backfill exists to size.
+   * Acquisition-side truncation is therefore counted here and added back in
+   * {@link main}, so `population === probed + notProbed` holds on both sources.
+   */
+  omitted: number;
 };
 
 /** Evidence over the exact code path the weekly sweep runs. */
@@ -129,11 +151,13 @@ async function acquireFromDb(companyId: string, now: Date): Promise<Acquisition>
     byAgeDescending.map((candidate) => ({ id: candidate.id, identifier: candidate.identifier })),
   );
   // 1 candidate query + 2 human-clock aggregates + 2 evidence queries.
-  return { evidence, calls: 5, population: candidates.length };
+  // The DB path hands `revalidateGates` the *whole* ranked population and lets
+  // it apply the budget, so it truncates nothing itself and `omitted` is 0.
+  return { evidence, calls: 5, population: candidates.length, omitted: 0 };
 }
 
 /** Evidence over the public API, for a reader without database access. */
-async function acquireFromApi(
+export async function acquireFromApi(
   companyId: string,
   budget: number | null,
   now: Date,
@@ -218,6 +242,13 @@ async function acquireFromApi(
     })),
     now,
   );
+  // Applying the budget *here* rather than handing the whole population to
+  // `revalidateGates` is deliberate: the per-issue approvals call below is the
+  // only unbounded cost in this pass, and fetching it for rows the classifier
+  // would immediately slice off would make `--max-probes` cost the same as an
+  // uncapped run. The price is that the classifier can no longer see what it
+  // did not receive, so the truncation is counted into `omitted` and added back
+  // in `main` — never silently dropped.
   const probed = (budget === null ? ranked : ranked.slice(0, budget)).map(
     (candidate) => candidate.row,
   );
@@ -247,12 +278,28 @@ async function acquireFromApi(
     });
   }
 
-  return { evidence, calls, population: humanGated.length };
+  return {
+    evidence,
+    calls,
+    population: humanGated.length,
+    omitted: humanGated.length - probed.length,
+  };
 }
 
-function renderReport(
+export function renderReport(
   report: GateRevalidationReport,
-  meta: { population: number; calls: number; elapsedMs: number; source: string },
+  meta: {
+    population: number;
+    calls: number;
+    elapsedMs: number;
+    source: string;
+    /**
+     * Unexamined rows across *both* truncation points — the classifier's own
+     * budget and any the acquisition dropped. Not `report.notProbed`, which
+     * sees only the former.
+     */
+    notProbed: number;
+  },
 ): string {
   const probed =
     report.counts["still-gated"] + report.counts["resolved-but-open"] + report.counts.unverifiable;
@@ -260,7 +307,7 @@ function renderReport(
     `# BLO-30608 gate re-validation backfill (source: ${meta.source})`,
     "",
     `Open human-gated population : ${meta.population}`,
-    `Probed                      : ${probed}${report.notProbed > 0 ? ` (${report.notProbed} beyond the budget)` : ""}`,
+    `Probed                      : ${probed}${meta.notProbed > 0 ? ` (${meta.notProbed} beyond the budget)` : ""}`,
     "",
     `still-gated        : ${report.counts["still-gated"]}`,
     `resolved-but-open  : ${report.counts["resolved-but-open"]}`,
@@ -298,6 +345,11 @@ async function main(): Promise<void> {
       : await acquireFromApi(args.companyId, args.maxProbes, now);
   const report = revalidateGates(acquisition.evidence, { maxProbes: args.maxProbes });
   const elapsedMs = Date.now() - startedAt;
+  // Rows can go unexamined at either truncation point — the acquisition's, or
+  // the classifier's. Reporting only the classifier's would let a capped API
+  // run print a sample as if it were the whole queue. Summing them keeps the
+  // invariant `population === probed + notProbed` true on both sources.
+  const notProbed = report.notProbed + acquisition.omitted;
 
   if (args.json) {
     console.log(
@@ -307,7 +359,7 @@ async function main(): Promise<void> {
           population: acquisition.population,
           counts: report.counts,
           countsByResolutionKind: report.countsByResolutionKind,
-          notProbed: report.notProbed,
+          notProbed,
           calls: acquisition.calls,
           elapsedMs,
           classifications: report.classifications,
@@ -325,14 +377,23 @@ async function main(): Promise<void> {
       calls: acquisition.calls,
       elapsedMs,
       source: args.source,
+      notProbed,
     }),
   );
 }
 
-main().then(
-  () => process.exit(0),
-  (error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
-  },
-);
+// Only run when invoked as the entrypoint. Without this guard, importing the
+// module to test `acquireFromApi` runs `main`, which exits the process on the
+// missing `--company` argument and takes the test runner with it.
+const isEntrypoint =
+  Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isEntrypoint) {
+  main().then(
+    () => process.exit(0),
+    (error: unknown) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    },
+  );
+}
