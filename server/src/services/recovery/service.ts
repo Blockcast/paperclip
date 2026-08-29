@@ -12218,11 +12218,12 @@ export function recoveryService(
         })
         .where(and(
           eq(issueRecoveryActions.id, candidate.actionId),
-          eq(issueRecoveryActions.companyId, candidate.companyId),
-          eq(issueRecoveryActions.ownerAgentId, ownerAgentId),
-          inArray(issueRecoveryActions.status, ["active", "escalated"]),
-          or(isNull(issueRecoveryActions.lastAttemptAt), lt(issueRecoveryActions.lastAttemptAt, cooldownBefore)),
-        ))
+           eq(issueRecoveryActions.companyId, candidate.companyId),
+           eq(issueRecoveryActions.ownerAgentId, ownerAgentId),
+           inArray(issueRecoveryActions.status, ["active", "escalated"]),
+           isNull(issueRecoveryActions.retiringBound),
+           or(isNull(issueRecoveryActions.lastAttemptAt), lt(issueRecoveryActions.lastAttemptAt, cooldownBefore)),
+         ))
         .returning({ lastAttemptAt: issueRecoveryActions.lastAttemptAt })
         .then((rows) => rows[0] ?? null);
       if (!claimed) {
