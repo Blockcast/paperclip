@@ -12044,6 +12044,7 @@ export function recoveryService(
     const queryCandidates = (afterActionId: string | null) => {
       const filters = [
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        isNull(issueRecoveryActions.retiringBound),
         inArray(issues.status, STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,

@@ -1024,6 +1024,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       retiringBound: "attempt_budget",
     });
     expect(unchanged?.lastAttemptAt).toEqual(new Date("2026-05-01T00:00:00.000Z"));
+
+    // Retirement is sticky: a later sweep must not reselect the escalated row
+    // after the attempt count was refunded by the retirement CAS.
+    const secondSweep = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: new Date("2026-08-26T00:30:00.000Z"),
+      cooldownMs: 30 * 60 * 1000,
+    });
+    expect(secondSweep).toMatchObject({ checked: 0, exhaustedSkipped: 0, healed: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [stillRetired] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(stillRetired).toMatchObject({
+      status: "escalated",
+      attemptCount: defaultRecoveryActionMaxAttempts,
+      retiringBound: "attempt_budget",
+    });
   });
 
   it("publishes the committed review-stage escalation activity", async () => {
