@@ -38,6 +38,22 @@ describe("startup filesystem I/O", () => {
     expect(guard).toContain("await copyWorkspaceSharedDist();");
   });
 
+  it("preserves the installed SDK version when vendoring the workspace fork", () => {
+    const fn = serverSource.slice(
+      serverSource.indexOf("async function copyWorkspacePluginSdk()"),
+      serverSource.indexOf("async function copyWorkspaceSharedDist()"),
+    );
+
+    // The workspace manifest is unstamped (1.0.0) while the plugin store's
+    // package-lock.json records the installed registry version. Copying the
+    // manifest verbatim makes installed !== locked, which trips
+    // plugin-lifecycle's torn-store guard and fails EVERY plugin activation
+    // closed. Reinstalling does not recover it — this function re-tears the
+    // store on the next boot. So the version must be carried over.
+    expect(fn).not.toMatch(/cp\(\s*workspaceSdkPkg/);
+    expect(fn).toContain("merged.version = installedVersion");
+  });
+
   it("does not recursively chown the shared Claude directory", () => {
     expect(statefulSet).not.toMatch(/chown\s+-R[^\n]*\.claude/);
     expect(statefulSet).toContain('timeout 45s "$@"');
