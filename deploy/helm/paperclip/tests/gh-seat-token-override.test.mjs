@@ -76,6 +76,30 @@ function writeExecutable(dir, name, body) {
   return file;
 }
 
+// The seed step that publishes the scrubbing `gh` onto the default PATH
+// (PEN-2527), lifted from the rendered script so a test runs the real thing
+// rather than a restatement of it. Asserts rather than returning empty when the
+// step is missing, so its removal fails loudly instead of silently passing.
+function extractPathPublishFragment(rendered) {
+  const lines = rendered.split("\n");
+  const startIdx = lines.findIndex((line) =>
+    /^\s*PATH_BIN="\$\{BASE\}\/bin"$/.test(line),
+  );
+  assert.notEqual(
+    startIdx,
+    -1,
+    "seed script no longer publishes gh onto the default PATH",
+  );
+  const indent = lines[startIdx].match(/^(\s*)/)[1];
+  const body = [];
+  for (let i = startIdx; i < lines.length; i += 1) {
+    const line = lines[i].slice(indent.length);
+    body.push(line);
+    if (/^ln -sf /.test(line)) return body.join("\n");
+  }
+  throw new Error("did not find the gh symlink line in the publish step");
+}
+
 const rendered = renderStatefulSet();
 const envScriptBody = extractHeredoc(rendered, "paperclip-github-token-env");
 const credHelperBody = extractHeredoc(rendered, "github-token-credential-helper");
@@ -144,6 +168,59 @@ test("rendered gh wrapper exercises the generated runtime command path", () => {
     argv: args,
   });
   assert.equal(fs.readFileSync(path.join(dir, "target-ran"), "utf8"), "invoked\n");
+});
+
+// PEN-2527. The scrubbing wrapper landed in ${LOCAL_BIN}, but that directory is
+// only prepended to PATH by ${BASE}/.profile and ${BASE}/.bashrc, which only a
+// *login* shell sources. Agent tool harnesses spawn non-login, non-interactive
+// shells, where `gh` resolved straight to the image CLI and the scrubber was
+// never reached. The control was deployed and correct and still sat off the
+// traffic path. These two tests fail against that arrangement.
+
+test("seed publishes the gh wrapper into the PATH-visible bin, not only .local/bin", () => {
+  assert.match(rendered, /PATH_BIN="\$\{BASE\}\/bin"/);
+  assert.match(rendered, /ln -sf "\$\{LOCAL_BIN\}\/gh" "\$\{PATH_BIN\}\/gh"/);
+});
+
+test("a non-login shell resolves gh to the egress wrapper, not the image CLI", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gh-path-reach-"));
+  const localBin = path.join(base, ".local", "bin");
+  const imageBin = path.join(base, "usr-bin");
+  for (const dir of [localBin, imageBin]) fs.mkdirSync(dir, { recursive: true });
+
+  // The scrubbing wrapper as the seed installs it, and the image CLI it must win
+  // against. Each announces itself so the winner is unambiguous.
+  writeExecutable(localBin, "gh", "#!/bin/sh\necho scrubbing-wrapper\n");
+  writeExecutable(imageBin, "gh", "#!/bin/sh\necho image-cli\n");
+
+  // Run the seed's own publish step rather than symlinking here, so this test
+  // fails if the seed stops publishing onto the PATH-visible bin.
+  const seeded = spawnSync(
+    "sh",
+    [
+      "-c",
+      [
+        "set -eu",
+        `BASE=${JSON.stringify(base)}`,
+        `LOCAL_BIN=${JSON.stringify(localBin)}`,
+        extractPathPublishFragment(rendered),
+      ].join("\n"),
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  // A non-login shell: ${BASE}/bin is on PATH ahead of the image bin, .local/bin
+  // is absent because no profile was sourced. This is the live agent shell.
+  // /bin/sh by absolute path so the shell itself does not depend on the PATH
+  // under test — only the `gh` lookup inside it does.
+  const result = spawnSync("/bin/sh", ["-c", "gh"], {
+    encoding: "utf8",
+    env: { PATH: `${path.join(base, "bin")}:${imageBin}` },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "scrubbing-wrapper");
 });
 
 test("paperclip-github-token-env: GH_SEAT_TOKEN_VALUE overrides the App-installation token file", () => {
