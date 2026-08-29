@@ -173,6 +173,60 @@ export function humanSilenceDays(issue: HumanGatedIssue, now: Date): number {
   return elapsedMs / 86_400_000;
 }
 
+/**
+ * Stable `originKind` for the durable human-gated ageing digest row.
+ *
+ * Lives in this dependency-free module rather than beside the digest delivery
+ * code because it is part of the *population predicate*: the digest row is
+ * itself an open issue assigned to a human, so any pass over the human-gated
+ * queue must exclude it or it counts itself. A caller reproducing that
+ * predicate — the BLO-30608 backfill's API path, for one — needs the name
+ * without needing the database layer.
+ */
+export const HUMAN_GATED_DIGEST_ORIGIN_KIND = "human-gated-ageing-digest";
+
+/**
+ * Silence in days for *ranking only*, tolerating a row the clock cannot read.
+ *
+ * {@link humanSilenceDays} throws on a row with an unparseable `createdAt` and
+ * no human touch. That row is legitimate input to a ranking pass — the digest
+ * loader emits `createdAt: ""` precisely so {@link selectAgedHumanGatedIssues}
+ * can classify it `malformed` and say which key was wrong — so a caller that
+ * only needs an order must be able to place it without deciding its fate.
+ * Returning `-Infinity` sorts it last (least likely to be stale, so a bounded
+ * probe budget is not spent on it) and leaves the actual verdict to the pass
+ * that reports malformed rows rather than throwing on them.
+ */
+export function rankableSilenceDays(issue: HumanGatedIssue, now: Date): number {
+  try {
+    return humanSilenceDays(issue, now);
+  } catch {
+    return Number.NEGATIVE_INFINITY;
+  }
+}
+
+/**
+ * Order human-gated rows oldest-human-clock-first.
+ *
+ * This is the ordering *every* bounded pass over the human-gated population
+ * must use, and it lives here — beside the clock it reads — so there is exactly
+ * one implementation of "which row is older". A pass that probes only the first
+ * N rows decides its own finding by that order: rank on anything else (query
+ * order, API response order) and the reported split measures the ordering
+ * rather than staleness. Callers apply their budget with a plain `slice`, so
+ * the property that matters — a capped run probes the oldest candidates — is a
+ * property of this function and is tested as one.
+ *
+ * Non-destructive: returns a new array, leaving the caller's population in its
+ * original order for anything that still needs it.
+ */
+export function orderByHumanSilenceDescending<T extends HumanGatedIssue>(
+  issues: readonly T[],
+  now: Date,
+): T[] {
+  return [...issues].sort((a, b) => rankableSilenceDays(b, now) - rankableSilenceDays(a, now));
+}
+
 export function isHumanGatedOpenIssue(issue: HumanGatedIssue): boolean {
   return Boolean(issue.assigneeUserId) && HUMAN_GATED_OPEN_STATUS_SET.has(issue.status);
 }

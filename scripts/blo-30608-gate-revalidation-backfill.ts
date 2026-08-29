@@ -21,6 +21,25 @@
  * offering both: the API path is auditable by whoever is reading the report,
  * and the DB path is the one that ships.
  *
+ * Both also rank oldest-human-clock-first, through the same
+ * `orderByHumanSilenceDescending` the production producer uses, *before* the
+ * probe budget is applied. Under a cap the ordering decides the finding: probe
+ * in query or response order and the reported split measures that order rather
+ * than staleness.
+ *
+ * Where `--source=api` is only an approximation, stated rather than papered over:
+ *
+ * - **Clock.** The API does not expose `lastHumanTouchAt` (an `issue_comments` /
+ *   `activity_log` aggregate), so the API path ranks on `createdAt` alone. It
+ *   errs one way: a human-touched row ranks *older* than the sweep would rank
+ *   it, so a capped API run can over-probe a recently-tended row — never skip
+ *   one the sweep would have reached first.
+ * - **Population.** The hidden-row and digest-row exclusions are reproduced from
+ *   the fields the API returns; any future server-side predicate the endpoint
+ *   does not expose would not be.
+ *
+ * For a split that *is* the sweep's split, use `--source=db`.
+ *
  * Usage:
  *   DATABASE_URL=... npx tsx scripts/blo-30608-gate-revalidation-backfill.ts --company <uuid>
  *   npx tsx scripts/blo-30608-gate-revalidation-backfill.ts --source=api --company <uuid>
@@ -36,6 +55,10 @@ import {
   type GateEvidenceInput,
   type GateRevalidationReport,
 } from "../server/src/services/human-gated-gate-revalidation.js";
+import {
+  HUMAN_GATED_DIGEST_ORIGIN_KIND,
+  orderByHumanSilenceDescending,
+} from "../server/src/services/human-gated-ageing.js";
 
 const OPEN_STATUSES = ["todo", "backlog", "in_progress", "in_review", "blocked"] as const;
 
@@ -83,7 +106,7 @@ type Acquisition = {
 };
 
 /** Evidence over the exact code path the weekly sweep runs. */
-async function acquireFromDb(companyId: string): Promise<Acquisition> {
+async function acquireFromDb(companyId: string, now: Date): Promise<Acquisition> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error("DATABASE_URL is required for --source=db");
 
@@ -94,17 +117,27 @@ async function acquireFromDb(companyId: string): Promise<Acquisition> {
 
   const db = createDb(connectionString);
   const candidates = await loadHumanGatedIssues(db, companyId);
+  // Rank before the budget lands, exactly as `humanGatedAgeingProducer` does.
+  // `loadHumanGatedIssues` orders by `issues.id` — a lock-ordering choice, not
+  // an age one — so probing it as returned would spend a capped budget on an
+  // arbitrary slice and report a split that measures UUID order rather than
+  // staleness.
+  const byAgeDescending = orderByHumanSilenceDescending(candidates, now);
   const evidence = await loadGateEvidence(
     db,
     companyId,
-    candidates.map((candidate) => ({ id: candidate.id, identifier: candidate.identifier })),
+    byAgeDescending.map((candidate) => ({ id: candidate.id, identifier: candidate.identifier })),
   );
   // 1 candidate query + 2 human-clock aggregates + 2 evidence queries.
   return { evidence, calls: 5, population: candidates.length };
 }
 
 /** Evidence over the public API, for a reader without database access. */
-async function acquireFromApi(companyId: string, budget: number | null): Promise<Acquisition> {
+async function acquireFromApi(
+  companyId: string,
+  budget: number | null,
+  now: Date,
+): Promise<Acquisition> {
   const base = process.env.PAPERCLIP_API_URL;
   const key = process.env.PAPERCLIP_API_KEY;
   if (!base || !key) {
@@ -127,6 +160,9 @@ async function acquireFromApi(companyId: string, budget: number | null): Promise
     identifier?: string | null;
     status: string;
     assigneeUserId?: string | null;
+    createdAt?: string | null;
+    hiddenAt?: string | null;
+    originKind?: string | null;
     blockedBy?: { id: string; identifier?: string | null; status: string }[];
   };
 
@@ -144,8 +180,47 @@ async function acquireFromApi(companyId: string, budget: number | null): Promise
     }
   }
 
-  const humanGated = rows.filter((row) => Boolean(row.assigneeUserId));
-  const probed = budget === null ? humanGated : humanGated.slice(0, budget);
+  // Reproduce `loadHumanGatedIssues`' population predicate, not just its
+  // `assigneeUserId IS NOT NULL` clause. It also drops hidden rows and the
+  // digest row itself — the latter because the digest is an open issue assigned
+  // to a human, so leaving it in makes the report count itself. A population
+  // that differs from the sweep's makes every count here incomparable with the
+  // sweep's, which is the one thing this script exists to check.
+  const humanGated = rows.filter(
+    (row) =>
+      Boolean(row.assigneeUserId) &&
+      !row.hiddenAt &&
+      row.originKind !== HUMAN_GATED_DIGEST_ORIGIN_KIND,
+  );
+
+  // Rank oldest-human-clock-first before the budget lands, through the same
+  // helper the production producer uses. The API does not expose the
+  // `lastHumanTouchAt` half of the clock (it is an `issue_comments` /
+  // `activity_log` aggregate), so this path ranks on `createdAt` alone. That is
+  // a stated approximation, and it errs in one direction only: a row a human
+  // touched after creation ranks *older* here than the sweep would rank it, so
+  // a capped API run can over-probe a recently-tended row — it can never skip
+  // one the sweep would have probed first. Use `--source=db` for a split that
+  // is the sweep's split by construction.
+  const ranked = orderByHumanSilenceDescending(
+    humanGated.map((row) => ({
+      id: row.id,
+      identifier: row.identifier ?? null,
+      title: "",
+      status: row.status,
+      priority: "medium",
+      assigneeUserId: row.assigneeUserId ?? null,
+      // Mirror the loader: an unparseable value becomes `""` so it ranks last
+      // rather than throwing the pass.
+      createdAt: row.createdAt ?? "",
+      lastHumanTouchAt: null,
+      row,
+    })),
+    now,
+  );
+  const probed = (budget === null ? ranked : ranked.slice(0, budget)).map(
+    (candidate) => candidate.row,
+  );
 
   // Approvals are per-issue, so this is the only unbounded-ish cost in the pass
   // and it is bounded by the probe budget rather than by the population.
@@ -214,10 +289,13 @@ function renderReport(
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const startedAt = Date.now();
+  // One clock reading for the whole pass: ranking must not shift underneath a
+  // long acquisition, or two rows can swap places mid-run.
+  const now = new Date(startedAt);
   const acquisition =
     args.source === "db"
-      ? await acquireFromDb(args.companyId)
-      : await acquireFromApi(args.companyId, args.maxProbes);
+      ? await acquireFromDb(args.companyId, now)
+      : await acquireFromApi(args.companyId, args.maxProbes, now);
   const report = revalidateGates(acquisition.evidence, { maxProbes: args.maxProbes });
   const elapsedMs = Date.now() - startedAt;
 
