@@ -8657,9 +8657,42 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const handBackAgentId = outcome === "restored" && sourceIssueStatus === "todo"
-      ? activeRecoveryAction?.returnOwnerAgentId ?? null
-      : null;
+    // Ownership returns to the original assignee on two distinct paths, and the
+    // difference is the source issue's status, not the ownership question:
+    //
+    //   restored + todo    — the strand cleared and the issue is dispatchable again.
+    //   blocked  + blocked — the strand cleared but the issue is genuinely waiting
+    //                        on a first-class blocker (enforced below), so it stays
+    //                        `blocked` while ownership goes home. This is an
+    //                        ownership-only restore.
+    //
+    // The second path exists because a dependency-blocked issue is not a strand
+    // needing a manager's judgment — it is an issue waiting for its blocker. Parking
+    // it on the manager makes `reconcileResolvedBlockerDependents` wake
+    // `assigneeAgentId` (the manager) when the blocker resolves, so the agent that
+    // was actually doing the work is never woken. Returning ownership while the row
+    // stays `blocked` re-points that wake at the right agent without falsifying the
+    // status — which is why this must NOT be done by moving the issue to `todo`.
+    const handBackAgentId =
+      ((outcome === "restored" && sourceIssueStatus === "todo") ||
+        (outcome === "blocked" && sourceIssueStatus === "blocked")) &&
+      // A human holding the issue outranks a recorded return owner. The sibling
+      // PATCH path refuses this case too (it requires the action owner to be the
+      // current assignee, which a user-assigned issue can never satisfy). Here the
+      // stakes are higher: this path sets `assigneeAgentId` without clearing
+      // `assigneeUserId`, so handing back would leave BOTH set rather than merely
+      // reassigning.
+      !existing.assigneeUserId
+        ? activeRecoveryAction?.returnOwnerAgentId ?? null
+        : null;
+    // A hand-back only converges if the return owner can actually run. The PATCH
+    // blocked->todo path already routes the return owner through this guard, which
+    // is what makes it reject a terminated owner with 409; this endpoint wrote the
+    // id straight through, so a hand-back here could park work on a terminated or
+    // invalid-org-chain agent and strand it silently. Validate on both paths.
+    if (handBackAgentId) {
+      await normalizeIssueAssigneeAgentReference(existing.companyId, handBackAgentId);
+    }
     const recordedOutcome = handBackAgentId
       ? "handed_back"
       : outcome === "restored" && sourceIssueStatus === "done"

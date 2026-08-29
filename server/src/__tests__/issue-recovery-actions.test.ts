@@ -5231,6 +5231,195 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
+  it("returns ownership to the return owner while the source issue stays blocked", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Real blocker that is still open",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "issue_dependencies_blocked",
+      fingerprint: "graph-liveness:ownership-only-restore",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Return ownership; the blocker is real.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+    const resolved = await request(createApp(undefined, {
+      recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup,
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "blocked",
+        sourceIssueStatus: "blocked",
+        resolutionNote: "Blocker is real; ownership returned to the original agent.",
+      })
+      .expect(200);
+
+    // Ownership goes home, but the status still reflects reality. Moving this row
+    // to `todo` to achieve the hand-back would falsify state — the blocker is real.
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "blocked",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "handed_back",
+    });
+    // No wake: the row is still blocked, so the blockers-resolved sweep is what
+    // should wake the return owner later. Waking now would be pure churn.
+    expect(enqueueRecoveryActionWakeup).not.toHaveBeenCalled();
+  });
+
+  it("leaves a user-assigned blocked issue with its human owner", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Real blocker that is still open",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "issue_dependencies_blocked",
+      fingerprint: "graph-liveness:user-owned-ownership-only",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Leave the human-owned issue alone.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const resolved = await request(createApp())
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "blocked",
+        sourceIssueStatus: "blocked",
+        resolutionNote: "Human owns this row.",
+      })
+      .expect(200);
+
+    // A human holding the issue outranks the recorded return owner. Handing back
+    // here would leave assigneeUserId AND assigneeAgentId both set.
+    expect(resolved.body.issue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user",
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({ outcome: "blocked" });
+  });
+
+  it("rejects an ownership-only restore to a terminated return owner", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, coderId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Real blocker that is still open",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "issue_dependencies_blocked",
+      fingerprint: "graph-liveness:terminated-ownership-only",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Return ownership; the blocker is real.",
+      wakePolicy: { type: "manual" },
+    });
+
+    await request(createApp())
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "blocked",
+        sourceIssueStatus: "blocked",
+        resolutionNote: "Return owner is gone.",
+      })
+      .expect(409);
+
+    // The action must survive so the row stays visible to the next sweep rather
+    // than being resolved onto an agent that can never run it.
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: managerId });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
+  });
+
   it("rejects false-positive recovery resolution without an explicit source issue status", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);
