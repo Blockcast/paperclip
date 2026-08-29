@@ -1686,6 +1686,67 @@ describe("aggregate firing fence recovery", () => {
   });
 });
 
+describe("handleWebhook — terminal severity", () => {
+  it("creates severity=none as done and unassigned without resolving an owner", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = baseAlert({
+      fingerprint: "watchdog-1",
+      labels: { alertname: "Watchdog", severity: "none" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "done",
+        assigneeAgentId: undefined,
+        assigneeUserId: undefined,
+      }),
+    );
+    expect(mocks.agents.list).not.toHaveBeenCalled();
+    expect(mocks.users.findByEmail).not.toHaveBeenCalled();
+  });
+
+  it("recovers and refreshes the same terminal row after state loss", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockResolvedValueOnce([
+      { id: "issue-watchdog", status: "done", assigneeAgentId: "old-agent" },
+    ]);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "done",
+      assigneeAgentId: "old-agent",
+    });
+    const alert = baseAlert({
+      fingerprint: "watchdog-1",
+      labels: { alertname: "Watchdog", severity: "none" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+    );
+  });
+});
+
 describe("handleWebhook — resolved", () => {
   it("posts a comment when autoCloseOnResolve=false", async () => {
     const { ctx, mocks } = mkCtx();

@@ -22,6 +22,7 @@ import {
   buildIssueDescription,
   buildIssueTitle,
   effectiveAlertStatus,
+  isTerminalSeverity,
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
@@ -765,10 +766,16 @@ export async function handleFiring(
   //
   // This is the same `state ?? recover-from-issue` fallback the resolved path
   // has always used; only the firing path was missing it.
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
+  const terminal = isTerminalSeverity(severity, config.terminalSeverities);
+  const existing = stateRecord ?? (await recoverStateFromIssue(
+    ctx,
+    config,
+    alert,
+    terminal,
+  ));
   const storedAggregateKey = existing
     ? (existing.aggregateKey ??
       (await findAggregateMemberKey(
@@ -779,6 +786,44 @@ export async function handleFiring(
       )))
     : null;
   const aggregateKey = storedAggregateKey ?? aggregateKeyForAlert(alert);
+
+  if (terminal && existing?.paperclipIssueId) {
+    const issue = await ctx.issues.get(
+      existing.paperclipIssueId,
+      existing.paperclipCompanyId,
+    );
+    if (!issue) {
+      throw new Error(`Terminal alert issue ${existing.paperclipIssueId} is missing`);
+    }
+    await ctx.issues.update(
+      existing.paperclipIssueId,
+      {
+        ...(issue.status !== "done" ? { status: "done" as const } : {}),
+        description: buildIssueDescription(alert),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      },
+      existing.paperclipCompanyId,
+    );
+    await ctx.state.set(stateRef, {
+      ...existing,
+      alertname,
+      severity,
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      lastFiredAt: nowIso,
+      resolvedAt: null,
+      operatorSuppressedAt: null,
+      nextEscalationAt: null,
+      escalationIntervalMs: null,
+      escalationComplete: true,
+    });
+    await ctx.metrics.write("alertmanager.terminal.refreshed", 1, {
+      alertname,
+      severity,
+    });
+    return;
+  }
 
   if (!existing && (alert.labels.severity ?? "").trim().toLowerCase() === "info") {
     ctx.logger.info(
@@ -1069,7 +1114,9 @@ export async function handleFiring(
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
   let retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
-  const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
+  const issueRouteResolution = terminal
+    ? { route: null, source: null }
+    : resolveIssueRoute(alert, config.issueRouteMap);
   const issueRoute = issueRouteResolution.route;
   const routeAssigneeAgentId = nonEmptyString(issueRoute?.assigneeAgentId);
   const routeHasAssigneeUserId = Object.prototype.hasOwnProperty.call(
@@ -1083,7 +1130,7 @@ export async function handleFiring(
   let createAssigneeUserId: string | undefined;
   let assigneeResolutionSource = "aggregate-winner";
   let resolvedTarget = "(aggregate-winner)";
-  if (!retainedIssue) {
+  if (!retainedIssue && !terminal) {
     const { assigneeUserId, assigneeAgentId, resolution } =
       await resolveAssigneeUserId(ctx, alert, config.ownerMap);
     const ownerOverride =
@@ -1105,8 +1152,9 @@ export async function handleFiring(
         ? `agent:${resolution.agentId}`
         : resolution.email ?? "(none)";
   }
-  const fallbackAssigneeAgentId =
-    retainedIssue || createAssigneeAgentId || createAssigneeUserId
+  const fallbackAssigneeAgentId = terminal
+    ? undefined
+    : retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
           ctx,
@@ -1115,7 +1163,12 @@ export async function handleFiring(
           fallbackOwnerMemo,
         );
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
-  if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+  if (
+    !terminal &&
+    !retainedIssue &&
+    !finalAssigneeAgentId &&
+    !createAssigneeUserId
+  ) {
     ctx.logger.warn(
       `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
     );
@@ -1129,7 +1182,7 @@ export async function handleFiring(
   }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
-  const routeStatus = issueRoute?.status;
+  const routeStatus = terminal ? "done" : issueRoute?.status;
   const resolvedAssignee =
     finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
@@ -1230,13 +1283,13 @@ export async function handleFiring(
     firstSeenAt: alert.startsAt || nowIso,
     lastFiredAt: nowIso,
     resolvedAt: null,
-    nextEscalationAt: (() => {
+    nextEscalationAt: terminal ? null : (() => {
       const delay = escalationDeadlineMs(alert, config);
       return delay === null ? null : new Date(Date.now() + delay).toISOString();
     })(),
     escalationAttempt: 0,
-    escalationComplete: false,
-    escalationIntervalMs: escalationDeadlineMs(alert, config),
+    escalationComplete: terminal,
+    escalationIntervalMs: terminal ? null : escalationDeadlineMs(alert, config),
   };
   await upsertAggregateMember(
     ctx,
@@ -1557,6 +1610,7 @@ async function recoverStateFromIssue(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  includeTerminalIssue = false,
 ): Promise<AlertStateRecord | null> {
   const companyId = config.defaultCompanyId;
   if (!companyId) return null;
@@ -1573,7 +1627,10 @@ async function recoverStateFromIssue(
   // let that historical row mask the aggregate membership fallback: state
   // loss must recover the live aggregate binding, not conclude that the alert
   // is unknown merely because its first origin match is terminal.
-  if (!issue || issue.status === "done" || issue.status === "cancelled") {
+  if (
+    !issue ||
+    (!includeTerminalIssue && (issue.status === "done" || issue.status === "cancelled"))
+  ) {
     return recoverStateFromAggregateMember(ctx, config, alert);
   }
 

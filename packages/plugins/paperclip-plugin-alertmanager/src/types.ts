@@ -126,6 +126,18 @@ export interface AlertmanagerPluginConfig {
    * their own. Defaults to `DEFAULT_COVER_DEDUP_WINDOW_MINUTES`.
    */
   coverDedupWindowMinutes?: number;
+  /**
+   * Severities (case-insensitive) that never produce agent-actionable work
+   * (BLO-24177). A matching alert's issue is created/kept in a terminal
+   * status with no assignee — owner and issue-route resolution are skipped
+   * entirely — instead of the normal `todo` + owner-map flow. The row is
+   * still created and refreshed on every re-fire, so it stays available as a
+   * liveness signal for the delivery path; it just never becomes work an
+   * agent or a stranded-issue sweep can pick up. Defaults to
+   * `DEFAULT_TERMINAL_SEVERITIES` (`["none"]`, e.g. Prometheus's always-firing
+   * `Watchdog` alert).
+   */
+  terminalSeverities?: string[];
 }
 
 // ---------------------------------------------------------------------------
