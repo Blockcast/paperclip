@@ -1502,6 +1502,28 @@ export async function startServer(): Promise<StartedServer> {
           }));
 
         if (heartbeatSchedulerStopped) return;
+        // BLO-19123. Deliberately its own tracked pass rather than a link in the long serial
+        // recovery chain below: that chain begins with provider-facing work, and an outage
+        // there must not starve the drain that returns mis-owned rows to their real owners.
+        // The pass is internally serialized, so a slow tick cannot overlap itself. Opt-in —
+        // see the flag's rationale in config.ts.
+        if (config.strandedRecoveryHandBackDrainEnabled) {
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileStrandedRecoveryHandBacks()
+            .then((result) => {
+              if (result.handedBack > 0 || result.failed > 0) {
+                logger.info(
+                  { ...result, residual: result.residual.length },
+                  "stranded-recovery hand-back pass returned ownership to original owners",
+                );
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "stranded-recovery hand-back pass failed");
+            }));
+        }
+
+        if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(environmentCustomImages
           .cleanupExpiredSetupSessions()
           .then((result) => {

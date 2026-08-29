@@ -22933,6 +22933,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  /**
+   * BLO-19123 drain: returns ownership of mis-owned but correctly-blocked recovery rows to
+   * the agent that was doing the work. Exposed here so the scheduler reaches it the same way
+   * it reaches the other recovery passes.
+   */
+  async function reconcileStrandedRecoveryHandBacks(
+    opts?: Parameters<typeof recovery.reconcileStrandedRecoveryHandBacks>[0],
+  ) {
+    return recovery.reconcileStrandedRecoveryHandBacks(opts);
+  }
+
   // BLO-21621: a queued run can outlive an issue lock that once named it. A
   // NULL lock pointer is not evidence of that defect: normal lazy-lock queue
   // rows leave executionRunId NULL until claim, and can legitimately wait for
@@ -35331,6 +35342,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    reconcileStrandedRecoveryHandBacks,
 
     sweepStaleIssueLocks,
 
