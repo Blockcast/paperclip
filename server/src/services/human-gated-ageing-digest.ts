@@ -64,6 +64,11 @@ import {
   revalidateGates,
   type GateEvidenceInput,
 } from "./human-gated-gate-revalidation.js";
+// The second producer on this seam (BLO-30259). Reads
+// `pull_request_review_state`, which `pr-review-state-reconciler.ts` fills out of
+// band — collection here runs under the company advisory lock, so a producer must
+// not do network I/O.
+import { prReviewRequestAgeingProducer } from "./pr-review-request-ageing-producer.js";
 
 /**
  * Stable `originKind` for the durable digest row.
@@ -528,6 +533,7 @@ export const humanGatedAgeingProducer: DigestProducer = {
 /** Producers contributing to the digest, in render order. */
 export const DEFAULT_DIGEST_PRODUCERS: readonly DigestProducer[] = Object.freeze([
   humanGatedAgeingProducer,
+  prReviewRequestAgeingProducer,
 ]);
 
 // ---------------------------------------------------------------------------
