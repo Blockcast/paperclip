@@ -1552,6 +1552,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: promptSecret.data,
           },
         });
+        launchLeaseHeartbeat.markCreated(promptSecret);
         await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1591,6 +1592,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: envSecret.data,
           },
         });
+        launchLeaseHeartbeat.markCreated(envSecret);
         await onLog("stdout", `[paperclip] Created env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1633,6 +1635,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             stringData: mcpConfigSecret.data,
           },
         });
+        launchLeaseHeartbeat.markCreated(mcpConfigSecret);
         await onLog("stdout", `[paperclip] Created mcp-config Secret: ${mcpConfigSecret.name}\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1656,6 +1659,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Create the Job
     let createdJobUid: string | undefined;
     try {
+      // A launch that cannot renew every created Secret's object-backed lease
+      // must not create a Job that could race a cross-replica orphan sweep.
+      await launchLeaseHeartbeat.assertLaunchSafe();
       const created = await batchApi.createNamespacedJob({ namespace, body: job });
       createdJobUid = created.metadata?.uid;
     } catch (err) {

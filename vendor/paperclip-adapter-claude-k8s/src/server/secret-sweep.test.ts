@@ -406,6 +406,51 @@ describe("launchLeaseExpiry", () => {
     heartbeat.stop();
     vi.useRealTimers();
   });
+
+  it("does not let a stalled Secret patch suppress other renewals", async () => {
+    vi.useFakeTimers();
+    const stalled = new Promise<never>(() => {});
+    const patchNamespacedSecret = vi.fn((req: { name: string }) =>
+      req.name === "ac-agent-run-stalled-prompt" ? stalled : Promise.resolve({}),
+    );
+    const heartbeat = createLaunchLeaseHeartbeat({
+      coreApi: { patchNamespacedSecret },
+      leaseMs: 9_000,
+    });
+    heartbeat.add({ name: "ac-agent-run-stalled-prompt", namespace: "paperclip" });
+    heartbeat.add({ name: "ac-agent-run-healthy-prompt", namespace: "paperclip" });
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    expect(patchNamespacedSecret.mock.calls.filter(([req]) =>
+      req.name === "ac-agent-run-stalled-prompt",
+    )).toHaveLength(2);
+    expect(patchNamespacedSecret.mock.calls.filter(([req]) =>
+      req.name === "ac-agent-run-healthy-prompt",
+    )).toHaveLength(2);
+    heartbeat.stop();
+    vi.useRealTimers();
+  });
+
+  it("fences Job creation when the same Secret lease cannot be renewed", async () => {
+    vi.useFakeTimers();
+    const stalled = new Promise<never>(() => {});
+    const patchNamespacedSecret = vi.fn(() => stalled);
+    const heartbeat = createLaunchLeaseHeartbeat({
+      coreApi: { patchNamespacedSecret },
+      leaseMs: 9_000,
+    });
+    const target = { name: "ac-agent-run-fenced-prompt", namespace: "paperclip" };
+    heartbeat.add(target);
+    heartbeat.markCreated(target);
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(heartbeat.assertLaunchSafe()).rejects.toThrow("launch lease renewal failed");
+
+    heartbeat.stop();
+    vi.useRealTimers();
+  });
 });
 
 describe("deriveOwningJobName", () => {  it("strips each known run-Secret suffix", () => {
