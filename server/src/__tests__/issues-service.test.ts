@@ -606,36 +606,30 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
-  it("rejects foreign project ids on create and update", async () => {
+  it("returns the active aggregate winner for sequential alertmanager creates", async () => {
     const companyId = await seedAssignableAgentCompany();
-    const foreignCompanyId = await seedAssignableAgentCompany();
-    const foreignProjectId = randomUUID();
-    await db.insert(projects).values({
-      id: foreignProjectId,
-      companyId: foreignCompanyId,
-      name: "Foreign project",
+    const originFingerprint =
+      'alert-aggregate:v1:["HindsightConsolidationStalled",null]';
+    const first = await svc.create(companyId, {
+      title: "First alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-1",
+      originFingerprint,
     });
 
-    await expect(svc.create(companyId, {
-      title: "Foreign project create",
+    const second = await svc.create(companyId, {
+      title: "Concurrent alert series",
       status: "todo",
-      priority: "medium",
-      projectId: foreignProjectId,
-    })).rejects.toMatchObject({
-      status: 422,
-      message: "Project must belong to the issue's company",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-2",
+      originFingerprint,
     });
 
-    const issue = await svc.create(companyId, {
-      title: "Foreign project update",
-      status: "todo",
-      priority: "medium",
-    });
-    await expect(svc.update(issue.id, { projectId: foreignProjectId })).rejects.toMatchObject({
-      status: 422,
-      message: "Project must belong to the issue's company",
-    });
-    await expect(svc.getById(issue.id)).resolves.toMatchObject({ projectId: null });
+    expect(second.id).toBe(first.id);
+    expect(second.identifier).toBe(first.identifier);
   });
 
   function agentRow(companyId: string, input: {

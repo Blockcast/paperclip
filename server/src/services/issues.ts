@@ -5240,6 +5240,29 @@ function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
   return false;
 }
 
+function isAlertmanagerAggregateCreationConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = maybe.constraint ?? maybe.constraint_name;
+    if (
+      maybe.code === "23505" &&
+      constraint === "issues_active_alertmanager_aggregate_creation_uq"
+    ) {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
+}
+
 // PEN-2395: matches a 23505 violation of `issues_open_routine_execution_uq`
 // (partial unique index on companyId+originKind+originId+originFingerprint,
 // scoped to open routine-execution rows that hold an `execution_run_id`).
@@ -5266,6 +5289,21 @@ export function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
     current = maybe.cause;
   }
   return false;
+}
+
+function alertmanagerAggregateCreationFingerprint(
+  issueData: Pick<typeof issues.$inferInsert, "originKind" | "originFingerprint">,
+): string | null {
+  const fingerprint = issueData.originFingerprint;
+  if (
+    issueData.originKind !== "plugin:paperclip-plugin-alertmanager" ||
+    typeof fingerprint !== "string" ||
+    fingerprint.trim() === "" ||
+    fingerprint === "default"
+  ) {
+    return null;
+  }
+  return fingerprint;
 }
 
 export function issueService(db: Db) {
@@ -9449,6 +9487,28 @@ export function issueService(db: Db) {
             .limit(1);
           if (existingIssue) deduplicationReason = "recent_open_title";
         }
+        const alertmanagerAggregateFingerprint =
+          alertmanagerAggregateCreationFingerprint(issueData);
+        if (!existingIssue && alertmanagerAggregateFingerprint) {
+          // This arbitration must run before allocateIdentifier(): Linear-backed
+          // companies mint the external issue there, so aggregate losers need to
+          // observe the retained row before any provider side effects occur.
+          const aggregateGuardKey =
+            `issue-create:alertmanager-aggregate:${companyId}:${alertmanagerAggregateFingerprint}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${aggregateGuardKey}, 0))`);
+          [existingIssue] = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.originKind, "plugin:paperclip-plugin-alertmanager"),
+              eq(issues.originFingerprint, alertmanagerAggregateFingerprint),
+              isNull(issues.hiddenAt),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ))
+            .orderBy(asc(issues.createdAt), asc(issues.id))
+            .limit(1);
+        }
         if (existingIssue) {
           if (idempotencyKey) {
             await tx
@@ -9873,6 +9933,12 @@ export function issueService(db: Db) {
           // alertmanager plugin can distinguish "I lost the race" from a
           // real failure and attach itself to the winning cover instead.
           throw conflict("Alert escalation cover conflict", {
+            companyId,
+            originFingerprint: issueData.originFingerprint,
+          });
+        }
+        if (isAlertmanagerAggregateCreationConflict(err)) {
+          throw conflict("Alertmanager aggregate creation conflict", {
             companyId,
             originFingerprint: issueData.originFingerprint,
           });
