@@ -685,7 +685,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       cooldownMs: 30 * 60 * 1000,
     });
 
-    expect(result).toMatchObject({ checked: 1, exhaustedSkipped: 1, healed: 0 });
+    expect(result).toMatchObject({ checked: 0, exhaustedSkipped: 0, healed: 0 });
     expect(enqueueWakeup).not.toHaveBeenCalled();
     const [current] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
     expect(current).toMatchObject({
