@@ -481,6 +481,9 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
 
     const seed = readK8sRoSeed();
     expect(seed.type).toBe("http");
+    expect(seed.url).toBe(
+      "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp",
+    );
     const seedUrl = new URL(seed.url);
     expect(seedUrl.protocol).toBe("http:");
     expect(seedUrl.hostname).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
