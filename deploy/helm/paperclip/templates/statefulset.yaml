@@ -473,7 +473,24 @@ spec:
                 "${LOCAL_BIN}/github-mcp-server" \
                 "${LOCAL_BIN}/git"
               chown 1000:1000 "${LOCAL_BIN}" "${LOCAL_BIN}"/* 2>/dev/null || true
+
+              # PEN-2527: ${LOCAL_BIN} is only prepended to PATH by ${BASE}/.profile
+              # and ${BASE}/.bashrc, which a *login* shell sources. Agent tool
+              # harnesses spawn non-login, non-interactive shells, so there `gh`
+              # resolves straight to /usr/bin/gh and the egress scrubber above is
+              # never reached — the choke point exists but sits off the traffic
+              # path. ${BASE}/bin IS on the image PATH ahead of /usr/bin for every
+              # shell, so publish `gh` there too.
+              #
+              # A symlink rather than a second copy: one canonical wrapper file
+              # stays the only thing to edit, so the two locations cannot drift
+              # into two different rules.
+              PATH_BIN="${BASE}/bin"
+              mkdir -p "${PATH_BIN}"
+              ln -sf "${LOCAL_BIN}/gh" "${PATH_BIN}/gh"
+              chown -h 1000:1000 "${PATH_BIN}/gh" 2>/dev/null || true
               echo "seed: installed fresh-read GitHub token wrappers in ${LOCAL_BIN}"
+              echo "seed: published egress-scrubbing gh on the default PATH at ${PATH_BIN}/gh"
 
               # Seed a project-scope .mcp.json at $HOME (CWD for k8s Job pods is
               # /paperclip by default — matches PAPERCLIP_HOME) so every claude
