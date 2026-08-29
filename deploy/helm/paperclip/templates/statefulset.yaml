@@ -607,10 +607,12 @@ spec:
                 #   - tempo       — Tempo 2.10's built-in MCP at /api/mcp.
                 #   - k8s-ro      — containers/kubernetes-mcp-server, READONLY
                 #                    tier (cluster-wide get/list/watch, no
-                #                    secrets). Direct in-cluster reach via the
-                #                    `-readonly` Service; bypasses the public
-                #                    paperclip-mcp-gateway hop. Uses Streamable
-                #                    HTTP to match the stateless server. Its
+                #                    secrets). Traffic goes through the
+                #                    dedicated ClusterIP scrubbing gateway;
+                #                    direct access to the readonly Service is
+                #                    closed separately after this path is live.
+                #                    Uses Streamable HTTP to match the
+                #                    stateless server. Its
                 #                    name matches
                 #                    the public path convention (/k8s-ro/mcp,
                 #                    /k8s-rw/mcp, /k8s-admin/mcp) so escalations
@@ -643,7 +645,7 @@ spec:
                   },
                   "k8s-ro": {
                     "type": "http",
-                    "url": "http://kubernetes-mcp-server-readonly.paperclip.svc.cluster.local:8080/mcp"
+                    "url": "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp"
                   },
                   "github": {
                     "command": "/paperclip/.local/bin/github-mcp-server",
