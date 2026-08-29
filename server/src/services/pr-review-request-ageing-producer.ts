@@ -32,6 +32,16 @@
  * wanted — not re-notifying about the same thing every tick — is delivered by the
  * seam's `unchanged` outcome instead, at the row level rather than per PR.
  *
+ * ## Why this does not lock rows, unlike the human-gated producer
+ *
+ * `humanGatedAgeingProducer` reads with `lockRows: true`, so a human resolving
+ * the last overdue issue cannot commit between the ageing snapshot and its
+ * delivery. That reasoning does not transfer: nothing a *human* does writes
+ * `pull_request_review_state`. It is written only by the reconciler, on its own
+ * interval, from a GitHub poll — so the rows are already a snapshot of
+ * GitHub-at-poll-time, and locking them would buy no extra consistency while
+ * blocking the reconciler behind the per-company digest lock.
+ *
  * ## AC6 — unreadable is rendered, never collapsed into empty
  *
  * A PR whose review state could not be read is **excluded from the ageing input

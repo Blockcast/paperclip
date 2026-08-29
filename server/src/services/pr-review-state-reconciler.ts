@@ -287,9 +287,19 @@ export async function fetchOldestReviewRequestedAt(input: {
     return null;
   }
   requested.sort();
-  // Each removal cancels the oldest outstanding request. Whatever is left is
-  // still standing; if removals exhaust the list there is no dated live request
-  // and the caller falls back to PR creation.
+  // Each removal is paired against the oldest outstanding request. This is
+  // positional, not identity-matched: the timeline's `requested_team` /
+  // `requested_reviewer` fields are subject to the same App-token unreadability
+  // as everything else here, so pairing on them would work only for the cases
+  // that were never the problem.
+  //
+  // Failure direction, stated because it is not obvious: on a PR that had a
+  // request removed, this can pair the wrong one and return a *newer* timestamp
+  // than the truth, which **under-states** the age and delays the escalation. It
+  // cannot invent a request that does not exist, and it cannot over-state age
+  // past the PR's creation floor. Delay is the milder failure — but it is still
+  // a failure, and if re-requests turn out to be common on aged PRs this should
+  // become identity-matched with an unreadable-pair fallback to `null`.
   const standing = requested.slice(removedCount);
   return standing[0] ?? null;
 }
