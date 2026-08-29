@@ -876,7 +876,33 @@ export async function startServer(): Promise<StartedServer> {
         recursive: true,
       });
       if (await pathExists(workspaceSdkPkg)) {
-        await fs.promises.cp(workspaceSdkPkg, path.join(pluginsSdkDir, "package.json"));
+        // Merge, do NOT overwrite. We want the workspace `exports` map (the
+        // registry copy's points at different paths), but we must NOT adopt the
+        // workspace `version`: the workspace manifest is unstamped (1.0.0) while
+        // the plugin store's package-lock.json records the installed registry
+        // version. Copying it verbatim makes installed !== locked, and
+        // plugin-lifecycle's torn-store guard then fails closed on EVERY
+        // activation with "Torn plugin store detected", taking the whole plugin
+        // fleet down until someone reconciles the store by hand.
+        //
+        // Reinstalling the store does not fix that: this function re-vendors on
+        // the next boot and re-tears it. That is why `npm install
+        // @paperclipai/plugin-sdk@<version>` against the shared store carries a
+        // DO-NOT-RUN banner. Preserving the version here is what makes the
+        // deliberate fork vendoring and the torn-store guard coexist.
+        const installedSdkPkg = path.join(pluginsSdkDir, "package.json");
+        const merged = JSON.parse(await fs.promises.readFile(workspaceSdkPkg, "utf8"));
+        let installedVersion: unknown;
+        try {
+          installedVersion = JSON.parse(await fs.promises.readFile(installedSdkPkg, "utf8"))?.version;
+        } catch {
+          // No readable installed manifest — nothing to preserve; fall through
+          // and write the workspace version rather than failing the boot.
+        }
+        if (typeof installedVersion === "string" && installedVersion.length > 0) {
+          merged.version = installedVersion;
+        }
+        await fs.promises.writeFile(installedSdkPkg, `${JSON.stringify(merged, null, 2)}\n`);
       }
       logger.info("Copied workspace plugin SDK dist to local plugins directory");
     } catch (err) {
