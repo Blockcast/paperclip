@@ -108,6 +108,13 @@ export interface Config {
   humanGatedDigestEnabled: boolean;
   humanGatedDigestIntervalMinutes: number;
   humanGatedDigestPeriodDays: number;
+  // Open-PR review-state reconciler (BLO-30259): persists pending review
+  // requests + reviews so the ageing digest producer can be a pure DB read.
+  // The producer runs under the digest's advisory lock and must not do network
+  // I/O, so the GitHub polling lives here on its own interval.
+  prReviewStateReconcilerEnabled: boolean;
+  prReviewStateReconcilerIntervalMinutes: number;
+  prReviewStateMaxPullRequestsPerRepo: number;
   // Approval-gate reconciler (BLO-29359): closes board approval cards whose
   // external GitHub gate has terminated, so an approver is never sent to a dead
   // run. Worker-tier only, same rationale as the PR reconciler.
@@ -306,6 +313,12 @@ export const NUMERIC_SETTING_BOUNDS = {
     max: TIMER_PERIOD_MINUTES_MAX,
   },
   humanGatedDigestPeriodDays: { fallback: 7, min: 1, max: 365 },
+  prReviewStateReconcilerIntervalMinutes: {
+    fallback: 360,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  prReviewStateMaxPullRequestsPerRepo: { fallback: 400, min: 1, max: 5000 },
   approvalGateReconcilerIntervalMinutes: {
     fallback: 10,
     min: 1,
@@ -331,6 +344,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
   humanGatedDigestIntervalMinutes: 60_000,
+  prReviewStateReconcilerIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
@@ -660,6 +674,20 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.humanGatedDigestPeriodDays,
     "humanGatedDigestPeriodDays",
   );
+  const prReviewStateReconcilerEnabled =
+    process.env.PAPERCLIP_PR_REVIEW_STATE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_PR_REVIEW_STATE_RECONCILER_ENABLED === "true"
+      : true;
+  const prReviewStateReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_REVIEW_STATE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.prReviewStateReconcilerIntervalMinutes,
+    "prReviewStateReconcilerIntervalMinutes",
+  );
+  const prReviewStateMaxPullRequestsPerRepo = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_REVIEW_STATE_MAX_PULL_REQUESTS_PER_REPO],
+    NUMERIC_SETTING_BOUNDS.prReviewStateMaxPullRequestsPerRepo,
+    "prReviewStateMaxPullRequestsPerRepo",
+  );
   const approvalGateReconcilerEnabled =
     process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED === "true"
@@ -778,6 +806,9 @@ export function loadConfig(): Config {
     humanGatedDigestEnabled,
     humanGatedDigestIntervalMinutes,
     humanGatedDigestPeriodDays,
+    prReviewStateReconcilerEnabled,
+    prReviewStateReconcilerIntervalMinutes,
+    prReviewStateMaxPullRequestsPerRepo,
     approvalGateReconcilerEnabled,
     approvalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,

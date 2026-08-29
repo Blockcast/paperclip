@@ -1821,6 +1821,42 @@ export async function startServer(): Promise<StartedServer> {
     });
   }
 
+  // Open-PR review-state reconciler (BLO-30259). Worker-tier singleton. Feeds
+  // the digest's second producer: it polls each discovered repo's open PRs for
+  // pending review requests and submitted reviews and persists them, so the
+  // producer itself is a pure DB read. The split is required, not stylistic —
+  // producer collection runs inside the per-company digest transaction with the
+  // advisory lock held, and a GitHub call there would serialise every company's
+  // digest behind GitHub latency and rate limits.
+  //
+  // Gated on GitHub App credentials for the same reason as the approval-gate
+  // reconciler below: without them every probe is unreadable and the sweep is a
+  // no-op that would otherwise log once per pass.
+  if (config.prReviewStateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Open-PR review-state reconciler disabled: GitHub App credentials are not configured (BLO-30259)",
+      );
+    } else {
+      const { startPrReviewStateReconciler } = await import(
+        "./services/pr-review-state-reconciler.js"
+      );
+      logger.info(
+        {
+          intervalMinutes: config.prReviewStateReconcilerIntervalMinutes,
+          maxPullRequestsPerRepo: config.prReviewStateMaxPullRequestsPerRepo,
+        },
+        "Open-PR review-state reconciler enabled (BLO-30259)",
+      );
+      startPrReviewStateReconciler(
+        db,
+        config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
+        { maxPullRequests: config.prReviewStateMaxPullRequestsPerRepo },
+      );
+    }
+  }
+
   // Approval-gate reconciler (BLO-29359). Closes board approval cards whose
   // external GitHub gate has terminated and announces the death on every linked
   // issue. Worker-tier only and idempotent: each close re-checks that the card is
