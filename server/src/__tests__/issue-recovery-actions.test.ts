@@ -5173,6 +5173,66 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("refuses the ownership-only hand-back when the blocked status is not backed by a real blocker", async () => {
+    // The ownership-only restore is deliberately hung on `outcome: "blocked"` so it
+    // inherits the unresolved-first-class-blocker guard; `restored` + `blocked` would
+    // have returned ownership without ever proving the row is genuinely blocked. That
+    // makes the guard load-bearing rather than incidental, so pin it against the path
+    // that has something to gain from skipping it: a resolvable `returnOwnerAgentId`
+    // present, i.e. a hand-back sitting right there to be performed.
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    // Mirror the production shape this issue exists to drain: re-homed onto the
+    // manager, reading `blocked`, with the original agent recorded as return owner —
+    // but no `blocks` relation actually backing that status.
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "issue_dependencies_blocked",
+      fingerprint: "graph-liveness:ownership-only-without-blocker",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Return ownership only if the blocker is real.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const rejected = await request(createApp())
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "blocked",
+        sourceIssueStatus: "blocked",
+        resolutionNote: "Attempted ownership-only restore without a real blocker.",
+      })
+      .expect(422);
+
+    expect(rejected.body.error).toContain("requires an unresolved first-class blocker");
+
+    // The whole resolution is refused, so ownership must NOT go home either. A row
+    // that reads `blocked` without a blocker is an artifact needing a disposition,
+    // not a row to quietly hand back while leaving the false status in place.
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: managerId });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+  });
+
   it("allows blocked recovery resolution when the source issue has an unresolved first-class blocker", async () => {
     const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
     const blockerIssueId = randomUUID();
