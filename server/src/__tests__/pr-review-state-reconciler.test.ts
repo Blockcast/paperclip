@@ -249,6 +249,76 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
     expect(rows[0]?.pendingReviewRequests[0]?.requestedAt).toBe("2026-08-01T00:00:00.000Z");
   });
 
+  // Review finding, head a47830df #1. A 200 with a payload that is not the
+  // documented shape is NOT an answer. Coercing a missing `users`/`teams` to `[]`
+  // turns a malformed response into a confident "nobody is requested" — the same
+  // false all-clear the list payload produces.
+  it.each([
+    ["missing both fields", {}],
+    ["null fields", { users: null, teams: null }],
+    ["users present, teams missing", { users: [], teams: undefined }],
+    ["non-array field", { users: "nope", teams: [] }],
+  ])("treats a malformed requested_reviewers payload (%s) as unreadable, not as no-request", async (_label, payload) => {
+    routeGithub({
+      openPrPages: [[openPr(2700)]],
+      requestedReviewers: () => payload,
+      reviews: () => [],
+    });
+
+    const result = await reconcileRepoReviewState(db, { companyId, repoFullName: REPO, token: "t", now: NOW });
+
+    expect(result.unreadable).toBe(1);
+    const rows = await storedRows();
+    expect(rows[0]?.requestsReadable).toBe(false);
+    expect(rows[0]?.unreadableReason).toContain("requested_reviewers probe failed");
+  });
+
+  // Review finding, head a47830df #2. A skipped list entry is still an open PR;
+  // it is simply absent from what we managed to read. Pruning on that reads it as
+  // closed and deletes a live row.
+  it("does NOT prune when a list entry was malformed, because that PR is still open", async () => {
+    routeGithub({
+      openPrPages: [[openPr(1), openPr(2)]],
+      requestedReviewers: () => ({ users: [], teams: [] }),
+    });
+    await reconcileRepoReviewState(db, { companyId, repoFullName: REPO, token: "t", now: NOW });
+    expect(await storedRows()).toHaveLength(2);
+
+    // #2 comes back unparseable — no `created_at`. It has NOT closed.
+    routeGithub({
+      openPrPages: [[openPr(1), { ...openPr(2), created_at: null }]],
+      requestedReviewers: () => ({ users: [], teams: [] }),
+    });
+    const result = await reconcileRepoReviewState(db, {
+      companyId,
+      repoFullName: REPO,
+      token: "t",
+      now: NOW,
+      logger: { info: () => {}, warn: () => {} },
+    });
+
+    expect(result.malformed).toBe(1);
+    expect(result.pruned).toBe(0);
+    expect((await storedRows()).map((row) => row.prNumber).sort((a, b) => a - b)).toEqual([1, 2]);
+  });
+
+  it("treats a non-array open-PR page as unreadable rather than as zero open PRs", async () => {
+    routeGithub({ openPrPages: [[openPr(1)]], requestedReviewers: () => ({ users: [], teams: [] }) });
+    await reconcileRepoReviewState(db, { companyId, repoFullName: REPO, token: "t", now: NOW });
+    expect(await storedRows()).toHaveLength(1);
+
+    // An object body would iterate as empty and report a complete enumeration of
+    // zero — pruning the entire repo.
+    ghFetchMock.mockImplementation(async (url: string) => {
+      if (url.includes("/pulls?state=open")) return jsonResponse({ message: "Bad credentials" });
+      return jsonResponse([]);
+    });
+    await expect(
+      reconcileRepoReviewState(db, { companyId, repoFullName: REPO, token: "t", now: NOW }),
+    ).rejects.toThrow(/open-PR enumeration failed/);
+    expect(await storedRows()).toHaveLength(1);
+  });
+
   it("discovers targets from work products, so a repo with only OPEN PRs is visible", async () => {
     const { issueWorkProducts, issues } = await import("@paperclipai/db");
     const issueId = randomUUID();

@@ -79,8 +79,10 @@ export type ReviewStateReconcileResult = {
   written: number;
   pruned: number;
   unreadable: number;
-  /** True when the open-PR enumeration hit a cap or a bad page — prune skipped. */
+  /** True when the open-PR enumeration hit a cap — prune suppressed. */
   truncated: boolean;
+  /** Unparseable list entries. Non-zero also suppresses the prune. */
+  malformed: number;
 };
 
 type Logger = { info: (o: unknown, m?: string) => void; warn: (o: unknown, m?: string) => void };
@@ -130,17 +132,25 @@ export async function listOpenPullRequests(input: {
   repoFullName: string;
   token: string;
   maxPullRequests: number;
-}): Promise<{ pullRequests: OpenPullRequest[]; truncated: boolean } | null> {
+}): Promise<{ pullRequests: OpenPullRequest[]; truncated: boolean; malformed: number } | null> {
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const headers = githubHeaders(input.token);
   const pullRequests: OpenPullRequest[] = [];
+  // A skipped entry makes the enumeration INCOMPLETE, not merely lossy. Counted
+  // rather than ignored because the prune treats "absent from the open set" as
+  // "closed" — silently dropping an unparseable entry would delete a live row.
+  let malformed = 0;
 
   try {
     for (let page = 1; page <= MAX_OPEN_PR_PAGES; page += 1) {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls?state=open&per_page=100&page=${page}`;
       const response = await ghFetch(url, { headers });
       if (!response.ok) return null;
-      const batch = (await response.json()) as Array<{
+      const payload = await response.json();
+      // A non-array body is not an empty page. Treating it as one would report a
+      // complete enumeration of zero open PRs and prune the entire repo.
+      if (!Array.isArray(payload)) return null;
+      const batch = payload as Array<{
         number?: number;
         title?: string | null;
         html_url?: string | null;
@@ -150,7 +160,10 @@ export async function listOpenPullRequests(input: {
       }>;
 
       for (const pr of batch) {
-        if (!Number.isInteger(pr.number) || typeof pr.created_at !== "string") continue;
+        if (!Number.isInteger(pr.number) || typeof pr.created_at !== "string") {
+          malformed += 1;
+          continue;
+        }
         pullRequests.push({
           number: pr.number as number,
           title: pr.title ?? null,
@@ -160,14 +173,14 @@ export async function listOpenPullRequests(input: {
           isDraft: pr.draft === true,
         });
         if (pullRequests.length >= input.maxPullRequests) {
-          return { pullRequests, truncated: true };
+          return { pullRequests, truncated: true, malformed };
         }
       }
 
-      if (batch.length < 100) return { pullRequests, truncated: false };
-      if (page === MAX_OPEN_PR_PAGES) return { pullRequests, truncated: true };
+      if (batch.length < 100) return { pullRequests, truncated: false, malformed };
+      if (page === MAX_OPEN_PR_PAGES) return { pullRequests, truncated: true, malformed };
     }
-    return { pullRequests, truncated: false };
+    return { pullRequests, truncated: false, malformed };
   } catch {
     return null;
   }
@@ -176,6 +189,13 @@ export async function listOpenPullRequests(input: {
 /**
  * Pending review requests from the dedicated endpoint — the one surface that
  * resolves team requests under an App token. `null` means unreadable.
+ *
+ * A 200 is not by itself a readable answer. If either `users` or `teams` is
+ * absent or not an array, the payload is not the documented shape and we do not
+ * know what is pending — so it returns `null` (unreadable) rather than coercing
+ * the missing field to `[]`. Coercing would turn a malformed response into a
+ * confident "nobody is requested", which is the same false all-clear the list
+ * payload produces and the exact thing this module exists to refuse.
  */
 export async function fetchPendingReviewRequests(input: {
   repoFullName: string;
@@ -192,12 +212,12 @@ export async function fetchPendingReviewRequests(input: {
     const body = (await response.json()) as {
       users?: Array<{ login?: string | null }> | null;
       teams?: Array<{ slug?: string | null }> | null;
-    };
-    const users = Array.isArray(body.users) ? body.users : [];
-    const teams = Array.isArray(body.teams) ? body.teams : [];
+    } | null;
+    if (body === null || typeof body !== "object") return null;
+    if (!Array.isArray(body.users) || !Array.isArray(body.teams)) return null;
     return [
-      ...users.map((user) => ({ reviewerLogin: user.login ?? null })),
-      ...teams.map((team) => ({ reviewerSlug: team.slug ?? null })),
+      ...body.users.map((user) => ({ reviewerLogin: user?.login ?? null })),
+      ...body.teams.map((team) => ({ reviewerSlug: team?.slug ?? null })),
     ];
   } catch {
     return null;
@@ -225,12 +245,16 @@ export async function fetchPullRequestReviews(input: {
       const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
       const response = await ghFetch(url, { headers });
       if (!response.ok) return null;
-      const batch = (await response.json()) as Array<{
+      const payload = await response.json();
+      if (!Array.isArray(payload)) return null;
+      const batch = payload as Array<{
         user?: { login?: string | null } | null;
         state?: string | null;
         submitted_at?: string | null;
       }>;
       for (const review of batch) {
+        // No `submitted_at` means an unsubmitted PENDING draft review. Skipping
+        // it is correct rather than lossy — it is not a review anyone has given.
         if (typeof review.submitted_at !== "string") continue;
         reviews.push({
           authorLogin: review.user?.login ?? null,
@@ -274,7 +298,9 @@ export async function fetchOldestReviewRequestedAt(input: {
         headers: { ...headers, accept: "application/vnd.github+json" },
       });
       if (!response.ok) return null;
-      const batch = (await response.json()) as Array<{ event?: string | null; created_at?: string | null }>;
+      const payload = await response.json();
+      if (!Array.isArray(payload)) return null;
+      const batch = payload as Array<{ event?: string | null; created_at?: string | null }>;
       for (const entry of batch) {
         if (typeof entry.created_at !== "string") continue;
         if (entry.event === "review_requested") requested.push(entry.created_at);
@@ -412,11 +438,20 @@ export async function reconcileRepoReviewState(
     written += 1;
   }
 
-  // Prune only behind a complete enumeration. A truncated list is not evidence
-  // that the PRs it did not reach have closed, and deleting them would silently
-  // shrink the digest's population.
+  // Prune only behind an enumeration known to be COMPLETE. Two things break
+  // that, and both must suppress it:
+  //
+  //   - `truncated` — the budget or page cap stopped us early. The PRs we did
+  //     not reach have not closed; we simply did not look.
+  //   - `malformed` — an entry we could not parse. It is still an open PR, it
+  //     just is not in `observedNumbers`, so pruning would read it as closed and
+  //     delete a live row.
+  //
+  // Both are the same mistake in different clothing: treating "absent from what
+  // I managed to read" as "absent from GitHub".
   let pruned = 0;
-  if (!listed.truncated) {
+  const enumerationComplete = !listed.truncated && listed.malformed === 0;
+  if (enumerationComplete) {
     const scope = and(
       eq(pullRequestReviewState.companyId, input.companyId),
       eq(pullRequestReviewState.repoFullName, input.repoFullName),
@@ -432,8 +467,13 @@ export async function reconcileRepoReviewState(
     pruned = deleted.length;
   } else {
     log.warn(
-      { repoFullName: input.repoFullName, maxPullRequests },
-      "pr-review-state: open-PR enumeration truncated; prune skipped for this repo",
+      {
+        repoFullName: input.repoFullName,
+        maxPullRequests,
+        truncated: listed.truncated,
+        malformedEntries: listed.malformed,
+      },
+      "pr-review-state: open-PR enumeration incomplete; prune skipped for this repo",
     );
   }
 
@@ -443,6 +483,7 @@ export async function reconcileRepoReviewState(
     pruned,
     unreadable,
     truncated: listed.truncated,
+    malformed: listed.malformed,
   };
 }
 
@@ -465,6 +506,7 @@ export async function prReviewStateReconcilerTick(
     pruned: 0,
     unreadable: 0,
     truncated: false,
+    malformed: 0,
   };
 
   const tokenResult = await getInstallationTokenResult();
@@ -495,6 +537,7 @@ export async function prReviewStateReconcilerTick(
       totals.pruned += result.pruned;
       totals.unreadable += result.unreadable;
       totals.truncated = totals.truncated || result.truncated;
+      totals.malformed += result.malformed;
       ok += 1;
     } catch (err) {
       failed += 1;
