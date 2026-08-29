@@ -22,6 +22,7 @@ import {
   launchLeaseExpiry,
   MANAGED_BY_LABEL,
   RUN_ID_LABEL,
+  resolveLaunchLeaseMs,
 } from "./secret-sweep.js";
 import {
   parseClaudeStreamJson,
@@ -1488,7 +1489,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // or any other — can tell a launch in flight from one that died before it
     // could set an ownerReference (BLO-21857).  Taken once so all three Secrets
     // share a deadline.
-    const launchLeaseMs = Math.max(0, asNumber(config.orphanSecretLaunchLeaseSec, DEFAULT_LAUNCH_LEASE_SEC)) * 1000;
+    const launchLeaseMs = resolveLaunchLeaseMs(
+      asNumber(config.orphanSecretLaunchLeaseSec, DEFAULT_LAUNCH_LEASE_SEC),
+    );
     const launchLease = launchLeaseExpiry(
       Date.now(),
       launchLeaseMs,

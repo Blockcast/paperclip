@@ -82,12 +82,25 @@ export const DEFAULT_SWEEP_INTERVAL_SEC = 300;
  */
 export const DEFAULT_LAUNCH_LEASE_SEC = 900;
 /**
+ * Keep the launch lease above the heartbeat cadence and enough API latency
+ * margin for a cross-replica sweep to observe and re-check a candidate.
+ */
+export const MIN_LAUNCH_LEASE_SEC = 30;
+/**
  * Floor on Secret age, independent of the lease.  Only reachable for Secrets
  * created before `LAUNCH_LEASE_ANNOTATION` existed (which carry no lease and
  * would otherwise be judged on the Job check alone) — for anything this adapter
  * writes now, the longer lease always dominates.
  */
 export const DEFAULT_SWEEP_AGE_FLOOR_SEC = 120;
+
+/** Normalize operator input so a lease cannot expire before its first renewal. */
+export function resolveLaunchLeaseMs(value: unknown): number {
+  const seconds = typeof value === "number" && Number.isFinite(value)
+    ? value
+    : DEFAULT_LAUNCH_LEASE_SEC;
+  return Math.max(MIN_LAUNCH_LEASE_SEC, seconds) * 1000;
+}
 
 /**
  * The lease instant to stamp on a Secret created at `now`.  Exported so

@@ -10,7 +10,9 @@ import {
   LAUNCH_LEASE_ANNOTATION,
   launchLeaseExpiry,
   MANAGED_BY_LABEL,
+  MIN_LAUNCH_LEASE_SEC,
   RUN_ID_LABEL,
+  resolveLaunchLeaseMs,
   sweepOrphanedRunSecrets,
   type SecretSweepObjectMeta,
 } from "./secret-sweep.js";
@@ -367,6 +369,12 @@ describe("sweepOrphanedRunSecrets", () => {
 });
 
 describe("launchLeaseExpiry", () => {
+  it("clamps zero and short launch leases above the renewal cadence", () => {
+    expect(resolveLaunchLeaseMs(0)).toBe(MIN_LAUNCH_LEASE_SEC * 1000);
+    expect(resolveLaunchLeaseMs(0.5)).toBe(MIN_LAUNCH_LEASE_SEC * 1000);
+    expect(resolveLaunchLeaseMs(undefined)).toBe(DEFAULT_LAUNCH_LEASE_SEC * 1000);
+  });
+
   it("stamps a lease the sweep reads back as still in flight", async () => {
     const lease = launchLeaseExpiry(NOW);
     expect(Date.parse(lease)).toBe(NOW + DEFAULT_LAUNCH_LEASE_SEC * 1000);
