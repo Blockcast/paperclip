@@ -68,7 +68,12 @@ function excludedRows(): StubIssue[] {
 
 type Stub = { requests: string[]; restore: () => void };
 
-function stubApi(rowsByStatus: Record<string, StubIssue[]>): Stub {
+type StubInteraction = { id: string; kind: string; status: string };
+
+function stubApi(
+  rowsByStatus: Record<string, StubIssue[]>,
+  interactionsByIssue: Record<string, StubInteraction[]> = {},
+): Stub {
   const original = globalThis.fetch;
   const requests: string[] = [];
 
@@ -79,6 +84,17 @@ function stubApi(rowsByStatus: Record<string, StubIssue[]>): Stub {
     const approvals = url.pathname.match(/^\/api\/issues\/([^/]+)\/approvals$/);
     if (approvals) {
       return new Response(JSON.stringify([]), { status: 200 });
+    }
+
+    // Matched explicitly rather than left to fall through to the status branch
+    // below: that branch answers `[]` for any unrecognised path, so an
+    // interactions call that was never wired would still look like a row with
+    // no question cards — a silent false negative on the whole new gate kind.
+    const interactions = url.pathname.match(/^\/api\/issues\/([^/]+)\/interactions$/);
+    if (interactions) {
+      return new Response(JSON.stringify(interactionsByIssue[interactions[1]] ?? []), {
+        status: 200,
+      });
     }
 
     const status = url.searchParams.get("status") ?? "";
@@ -177,14 +193,47 @@ describe("BLO-30608 backfill — API acquisition", () => {
     expect(acquisition.omitted).toBe(0);
   });
 
-  it("bounds the per-issue approvals cost by the budget, not the population", async () => {
+  it("bounds the per-issue evidence cost by the budget, not the population", async () => {
     stub = stubApi({ blocked: humanGatedRows() });
 
     const acquisition = await acquireFromApi(COMPANY_ID, 2, NOW);
 
     const approvalCalls = stub.requests.filter((path) => path.includes("/approvals"));
+    const interactionCalls = stub.requests.filter((path) => path.includes("/interactions"));
     expect(approvalCalls).toHaveLength(2);
-    // 5 status pages + 2 approvals. Reported as the AC5 cost figure.
-    expect(acquisition.calls).toBe(7);
+    // BLO-30627 added interaction evidence as a second per-issue call. It must
+    // obey the same budget as approvals — a gate kind that fetched for the
+    // whole population would make `--max-probes` cost the same as an uncapped
+    // run, which is the trap the budget-at-acquisition design exists to avoid.
+    expect(interactionCalls).toHaveLength(2);
+    // 5 status pages + 2 approvals + 2 interactions. Reported as the AC5 cost
+    // figure, and pinned so a third per-issue gate kind cannot be added without
+    // the doubling showing up here first.
+    expect(acquisition.calls).toBe(9);
+  });
+
+  it("threads interaction evidence and row status into the classifier (BLO-30627)", async () => {
+    // End-to-end for the new gate kind on the API path: a pending question card
+    // has to reach `classifyGate` as a live gate. Acquiring it but dropping it
+    // on the floor would leave the row `unverifiable` and look identical to the
+    // pre-BLO-30627 behaviour this change exists to move.
+    stub = stubApi({ blocked: humanGatedRows() }, {
+      "i-1": [{ id: "int-1", kind: "ask_user_questions", status: "pending" }],
+      "i-2": [{ id: "int-2", kind: "request_confirmation", status: "cancelled" }],
+    });
+
+    const acquisition = await acquireFromApi(COMPANY_ID, 3, NOW);
+    const report = revalidateGates(acquisition.evidence, { maxProbes: null });
+    const byIdentifier = new Map(report.classifications.map((c) => [c.identifier, c]));
+
+    expect(byIdentifier.get("BLO-1")?.verdict).toBe("still-gated");
+    expect(byIdentifier.get("BLO-2")?.verdict).toBe("resolved-but-open");
+    expect(byIdentifier.get("BLO-2")?.resolutionKind).toBe("interaction-abandoned");
+    // BLO-3 has no cards at all, so it stays unverifiable — but now with the
+    // named reason, which is only reachable because `status` was threaded too.
+    expect(byIdentifier.get("BLO-3")?.verdict).toBe("unverifiable");
+    expect(byIdentifier.get("BLO-3")?.unverifiableReason).toBe(
+      "blocked-status-without-blocker-edge",
+    );
   });
 });

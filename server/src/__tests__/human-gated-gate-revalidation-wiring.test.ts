@@ -22,6 +22,7 @@ import {
   issueApprovals,
   issueComments,
   issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -64,6 +65,10 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     await db.delete(approvals);
     await db.delete(issueRelations);
     await db.delete(issueComments);
+    // Before `issues`: `issue_thread_interactions` has an FK to it, so leaving
+    // this out fails the delete and every *subsequent* test inherits the
+    // undeleted company — one missing line reads as eight unrelated failures.
+    await db.delete(issueThreadInteractions);
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
@@ -150,6 +155,24 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     });
     await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
     return approvalId;
+  }
+
+  async function addInteraction(
+    companyId: string,
+    issueId: string,
+    status: string,
+    kind = "ask_user_questions",
+  ) {
+    const id = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id,
+      companyId,
+      issueId,
+      kind,
+      status,
+      payload: { version: 1, questions: [] },
+    });
+    return id;
   }
 
   function collect(companyId: string) {
@@ -260,8 +283,61 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     const markdown = (await collect(companyId))!.markdown;
     expect(markdown).toContain("unverifiable 1");
     expect(markdown).toContain("express no machine-checkable gate");
+    // BLO-30627 AC2: the residual is named, not one opaque bucket. `insertIssue`
+    // defaults to `blocked`, and this row carries no blocker edge — so the
+    // contradiction is the finding.
+    expect(markdown).toContain("status 'blocked' but no blocker edge exists");
     // Unverifiable is a finding, not a reason to withhold the row.
     expect(markdown).toContain("Human-gated work past its human-silence threshold (1)");
+  });
+
+  it("reads a pending question card as a live gate (BLO-30627)", async () => {
+    // The DB half of the new probe: proves `loadGateEvidence` actually issues
+    // the `issue_thread_interactions` query. The pure classifier tests cannot
+    // catch a loader that never populates `interactions`.
+    const { companyId } = await createCompany("GRQ");
+    const asked = await insertIssue({
+      companyId,
+      identifier: "GRQ-1",
+      status: "in_progress",
+      createdAt: daysAgo(41),
+    });
+    await addInteraction(companyId, asked, "pending", "request_confirmation");
+
+    const evidence = await loadGateEvidence(db, companyId, [
+      { id: asked, identifier: "GRQ-1", status: "in_progress" },
+    ]);
+    expect(evidence[0].interactions).toHaveLength(1);
+    expect(evidence[0].interactions[0]).toMatchObject({
+      interactionKind: "request_confirmation",
+      interactionStatus: "pending",
+    });
+
+    const markdown = (await collect(companyId))!.markdown;
+    expect(markdown).toContain("still-gated 1");
+    // Before this probe the same row read `unverifiable`, which is the delta
+    // BLO-30627 exists to move.
+    expect(markdown).toContain("unverifiable 0");
+  });
+
+  it("reports an abandoned question card as resolved-but-open (BLO-30627)", async () => {
+    // Every card withdrawn: the human was asked and never answered, and no
+    // answer is coming. Ranked with the stuck cancelled edge because neither
+    // can self-clear.
+    const { companyId } = await createCompany("GRZ");
+    const dropped = await insertIssue({
+      companyId,
+      identifier: "GRZ-1",
+      status: "in_progress",
+      createdAt: daysAgo(41),
+    });
+    await addInteraction(companyId, dropped, "cancelled", "request_confirmation");
+
+    const markdown = (await collect(companyId))!.markdown;
+    expect(markdown).toContain("resolved-but-open 1");
+    expect(markdown).toContain(
+      "Every question card was withdrawn or expired — the human was asked and never answered",
+    );
   });
 
   it("resolves the gate from a decided approval card without calling GitHub", async () => {
