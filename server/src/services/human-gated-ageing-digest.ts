@@ -41,6 +41,7 @@ import {
   issueApprovals,
   issueComments,
   issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
@@ -359,7 +360,7 @@ export async function loadHumanGatedIssues(
 export async function loadGateEvidence(
   db: Db,
   companyId: string,
-  rows: readonly { id: string; identifier?: string | null }[],
+  rows: readonly { id: string; identifier?: string | null; status?: string | null }[],
 ): Promise<GateEvidenceInput[]> {
   const evidenceById = new Map<string, GateEvidenceInput>();
   for (const row of rows) {
@@ -368,6 +369,8 @@ export async function loadGateEvidence(
       identifier: row.identifier ?? null,
       blockers: [],
       approvals: [],
+      interactions: [],
+      status: row.status ?? null,
     });
   }
   if (evidenceById.size === 0) return [];
@@ -424,6 +427,34 @@ export async function loadGateEvidence(
     }
   }
 
+  // Thread interactions — the cards asking this row's human to answer
+  // something (BLO-30627). Batched at the same chunk size as the two queries
+  // above, so adding this gate kind costs O(ceil(rows / 500)) more queries per
+  // sweep rather than one per row.
+  for (const ids of chunk(issueIds, AGGREGATE_CHUNK_SIZE)) {
+    const interactionRows = await db
+      .select({
+        issueId: issueThreadInteractions.issueId,
+        interactionId: issueThreadInteractions.id,
+        interactionKind: issueThreadInteractions.kind,
+        interactionStatus: issueThreadInteractions.status,
+      })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          inArray(issueThreadInteractions.issueId, ids),
+        ),
+      );
+    for (const row of interactionRows) {
+      evidenceById.get(row.issueId)?.interactions.push({
+        interactionId: row.interactionId,
+        interactionKind: row.interactionKind,
+        interactionStatus: row.interactionStatus,
+      });
+    }
+  }
+
   // Preserve the caller's ordering: the producer supplies rows oldest-clock
   // first, and `revalidateGates` spends its budget from the front, so the
   // rows most likely to be stale are the ones that get probed.
@@ -434,6 +465,8 @@ export async function loadGateEvidence(
         identifier: row.identifier ?? null,
         blockers: [],
         approvals: [],
+        interactions: [],
+        status: row.status ?? null,
       },
   );
 }

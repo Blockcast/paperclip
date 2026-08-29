@@ -3,9 +3,10 @@
  *
  * Reports, for every open human-gated row in a company, the three-way split
  * {`still-gated`, `resolved-but-open`, `unverifiable`} plus the measured cost of
- * one full pass (AC5). It is **read-only** on both evidence sources: no write
- * path exists here and none is wanted — BLO-30608 is explicit that the pass
- * reports and an owner decides.
+ * one full pass (AC5). It never changes an issue's state, status, or blocker
+ * edges on either source — BLO-30608 is explicit that the pass reports and an
+ * owner decides. (One narrow, non-issue side effect exists on `--source=api`
+ * only; it is stated under "approximations" below rather than left implicit.)
  *
  * Two evidence sources, one classifier:
  *
@@ -43,6 +44,20 @@
  *   and lets the classifier cap it. Either way the rows left unexamined are
  *   reported as `notProbed`, so `population === probed + notProbed` holds on
  *   both sources and a capped run can never read as a complete one.
+ * - **Read-only, with one stated exception on this path only.** The pass
+ *   changes no issue state, blocker edge, or status on either source. But
+ *   `GET /api/issues/:id/interactions` — the only way to read interaction
+ *   evidence without database access — first runs
+ *   `expireRequestConfirmationsSupersededByHistoricalComments`, so reading it
+ *   can expire a confirmation card that a later comment had already superseded.
+ *   That is the endpoint's normal behaviour for *any* reader, including the UI,
+ *   and it touches no issue field. It is called out because "read-only" is an
+ *   acceptance criterion and an unstated write would quietly break it. The
+ *   shipping DB path reads `issue_thread_interactions` directly and has no such
+ *   effect; use `--source=db` if you need a strictly side-effect-free pass.
+ * - **Cost.** Interaction evidence is a second per-issue call, so this path now
+ *   costs roughly 2 round trips per probed row rather than 1. The DB path is
+ *   unaffected: it batches at 500 rows per query.
  *
  * For a split that *is* the sweep's split, use `--source=db`.
  *
@@ -148,12 +163,21 @@ async function acquireFromDb(companyId: string, now: Date): Promise<Acquisition>
   const evidence = await loadGateEvidence(
     db,
     companyId,
-    byAgeDescending.map((candidate) => ({ id: candidate.id, identifier: candidate.identifier })),
+    byAgeDescending.map((candidate) => ({
+      id: candidate.id,
+      identifier: candidate.identifier,
+      // Threaded through so an `unverifiable` row can be named by *why* nothing
+      // was checkable (BLO-30627 AC2) rather than reported as one opaque bucket.
+      status: candidate.status,
+    })),
   );
-  // 1 candidate query + 2 human-clock aggregates + 2 evidence queries.
+  // 1 candidate query + 2 human-clock aggregates + 3 batched evidence queries
+  // (blockers, approvals, interactions). Each evidence query is one round trip
+  // per 500-row chunk, so this is O(ceil(n/500)) and not O(n) — the reason the
+  // probe cap can be raised well past the population without a cost cliff.
   // The DB path hands `revalidateGates` the *whole* ranked population and lets
   // it apply the budget, so it truncates nothing itself and `omitted` is 0.
-  return { evidence, calls: 5, population: candidates.length, omitted: 0 };
+  return { evidence, calls: 6, population: candidates.length, omitted: 0 };
 }
 
 /** Evidence over the public API, for a reader without database access. */
@@ -253,18 +277,23 @@ export async function acquireFromApi(
     (candidate) => candidate.row,
   );
 
-  // Approvals are per-issue, so this is the only unbounded-ish cost in the pass
-  // and it is bounded by the probe budget rather than by the population.
+  // Approvals and interactions are both per-issue, so these are the only
+  // unbounded-ish costs in the pass and both are bounded by the probe budget
+  // rather than by the population. Issued together per row so the added gate
+  // kind costs round trips but not wall clock.
   const evidence: GateEvidenceInput[] = [];
   for (const row of probed) {
-    const approvals = (await getJson(`/api/issues/${row.id}/approvals`)) as {
-      id: string;
-      type?: string | null;
-      status: string;
-    }[];
+    const [approvals, interactions] = (await Promise.all([
+      getJson(`/api/issues/${row.id}/approvals`),
+      getJson(`/api/issues/${row.id}/interactions`),
+    ])) as [
+      { id: string; type?: string | null; status: string }[],
+      { id: string; kind?: string | null; status: string }[],
+    ];
     evidence.push({
       issueId: row.id,
       identifier: row.identifier ?? null,
+      status: row.status ?? null,
       blockers: (row.blockedBy ?? []).map((blocker) => ({
         blockerIssueId: blocker.id,
         blockerIdentifier: blocker.identifier ?? null,
@@ -274,6 +303,11 @@ export async function acquireFromApi(
         approvalId: approval.id,
         approvalType: approval.type ?? null,
         approvalStatus: approval.status,
+      })),
+      interactions: (Array.isArray(interactions) ? interactions : []).map((interaction) => ({
+        interactionId: interaction.id,
+        interactionKind: interaction.kind ?? null,
+        interactionStatus: interaction.status,
       })),
     });
   }
@@ -315,8 +349,17 @@ export function renderReport(
     "",
     "resolved-but-open by who can clear it:",
     `  blocker edge cancelled (never self-clears) : ${report.countsByResolutionKind["blocker-cancelled-edge-stuck"]}`,
+    `  every question card withdrawn/expired      : ${report.countsByResolutionKind["interaction-abandoned"]}`,
     `  all blockers done, row never moved         : ${report.countsByResolutionKind["blocker-done-row-not-moved"]}`,
     `  every linked approval decided              : ${report.countsByResolutionKind["approval-decided"]}`,
+    `  every question card answered               : ${report.countsByResolutionKind["interaction-answered"]}`,
+    "",
+    "unverifiable by why no gate was checkable:",
+    `  status 'blocked' but no blocker edge       : ${report.countsByUnverifiableReason["blocked-status-without-blocker-edge"]}`,
+    `  status 'in_review' but no approval card    : ${report.countsByUnverifiableReason["in-review-without-approval-record"]}`,
+    `  in progress, gate is outside this system   : ${report.countsByUnverifiableReason["in-progress-no-expressed-gate"]}`,
+    `  queued, waiting on attention not a gate    : ${report.countsByUnverifiableReason["awaiting-start"]}`,
+    `  status unreadable                          : ${report.countsByUnverifiableReason["status-unreadable"]}`,
     "",
     `Cost: ${meta.calls} round trips, ${(meta.elapsedMs / 1000).toFixed(1)}s wall clock.`,
     "",
@@ -359,6 +402,7 @@ async function main(): Promise<void> {
           population: acquisition.population,
           counts: report.counts,
           countsByResolutionKind: report.countsByResolutionKind,
+          countsByUnverifiableReason: report.countsByUnverifiableReason,
           notProbed,
           calls: acquisition.calls,
           elapsedMs,

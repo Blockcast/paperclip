@@ -42,8 +42,8 @@
  *
  * ## Why the probes are DB-local
  *
- * Both shipped probes answer from tables this server already owns, so one full
- * pass costs two batched `SELECT`s and zero external calls:
+ * Every shipped probe answers from tables this server already owns, so one full
+ * pass costs a handful of batched `SELECT`s and zero external calls:
  *
  * - **Blocker-premise** reads `issue_relations` + the blockers' `status`.
  * - **Approval-gate** reads `issue_approvals` + `approvals.status`. It does
@@ -51,12 +51,34 @@
  *   because `approval-gate-reconciler.ts` already polls those runs and closes
  *   the card when the run terminates. Reading the card's status reuses that
  *   audited mechanism instead of building a second, disagreeing one.
+ * - **Pending-interaction** (BLO-30627) reads `issue_thread_interactions`.
  *
- * A permission/RBAC probe is a declared seam ({@link GateProbeKind}) rather
- * than a half-built implementation: a live access probe needs network egress
- * and per-target credentials, and the digest's collection runs inside a
- * database transaction. Until that probe exists, rows gated on access are
- * honestly reported as `unverifiable` rather than guessed at.
+ * ## Why the third probe is interactions, not permission/RBAC (BLO-30627)
+ *
+ * BLO-30608 named a permission/RBAC read-probe as the obvious next gate kind.
+ * It is still the wrong next one to build, for the reason its own seam comment
+ * gave: a live access probe needs network egress and per-target credentials,
+ * and this pass's collection runs inside a database transaction. Building it
+ * would mean either doing I/O under a transaction or splitting the pass in two.
+ *
+ * `issue_thread_interactions` is the better increment because it is where this
+ * codebase actually *expresses* "a human has to answer something" — the
+ * `ask_user_questions` / `request_confirmation` / `request_checkbox_confirmation`
+ * cards. That is the single largest human-gated category BLO-30627 measured as
+ * having no gate to re-test, and unlike RBAC it is DB-local, so it keeps all
+ * three properties above intact. `permission-rbac` stays a declared, unbuilt
+ * seam ({@link GateProbeKind}); rows gated on access are still honestly
+ * `unverifiable` rather than guessed at.
+ *
+ * ## Why `unverifiable` is subdivided
+ *
+ * BLO-30627's finding was that 90.9% of the population landed in this one
+ * bucket, which is a number a reader cannot act on. {@link UnverifiableReason}
+ * splits it by *why* no gate was checkable, so the residual is a list of named
+ * categories. The reasons are derived from the row's own `status`, which the
+ * loader already has — no extra query, and it surfaces the contradictions
+ * directly: a row whose status is `blocked` but which carries no blocker edge
+ * at all is claiming a gate it never expressed.
  */
 
 import { sanitizeRenderedField } from "./human-gated-ageing.js";
@@ -68,10 +90,14 @@ export type GateVerdict = "still-gated" | "resolved-but-open" | "unverifiable";
  * Which probe produced a verdict.
  *
  * `permission-rbac` is declared but not implemented — see the module docblock.
- * Naming it here keeps the extension point visible instead of implying the two
- * shipped probes are the whole space.
+ * Naming it here keeps the extension point visible instead of implying the
+ * three shipped probes are the whole space.
  */
-export type GateProbeKind = "blocker-premise" | "approval-gate" | "permission-rbac";
+export type GateProbeKind =
+  | "blocker-premise"
+  | "approval-gate"
+  | "pending-interaction"
+  | "permission-rbac";
 
 /**
  * Why a `resolved-but-open` row is open, which decides *who* can clear it.
@@ -84,14 +110,46 @@ export type GateProbeKind = "blocker-premise" | "approval-gate" | "permission-rb
  *   the edge (`listIssueDependencyReadinessMap`, `services/issues.ts`). So a
  *   cancelled blocker is a permanent `422` freeze, and no amount of waiting
  *   fixes it. This is the highest-severity thing this pass can find.
+ * - `interaction-abandoned` is the same shape one layer up: every card asking
+ *   this row's human a question was withdrawn, expired, or failed, so nobody
+ *   ever answered and no answer is now coming. The row reads as "waiting on a
+ *   human" while the thing it was waiting on no longer exists. Like a stuck
+ *   edge it cannot self-clear — someone has to re-ask or drop the row.
  * - `blocker-done-row-not-moved` is a row whose blockers all completed; the
  *   platform already considers it dependency-ready and it is merely still open.
  * - `approval-decided` is a row whose every linked approval has been answered.
+ * - `interaction-answered` is a row whose every question card got a real human
+ *   decision (accepted / rejected / answered) and which is still open anyway.
  */
 export type GateResolutionKind =
   | "blocker-cancelled-edge-stuck"
+  | "interaction-abandoned"
   | "blocker-done-row-not-moved"
-  | "approval-decided";
+  | "approval-decided"
+  | "interaction-answered";
+
+/**
+ * Why a row was `unverifiable` — the named residual BLO-30627 asked for.
+ *
+ * Derived from the row's own `status`, so it costs no extra query. Two of these
+ * are contradictions worth acting on rather than mere absences:
+ *
+ * - `blocked-status-without-blocker-edge` — the row says `blocked` but expresses
+ *   no blocker at all. Nothing can ever resolve it, because nothing was ever
+ *   named as blocking it.
+ * - `in-review-without-approval-record` — the row says `in_review` but no
+ *   approval card exists, so the review it is waiting on is not tracked
+ *   anywhere a probe (or a reviewer's queue) can see.
+ *
+ * The rest are honest absences: the row is simply not gated on anything
+ * expressible, and its clock is a human's attention rather than a gate.
+ */
+export type UnverifiableReason =
+  | "blocked-status-without-blocker-edge"
+  | "in-review-without-approval-record"
+  | "awaiting-start"
+  | "in-progress-no-expressed-gate"
+  | "status-unreadable";
 
 /** Issue statuses that resolve a blocker for dependency purposes. */
 const BLOCKER_RESOLVING_STATUSES: ReadonlySet<string> = new Set(["done"]);
@@ -107,8 +165,57 @@ const BLOCKER_TERMINAL_NON_RESOLVING_STATUSES: ReadonlySet<string> = new Set(["c
 /** Approval statuses that mean the board has not answered yet. */
 const APPROVAL_UNDECIDED: ReadonlySet<string> = new Set(["pending", "revision_requested"]);
 
-/** Probe budget for one sweep. See property 3 in the module docblock. */
-export const DEFAULT_MAX_PROBES = 600;
+/**
+ * Interaction statuses that mean a human still owes an answer.
+ *
+ * `ISSUE_THREAD_INTERACTION_STATUSES` is a plain `text` column, not a pg enum,
+ * so an unrecognised value is reachable — a future kind of wait, most likely.
+ * {@link probePendingInteraction} treats anything outside the two terminal sets
+ * below as still-pending rather than defaulting it into a resolution, which is
+ * property 2 (fail toward `still-gated`) applied to schema drift.
+ */
+const INTERACTION_PENDING: ReadonlySet<string> = new Set(["pending"]);
+
+/** Interaction statuses where a human actually decided something. */
+const INTERACTION_HUMAN_DECIDED: ReadonlySet<string> = new Set([
+  "accepted",
+  "rejected",
+  "answered",
+]);
+
+/**
+ * Interaction statuses where the ask went away *without* an answer.
+ *
+ * Withdrawn by its author (`cancelled`), superseded by a plain comment or timed
+ * out (`expired`), or never delivered (`failed`). Distinguished from
+ * {@link INTERACTION_HUMAN_DECIDED} because "the question was answered" and
+ * "the question evaporated" are different findings for whoever reads the
+ * digest: only the second one means a human was asked and never replied.
+ */
+const INTERACTION_ABANDONED: ReadonlySet<string> = new Set(["cancelled", "expired", "failed"]);
+
+/**
+ * Probe budget for one sweep. See property 3 in the module docblock.
+ *
+ * BLO-30627 raised this from 600, which had drifted below the live population
+ * (746 open human-gated rows measured 2026-08-29) and so silently left the
+ * newest 146 rows unexamined every sweep.
+ *
+ * The 99s / 775-round-trip figure BLO-30627 measured belongs to the
+ * `--source=api` backfill script, whose per-issue approvals call is O(rows) —
+ * it is *not* what the shipping pass costs. The sweep reads through
+ * `loadGateEvidence`, which batches at `AGGREGATE_CHUNK_SIZE` (500), so its
+ * cost is O(ceil(rows / 500)) queries: 9 at the measured population and 15 at
+ * this cap, against a classifier that is pure and in-memory. Raising the cap by
+ * 3.3× therefore adds single-digit queries per sweep, not 1400 round trips.
+ *
+ * So the cap is a runaway guard, not a cost control — it exists so a
+ * pathological population cannot make one sweep unbounded, and it is set with
+ * ~2.7× headroom over the measured population rather than tight against it,
+ * because a cap that tracks the population has to be re-raised every time the
+ * queue grows and is silently wrong in between.
+ */
+export const DEFAULT_MAX_PROBES = 2000;
 
 /** A blocker edge, flattened with the blocker's own status. */
 export type BlockerEvidence = {
@@ -122,6 +229,14 @@ export type ApprovalEvidence = {
   approvalId: string;
   approvalType?: string | null;
   approvalStatus: string;
+};
+
+/** A thread interaction on the row — a card asking a human to answer. */
+export type InteractionEvidence = {
+  interactionId: string;
+  /** `ask_user_questions`, `request_confirmation`, … */
+  interactionKind?: string | null;
+  interactionStatus: string;
 };
 
 /**
@@ -138,6 +253,20 @@ export type GateEvidenceInput = {
   identifier?: string | null;
   blockers: BlockerEvidence[];
   approvals: ApprovalEvidence[];
+  /**
+   * Required rather than optional so a loader that forgets to populate it fails
+   * to compile. A silently-absent evidence array would make a row carrying a
+   * live question card read as though it expressed no gate — the exact class of
+   * false all-clear this module exists to refuse.
+   */
+  interactions: InteractionEvidence[];
+  /**
+   * The row's own status, used only to name an `unverifiable` residual
+   * ({@link UnverifiableReason}). Optional because it refines a report line
+   * rather than deciding a verdict: absent, the row is honestly reported as
+   * `status-unreadable` instead of being sorted into a category by guess.
+   */
+  status?: string | null;
 };
 
 /** One probe's answer about one row. */
@@ -163,6 +292,8 @@ export type GateClassification = {
   probes: ProbeResult[];
   /** Set only when `verdict` is `resolved-but-open`. */
   resolutionKind?: GateResolutionKind;
+  /** Set only when `verdict` is `unverifiable`. Names the residual (BLO-30627). */
+  unverifiableReason?: UnverifiableReason;
   /** Flattened, human-readable evidence for the winning verdict. */
   evidence: string;
 };
@@ -180,6 +311,14 @@ function describeApproval(approval: ApprovalEvidence): string {
   const ref = formatRef(approval.approvalId, "(unidentified)");
   const type = approval.approvalType ? `${formatRef(approval.approvalType, "(untyped)")}:` : "";
   return `${type}${ref}=${formatRef(approval.approvalStatus, "(no status)")}`;
+}
+
+function describeInteraction(interaction: InteractionEvidence): string {
+  const ref = formatRef(interaction.interactionId, "(unidentified)");
+  const kind = interaction.interactionKind
+    ? `${formatRef(interaction.interactionKind, "(untyped)")}:`
+    : "";
+  return `${kind}${ref}=${formatRef(interaction.interactionStatus, "(no status)")}`;
 }
 
 /**
@@ -275,11 +414,128 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
   };
 }
 
+/**
+ * Pending-interaction probe (BLO-30627).
+ *
+ * Reads the row's `issue_thread_interactions` cards — the records this codebase
+ * creates when an agent asks its human a question, a confirmation, or a
+ * checkbox verdict. This is the gate kind BLO-30627 measured as the largest
+ * unprobed category: "waiting on a person to answer" *is* expressed in a table,
+ * it was just never read.
+ *
+ * Three outcomes, and the split between the last two is the point:
+ *
+ * - any card still pending (or carrying a status this module does not
+ *   recognise) → `still-gated`;
+ * - otherwise, any card a human actually decided → `interaction-answered`;
+ * - otherwise every card was withdrawn, expired, or failed → the human was
+ *   asked and never replied, and no reply is coming (`interaction-abandoned`).
+ */
+export function probePendingInteraction(input: GateEvidenceInput): ProbeResult | null {
+  if (input.interactions.length === 0) return null;
+
+  // Unknown statuses count as live. `status` is a `text` column, so a value
+  // outside the known sets most likely means a new kind of wait was added — and
+  // reading a new wait as a resolution is the one failure this pass must not
+  // make. See INTERACTION_PENDING.
+  const live = input.interactions.filter(
+    (interaction) =>
+      INTERACTION_PENDING.has(interaction.interactionStatus) ||
+      (!INTERACTION_HUMAN_DECIDED.has(interaction.interactionStatus) &&
+        !INTERACTION_ABANDONED.has(interaction.interactionStatus)),
+  );
+
+  if (live.length > 0) {
+    return {
+      probe: "pending-interaction",
+      verdict: "still-gated",
+      evidence: `${live.length} of ${input.interactions.length} thread interaction${input.interactions.length === 1 ? "" : "s"} awaiting a human answer: ${live.map(describeInteraction).join(", ")}`,
+    };
+  }
+
+  const decided = input.interactions.filter((interaction) =>
+    INTERACTION_HUMAN_DECIDED.has(interaction.interactionStatus),
+  );
+
+  if (decided.length > 0) {
+    // Phrased as "closed, N by a human decision" rather than "all answered":
+    // this branch is reached when *at least one* card got a real decision, so
+    // the rest may have expired or been withdrawn. Saying they were all
+    // answered would be false on exactly the mixed rows this branch exists to
+    // separate from `interaction-abandoned`, and the evidence line is the part
+    // a reader audits.
+    return {
+      probe: "pending-interaction",
+      verdict: "resolved-but-open",
+      resolutionKind: "interaction-answered",
+      evidence: `all ${input.interactions.length} thread interaction${input.interactions.length === 1 ? " is" : "s are"} closed, ${decided.length} by a human decision: ${input.interactions.map(describeInteraction).join(", ")}`,
+    };
+  }
+
+  // The card refs lead, for the same reason they do in the cancelled-blocker
+  // branch: the rendered evidence is length-bounded, and *which* ask was
+  // dropped is the only part a reader can act on.
+  return {
+    probe: "pending-interaction",
+    verdict: "resolved-but-open",
+    resolutionKind: "interaction-abandoned",
+    evidence: `${input.interactions.map(describeInteraction).join(", ")} — all ${input.interactions.length} thread interaction${input.interactions.length === 1 ? " was" : "s were"} withdrawn, expired, or failed, so the human was asked and never answered and no answer is coming; someone must re-ask or drop the row`,
+  };
+}
+
 /** Probes run for every row, in the order their evidence is reported. */
 const PROBES: ReadonlyArray<(input: GateEvidenceInput) => ProbeResult | null> = Object.freeze([
   probeBlockerPremise,
   probeApprovalGate,
+  probePendingInteraction,
 ]);
+
+/**
+ * Resolution kinds that can never clear themselves, most severe first.
+ *
+ * Both describe a gate whose counterparty is gone: a cancelled blocker edge no
+ * `done` can ever satisfy, and a question every card for which was withdrawn.
+ * They are reported ahead of the merely-finished kinds because they are the
+ * ones a reader has to *act* on rather than notice.
+ */
+const NON_SELF_CLEARING_RESOLUTION_KINDS: readonly GateResolutionKind[] = Object.freeze([
+  "blocker-cancelled-edge-stuck",
+  "interaction-abandoned",
+]);
+
+/** Statuses whose `unverifiable` residual is a contradiction, not an absence. */
+const UNVERIFIABLE_REASON_BY_STATUS: Readonly<Record<string, UnverifiableReason>> = Object.freeze({
+  blocked: "blocked-status-without-blocker-edge",
+  in_review: "in-review-without-approval-record",
+  todo: "awaiting-start",
+  backlog: "awaiting-start",
+  in_progress: "in-progress-no-expressed-gate",
+});
+
+/**
+ * Name *why* a row had no machine-checkable gate.
+ *
+ * Only reached once every probe has declined to speak, so the row is known to
+ * carry no blocker edge, no linked approval, and no thread interaction. What is
+ * left to distinguish these rows is what the row itself claims to be doing.
+ */
+export function classifyUnverifiableReason(status: string | null | undefined): UnverifiableReason {
+  if (typeof status !== "string") return "status-unreadable";
+  return UNVERIFIABLE_REASON_BY_STATUS[status] ?? "status-unreadable";
+}
+
+const UNVERIFIABLE_REASON_EVIDENCE: Readonly<Record<UnverifiableReason, string>> = Object.freeze({
+  "blocked-status-without-blocker-edge":
+    "status is 'blocked' but the row carries no blocker edge, no linked approval and no open question — it claims a gate it never expressed, so nothing can ever resolve it",
+  "in-review-without-approval-record":
+    "status is 'in_review' but no approval card, blocker edge or question card exists — the review it waits on is not tracked anywhere a probe or a reviewer queue can see",
+  "awaiting-start":
+    "row is queued (todo/backlog) and expresses no blocker edge, approval or question — it is waiting on a human's attention rather than on a gate",
+  "in-progress-no-expressed-gate":
+    "row is in progress and expresses no blocker edge, approval or question — whatever it waits on lives outside this system",
+  "status-unreadable":
+    "no machine-checkable gate expressed and the row's own status could not be read, so the residual cannot be categorised further",
+});
 
 /**
  * Combine the probes that spoke into one verdict.
@@ -292,6 +548,7 @@ export function combineProbeVerdicts(
   issueId: string,
   identifier: string | null | undefined,
   probes: ProbeResult[],
+  status?: string | null,
 ): GateClassification {
   const gating = probes.filter((probe) => probe.verdict === "still-gated");
   if (gating.length > 0) {
@@ -306,11 +563,12 @@ export function combineProbeVerdicts(
 
   const resolved = probes.filter((probe) => probe.verdict === "resolved-but-open");
   if (resolved.length > 0) {
-    // A stuck cancelled edge is reported ahead of a merely-finished one: it is
-    // the only resolution kind that cannot clear itself, so it is the one a
-    // reader must act on rather than merely notice.
-    const stuck = resolved.find(
-      (probe) => probe.resolutionKind === "blocker-cancelled-edge-stuck",
+    // A gate whose counterparty is gone is reported ahead of a merely-finished
+    // one: those are the only kinds that cannot clear themselves, so they are
+    // the ones a reader must act on rather than merely notice.
+    const stuck = NON_SELF_CLEARING_RESOLUTION_KINDS.reduce<ProbeResult | undefined>(
+      (found, kind) => found ?? resolved.find((probe) => probe.resolutionKind === kind),
+      undefined,
     );
     const primary = stuck ?? resolved[0];
     return {
@@ -323,13 +581,14 @@ export function combineProbeVerdicts(
     };
   }
 
+  const unverifiableReason = classifyUnverifiableReason(status);
   return {
     issueId,
     identifier,
     verdict: "unverifiable",
     probes,
-    evidence:
-      "no machine-checkable gate expressed: the row carries no blocker edge and no linked approval, so nothing on it can be re-tested",
+    unverifiableReason,
+    evidence: UNVERIFIABLE_REASON_EVIDENCE[unverifiableReason],
   };
 }
 
@@ -340,7 +599,7 @@ export function classifyGate(input: GateEvidenceInput): GateClassification {
     const result = probe(input);
     if (result) probes.push(result);
   }
-  return combineProbeVerdicts(input.issueId, input.identifier, probes);
+  return combineProbeVerdicts(input.issueId, input.identifier, probes, input.status);
 }
 
 export type GateRevalidationReport = {
@@ -353,6 +612,14 @@ export type GateRevalidationReport = {
   maxProbes: number;
   /** Breakdown of `resolved-but-open` by who can clear it. */
   countsByResolutionKind: Record<GateResolutionKind, number>;
+  /**
+   * Breakdown of `unverifiable` by why nothing was checkable (BLO-30627 AC2).
+   *
+   * Reported so the residual is a list of named categories rather than one
+   * opaque bucket — the finding that produced this field was that 90.9% of the
+   * population landed in that bucket, which nobody can act on.
+   */
+  countsByUnverifiableReason: Record<UnverifiableReason, number>;
 };
 
 export type RevalidateGatesOptions = {
@@ -392,13 +659,25 @@ export function revalidateGates(
   };
   const countsByResolutionKind: Record<GateResolutionKind, number> = {
     "blocker-cancelled-edge-stuck": 0,
+    "interaction-abandoned": 0,
     "blocker-done-row-not-moved": 0,
     "approval-decided": 0,
+    "interaction-answered": 0,
+  };
+  const countsByUnverifiableReason: Record<UnverifiableReason, number> = {
+    "blocked-status-without-blocker-edge": 0,
+    "in-review-without-approval-record": 0,
+    "awaiting-start": 0,
+    "in-progress-no-expressed-gate": 0,
+    "status-unreadable": 0,
   };
   for (const classification of classifications) {
     counts[classification.verdict] += 1;
     if (classification.resolutionKind) {
       countsByResolutionKind[classification.resolutionKind] += 1;
+    }
+    if (classification.unverifiableReason) {
+      countsByUnverifiableReason[classification.unverifiableReason] += 1;
     }
   }
 
@@ -408,6 +687,7 @@ export function revalidateGates(
     notProbed: inputs.length - classifications.length,
     maxProbes: maxProbes === null ? Number.POSITIVE_INFINITY : maxProbes,
     countsByResolutionKind,
+    countsByUnverifiableReason,
   };
 }
 
@@ -426,8 +706,26 @@ const MAX_RENDERED_EVIDENCE_CHARS = 300;
 const RESOLUTION_KIND_HEADINGS: Record<GateResolutionKind, string> = {
   "blocker-cancelled-edge-stuck":
     "Blocker edge is cancelled — permanently un-checkoutable until an operator clears it",
+  "interaction-abandoned":
+    "Every question card was withdrawn or expired — the human was asked and never answered",
   "blocker-done-row-not-moved": "Every blocker is done — the row simply never moved",
   "approval-decided": "Every linked approval has been decided",
+  "interaction-answered": "Every question card has been answered",
+};
+
+/**
+ * One line per `unverifiable` reason, phrased as what a reader should conclude.
+ *
+ * The first two are contradictions the reader can act on directly; the rest are
+ * honest absences that tell the reader this queue is gated on attention rather
+ * than on anything a probe could ever re-test.
+ */
+const UNVERIFIABLE_REASON_HEADINGS: Record<UnverifiableReason, string> = {
+  "blocked-status-without-blocker-edge": "status 'blocked' but no blocker edge exists",
+  "in-review-without-approval-record": "status 'in_review' but no approval card exists",
+  "awaiting-start": "queued (todo/backlog), waiting on attention rather than a gate",
+  "in-progress-no-expressed-gate": "in progress, gated on something outside this system",
+  "status-unreadable": "status could not be read",
 };
 
 /**
@@ -523,8 +821,24 @@ export function formatGateRevalidationSections(
   if (report.counts.unverifiable > 0) {
     head.push(
       "",
-      `${report.counts.unverifiable} of ${total} probed rows express no machine-checkable gate (no blocker edge, no linked approval). Those are aged as normal; a high count here means the queue is mostly gated on things no probe can see.`,
+      `${report.counts.unverifiable} of ${total} probed rows express no machine-checkable gate (no blocker edge, no linked approval, no open question card). Those are aged as normal; a high count here means the queue is mostly gated on things no probe can see. Broken down by why:`,
     );
+    // Contradictions first: a row claiming `blocked` with no blocker edge, or
+    // `in_review` with no approval card, is a fixable inconsistency rather than
+    // a row that is merely waiting on a person.
+    const reasonOrder: UnverifiableReason[] = [
+      "blocked-status-without-blocker-edge",
+      "in-review-without-approval-record",
+      "in-progress-no-expressed-gate",
+      "awaiting-start",
+      "status-unreadable",
+    ];
+    for (const reason of reasonOrder) {
+      const count = report.countsByUnverifiableReason[reason];
+      if (count > 0) {
+        head.push(`- ${count} — ${UNVERIFIABLE_REASON_HEADINGS[reason]}`);
+      }
+    }
   }
 
   const resolved = report.classifications.filter(
@@ -550,11 +864,12 @@ export function formatGateRevalidationSections(
     `#### Resolved but still open — ${resolved.length} (withheld from the age-ranked list; these are not still waiting)`,
   );
 
-  // Order by resolution kind so the one that cannot self-clear leads.
+  // Order by resolution kind so the ones that cannot self-clear lead.
   const kindOrder: GateResolutionKind[] = [
-    "blocker-cancelled-edge-stuck",
+    ...NON_SELF_CLEARING_RESOLUTION_KINDS,
     "blocker-done-row-not-moved",
     "approval-decided",
+    "interaction-answered",
   ];
 
   let listed = 0;
