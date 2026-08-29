@@ -59,6 +59,9 @@ function readK8sRoSeed(): SeedEntry {
   return JSON.parse(source.slice(objectStart, objectEnd + closingIndent.length + 1)) as SeedEntry;
 }
 
+const EXPECTED_K8S_RO_GATEWAY_URL =
+  "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp";
+
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -481,9 +484,10 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
 
     const seed = readK8sRoSeed();
     expect(seed.type).toBe("http");
-    expect(seed.url).toBe(
-      "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp",
-    );
+    expect(seed.url).toBe(EXPECTED_K8S_RO_GATEWAY_URL);
+    const statefulSetSource = readFileSync(statefulSetPath, "utf8");
+    expect(statefulSetSource).toContain('"k8s-ro": {');
+    expect(statefulSetSource).toContain(EXPECTED_K8S_RO_GATEWAY_URL);
     const seedUrl = new URL(seed.url);
     expect(seedUrl.protocol).toBe("http:");
     expect(seedUrl.hostname).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
