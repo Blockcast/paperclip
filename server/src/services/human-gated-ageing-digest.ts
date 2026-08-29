@@ -50,7 +50,9 @@ import {
   DEFAULT_MAX_ESCALATED,
   HUMAN_GATED_OPEN_STATUSES,
   formatHumanGatedAgeingSections,
-  humanSilenceDays,
+  HUMAN_GATED_DIGEST_ORIGIN_KIND,
+  orderByHumanSilenceDescending,
+  rankableSilenceDays,
   sanitizeRenderedField,
   selectAgedHumanGatedIssues,
   type HumanGatedIssue,
@@ -63,8 +65,15 @@ import {
   type GateEvidenceInput,
 } from "./human-gated-gate-revalidation.js";
 
-/** Stable `originKind` for the durable digest row. */
-export const HUMAN_GATED_DIGEST_ORIGIN_KIND = "human-gated-ageing-digest";
+/**
+ * Stable `originKind` for the durable digest row.
+ *
+ * Re-exported from the pure ageing module, where it lives so that a caller
+ * reproducing the digest's *population* predicate — "open, human-assigned, not
+ * hidden, not the digest row itself" — can name the exclusion without importing
+ * this module and, with it, the database layer.
+ */
+export { HUMAN_GATED_DIGEST_ORIGIN_KIND } from "./human-gated-ageing.js";
 
 /**
  * Stable `originId` — company-scoped and constant across periods, so there is
@@ -434,26 +443,6 @@ export async function loadGateEvidence(
 // ---------------------------------------------------------------------------
 
 /**
- * Silence in days for *ranking only*, tolerating a row the clock cannot read.
- *
- * {@link humanSilenceDays} throws on a row with an unparseable `createdAt` and
- * no human touch. That row is legitimate input here — `loadHumanGatedIssues`
- * emits `createdAt: ""` precisely so the ageing pass can classify it
- * `malformed` and say which key was wrong — so the re-validation pass must be
- * able to order it without deciding its fate. Returning `-Infinity` sorts it
- * last (least likely to be stale, so the probe budget is not spent on it) and
- * leaves the actual verdict to `selectAgedHumanGatedIssues`, where a malformed
- * row is *reported* rather than thrown.
- */
-function rankableSilenceDays(issue: HumanGatedIssue, now: Date): number {
-  try {
-    return humanSilenceDays(issue, now);
-  } catch {
-    return Number.NEGATIVE_INFINITY;
-  }
-}
-
-/**
  * The BLO-19130 human-gated ageing report, wired to the real human clock, with
  * the BLO-30608 gate re-validation pass in front of it.
  *
@@ -473,10 +462,11 @@ export const humanGatedAgeingProducer: DigestProducer = {
     if (candidates.length === 0) return null;
 
     // Probe oldest-clock-first so a bounded budget is spent where staleness is
-    // most likely. `humanSilenceDays` is the same clock the ageing pass ranks
-    // on, so the two passes never disagree about which row is older.
+    // most likely. `orderByHumanSilenceDescending` is the same clock the ageing
+    // pass ranks on — and the same one the BLO-30608 backfill script ranks on —
+    // so no two passes can disagree about which row is older.
     //
-    // Read through `rankableSilenceDays`, never `humanSilenceDays` directly:
+    // It reads through `rankableSilenceDays`, never `humanSilenceDays` directly:
     // the clock *throws* on a row with an unparseable `createdAt` and no human
     // touch, and `loadHumanGatedIssues` deliberately emits `createdAt: ""` for
     // exactly that row so `selectAgedHumanGatedIssues` can report it as
@@ -484,9 +474,7 @@ export const humanGatedAgeingProducer: DigestProducer = {
     // into a thrown producer — trading a precise "this row is malformed" line
     // for a whole failed section, which is the louder-but-less-useful failure
     // this seam exists to avoid.
-    const byAgeDescending = [...candidates].sort(
-      (a, b) => rankableSilenceDays(b, now) - rankableSilenceDays(a, now),
-    );
+    const byAgeDescending = orderByHumanSilenceDescending(candidates, now);
     const evidence = await loadGateEvidence(db, companyId, byAgeDescending);
     const revalidation = revalidateGates(evidence, { maxProbes: DEFAULT_MAX_PROBES });
     const withheld = resolvedButOpenIssueIds(revalidation);
