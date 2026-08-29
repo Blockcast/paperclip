@@ -451,6 +451,27 @@ describe("launchLeaseExpiry", () => {
     heartbeat.stop();
     vi.useRealTimers();
   });
+
+  it("rejects a stalled Job launch when renewal fails after Secret creation", async () => {
+    vi.useFakeTimers();
+    const stalledJob = new Promise<never>(() => {});
+    const patchNamespacedSecret = vi.fn(() => Promise.reject(new Error("lease patch failed")));
+    const heartbeat = createLaunchLeaseHeartbeat({
+      coreApi: { patchNamespacedSecret },
+      leaseMs: 9_000,
+    });
+    const target = { name: "ac-agent-run-stalled-prompt", namespace: "paperclip" };
+    heartbeat.add(target);
+    heartbeat.markCreated(target);
+
+    const launch = Promise.race([stalledJob, heartbeat.launchFailure()]);
+    launch.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(launch).rejects.toThrow("launch lease renewal failed");
+
+    heartbeat.stop();
+    vi.useRealTimers();
+  });
 });
 
 describe("deriveOwningJobName", () => {  it("strips each known run-Secret suffix", () => {

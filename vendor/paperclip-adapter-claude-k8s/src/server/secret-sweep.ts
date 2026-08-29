@@ -154,6 +154,8 @@ export function createLaunchLeaseHeartbeat(args: {
   add(target: LaunchLeaseTarget): void;
   markCreated(target: LaunchLeaseTarget): void;
   assertLaunchSafe(): Promise<void>;
+  /** Rejects as soon as a created Secret can no longer be renewed. */
+  launchFailure(): Promise<never>;
   stop(): void;
 } {
   const targets = new Map<string, LaunchLeaseTarget>();
@@ -163,10 +165,27 @@ export function createLaunchLeaseHeartbeat(args: {
   // renewals for the other targets or later timer ticks.
   const renewing = new Map<string, symbol>();
   const created = new Set<string>();
+  let rejectLaunchFailure: ((err: Error) => void) | null = null;
+  let launchFailureSettled = false;
+  const launchFailure = new Promise<never>((_, reject) => {
+    rejectLaunchFailure = reject;
+  });
+  // A renewal can fail before execute() reaches the Job-create await. Keep the
+  // coordination promise observed from the moment it is created; the launch
+  // path still receives the same rejection when it attaches its race later.
+  launchFailure.catch(() => undefined);
+  const failLaunch = (err: unknown) => {
+    if (launchFailureSettled) return;
+    launchFailureSettled = true;
+    rejectLaunchFailure?.(err instanceof Error ? err : new Error(String(err)));
+  };
   const renewTarget = async (target: LaunchLeaseTarget): Promise<boolean> => {
     if (typeof args.coreApi.patchNamespacedSecret !== "function") return true;
     const key = `${target.namespace}/${target.name}`;
-    if (renewing.has(key)) return false;
+    if (renewing.has(key)) {
+      if (created.has(key)) failLaunch(new Error(`launch lease renewal already in flight for ${key}`));
+      return false;
+    }
     const renewalToken = Symbol(key);
     renewing.set(key, renewalToken);
     const request = Promise.resolve(args.coreApi.patchNamespacedSecret({
@@ -186,6 +205,7 @@ export function createLaunchLeaseHeartbeat(args: {
       return true;
     } catch (err) {
       await args.onError?.(err);
+      if (created.has(key)) failLaunch(new Error(`launch lease renewal failed for ${key}`));
       return false;
     } finally {
       if (timeout) clearTimeout(timeout);
@@ -208,6 +228,7 @@ export function createLaunchLeaseHeartbeat(args: {
         if (!(await renewTarget(target))) throw new Error(`launch lease renewal failed for ${key}`);
       }
     },
+    launchFailure() { return launchFailure; },
     stop() { clearInterval(timer); targets.clear(); created.clear(); renewing.clear(); },
   };
 }

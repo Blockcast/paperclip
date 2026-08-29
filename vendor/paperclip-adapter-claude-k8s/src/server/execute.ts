@@ -1658,13 +1658,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Create the Job
     let createdJobUid: string | undefined;
+    let launchFenced = false;
     try {
       // A launch that cannot renew every created Secret's object-backed lease
       // must not create a Job that could race a cross-replica orphan sweep.
       await launchLeaseHeartbeat.assertLaunchSafe();
-      const created = await batchApi.createNamespacedJob({ namespace, body: job });
+      // The generated Kubernetes client does not accept an AbortSignal. Race
+      // the request against the live lease fence; if the request completes
+      // later despite losing the race, remove that Job without acknowledging it
+      // or allowing the run to consume the now-unleased Secrets.
+      const jobRequest = batchApi.createNamespacedJob({ namespace, body: job });
+      void jobRequest.then((lateCreated) => {
+        if (launchFenced && lateCreated.metadata?.uid) {
+          void cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+        }
+      }).catch(() => undefined);
+      const created = await Promise.race([
+        jobRequest,
+        launchLeaseHeartbeat.launchFailure(),
+      ]);
       createdJobUid = created.metadata?.uid;
     } catch (err) {
+      // The request may still complete after the fence wins; its observer above
+      // deletes that late Job before the launch can be acknowledged.
+      launchFenced = true;
       const msg = err instanceof Error ? err.message : String(err);
       await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
       if (promptSecret) {
