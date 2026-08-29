@@ -499,6 +499,30 @@ describe("formatGateRevalidationSections", () => {
     expect(markdown.indexOf("cancelled")).toBeLessThan(markdown.indexOf("never moved"));
   });
 
+  it("does not head a mixed answered/expired row as if every card was answered", () => {
+    // The `interaction-answered` kind is assigned whenever *at least one* card
+    // got a decision, so this row — one answered, one expired — lands under
+    // that heading. An earlier wording read "Every question card has been
+    // answered", which contradicted the evidence line printed directly beneath
+    // it ("closed, 1 by a human decision") and hid the abandoned ask.
+    const report = revalidateGates([
+      evidence({
+        issueId: "mixed",
+        identifier: "BLO-2880",
+        interactions: [
+          { interactionId: "i1", interactionKind: "request_confirmation", interactionStatus: "expired" },
+          { interactionId: "i2", interactionKind: "ask_user_questions", interactionStatus: "answered" },
+        ],
+      }),
+    ]);
+    const markdown = formatGateRevalidationSections(report);
+    expect(markdown).toContain("At least one question card was answered");
+    expect(markdown).not.toContain("Every question card has been answered");
+    // Heading and evidence must agree: the expired card is still reported.
+    expect(markdown).toContain("closed, 1 by a human decision");
+    expect(markdown).toContain("i1=expired");
+  });
+
   it("says so explicitly when nothing was found resolved", () => {
     const report = revalidateGates([
       evidence({ issueId: "gated", blockers: [{ blockerIssueId: "b", blockerStatus: "todo" }] }),
