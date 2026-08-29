@@ -118,8 +118,11 @@ export type GateProbeKind =
  * - `blocker-done-row-not-moved` is a row whose blockers all completed; the
  *   platform already considers it dependency-ready and it is merely still open.
  * - `approval-decided` is a row whose every linked approval has been answered.
- * - `interaction-answered` is a row whose every question card got a real human
- *   decision (accepted / rejected / answered) and which is still open anyway.
+ * - `interaction-answered` is a row where at least one question card got a real
+ *   human decision (accepted / rejected / answered) and which is still open
+ *   anyway. Deliberately *not* "every card": a row whose remaining cards were
+ *   cancelled or expired still lands here, because a human did engage. The
+ *   evidence line names how many were decided and what became of the rest.
  */
 export type GateResolutionKind =
   | "blocker-cancelled-edge-stuck"
@@ -710,7 +713,14 @@ const RESOLUTION_KIND_HEADINGS: Record<GateResolutionKind, string> = {
     "Every question card was withdrawn or expired — the human was asked and never answered",
   "blocker-done-row-not-moved": "Every blocker is done — the row simply never moved",
   "approval-decided": "Every linked approval has been decided",
-  "interaction-answered": "Every question card has been answered",
+  // Not "every card was answered": the branch that assigns this kind fires
+  // whenever *at least one* card got a real decision, so the rest may have been
+  // cancelled, expired, or failed. The evidence line already says "closed, N by
+  // a human decision"; a heading claiming otherwise would contradict the line
+  // directly beneath it and hide an abandoned ask on exactly the mixed rows
+  // this kind exists to separate from `interaction-abandoned`.
+  "interaction-answered":
+    "At least one question card was answered — any remaining cards closed without an answer",
 };
 
 /**

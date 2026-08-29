@@ -385,7 +385,7 @@ export function renderReport(
     `  every question card withdrawn/expired      : ${report.countsByResolutionKind["interaction-abandoned"]}`,
     `  all blockers done, row never moved         : ${report.countsByResolutionKind["blocker-done-row-not-moved"]}`,
     `  every linked approval decided              : ${report.countsByResolutionKind["approval-decided"]}`,
-    `  every question card answered               : ${report.countsByResolutionKind["interaction-answered"]}`,
+    `  at least one question card answered        : ${report.countsByResolutionKind["interaction-answered"]}`,
     "",
     "unverifiable by why no gate was checkable:",
     `  status 'blocked' but no blocker edge       : ${report.countsByUnverifiableReason["blocked-status-without-blocker-edge"]}`,
