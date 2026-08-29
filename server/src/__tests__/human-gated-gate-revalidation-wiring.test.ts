@@ -11,6 +11,7 @@
  * it resolves, and actually renders both sections.
  */
 import { randomUUID } from "node:crypto";
+import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -313,6 +314,39 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     const section = await collect(companyId);
     expect(section).not.toBeNull();
     expect(section!.markdown).toContain("Resolved but still open — 1");
+  });
+
+  it("reports an unreadable-clock row as malformed instead of throwing the producer", async () => {
+    // Regression: the re-validation pass ranks rows oldest-first to spend its
+    // probe budget where staleness is likeliest, and the human clock THROWS on
+    // a row with an unparseable `createdAt` and no human touch. Ranking before
+    // `selectAgedHumanGatedIssues` validates would turn one unreadable row into
+    // a thrown producer — trading a precise "this row is malformed" line for a
+    // whole failed section.
+    const { companyId } = await createCompany("GRM");
+    const stale = await insertIssue({ companyId, identifier: "GRM-1", createdAt: daysAgo(41) });
+    const blocker = await insertIssue({
+      companyId,
+      identifier: "GRM-2",
+      status: "done",
+      createdAt: daysAgo(60),
+      assigneeUserId: null,
+    });
+    await blockWith(companyId, stale, blocker);
+
+    // `loadHumanGatedIssues` maps an unparseable creation time to `createdAt:
+    // ""`, which is what makes the clock unreadable. Reproduce that state
+    // directly rather than trusting a NULL the column forbids.
+    const broken = await insertIssue({ companyId, identifier: "GRM-3", createdAt: daysAgo(41) });
+    await db.execute(
+      sql`UPDATE issues SET created_at = '-infinity'::timestamptz WHERE id = ${broken}::uuid`,
+    );
+
+    const section = await collect(companyId);
+    // The producer survived, and the readable row is still classified.
+    expect(section).not.toBeNull();
+    expect(section!.markdown).toContain("Resolved but still open — 1");
+    expect(section!.markdown).toContain("GRM-1");
   });
 
   it("mutates nothing: statuses and blocker edges are identical after a pass", async () => {

@@ -434,6 +434,26 @@ export async function loadGateEvidence(
 // ---------------------------------------------------------------------------
 
 /**
+ * Silence in days for *ranking only*, tolerating a row the clock cannot read.
+ *
+ * {@link humanSilenceDays} throws on a row with an unparseable `createdAt` and
+ * no human touch. That row is legitimate input here — `loadHumanGatedIssues`
+ * emits `createdAt: ""` precisely so the ageing pass can classify it
+ * `malformed` and say which key was wrong — so the re-validation pass must be
+ * able to order it without deciding its fate. Returning `-Infinity` sorts it
+ * last (least likely to be stale, so the probe budget is not spent on it) and
+ * leaves the actual verdict to `selectAgedHumanGatedIssues`, where a malformed
+ * row is *reported* rather than thrown.
+ */
+function rankableSilenceDays(issue: HumanGatedIssue, now: Date): number {
+  try {
+    return humanSilenceDays(issue, now);
+  } catch {
+    return Number.NEGATIVE_INFINITY;
+  }
+}
+
+/**
  * The BLO-19130 human-gated ageing report, wired to the real human clock, with
  * the BLO-30608 gate re-validation pass in front of it.
  *
@@ -455,8 +475,17 @@ export const humanGatedAgeingProducer: DigestProducer = {
     // Probe oldest-clock-first so a bounded budget is spent where staleness is
     // most likely. `humanSilenceDays` is the same clock the ageing pass ranks
     // on, so the two passes never disagree about which row is older.
+    //
+    // Read through `rankableSilenceDays`, never `humanSilenceDays` directly:
+    // the clock *throws* on a row with an unparseable `createdAt` and no human
+    // touch, and `loadHumanGatedIssues` deliberately emits `createdAt: ""` for
+    // exactly that row so `selectAgedHumanGatedIssues` can report it as
+    // `malformed`. Ranking before that validation would turn one unreadable row
+    // into a thrown producer — trading a precise "this row is malformed" line
+    // for a whole failed section, which is the louder-but-less-useful failure
+    // this seam exists to avoid.
     const byAgeDescending = [...candidates].sort(
-      (a, b) => humanSilenceDays(b, now) - humanSilenceDays(a, now),
+      (a, b) => rankableSilenceDays(b, now) - rankableSilenceDays(a, now),
     );
     const evidence = await loadGateEvidence(db, companyId, byAgeDescending);
     const revalidation = revalidateGates(evidence, { maxProbes: DEFAULT_MAX_PROBES });
@@ -465,7 +494,10 @@ export const humanGatedAgeingProducer: DigestProducer = {
     const ageDaysByIssueId = new Map<string, number>(
       candidates
         .filter((candidate) => withheld.has(candidate.id))
-        .map((candidate) => [candidate.id, humanSilenceDays(candidate, now)]),
+        .map((candidate) => [candidate.id, rankableSilenceDays(candidate, now)])
+        // An unrankable row has no age to render; omitting it leaves the entry
+        // absent so the renderer prints no age rather than a fabricated one.
+        .filter(([, days]) => Number.isFinite(days)) as [string, number][],
     );
 
     const report = selectAgedHumanGatedIssues(
