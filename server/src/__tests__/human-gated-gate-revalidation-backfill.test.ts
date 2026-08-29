@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   acquireFromApi,
+  dbRoundTrips,
   renderReport,
 } from "../../../scripts/blo-30608-gate-revalidation-backfill.js";
 import { revalidateGates } from "../services/human-gated-gate-revalidation.js";
@@ -235,5 +236,53 @@ describe("BLO-30608 backfill — API acquisition", () => {
     expect(byIdentifier.get("BLO-3")?.unverifiableReason).toBe(
       "blocked-status-without-blocker-edge",
     );
+  });
+});
+
+/**
+ * The DB path's reported cost (AC5) is derived, not stated.
+ *
+ * `acquireFromDb` needs a live `DATABASE_URL`, so the round-trip arithmetic is
+ * factored into a pure function and pinned here across the chunk boundary. The
+ * regression this guards is a constant: the shipped `calls: 6` was right only
+ * for a single-chunk population and silently wrong on both sides of it.
+ */
+describe("dbRoundTrips", () => {
+  it("charges only the candidate query for an empty population", () => {
+    // `chunk([], 500)` yields no iterations, so none of the five batched
+    // families runs. The old constant reported 6 round trips for zero rows.
+    expect(dbRoundTrips(0, 500)).toBe(1);
+  });
+
+  it("charges one chunk of every batched family for a single row", () => {
+    expect(dbRoundTrips(1, 500)).toBe(6);
+  });
+
+  it("still charges one chunk at exactly the chunk size", () => {
+    // The upper edge of the range where the old constant happened to be right.
+    expect(dbRoundTrips(500, 500)).toBe(6);
+  });
+
+  it("charges a second chunk one row past the boundary", () => {
+    // The off-by-one the constant could not express: 501 rows costs 11, not 6.
+    expect(dbRoundTrips(501, 500)).toBe(11);
+  });
+
+  it("reports 11 round trips for the measured 746-row population", () => {
+    // The figure BLO-30627's verifying signal asks to be posted beside the
+    // 16 / 52 / 678 split. Pinned so the report cannot drift from the code.
+    expect(dbRoundTrips(746, 500)).toBe(11);
+  });
+
+  it("tracks the chunk size rather than the literal 500", () => {
+    // Derived from `AGGREGATE_CHUNK_SIZE`, so shrinking the chunk raises the
+    // reported cost automatically instead of leaving a stale constant behind.
+    expect(dbRoundTrips(746, 250)).toBe(16);
+  });
+
+  it("rejects inputs that cannot produce a meaningful count", () => {
+    expect(() => dbRoundTrips(-1, 500)).toThrow(/non-negative integer/);
+    expect(() => dbRoundTrips(1.5, 500)).toThrow(/non-negative integer/);
+    expect(() => dbRoundTrips(10, 0)).toThrow(/positive integer/);
   });
 });
