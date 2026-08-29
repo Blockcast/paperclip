@@ -285,6 +285,19 @@ const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+
+export type BackstopSweepCompletionPath = "page_drained" | "cursor_wrap";
+
+export function backstopSweepCompletionPath(input: {
+  useCursor: boolean;
+  cursorBeforeQuery: string | null;
+  cursorWasReset: boolean;
+  candidateLimitSkipped: number;
+}): BackstopSweepCompletionPath | null {
+  if (!input.useCursor || !input.cursorBeforeQuery || input.candidateLimitSkipped > 0) return null;
+  return input.cursorWasReset ? "cursor_wrap" : "page_drained";
+}
+
 // A persisted claim gives a process that dies after the review-stage transaction commits a
 // bounded retry lease. It deliberately does not spend another recovery-action attempt: that
 // attempt was already reserved by the escalation which failed to dispatch its wake.
@@ -9044,8 +9057,11 @@ export function recoveryService(
         .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
     };
 
-    let candidateRows = await queryCandidates(useCursor ? resolvedDependencyWakeBackstopCandidateCursor : null);
+    const cursorBeforeQuery = resolvedDependencyWakeBackstopCandidateCursor;
+    let cursorWasReset = false;
+    let candidateRows = await queryCandidates(useCursor ? cursorBeforeQuery : null);
     if (useCursor && candidateRows.length === 0 && resolvedDependencyWakeBackstopCandidateCursor) {
+      cursorWasReset = true;
       resolvedDependencyWakeBackstopCandidateCursor = null;
       candidateRows = await queryCandidates(null);
     }
@@ -9054,7 +9070,6 @@ export function recoveryService(
     result.checked = candidates.length;
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
     const lastCandidate = candidates[candidates.length - 1] ?? null;
-    const cursorBeforeAdvance = resolvedDependencyWakeBackstopCandidateCursor;
     if (useCursor) {
       resolvedDependencyWakeBackstopCandidateCursor =
         result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.id : null;
@@ -9076,7 +9091,12 @@ export function recoveryService(
         },
         "issue graph liveness backstop deferred resolved dependency wake candidates past page limit",
       );
-    } else if (useCursor && cursorBeforeAdvance) {
+    } else if (backstopSweepCompletionPath({
+      useCursor,
+      cursorBeforeQuery,
+      cursorWasReset,
+      candidateLimitSkipped: result.candidateLimitSkipped,
+    })) {
       // Sweep-completion signal (BLO-29722). Without this line the drain tick is
       // silent, so a healthy rotating sweep and a permanently starved tail emit
       // byte-identical logs -- only the WARN above, forever, at a pinned cursor.
@@ -9089,7 +9109,8 @@ export function recoveryService(
         {
           processed: candidates.length,
           limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
-          sweptFromCursor: cursorBeforeAdvance,
+          sweptFromCursor: cursorBeforeQuery,
+          completionPath: cursorWasReset ? "cursor_wrap" : "page_drained",
           source,
         },
         "issue graph liveness backstop completed resolved dependency wake candidate sweep",
@@ -9427,8 +9448,11 @@ export function recoveryService(
         .limit(STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
     };
 
-    let candidateRows = await queryCandidates(strandedRecoveryWakeBackstopCandidateCursor);
+    const cursorBeforeQuery = strandedRecoveryWakeBackstopCandidateCursor;
+    let cursorWasReset = false;
+    let candidateRows = await queryCandidates(cursorBeforeQuery);
     if (candidateRows.length === 0 && strandedRecoveryWakeBackstopCandidateCursor) {
+      cursorWasReset = true;
       strandedRecoveryWakeBackstopCandidateCursor = null;
       candidateRows = await queryCandidates(null);
     }
@@ -9437,7 +9461,6 @@ export function recoveryService(
     result.checked = candidates.length;
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
     const lastCandidate = candidates[candidates.length - 1] ?? null;
-    const cursorBeforeAdvance = strandedRecoveryWakeBackstopCandidateCursor;
     strandedRecoveryWakeBackstopCandidateCursor =
       result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.actionId : null;
 
@@ -9454,7 +9477,12 @@ export function recoveryService(
         },
         "stranded recovery wake backstop deferred candidates past page limit",
       );
-    } else if (cursorBeforeAdvance) {
+    } else if (backstopSweepCompletionPath({
+      useCursor: true,
+      cursorBeforeQuery,
+      cursorWasReset,
+      candidateLimitSkipped: result.candidateLimitSkipped,
+    })) {
       // Sweep-completion signal (BLO-29722), same rationale as the sibling
       // backstop: this loop's 2-page sweep previously logged only its first
       // page, so 45 consecutive identical WARN lines at a pinned cursor were
@@ -9463,7 +9491,8 @@ export function recoveryService(
         {
           processed: candidates.length,
           limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
-          sweptFromCursor: cursorBeforeAdvance,
+          sweptFromCursor: cursorBeforeQuery,
+          completionPath: cursorWasReset ? "cursor_wrap" : "page_drained",
         },
         "stranded recovery wake backstop completed candidate sweep",
       );

@@ -38,10 +38,40 @@ import {
   STRANDED_ASSIGNED_ISSUE_STATUSES,
   STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES,
   STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
+  backstopSweepCompletionPath,
   isInfraClassStrandedFailure,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
 } from "../services/recovery/service.js";
+
+describe("backstop sweep completion path", () => {
+  it.each([
+    ["page_drained", false],
+    ["cursor_wrap", true],
+  ] as const)("reports %s completion", (expected, cursorWasReset) => {
+    expect(backstopSweepCompletionPath({
+      useCursor: true,
+      cursorBeforeQuery: "cursor-1",
+      cursorWasReset,
+      candidateLimitSkipped: 0,
+    })).toBe(expected);
+  });
+
+  it("does not report an incomplete page or a non-cursor query as completion", () => {
+    expect(backstopSweepCompletionPath({
+      useCursor: true,
+      cursorBeforeQuery: "cursor-1",
+      cursorWasReset: false,
+      candidateLimitSkipped: 1,
+    })).toBeNull();
+    expect(backstopSweepCompletionPath({
+      useCursor: false,
+      cursorBeforeQuery: null,
+      cursorWasReset: false,
+      candidateLimitSkipped: 0,
+    })).toBeNull();
+  });
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
