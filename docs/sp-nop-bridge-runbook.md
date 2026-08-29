@@ -18,11 +18,104 @@ identity NOP presents (via mTLS) to the orc8r `tenants_beacon` service
 when minting `individual_beacon` members under the public umbrella
 (`st_public`).
 
-Once the `tenants_beacon` servicer's mTLS-caller-verify path ships
-(BLO-5410), the first `MintMember` call from NOP fails with a
-caller-not-found error if this row is missing. Until BLO-5410 lands,
-this row is a pre-positioned identity awaiting its consumer — see the
-Wave 1 caveats below.
+The `tenants_beacon` servicer is tracked as delivered by BLO-5410. Its
+caller verification and RPC idempotency are prerequisites for the flow below:
+the first `MintMember` call from NOP fails with a caller-not-found error if
+this row is missing. This runbook specifies the NOP-side E2 completeness
+delta rather than restating the servicer implementation.
+
+## E2 completeness delta
+
+This is the contract for the NOP registration flow after BLO-5410. BLO-5410
+owns mTLS caller verification and the orc8r-side idempotent RPC. NOP owns
+local ordering, tenant selection, retry state, and reconciliation.
+
+### MintMember identity and idempotency
+
+NOP MUST derive the logical idempotency key from `(gateway_hwid, wallet)`,
+using the canonical normalized form already used by the registration store.
+The key MUST be stable across retries and MUST NOT include request time, a
+random UUID, access token, or mutable display data. Persist it with the
+registration attempt and send the same logical identity on every retry. A
+repeated successful call returns the original `mb_uuid`; it MUST NOT create
+another `individual_beacon` row.
+
+The orc8r identity is fixed by the bridge contract: `st_uuid` is the seeded
+`st_public` tenant identity, `subject_kind` is `individual_beacon`, and the
+issuer is `nop.blockcast.net`. NOP must not accept issuer or subject from an
+untrusted client or manufacture a second identity when a retry times out.
+
+### Explicit tenant-target rule
+
+The minted member is written under the orc8r `st_public` umbrella. It is not
+written into a synthesized Privy tenant and it is not written into an
+organization tenant selected by the browser, wallet, gateway payload, or
+requester. `st_public` is an orc8r identity/compatibility sentinel, not a v2
+NOP `tenants.id`, and MUST NOT be sent as `X-Tenant-Id` to NOP tenant APIs.
+
+The authorization for this target is the authenticated `sp_nop_bridge`
+principal and the `tenants_beacon` service policy: it may mint only the
+`individual_beacon` member shape under `st_public`. A response with any
+other `st_uuid`, tenant kind, or subject kind is a protocol error. NOP MUST
+mark that attempt failed/quarantined and MUST NOT attach it to an org.
+Organization onboarding and membership attachment require the separate
+ASN-verified org-tenant flow and explicit membership/terms authorization;
+they are not side effects of gateway registration.
+
+### Local-first ordering and pending state
+
+Registration MUST use this order:
+
+1. In one local transaction, upsert the registration intent and its
+   `(gateway_hwid, wallet)` idempotency key. The row starts in explicit
+   `pending_orc8r` state; no local success state is written yet.
+2. Call `MintMember` with the same derived identity and bridge mTLS
+   credential.
+3. In a second local transaction, validate the returned `mb_uuid`, bind it
+   to the existing intent, and transition to `registered`.
+
+If orc8r is unavailable, times out, or returns a retryable error, retain the
+intent as `pending_orc8r` with `last_error`, `next_retry_at`, and an attempt
+counter. Return a pending response. Never report success, create an unbound
+local member, or silently discard the intent. Non-retryable identity,
+tenant-target, or authorization errors transition to `registration_failed`
+and require operator-visible remediation.
+
+### Reconciliation sweep
+
+Run a bounded, repeatable sweep at least once per deployment and on an
+operator-triggered repair:
+
+- Find due `pending_orc8r` intents and retry the exact same idempotency tuple.
+- Find local `individual_beacon` rows without a valid `mb_uuid`/gateway
+  binding and either complete them through `MintMember` or quarantine them;
+  never guess a tenant.
+- Group orc8r members by `(st_uuid, normalized gateway_hwid, wallet)` and
+  surface duplicates. Keep the earliest authoritative `mb_uuid`, quarantine
+  later rows, and require explicit repair before deletion or reassignment.
+- Emit counts for pending, orphaned, duplicate, repaired, and quarantined
+  rows. Query failure is an unhealthy sweep, not a clean zero-count result.
+
+The sweep must be safe to run concurrently with registration. It must use
+the same unique constraint/idempotency path as the live call and must never
+delete based only on a stale read.
+
+### E2 verifying signal
+
+The completeness suite MUST prove that concurrent retries with the same
+`(gateway_hwid, wallet)` yield one member; a timeout leaves `pending_orc8r`;
+a later retry converges to `registered`; a result under a non-`st_public`
+tenant is rejected; and the sweep reports and quarantines an orphan/duplicate
+without silently reassigning it. Manual verification must inspect persisted
+registration state and orchestrator logs for the idempotency key.
+
+### Dependency boundary
+
+BLO-5410 is the delivered caller-verification plus MintMember/MintGateway
+servicer contract. BLO-5389 remains the cert/discovery/rotation track; this
+document does not move those controls into registration. A gap in the shipped
+BLO-5410 artifact is a blocker to claiming E2 complete, not a reason for NOP
+to add a second caller-verification implementation.
 
 ## Prerequisites
 
@@ -39,10 +132,11 @@ Wave 1 caveats below.
 ## One-time INSERT
 
 Run **once per environment** (staging, canary, production). The
-`sp_uuid` value is intentionally well-known so all environments can
-share the same caller-identity literal in NOP code; pick a fresh v4
-UUID below per environment OR reuse the same suggested value across all
-environments — both are acceptable.
+`sp_uuid` value below is the canonical caller-identity literal and MUST
+be used unchanged by NOP code, certificate SANs, and every lifecycle
+operation in this runbook. Do not substitute a per-environment UUID
+unless every reference in this runbook and the deployed NOP configuration
+is changed together.
 
 ### Suggested well-known value (acceptable for all environments)
 
@@ -65,6 +159,39 @@ INSERT INTO system_principals (
 ON CONFLICT (sp_uuid) DO NOTHING;
 ```
 
+The conflict clause only makes a matching seed retryable; it does not
+prove that an existing row is the NOP bridge. Run this assertion in the
+same database session immediately afterward. It raises an error and
+aborts the bootstrap if the existing row has any different required
+field, rather than allowing a colliding principal to look successfully
+seeded:
+
+```sql
+DO $$
+DECLARE
+    actual_kind system_principals.kind%TYPE;
+    actual_scope system_principals.scope%TYPE;
+    actual_scope_target system_principals.scope_target%TYPE;
+    actual_display_name system_principals.display_name%TYPE;
+    actual_approval_required system_principals.approval_required%TYPE;
+BEGIN
+    SELECT kind, scope, scope_target, display_name, approval_required
+      INTO STRICT actual_kind, actual_scope, actual_scope_target,
+                actual_display_name, actual_approval_required
+      FROM system_principals
+     WHERE sp_uuid = 'sp_00000000-0000-4000-8000-000000000002';
+
+    IF actual_kind <> 'nop_bridge'
+       OR actual_scope <> 'global'
+       OR actual_scope_target IS NOT NULL
+       OR actual_display_name <> 'NOP bridge for BEACON'
+       OR actual_approval_required IS DISTINCT FROM false THEN
+        RAISE EXCEPTION
+          'sp_uuid exists but is not the expected NOP bridge principal';
+    END IF;
+END $$;
+```
+
 ### Field rationale
 
 | Field | Value | Why |
@@ -76,8 +203,9 @@ ON CONFLICT (sp_uuid) DO NOTHING;
 | `display_name` | `NOP bridge for BEACON` | Human-readable label for audit logs / Portal. |
 | `approval_required` | `false` | NOP-bridge cert issuance is one-time at NOP go-live; ongoing rotations don't require human approval. (Contrast: `break_glass` requires per-issuance approval; gated by the certifier-validator once BLO-5389 lands.) |
 
-`ON CONFLICT (sp_uuid) DO NOTHING` makes this idempotent — safe to
-re-run during a re-deploy or after a partial failure.
+The `INSERT` plus assertion is idempotent and safe to re-run during a
+re-deploy or after a partial failure, while failing closed on a conflicting
+row with the wrong principal attributes.
 
 ## Cert issuance
 
@@ -99,8 +227,8 @@ certifier path:
    long-term automated path (per-issuance validator gating) lands in
    BLO-5389; until then, the operator runs the issuance with explicit
    approval in the same shell session.
-4. Drop the resulting cert + private key into NOP's secret store at
-   the path expected by the BLO-5413 outbound mTLS client (see
+4. Drop the resulting cert + private key into NOP's secret store at the
+   path expected by the BLO-5413 outbound mTLS client (see
    BLO-5413 ticket for the env var / path contract).
 
 ## Rotation
@@ -175,13 +303,15 @@ INSERT INTO revocation_blocklist (
 After running the INSERT, confirm:
 
 ```sql
-SELECT sp_uuid, kind, scope, display_name, approval_required
+SELECT sp_uuid, kind, scope, scope_target, display_name, approval_required
   FROM system_principals
  WHERE sp_uuid = 'sp_00000000-0000-4000-8000-000000000002';
 ```
 
 Expected: exactly one row, `kind = 'nop_bridge'`, `scope = 'global'`,
-`approval_required = false`.
+`scope_target IS NULL`, `display_name = 'NOP bridge for BEACON'`, and
+`approval_required = false`. Any other result is a bootstrap failure; do
+not issue or use a certificate for that UUID.
 
 ## Troubleshooting
 
