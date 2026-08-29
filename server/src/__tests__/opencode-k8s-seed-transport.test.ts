@@ -137,7 +137,7 @@ async function listen(server: Server): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
-async function startK8sMcpFixture() {
+async function startK8sMcpFixture(mcpPath = "/mcp") {
   let now = 0;
   let legacyInitializedAt: number | null = null;
   let legacyStream: ServerResponse | null = null;
@@ -221,7 +221,7 @@ async function startK8sMcpFixture() {
       return;
     }
 
-    if (req.method === "POST" && requestUrl.pathname === "/mcp") {
+    if (req.method === "POST" && requestUrl.pathname === mcpPath) {
       const message = (await readJson(req)) as JsonRpcMessage;
       if (message.method === "notifications/initialized") {
         res.writeHead(202).end();
@@ -493,7 +493,7 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
     expect(seedUrl.hostname).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
     expect(seedUrl.port).toBe("8080");
     expect(seedUrl.pathname).toBe("/k8s-ro/mcp");
-    const currentMcp = await startK8sMcpFixture();
+    const currentMcp = await startK8sMcpFixture(seedUrl.pathname);
     const currentPlan: PlannedCall[] = [
       { tool: "pods_list_in_namespace", arguments: { namespace: "hindsight" } },
       { tool: "pods_list_in_namespace", arguments: { namespace: "hindsight" } },
