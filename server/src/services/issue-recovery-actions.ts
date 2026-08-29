@@ -681,6 +681,34 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       );
   }
 
+  async function retireAndReleaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+    retiringBound: IssueRecoveryActionRetiringBound;
+  }): Promise<void> {
+    // Retiring and refunding must share the reservation CAS. Otherwise changing the
+    // status first makes the refund match `escalated`, reopening the exhausted action.
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        status: "escalated",
+        retiringBound: input.retiringBound,
+        attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+        eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
+        eq(issueRecoveryActions.status, "active"),
+        isNull(issueRecoveryActions.retiringBound),
+      ));
+  }
+
   async function retireWakeAction(input: {
     companyId: string;
     actionId: string;
@@ -831,6 +859,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     escalateExpiredWakeHorizons,
     upsertSourceScoped,
     releaseWakeAttempt,
+    retireAndReleaseWakeAttempt,
     retireWakeAction,
     recordNonDeliverySweep,
   };

@@ -5543,7 +5543,7 @@ export function recoveryService(
     const reservedOwnerAgentId = input.action.ownerAgentId;
     const reservedAttemptCount = input.action.attemptCount;
     const refundUnspentWakeAttempt = async (
-      cause: "enqueue_threw" | "enqueue_not_delivered" | "attempts_exhausted",
+      cause: "enqueue_threw" | "enqueue_not_delivered",
       error?: unknown,
     ) => {
       const release = () =>
@@ -5599,12 +5599,33 @@ export function recoveryService(
     // re-trips this same gate before any enqueue — so the delivered-wake ceiling is unchanged
     // at exactly `maxAttempts`, and `timeoutAt` still bounds wall-clock independently.
     if (strandedRecoveryWakeAttemptsExhausted(input.action)) {
-      await recoveryActionsSvc.retireWakeAction({
+      const retireAndRefund = () => recoveryActionsSvc.retireAndReleaseWakeAttempt({
         companyId: input.issue.companyId,
         actionId: input.action.id,
+        expectedOwnerAgentId: reservedOwnerAgentId,
+        expectedAttemptCount: reservedAttemptCount,
         retiringBound: "attempt_budget",
       });
-      await refundUnspentWakeAttempt("attempts_exhausted");
+      try {
+        await retireAndRefund();
+      } catch (firstError) {
+        try {
+          await retireAndRefund();
+        } catch (secondError) {
+          logger.warn(
+            {
+              err: secondError,
+              firstErr: firstError,
+              companyId: input.issue.companyId,
+              issueId: input.issue.id,
+              recoveryActionId: input.action.id,
+              attemptCount: input.action.attemptCount,
+              maxAttempts: input.action.maxAttempts,
+            },
+            "recovery wake retirement/refund failed after retry",
+          );
+        }
+      }
       return;
     }
     const enqueueOrRefundAttempt: typeof deps.enqueueWakeup = async (agentId, opts) => {

@@ -653,6 +653,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(current).toMatchObject({ ownerAgentId: managerId, attemptCount: 0 });
   });
 
+  it("atomically retires an exhausted reservation so the backstop cannot redeliver it", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "atomic-retire-refund:fingerprint",
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+    });
+
+    await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "attempt_budget",
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: new Date("2026-08-26T00:00:00.000Z"),
+      cooldownMs: 30 * 60 * 1000,
+    });
+
+    expect(result).toMatchObject({ checked: 1, exhaustedSkipped: 1, healed: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [current] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(current).toMatchObject({
+      status: "escalated",
+      retiringBound: "attempt_budget",
+      attemptCount: action.attemptCount - 1,
+      nonDeliverySweepCount: 1,
+    });
+  });
+
   it.each([
     ["job_missing", "in_progress"],
     ["job_missing", "todo"],
