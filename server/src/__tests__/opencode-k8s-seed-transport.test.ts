@@ -483,9 +483,9 @@ describe("opencode_k8s production k8s-ro connector after idle", () => {
     expect(seed.type).toBe("http");
     const seedUrl = new URL(seed.url);
     expect(seedUrl.protocol).toBe("http:");
-    expect(seedUrl.hostname).toBe("kubernetes-mcp-server-readonly.paperclip.svc.cluster.local");
+    expect(seedUrl.hostname).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
     expect(seedUrl.port).toBe("8080");
-    expect(seedUrl.pathname).toBe("/mcp");
+    expect(seedUrl.pathname).toBe("/k8s-ro/mcp");
     const currentMcp = await startK8sMcpFixture();
     const currentPlan: PlannedCall[] = [
       { tool: "pods_list_in_namespace", arguments: { namespace: "hindsight" } },
