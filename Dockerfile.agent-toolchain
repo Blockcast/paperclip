@@ -112,11 +112,26 @@ RUN curl -fsSL https://sh.rustup.rs \
 # NOTE: fec-raptorq is deliberately NOT baked. It is a submodule of the multicast
 # repo, versioned with it, so a per-run `cargo build` in the workspace is correct
 # — which is what the writable CARGO_HOME below enables.
-ARG AMT_PROTOCOL_REF=main
+#
+# PINNED to an immutable commit, not a branch. This image's tag is content-derived
+# from this Dockerfile (scripts/container-base-tag.sh), so a floating ref would let
+# identical inputs produce a different library — breaking the reproducibility
+# contract the content-addressing exists to provide. The pin below is exactly the
+# commit multicast's own `amt-protocol` submodule points at, so the baked library
+# matches what the consuming repo expects. Bump both together, deliberately.
+ARG AMT_PROTOCOL_REF=ef1bf21a7b82e964dd336b8fe1f7204860c839d5
 RUN set -eux; \
-  git clone --depth 1 --branch "${AMT_PROTOCOL_REF}" \
-      https://github.com/Blockcast/amt-protocol.git /tmp/amt-protocol; \
-  git -C /tmp/amt-protocol rev-parse HEAD; \
+  mkdir -p /tmp/amt-protocol; \
+  git -C /tmp/amt-protocol init -q; \
+  git -C /tmp/amt-protocol remote add origin https://github.com/Blockcast/amt-protocol.git; \
+  git -C /tmp/amt-protocol fetch -q --depth 1 origin "${AMT_PROTOCOL_REF}"; \
+  git -C /tmp/amt-protocol checkout -q --detach FETCH_HEAD; \
+  resolved="$(git -C /tmp/amt-protocol rev-parse HEAD)"; \
+  echo "amt-protocol pinned=${AMT_PROTOCOL_REF} resolved=${resolved}"; \
+  if [ "${AMT_PROTOCOL_REF}" != "${resolved}" ]; then \
+    echo "ERROR: AMT_PROTOCOL_REF must be a full immutable commit SHA; '${AMT_PROTOCOL_REF}' resolved to ${resolved}" >&2; \
+    exit 1; \
+  fi; \
   cd /tmp/amt-protocol; \
   make ffi; \
   make install; \
