@@ -51,6 +51,20 @@ export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
  * a project has drifted into the ambiguous state and should be re-flagged.
  */
 export const PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC = "paperclip_project_primary_workspace_fallback_total";
+export const BACKSTOP_DEFERRED_CANDIDATES_METRIC = "paperclip_backstop_deferred_candidates";
+export const BACKSTOP_SWEEP_COMPLETED_METRIC = "paperclip_backstop_sweep_completed_total";
+export const BACKSTOP_CANDIDATES_SKIPPED_METRIC = "paperclip_backstop_candidates_skipped_total";
+export const BACKSTOP_SOURCES = [
+  "issue_graph_liveness.backstop",
+  "stranded_recovery_wake_backstop",
+] as const;
+export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
+export const BACKSTOP_SKIP_REASONS = [
+  "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
+  "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
+  "deferred_or_failed", "enqueue_failed",
+] as const;
+export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -129,6 +143,18 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
+// BLO-28865. Deliberately NOT a threshold over the pre-existing
+// EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC: that gauge is unlabelled and
+// measures reservation age only, so it cannot separate a stranded row from a
+// legitimately long run (measured 7d spread: ~93 min to ~9.0h, all healthy)
+// and cannot name the wedged agent. This gauge encodes the correlation in SQL
+// instead -- it only counts a reservation whose run is terminal or silent --
+// so the alert is a plain threshold over a series that is already 0 for a
+// healthy long run.
+export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
+  "paperclip_external_runtime_reservation_stranded_oldest_age_seconds";
+export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -370,6 +396,154 @@ export const GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC =
  */
 export const GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC =
   "paperclip_github_review_request_dead_letter_unresolved";
+
+/**
+ * Reviews the reviewer identity actually PUBLISHED to GitHub (BLO-27608).
+ *
+ * Every other GitHub review metric in this file is REQUEST-side: they count
+ * deliveries arriving, being queued, suppressed, deferred or dead-lettered.
+ * None of them can answer "did a review come out the other end". That gap is
+ * not theoretical — Ally was silently down fleet-wide for ~8.6h on 2026-08-12
+ * (codex provider unavailability, BLO-27123) and the request funnel read
+ * perfectly healthy throughout: `received 131 / queued 131 / suppressed 0 /
+ * deferred 0 / dead_lettered 0`. The runs were enqueued and dispatched; they
+ * died at the model call and produced no artifact. Nothing paged, because
+ * "enqueued" is exactly what a healthy fleet also looks like.
+ *
+ * WHERE THIS IS INCREMENTED, AND WHY IT IS NOT AT THE POST CALL. The control
+ * plane never posts a review: there is no `POST /pulls/{n}/reviews` anywhere in
+ * this server, and the only two GitHub writes it makes are a commit status and
+ * an issue back-link comment. Ally composes and posts its own review by running
+ * `gh pr review` inside its pod, so there is no in-process "the post succeeded"
+ * moment to hook. What the server does have is GitHub telling it the artifact
+ * exists, over the signed webhook — which is strictly stronger than
+ * instrumenting the caller would be: it is a first-party observation of the
+ * published review rather than the poster's own report that it published one.
+ * It is therefore incremented from the webhook receiver, once per delivery that
+ * carries a review authored by the configured reviewer identity.
+ *
+ * SCOPE IS DELIBERATELY THE REVIEWER IDENTITY ONLY — a human's review on one of
+ * our repos does NOT count here. The drought alert this feeds
+ * (`PaperclipGithubReviewOutputDrought`) is a bare
+ * `sum(increase(paperclip_github_review_posted_total[2h])) == 0`, with no label
+ * selector, so any series that can be fed by a non-Ally reviewer would let one
+ * human review during an Ally blackout hold the alert down. Keep this counter
+ * meaning "Ally published a review" and nothing else; if per-author breakdown is
+ * ever wanted, add a SEPARATE metric rather than a label here.
+ *
+ * BOTH SURFACES ARE COUNTED because Ally uses both and either one alone
+ * under-reports: measured, `Blockcast/paperclip#952` carries 4 comment-shaped
+ * reviews and 0 formal, while `#937` carries 4 formal and 0 comment-shaped.
+ * `surface="formal"` is a `pull_request_review.submitted` event;
+ * `surface="comment"` is an `issue_comment` whose body carries Ally's
+ * consolidated-review heading. The comment surface is the one that most needs a
+ * dedicated observation point: a CLEAN comment-shaped review resolves to no
+ * event context at all (`isActionablePrReviewComment` requires actionable
+ * findings), so it is invisible to every existing counter in this file.
+ *
+ * Cardinality: `surface` is closed at 2 and `repo` is bounded by the GitHub App
+ * installation's repository selection — signature verification means only our
+ * own installation can produce these deliveries, so `repo` is not
+ * caller-controlled free text. Measured 2026-08-16 the installation carries 98
+ * repositories, giving a worst case of 196 series if Ally ever reviewed in all
+ * of them; the live set is a single-digit subset. That is small enough to be
+ * worth the label, which is the one dimension an operator needs to answer "is
+ * the drought fleet-wide or one repo". PR number, review id and author stay on
+ * the structured log line, per the guardrail
+ * {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} documents.
+ *
+ * Redelivery: GitHub can redeliver a webhook, which would double-count here.
+ * That is accepted rather than deduped — this counter exists to distinguish
+ * "zero" from "non-zero" for a drought alert, where an over-count is harmless
+ * and the dedup state would have to be durable to help.
+ */
+export const GITHUB_REVIEW_POSTED_METRIC = "paperclip_github_review_posted_total";
+
+/**
+ * Which GitHub surface a published review was written to. Closed set — see
+ * {@link GITHUB_REVIEW_POSTED_METRIC} for why both are counted.
+ */
+export const KNOWN_GITHUB_REVIEW_SURFACES = ["formal", "comment"] as const;
+
+export type GithubReviewSurface = (typeof KNOWN_GITHUB_REVIEW_SURFACES)[number];
+
+export const UNKNOWN_GITHUB_REVIEW_REPO = "unknown";
+
+/**
+ * Coerce a webhook-supplied repository full name to a metric label. Only guards
+ * the missing/blank case: the value is already bounded by the installation (see
+ * the cardinality note on {@link GITHUB_REVIEW_POSTED_METRIC}), and an
+ * allow-list here would silently drop a newly-onboarded repo from the drought
+ * alert — failing open on coverage is worse than the bounded label growth.
+ */
+export function normalizeGithubReviewRepo(repo: string | null | undefined): string {
+  const trimmed = typeof repo === "string" ? repo.trim() : "";
+  return trimmed.length > 0 ? trimmed : UNKNOWN_GITHUB_REVIEW_REPO;
+}
+
+/**
+ * Terminal verdict of a reviewer run's completion evidence (BLO-27608), the
+ * companion to {@link GITHUB_REVIEW_POSTED_METRIC}.
+ *
+ * The drought alert asks "did any review get published". On its own that
+ * over-fires, because there are outcomes where publishing nothing is CORRECT:
+ * Ally declining to self-review a PR it authored (BLO-9293), a repo that has
+ * been archived, or a head that was already reviewed. A quiet period made
+ * entirely of those is healthy; a quiet period made of `missing` is an outage.
+ * Without this breakdown the two are indistinguishable, and intentional-skip
+ * volume masks a genuine drought.
+ *
+ * `status` mirrors `evaluatePrReviewCompletionEvidence`'s verdict exactly, and
+ * is recorded AFTER the authoritative GitHub re-verification that call sites
+ * apply — so a locally-`missing` run that GitHub then proves did post lands here
+ * as `posted_review`, matching what the run was actually credited with. The
+ * deliberate-skip outcomes are `self_review_skipped`, `already_reviewed` and
+ * `archived_repo_skipped`; the failure outcome is `missing`; `auth_expired` is a
+ * recoverable fault that is retried rather than either.
+ *
+ * Note this is RUN-side and therefore complementary to, not a substitute for,
+ * the webhook-observed counter: a run that dies at the model call never reaches
+ * a verdict at all, so it is silence here and silence there — which is exactly
+ * what the drought alert keys on.
+ *
+ * Cardinality: `status` is closed at the 6 verdicts below.
+ */
+export const GITHUB_REVIEW_COMPLETION_METRIC = "paperclip_github_review_completion_total";
+
+/**
+ * The reviewer-run completion verdicts. Closed set, mirroring
+ * `evaluatePrReviewCompletionEvidence`. `not_applicable` is deliberately absent:
+ * it means the run was not a reviewer run, which is not a review outcome.
+ */
+export const KNOWN_GITHUB_REVIEW_COMPLETION_STATUSES = [
+  "posted_review",
+  "already_reviewed",
+  "self_review_skipped",
+  "archived_repo_skipped",
+  "auth_expired",
+  "missing",
+] as const;
+
+export type GithubReviewCompletionStatus =
+  (typeof KNOWN_GITHUB_REVIEW_COMPLETION_STATUSES)[number];
+
+export const UNKNOWN_GITHUB_REVIEW_COMPLETION_STATUS = "other";
+
+const knownGithubReviewCompletionStatusSet: ReadonlySet<string> = new Set(
+  KNOWN_GITHUB_REVIEW_COMPLETION_STATUSES,
+);
+
+/**
+ * Coerce a completion verdict to the bounded label set. A future verdict added
+ * to `evaluatePrReviewCompletionEvidence` collapses to
+ * {@link UNKNOWN_GITHUB_REVIEW_COMPLETION_STATUS} rather than inflating
+ * cardinality before this allow-list is updated.
+ */
+export function normalizeGithubReviewCompletionStatus(status: string | null | undefined): string {
+  return typeof status === "string" && knownGithubReviewCompletionStatusSet.has(status)
+    ? status
+    : UNKNOWN_GITHUB_REVIEW_COMPLETION_STATUS;
+}
 
 /**
  * Restart-safe gauge of `agent_wakeup_requests` rows sitting in the terminal
@@ -1101,6 +1275,8 @@ let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
+let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
+let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -1110,6 +1286,8 @@ let orphanedManagedPodReaped: Counter<"adapter"> | null = null;
 let githubReviewRequestDelivery: Counter<"state" | "reason"> | null = null;
 let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
+let githubReviewPosted: Counter<"repo" | "surface"> | null = null;
+let githubReviewCompletion: Counter<"status"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
@@ -1125,6 +1303,9 @@ let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
 let agentErrorDuration: Gauge<"agent_id"> | null = null;
 let projectPrimaryWorkspaceFallback: Counter | null = null;
+let backstopDeferredCandidates: Gauge<"source"> | null = null;
+let backstopSweepCompleted: Counter<"source"> | null = null;
+let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -1146,6 +1327,8 @@ function ensureRegistry(): {
   githubReviewRequestDeliveryCounter: Counter<"state" | "reason">;
   githubReviewRequestSuppressionCounter: Counter<"cause" | "reason">;
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
+  githubReviewPostedCounter: Counter<"repo" | "surface">;
+  githubReviewCompletionCounter: Counter<"status">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
@@ -1157,11 +1340,16 @@ function ensureRegistry(): {
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
+  externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
+  externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
   agentErrorDurationGauge: Gauge<"agent_id">;
   projectPrimaryWorkspaceFallbackCounter: Counter;
+  backstopDeferredCandidatesGauge: Gauge<"source">;
+  backstopSweepCompletedCounter: Counter<"source">;
+  backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
 } {
   if (
     !registry
@@ -1175,6 +1363,8 @@ function ensureRegistry(): {
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
     || !queuedRunAgeMetricsRefreshSuccess
+    || !externalRuntimeReservationStrandedOldestAge
+    || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -1184,6 +1374,8 @@ function ensureRegistry(): {
     || !githubReviewRequestDelivery
     || !githubReviewRequestSuppression
     || !githubReviewRequestDeadLetterUnresolved
+    || !githubReviewPosted
+    || !githubReviewCompletion
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
@@ -1199,6 +1391,9 @@ function ensureRegistry(): {
     || !agentHeartbeatInterval
     || !agentErrorDuration
     || !projectPrimaryWorkspaceFallback
+    || !backstopDeferredCandidates
+    || !backstopSweepCompleted
+    || !backstopCandidatesSkipped
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1296,6 +1491,30 @@ function ensureRegistry(): {
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess.set(0);
+    externalRuntimeReservationStrandedOldestAge = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest STRANDED unreleased external-runtime reservation for an agent "
+        + "(BLO-28865). Stranded means the reservation's heartbeat run is already terminal, or the run "
+        + "is non-terminal but has emitted nothing past the hard-stale floor. A legitimately "
+        + "long-running run is neither, so it contributes 0 -- that is the whole point, and the reason "
+        + "this exists alongside " + EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC + " rather than "
+        + "being a threshold over it: that gauge is unlabelled and measures age alone, which cannot "
+        + "distinguish a wedge from a long run. Reset-then-set every refresh so an agent whose "
+        + "reservation is released reads back an explicit 0 rather than a frozen stale value or an "
+        + "absent series (an absent series and 'nothing stuck' render identically). Labeled by bounded "
+        + "agent_id so the alert names who is wedged.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    externalRuntimeReservationStrandMetricsRefreshSuccess = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent stranded-reservation database refresh completed before metrics "
+        + "exposition; 0 when it failed, so stale strand ages cannot be read as fresh.",
+      registers: [registry],
+    });
+    externalRuntimeReservationStrandMetricsRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -1439,6 +1658,59 @@ function ensureRegistry(): {
     // missing series would render identically to a stalled reconciler.
     for (const reason of [...KNOWN_GITHUB_WAKE_REASONS, UNKNOWN_GITHUB_WAKE_REASON]) {
       githubReviewRequestDeadLetterUnresolved.set({ reason }, 0);
+    }
+    githubReviewPosted = new Counter({
+      name: GITHUB_REVIEW_POSTED_METRIC,
+      help:
+        "Count of PR reviews the configured reviewer identity actually PUBLISHED to GitHub, "
+        + "observed from the signed webhook once per delivery (BLO-27608). This is the "
+        + "OUTPUT-side companion to "
+        + GITHUB_REVIEW_REQUEST_DELIVERY_METRIC
+        + ", which is entirely request-side and reads healthy through a total review blackout "
+        + "(the runs enqueue and dispatch, then die at the model call producing no artifact). "
+        + "surface='formal' is a pull_request_review.submitted event; surface='comment' is an "
+        + "issue_comment carrying Ally's consolidated-review heading — both are counted because "
+        + "Ally uses both and either alone under-reports. Scoped to the reviewer identity only: "
+        + "a human review must not hold the drought alert down. Redeliveries may double-count; "
+        + "this counter is built to separate zero from non-zero, not to be an exact tally.",
+      labelNames: ["repo", "surface"],
+      registers: [registry],
+    });
+    // Zero-initialize both surfaces under the placeholder repo. This is not
+    // cosmetic here, it is what makes the drought alert able to fire at all:
+    // `PaperclipGithubReviewOutputDrought` keys on
+    // `sum(increase(paperclip_github_review_posted_total[2h])) == 0`, and an
+    // ABSENT series makes that inner expression an empty vector, so the `and`
+    // yields nothing and the alert stays silent. Absent and zero are the same
+    // rendering and opposite meanings, and the case where they diverge — no
+    // review has been posted since this pod started — is exactly the outage.
+    // 2 constant-zero series.
+    for (const surface of KNOWN_GITHUB_REVIEW_SURFACES) {
+      githubReviewPosted.inc({ repo: UNKNOWN_GITHUB_REVIEW_REPO, surface }, 0);
+    }
+    githubReviewCompletion = new Counter({
+      name: GITHUB_REVIEW_COMPLETION_METRIC,
+      help:
+        "Terminal verdict of each reviewer run's completion evidence (BLO-27608), recorded "
+        + "after the authoritative GitHub re-verification the call sites apply. Distinguishes a "
+        + "DELIBERATE non-post — self_review_skipped (Ally declining to review its own PR, "
+        + "BLO-9293), already_reviewed, archived_repo_skipped — from a FAILURE to produce output "
+        + "(missing). Without that split, intentional-skip volume is indistinguishable from a "
+        + "genuine drought on "
+        + GITHUB_REVIEW_POSTED_METRIC
+        + ". auth_expired is a recoverable fault that is retried rather than either. A run that "
+        + "dies before completing never reaches a verdict, so an outage is silence here too.",
+      labelNames: ["status"],
+      registers: [registry],
+    });
+    // Same absent-vs-zero reasoning as above, over the closed verdict set: a
+    // healthy fleet must render 0 on the skip/failure panels rather than "No
+    // data". 7 constant-zero series.
+    for (const status of [
+      ...KNOWN_GITHUB_REVIEW_COMPLETION_STATUSES,
+      UNKNOWN_GITHUB_REVIEW_COMPLETION_STATUS,
+    ]) {
+      githubReviewCompletion.inc({ status }, 0);
     }
     agentWakeupTerminalFailedUnresolved = new Gauge({
       name: AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
@@ -1652,6 +1924,27 @@ function ensureRegistry(): {
       registers: [registry],
     });
     projectPrimaryWorkspaceFallback.inc(0);
+    backstopDeferredCandidates = new Gauge({
+      name: BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+      help: "Current number of backstop candidates deferred beyond the page limit.",
+      labelNames: ["source"],
+      registers: [registry],
+    });
+    backstopSweepCompleted = new Counter({
+      name: BACKSTOP_SWEEP_COMPLETED_METRIC,
+      help: "Completed backstop sweeps, labeled by stream.",
+      labelNames: ["source"],
+      registers: [registry],
+    });
+    backstopCandidatesSkipped = new Counter({
+      name: BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+      help: "Backstop candidates skipped by a bounded decision reason.",
+      labelNames: ["source", "reason"],
+      registers: [registry],
+    });
+    for (const source of BACKSTOP_SOURCES) {
+      backstopDeferredCandidates.set({ source }, 0);
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -1668,6 +1961,9 @@ function ensureRegistry(): {
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
+    externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
+    externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
+      externalRuntimeReservationStrandMetricsRefreshSuccess,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -1677,6 +1973,8 @@ function ensureRegistry(): {
     githubReviewRequestDeliveryCounter: githubReviewRequestDelivery,
     githubReviewRequestSuppressionCounter: githubReviewRequestSuppression,
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
+    githubReviewPostedCounter: githubReviewPosted,
+    githubReviewCompletionCounter: githubReviewCompletion,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
@@ -1692,6 +1990,9 @@ function ensureRegistry(): {
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
     agentErrorDurationGauge: agentErrorDuration,
     projectPrimaryWorkspaceFallbackCounter: projectPrimaryWorkspaceFallback,
+    backstopDeferredCandidatesGauge: backstopDeferredCandidates,
+    backstopSweepCompletedCounter: backstopSweepCompleted,
+    backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
   };
 }
 
@@ -1882,7 +2183,19 @@ export function recordAgentZeroTokenCompletedRunStreak(
   return { ...labels, streak };
 }
 
-const EXTERNAL_RUNTIME_RESERVATION_EVENTS = new Set(["reserved", "contended", "launching", "launched", "released"]);
+const EXTERNAL_RUNTIME_RESERVATION_EVENTS = new Set([
+  "reserved",
+  "contended",
+  "launching",
+  "launched",
+  "released",
+  // BLO-28865. Distinct from every other label here: the rest are lifecycle
+  // transitions, this one is a fault -- a launch arriving under a Job name the
+  // reservation was not launched with (the adapter-type strand). It is
+  // enumerated rather than left to fall through to "other" precisely so it can
+  // be alerted and graphed on its own.
+  "name_mismatch",
+]);
 
 export function recordExternalRuntimeReservationEvent(event: string): string {
   const normalized = EXTERNAL_RUNTIME_RESERVATION_EVENTS.has(event) ? event : "other";
@@ -1950,6 +2263,38 @@ export function setScheduledRetryParkHorizonMetrics(
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
   ensureRegistry().scheduledRetryParkHorizonRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the oldest STRANDED external-runtime reservation age per known agent
+ * (BLO-28865). Same reset-then-set contract as
+ * {@link setQueuedRunOldestAgeMetrics}, and for the same reason: an agent whose
+ * reservation is released must read 0 rather than retaining an age that would
+ * hold the strand alert open forever.
+ */
+export function setExternalRuntimeReservationStrandedOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().externalRuntimeReservationStrandedOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/** Mark whether the stranded-reservation gauge was refreshed from the database. */
+export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().externalRuntimeReservationStrandMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -2094,6 +2439,44 @@ export function recordGithubReviewRequestSuppressed(input: {
   registry.githubReviewRequestDeliveryCounter.inc({ state: "suppressed", reason });
   registry.githubReviewRequestSuppressionCounter.inc({ cause, reason });
   return { state: "suppressed", reason, cause };
+}
+
+/**
+ * Record one PR review the reviewer identity published to GitHub (BLO-27608).
+ *
+ * Called from the webhook receiver on a signed delivery that carries a review
+ * authored by the configured reviewer identity — see
+ * {@link GITHUB_REVIEW_POSTED_METRIC} for why the observation point is the
+ * webhook rather than a post call (the control plane never posts a review), and
+ * why a human reviewer must never reach this counter.
+ */
+export function recordGithubReviewPosted(input: {
+  repo: string | null | undefined;
+  surface: GithubReviewSurface;
+}): { repo: string; surface: string } {
+  const labels = {
+    repo: normalizeGithubReviewRepo(input.repo),
+    surface: input.surface,
+  };
+  ensureRegistry().githubReviewPostedCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Record the terminal verdict of one reviewer run (BLO-27608).
+ *
+ * Call this with the FINAL verdict, after any authoritative GitHub
+ * re-verification the call site performs — recording the pre-verification value
+ * would count a `missing` that GitHub then proved was a real posted review, and
+ * the run is credited the other way. `not_applicable` (the run was not a
+ * reviewer run) is dropped rather than counted, since it is not a review
+ * outcome.
+ */
+export function recordGithubReviewCompletion(status: string | null | undefined): string | null {
+  if (status === "not_applicable") return null;
+  const label = normalizeGithubReviewCompletionStatus(status);
+  ensureRegistry().githubReviewCompletionCounter.inc({ status: label });
+  return label;
 }
 
 /**
@@ -2381,6 +2764,18 @@ export function recordProjectPrimaryWorkspaceFallback(projectId: string): void {
   );
 }
 
+export function setBackstopDeferredCandidates(source: BackstopSource, value: number): void {
+  ensureRegistry().backstopDeferredCandidatesGauge.set({ source }, Math.max(0, value));
+}
+
+export function recordBackstopSweepCompleted(source: BackstopSource): void {
+  ensureRegistry().backstopSweepCompletedCounter.inc({ source });
+}
+
+export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
+  ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -2427,6 +2822,8 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
   queuedRunAgeMetricsRefreshSuccess = null;
+  externalRuntimeReservationStrandedOldestAge = null;
+  externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -2451,6 +2848,9 @@ export function __resetMetricsForTest(): void {
   agentHeartbeatInterval = null;
   agentErrorDuration = null;
   projectPrimaryWorkspaceFallback = null;
+  backstopDeferredCandidates = null;
+  backstopSweepCompleted = null;
+  backstopCandidatesSkipped = null;
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();

@@ -556,6 +556,14 @@ prometheusRule:
   scheduledRetryParkHorizonRefreshFailureFor: 5m
   # -- Runbook for the scheduled-retry park-horizon and freshness alerts.
   scheduledRetryParkHorizonRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#scheduled-retry-park-horizon-blo-25036"
+  # -- How long a STRANDED external-runtime reservation may sit before firing (BLO-28865). Compared against paperclip_external_runtime_reservation_stranded_oldest_age_seconds, which the server publishes only for reservations whose run is terminal or silent past the 45m hard-stale floor -- the strand condition is evaluated in SQL, so this is a plain age threshold and NOT the naive "oldest reservation age > 45m" rule the issue explicitly rules out. Set to 900 (15m): the pre-fix wedge resolved incidentally at the 45m hard-stale boundary, so a useful page must land well inside that. `for:` below stacks on top, so real fire time is 900 + 300 = 1200s (20m), still comfortably ahead of 45m.
+  externalRuntimeReservationStrandedAgeSeconds: 900
+  # -- Scrape-flap tolerance only (BLO-28865). The ageing lives in externalRuntimeReservationStrandedAgeSeconds above; it stacks on top of that threshold rather than testing independently.
+  externalRuntimeReservationStrandedFor: 5m
+  # -- Alert only after sustained failed refreshes; a one-off failed scrape is logged and retried on the next scrape.
+  externalRuntimeReservationStrandMetricsRefreshFailureFor: 5m
+  # -- Runbook for the stranded-reservation and metric-freshness alerts, linked from their annotations.
+  externalRuntimeReservationStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/external-runtime-reservation-stranded.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- How long an installed plugin may sit at status='error' before firing (BLO-21092/BLO-20410). Long enough to ride out a deploy's brief activation retries (BLO-978 makes activation timeouts retry rather than latch), short enough that a genuinely dead plugin -- a bad manifest, an expired credential in `initialize` -- pages within the hour. Unlike the wake-terminal-failed alert above, a plain `for:` is safe here: paperclip_plugin_error already carries plugin_id/plugin_key labels, so Prometheus tracks continuity per plugin series rather than summing plugins together.

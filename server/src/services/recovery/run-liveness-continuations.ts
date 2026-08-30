@@ -4,6 +4,7 @@ import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai
 import type { RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
+import { WAKE_IDEMPOTENCY_RECEIPT_STATUSES } from "../wake-idempotency.js";
 
 export const RUN_LIVENESS_CONTINUATION_REASON = RECOVERY_REASON_KINDS.runLivenessContinuation;
 export const DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS = 2;
@@ -13,18 +14,7 @@ const CONTINUATION_ACTIVE_ISSUE_STATUSES = new Set(["todo", "in_progress"]);
 // A prior adapter error should not permanently suppress bounded liveness
 // continuations; the max-attempt/idempotency guards prevent unbounded retries.
 const CONTINUATION_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
-// `claimed` is a DELIVERED state, not a pending one: a wake reaches it only
-// once a worker has picked its run up (see setWakeupStatus(..., "claimed") in
-// heartbeat.ts). Omitting it made a wake that was delivered *and already
-// running* read as undelivered, so both readers of this set would hand out a
-// second run for a delivery that had plainly succeeded (BLO-25726, Ally review
-// on #1313).
-//
-// This does not over-suppress the continuation path that reads it here: the
-// key is minted per `nextAttempt`, so a later attempt carries a different key
-// and is unaffected -- only a duplicate of the exact attempt already running
-// is skipped.
-const IDEMPOTENT_WAKE_STATUSES = ["queued", "claimed", "deferred_issue_execution", "completed"];
+const IDEMPOTENT_WAKE_STATUSES = [...WAKE_IDEMPOTENCY_RECEIPT_STATUSES];
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<

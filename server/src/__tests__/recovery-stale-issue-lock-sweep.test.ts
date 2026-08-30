@@ -24,7 +24,20 @@ import {
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
+// BLO-30087: the sweeper now corroborates output-silence with pod CPU before it
+// frees a `running` holder's lock. Default "unknown" reproduces the pre-change
+// behaviour exactly, so every pre-existing case in this file is unaffected.
+const mockProbeAgentPodActivity = vi.hoisted(() => vi.fn(async () => "unknown" as string));
+vi.mock("../services/k8s-job-liveness.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/k8s-job-liveness.ts")>();
+  return { ...actual, probeAgentPodActivity: mockProbeAgentPodActivity };
+});
+
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
+import { AGENT_POD_BUSY_MAX_STALE_MS } from "../services/k8s-job-liveness.ts";
+import { STALE_RUNNING_ISSUE_LOCK_MS } from "../services/recovery/service.ts";
+import { NON_LIVE_EXECUTION_SILENCE_MS } from "../services/productivity-review.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -62,6 +75,9 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companies);
+    // BLO-30087: back to "no positive busy evidence" so a busy-pod case cannot
+    // leak into the pre-existing cases, which all assume silence == dead.
+    mockProbeAgentPodActivity.mockImplementation(async () => "unknown");
   });
 
   afterAll(async () => {
@@ -1445,8 +1461,240 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(details?.runningLockSilentMs).toBeGreaterThanOrEqual(3 * 60 * 60 * 1000);
   });
 
-  it("preserves a holder whose useful-action stamp is stale but whose output is fresh (BLO-19848)", async () => {
-    // The three activity columns are independent stamps, not a priority chain.
+  // BLO-30087 — the seam between the hard-stale reaper and this sweeper.
+  //
+  // Both components were individually well tested and both suites passed while
+  // the bug was live, because each tested its own half in isolation:
+  //   * the sweeper suite asserts the holder run is left `running` when its lock
+  //     is cleared, and calls that non-destructive SAFETY.
+  //   * the reaper suite (heartbeat-hard-stale-subprocess-liveness) asserts a
+  //     busy-pod run SURVIVES, and never asserts it still owns its lock.
+  // Neither asked what a sibling can do next. These cases cross that seam.
+  describe("busy-pod holders (BLO-30087)", () => {
+    // Inside the window the bug opened: past the sweeper's 2h bound, under the
+    // reaper's 3h busy ceiling. Pre-fix this cleared the lock of a run the
+    // reaper was deliberately keeping alive.
+    const SILENT_INSIDE_WINDOW_MS = 2.5 * 60 * 60 * 1000;
+
+    it("keeps the lock of a silent holder whose pod is busy, and a sibling still cannot acquire it", async () => {
+      const { companyId, agentId } = await seed();
+      const { wedgedRunId, issueId } = await seedWedgedRunningIssue({
+        companyId,
+        agentId,
+        lastOutputAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lastUsefulActionAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      });
+      mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+      expect(result.cleared).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      // (a) the lock is intact.
+      const row = await db
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({ checkoutRunId: wedgedRunId, executionRunId: wedgedRunId });
+
+      // (b) — the assertion that actually pins the bug. Asserting only (a)
+      // reproduces the isolation blind spot: what made BLO-30087 bite was a
+      // SIBLING getting a legitimate clean acquire on an unlocked row and then
+      // sharing the still-writing holder's workspace. A second run of the same
+      // agent must be refused.
+      const siblingRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: siblingRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "assignment",
+        startedAt: new Date(),
+      });
+      await expect(
+        issueService(db).checkout(issueId, agentId, ["in_progress"], siblingRunId),
+      ).rejects.toMatchObject({ status: 409 });
+
+      // And the lock still belongs to the original holder afterwards.
+      const afterCheckout = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(afterCheckout?.executionRunId).toBe(wedgedRunId);
+    });
+
+    it("still clears the lock of a busy-looking holder past the busy ceiling", async () => {
+      // The zombie bound: a run wedged in a CPU-burning spin loop looks "busy"
+      // forever. Past the shared ceiling it loses the lock regardless, exactly
+      // as the reaper kills it regardless — so BLO-19941 reclamation keeps a
+      // bound and a spin-looping pod cannot hold an issue hostage indefinitely.
+      const { companyId, agentId } = await seed();
+      const silentFor = AGENT_POD_BUSY_MAX_STALE_MS + 10 * 60 * 1000;
+      const { issueId } = await seedWedgedRunningIssue({
+        companyId,
+        agentId,
+        lastOutputAt: new Date(Date.now() - silentFor),
+        lastUsefulActionAt: new Date(Date.now() - silentFor),
+        lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      });
+      mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+      expect(result.cleared).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+    });
+
+    // Why the in-transaction revalidation does NOT need to re-check the busy
+    // ceiling — reviewed and asserted rather than left to inference.
+    //
+    // `currentRunningLockSilent` reads the memoized busy verdict without
+    // re-deriving the ceiling, which reads like a hole: a holder probed at 2h30m
+    // could be past the 3h ceiling by the time the transaction revalidates, and
+    // a memoized "spared" would then preserve a zombie's lock. It cannot,
+    // because being spared and reaching the transaction are mutually exclusive:
+    //
+    //   executionLockExpired = isPreClaimLockExpired(...) || runningLockSilent
+    //   runningLockSilent    = isRunningLockSilent(...) && !isBusySparedRunningHolder(...)
+    //
+    // and a non-cleanable `running` holder that is not expired hits `continue`
+    // before `db.transaction` is ever opened. So a `running` holder only reaches
+    // the transaction when the busy spare returned FALSE, which means the memo
+    // for that run is `false` or absent exactly when the branch is evaluated.
+    // The `=== true` arm is defensive, not load-bearing.
+    //
+    // That guarantee lives in the ordering of two guards ~150 lines apart, and
+    // nothing enforced it. This case does: let a spared holder into the
+    // transaction and the branch stops being a no-op and becomes the bug it is
+    // mistaken for.
+    it("never lets a spared busy holder reach the sweep transaction", async () => {
+      const { companyId, agentId } = await seed();
+      // Spared: busy pod, inside the band.
+      const busy = await seedWedgedRunningIssue({
+        companyId,
+        agentId,
+        lastOutputAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lastUsefulActionAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      });
+      // Control, so the negative assertion below cannot pass vacuously: same
+      // fixture, same band, but no positive busy evidence. This one MUST reach
+      // the transaction and be cleared — proving the hook fires at all.
+      const idle = await seedWedgedRunningIssue({
+        companyId,
+        agentId,
+        lastOutputAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lastUsefulActionAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+        lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      });
+      mockProbeAgentPodActivity.mockImplementation(async (runId: string) =>
+        runId === busy.wedgedRunId ? "busy" : "idle",
+      );
+
+      const reachedTransaction: string[] = [];
+      const heartbeat = heartbeatService(db, {
+        beforeStaleIssueLockSweepClearForTest: async (issue) => {
+          reachedTransaction.push(issue.id);
+        },
+      });
+      const result = await heartbeat.sweepStaleIssueLocks();
+
+      // The spared holder is filtered out before the transaction opens.
+      expect(reachedTransaction).not.toContain(busy.issueId);
+      // The control did open a transaction and was cleared.
+      expect(reachedTransaction).toContain(idle.issueId);
+      expect(result.cleared).toBe(1);
+      expect(result.issueIds).toEqual([idle.issueId]);
+
+      // And the spared holder still owns every lock column.
+      const row = await db
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, busy.issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        checkoutRunId: busy.wedgedRunId,
+        executionRunId: busy.wedgedRunId,
+      });
+    });
+
+    // Regression guards: a genuinely wedged holder is still reclaimed on the
+    // existing schedule. `idle` is positive evidence of wedging; `unknown` is
+    // the no-metrics-server case and must degrade to byte-for-byte pre-change
+    // behaviour, matching the fail-closed posture PR #1465 adopted.
+    for (const activity of ["idle", "unknown"] as const) {
+      it(`clears the lock of a silent holder whose pod reports ${activity}`, async () => {
+        const { companyId, agentId } = await seed();
+        const { wedgedRunId, issueId } = await seedWedgedRunningIssue({
+          companyId,
+          agentId,
+          lastOutputAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+          lastUsefulActionAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+          lockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+        });
+        mockProbeAgentPodActivity.mockImplementation(async () => activity);
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+        expect(result.cleared).toBe(1);
+        expect(result.issueIds).toEqual([issueId]);
+
+        const row = await db
+          .select({
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+            executionLockedAt: issues.executionLockedAt,
+          })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]);
+        expect(row).toEqual({ checkoutRunId: null, executionRunId: null, executionLockedAt: null });
+
+        // BLO-22060 accounting is unchanged on this path.
+        const run = await db
+          .select({
+            status: heartbeatRuns.status,
+            issueLockReleaseCount: heartbeatRuns.issueLockReleaseCount,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, wedgedRunId))
+          .then((rows) => rows[0]);
+        expect(run?.status).toBe("running");
+        expect(run?.issueLockReleaseCount).toBe(1);
+
+        const audit = await db
+          .select({ details: activityLog.details })
+          .from(activityLog)
+          .where(eq(activityLog.action, "issue.stale_lock_cleared"))
+          .then((rows) => rows[0]);
+        expect((audit?.details as { reason?: string } | null)?.reason).toBe("running_lock_silent");
+      });
+    }
+
+    // Constant-drift guard. BLO-30087 was a disagreement between two bounds
+    // that were never asserted against each other, and the 45min/2h/3h
+    // relationship inverted silently when PR #1465 raised the reaper's ceiling.
+    it("pins the relationship between all three silence bounds", () => {
+      // The sweeper fires BEFORE the busy ceiling — that gap IS the window the
+      // busy-pod check above now covers. If a future edit closes it by raising
+      // the sweeper's bound instead, this fails and the busy-pod cases become
+      // dead code that would silently stop testing anything.
+      expect(STALE_RUNNING_ISSUE_LOCK_MS).toBeLessThan(AGENT_POD_BUSY_MAX_STALE_MS);
+      // productivity-review.ts documents NON_LIVE_EXECUTION_SILENCE_MS as
+      // "matches STALE_RUNNING_ISSUE_LOCK_MS" but keeps it as a local constant
+      // to avoid coupling. Nothing enforced that until now.
+      expect(NON_LIVE_EXECUTION_SILENCE_MS).toBe(STALE_RUNNING_ISSUE_LOCK_MS);
+    });
+  });
+
+  it("preserves a holder whose useful-action stamp is stale but whose output is fresh (BLO-19848)", async () => {    // The three activity columns are independent stamps, not a priority chain.
     // A `??` chain returns the FIRST non-null, so a 5h-old lastUsefulActionAt
     // masked a 1-minute-old lastOutputAt and classified a demonstrably live run
     // as silent — clearing the lock out from under it. Both the pre-transaction

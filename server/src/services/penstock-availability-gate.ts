@@ -49,6 +49,11 @@ export type PenstockAvailabilityGateResult =
 export interface PenstockAvailabilityGate {
   checkAdapter(input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult>;
   _resetForTesting(): void;
+  /**
+   * Resident verdict-cache entries. Test-only, and optional so the hand-rolled
+   * gate fakes in the heartbeat suites do not have to implement it.
+   */
+  _cacheSizeForTesting?(): number;
 }
 
 interface CacheEntry {
@@ -83,15 +88,25 @@ interface CacheEntry {
  * not start, and a `/v1/pools/default/capacity` readback that was green for
  * one credential was green for all of them.
  *
- * Hashed, not embedded: this string is a Map key that reaches logs and heap
- * dumps, and a bearer token has no business in either. A truncated SHA-256 is
- * sufficient -- the key needs to *distinguish* credentials, not authenticate
- * them, and collisions here are the pre-existing behaviour rather than a new
- * failure.
+ * Hashed, not embedded: this string is held in a Map for the life of the
+ * process, so it reaches heap dumps and anything else that walks live objects,
+ * and a bearer token has no business there. (Logs are not the reason -- no
+ * payload in this module carries the key -- and the heap-dump rationale stands
+ * on its own.) A truncated SHA-256 is sufficient: the key needs to
+ * *distinguish* credentials, not authenticate them, and a collision degrades
+ * to the pre-existing shared-entry behaviour rather than to a new failure.
  *
- * Cost: probes now scale with distinct credentials rather than with distinct
- * (endpoint, model) pairs. Each is one cached GET bounded by `cacheTtlMs`, so
- * the ceiling is one probe per credential per TTL.
+ * Cost, in probes: these now scale with distinct credentials rather than with
+ * distinct (endpoint, model) pairs. Each is one cached GET bounded by
+ * `cacheTtlMs`, so the ceiling is one probe per credential per TTL.
+ *
+ * Cost, in resident entries (PEN-2462): the same widening makes the key space
+ * open-ended over the process lifetime. A rotated or retired token is never
+ * probed again, but nothing gives its entry a reason to leave, and the gate is
+ * constructed once per process (`createPenstockAvailabilityGate`, called from
+ * `heartbeatService`) -- so that tail would accumulate until restart.
+ * `sweepExpiredCapacityCacheEntries` is what bounds it; the argument for why
+ * that suffices is there.
  */
 function penstockCapacityCacheKey(input: {
   capacityUrl: URL;
@@ -106,6 +121,42 @@ function penstockCapacityCacheKey(input: {
     input.model,
     credential,
   ].join("::");
+}
+
+/**
+ * Reclaim verdict-cache entries that are already unreachable (PEN-2462).
+ *
+ * Behaviour-preserving by construction: `checkAdapter` will only serve an
+ * entry while `nowMs - fetchedAt < cacheTtlMs`, so an entry at or past the TTL
+ * can never be returned again. Deleting it frees memory and changes no
+ * verdict. (An entry with a `fetchedAt` ahead of `nowMs` yields a negative
+ * age and is kept, so a caller-supplied clock that goes backwards costs at
+ * most a stale entry, never a wrong one.)
+ *
+ * This is what bounds the map, and sweeping at `set` is enough on its own -- a
+ * size cap would be redundant. A `set` only ever follows a non-hit, and a hit
+ * is served for a TTL after each write, so a credential can hold at most one
+ * entry within a TTL window. (It may be *written* more than once -- a deny
+ * whose `resumeAt` has elapsed re-probes while still inside the TTL -- but
+ * that overwrites in place under the same key and does not add residency.)
+ * The survivors of a sweep are therefore exactly the credentials probed within
+ * the last TTL: residency is bounded by the credentials *actively probing*,
+ * not by every credential the process has ever seen -- which is the bound the
+ * credential dimension took away.
+ *
+ * Note that `cache.delete(key)` on the stale-read branch would not achieve
+ * this. A key only comes back around when its credential is still in use, so
+ * the retired-credential tail is precisely the part such a delete never
+ * reaches.
+ */
+function sweepExpiredCapacityCacheEntries(
+  cache: Map<string, CacheEntry>,
+  nowMs: number,
+  cacheTtlMs: number,
+): void {
+  for (const [key, entry] of cache) {
+    if (nowMs - entry.fetchedAt >= cacheTtlMs) cache.delete(key);
+  }
 }
 
 interface ResolvedPenstockCheck {
@@ -191,11 +242,15 @@ export function createPenstockAvailabilityGate(
           : // No secondary probe for this provider: fail open, which is the
             // pre-existing behaviour for any adapter this gate did not cover.
             ({ allow: true } as PenstockAvailabilityGateResult));
+      sweepExpiredCapacityCacheEntries(cache, nowMs, cacheTtlMs);
       cache.set(key, { fetchedAt: nowMs, result });
       return result;
     },
     _resetForTesting() {
       cache.clear();
+    },
+    _cacheSizeForTesting() {
+      return cache.size;
     },
   };
 }

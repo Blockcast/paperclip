@@ -167,6 +167,7 @@ import { executionWorkspaceService as executionWorkspaceServiceDirect } from "..
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { issueEfficiencyService } from "../services/issue-efficiency.js";
 import {
@@ -174,6 +175,8 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  listBlockedDependentIssueIds,
+  recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.js";
 import {
   authorizationBoundaryLabel,
@@ -181,6 +184,7 @@ import {
   commentAuthorCanGrantIssueMention,
   getActiveCompanyMembership,
 } from "../services/authorization.js";
+import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -215,6 +219,14 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  enqueueCommentEffects,
+  getEffectResult,
+  hasCommentEffects,
+  processCommentEffects,
+  type CommentEffectIntent,
+  type CommentEffectRow,
+} from "../services/issue-comment-effects.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -3058,6 +3070,7 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    registerCommentEffectProcessor?: (processor: (commentId: string) => Promise<unknown>) => void;
   } = {},
 ) {
   const router = Router();
@@ -3944,6 +3957,245 @@ export function issueRoutes(
       });
     }
   }
+
+  type PersistedCommentActor = {
+    actorType: "agent" | "user";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    agentApiKeyId: string | null;
+  };
+
+  function persistedCommentActor(actor: ReturnType<typeof getActorInfo>): PersistedCommentActor {
+    return {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId ?? null,
+      runId: actor.runId ?? null,
+      agentApiKeyId: actor.agentApiKeyId ?? null,
+    };
+  }
+
+  async function buildKeyedCommentEffectIntents(input: {
+    issue: IssueRouteSnapshot;
+    comment: typeof issueComments.$inferSelect;
+    actor: ReturnType<typeof getActorInfo>;
+    referenceSummaryBefore: Awaited<ReturnType<typeof issueReferencesSvc.listIssueReferenceSummary>>;
+  }): Promise<CommentEffectIntent[]> {
+    const actor = persistedCommentActor(input.actor);
+    const effects: CommentEffectIntent[] = [
+      {
+        effectKind: "references_sync",
+        effectKey: "references_sync",
+        payload: { referenceSummaryBefore: input.referenceSummaryBefore },
+      },
+      { effectKind: "comment_activity", effectKey: "comment_activity", payload: { actor } },
+      { effectKind: "interaction_expiry", effectKey: "interaction_expiry", payload: { actor } },
+      { effectKind: "recovery_revalidation", effectKey: "recovery_revalidation", payload: { actor } },
+    ];
+
+    const wakeups = new Map<string, { agentId: string; wakeup: IssueWakeupRequest }>();
+    const assigneeId = input.issue.assigneeAgentId;
+    const selfComment = actor.actorType === "agent" && actor.actorId === assigneeId;
+    if (assigneeId && !selfComment && !isClosedIssueStatus(input.issue.status)) {
+      wakeups.set(`${assigneeId}:${input.issue.id}`, {
+        agentId: assigneeId,
+        wakeup: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: { issueId: input.issue.id, commentId: input.comment.id, mutation: "comment" },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${input.comment.id}:assignee:${assigneeId}`,
+          contextSnapshot: {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            commentId: input.comment.id,
+            wakeCommentId: input.comment.id,
+            source: "issue.comment",
+            wakeReason: "issue_commented",
+          },
+        },
+      });
+    }
+
+    const mentionedIds = await svc.findMentionedAgents(input.issue.companyId, input.comment.body);
+    let authorUserIsActiveMember = false;
+    if (mentionedIds.length > 0 && actor.actorType === "user") {
+      try {
+        authorUserIsActiveMember = Boolean(
+          await getActiveCompanyMembership(db, input.issue.companyId, "user", actor.actorId),
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: input.issue.id }, "failed to resolve keyed comment author membership for @-mentions");
+      }
+    }
+    for (const mentionedId of mentionedIds) {
+      if (!commentAuthorCanGrantIssueMention({
+        mentionedAgentId: mentionedId,
+        issueAssigneeAgentId: input.issue.assigneeAgentId,
+        authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        authorUserIsActiveMember,
+      })) continue;
+      const key = `${mentionedId}:${input.issue.id}`;
+      if (wakeups.has(key)) continue;
+      wakeups.set(key, {
+        agentId: mentionedId,
+        wakeup: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_comment_mentioned",
+          payload: { issueId: input.issue.id, commentId: input.comment.id },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${input.comment.id}:mention:${mentionedId}`,
+          contextSnapshot: {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            commentId: input.comment.id,
+            wakeCommentId: input.comment.id,
+            wakeReason: "issue_comment_mentioned",
+            source: "comment.mention",
+          },
+        },
+      });
+    }
+    for (const { agentId, wakeup } of wakeups.values()) {
+      effects.push({
+        effectKind: "wake",
+        effectKey: `wake:${agentId}:${input.issue.id}`,
+        payload: { agentId, wakeup },
+      });
+    }
+    effects.push({ effectKind: "watchdog_evaluation", effectKey: "watchdog_evaluation", payload: { runId: actor.runId } });
+    if (actor.runId) {
+      effects.push({ effectKind: "run_activity", effectKey: "run_activity", payload: { runId: actor.runId } });
+    }
+    return effects;
+  }
+
+  async function executeKeyedCommentEffect(effect: CommentEffectRow) {
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, effect.commentId)).limit(1);
+    const issue = await svc.getById(effect.issueId);
+    if (!comment || !issue) throw new Error(`Comment effect target is missing: ${effect.id}`);
+    const payload = effect.payload as Record<string, any>;
+    const actor = payload.actor as PersistedCommentActor | undefined;
+
+    switch (effect.effectKind) {
+      case "references_sync": {
+        await issueReferencesSvc.syncComment(comment.id);
+        const after = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+        return issueReferencesSvc.diffIssueReferenceSummary(payload.referenceSummaryBefore, after) as unknown as Record<string, unknown>;
+      }
+      case "comment_activity": {
+        if (await hasIssueCommentAddedActivity({ issueId: issue.id, commentId: comment.id })) return;
+        if (!actor) throw new Error("Comment activity effect is missing actor context");
+        const referenceEffect = await getEffectResult(db, comment.id, "references_sync");
+        const diff = referenceEffect?.result as any;
+        // The activity row and its plugin event must land together. The guard above
+        // treats the activity row as proof the event was emitted, so if the event
+        // were enqueued fire-and-forget and failed, the retry would skip this
+        // branch and the `issue.comment.created` event would be lost permanently.
+        // Committing both in one transaction makes the guard's premise true.
+        const publish = await db.transaction(async (tx) =>
+          logActivity(tx as unknown as typeof db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.comment_added",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+              identifier: issue.identifier,
+              issueTitle: issue.title,
+              ...summarizeIssueReferenceActivityDetails({
+                addedReferencedIssues: (diff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                removedReferencedIssues: (diff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                currentReferencedIssues: (diff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+              }),
+            },
+            pluginEventPayloadExtra: {
+              issueId: issue.id,
+              body: comment.body,
+              authorName: await resolveCommentAuthorName(actor as ReturnType<typeof getActorInfo>),
+            },
+          }, { deferPublish: true, enlistPluginOutbox: true }),
+        );
+        // Live fan-out only, after commit: durable delivery is already enqueued.
+        publish();
+        return;
+      }
+      case "interaction_expiry": {
+        if (!actor) throw new Error("Interaction expiry effect is missing actor context");
+        const expired = await issueThreadInteractionsSvc.expireRequestConfirmationsSupersededByComment(
+          issue,
+          comment,
+          { agentId: actor.agentId, userId: actor.actorType === "user" ? actor.actorId : null },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expired,
+          actor: actor as ReturnType<typeof getActorInfo>,
+          source: "issue.comment",
+        });
+        return { expiredInteractionIds: expired.map((interaction) => interaction.id) };
+      }
+      case "recovery_revalidation":
+        if (!actor) throw new Error("Recovery effect is missing actor context");
+        await revalidateActiveSourceRecovery({
+          issue,
+          trigger: "comment",
+          actor: actor as ReturnType<typeof getActorInfo>,
+        });
+        return;
+      case "wake": {
+        const agentId = payload.agentId;
+        if (typeof agentId !== "string" || !payload.wakeup) throw new Error("Wake effect payload is invalid");
+        const wakeup = payload.wakeup as IssueWakeupRequest;
+        // `heartbeat.wakeup` is the one sink here that is not naturally
+        // idempotent across "executed, then died before the ledger recorded it".
+        // Its own coalescing only merges a wake into a still-queued/running run,
+        // so once the first run finishes, a reclaim after lease expiry would
+        // create a SECOND run for one comment. The wake carries a deterministic
+        // idempotency key (`issue_comment:<commentId>:assignee|mention:<target>`),
+        // and an accepted wake request keeps that key on a row that outlives the
+        // run — so the key doubles as a durable receipt we can check first.
+        //
+        // Safe against the check-then-act race because effect claims serialize
+        // execution of this effect: only the claim holder reaches this line.
+        const idempotencyKey = wakeup.idempotencyKey;
+        if (typeof idempotencyKey === "string" && idempotencyKey.length > 0) {
+          const receipt = await findWakeIdempotencyReceipt(db, {
+            companyId: issue.companyId,
+            idempotencyKey,
+          });
+          if (receipt) return { wakeSkipped: "already_accepted", wakeupRequestId: receipt.id };
+        }
+        await heartbeat.wakeup(agentId, wakeup);
+        return;
+      }
+      case "watchdog_evaluation":
+        await taskWatchdogsSvc.reconcileForIssueAndAncestors(issue.companyId, issue.id, {
+          runId: typeof payload.runId === "string" ? payload.runId : null,
+        });
+        return;
+      case "run_activity":
+        if (typeof payload.runId === "string") await heartbeat.reportRunActivity(payload.runId);
+        return;
+      default:
+        throw new Error(`Unknown comment effect kind: ${effect.effectKind}`);
+    }
+  }
+
+  const processKeyedCommentEffects = (commentId: string) =>
+    processCommentEffects(db, commentId, executeKeyedCommentEffect);
+  opts.registerCommentEffectProcessor?.(processKeyedCommentEffects);
 
   function parseDateQuery(value: unknown, field: string) {
     if (typeof value !== "string" || value.trim().length === 0) return undefined;
@@ -7379,6 +7631,18 @@ export function issueRoutes(
     const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
       ? Number.parseInt(rawOffset, 10)
       : null;
+    // BLO-24495: this endpoint only ever implemented limit/offset. `page`/`perPage`
+    // were silently dropped (never read from req.query), so every page number
+    // replayed the same limit/offset-default window with no error. Reject
+    // explicitly instead of returning a confident, wrong result set.
+    const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
+    if (unsupportedPaginationParams.length > 0) {
+      res.status(400).json({
+        error: "page/perPage pagination is not supported on this endpoint; use limit and offset instead",
+        unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
@@ -8393,9 +8657,42 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const handBackAgentId = outcome === "restored" && sourceIssueStatus === "todo"
-      ? activeRecoveryAction?.returnOwnerAgentId ?? null
-      : null;
+    // Ownership returns to the original assignee on two distinct paths, and the
+    // difference is the source issue's status, not the ownership question:
+    //
+    //   restored + todo    — the strand cleared and the issue is dispatchable again.
+    //   blocked  + blocked — the strand cleared but the issue is genuinely waiting
+    //                        on a first-class blocker (enforced below), so it stays
+    //                        `blocked` while ownership goes home. This is an
+    //                        ownership-only restore.
+    //
+    // The second path exists because a dependency-blocked issue is not a strand
+    // needing a manager's judgment — it is an issue waiting for its blocker. Parking
+    // it on the manager makes `reconcileResolvedBlockerDependents` wake
+    // `assigneeAgentId` (the manager) when the blocker resolves, so the agent that
+    // was actually doing the work is never woken. Returning ownership while the row
+    // stays `blocked` re-points that wake at the right agent without falsifying the
+    // status — which is why this must NOT be done by moving the issue to `todo`.
+    const handBackAgentId =
+      ((outcome === "restored" && sourceIssueStatus === "todo") ||
+        (outcome === "blocked" && sourceIssueStatus === "blocked")) &&
+      // A human holding the issue outranks a recorded return owner. The sibling
+      // PATCH path refuses this case too (it requires the action owner to be the
+      // current assignee, which a user-assigned issue can never satisfy). Here the
+      // stakes are higher: this path sets `assigneeAgentId` without clearing
+      // `assigneeUserId`, so handing back would leave BOTH set rather than merely
+      // reassigning.
+      !existing.assigneeUserId
+        ? activeRecoveryAction?.returnOwnerAgentId ?? null
+        : null;
+    // A hand-back only converges if the return owner can actually run. The PATCH
+    // blocked->todo path already routes the return owner through this guard, which
+    // is what makes it reject a terminated owner with 409; this endpoint wrote the
+    // id straight through, so a hand-back here could park work on a terminated or
+    // invalid-org-chain agent and strand it silently. Validate on both paths.
+    if (handBackAgentId) {
+      await normalizeIssueAssigneeAgentReference(existing.companyId, handBackAgentId);
+    }
     const recordedOutcome = handBackAgentId
       ? "handed_back"
       : outcome === "restored" && sourceIssueStatus === "done"
@@ -12196,16 +12493,59 @@ export function issueRoutes(
             mutation: "blocker_done",
           });
         }
+        // BLO-21523 phase 2: the wake above only reaches assigned, wakeable
+        // dependents. Flip `status` for every `blocked` dependent this
+        // blocker's `done` transition may have freed — including unassigned
+        // ones no wake ever targets — so the fix isn't just "the agent got
+        // told," it's "the row is dispatchable."
+        try {
+          const blockedDependentIds = await listBlockedDependentIssueIds(db, issue.companyId, issue.id);
+          if (blockedDependentIds.length > 0) {
+            await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, blockedDependentIds, {
+              triggerPath: "eager_status_recompute",
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: issue.id },
+            "failed to recompute blocked dependents' status after blocker resolved",
+          );
+        }
+      }
+
+      // BLO-21523 phase 2: clearing this issue's own last blocker (via
+      // `blockedByIssueIds`) must recompute its `status` even when it has no
+      // assignee yet to wake.
+      //
+      // Gated on an actual blocker-edge write, NOT on the broader wake
+      // condition below. The wake's other two disjuncts are not blocker
+      // transitions: `existing.status !== "blocked"` fires on a transition
+      // *into* blocked, and the assignee comparison fires on reassignment.
+      // Since an issue with no blocker edges is always dependency-ready,
+      // reusing them here would flip a bare `PATCH {status: "blocked"}` — the
+      // common "blocked on a human/external gate" escalation, which carries no
+      // edges by construction — straight back to `todo`, contradicting the
+      // 200 the caller just received and making `blocked` unsettable.
+      const statusRecomputeCandidate =
+        issue.status === "blocked" && Array.isArray(req.body.blockedByIssueIds);
+      if (statusRecomputeCandidate) {
+        try {
+          await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, [issue.id], {
+            triggerPath: "eager_status_recompute",
+          });
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id }, "failed to recompute blocked status after blocker-transition");
+        }
       }
 
       const restoredBlockedReadyDependency =
         issue.status === "blocked" &&
-        issue.assigneeAgentId &&
         (
           existing.status !== "blocked" ||
           Array.isArray(req.body.blockedByIssueIds) ||
           existing.assigneeAgentId !== issue.assigneeAgentId
-        );
+        ) &&
+        issue.assigneeAgentId;
       if (restoredBlockedReadyDependency && typeof dependencyReadinessSvc.getDependencyReadiness === "function") {
         const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
@@ -14013,17 +14353,38 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
         });
       } else {
-        comment = await svc.addComment(id, req.body.body, {
+        const commentActor = {
           agentId: actor.agentId ?? undefined,
           userId: actor.actorType === "user" ? actor.actorId : undefined,
           runId: actor.runId,
-        }, {
+        };
+        const commentOptions = {
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
           idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
-        });
+        };
+        if (req.body.idempotencyKey) {
+          comment = await db.transaction(async (tx) => {
+            const accepted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
+            const effects = await buildKeyedCommentEffectIntents({
+              issue: currentIssue,
+              comment: accepted,
+              actor,
+              referenceSummaryBefore: commentReferenceSummaryBefore,
+            });
+            await enqueueCommentEffects(tx as unknown as Db, {
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              commentId: accepted.id,
+              effects,
+            });
+            return accepted;
+          });
+        } else {
+          comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
+        }
       }
     }
 
@@ -14037,6 +14398,28 @@ export function issueRoutes(
         res.status(200).json(comment);
         return;
       }
+    }
+
+    if (req.body.idempotencyKey) {
+      if (idempotentReplay) {
+        if (!(await hasCommentEffects(db, comment.id))) {
+          const effects = await buildKeyedCommentEffectIntents({
+            issue: currentIssue,
+            comment,
+            actor,
+            referenceSummaryBefore: commentReferenceSummaryBefore,
+          });
+          await enqueueCommentEffects(db, {
+            companyId: currentIssue.companyId,
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            effects,
+          });
+        }
+      }
+      await processKeyedCommentEffects(comment.id);
+      res.status(idempotentReplay ? 200 : 201).json(comment);
+      return;
     }
 
     if (commentReferenceDiff === null) {
@@ -14309,6 +14692,29 @@ export function issueRoutes(
             blockerIssueIds: dependent.blockerIssueIds,
           });
         }
+        // BLO-21523 phase 2: see the matching comment on the PATCH /issues/:id
+        // becameDone block — flip status for every blocked dependent this
+        // transition may have freed, not just the ones with a wake target.
+        // This whole block is `await`-ed before the comment response is sent
+        // (unlike the PATCH route's fire-and-forget wake dispatch), so a
+        // recompute failure must not fail the comment-post request itself.
+        try {
+          const blockedDependentIds = await listBlockedDependentIssueIds(
+            db,
+            currentIssue.companyId,
+            currentIssue.id,
+          );
+          if (blockedDependentIds.length > 0) {
+            await recomputeBlockedIssuesStatusIfReady(db, currentIssue.companyId, blockedDependentIds, {
+              triggerPath: "eager_status_recompute",
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: currentIssue.id },
+            "failed to recompute blocked dependents' status after blocker resolved",
+          );
+        }
       }
 
       const becameTerminal =
@@ -14352,9 +14758,6 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    if (req.body.idempotencyKey) {
-      await svc.markCommentIdempotencyProcessed(comment.id);
-    }
     res.status(idempotentReplay ? 200 : 201).json(comment);
   });
 

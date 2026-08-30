@@ -75,6 +75,7 @@ import {
   refreshQueuedRunAgeMetrics,
   refreshScheduledRetryParkHorizonMetrics,
 } from "./services/queued-run-age-metrics.js";
+import { refreshExternalRuntimeReservationStrandMetrics } from "./services/external-runtime-reservation-strand-metrics.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -94,6 +95,7 @@ import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
 import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
+import { startIssueCommentEffectReconciler } from "./services/issue-comment-effects.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -325,6 +327,13 @@ export async function createApp(
       await refreshScheduledRetryParkHorizonMetrics(db).catch((err) => {
         logger.warn({ err }, "failed to refresh scheduled-retry park horizon metrics before scrape");
       });
+      // BLO-28865. Swallowing the rejection here is safe and intended: the
+      // refresh has already set its own freshness gauge to 0 on the way out,
+      // which is what makes the stale age ineligible for the strand alert and
+      // pages the refresh failure on its own. Same contract as the two above.
+      await refreshExternalRuntimeReservationStrandMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh stranded-reservation metrics before scrape");
+      });
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
@@ -545,10 +554,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
+  let processIssueCommentEffects: ((commentId: string) => Promise<unknown>) | null = null;
   api.use(issueRoutes(db, opts.storageService, {
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
+    registerCommentEffectProcessor: (processor) => {
+      processIssueCommentEffects = processor;
+    },
   }));
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(toolAccessRoutes(db, {
@@ -1028,6 +1041,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
   let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
+  let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1044,6 +1058,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     // persisting it during the authority activation rollout.
     if (appConfig.githubReviewGateEnabled) {
       stopGithubReviewGateDeliveryWorker = startGithubReviewGateDeliveryWorker(db);
+    }
+    if (processIssueCommentEffects) {
+      stopIssueCommentEffectReconciler = startIssueCommentEffectReconciler(db, processIssueCommentEffects);
     }
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
@@ -1072,6 +1089,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
+    await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();

@@ -181,6 +181,7 @@
     "server/src/__tests__/heartbeat-external-runtime-retry.test.ts": 20394,
     "server/src/__tests__/heartbeat-failure-metrics.test.ts": 6,
     "server/src/__tests__/heartbeat-finalize-cancelled-skip-dispatch.test.ts": 13347,
+    "server/src/__tests__/heartbeat-hard-stale-subprocess-liveness.test.ts": 22961,
     "server/src/__tests__/heartbeat-hintless-transient-upstream.test.ts": 12812,
     "server/src/__tests__/heartbeat-issue-rewake-throttle.test.ts": 12827,
     "server/src/__tests__/heartbeat-k8s-git-probe-timeout.test.ts": 17998,

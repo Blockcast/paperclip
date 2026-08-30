@@ -938,3 +938,63 @@ test("PaperclipPluginStatusCollectorAbsent covers the worker-down case the stale
     "an absent collector must page critical -- it renders the plugin gauges invisible, not merely stale",
   );
 });
+
+test("PaperclipExternalRuntimeReservationStranded gates on strand state, not raw reservation age (BLO-28865)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipExternalRuntimeReservationStranded/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "stranded-reservation alert must render an expr");
+  assert.doesNotMatch(
+    expr,
+    /paperclip_external_runtime_reservation_oldest_age_seconds/,
+    "stranded-reservation alert must not threshold raw reservation age",
+  );
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_external_runtime_reservation_stranded_oldest_age_seconds and on\(instance\) \(paperclip_external_runtime_reservation_strand_metrics_refresh_success == 1\)\) > (\d+)$/,
+  );
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  assert.ok(Number(ageThreshold) > 0);
+
+  const [, forWindow] = rendered.match(
+    /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(forWindow, "stranded-reservation alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(forMinutes !== null && forMinutes > 0 && forMinutes <= 10);
+  assert.ok(Number(ageThreshold) + forMinutes * 60 < 45 * 60);
+  assert.match(
+    rendered,
+    /alert: PaperclipExternalRuntimeReservationStranded[\s\S]*?runbook_url: "[^\"]*runbooks\/external-runtime-reservation-stranded\.md"/,
+  );
+});
+
+test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a stale snapshot instead of hiding it", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_external_runtime_reservation_strand_metrics_refresh_success == 0\n/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/external-runtime-reservation-stranded\.md"/,
+  );
+});

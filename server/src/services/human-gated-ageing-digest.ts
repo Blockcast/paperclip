@@ -34,7 +34,16 @@
  */
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, companyMemberships, issueComments, issues } from "@paperclipai/db";
+import {
+  activityLog,
+  approvals,
+  companyMemberships,
+  issueApprovals,
+  issueComments,
+  issueRelations,
+  issueThreadInteractions,
+  issues,
+} from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 import {
@@ -42,13 +51,35 @@ import {
   DEFAULT_MAX_ESCALATED,
   HUMAN_GATED_OPEN_STATUSES,
   formatHumanGatedAgeingSections,
+  HUMAN_GATED_DIGEST_ORIGIN_KIND,
+  orderByHumanSilenceDescending,
+  rankableSilenceDays,
   sanitizeRenderedField,
   selectAgedHumanGatedIssues,
   type HumanGatedIssue,
 } from "./human-gated-ageing.js";
+import {
+  DEFAULT_MAX_PROBES,
+  formatGateRevalidationSections,
+  resolvedButOpenIssueIds,
+  revalidateGates,
+  type GateEvidenceInput,
+} from "./human-gated-gate-revalidation.js";
+// The second producer on this seam (BLO-30259). Reads
+// `pull_request_review_state`, which `pr-review-state-reconciler.ts` fills out of
+// band — collection here runs under the company advisory lock, so a producer must
+// not do network I/O.
+import { prReviewRequestAgeingProducer } from "./pr-review-request-ageing-producer.js";
 
-/** Stable `originKind` for the durable digest row. */
-export const HUMAN_GATED_DIGEST_ORIGIN_KIND = "human-gated-ageing-digest";
+/**
+ * Stable `originKind` for the durable digest row.
+ *
+ * Re-exported from the pure ageing module, where it lives so that a caller
+ * reproducing the digest's *population* predicate — "open, human-assigned, not
+ * hidden, not the digest row itself" — can name the exclusion without importing
+ * this module and, with it, the database layer.
+ */
+export { HUMAN_GATED_DIGEST_ORIGIN_KIND } from "./human-gated-ageing.js";
 
 /**
  * Stable `originId` — company-scoped and constant across periods, so there is
@@ -65,8 +96,15 @@ export const DEFAULT_DIGEST_PERIOD_DAYS = 7;
 
 const DAY_MS = 86_400_000;
 
-/** Rows per `inArray` chunk — keeps each aggregate's parameter list bounded. */
-const AGGREGATE_CHUNK_SIZE = 500;
+/**
+ * Rows per `inArray` chunk — keeps each aggregate's parameter list bounded.
+ *
+ * Exported so a caller reporting the *cost* of a pass derives it from the real
+ * chunk size rather than restating the literal. Every batched query family in
+ * this module runs once per chunk, so the round-trip count is a function of
+ * this constant; a copy of `500` elsewhere would silently stop tracking it.
+ */
+export const AGGREGATE_CHUNK_SIZE = 500;
 
 const DIGEST_TITLE = "[user-cover] Human-gated work is ageing past its escalation threshold";
 const UNKNOWN_PRODUCER = "(unknown producer)";
@@ -307,10 +345,158 @@ export async function loadHumanGatedIssues(
 }
 
 // ---------------------------------------------------------------------------
+// Gate evidence (BLO-30608)
+// ---------------------------------------------------------------------------
+
+/**
+ * Load the machine-checkable gate evidence for a batch of rows.
+ *
+ * Two batched `SELECT`s, both index-covered
+ * (`issue_relations_company_related_issue_idx`, `issue_approvals_issue_idx`)
+ * and both chunked to {@link AGGREGATE_CHUNK_SIZE} so the parameter list stays
+ * bounded — the same shape the human-clock aggregates already use.
+ *
+ * **Read-only by construction.** There is no write path here and none is
+ * wanted: BLO-30608 is explicit that re-validation reports and an owner
+ * decides. The demonstrated instance needed judgement about *which* of two
+ * similar-sounding drifts applied, which is not a call a sweep should make.
+ *
+ * Every requested id gets an entry, including rows with neither blockers nor
+ * approvals. An absent entry and an entry with empty evidence must not be the
+ * same thing: the empty entry is what
+ * {@link import("./human-gated-gate-revalidation.js").classifyGate} turns into
+ * an honest `unverifiable`, whereas a missing one would silently drop the row
+ * from the counts and understate exactly the number BLO-30608 asks us to
+ * measure.
+ */
+export async function loadGateEvidence(
+  db: Db,
+  companyId: string,
+  rows: readonly { id: string; identifier?: string | null; status?: string | null }[],
+): Promise<GateEvidenceInput[]> {
+  const evidenceById = new Map<string, GateEvidenceInput>();
+  for (const row of rows) {
+    evidenceById.set(row.id, {
+      issueId: row.id,
+      identifier: row.identifier ?? null,
+      blockers: [],
+      approvals: [],
+      interactions: [],
+      status: row.status ?? null,
+    });
+  }
+  if (evidenceById.size === 0) return [];
+
+  const issueIds = [...evidenceById.keys()];
+
+  for (const ids of chunk(issueIds, AGGREGATE_CHUNK_SIZE)) {
+    // `issue_relations.issueId` is the blocker and `relatedIssueId` the blocked
+    // row — the same direction `listIssueDependencyReadinessMap` reads, so this
+    // pass and dependency readiness can never disagree about which way an edge
+    // points.
+    const blockerRows = await db
+      .select({
+        issueId: issueRelations.relatedIssueId,
+        blockerIssueId: issueRelations.issueId,
+        blockerIdentifier: issues.identifier,
+        blockerStatus: issues.status,
+      })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.relatedIssueId, ids),
+        ),
+      );
+    for (const row of blockerRows) {
+      evidenceById.get(row.issueId)?.blockers.push({
+        blockerIssueId: row.blockerIssueId,
+        blockerIdentifier: row.blockerIdentifier,
+        blockerStatus: row.blockerStatus,
+      });
+    }
+  }
+
+  for (const ids of chunk(issueIds, AGGREGATE_CHUNK_SIZE)) {
+    const approvalRows = await db
+      .select({
+        issueId: issueApprovals.issueId,
+        approvalId: approvals.id,
+        approvalType: approvals.type,
+        approvalStatus: approvals.status,
+      })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(eq(issueApprovals.companyId, companyId), inArray(issueApprovals.issueId, ids)));
+    for (const row of approvalRows) {
+      evidenceById.get(row.issueId)?.approvals.push({
+        approvalId: row.approvalId,
+        approvalType: row.approvalType,
+        approvalStatus: row.approvalStatus,
+      });
+    }
+  }
+
+  // Thread interactions — the cards asking this row's human to answer
+  // something (BLO-30627). Batched at the same chunk size as the two queries
+  // above, so adding this gate kind costs O(ceil(rows / 500)) more queries per
+  // sweep rather than one per row.
+  for (const ids of chunk(issueIds, AGGREGATE_CHUNK_SIZE)) {
+    const interactionRows = await db
+      .select({
+        issueId: issueThreadInteractions.issueId,
+        interactionId: issueThreadInteractions.id,
+        interactionKind: issueThreadInteractions.kind,
+        interactionStatus: issueThreadInteractions.status,
+      })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          inArray(issueThreadInteractions.issueId, ids),
+        ),
+      );
+    for (const row of interactionRows) {
+      evidenceById.get(row.issueId)?.interactions.push({
+        interactionId: row.interactionId,
+        interactionKind: row.interactionKind,
+        interactionStatus: row.interactionStatus,
+      });
+    }
+  }
+
+  // Preserve the caller's ordering: the producer supplies rows oldest-clock
+  // first, and `revalidateGates` spends its budget from the front, so the
+  // rows most likely to be stale are the ones that get probed.
+  return rows.map(
+    (row) =>
+      evidenceById.get(row.id) ?? {
+        issueId: row.id,
+        identifier: row.identifier ?? null,
+        blockers: [],
+        approvals: [],
+        interactions: [],
+        status: row.status ?? null,
+      },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Producers
 // ---------------------------------------------------------------------------
 
-/** The BLO-19130 human-gated ageing report, wired to the real human clock. */
+/**
+ * The BLO-19130 human-gated ageing report, wired to the real human clock, with
+ * the BLO-30608 gate re-validation pass in front of it.
+ *
+ * Order matters and is the point of BLO-30608: re-validation runs **first**, and
+ * the rows it finds `resolved-but-open` are withheld from the age-ranked list
+ * rather than aged another day as if they were still waiting. They are not
+ * dropped — they are rendered in their own section, carrying their age, so
+ * reclassification never loses information a reader had before.
+ */
 export const humanGatedAgeingProducer: DigestProducer = {
   key: "human-gated-ageing",
   collect: async ({ db, companyId, now }) => {
@@ -320,23 +506,66 @@ export const humanGatedAgeingProducer: DigestProducer = {
     const candidates = await loadHumanGatedIssues(db, companyId, { lockRows: true });
     if (candidates.length === 0) return null;
 
-    const report = selectAgedHumanGatedIssues(candidates, {
-      now,
-      escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
-      // Explicit rather than defaulted: the cap is an acceptance criterion, so
-      // it should be visible at the call site rather than inherited silently.
-      maxEscalated: DEFAULT_MAX_ESCALATED,
-    });
+    // Probe oldest-clock-first so a bounded budget is spent where staleness is
+    // most likely. `orderByHumanSilenceDescending` is the same clock the ageing
+    // pass ranks on — and the same one the BLO-30608 backfill script ranks on —
+    // so no two passes can disagree about which row is older.
+    //
+    // It reads through `rankableSilenceDays`, never `humanSilenceDays` directly:
+    // the clock *throws* on a row with an unparseable `createdAt` and no human
+    // touch, and `loadHumanGatedIssues` deliberately emits `createdAt: ""` for
+    // exactly that row so `selectAgedHumanGatedIssues` can report it as
+    // `malformed`. Ranking before that validation would turn one unreadable row
+    // into a thrown producer — trading a precise "this row is malformed" line
+    // for a whole failed section, which is the louder-but-less-useful failure
+    // this seam exists to avoid.
+    const byAgeDescending = orderByHumanSilenceDescending(candidates, now);
+    const evidence = await loadGateEvidence(db, companyId, byAgeDescending);
+    const revalidation = revalidateGates(evidence, { maxProbes: DEFAULT_MAX_PROBES });
+    const withheld = resolvedButOpenIssueIds(revalidation);
+
+    const ageDaysByIssueId = new Map<string, number>(
+      candidates
+        .filter((candidate) => withheld.has(candidate.id))
+        .map((candidate) => [candidate.id, rankableSilenceDays(candidate, now)])
+        // An unrankable row has no age to render; omitting it leaves the entry
+        // absent so the renderer prints no age rather than a fabricated one.
+        .filter(([, days]) => Number.isFinite(days)) as [string, number][],
+    );
+
+    const report = selectAgedHumanGatedIssues(
+      candidates.filter((candidate) => !withheld.has(candidate.id)),
+      {
+        now,
+        escalateAfterDaysByPriority: DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
+        // Explicit rather than defaulted: the cap is an acceptance criterion, so
+        // it should be visible at the call site rather than inherited silently.
+        maxEscalated: DEFAULT_MAX_ESCALATED,
+      },
+    );
 
     // A malformed row is reported even at zero escalations: "nothing is
     // overdue" computed from input we could not read is the false all-clear
-    // the ageing module was built to refuse.
-    if (report.totalOverThreshold === 0 && report.malformed.length === 0) return null;
+    // the ageing module was built to refuse. A resolved-but-open row is
+    // reported on the same principle — withholding it from the age list must
+    // never be able to make the whole section disappear.
+    if (
+      report.totalOverThreshold === 0 &&
+      report.malformed.length === 0 &&
+      revalidation.counts["resolved-but-open"] === 0
+    ) {
+      return null;
+    }
+
+    const markdown = [
+      formatGateRevalidationSections(revalidation, { ageDaysByIssueId }),
+      formatHumanGatedAgeingSections(report),
+    ].join("\n\n---\n\n");
 
     return {
       key: "human-gated-ageing",
-      markdown: formatHumanGatedAgeingSections(report),
-      itemCount: report.totalOverThreshold,
+      markdown,
+      itemCount: report.totalOverThreshold + revalidation.counts["resolved-but-open"],
     };
   },
 };
@@ -344,6 +573,7 @@ export const humanGatedAgeingProducer: DigestProducer = {
 /** Producers contributing to the digest, in render order. */
 export const DEFAULT_DIGEST_PRODUCERS: readonly DigestProducer[] = Object.freeze([
   humanGatedAgeingProducer,
+  prReviewRequestAgeingProducer,
 ]);
 
 // ---------------------------------------------------------------------------
