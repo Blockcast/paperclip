@@ -5255,18 +5255,37 @@ export function recoveryService(
     const hasNewActivitySinceLastAttempt = !previousAttemptAt
       || input.issue.lastActivityAt > previousAttemptAt;
 
-    // An ownerless action has no wake budget to spend. Reuse the unchanged action so a
-    // sweepable no-owner issue cannot increment attemptCount on every sweep. A changed cause
-    // or newly resolved owner still uses the normal upsert path below.
-    if (existingAction && !ownerAgentId && !existingAction.ownerAgentId &&
+    const isUnchangedAction = existingAction != null &&
       existingAction.cause === recoveryCause &&
       existingAction.fingerprint === strandedRecoveryActionFingerprint({
         issue: input.issue,
         recoveryCause,
         latestRun: input.latestRun,
         blockerIssueIds: input.blockerIssueIds,
-      })) {
-      return { action: existingAction, hasNewActivitySinceLastAttempt, unchangedOwnerless: true };
+      });
+
+    // Neither shape below has a wake budget left to spend, so re-upserting an unchanged
+    // action would only increment attemptCount and re-run the escalation's side effects on
+    // every sweep. Reuse it instead. A changed cause or fingerprint, or a newly resolved
+    // owner, still takes the normal upsert path below.
+    //
+    //   - ownerless: routing found nobody invokable, so no wake was ever armed.
+    //   - escalated (BLO-30743): the creation-anchored horizon expired and
+    //     `escalateExpiredWakeHorizons` retired the action. Its `ownerAgentId` column stays
+    //     populated — the transition writes only `status` — so this branch used to read as
+    //     "owner resolved" and re-upsert forever, even though
+    //     `reconcileStrandedRecoveryWakeBackstop` drops every one of those sweeps at
+    //     `exhaustedSkipped`. Measured on BLO-27999: attemptCount 748 against maxAttempts 5,
+    //     re-emitting `issue.escalation.needs_human_decision` — each one a Slack forward —
+    //     208 times in 10.3h. Matching on an UNCHANGED owner keeps a genuine reassignment
+    //     escalating normally; only the standing, unwakeable state is deduplicated.
+    const hasNoWakeBudgetToSpend = existingAction != null && (
+      (!ownerAgentId && !existingAction.ownerAgentId) ||
+      (existingAction.status === "escalated" &&
+        (ownerAgentId ?? null) === existingAction.ownerAgentId)
+    );
+    if (existingAction && isUnchangedAction && hasNoWakeBudgetToSpend) {
+      return { action: existingAction, hasNewActivitySinceLastAttempt, unchangedWithoutWakeBudget: true };
     }
 
     const action = await actionSvc.upsertSourceScoped({
@@ -5346,7 +5365,7 @@ export function recoveryService(
       lastAttemptAt: now,
     });
 
-    return { action, hasNewActivitySinceLastAttempt, unchangedOwnerless: false };
+    return { action, hasNewActivitySinceLastAttempt, unchangedWithoutWakeBudget: false };
   }
 
   async function enqueueSourceScopedStrandedRecoveryWake(input: {
@@ -6694,7 +6713,7 @@ export function recoveryService(
         blockerIssueIds: blockerIds,
         needsHumanDecision,
       } = await unresolvedBlockerHumanDecisionEscalationState(fresh.companyId, fresh.id, tx);
-      const { action, hasNewActivitySinceLastAttempt, unchangedOwnerless } = await ensureSourceScopedStrandedRecoveryAction({
+      const { action, hasNewActivitySinceLastAttempt, unchangedWithoutWakeBudget } = await ensureSourceScopedStrandedRecoveryAction({
         issue: fresh,
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
@@ -6703,7 +6722,7 @@ export function recoveryService(
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
         blockerIssueIds: blockerIds,
       }, tx);
-      if (unchangedOwnerless) return null;
+      if (unchangedWithoutWakeBudget) return null;
       const isProviderQuotaWait = recoveryCause === "provider_quota" &&
         !action.ownerAgentId && Boolean(action.returnOwnerAgentId);
 
@@ -6721,9 +6740,17 @@ export function recoveryService(
       // row dispatchable so it self-heals when capacity returns, and keep every other
       // escalation side effect (recovery action, board-escalation comment, activity
       // record) so the strand stays visible.
+      //
+      // BLO-30743: `action.status === "escalated"` is the wake-exhaustion signal. The
+      // BLO-21523 reconciler suppresses only on `active`, so an escalated action stops
+      // holding the row back there while its still-populated `ownerAgentId` kept this
+      // call writing `blocked` — the two sweeps then traded the row every 15 minutes.
+      // Passing the status in makes both halves test "will anyone be woken" instead of
+      // "is an owner named".
       const { status: escalatedStatus, hasNoRecoveryPath } = resolveStrandedEscalationStatus({
         currentStatus: fresh.status,
         recoveryOwnerAgentId: action.ownerAgentId ?? null,
+        isWakeExhaustedEscalation: action.status === "escalated",
         isProviderQuotaWait,
         blockerIssueIds: blockerIds,
         recoveryCause,
