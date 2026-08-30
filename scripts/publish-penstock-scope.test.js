@@ -161,3 +161,21 @@ test("bootstrap publishes without dry-run or provenance flags", () => {
     rmSync(fakeNpm.dir, { recursive: true, force: true });
   }
 });
+
+test("release workflow never grants id-token: write", () => {
+  const wf = readFileSync(
+    new URL("../.github/workflows/release-penstock-scope.yml", import.meta.url),
+    "utf8",
+  );
+  // Granting id-token: write lets npm reach an OIDC token, which silently
+  // re-enables trusted publishing and its UNCONDITIONAL provenance attestation.
+  // npm then 422s that attestation because these are self-hosted runners, so the
+  // permission is what breaks CI publishing — not the --provenance flag.
+  // Comments mentioning it are fine; an actual grant is not.
+  const uncommented = wf
+    .split("\n")
+    .filter((l) => !l.trimStart().startsWith("#"))
+    .join("\n");
+  assert.doesNotMatch(uncommented, /id-token\s*:\s*write/);
+  assert.match(uncommented, /NODE_AUTH_TOKEN:\s*\$\{\{\s*secrets\.NPM_TOKEN\s*\}\}/);
+});

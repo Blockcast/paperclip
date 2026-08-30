@@ -1165,10 +1165,19 @@ function scrubJsonValueTracked(
         // added for — the JSON path exists so an upstream shape change cannot
         // silently turn the scrubber into a no-op, and a shape it passes through
         // in the clear defeats that. Keep the name, drop the material.
+        //
+        // The name is validated with the SAME shared constant as the other two
+        // name-preserving rules, not with `indexOf("=")`. That distinction is
+        // the whole point of `ENV_KEY_VALUE_SCALAR`, and this call site is the
+        // third spelling of one predicate: `[LEAKED]=x` and a padded base64 body
+        // are both `=`-bearing and name-shaped, so slicing at the first `=`
+        // promotes the material into the name position and prints it in the
+        // clear beside its own redaction marker — design note 4's false
+        // assurance, which is worse than not scrubbing at all.
         if (typeof entry === "string") {
           ctx.changed = true;
-          const eq = entry.indexOf("=");
-          return eq > 0 ? `${entry.slice(0, eq)}=${REDACTED}` : REDACTED;
+          const named = ENV_KEY_VALUE_SCALAR.exec(entry);
+          return named ? `${named[1]}=${REDACTED}` : REDACTED;
         }
         // A nested array (`[["A", "LEAKED"]]`) or any other non-object entry
         // carries no name we can identify, so there is nothing to preserve.

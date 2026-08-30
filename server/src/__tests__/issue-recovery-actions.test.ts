@@ -41,6 +41,7 @@ import {
   isInfraClassStrandedFailure,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
+  summarizeStrandedRecoveryHandBackPass,
 } from "../services/recovery/service.js";
 
 // BLO-19160: seam for the adoption-interleaving regression test. The stranded
@@ -7282,4 +7283,797 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       }
     });
   });
+
+  describe("reconcileStrandedRecoveryHandBacks (BLO-19123 drain)", () => {
+    const NOW = new Date("2026-08-29T18:00:00.000Z");
+
+    /**
+     * Builds the exact production shape the drain exists for: a row re-homed onto the
+     * manager, correctly `blocked` behind a real unresolved blocker, with the IC that was
+     * doing the work recorded as `returnOwnerAgentId`.
+     */
+    async function seedMisownedBlockedRow(overrides?: {
+      targetDate?: string | null;
+      assigneeUserId?: string | null;
+      returnOwnerStatus?: string;
+      withRunEvidence?: boolean;
+      priorHandBacks?: number;
+      kind?: string;
+      cause?: string;
+      actionCreatedAt?: Date;
+    }) {
+      const seeded = await seedCompany();
+      const { companyId, managerId, coderId, sourceIssueId, prefix } = seeded;
+
+      await db
+        .update(issues)
+        .set({
+          status: "blocked",
+          assigneeAgentId: managerId,
+          ...(overrides?.assigneeUserId ? { assigneeUserId: overrides.assigneeUserId } : {}),
+          ...(overrides?.targetDate !== undefined ? { targetDate: overrides.targetDate } : {}),
+        })
+        .where(eq(issues.id, sourceIssueId));
+
+      // A real first-class blocker, so the row's `blocked` status is truthful and the
+      // drain's truthfulness precondition is satisfied.
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerIssueId,
+        companyId,
+        title: "Upstream blocker",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${prefix}-2`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: sourceIssueId,
+        type: "blocks",
+      });
+
+      if (overrides?.returnOwnerStatus) {
+        await db
+          .update(agents)
+          .set({ status: overrides.returnOwnerStatus })
+          .where(eq(agents.id, coderId));
+      }
+
+      if (overrides?.withRunEvidence !== false) {
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId: coderId,
+          invocationSource: "manual",
+          status: "succeeded",
+          livenessState: "completed",
+          startedAt: new Date(NOW.getTime() - 60 * 60 * 1000),
+          finishedAt: new Date(NOW.getTime() - 30 * 60 * 1000),
+          lastUsefulActionAt: new Date(NOW.getTime() - 31 * 60 * 1000),
+        });
+      }
+
+      // Spent-budget rows are prior *resolved* actions on the same source issue. The active
+      // action is inserted after them so the partial unique index stays satisfied.
+      for (let i = 0; i < (overrides?.priorHandBacks ?? 0); i += 1) {
+        await db.insert(issueRecoveryActions).values({
+          companyId,
+          sourceIssueId,
+          kind: "stranded_assigned_issue",
+          cause: "stranded_assigned_issue",
+          status: "resolved",
+          outcome: "handed_back",
+          ownerType: "agent",
+          ownerAgentId: managerId,
+          returnOwnerAgentId: coderId,
+          fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:prior-${i}`,
+          evidence: {},
+          nextAction: "wake_owner",
+          resolvedAt: new Date(NOW.getTime() - (i + 2) * 24 * 60 * 60 * 1000),
+        });
+      }
+
+      const [action] = await db
+        .insert(issueRecoveryActions)
+        .values({
+          companyId,
+          sourceIssueId,
+          // The values the production path actually writes: `strandedRecoveryActionKind`
+          // returns the canonical `stranded_assigned_issue` kind (`source_scoped_recovery`
+          // is the fingerprint prefix, not a kind — it is not in ISSUE_RECOVERY_ACTION_KINDS),
+          // and the cause is the default bucket a dependency-blocked strand falls into.
+          // The drain filters on both, so seeding anything else would not exercise it.
+          kind: overrides?.kind ?? "stranded_assigned_issue",
+          cause: overrides?.cause ?? "stranded_assigned_issue",
+          status: "active",
+          ownerType: "agent",
+          ownerAgentId: managerId,
+          previousOwnerAgentId: coderId,
+          returnOwnerAgentId: coderId,
+          fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:drain`,
+          evidence: {},
+          nextAction: "wake_owner",
+          // Backdated past the run-evidence window, which is what the real population
+          // looks like — the drain exists for rows that have been mis-owned for weeks.
+          // It also has to be set explicitly: the column defaults to the DATABASE clock,
+          // which is real wall time and therefore ahead of the injected `NOW`, so a
+          // defaulted row would sit in the future relative to every seeded run.
+          createdAt: overrides?.actionCreatedAt ?? new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000),
+        })
+        .returning();
+
+      return { ...seeded, blockerIssueId, action: action! };
+    }
+
+    it("returns ownership to the return owner while the issue stays blocked", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow();
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 1, failed: 0, claimLost: 0 });
+      expect(result.residual).toEqual([]);
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      // Ownership moved; status did NOT. Falsifying `blocked` is the failure this whole
+      // design exists to avoid, so both halves are asserted together.
+      expect(issue!.assigneeAgentId).toBe(coderId);
+      expect(issue!.status).toBe("blocked");
+
+      const [resolved] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.status, "resolved"),
+        ));
+      expect(resolved).toMatchObject({ status: "resolved", outcome: "handed_back" });
+    });
+
+    // Ally review on #1549: the candidate query previously filtered only on
+    // "active action + non-null returnOwnerAgentId + blocked + mis-owned", which also
+    // matches recovery shapes this drain's guards were never designed for. Both
+    // non-target shapes below are otherwise byte-identical to a drainable row, so a
+    // regression that drops either predicate fails here rather than in production
+    // against ~360 live rows.
+    it("leaves a provider_quota action untouched even though its row is blocked and mis-owned", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        cause: "provider_quota",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 0, handedBack: 0 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ status: "active", outcome: null });
+    });
+
+    it("leaves a pr_review_non_convergence action untouched", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        kind: "pr_review_non_convergence",
+        cause: "self_review_pr_non_convergence",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 0, handedBack: 0 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ status: "active", outcome: null });
+    });
+
+    // Ally review on #1549: the run-evidence guard is anchored to the candidate action,
+    // not to a flat window, so an owner that has not completed anything since the strand
+    // it caused cannot take the row back yet.
+    it("skips when the return owner's only positive run predates the strand", async () => {
+      // The action is RECENT, so the anchored floor is its `createdAt` rather than the
+      // 7-day window. The seeded run then sits comfortably inside the window but before
+      // the strand — so a skip here can only be the anchor, not the window.
+      const strandedAt = new Date(NOW.getTime() - 2 * 60 * 60 * 1000);
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow({
+        withRunEvidence: false,
+        actionCreatedAt: strandedAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "succeeded",
+        livenessState: "completed",
+        startedAt: new Date(strandedAt.getTime() - 2 * 60 * 60 * 1000),
+        finishedAt: new Date(strandedAt.getTime() - 60 * 60 * 1000),
+        lastUsefulActionAt: new Date(strandedAt.getTime() - 60 * 60 * 1000),
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, noRunEvidenceSkipped: 1 });
+      expect(result.residual).toContainEqual(
+        expect.objectContaining({ issueId: sourceIssueId, reason: "no_positive_run_evidence" }),
+      );
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).not.toBe(coderId);
+    });
+
+    it("enqueues no wake, leaving the blockers-resolved sweep to wake the new owner", async () => {
+      const { companyId } = await seedMisownedBlockedRow();
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup } as any);
+
+      await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      // Waking here would re-drive an issue that is still legitimately blocked — the churn
+      // the ownership-only path was chosen to avoid.
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      const wakes = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakes).toEqual([]);
+    });
+
+    it("refuses a third auto-return once the per-issue hand-back budget is spent", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({ priorHandBacks: 2 });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, budgetExhaustedSkipped: 1 });
+      expect(result.residual).toEqual([
+        expect.objectContaining({ issueId: sourceIssueId, reason: "hand_back_budget_exhausted" }),
+      ]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+    });
+
+    it("skips a terminated return owner and names the failing reason", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedMisownedBlockedRow({
+        returnOwnerStatus: "terminated",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, returnOwnerIneligibleSkipped: 1 });
+      expect(result.residual).toEqual([
+        expect.objectContaining({
+          issueId: sourceIssueId,
+          returnOwnerAgentId: coderId,
+          reason: "return_owner_ineligible",
+          detail: "terminated",
+        }),
+      ]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+    });
+
+    it("requires positive run evidence, not mere liveness, before handing back", async () => {
+      const { companyId, coderId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        withRunEvidence: false,
+      });
+      // Alive and heartbeating, and its last run even "succeeded" — but the classifier says
+      // the run accomplished nothing. That is exactly the case `lastHeartbeatAt` cannot see.
+      await db.update(agents).set({ lastHeartbeatAt: NOW }).where(eq(agents.id, coderId));
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "succeeded",
+        livenessState: "empty_response",
+        startedAt: new Date(NOW.getTime() - 20 * 60 * 1000),
+        finishedAt: new Date(NOW.getTime() - 10 * 60 * 1000),
+        lastUsefulActionAt: new Date(NOW.getTime() - 11 * 60 * 1000),
+      });
+
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, noRunEvidenceSkipped: 1 });
+      expect(result.residual).toEqual([
+        expect.objectContaining({ issueId: sourceIssueId, reason: "no_positive_run_evidence" }),
+      ]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+    });
+
+    it("reports work past its validity window as lost instead of returning it late", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        targetDate: "2026-08-20",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, windowExpiredSkipped: 1 });
+      expect(result.residual).toEqual([
+        expect.objectContaining({
+          issueId: sourceIssueId,
+          reason: "validity_window_expired",
+          detail: "2026-08-20",
+        }),
+      ]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+    });
+
+    it("hands back work whose validity window closes today", async () => {
+      // A `date` deadline is a calendar day, not an instant: "due today" is still inside the
+      // window, so an off-by-one here would silently strand same-day work.
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow({
+        targetDate: "2026-08-29",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ handedBack: 1, windowExpiredSkipped: 0 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(coderId);
+    });
+
+    it("leaves a row whose blocked status has no real blocker behind it", async () => {
+      const { companyId, managerId, sourceIssueId, blockerIssueId } = await seedMisownedBlockedRow();
+      // Blocker resolved, so nothing backs the `blocked` status any more. Handing this row
+      // back would launder a false status into the IC's queue.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, blockerMissingSkipped: 1 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+    });
+
+    it("leaves a user-assigned row with its human owner", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        assigneeUserId: "human-owner",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, userAssignedSkipped: 1 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+      expect(issue!.assigneeUserId).toBe("human-owner");
+    });
+
+    it("ignores a row already owned by its return owner", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow();
+      await db.update(issues).set({ assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      // Not a candidate at all — the SQL predicate excludes it, so it never consumes budget.
+      expect(result).toMatchObject({ checked: 0, handedBack: 0 });
+    });
+
+    it("paces re-returns with a source-scoped cooldown", async () => {
+      // The cooldown is keyed on the last hand-back for the ISSUE, not on the action: a
+      // successful hand-back resolves its action, so the next strand always arrives with
+      // `lastAttemptAt: null` and an action-scoped cooldown would never fire.
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({ priorHandBacks: 1 });
+      await db
+        .update(issueRecoveryActions)
+        .set({ resolvedAt: new Date(NOW.getTime() - 60 * 60 * 1000) })
+        .where(and(
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          eq(issueRecoveryActions.outcome, "handed_back"),
+        ));
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const cooled = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+      expect(cooled).toMatchObject({ checked: 1, handedBack: 0, cooldownSkipped: 1 });
+      const [held] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(held!.assigneeAgentId).toBe(managerId);
+
+      // Past the cooldown the same row becomes eligible again, so the guard paces rather
+      // than permanently strands.
+      const elapsed = await recovery.reconcileStrandedRecoveryHandBacks({
+        companyId,
+        now: new Date(NOW.getTime() + 7 * 60 * 60 * 1000),
+      });
+      expect(elapsed).toMatchObject({ handedBack: 1, cooldownSkipped: 0 });
+    });
+
+    it("spends the budget at most once per issue across repeated passes", async () => {
+      const { companyId, managerId, sourceIssueId, coderId } = await seedMisownedBlockedRow();
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+      // Cooldown is exercised by its own test above; zero it here so this one isolates the
+      // budget and does not depend on the database clock relative to the injected `now`.
+      const pass = () => recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW, cooldownMs: 0 });
+
+      const restrand = async (suffix: string) => {
+        await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+        // `resolveActiveForIssue` stamps `resolvedAt` from the database clock, which is real
+        // wall time and therefore ahead of the injected `now`. Backdate the prior hand-backs
+        // so the source-scoped cooldown cannot fire here — that guard has its own test, and
+        // this one is about the budget.
+        await db
+          .update(issueRecoveryActions)
+          .set({ resolvedAt: new Date(NOW.getTime() - 48 * 60 * 60 * 1000) })
+          .where(and(
+            eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+            eq(issueRecoveryActions.outcome, "handed_back"),
+          ));
+        await db.insert(issueRecoveryActions).values({
+          companyId,
+          sourceIssueId,
+          kind: "stranded_assigned_issue",
+          cause: "stranded_assigned_issue",
+          status: "active",
+          ownerType: "agent",
+          ownerAgentId: managerId,
+          returnOwnerAgentId: coderId,
+          fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:${suffix}`,
+          evidence: {},
+          nextAction: "wake_owner",
+          createdAt: new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000),
+        });
+      };
+
+      expect(await pass()).toMatchObject({ handedBack: 1, budgetExhaustedSkipped: 0 });
+
+      // Simulate the row re-stranding onto the manager, which is the oscillation the budget
+      // guard exists to bound.
+      await restrand("drain-2");
+      expect(await pass()).toMatchObject({ handedBack: 1, budgetExhaustedSkipped: 0 });
+
+      // Third strand: budget is now spent, so the drain must stop rather than oscillate.
+      await restrand("drain-3");
+      expect(await pass()).toMatchObject({ handedBack: 0, budgetExhaustedSkipped: 1 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+    });
+
+    /**
+     * Ally review on #1549: an over-limit pass used to represent everything past the page as a
+     * bare `candidateLimitSkipped` count, so the rows that stayed mis-owned had no identifier
+     * and no reason — the residual stopped being the operator repair list at exactly the
+     * backlog size that needs one.
+     *
+     * Exercised through the injectable `limit` rather than by seeding 501 rows. The production
+     * limit is a parameter, not a branch: `limit: 1` against 4 candidates drives the identical
+     * `candidateLimitSkipped > 0` path, and seeding a real 500-row page would cost minutes of
+     * suite time to prove nothing extra.
+     */
+    async function seedAdditionalDrainableRow(
+      seeded: { companyId: string; managerId: string; coderId: string; prefix: string },
+      n: number,
+    ) {
+      const { companyId, managerId, coderId, prefix } = seeded;
+      const sourceIssueId = randomUUID();
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values([
+        {
+          id: sourceIssueId,
+          companyId,
+          title: `Mis-owned blocked row ${n}`,
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: managerId,
+          issueNumber: 100 + n * 2,
+          identifier: `${prefix}-${100 + n * 2}`,
+        },
+        {
+          id: blockerIssueId,
+          companyId,
+          title: `Upstream blocker ${n}`,
+          status: "in_progress",
+          priority: "medium",
+          issueNumber: 101 + n * 2,
+          identifier: `${prefix}-${101 + n * 2}`,
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: sourceIssueId,
+        type: "blocks",
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        previousOwnerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:drain`,
+        evidence: {},
+        nextAction: "wake_owner",
+        createdAt: new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000),
+      });
+      return sourceIssueId;
+    }
+
+    it("enumerates every candidate the processing limit deferred, with an explicit reason", async () => {
+      const seeded = await seedMisownedBlockedRow();
+      const { companyId, coderId, sourceIssueId } = seeded;
+      const extraIssueIds = [
+        await seedAdditionalDrainableRow(seeded, 1),
+        await seedAdditionalDrainableRow(seeded, 2),
+        await seedAdditionalDrainableRow(seeded, 3),
+      ];
+      const allIssueIds = new Set([sourceIssueId, ...extraIssueIds]);
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW, limit: 1 });
+
+      expect(result).toMatchObject({ checked: 1, candidateLimitSkipped: 3 });
+
+      const deferred = result.residual.filter((row) => row.reason === "candidate_limit_deferred");
+      expect(deferred).toHaveLength(3);
+      // Individually identifiable, which is the whole point: a count cannot be repaired from.
+      for (const row of deferred) {
+        expect(row.issueId).toBeTruthy();
+        expect(row.identifier).toBeTruthy();
+        expect(row.returnOwnerAgentId).toBe(coderId);
+      }
+
+      // The completeness assertion. Every candidate the pass saw is accounted for exactly
+      // once, either as handed back or as a named residual row — no candidate is represented
+      // only by an aggregate counter.
+      const accountedFor = [...result.issueIds, ...result.residual.map((row) => row.issueId)];
+      expect(new Set(accountedFor)).toEqual(allIssueIds);
+      expect(accountedFor).toHaveLength(allIssueIds.size);
+    });
+
+    /**
+     * Ally review on #1549, second pass: a *capped* enumeration only moved the unnamed-rows
+     * problem to a higher threshold. The enumeration now pages until the deferred set is
+     * exhausted, so completeness must hold when the deferred population is larger than one
+     * enumeration page — the case a single bounded query silently got wrong.
+     */
+    it("pages through deferred candidates so completeness does not depend on page size", async () => {
+      const seeded = await seedMisownedBlockedRow();
+      const { companyId, sourceIssueId } = seeded;
+      const extraIssueIds = [
+        await seedAdditionalDrainableRow(seeded, 1),
+        await seedAdditionalDrainableRow(seeded, 2),
+        await seedAdditionalDrainableRow(seeded, 3),
+        await seedAdditionalDrainableRow(seeded, 4),
+      ];
+      const allIssueIds = new Set([sourceIssueId, ...extraIssueIds]);
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      // 4 deferred rows against a 1-row enumeration page: four round trips, not one truncated
+      // query. A capped implementation names 1 of 4 here and reports the rest as an aggregate.
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({
+        companyId,
+        now: NOW,
+        limit: 1,
+        residualPageSize: 1,
+      });
+
+      expect(result.candidateLimitSkipped).toBe(4);
+      expect(result.residual.filter((row) => row.reason === "candidate_limit_deferred")).toHaveLength(4);
+
+      const accountedFor = [...result.issueIds, ...result.residual.map((row) => row.issueId)];
+      expect(new Set(accountedFor)).toEqual(allIssueIds);
+      expect(accountedFor).toHaveLength(allIssueIds.size);
+    });
+
+    /**
+     * Ally review on #1549, third pass. The in-memory enumeration was complete, but the
+     * scheduler is the only production caller and it logs a bounded sample before dropping
+     * the array — so beyond the sample the inventory existed nowhere an operator could reach.
+     * These lock the durable record that closes that gap.
+     */
+    describe("durable residual inventory", () => {
+      const readMarkers = async (companyId: string) =>
+        db
+          .select({
+            sourceIssueId: issueRecoveryActions.sourceIssueId,
+            reason: issueRecoveryActions.handBackResidualReason,
+            detail: issueRecoveryActions.handBackResidualDetail,
+            at: issueRecoveryActions.handBackResidualAt,
+          })
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.companyId, companyId));
+
+      it("persists the skip reason on the recovery action, not just in the returned array", async () => {
+        // A human owner outranks the return owner, so this row is skipped `user_assigned`.
+        const { companyId, sourceIssueId } = await seedMisownedBlockedRow({ assigneeUserId: "user-1" });
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+        const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+        expect(result).toMatchObject({ handedBack: 0, userAssignedSkipped: 1, residualPersisted: 1 });
+
+        const markers = await readMarkers(companyId);
+        expect(markers).toHaveLength(1);
+        expect(markers[0]).toMatchObject({
+          sourceIssueId,
+          reason: "user_assigned",
+          detail: "user-1",
+        });
+        expect(markers[0]!.at).toBeInstanceOf(Date);
+      });
+
+      /**
+       * The finding's exact shape: rows past the processing limit are the ones the log sample
+       * is least likely to carry, so they are the ones that most need a durable record.
+       */
+      it("persists a marker for every candidate deferred past the processing limit", async () => {
+        const seeded = await seedMisownedBlockedRow();
+        const { companyId } = seeded;
+        const allIssueIds = new Set([
+          seeded.sourceIssueId,
+          await seedAdditionalDrainableRow(seeded, 1),
+          await seedAdditionalDrainableRow(seeded, 2),
+          await seedAdditionalDrainableRow(seeded, 3),
+        ]);
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+        const result = await recovery.reconcileStrandedRecoveryHandBacks({
+          companyId,
+          now: NOW,
+          limit: 1,
+          residualPageSize: 1,
+        });
+        expect(result).toMatchObject({ checked: 1, handedBack: 1, candidateLimitSkipped: 3 });
+
+        // Candidates are ordered by action id (a random uuid), so which row the limit admits
+        // is not the seed order — read it back rather than assuming.
+        const [handedBackIssueId] = result.issueIds;
+        const markers = await readMarkers(companyId);
+        const deferred = markers.filter((row) => row.reason === "candidate_limit_deferred");
+        // Every deferred row is individually recoverable from the database alone — no
+        // dependence on the log sample, which by construction cannot be relied on here.
+        expect(new Set(deferred.map((row) => row.sourceIssueId))).toEqual(
+          new Set([...allIssueIds].filter((id) => id !== handedBackIssueId)),
+        );
+        // The row that WAS handed back carries no stale diagnosis.
+        const handedBack = markers.find((row) => row.sourceIssueId === handedBackIssueId);
+        expect(handedBack!.reason).toBeNull();
+        expect(handedBack!.at).toBeNull();
+      });
+
+      /**
+       * The write is change-gated, which is what makes it affordable on a 30s tick against a
+       * population that is stable by definition. A re-run must cost zero row writes while the
+       * inventory itself stays complete.
+       */
+      it("rewrites nothing when the diagnosis is unchanged, and moves the timestamp only when it changes", async () => {
+        const { companyId } = await seedMisownedBlockedRow({ assigneeUserId: "user-1" });
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+        const first = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+        expect(first.residualPersisted).toBe(1);
+        const [afterFirst] = await readMarkers(companyId);
+
+        const later = new Date(NOW.getTime() + 60_000);
+        const second = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: later });
+        // Same reason, same detail: no write, so the timestamp keeps reading as "stuck since",
+        // not "last swept".
+        expect(second.residualPersisted).toBe(0);
+        const [afterSecond] = await readMarkers(companyId);
+        expect(afterSecond!.at!.getTime()).toBe(afterFirst!.at!.getTime());
+
+        // Change the diagnosis: the human owner steps off, so the next gate takes over.
+        await db.update(issues).set({ assigneeUserId: null }).where(eq(issues.companyId, companyId));
+        const third = await recovery.reconcileStrandedRecoveryHandBacks({
+          companyId,
+          now: later,
+          // Force a different terminal gate rather than a hand-back, so there is a new
+          // reason to observe.
+          maxHandBacksPerIssue: 0,
+        });
+        expect(third.residualPersisted).toBe(1);
+        const [afterThird] = await readMarkers(companyId);
+        expect(afterThird!.reason).toBe("hand_back_budget_exhausted");
+        expect(afterThird!.at!.getTime()).toBe(later.getTime());
+      });
+    });
+  });
 });
+
+/**
+ * BLO-19123. The scheduler's reporting decision, tested here rather than at the scheduler
+ * because nothing imports `src/index.ts` under test. The case that matters is the pass that
+ * hands nothing back: its residual is the operator's repair list, and reporting only on
+ * `handedBack > 0` made that inventory unrecoverable.
+ */
+describe("summarizeStrandedRecoveryHandBackPass", () => {
+  const residualRow = (reason: string, n: number) => ({
+    issueId: `issue-${reason}-${n}`,
+    identifier: `BLO-${n}`,
+    returnOwnerAgentId: `agent-${n}`,
+    reason,
+  });
+
+  it("reports an all-skipped pass, with every residual reason enumerated", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 3,
+      handedBack: 0,
+      failed: 0,
+      returnOwnerIneligibleSkipped: 2,
+      budgetExhaustedSkipped: 1,
+      residual: [
+        residualRow("return_owner_ineligible", 1),
+        residualRow("return_owner_ineligible", 2),
+        residualRow("budget_exhausted", 3),
+      ],
+    });
+
+    expect(summary).not.toBeNull();
+    // Warn, not info: nothing was returned, so this is the line an operator goes looking for.
+    expect(summary!.level).toBe("warn");
+    expect(summary!.message).toContain("enumerated in residual");
+    expect(summary!.payload.residualCount).toBe(3);
+    expect(summary!.payload.residualByReason).toEqual({
+      return_owner_ineligible: 2,
+      budget_exhausted: 1,
+    });
+    // The sample carries the rows themselves, so a small residual is fully readable from the
+    // log line. The authoritative record is the per-action marker asserted above.
+    expect(summary!.payload.residual).toHaveLength(3);
+    expect(summary!.payload.residualTruncated).toBe(false);
+    expect(summary!.payload.checked).toBe(3);
+  });
+
+  it("stays silent only when the pass had nothing to say", () => {
+    expect(
+      summarizeStrandedRecoveryHandBackPass({ checked: 0, handedBack: 0, failed: 0, residual: [] }),
+    ).toBeNull();
+  });
+
+  it("reports a successful pass at info while still carrying its residual", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 2,
+      handedBack: 1,
+      failed: 0,
+      residual: [residualRow("cooldown", 1)],
+    });
+
+    expect(summary!.level).toBe("info");
+    expect(summary!.message).toContain("returned ownership");
+    expect(summary!.payload.residualByReason).toEqual({ cooldown: 1 });
+  });
+
+  it("warns when a row failed, even though others were handed back", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 2,
+      handedBack: 1,
+      failed: 1,
+      residual: [residualRow("error", 1)],
+    });
+
+    expect(summary!.level).toBe("warn");
+  });
+
+  it("bounds the logged sample and says so rather than implying it is complete", () => {
+    const residual = Array.from({ length: 120 }, (_, i) => residualRow("cooldown", i));
+    const summary = summarizeStrandedRecoveryHandBackPass(
+      { checked: 120, handedBack: 0, failed: 0, residual },
+      { residualSampleLimit: 50 },
+    );
+
+    expect(summary!.payload.residual).toHaveLength(50);
+    expect(summary!.payload.residualTruncated).toBe(true);
+    // The aggregate stays complete even when the sample does not, so the count never lies.
+    expect(summary!.payload.residualCount).toBe(120);
+    expect(summary!.payload.residualByReason).toEqual({ cooldown: 120 });
+  });
+});
+

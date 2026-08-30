@@ -101,6 +101,7 @@ export interface Config {
   // `blocked` with zero unresolved blockers (last blocker cleared but `status`
   // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
   strandedBlockedIssueReconcilerEnabled: boolean;
+  strandedRecoveryHandBackDrainEnabled: boolean;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
   // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
   // to a durable, human-assigned issue refreshed in place each period. Worker-tier
@@ -650,6 +651,13 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
     "strandedBlockedIssueReconcilerIntervalMinutes",
   );
+  // BLO-19123. Opt-IN, unlike its sibling reconcilers above, and deliberately so: this pass
+  // reassigns real in-flight work in bulk (~360 rows at the time of writing). Defaulting it
+  // on would make "deploy the code" and "perform the data move" the same irreversible act,
+  // with no run in between to re-derive the inventory the plan requires. Shipping it dark
+  // keeps those two decisions separate — enabling the flag is the drain.
+  const strandedRecoveryHandBackDrainEnabled =
+    process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED === "true";
   // Human-gated ageing digest (BLO-29420). Enabled by default, consistent with
   // the reconcilers above: BLO-19130's escalation shipped inert and never fired
   // once, so an opt-in flag would just be a second way to stay silent. The sweep
@@ -802,6 +810,7 @@ export function loadConfig(): Config {
     prReconcilerWindowDays,
     prReconcilerEnrichLoc,
     strandedBlockedIssueReconcilerEnabled,
+    strandedRecoveryHandBackDrainEnabled,
     strandedBlockedIssueReconcilerIntervalMinutes,
     humanGatedDigestEnabled,
     humanGatedDigestIntervalMinutes,

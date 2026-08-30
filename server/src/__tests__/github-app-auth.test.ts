@@ -21,6 +21,7 @@ import {
   githubFetchPrHeadSha,
   githubGetPullRequestGate,
   githubGetWorkflowRun,
+  githubHasCommitEvidence,
   githubHasReviewerEvidenceForPr,
   githubGetLatestCommitStatusForContext,
   githubListIssueCommentsWithTimestamps,
@@ -281,6 +282,53 @@ describe("githubFetchPrHeadSha", () => {
 
     await expect(githubFetchPrHeadSha({ repoFullName: "Blockcast/paperclip", prNumber: 1049 }))
       .resolves.toBe("abcdef1234567890abcdef1234567890abcdef12");
+  });
+});
+
+describe("githubHasCommitEvidence", () => {
+  it("accepts a commit that exists in the configured GitHub installation", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ sha: "abcdef1234567" });
+    }));
+
+    await expect(githubHasCommitEvidence({
+      repoFullName: "Blockcast/paperclip",
+      sha: "abcdef1234567",
+    })).resolves.toEqual({ found: true });
+  });
+
+  it("rejects a commit URL that GitHub cannot resolve", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ message: "No commit found for SHA" }, false, 422);
+    }));
+
+    await expect(githubHasCommitEvidence({
+      repoFullName: "Blockcast/paperclip",
+      sha: "abcdef1234567",
+    })).resolves.toEqual({ found: false });
+  });
+
+  it("keeps transport failures retryable", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ message: "unavailable" }, false, 503);
+    }));
+
+    await expect(githubHasCommitEvidence({
+      repoFullName: "Blockcast/paperclip",
+      sha: "abcdef1234567",
+    })).resolves.toEqual({ error: "commit_http_503" });
   });
 });
 

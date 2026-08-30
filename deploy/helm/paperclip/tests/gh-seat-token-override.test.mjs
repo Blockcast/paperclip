@@ -146,6 +146,11 @@ test("rendered gh wrapper exercises the generated runtime command path", () => {
   assert.equal(fs.readFileSync(path.join(dir, "target-ran"), "utf8"), "invoked\n");
 });
 
+// PEN-2527. The PATH-reachability half of this — that the seed publishes the
+// scrubbing `gh` onto a PATH the agent shell actually searches, and that it wins
+// against the image CLI — lives in agent-egress-path.test.mjs, which renders the
+// chart's default values rather than the Blockcast overlay this file uses.
+
 test("paperclip-github-token-env: GH_SEAT_TOKEN_VALUE overrides the App-installation token file", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-"));
   const script = writeExecutable(dir, "paperclip-github-token-env", envScriptBody);

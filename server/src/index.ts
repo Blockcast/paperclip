@@ -63,6 +63,7 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
@@ -1500,6 +1501,29 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             logger.error({ err }, "routine scheduler tick failed");
           }));
+
+        if (heartbeatSchedulerStopped) return;
+        // BLO-19123. Deliberately its own tracked pass rather than a link in the long serial
+        // recovery chain below: that chain begins with provider-facing work, and an outage
+        // there must not starve the drain that returns mis-owned rows to their real owners.
+        // The pass is internally serialized, so a slow tick cannot overlap itself. Opt-in —
+        // see the flag's rationale in config.ts.
+        if (config.strandedRecoveryHandBackDrainEnabled) {
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileStrandedRecoveryHandBacks()
+            .then((result) => {
+              // The all-skipped pass is reported too: its residual is the repair list, and
+              // dropping it left operators no way to recover what stayed mis-owned or why.
+              // This line carries a bounded sample; the complete per-row inventory is written
+              // durably by the pass onto `issue_recovery_actions.hand_back_residual_reason`,
+              // so nothing here depends on the return value surviving the promise.
+              const summary = summarizeStrandedRecoveryHandBackPass(result);
+              if (summary) logger[summary.level](summary.payload, summary.message);
+            })
+            .catch((err) => {
+              logger.error({ err }, "stranded-recovery hand-back pass failed");
+            }));
+        }
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(environmentCustomImages

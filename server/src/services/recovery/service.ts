@@ -5,6 +5,7 @@ import {
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  getAgentWorkEligibility,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
   type IssueStatus,
@@ -402,6 +403,140 @@ const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 // bounded retry lease. It deliberately does not spend another recovery-action attempt: that
 // attempt was already reserved by the escalation which failed to dispatch its wake.
 const STRANDED_RECOVERY_WAKE_BACKSTOP_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * Bounds for the ownership-only hand-back drain (BLO-19123).
+ *
+ * The budget is the load-bearing one: a source issue may be auto-returned at most twice
+ * across all time. A dependency-blocked row that keeps re-stranding is not a routing problem
+ * the drain can fix by handing it back a third time — it is a signal that something about
+ * that issue needs a human, so the drain reports it as residual instead of oscillating.
+ */
+const STRANDED_RECOVERY_MAX_HAND_BACKS_PER_ISSUE = 2;
+const STRANDED_RECOVERY_HAND_BACK_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+/**
+ * How recently the return owner must have completed real work. Wider than the cooldown on
+ * purpose: an IC parked behind a provider-capacity wait can be legitimately quiet for hours
+ * and is still the right owner.
+ */
+const STRANDED_RECOVERY_HAND_BACK_RUN_EVIDENCE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT = 500;
+
+/**
+ * Batch size for the deferred-candidate enumeration (BLO-19123, #1549 review).
+ *
+ * This is a page size, NOT an inventory bound: the enumeration loops until the deferred set
+ * is exhausted, so every deferred row is named regardless of how many there are. An earlier
+ * revision capped the enumeration instead, which just moved the unnamed-rows problem to a
+ * higher threshold — an inventory that is complete "up to N" is not the individually
+ * actionable repair list the acceptance criterion asks for.
+ *
+ * Exhaustive enumeration is affordable because the population is bounded by construction and
+ * measured: the filter is `blocked` + active `stranded_assigned_issue` action + non-null
+ * `returnOwnerAgentId` differing from the assignee, so its ceiling is the company's blocked
+ * issue count — 811 across every agent on 2026-08-30, against ~360 rows actually mis-owned.
+ * Each row costs three columns. Bounding the *processing* loop at
+ * `STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT` still matters, because working a candidate
+ * costs several queries and a transaction; naming one does not.
+ */
+const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_PAGE_SIZE = 1000;
+
+/**
+ * How many residual rows a single log line carries. The residual is bounded only by the
+ * candidate population, so a whole-set log line could bury everything around it. The sample
+ * plus `residualByReason` (which is always complete, being a count over every residual row)
+ * answers "what was skipped and why" at a glance.
+ *
+ * The log line is a convenience view, NOT the inventory. The authoritative per-row record is
+ * `issue_recovery_actions.hand_back_residual_reason`, written by the pass itself, which is
+ * durable, queryable and JOINable against the issue — see the column's doc comment for the
+ * operator query. `residualTruncated` marks the sample as partial so nobody mistakes it for
+ * the whole set.
+ */
+const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_LOG_SAMPLE = 50;
+
+export type StrandedRecoveryHandBackResidualRow = {
+  issueId: string;
+  identifier: string | null;
+  returnOwnerAgentId: string | null;
+  reason: string;
+  detail?: string;
+};
+
+/**
+ * Decides what a hand-back pass should report, and is exported so the decision is testable
+ * without standing up the scheduler (nothing imports `src/index.ts` under test).
+ *
+ * A pass that skips every candidate is the case this exists for. It is not a quiet pass — it
+ * is the pass whose residual an operator most needs, because every row it examined stayed
+ * mis-owned and the reasons are the repair list. Reporting only when `handedBack > 0` left
+ * that inventory unrecoverable, which is the defect this closes.
+ *
+ * Returns `null` only when the pass had nothing to say at all (no candidates, no residual),
+ * so an idle fleet does not log on every scheduler tick.
+ */
+export function summarizeStrandedRecoveryHandBackPass(
+  result: {
+    handedBack: number;
+    failed: number;
+    residual: readonly StrandedRecoveryHandBackResidualRow[];
+  } & Record<string, unknown>,
+  opts?: { residualSampleLimit?: number },
+): { level: "info" | "warn"; message: string; payload: Record<string, unknown> } | null {
+  const { residual, ...counters } = result;
+  const residualCount = residual.length;
+  if (result.handedBack === 0 && result.failed === 0 && residualCount === 0) return null;
+
+  const sampleLimit = Math.max(0, Math.floor(opts?.residualSampleLimit ?? STRANDED_RECOVERY_HAND_BACK_RESIDUAL_LOG_SAMPLE));
+  const residualByReason: Record<string, number> = {};
+  for (const row of residual) {
+    residualByReason[row.reason] = (residualByReason[row.reason] ?? 0) + 1;
+  }
+
+  return {
+    // A pass that returned nothing while holding residual is not an error — a fleet whose
+    // candidates are all legitimately on the live path skips all of them — but it is the
+    // line an operator goes looking for, so it must not be buried at info alongside the
+    // successful passes.
+    level: result.failed > 0 || (result.handedBack === 0 && residualCount > 0) ? "warn" : "info",
+    message:
+      result.handedBack > 0
+        ? "stranded-recovery hand-back pass returned ownership to original owners"
+        // True unconditionally: candidates the pass deferred past its processing limit are
+        // enumerated exhaustively, so `residual` names every candidate it did not hand back.
+        : "stranded-recovery hand-back pass returned nothing; every candidate is enumerated in residual",
+    payload: {
+      ...counters,
+      residualCount,
+      residualByReason,
+      residual: sampleLimit > 0 ? residual.slice(0, sampleLimit) : [],
+      // Bounds the LOG LINE only. `residualCount` and `residualByReason` remain complete, and
+      // the durable per-row inventory lives on the recovery actions themselves.
+      residualTruncated: residualCount > sampleLimit,
+    },
+  };
+}
+
+/**
+ * Signals that the issue-side ownership write lost a race after the action was already
+ * resolved in the same transaction, so the whole hand-back must roll back together.
+ */
+class HandBackOwnershipRaceLost extends Error {
+  constructor() {
+    super("hand-back ownership race lost");
+    this.name = "HandBackOwnershipRaceLost";
+  }
+}
+
+/**
+ * `targetDate` is a calendar date, not an instant, so a deadline of "today" is still live.
+ * Only a strictly earlier day counts as expired.
+ */
+function isValidityWindowExpired(targetDate: string | Date, now: Date): boolean {
+  const raw = targetDate instanceof Date ? targetDate.toISOString().slice(0, 10) : String(targetDate).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return false;
+  return raw < now.toISOString().slice(0, 10);
+}
 
 /**
  * Issue statuses whose active recovery actions `reconcileStrandedAssignedIssues` can select.
@@ -1814,6 +1949,7 @@ export function recoveryService(
   let strandedRecoveryWakeBackstopCandidateCursor: string | null = null;
   let resolvedDependencyWakeBackstopTail = Promise.resolve();
   let strandedRecoveryWakeBackstopTail = Promise.resolve();
+  let strandedRecoveryHandBackTail = Promise.resolve();
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -2197,6 +2333,83 @@ export function recoveryService(
     ]);
 
     return Boolean(run || deferredWake);
+  }
+
+  /**
+   * Whether the recorded return owner can actually be assigned work, and if not, why.
+   *
+   * Mirrors the route-layer `normalizeIssueAssigneeAgentReference` gate, but as a value
+   * rather than a thrown HTTP error, so the drain can report a per-row reason instead of
+   * aborting the batch. Handing work to a terminated or unapproved agent is how a hand-back
+   * "succeeds" and still never converges.
+   */
+  async function resolveReturnOwnerEligibility(
+    companyId: string,
+    returnOwnerAgentId: string,
+  ): Promise<{ assignable: boolean; reason: string }> {
+    const companyAgents = await db
+      .select({
+        id: agents.id,
+        companyId: agents.companyId,
+        name: agents.name,
+        status: agents.status,
+        reportsTo: agents.reportsTo,
+      })
+      .from(agents)
+      .where(eq(agents.companyId, companyId));
+    const agent = companyAgents.find((row) => row.id === returnOwnerAgentId);
+    if (!agent) return { assignable: false, reason: "not_found" };
+    const eligibility = getAgentWorkEligibility({ agent, agents: companyAgents });
+    return { assignable: eligibility.assignable, reason: eligibility.assignabilityReason };
+  }
+
+  /**
+   * Positive evidence that an agent recently did real work — not merely that it is alive.
+   *
+   * `agents.lastHeartbeatAt` only proves the process ticked, and a no-op run still reports
+   * `status: "succeeded"`, so both are satisfied by an agent that is accomplishing nothing.
+   * `livenessState` is the classifier's verdict on whether the run advanced anything, which
+   * is the signal the plan required in place of the dry run's liveness proxy.
+   *
+   * `lastUsefulActionAt` is coalesced with `lastOutputAt` because some adapters
+   * (`opencode_k8s`) never write the former, and a bare `is not null` on it would silently
+   * exclude every agent on those adapters.
+   */
+  async function hasPositiveRunEvidence(agentId: string, cutoff: Date): Promise<boolean> {
+    // Bind the cutoff as an ISO string with an explicit cast: postgres.js cannot serialize a
+    // Date passed into a raw `sql` template (it only accepts string/Buffer there), so a bare
+    // `${cutoff}` throws ERR_INVALID_ARG_TYPE at bind time rather than returning a wrong row.
+    const cutoffIso = cutoff.toISOString();
+    const rows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.status, "succeeded"),
+        inArray(heartbeatRuns.livenessState, ["completed", "advanced"]),
+        sql`coalesce(${heartbeatRuns.lastUsefulActionAt}, ${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.finishedAt}) > ${cutoffIso}::timestamptz`,
+      ))
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  /**
+   * Whether a first-class `blocks` relation still holds this issue back. This is the
+   * truthfulness precondition the resolve endpoint enforces for a `blocked` outcome
+   * (`routes/issues.ts:8710`), duplicated here so the sweep path inherits it too.
+   */
+  async function hasUnresolvedFirstClassBlocker(issueId: string): Promise<boolean> {
+    const rows = await db
+      .select({ id: issueRelations.id })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issues.id, issueRelations.issueId))
+      .where(and(
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.relatedIssueId, issueId),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ))
+      .limit(1);
+    return rows.length > 0;
   }
 
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
@@ -10975,6 +11188,526 @@ export function recoveryService(
   }
 
   /**
+   * Returns ownership of correctly-blocked-but-mis-owned recovery rows to the IC who was
+   * doing the work, without touching the issue's status (BLO-19123).
+   *
+   * The stranded-recovery ladder re-homes a strand onto the owner's manager. For a
+   * dependency-blocked issue that transfer is an artifact: the issue is not stranded, it is
+   * waiting for its blocker, and when the blocker resolves
+   * `reconcileResolvedBlockerDependents` wakes the *current* assignee — the manager — so the
+   * agent that was actually doing the work is never woken. 290 rows accrued on two agents
+   * that way before anything looked.
+   *
+   * This is the automated drain for that stock. It is deliberately ownership-only: the row
+   * stays `blocked`, because 217 of 218 such rows have genuinely unresolved blockers and
+   * moving them to `todo` would falsify state. That is the same `blocked`+`blocked` contract
+   * the resolve endpoint sanctions (`routes/issues.ts:8676`), reached from a sweep instead of
+   * an HTTP call — including its precondition that an unresolved first-class `blocks`
+   * relation actually backs the status, so the drain can never launder a false `blocked`.
+   *
+   * No wake is enqueued. The blockers-resolved sweep wakes the now-correct assignee when the
+   * blocker clears, which is the whole point of putting ownership back.
+   *
+   * Guard rationale — each of these exists because a naive drain re-triggers the ratchet:
+   * - **Hand-back budget.** Two auto-returns per source issue, ever, counted over resolved
+   *   history (rows are never deleted, so the count is durable). Without it a row can
+   *   oscillate blocked -> handed back -> stranded -> blocked indefinitely.
+   * - **Positive run evidence.** `agents.lastHeartbeatAt` proves the process is alive, not
+   *   that it accomplished anything — a no-op run also succeeds. Requiring a recent run with
+   *   `livenessState in (completed, advanced)` is the "real run signal" the plan asked for.
+   * - **Return-owner eligibility.** A hand-back only converges if the return owner can
+   *   actually run it, so terminated / `pending_approval` / invalid-org-chain owners are
+   *   skipped and reported with their reason rather than silently handed work they cannot do.
+   * - **Cooldown.** Source-scoped, so a row cannot be re-driven every tick.
+   * - **Validity window.** An issue whose `targetDate` has already passed is reported as lost
+   *   rather than silently returned late, since handing back expired work manufactures a
+   *   second false signal on top of the first.
+   */
+  async function reconcileStrandedRecoveryHandBacksImpl(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    cooldownMs?: number;
+    limit?: number;
+    maxHandBacksPerIssue?: number;
+    runEvidenceWindowMs?: number;
+    residualPageSize?: number;
+  }) {
+    const result = {
+      checked: 0,
+      handedBack: 0,
+      userAssignedSkipped: 0,
+      budgetExhaustedSkipped: 0,
+      windowExpiredSkipped: 0,
+      cooldownSkipped: 0,
+      returnOwnerIneligibleSkipped: 0,
+      noRunEvidenceSkipped: 0,
+      blockerMissingSkipped: 0,
+      livePathSkipped: 0,
+      pauseHoldSkipped: 0,
+      claimLost: 0,
+      candidateLimitSkipped: 0,
+      failed: 0,
+      /**
+       * How many residual markers this pass actually wrote. Zero alongside a non-empty
+       * `residual` is the healthy steady state, not a failure: it means every row's durable
+       * diagnosis already matched what this pass computed.
+       */
+      residualPersisted: 0,
+      issueIds: [] as string[],
+      /**
+       * Per-row residual, so the acceptance criterion "rows not handed back are enumerated
+       * individually with the failing reason" is served by the sweep itself rather than by a
+       * separate reconstruction pass that could disagree with it. This names every candidate
+       * the pass did not hand back, with no cap: rows it *worked* carry the gate that
+       * rejected them, and rows past the processing limit carry `candidate_limit_deferred`,
+       * which is a scheduling reason rather than a diagnosis — those rows were never
+       * evaluated, so no gate has judged them yet.
+       */
+      residual: [] as Array<{
+        issueId: string;
+        identifier: string | null;
+        returnOwnerAgentId: string | null;
+        reason: string;
+        detail?: string;
+      }>,
+    };
+    const now = opts?.now ?? new Date();
+    const cooldownMs = Math.max(
+      0,
+      Math.floor(asNumber(opts?.cooldownMs, STRANDED_RECOVERY_HAND_BACK_COOLDOWN_MS)),
+    );
+    const maxHandBacksPerIssue = Math.max(
+      0,
+      Math.floor(asNumber(opts?.maxHandBacksPerIssue, STRANDED_RECOVERY_MAX_HAND_BACKS_PER_ISSUE)),
+    );
+    const runEvidenceWindowMs = Math.max(
+      0,
+      Math.floor(asNumber(opts?.runEvidenceWindowMs, STRANDED_RECOVERY_HAND_BACK_RUN_EVIDENCE_WINDOW_MS)),
+    );
+    const candidateLimit = Math.max(
+      1,
+      Math.floor(asNumber(opts?.limit, STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT)),
+    );
+    const residualPageSize = Math.max(
+      1,
+      Math.floor(asNumber(opts?.residualPageSize, STRANDED_RECOVERY_HAND_BACK_RESIDUAL_PAGE_SIZE)),
+    );
+    const runEvidenceCutoff = new Date(now.getTime() - runEvidenceWindowMs);
+    const residualMarkers: Array<{ actionId: string; reason: string; detail: string | null }> = [];
+    const handedBackActionIds: string[] = [];
+
+    const noteResidual = (
+      candidate: { actionId: string; issueId: string; identifier: string | null; returnOwnerAgentId: string | null },
+      reason: string,
+      detail?: string,
+    ) => {
+      result.residual.push({
+        issueId: candidate.issueId,
+        identifier: candidate.identifier,
+        returnOwnerAgentId: candidate.returnOwnerAgentId,
+        reason,
+        ...(detail ? { detail } : {}),
+      });
+      // Keyed by action id rather than issue id: the durable marker lives on the recovery
+      // action, which is the row that carries `returnOwnerAgentId` and the one an operator
+      // resolves. Held separately from `result.residual` so the reported shape stays the
+      // caller's contract and is not widened by a persistence detail.
+      residualMarkers.push({ actionId: candidate.actionId, reason, detail: detail ?? null });
+    };
+
+    const filters = [
+      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      eq(issues.status, "blocked"),
+      visibleIssueCondition(),
+      // The drain is scoped to ONE action shape: the stranded-assigned re-home. Without
+      // both predicates the query is "any active action carrying a return owner whose
+      // issue is blocked and mis-owned", which is a much larger population than this
+      // drain was designed and guarded for. `returnOwnerAgentId` has three writers —
+      // the source-scoped stranded path (any `StrandedRecoveryCause`, so including
+      // `provider_quota`), and the `pr_review_non_convergence` path at :13062 — and the
+      // other two produce actions whose issues can equally be blocked and mis-owned.
+      // Draining those would resolve them `handed_back` and move ownership on rows whose
+      // recovery semantics this sweep's guards say nothing about.
+      //
+      // `kind` alone is not sufficient: `strandedRecoveryActionKind` maps several causes
+      // (notably `provider_quota` and `process_lost`) onto `stranded_assigned_issue`, so
+      // the cause predicate is what actually excludes the quota-wait shape.
+      eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+      eq(issueRecoveryActions.cause, "stranded_assigned_issue"),
+      sql`${issueRecoveryActions.returnOwnerAgentId} is not null`,
+      sql`${issues.assigneeAgentId} is not null`,
+      // Mis-owned is the whole population: the row already sits on someone other than the
+      // agent it should go back to. A row already on its return owner needs no repair.
+      sql`${issues.assigneeAgentId} <> ${issueRecoveryActions.returnOwnerAgentId}`,
+    ];
+    if (opts?.companyId) filters.push(eq(issueRecoveryActions.companyId, opts.companyId));
+
+    const candidateRows = await db
+      .select({
+        actionId: issueRecoveryActions.id,
+        companyId: issueRecoveryActions.companyId,
+        actionOwnerAgentId: issueRecoveryActions.ownerAgentId,
+        actionCause: issueRecoveryActions.cause,
+        actionCreatedAt: issueRecoveryActions.createdAt,
+        actionLastAttemptAt: issueRecoveryActions.lastAttemptAt,
+        returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+        issueId: issues.id,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        targetDate: issues.targetDate,
+        totalCount: sql<number>`count(*) over()::int`,
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+      .where(and(...filters))
+      .orderBy(asc(issueRecoveryActions.id))
+      .limit(candidateLimit);
+
+    const totalCandidateCount = candidateRows[0]?.totalCount ?? 0;
+    const candidates = candidateRows.map(({ totalCount: _totalCount, ...candidate }) => candidate);
+    result.checked = candidates.length;
+    result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
+
+    for (const candidate of candidates) {
+      const returnOwnerAgentId = candidate.returnOwnerAgentId;
+      if (!returnOwnerAgentId) continue;
+
+      // The whole per-candidate body, gates included, is contained: every gate issues its own
+      // queries, so an error in one of them would otherwise abort the entire batch and leave
+      // the remaining rows unexamined with no record of why.
+      try {
+        // A human owner outranks the recorded return owner. The underlying write sets
+        // `assigneeAgentId` without clearing `assigneeUserId`, so handing back here would
+        // leave the row owned by both.
+        if (candidate.assigneeUserId) {
+          result.userAssignedSkipped += 1;
+          noteResidual(candidate, "user_assigned", candidate.assigneeUserId);
+          continue;
+        }
+
+        const priorHandBacks = await db
+          .select({
+            count: sql<number>`count(*)::int`,
+            latestResolvedAt: sql<Date | null>`max(${issueRecoveryActions.resolvedAt})`,
+          })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.companyId, candidate.companyId),
+            eq(issueRecoveryActions.sourceIssueId, candidate.issueId),
+            eq(issueRecoveryActions.outcome, "handed_back"),
+          ));
+        const priorHandBackCount = priorHandBacks[0]?.count ?? 0;
+        if (priorHandBackCount >= maxHandBacksPerIssue) {
+          result.budgetExhaustedSkipped += 1;
+          noteResidual(candidate, "hand_back_budget_exhausted", `${priorHandBackCount}/${maxHandBacksPerIssue}`);
+          continue;
+        }
+
+        // Source-scoped, not action-scoped. A successful hand-back resolves its action, so
+        // the next strand arrives as a brand-new row with `lastAttemptAt: null` — keying the
+        // cooldown on the action would let a row bounce straight back on the following tick,
+        // bounded only by the budget. Keying it on the last hand-back for this *issue* is
+        // what actually paces the oscillation.
+        const latestHandBackAt = priorHandBacks[0]?.latestResolvedAt
+          ? new Date(priorHandBacks[0].latestResolvedAt as Date | string)
+          : null;
+        if (latestHandBackAt && now.getTime() - latestHandBackAt.getTime() < cooldownMs) {
+          result.cooldownSkipped += 1;
+          noteResidual(candidate, "cooldown", latestHandBackAt.toISOString());
+          continue;
+        }
+
+        // `targetDate` is a date column: compare on the calendar day so a deadline of "today"
+        // is still inside its window.
+        if (candidate.targetDate && isValidityWindowExpired(candidate.targetDate, now)) {
+          result.windowExpiredSkipped += 1;
+          noteResidual(candidate, "validity_window_expired", String(candidate.targetDate));
+          continue;
+        }
+
+        const eligibility = await resolveReturnOwnerEligibility(candidate.companyId, returnOwnerAgentId);
+        if (!eligibility.assignable) {
+          result.returnOwnerIneligibleSkipped += 1;
+          noteResidual(candidate, "return_owner_ineligible", eligibility.reason);
+          continue;
+        }
+
+        // Anchored to THIS action, not just to a flat 7-day window: the floor is the later
+        // of the window and the moment this strand was recorded, so the evidence has to
+        // postdate the failure being repaired. An owner that stranded a row and has not
+        // completed anything since is not demonstrably able to take it back yet.
+        //
+        // Deliberately still agent-scoped rather than source-issue-scoped. Every candidate
+        // here is `blocked` behind a *verified* unresolved blocker (asserted below), and a
+        // blocked issue cannot be worked — its runs terminate `issue_dependencies_blocked`
+        // rather than succeeding. So a `status: succeeded` + `completed|advanced` run
+        // against the source issue cannot exist for any row in this population, and
+        // requiring one would skip 100% of candidates and drain nothing. Oscillation is
+        // bounded instead by the two guards that ARE source-scoped and do hold here: the
+        // permanent per-issue hand-back budget and the per-issue cooldown above.
+        const evidenceFloor = candidate.actionCreatedAt && candidate.actionCreatedAt > runEvidenceCutoff
+          ? candidate.actionCreatedAt
+          : runEvidenceCutoff;
+        if (!(await hasPositiveRunEvidence(returnOwnerAgentId, evidenceFloor))) {
+          result.noRunEvidenceSkipped += 1;
+          noteResidual(candidate, "no_positive_run_evidence", evidenceFloor.toISOString());
+          continue;
+        }
+
+        // Same precondition the resolve endpoint enforces for a `blocked` outcome: the status
+        // must be backed by a real unresolved blocker. Without this the drain would quietly
+        // hand back rows whose `blocked` is itself the lie.
+        if (!(await hasUnresolvedFirstClassBlocker(candidate.issueId))) {
+          result.blockerMissingSkipped += 1;
+          noteResidual(candidate, "no_unresolved_blocker");
+          continue;
+        }
+
+        if (await hasActiveExecutionPath(candidate.companyId, candidate.issueId, candidate.assigneeAgentId)) {
+          result.livePathSkipped += 1;
+          noteResidual(candidate, "live_execution_path");
+          continue;
+        }
+
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.issueId, treeControlSvc)) {
+          result.pauseHoldSkipped += 1;
+          noteResidual(candidate, "pause_hold");
+          continue;
+        }
+
+        const resolutionNote =
+          "Recovery ownership returned to the original assignee without changing the source issue "
+          + "status: the issue is waiting on its blocker, not stranded, so the blockers-resolved "
+          + "sweep must wake the agent that was doing the work.";
+        const handedBack = await db.transaction(async (tx) => {
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: candidate.companyId,
+            sourceIssueId: candidate.issueId,
+            actionId: candidate.actionId,
+            status: "resolved",
+            outcome: "handed_back",
+            resolutionNote,
+          }, tx);
+          if (!resolved) return null;
+          // Re-assert the observed ownership tuple in the WHERE clause so a concurrent
+          // checkout or adoption between candidate selection and this write loses the race
+          // rather than being silently overwritten.
+          const updated = await tx
+            .update(issues)
+            .set({ assigneeAgentId: returnOwnerAgentId, updatedAt: now })
+            .where(and(
+              eq(issues.id, candidate.issueId),
+              eq(issues.companyId, candidate.companyId),
+              eq(issues.status, "blocked"),
+              eq(issues.assigneeAgentId, candidate.assigneeAgentId as string),
+              isNull(issues.assigneeUserId),
+            ))
+            .returning({ id: issues.id });
+          if (updated.length === 0) {
+            // Roll the action resolution back with it: a resolved action whose issue never
+            // moved would drop the row out of the active set while leaving it mis-owned,
+            // which is strictly worse than not draining it.
+            throw new HandBackOwnershipRaceLost();
+          }
+          return resolved;
+        });
+
+        if (!handedBack) {
+          result.claimLost += 1;
+          noteResidual(candidate, "claim_lost");
+          continue;
+        }
+
+        result.handedBack += 1;
+        result.issueIds.push(candidate.issueId);
+        handedBackActionIds.push(candidate.actionId);
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "stranded_recovery_hand_back",
+          agentId: candidate.actionOwnerAgentId,
+          runId: opts?.runId ?? null,
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: candidate.issueId,
+          details: {
+            source: "recovery.stranded_recovery_hand_back",
+            identifier: candidate.identifier,
+            status: "blocked",
+            recoveryActionId: handedBack.id,
+            recoveryActionStatus: handedBack.status,
+            outcome: handedBack.outcome,
+            resolutionNote: handedBack.resolutionNote,
+            recoveryCause: candidate.actionCause,
+            recoveryOwnerAgentId: candidate.actionOwnerAgentId,
+            previousAssigneeAgentId: candidate.assigneeAgentId,
+            returnOwnerAgentId,
+            priorHandBackCount,
+          },
+        });
+      } catch (error) {
+        if (error instanceof HandBackOwnershipRaceLost) {
+          result.claimLost += 1;
+          noteResidual(candidate, "ownership_race_lost");
+          continue;
+        }
+        result.failed += 1;
+        noteResidual(candidate, "error", error instanceof Error ? error.message : String(error));
+        logger.warn(
+          { err: error, actionId: candidate.actionId, sourceIssueId: candidate.issueId },
+          "stranded-recovery hand-back failed for candidate",
+        );
+      }
+    }
+
+    // Name every row the processing limit deferred. `candidateLimitSkipped` alone made an
+    // over-limit pass report an inventory it did not have: the rows past the page stayed
+    // mis-owned, were not handed back, and carried no identifier or reason — so the residual
+    // silently stopped being the operator repair list at exactly the backlog size that needs
+    // one.
+    //
+    // Exhaustive, not capped. Capping the enumeration instead would only move the unnamed-rows
+    // problem to a higher threshold, and an inventory that is complete "up to N" is not the
+    // individually actionable list the acceptance criterion asks for. It stays a separate pass
+    // from the processing loop because the two costs differ by orders of magnitude: naming a
+    // row is three columns over the same index range, working one is several queries and a
+    // transaction. That split is what lets the inventory be complete while a single scheduler
+    // tick's write volume stays bounded.
+    //
+    // Cursored off the last processed action id, so the worked and deferred sets cannot
+    // overlap. The read is not in the processing loop's transaction, so a row concurrently
+    // handed back by another path can appear here as deferred; that is the ordinary staleness
+    // of a point-in-time report, and it errs toward naming a row that needs no repair rather
+    // than omitting one that does.
+    let deferredCursor = candidates.length > 0 ? candidates[candidates.length - 1].actionId : null;
+    if (result.candidateLimitSkipped > 0 && deferredCursor) {
+      let enumerated = 0;
+      for (;;) {
+        const deferredRows = await db
+          .select({
+            actionId: issueRecoveryActions.id,
+            issueId: issues.id,
+            identifier: issues.identifier,
+            returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+          })
+          .from(issueRecoveryActions)
+          .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+          .where(and(...filters, gt(issueRecoveryActions.id, deferredCursor as string)))
+          .orderBy(asc(issueRecoveryActions.id))
+          .limit(residualPageSize);
+
+        if (deferredRows.length === 0) break;
+        for (const row of deferredRows) {
+          noteResidual(row, "candidate_limit_deferred", `processing limit ${candidateLimit}`);
+          enumerated += 1;
+        }
+        deferredCursor = deferredRows[deferredRows.length - 1].actionId;
+        // A short page is the last page, so this terminates without a second round trip.
+        if (deferredRows.length < residualPageSize) break;
+      }
+
+      logger.warn(
+        {
+          processed: candidates.length,
+          skipped: result.candidateLimitSkipped,
+          limit: candidateLimit,
+          enumerated,
+        },
+        "stranded-recovery hand-back deferred candidates past processing limit",
+      );
+    }
+
+    // Make the residual inventory durable (BLO-19123, #1549 review). Up to here the inventory
+    // exists only in `result.residual`, and the scheduler — the sole production caller — logs a
+    // bounded sample and drops the rest when the promise resolves. That made the complete
+    // enumeration unobservable in production at exactly the backlog size that needs it: an
+    // operator could read the aggregate counts but could not name, let alone repair, row 51.
+    //
+    // Written to the action row rather than an append-only audit table because the residual is
+    // current state, not an event stream: "this row is still mis-owned, and this is the gate
+    // holding it" has exactly one true value at a time. Current-state storage also bounds
+    // growth at the candidate population instead of at population x tick count.
+    result.residualPersisted = await persistResidualMarkers(residualMarkers, now);
+    // Clear markers on rows this pass actually returned. Their actions are resolved, so the
+    // documented operator query (which filters on active status) already hides them — but a
+    // stale reason left on a resolved row would misread as a live diagnosis for anyone querying
+    // without that filter.
+    if (handedBackActionIds.length > 0) {
+      await clearResidualMarkers(handedBackActionIds);
+    }
+
+    return result;
+  }
+
+  /**
+   * Batch size for the residual marker write. Bounds the size of a single generated statement;
+   * it is not an inventory bound, since the chunks loop until the set is exhausted.
+   */
+  const STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK = 500;
+
+  /** `db.execute` returns driver-shaped results; normalize to an array before counting. */
+  function toRows<T>(rows: unknown): T[] {
+    return Array.isArray(rows) ? rows as T[] : Array.from(rows as Iterable<T>);
+  }
+
+  /**
+   * Writes the per-row residual reasons onto their recovery actions, returning how many rows
+   * actually changed.
+   *
+   * The `is distinct from` guard is what makes this affordable on a 30s scheduler tick: the
+   * residual population is stable by nature — these rows are stuck, which is the whole
+   * complaint — so in steady state every chunk matches zero rows and the pass costs one
+   * statement per chunk and no row writes. It also gives `hand_back_residual_at` its meaning:
+   * the timestamp only moves when the diagnosis changes, so its age reads as how long the row
+   * has been stuck for this reason rather than when the sweep last ran.
+   */
+  async function persistResidualMarkers(
+    markers: ReadonlyArray<{ actionId: string; reason: string; detail: string | null }>,
+    now: Date,
+  ): Promise<number> {
+    let changed = 0;
+    for (let offset = 0; offset < markers.length; offset += STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK) {
+      const chunk = markers.slice(offset, offset + STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK);
+      const values = sql.join(
+        chunk.map((marker) => sql`(${marker.actionId}::uuid, ${marker.reason}::text, ${marker.detail}::text)`),
+        sql`, `,
+      );
+      const updated = await db.execute(sql<{ id: string }>`
+        UPDATE issue_recovery_actions AS a
+           SET hand_back_residual_reason = v.reason,
+               hand_back_residual_detail = v.detail,
+               -- ISO string + explicit cast: the raw-SQL driver serializes bound parameters
+               -- itself and rejects a Date instance outright.
+               hand_back_residual_at = ${now.toISOString()}::timestamptz
+          FROM (VALUES ${values}) AS v(id, reason, detail)
+         WHERE a.id = v.id
+           AND (a.hand_back_residual_reason IS DISTINCT FROM v.reason
+                OR a.hand_back_residual_detail IS DISTINCT FROM v.detail)
+        RETURNING a.id::text AS id
+      `);
+      changed += toRows<{ id: string }>(updated).length;
+    }
+    return changed;
+  }
+
+  /** Drops residual markers from actions that are no longer residual. */
+  async function clearResidualMarkers(actionIds: readonly string[]): Promise<void> {
+    for (let offset = 0; offset < actionIds.length; offset += STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK) {
+      const chunk = actionIds.slice(offset, offset + STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK);
+      await db.execute(sql`
+        UPDATE issue_recovery_actions
+           SET hand_back_residual_reason = NULL,
+               hand_back_residual_detail = NULL,
+               hand_back_residual_at = NULL
+         WHERE id IN (${sql.join(chunk.map((id) => sql`${id}::uuid`), sql`, `)})
+           AND hand_back_residual_reason IS NOT NULL
+      `);
+    }
+  }
+
+  /**
    * Retries delivery for a blocked issue whose active recovery action committed but whose
    * owner wake did not. Review-stage escalation intentionally dispatches after committing
    * its stage-row transaction; a process exit or enqueue failure in that gap must therefore
@@ -11338,6 +12071,16 @@ export function recoveryService(
   function reconcileStrandedRecoveryWakeBackstop(opts?: Parameters<typeof reconcileStrandedRecoveryWakeBackstopImpl>[0]) {
     const run = strandedRecoveryWakeBackstopTail.then(() => reconcileStrandedRecoveryWakeBackstopImpl(opts));
     strandedRecoveryWakeBackstopTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Serialized like its sibling backstops: two overlapping passes would both read the same
+   * pre-hand-back budget count and could spend the per-issue budget twice on one row.
+   */
+  function reconcileStrandedRecoveryHandBacks(opts?: Parameters<typeof reconcileStrandedRecoveryHandBacksImpl>[0]) {
+    const run = strandedRecoveryHandBackTail.then(() => reconcileStrandedRecoveryHandBacksImpl(opts));
+    strandedRecoveryHandBackTail = run.then(() => undefined, () => undefined);
     return run;
   }
 
@@ -12663,6 +13406,7 @@ export function recoveryService(
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileResolvedDependencyWakeBackstop,
     reconcileStrandedRecoveryWakeBackstop,
+    reconcileStrandedRecoveryHandBacks,
     reconcileExpiredRecoveryWakeHorizons,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

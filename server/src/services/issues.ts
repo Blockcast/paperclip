@@ -141,6 +141,7 @@ import {
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
 import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
+import { githubHasCommitEvidence } from "./github-app-auth.js";
 import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
@@ -10394,6 +10395,7 @@ export function issueService(db: Db) {
       let doneTransitionEvidenceVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
       let doneGateEvidenceVerdict = existing.lastEvidenceVerdict;
       let doneGateNeedsDurableArtifactCheck = false;
+      let doneGateHasVerifiedCommitEvidence = false;
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
@@ -10401,6 +10403,7 @@ export function issueService(db: Db) {
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
         hasDurableArtifactEvidence: false,
+        hasVerifiedCommitEvidence: false,
       };
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
@@ -10416,7 +10419,27 @@ export function issueService(db: Db) {
             id,
           );
           doneGateEvidenceVerdict = doneTransitionEvidenceVerdict;
+          const commitEvidence = doneTransitionEvidenceVerdict.commitEvidence ?? [];
+          if (commitEvidence.length > 0) {
+            const commitResults = await Promise.all(
+              commitEvidence.map((ref) => githubHasCommitEvidence(ref)),
+            );
+            doneGateHasVerifiedCommitEvidence = commitResults.some(
+              (result) => "found" in result && result.found === true,
+            );
+            if (!doneGateHasVerifiedCommitEvidence) {
+              const unavailable = commitResults.find((result) => "error" in result);
+              if (unavailable && "error" in unavailable) {
+                throw new HttpError(503, "Done-gate commit evidence verification unavailable", {
+                  reason: unavailable.error,
+                  issueId: id,
+                  retryable: true,
+                });
+              }
+            }
+          }
         } catch (err) {
+          if (err instanceof HttpError) throw err;
           logger.warn(
             {
               issueId: id,
@@ -10432,6 +10455,7 @@ export function issueService(db: Db) {
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
           hasDurableArtifactEvidence: false,
+          hasVerifiedCommitEvidence: doneGateHasVerifiedCommitEvidence,
         });
       }
 
@@ -10841,6 +10865,7 @@ export function issueService(db: Db) {
               lastEvidenceVerdict: doneGateEvidenceVerdict,
               isAgentActor: actorAgentId != null,
               hasDurableArtifactEvidence: doneGateHasDurableArtifact,
+              hasVerifiedCommitEvidence: doneGateHasVerifiedCommitEvidence,
             })
           ) {
             throw unprocessable(
