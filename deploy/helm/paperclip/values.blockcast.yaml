@@ -172,13 +172,17 @@ env:
     # can be swept manually or by lowering this temporarily.
     - name: PAPERCLIP_DEPENDABOT_MIN_SEVERITY
       value: "high"
-    # Put Paperclip-seeded GitHub wrappers before the system binaries. The
-    # wrappers read the mounted `paperclip-github-mcp-token` Secret file at
-    # command startup, so long-running server/agent pods stop snapshotting the
-    # 60-minute App installation token through env vars. Keep /paperclip/bin in
-    # PATH too: Claude hooks call the shared ccrotate wrapper from there.
-    - name: PATH
-      value: /paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    # PATH is no longer set here. It moved into the chart itself
+    # ("paperclip.runtimePath"), because putting the Paperclip-seeded GitHub
+    # wrappers before the system binaries is a security invariant (PEN-2527)
+    # rather than a Blockcast preference: setting it only in this overlay left
+    # every other deployment of this chart resolving `gh` to the unscrubbed
+    # image CLI. The chart-derived value is byte-identical to what this entry
+    # held. The wrappers read the mounted `paperclip-github-mcp-token` Secret
+    # file at command startup, so long-running server/agent pods stop
+    # snapshotting the 60-minute App installation token through env vars; and
+    # /paperclip/bin stays on PATH because Claude hooks call the shared ccrotate
+    # wrapper from there. Override with `env.path`, not an `env.extra` entry.
     - name: PAPERCLIP_GITHUB_TOKEN_FILE
       value: /paperclip/.secrets/github-token/token
     # gbrain per-agent OAuth clients are now read from Penstock/Authbot instead

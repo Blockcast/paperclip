@@ -206,6 +206,10 @@ spec:
               value: {{ .Values.env.serveUi | quote }}
             - name: PAPERCLIP_HOME
               value: {{ .Values.persistence.mountPath | quote }}
+            # The API tier mounts the same RWX PVC, so it sees the wrappers the
+            # workers' seed publishes. See "paperclip.runtimePath" (PEN-2527).
+            - name: PATH
+              value: {{ include "paperclip.runtimePath" . | quote }}
             - name: PAPERCLIP_INSTANCE_ID
               value: {{ .Values.env.instanceId | quote }}
             {{- if .Values.runtimeCache.enabled }}
