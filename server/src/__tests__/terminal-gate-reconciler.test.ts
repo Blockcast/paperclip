@@ -353,6 +353,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]!.authorType).toBe("system");
     expect(comments[0]!.body).toContain("blockcast/paperclip#1281");
+    expect(comments[0]!.body.match(/Declared gate signals:/g)).toHaveLength(1);
     expect(comments[0]!.key).toBe(
       terminalGateResolutionIdempotencyKey(["pr:blockcast/paperclip#1281:merged"]),
     );
