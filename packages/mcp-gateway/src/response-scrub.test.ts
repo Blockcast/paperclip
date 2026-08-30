@@ -1206,31 +1206,54 @@ describe("scrubJsonValue — env entries that are not objects", () => {
   });
 });
 
-describe("scrubResponseBody — SSE sniff skips leading bytes", () => {
-  // The sniff is the fallback for an upstream that omits content-type. It was
-  // anchored on a 6-byte window with no allowance for leading bytes, while the
-  // JSON sniff already skipped whitespace — and that asymmetry meant a stream
-  // opening on a blank line or a BOM was classified as neither, so the whole
-  // stream including its data: payloads came back unscrubbed.
-  const frame = `data: {"env":[{"name":"OPENAI_API_KEY","value":"${LEAK}"}]}\n\n`;
+describe("scrubResponseBody — every entry point skips the same leading bytes", () => {
+  // The sniffs are the fallback for an upstream that omits content-type. This
+  // matrix used to run against the SSE entry point only, because that is the one
+  // an observer had seen fail — and while it was green, a BOM-prefixed JSON-RPC
+  // body was returned with its env values in the clear. Three classifiers each
+  // held a private idea of where a body begins (SSE skipped BOM + whitespace,
+  // the JSON sniff skipped whitespace, `JSON.parse` skipped neither), so
+  // widening one of them left the others behind.
+  //
+  // Running every prefix against every entry point is the assertion that matters:
+  // it fails on the next classifier that does not derive its offset from
+  // `significantByteOffset`, rather than on the one spelling someone happened to
+  // probe. Enumerating the cases we know is what let this reach production twice.
+  const payload = `{"env":[{"name":"OPENAI_API_KEY","value":"${LEAK}"}]}`;
 
-  for (const [label, prefix] of [
+  const ENTRY_POINTS = [
+    ["an SSE stream", `data: ${payload}\n\n`],
+    ["a JSON-RPC body", payload],
+  ] as const;
+
+  const PREFIXES = [
+    ["nothing", ""],
     ["a blank line", "\n"],
     ["CRLF", "\r\n"],
     ["a BOM", "﻿"],
     ["indentation", "  "],
     ["a BOM then a blank line", "﻿\n"],
-  ] as const) {
-    it(`scrubs a stream that opens on ${label}`, () => {
-      const out = scrubResponseBody(Buffer.from(prefix + frame, "utf8"), null).toString("utf8");
+  ] as const;
 
-      expectNoLeak(out);
-      expect(out).toContain(REDACTED);
-    });
+  for (const [entryLabel, body] of ENTRY_POINTS) {
+    for (const [prefixLabel, prefix] of PREFIXES) {
+      it(`scrubs ${entryLabel} that opens on ${prefixLabel}`, () => {
+        const out = scrubResponseBody(Buffer.from(prefix + body, "utf8"), null).toString("utf8");
+
+        expectNoLeak(out);
+        expect(out).toContain(REDACTED);
+      });
+    }
   }
 
   it("still leaves a leading-whitespace body that is not a stream byte-exact", () => {
     const body = Buffer.from("  this is plain prose, not an event stream\n", "utf8");
+
+    expect(scrubResponseBody(body, null)).toBe(body);
+  });
+
+  it("still leaves a BOM-prefixed body that carries no resource byte-exact", () => {
+    const body = Buffer.from(`﻿{"issues":[{"title":"env: notes"}]}`, "utf8");
 
     expect(scrubResponseBody(body, null)).toBe(body);
   });

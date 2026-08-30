@@ -1317,13 +1317,39 @@ export function scrubResponseBody(body: Buffer, contentType?: string | null): Bu
   return Buffer.from(scrubbed, "utf8");
 }
 
-/** First non-whitespace byte is `{` or `[`, checked without allocating. */
-function startsWithJsonPunctuation(body: Buffer): boolean {
-  for (const byte of body) {
-    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
-    return byte === 0x7b /* { */ || byte === 0x5b /* [ */;
+/**
+ * Offset of the first byte that decides a body's shape: one optional UTF-8 BOM,
+ * then any leading whitespace.
+ *
+ * Every classifier at this entry point derives its starting offset from here,
+ * and that single definition is the point. Each sniff previously carried its own
+ * idea of where a body begins, and they disagreed: the SSE sniff skipped a BOM
+ * and whitespace, `startsWithJsonPunctuation` skipped whitespace only, and
+ * `JSON.parse` skipped neither. A BOM-prefixed JSON-RPC body therefore matched
+ * no classifier at all and was returned in the clear, with its `env` values
+ * intact — the same fail-open the SSE sniff was widened to close, surviving in
+ * the one direction that widening did not reach.
+ *
+ * Deriving both sniffs from one function is what makes that class unreachable
+ * rather than merely patched: a prefix taught here is understood by every entry
+ * point at once, so the next one cannot silently disagree.
+ */
+function significantByteOffset(body: Buffer): number {
+  let start = body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf ? 3 : 0;
+  while (start < body.length) {
+    const byte = body[start]!;
+    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) start += 1;
+    else break;
   }
-  return false;
+  return start;
+}
+
+/** First significant byte is `{` or `[`, checked without allocating. */
+function startsWithJsonPunctuation(body: Buffer): boolean {
+  const start = significantByteOffset(body);
+  if (start >= body.length) return false;
+  const byte = body[start]!;
+  return byte === 0x7b /* { */ || byte === 0x5b /* [ */;
 }
 
 /**
@@ -1346,28 +1372,41 @@ const SSE_FIELD_HEAD = /^(?:event|data|id|retry):|^:/;
 /**
  * The window is 8 bytes: `retry:` already consumes six, and skipping leading
  * bytes below shifts the field name later in the buffer.
+ *
+ * The leading-byte skip is `significantByteOffset`, shared with the JSON sniff.
+ * It used to be a private copy here — correct, but private, which is precisely
+ * how the JSON sniff was left behind when this one learned about BOMs.
  */
 function startsWithSseField(body: Buffer): boolean {
-  let start = 0;
   // The SSE spec requires a client to strip one leading BOM, so a stream that
-  // carries one is well-formed, not malformed.
-  if (body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) start = 3;
-  // And a leading blank line is an empty event dispatch. Neither shifted the
-  // field name out of an anchored 6-byte window before this: the sniff missed,
-  // the JSON sniff saw `e`, and the whole stream — `data:` payloads included —
-  // was returned unscrubbed. `startsWithJsonPunctuation` already skips
-  // whitespace, and that asymmetry was the entire gap.
-  while (start < body.length) {
-    const byte = body[start]!;
-    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) start += 1;
-    else break;
-  }
+  // carries one is well-formed, not malformed. A leading blank line is an empty
+  // event dispatch, equally legal. Neither shifted the field name out of an
+  // anchored 6-byte window before this: the sniff missed, the JSON sniff saw
+  // `e`, and the whole stream — `data:` payloads included — was returned
+  // unscrubbed.
+  const start = significantByteOffset(body);
   return SSE_FIELD_HEAD.test(body.subarray(start, start + 8).toString("latin1"));
 }
 
+/**
+ * `JSON.parse` tolerates leading whitespace but rejects a leading BOM, so the
+ * strip here is the parse-side half of `significantByteOffset`.
+ *
+ * Teaching only the *sniff* about BOMs would have moved this fail-open one step
+ * down rather than closing it — the body would classify as JSON and then fail to
+ * parse, and a `null` return sends it through unscrubbed exactly as before. That
+ * is the same half-fix `scrubSseFrames` documents for its own framing regex:
+ * detection and parsing have to agree about where a body begins.
+ *
+ * Dropping the BOM from the output is safe because this function only ever
+ * returns a re-serialized document, which already does not preserve the original
+ * byte layout; a body we did not change is returned as the original Buffer by
+ * `scrubResponseBody` and keeps its BOM.
+ */
 function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
+  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   try {
-    return JSON.stringify(scrubJsonValueTracked(JSON.parse(text), ctx, false, false));
+    return JSON.stringify(scrubJsonValueTracked(JSON.parse(source), ctx, false, false));
   } catch {
     return null;
   }
