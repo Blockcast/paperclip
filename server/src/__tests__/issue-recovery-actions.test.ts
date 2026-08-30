@@ -7743,6 +7743,130 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(issue!.assigneeAgentId).toBe(managerId);
     });
+
+    /**
+     * Ally review on #1549: an over-limit pass used to represent everything past the page as a
+     * bare `candidateLimitSkipped` count, so the rows that stayed mis-owned had no identifier
+     * and no reason — the residual stopped being the operator repair list at exactly the
+     * backlog size that needs one.
+     *
+     * Exercised through the injectable `limit` rather than by seeding 501 rows. The production
+     * limit is a parameter, not a branch: `limit: 1` against 4 candidates drives the identical
+     * `candidateLimitSkipped > 0` path, and seeding a real 500-row page would cost minutes of
+     * suite time to prove nothing extra.
+     */
+    async function seedAdditionalDrainableRow(
+      seeded: { companyId: string; managerId: string; coderId: string; prefix: string },
+      n: number,
+    ) {
+      const { companyId, managerId, coderId, prefix } = seeded;
+      const sourceIssueId = randomUUID();
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values([
+        {
+          id: sourceIssueId,
+          companyId,
+          title: `Mis-owned blocked row ${n}`,
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: managerId,
+          issueNumber: 100 + n * 2,
+          identifier: `${prefix}-${100 + n * 2}`,
+        },
+        {
+          id: blockerIssueId,
+          companyId,
+          title: `Upstream blocker ${n}`,
+          status: "in_progress",
+          priority: "medium",
+          issueNumber: 101 + n * 2,
+          identifier: `${prefix}-${101 + n * 2}`,
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: sourceIssueId,
+        type: "blocks",
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        previousOwnerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:drain`,
+        evidence: {},
+        nextAction: "wake_owner",
+        createdAt: new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000),
+      });
+      return sourceIssueId;
+    }
+
+    it("enumerates every candidate the page limit deferred, with an explicit reason", async () => {
+      const seeded = await seedMisownedBlockedRow();
+      const { companyId, coderId, sourceIssueId } = seeded;
+      const extraIssueIds = [
+        await seedAdditionalDrainableRow(seeded, 1),
+        await seedAdditionalDrainableRow(seeded, 2),
+        await seedAdditionalDrainableRow(seeded, 3),
+      ];
+      const allIssueIds = new Set([sourceIssueId, ...extraIssueIds]);
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW, limit: 1 });
+
+      expect(result).toMatchObject({
+        checked: 1,
+        candidateLimitSkipped: 3,
+        residualComplete: true,
+        residualUnenumerated: 0,
+      });
+
+      const deferred = result.residual.filter((row) => row.reason === "candidate_limit_deferred");
+      expect(deferred).toHaveLength(3);
+      // Individually identifiable, which is the whole point: a count cannot be repaired from.
+      for (const row of deferred) {
+        expect(row.issueId).toBeTruthy();
+        expect(row.identifier).toBeTruthy();
+        expect(row.returnOwnerAgentId).toBe(coderId);
+      }
+
+      // The completeness assertion. Every candidate the pass saw is accounted for exactly
+      // once, either as handed back or as a named residual row — no candidate is represented
+      // only by an aggregate counter.
+      const accountedFor = [...result.issueIds, ...result.residual.map((row) => row.issueId)];
+      expect(new Set(accountedFor)).toEqual(allIssueIds);
+      expect(accountedFor).toHaveLength(allIssueIds.size);
+    });
+
+    it("reports an inventory it could not complete rather than implying it is whole", async () => {
+      const seeded = await seedMisownedBlockedRow();
+      const { companyId } = seeded;
+      await seedAdditionalDrainableRow(seeded, 1);
+      await seedAdditionalDrainableRow(seeded, 2);
+      await seedAdditionalDrainableRow(seeded, 3);
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({
+        companyId,
+        now: NOW,
+        limit: 1,
+        residualEnumerationLimit: 1,
+      });
+
+      expect(result).toMatchObject({
+        candidateLimitSkipped: 3,
+        residualComplete: false,
+        // 3 deferred, 1 enumerable: the 2 that stayed anonymous are counted, not hidden.
+        residualUnenumerated: 2,
+      });
+      expect(result.residual.filter((row) => row.reason === "candidate_limit_deferred")).toHaveLength(1);
+    });
   });
 });
 
@@ -7831,6 +7955,40 @@ describe("summarizeStrandedRecoveryHandBackPass", () => {
     // The aggregate stays complete even when the sample does not, so the count never lies.
     expect(summary!.payload.residualCount).toBe(120);
     expect(summary!.payload.residualByReason).toEqual({ cooldown: 120 });
+  });
+
+  // Ally review on #1549. A sampled log line and an incomplete inventory are different
+  // failures: the first is a display bound the operator can page past, the second means rows
+  // exist that the pass cannot name at all. Only the second may claim completeness falsely,
+  // so it must not be reported with the sentence that asserts every candidate is enumerated.
+  it("does not claim every candidate is enumerated when the inventory is incomplete", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 1,
+      handedBack: 0,
+      failed: 0,
+      residualComplete: false,
+      residualUnenumerated: 2,
+      residual: [residualRow("candidate_limit_deferred", 1)],
+    });
+
+    expect(summary!.level).toBe("warn");
+    expect(summary!.message).toContain("could not enumerate every candidate");
+    expect(summary!.message).not.toContain("every candidate is enumerated");
+    // The counter rides along so the line states how many rows went unnamed.
+    expect(summary!.payload.residualUnenumerated).toBe(2);
+  });
+
+  it("warns on an incomplete inventory even when rows were handed back", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 1,
+      handedBack: 1,
+      failed: 0,
+      residualComplete: false,
+      residualUnenumerated: 4,
+      residual: [],
+    });
+
+    expect(summary!.level).toBe("warn");
   });
 });
 

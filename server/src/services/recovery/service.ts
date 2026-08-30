@@ -423,10 +423,28 @@ const STRANDED_RECOVERY_HAND_BACK_RUN_EVIDENCE_WINDOW_MS = 7 * 24 * 60 * 60 * 10
 const STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT = 500;
 
 /**
- * How many residual rows a single log line carries. The residual is bounded by the candidate
- * limit above, so the worst case is 500 objects on one line — enough to bury the surrounding
- * log. The sample plus `residualByReason` (which is always complete) answers "what was skipped
- * and why" without that; `residualTruncated` keeps the line from implying it is the full set.
+ * How many *deferred* candidates the pass enumerates individually (BLO-19123, #1549 review).
+ *
+ * The candidate limit above bounds the rows the pass will *work* — each one costs several
+ * queries and a transaction — but it must not bound the rows the pass can *name*. Reporting
+ * an over-limit population as a bare `candidateLimitSkipped` count left the rows past the page
+ * with no identifier and no reason, so the residual stopped being the operator repair list it
+ * claims to be exactly when the backlog was large enough to need one.
+ *
+ * Enumeration is therefore a separate, much larger bound: it is three columns and one indexed
+ * range scan per pass, so it is cheap in the way the processing loop is not. It is still a
+ * bound rather than an unbounded select, and when a population somehow exceeds it the pass says
+ * so via `residualComplete: false` + `residualUnenumerated` instead of quietly implying the
+ * inventory is whole.
+ */
+const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_ENUMERATION_LIMIT = 5000;
+
+/**
+ * How many residual rows a single log line carries. The residual can now run to the
+ * enumeration limit above, so a whole-set log line would bury everything around it. The sample
+ * plus `residualByReason` (which is always complete, being a count over every residual row)
+ * answers "what was skipped and why" without that; `residualTruncated` keeps the line from
+ * implying it is the full set.
  */
 const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_LOG_SAMPLE = 50;
 
@@ -455,6 +473,7 @@ export function summarizeStrandedRecoveryHandBackPass(
     handedBack: number;
     failed: number;
     residual: readonly StrandedRecoveryHandBackResidualRow[];
+    residualComplete?: boolean;
   } & Record<string, unknown>,
   opts?: { residualSampleLimit?: number },
 ): { level: "info" | "warn"; message: string; payload: Record<string, unknown> } | null {
@@ -467,17 +486,25 @@ export function summarizeStrandedRecoveryHandBackPass(
   for (const row of residual) {
     residualByReason[row.reason] = (residualByReason[row.reason] ?? 0) + 1;
   }
+  // Absent means complete: the only producer that can leave rows unnamed sets it explicitly.
+  const residualComplete = result.residualComplete !== false;
 
   return {
     // A pass that returned nothing while holding residual is not an error — a fleet whose
     // candidates are all legitimately on the live path skips all of them — but it is the
     // line an operator goes looking for, so it must not be buried at info alongside the
-    // successful passes.
-    level: result.failed > 0 || (result.handedBack === 0 && residualCount > 0) ? "warn" : "info",
+    // successful passes. An incomplete inventory is likewise a warn: it is the one state in
+    // which the residual cannot be used as the repair list.
+    level:
+      result.failed > 0 || !residualComplete || (result.handedBack === 0 && residualCount > 0)
+        ? "warn"
+        : "info",
     message:
       result.handedBack > 0
         ? "stranded-recovery hand-back pass returned ownership to original owners"
-        : "stranded-recovery hand-back pass returned nothing; every candidate is enumerated in residual",
+        : residualComplete
+          ? "stranded-recovery hand-back pass returned nothing; every candidate is enumerated in residual"
+          : "stranded-recovery hand-back pass returned nothing and could not enumerate every candidate",
     payload: {
       ...counters,
       residualCount,
@@ -11202,6 +11229,7 @@ export function recoveryService(
     limit?: number;
     maxHandBacksPerIssue?: number;
     runEvidenceWindowMs?: number;
+    residualEnumerationLimit?: number;
   }) {
     const result = {
       checked: 0,
@@ -11220,9 +11248,19 @@ export function recoveryService(
       failed: 0,
       issueIds: [] as string[],
       /**
+       * Whether `residual` names every candidate the pass did not hand back. False only when
+       * the deferred population is itself larger than the enumeration limit, in which case
+       * `residualUnenumerated` counts the rows that stayed anonymous.
+       */
+      residualComplete: true,
+      residualUnenumerated: 0,
+      /**
        * Per-row residual, so the acceptance criterion "rows not handed back are enumerated
        * individually with the failing reason" is served by the sweep itself rather than by a
-       * separate reconstruction pass that could disagree with it.
+       * separate reconstruction pass that could disagree with it. This covers candidates the
+       * pass *worked* and, past the page limit, the ones it deferred — the latter carry
+       * `candidate_limit_deferred`, which is a scheduling reason, not a diagnosis: those rows
+       * were never evaluated, so no gate has judged them yet.
        */
       residual: [] as Array<{
         issueId: string;
@@ -11248,6 +11286,10 @@ export function recoveryService(
     const candidateLimit = Math.max(
       1,
       Math.floor(asNumber(opts?.limit, STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT)),
+    );
+    const residualEnumerationLimit = Math.max(
+      0,
+      Math.floor(asNumber(opts?.residualEnumerationLimit, STRANDED_RECOVERY_HAND_BACK_RESIDUAL_ENUMERATION_LIMIT)),
     );
     const runEvidenceCutoff = new Date(now.getTime() - runEvidenceWindowMs);
 
@@ -11510,12 +11552,58 @@ export function recoveryService(
       }
     }
 
-    if (result.candidateLimitSkipped > 0) {
+    // Name the rows the page limit deferred. `candidateLimitSkipped` alone made an over-limit
+    // pass report an inventory it did not have: the rows past the page stayed mis-owned, were
+    // not handed back, and carried no identifier or reason — so the residual silently stopped
+    // being the operator repair list at exactly the backlog size that needs one.
+    //
+    // This is a second, cheap pass rather than a wider first one: enumeration is three columns
+    // over the same index range, while *working* a candidate costs several queries and a
+    // transaction. Keeping the two bounds separate is what lets the inventory be complete
+    // without making the write volume of a single scheduler tick unbounded.
+    //
+    // Cursored off the last processed action id, so the two sets cannot overlap. The read is
+    // not in the processing loop's transaction, so a row concurrently handed back by another
+    // path can appear here as deferred; that is the ordinary staleness of a point-in-time
+    // report, and it errs toward naming a row that needs no repair rather than omitting one
+    // that does.
+    const lastProcessedActionId = candidates.length > 0 ? candidates[candidates.length - 1].actionId : null;
+    if (result.candidateLimitSkipped > 0 && lastProcessedActionId) {
+      if (residualEnumerationLimit === 0) {
+        result.residualComplete = false;
+        result.residualUnenumerated = result.candidateLimitSkipped;
+      } else {
+        const deferredRows = await db
+          .select({
+            issueId: issues.id,
+            identifier: issues.identifier,
+            returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+          })
+          .from(issueRecoveryActions)
+          .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+          .where(and(...filters, gt(issueRecoveryActions.id, lastProcessedActionId)))
+          .orderBy(asc(issueRecoveryActions.id))
+          .limit(residualEnumerationLimit);
+
+        for (const row of deferredRows) {
+          noteResidual(row, "candidate_limit_deferred", `page limit ${candidateLimit}`);
+        }
+        // Only when the deferred population outruns the enumeration bound too. Reported rather
+        // than papered over: an inventory that is knowingly partial is still useful, an
+        // inventory that claims to be whole and is not is worse than none.
+        if (deferredRows.length < result.candidateLimitSkipped) {
+          result.residualComplete = false;
+          result.residualUnenumerated = result.candidateLimitSkipped - deferredRows.length;
+        }
+      }
+
       logger.warn(
         {
           processed: candidates.length,
           skipped: result.candidateLimitSkipped,
           limit: candidateLimit,
+          enumerated: result.candidateLimitSkipped - result.residualUnenumerated,
+          residualComplete: result.residualComplete,
         },
         "stranded-recovery hand-back deferred candidates past page limit",
       );
