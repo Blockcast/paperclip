@@ -379,6 +379,109 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
       .expect(409);
   });
 
+  /**
+   * The structured request path: `prReviewTarget` names the PR directly and is
+   * what stamps `origin_fingerprint`. The text is deliberately free of anything
+   * resolvable — no URL, no repo, no number — so these cases fail unless the
+   * guard consumes the target itself rather than re-parsing title/description.
+   */
+  function structuredTargetIssueBody(reviewerId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      title: "Take a look at the gateway branch",
+      description: "Head is 8ee6f12d60.",
+      assigneeAgentId: reviewerId,
+      prReviewTarget: { repoFullName: REPO, prNumber: PR_NUMBER },
+      ...overrides,
+    };
+  }
+
+  it("rejects a structured prReviewTarget whose title and description never name the PR", async () => {
+    // Durable fingerprint dedupe cannot cover this: it matches unresolved
+    // *issues*, and a webhook-sourced review in flight has a run but no issue
+    // row. Without the target reaching the guard, this create is admitted and
+    // launches a second reviewer run on a PR already under review.
+    const { companyId, reviewer, app } = await setup();
+    const run = await seedReviewRun(companyId, reviewer.id, { status: "running" });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(structuredTargetIssueBody(reviewer.id))
+      .expect(409);
+
+    expect(res.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    expect(res.body.details).toMatchObject({
+      taskKey: TASK_KEY,
+      repoFullName: NORMALIZED_REPO,
+      prNumber: PR_NUMBER,
+      existingRunId: run.id,
+      existingRunStatus: "running",
+    });
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+  });
+
+  for (const [lockSpelling, webhookTaskKey] of [
+    ["normalized", TASK_KEY],
+    ["pre-compatibility mixed-case", `pr_review:${REPO}:${PR_NUMBER}`],
+  ] as const) {
+    it(`waits for a racing ${lockSpelling} webhook wake when only the structured target names the PR`, async () => {
+      // The lock namespace is the key's spelling, so the target has to feed both
+      // the normalized and source-casing lock sets exactly as a parsed URL does.
+      const { companyId, reviewer, app } = await setup();
+      let releaseWebhook!: () => void;
+      let reportLockAcquired!: () => void;
+      const lockAcquired = new Promise<void>((resolve) => {
+        reportLockAcquired = resolve;
+      });
+      const release = new Promise<void>((resolve) => {
+        releaseWebhook = resolve;
+      });
+
+      const webhookTransaction = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${webhookTaskKey}, 0))`);
+        reportLockAcquired();
+        await release;
+        await tx.insert(heartbeatRuns).values({
+          companyId,
+          agentId: reviewer.id,
+          status: "queued",
+          contextSnapshot: { taskKey: webhookTaskKey },
+        });
+      });
+      await lockAcquired;
+
+      const createRequest = request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send(structuredTargetIssueBody(reviewer.id))
+        .then((response) => response);
+      await expect(
+        Promise.race([
+          createRequest.then(() => "settled"),
+          new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 100)),
+        ]),
+      ).resolves.toBe("waiting");
+
+      releaseWebhook();
+      await webhookTransaction;
+      const response = await createRequest;
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    });
+  }
+
+  it("accepts a structured target for a different PR than the live run", async () => {
+    // The target must narrow the guard to one PR, not become a blanket
+    // rejection of every structured request while any review is in flight.
+    const { companyId, reviewer, app } = await setup();
+    await seedReviewRun(companyId, reviewer.id);
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(structuredTargetIssueBody(reviewer.id, {
+        prReviewTarget: { repoFullName: REPO, prNumber: PR_NUMBER + 1 },
+      }))
+      .expect(201);
+  });
+
   for (const status of ["queued", "running", "scheduled_retry"]) {
     it(`rejects while the existing review run is ${status}`, async () => {
       const { companyId, reviewer, app } = await setup();
