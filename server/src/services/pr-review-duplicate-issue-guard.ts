@@ -13,7 +13,8 @@
  *
  * The guard fires only on a genuine collision — all three must hold:
  *   1. the assignee is a configured PR reviewer (PAPERCLIP_PR_REVIEWER_AGENT_IDS),
- *   2. the issue text resolves to a canonical GitHub PR URL, and
+ *   2. the issue resolves to a GitHub PR — either from the structured
+ *      `prReviewTarget` or from a canonical PR URL in its text, and
  *   3. that exact PR already has a queued/running review run in the configured
  *      reviewer pool.
  *
@@ -113,26 +114,52 @@ export function isPrReviewTaskKey(taskKey: string): boolean {
  * pod miss a normalized row after the advisory lock is released.
  *
  * Every equality check against a live task key must go through here so the
- * transition is uniform: affinity lookup, coalescing, cancellation, and this
- * module's own duplicate lookup. Non-PR keys keep plain `IN (…)` equality, so
+ * transition is uniform: affinity lookup, coalescing, cancellation, the
+ * queued-to-running dispatch lock, and this module's own duplicate lookup.
+ * Non-PR keys keep plain `IN (…)` equality, so
  * unrelated task scopes see no behavioural or planner change. Once no
  * old readers remain, producers can switch to normalized keys in a later
  * release; after mixed-case rows drain, the `lower()` leg can be dropped.
+ *
+ * `column` is widened to any SQL expression because the dispatch lock compares
+ * `coalesce(context_task_key, context_snapshot ->> 'taskKey')` rather than a
+ * bare column, and open-coding a second predicate there is exactly how the two
+ * spellings drift back apart.
  */
-export function matchesAnyTaskKey(column: Column, taskKeys: readonly string[]): SQL {
+export function matchesAnyTaskKey(column: Column | SQL, taskKeys: readonly string[]): SQL {
   const exact = [...new Set(taskKeys)];
   const legacyCasingCandidates = [
     ...new Set(exact.filter(isPrReviewTaskKey).map((taskKey) => taskKey.toLowerCase())),
   ];
-  const exactLeg = inArray(column, exact);
+  // Render either input as one SQL expression: a bare Column and a composed
+  // expression have incompatible `inArray` overloads, and a plain column still
+  // renders as its qualified reference, so the index-backed plan is unchanged.
+  const target = sql`${column}`;
+  const exactLeg = inArray(target, exact);
   if (legacyCasingCandidates.length === 0) return exactLeg;
-  const legacyCasingLeg = inArray(sql`lower(${column})`, legacyCasingCandidates);
+  const legacyCasingLeg = inArray(sql`lower(${target})`, legacyCasingCandidates);
   return or(exactLeg, legacyCasingLeg) ?? exactLeg;
 }
 
 /** Single-key form of {@link matchesAnyTaskKey}. */
-export function matchesTaskKey(column: Column, taskKey: string): SQL {
+export function matchesTaskKey(column: Column | SQL, taskKey: string): SQL {
   return matchesAnyTaskKey(column, [taskKey]);
+}
+
+/**
+ * Every advisory-lock namespace that must be held to serialize one PR scope.
+ *
+ * The lock id is `hashtextextended(taskKey, 0)`, so the *spelling* selects the
+ * namespace: locking only the caller's spelling gives no mutual exclusion
+ * against a peer that spelled the same PR the other way. Sorted so every
+ * caller acquires the pair in one order and two peers contending for the same
+ * PR cannot livelock by grabbing opposite halves. Mirrors
+ * `buildPrReviewerTaskLockKeys` in routes/github-webhook.ts; retire both
+ * alongside the `lower()` legs above.
+ */
+export function prReviewTaskLockSpellings(taskKey: string): string[] {
+  if (!isPrReviewTaskKey(taskKey)) return [taskKey];
+  return [...new Set([taskKey, taskKey.toLowerCase()])].sort();
 }
 
 /**
@@ -207,12 +234,50 @@ export type DuplicatePrReviewIssueCandidate = {
   assigneeAgentId?: string | null;
   title?: string | null;
   description?: string | null;
+  /**
+   * The structured request target, when the caller supplied one. Authoritative,
+   * and deliberately independent of the text: it is what stamps
+   * `origin_fingerprint`, so a create carrying a valid target whose title and
+   * description never spell a GitHub PR URL would otherwise take no PR-scope
+   * lock and skip the live-review lookup entirely — reaching the exact fan-out
+   * this module exists to stop, through the newer of the two request paths.
+   */
+  prReviewTarget?: PullRequestRef | null;
 };
 
 export type DuplicatePrReviewIssueOptions = {
   /** Test seam; production reads PAPERCLIP_PR_REVIEWER_AGENT_IDS from the env. */
   reviewerAgentIds?: readonly string[];
 };
+
+/**
+ * Every PR this candidate refers to, from the structured target and the free
+ * text together.
+ *
+ * The target is listed first so it survives the scan cap: it is the caller's
+ * explicit statement of which PR this is, whereas the text refs are inferred.
+ */
+function candidatePullRequestRefs(
+  candidate: DuplicatePrReviewIssueCandidate,
+  preserveRepoCasing: boolean,
+): PullRequestRef[] {
+  const target = candidate.prReviewTarget;
+  const seen = new Map<string, PullRequestRef>();
+  // Mirrors the validation the text parser applies, so an internal caller that
+  // bypasses the create schema cannot key a lock on a non-PR number.
+  if (target && Number.isSafeInteger(target.prNumber) && target.prNumber > 0) {
+    const repoFullName = preserveRepoCasing
+      ? target.repoFullName.trim()
+      : normalizePrReviewRepoFullName(target.repoFullName);
+    if (repoFullName) seen.set(`${repoFullName}:${target.prNumber}`, { repoFullName, prNumber: target.prNumber });
+  }
+  for (const ref of parsePullRequestRefsWithCasing(preserveRepoCasing, candidate.title, candidate.description)) {
+    const key = `${ref.repoFullName}:${ref.prNumber}`;
+    if (!seen.has(key)) seen.set(key, ref);
+    if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) break;
+  }
+  return [...seen.values()];
+}
 
 function guardTaskKeys(
   candidate: DuplicatePrReviewIssueCandidate,
@@ -224,7 +289,7 @@ function guardTaskKeys(
   const reviewerAgentIds = configuredPrReviewerAgentIds(options.reviewerAgentIds);
   if (!reviewerAgentIds.includes(assigneeAgentId)) return [];
 
-  return parsePullRequestRefs(candidate.title, candidate.description).map(buildPrReviewTaskKey);
+  return candidatePullRequestRefs(candidate, false).map(buildPrReviewTaskKey);
 }
 
 /**
@@ -269,14 +334,13 @@ export async function lockPrReviewIssueScopes(
   if (normalizedTaskKeys.length === 0) return;
 
   // Preserve source spelling as an additional compatibility lock for callers
-  // that copied GitHub's canonical URL. Production rollout still gates this
-  // guard until every webhook pod locks the normalized namespace because
-  // arbitrary canonical casing cannot be inferred from user-authored text.
-  const sourceTaskKeys = parsePullRequestRefsWithCasing(
-    true,
-    candidate.title,
-    candidate.description,
-  ).map((ref) => `pr_review:${ref.repoFullName}:${ref.prNumber}`);
+  // that copied GitHub's canonical URL, or that named the repo in canonical
+  // casing on the structured target. Production rollout still gates this guard
+  // until every webhook pod locks the normalized namespace because arbitrary
+  // canonical casing cannot be inferred from user-authored text.
+  const sourceTaskKeys = candidatePullRequestRefs(candidate, true).map(
+    (ref) => `pr_review:${ref.repoFullName}:${ref.prNumber}`,
+  );
   const taskKeys = [...new Set([...normalizedTaskKeys, ...sourceTaskKeys])].sort();
 
   const deadline = Date.now() + PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS;
@@ -320,7 +384,7 @@ export async function assertNotDuplicatePrReviewIssue(
   const taskKeys = guardTaskKeys(candidate, options);
   if (!assigneeAgentId || taskKeys.length === 0) return;
 
-  const refs = parsePullRequestRefs(candidate.title, candidate.description);
+  const refs = candidatePullRequestRefs(candidate, false);
   const reviewerAgentIds = configuredPrReviewerAgentIds(options.reviewerAgentIds);
   let liveRun: { id: string; status: string; contextTaskKey: string | null; createdAt: Date } | undefined;
   try {

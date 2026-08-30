@@ -10236,7 +10236,7 @@ export function issueRoutes(
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
-    let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+    let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | null = null;
     const issue = await svc.create(companyId, {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
@@ -10255,6 +10255,19 @@ export function issueRoutes(
       },
     });
     if (deduplicationReason) {
+      if (deduplicationReason === "pr_review_target") {
+        await issueReferencesSvc.syncIssue(issue.id);
+        await externalObjectsSvc.syncIssueSafely(issue.id);
+        void queueIssueAssignmentWakeup({
+          heartbeat,
+          issue,
+          reason: "issue_assigned",
+          mutation: "create_deduplicated",
+          contextSource: "issue.create",
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+        });
+      }
       const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       res.status(200).json({
         ...issue,

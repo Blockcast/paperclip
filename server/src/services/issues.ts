@@ -115,6 +115,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import {
   assertNotDuplicatePrReviewIssue,
   lockPrReviewIssueScopes,
+  normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -1039,7 +1040,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
-  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  prReviewTarget?: { repoFullName: string; prNumber: number } | null;
+  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title" | "pr_review_target") => void;
   beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
@@ -9536,10 +9538,25 @@ export function issueService(db: Db) {
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
+        prReviewTarget,
         onDeduplicated,
         beforeSideEffects,
         ...issueData
       } = data;
+      // GitHub owner/repo identity is case-insensitive, so the persisted
+      // fingerprint must be too: without this, `Blockcast/paperclip` and
+      // `blockcast/paperclip` are different fingerprints and the same PR
+      // dedupes to two issues. This column is introduced by this migration,
+      // so there are no mixed-case rows to stay compatible with — unlike the
+      // live `pr_review:` task keys, whose producers are still mid-rollout and
+      // are matched through `matchesAnyTaskKey`'s dual-read predicate instead.
+      const prReviewFingerprint = prReviewTarget
+        ? `pr_review:${normalizePrReviewRepoFullName(prReviewTarget.repoFullName)}:${prReviewTarget.prNumber}`
+        : null;
+      if (prReviewFingerprint) {
+        issueData.originKind = "pr_review";
+        issueData.originFingerprint = prReviewFingerprint;
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9585,6 +9602,7 @@ export function issueService(db: Db) {
             assigneeAgentId: issueData.assigneeAgentId,
             title: issueData.title,
             description: issueData.description,
+            prReviewTarget,
           });
         }
         if (allowDuplicate === false) {
@@ -9596,9 +9614,13 @@ export function issueService(db: Db) {
           const idempotencyGuardKey = `issue-create:idempotency:${companyId}:${idempotencyKey}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyGuardKey}, 0))`);
         }
+        if (prReviewFingerprint) {
+          const prReviewGuardKey = `issue-create:${companyId}:${prReviewFingerprint}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${prReviewGuardKey}, 0))`);
+        }
 
         let existingIssue: typeof issues.$inferSelect | undefined;
-        let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+        let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | null = null;
         if (idempotencyKey) {
           const idempotencyKeyRetentionCutoff = new Date(Date.now() - ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS);
           await tx.execute(sql`
@@ -9624,6 +9646,31 @@ export function issueService(db: Db) {
             .limit(1)
             .then((rows) => rows.map((row) => row.issues));
           if (existingIssue) deduplicationReason = "idempotency_key";
+        }
+        if (!existingIssue && prReviewFingerprint) {
+          [existingIssue] = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.originKind, "pr_review"),
+              eq(issues.originFingerprint, prReviewFingerprint),
+              isNull(issues.hiddenAt),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ))
+            .limit(1);
+          if (existingIssue) {
+            [existingIssue] = await tx
+              .update(issues)
+              .set({
+                title: issueData.title,
+                description: issueData.description ?? existingIssue.description,
+                updatedAt: new Date(),
+              })
+              .where(eq(issues.id, existingIssue.id))
+              .returning();
+            deduplicationReason = "pr_review_target";
+          }
         }
         if (!existingIssue && allowDuplicate === false) {
           [existingIssue] = await tx
@@ -9688,6 +9735,7 @@ export function issueService(db: Db) {
             assigneeAgentId: issueData.assigneeAgentId,
             title: issueData.title,
             description: issueData.description,
+            prReviewTarget,
           });
         }
 
