@@ -423,6 +423,72 @@ const STRANDED_RECOVERY_HAND_BACK_RUN_EVIDENCE_WINDOW_MS = 7 * 24 * 60 * 60 * 10
 const STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT = 500;
 
 /**
+ * How many residual rows a single log line carries. The residual is bounded by the candidate
+ * limit above, so the worst case is 500 objects on one line — enough to bury the surrounding
+ * log. The sample plus `residualByReason` (which is always complete) answers "what was skipped
+ * and why" without that; `residualTruncated` keeps the line from implying it is the full set.
+ */
+const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_LOG_SAMPLE = 50;
+
+export type StrandedRecoveryHandBackResidualRow = {
+  issueId: string;
+  identifier: string | null;
+  returnOwnerAgentId: string | null;
+  reason: string;
+  detail?: string;
+};
+
+/**
+ * Decides what a hand-back pass should report, and is exported so the decision is testable
+ * without standing up the scheduler (nothing imports `src/index.ts` under test).
+ *
+ * A pass that skips every candidate is the case this exists for. It is not a quiet pass — it
+ * is the pass whose residual an operator most needs, because every row it examined stayed
+ * mis-owned and the reasons are the repair list. Reporting only when `handedBack > 0` left
+ * that inventory unrecoverable, which is the defect this closes.
+ *
+ * Returns `null` only when the pass had nothing to say at all (no candidates, no residual),
+ * so an idle fleet does not log on every scheduler tick.
+ */
+export function summarizeStrandedRecoveryHandBackPass(
+  result: {
+    handedBack: number;
+    failed: number;
+    residual: readonly StrandedRecoveryHandBackResidualRow[];
+  } & Record<string, unknown>,
+  opts?: { residualSampleLimit?: number },
+): { level: "info" | "warn"; message: string; payload: Record<string, unknown> } | null {
+  const { residual, ...counters } = result;
+  const residualCount = residual.length;
+  if (result.handedBack === 0 && result.failed === 0 && residualCount === 0) return null;
+
+  const sampleLimit = Math.max(0, Math.floor(opts?.residualSampleLimit ?? STRANDED_RECOVERY_HAND_BACK_RESIDUAL_LOG_SAMPLE));
+  const residualByReason: Record<string, number> = {};
+  for (const row of residual) {
+    residualByReason[row.reason] = (residualByReason[row.reason] ?? 0) + 1;
+  }
+
+  return {
+    // A pass that returned nothing while holding residual is not an error — a fleet whose
+    // candidates are all legitimately on the live path skips all of them — but it is the
+    // line an operator goes looking for, so it must not be buried at info alongside the
+    // successful passes.
+    level: result.failed > 0 || (result.handedBack === 0 && residualCount > 0) ? "warn" : "info",
+    message:
+      result.handedBack > 0
+        ? "stranded-recovery hand-back pass returned ownership to original owners"
+        : "stranded-recovery hand-back pass returned nothing; every candidate is enumerated in residual",
+    payload: {
+      ...counters,
+      residualCount,
+      residualByReason,
+      residual: sampleLimit > 0 ? residual.slice(0, sampleLimit) : [],
+      residualTruncated: residualCount > sampleLimit,
+    },
+  };
+}
+
+/**
  * Signals that the issue-side ownership write lost a race after the action was already
  * resolved in the same transaction, so the whole hand-back must roll back together.
  */

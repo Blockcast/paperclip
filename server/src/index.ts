@@ -63,6 +63,7 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
@@ -1511,12 +1512,10 @@ export async function startServer(): Promise<StartedServer> {
           trackHeartbeatSchedulerWork(heartbeat
             .reconcileStrandedRecoveryHandBacks()
             .then((result) => {
-              if (result.handedBack > 0 || result.failed > 0) {
-                logger.info(
-                  { ...result, residual: result.residual.length },
-                  "stranded-recovery hand-back pass returned ownership to original owners",
-                );
-              }
+              // The all-skipped pass is reported too: its residual is the repair list, and
+              // dropping it left operators no way to recover what stayed mis-owned or why.
+              const summary = summarizeStrandedRecoveryHandBackPass(result);
+              if (summary) logger[summary.level](summary.payload, summary.message);
             })
             .catch((err) => {
               logger.error({ err }, "stranded-recovery hand-back pass failed");

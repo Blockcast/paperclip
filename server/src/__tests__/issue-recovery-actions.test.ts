@@ -41,6 +41,7 @@ import {
   isInfraClassStrandedFailure,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
+  summarizeStrandedRecoveryHandBackPass,
 } from "../services/recovery/service.js";
 
 // BLO-19160: seam for the adoption-interleaving regression test. The stranded
@@ -7744,3 +7745,92 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 });
+
+/**
+ * BLO-19123. The scheduler's reporting decision, tested here rather than at the scheduler
+ * because nothing imports `src/index.ts` under test. The case that matters is the pass that
+ * hands nothing back: its residual is the operator's repair list, and reporting only on
+ * `handedBack > 0` made that inventory unrecoverable.
+ */
+describe("summarizeStrandedRecoveryHandBackPass", () => {
+  const residualRow = (reason: string, n: number) => ({
+    issueId: `issue-${reason}-${n}`,
+    identifier: `BLO-${n}`,
+    returnOwnerAgentId: `agent-${n}`,
+    reason,
+  });
+
+  it("reports an all-skipped pass, with every residual reason enumerated", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 3,
+      handedBack: 0,
+      failed: 0,
+      returnOwnerIneligibleSkipped: 2,
+      budgetExhaustedSkipped: 1,
+      residual: [
+        residualRow("return_owner_ineligible", 1),
+        residualRow("return_owner_ineligible", 2),
+        residualRow("budget_exhausted", 3),
+      ],
+    });
+
+    expect(summary).not.toBeNull();
+    // Warn, not info: nothing was returned, so this is the line an operator goes looking for.
+    expect(summary!.level).toBe("warn");
+    expect(summary!.message).toContain("enumerated in residual");
+    expect(summary!.payload.residualCount).toBe(3);
+    expect(summary!.payload.residualByReason).toEqual({
+      return_owner_ineligible: 2,
+      budget_exhausted: 1,
+    });
+    // The rows themselves survive, so the residual is recoverable from the log alone.
+    expect(summary!.payload.residual).toHaveLength(3);
+    expect(summary!.payload.residualTruncated).toBe(false);
+    expect(summary!.payload.checked).toBe(3);
+  });
+
+  it("stays silent only when the pass had nothing to say", () => {
+    expect(
+      summarizeStrandedRecoveryHandBackPass({ checked: 0, handedBack: 0, failed: 0, residual: [] }),
+    ).toBeNull();
+  });
+
+  it("reports a successful pass at info while still carrying its residual", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 2,
+      handedBack: 1,
+      failed: 0,
+      residual: [residualRow("cooldown", 1)],
+    });
+
+    expect(summary!.level).toBe("info");
+    expect(summary!.message).toContain("returned ownership");
+    expect(summary!.payload.residualByReason).toEqual({ cooldown: 1 });
+  });
+
+  it("warns when a row failed, even though others were handed back", () => {
+    const summary = summarizeStrandedRecoveryHandBackPass({
+      checked: 2,
+      handedBack: 1,
+      failed: 1,
+      residual: [residualRow("error", 1)],
+    });
+
+    expect(summary!.level).toBe("warn");
+  });
+
+  it("bounds the logged sample and says so rather than implying it is complete", () => {
+    const residual = Array.from({ length: 120 }, (_, i) => residualRow("cooldown", i));
+    const summary = summarizeStrandedRecoveryHandBackPass(
+      { checked: 120, handedBack: 0, failed: 0, residual },
+      { residualSampleLimit: 50 },
+    );
+
+    expect(summary!.payload.residual).toHaveLength(50);
+    expect(summary!.payload.residualTruncated).toBe(true);
+    // The aggregate stays complete even when the sample does not, so the count never lies.
+    expect(summary!.payload.residualCount).toBe(120);
+    expect(summary!.payload.residualByReason).toEqual({ cooldown: 120 });
+  });
+});
+
