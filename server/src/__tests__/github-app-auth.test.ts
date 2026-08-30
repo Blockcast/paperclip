@@ -206,7 +206,6 @@ describe("githubGetPullRequestGate", () => {
   });
 });
 
-<<<<<<< HEAD
 // `not_found` is the single lookup outcome that CLOSES an approval card, and closing
 // is irreversible. GitHub answers 404 both for a deleted run and for a repository the
 // installation cannot see, so the two must be told apart before that outcome is
@@ -283,7 +282,9 @@ describe("githubFetchPrHeadSha", () => {
 
     await expect(githubFetchPrHeadSha({ repoFullName: "Blockcast/paperclip", prNumber: 1049 }))
       .resolves.toBe("abcdef1234567890abcdef1234567890abcdef12");
-=======
+  });
+});
+
 describe("githubHasCommitEvidence", () => {
   it("accepts a commit that exists in the configured GitHub installation", async () => {
     setCreds();
@@ -328,7 +329,6 @@ describe("githubHasCommitEvidence", () => {
       repoFullName: "Blockcast/paperclip",
       sha: "abcdef1234567",
     })).resolves.toEqual({ error: "commit_http_503" });
->>>>>>> fd09d51a1 (fix(issues): verify remote commit evidence before done)
   });
 });
 
