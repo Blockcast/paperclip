@@ -7873,6 +7873,118 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(new Set(accountedFor)).toEqual(allIssueIds);
       expect(accountedFor).toHaveLength(allIssueIds.size);
     });
+
+    /**
+     * Ally review on #1549, third pass. The in-memory enumeration was complete, but the
+     * scheduler is the only production caller and it logs a bounded sample before dropping
+     * the array — so beyond the sample the inventory existed nowhere an operator could reach.
+     * These lock the durable record that closes that gap.
+     */
+    describe("durable residual inventory", () => {
+      const readMarkers = async (companyId: string) =>
+        db
+          .select({
+            sourceIssueId: issueRecoveryActions.sourceIssueId,
+            reason: issueRecoveryActions.handBackResidualReason,
+            detail: issueRecoveryActions.handBackResidualDetail,
+            at: issueRecoveryActions.handBackResidualAt,
+          })
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.companyId, companyId));
+
+      it("persists the skip reason on the recovery action, not just in the returned array", async () => {
+        // A human owner outranks the return owner, so this row is skipped `user_assigned`.
+        const { companyId, sourceIssueId } = await seedMisownedBlockedRow({ assigneeUserId: "user-1" });
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+        const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+        expect(result).toMatchObject({ handedBack: 0, userAssignedSkipped: 1, residualPersisted: 1 });
+
+        const markers = await readMarkers(companyId);
+        expect(markers).toHaveLength(1);
+        expect(markers[0]).toMatchObject({
+          sourceIssueId,
+          reason: "user_assigned",
+          detail: "user-1",
+        });
+        expect(markers[0]!.at).toBeInstanceOf(Date);
+      });
+
+      /**
+       * The finding's exact shape: rows past the processing limit are the ones the log sample
+       * is least likely to carry, so they are the ones that most need a durable record.
+       */
+      it("persists a marker for every candidate deferred past the processing limit", async () => {
+        const seeded = await seedMisownedBlockedRow();
+        const { companyId } = seeded;
+        const allIssueIds = new Set([
+          seeded.sourceIssueId,
+          await seedAdditionalDrainableRow(seeded, 1),
+          await seedAdditionalDrainableRow(seeded, 2),
+          await seedAdditionalDrainableRow(seeded, 3),
+        ]);
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+        const result = await recovery.reconcileStrandedRecoveryHandBacks({
+          companyId,
+          now: NOW,
+          limit: 1,
+          residualPageSize: 1,
+        });
+        expect(result).toMatchObject({ checked: 1, handedBack: 1, candidateLimitSkipped: 3 });
+
+        // Candidates are ordered by action id (a random uuid), so which row the limit admits
+        // is not the seed order — read it back rather than assuming.
+        const [handedBackIssueId] = result.issueIds;
+        const markers = await readMarkers(companyId);
+        const deferred = markers.filter((row) => row.reason === "candidate_limit_deferred");
+        // Every deferred row is individually recoverable from the database alone — no
+        // dependence on the log sample, which by construction cannot be relied on here.
+        expect(new Set(deferred.map((row) => row.sourceIssueId))).toEqual(
+          new Set([...allIssueIds].filter((id) => id !== handedBackIssueId)),
+        );
+        // The row that WAS handed back carries no stale diagnosis.
+        const handedBack = markers.find((row) => row.sourceIssueId === handedBackIssueId);
+        expect(handedBack!.reason).toBeNull();
+        expect(handedBack!.at).toBeNull();
+      });
+
+      /**
+       * The write is change-gated, which is what makes it affordable on a 30s tick against a
+       * population that is stable by definition. A re-run must cost zero row writes while the
+       * inventory itself stays complete.
+       */
+      it("rewrites nothing when the diagnosis is unchanged, and moves the timestamp only when it changes", async () => {
+        const { companyId } = await seedMisownedBlockedRow({ assigneeUserId: "user-1" });
+        const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+        const first = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+        expect(first.residualPersisted).toBe(1);
+        const [afterFirst] = await readMarkers(companyId);
+
+        const later = new Date(NOW.getTime() + 60_000);
+        const second = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: later });
+        // Same reason, same detail: no write, so the timestamp keeps reading as "stuck since",
+        // not "last swept".
+        expect(second.residualPersisted).toBe(0);
+        const [afterSecond] = await readMarkers(companyId);
+        expect(afterSecond!.at!.getTime()).toBe(afterFirst!.at!.getTime());
+
+        // Change the diagnosis: the human owner steps off, so the next gate takes over.
+        await db.update(issues).set({ assigneeUserId: null }).where(eq(issues.companyId, companyId));
+        const third = await recovery.reconcileStrandedRecoveryHandBacks({
+          companyId,
+          now: later,
+          // Force a different terminal gate rather than a hand-back, so there is a new
+          // reason to observe.
+          maxHandBacksPerIssue: 0,
+        });
+        expect(third.residualPersisted).toBe(1);
+        const [afterThird] = await readMarkers(companyId);
+        expect(afterThird!.reason).toBe("hand_back_budget_exhausted");
+        expect(afterThird!.at!.getTime()).toBe(later.getTime());
+      });
+    });
   });
 });
 
@@ -7913,7 +8025,8 @@ describe("summarizeStrandedRecoveryHandBackPass", () => {
       return_owner_ineligible: 2,
       budget_exhausted: 1,
     });
-    // The rows themselves survive, so the residual is recoverable from the log alone.
+    // The sample carries the rows themselves, so a small residual is fully readable from the
+    // log line. The authoritative record is the per-action marker asserted above.
     expect(summary!.payload.residual).toHaveLength(3);
     expect(summary!.payload.residualTruncated).toBe(false);
     expect(summary!.payload.checked).toBe(3);
