@@ -1514,6 +1514,9 @@ export async function startServer(): Promise<StartedServer> {
             .then((result) => {
               // The all-skipped pass is reported too: its residual is the repair list, and
               // dropping it left operators no way to recover what stayed mis-owned or why.
+              // This line carries a bounded sample; the complete per-row inventory is written
+              // durably by the pass onto `issue_recovery_actions.hand_back_residual_reason`,
+              // so nothing here depends on the return value surviving the promise.
               const summary = summarizeStrandedRecoveryHandBackPass(result);
               if (summary) logger[summary.level](summary.payload, summary.message);
             })

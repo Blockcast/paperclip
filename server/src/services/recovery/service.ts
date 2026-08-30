@@ -442,12 +442,16 @@ const STRANDED_RECOVERY_HAND_BACK_CANDIDATE_LIMIT = 500;
 const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_PAGE_SIZE = 1000;
 
 /**
- * How many residual rows a single log line carries. The residual is now bounded only by the
+ * How many residual rows a single log line carries. The residual is bounded only by the
  * candidate population, so a whole-set log line could bury everything around it. The sample
  * plus `residualByReason` (which is always complete, being a count over every residual row)
- * answers "what was skipped and why" without that; `residualTruncated` keeps the line from
- * implying it is the full set. The full set is in `result.residual`, which is what the
- * scheduler's caller receives.
+ * answers "what was skipped and why" at a glance.
+ *
+ * The log line is a convenience view, NOT the inventory. The authoritative per-row record is
+ * `issue_recovery_actions.hand_back_residual_reason`, written by the pass itself, which is
+ * durable, queryable and JOINable against the issue — see the column's doc comment for the
+ * operator query. `residualTruncated` marks the sample as partial so nobody mistakes it for
+ * the whole set.
  */
 const STRANDED_RECOVERY_HAND_BACK_RESIDUAL_LOG_SAMPLE = 50;
 
@@ -506,8 +510,8 @@ export function summarizeStrandedRecoveryHandBackPass(
       residualCount,
       residualByReason,
       residual: sampleLimit > 0 ? residual.slice(0, sampleLimit) : [],
-      // Bounds the LOG LINE only. `residualCount`, `residualByReason` and the caller's
-      // `result.residual` all remain complete.
+      // Bounds the LOG LINE only. `residualCount` and `residualByReason` remain complete, and
+      // the durable per-row inventory lives on the recovery actions themselves.
       residualTruncated: residualCount > sampleLimit,
     },
   };
@@ -11244,6 +11248,12 @@ export function recoveryService(
       claimLost: 0,
       candidateLimitSkipped: 0,
       failed: 0,
+      /**
+       * How many residual markers this pass actually wrote. Zero alongside a non-empty
+       * `residual` is the healthy steady state, not a failure: it means every row's durable
+       * diagnosis already matched what this pass computed.
+       */
+      residualPersisted: 0,
       issueIds: [] as string[],
       /**
        * Per-row residual, so the acceptance criterion "rows not handed back are enumerated
@@ -11284,9 +11294,11 @@ export function recoveryService(
       Math.floor(asNumber(opts?.residualPageSize, STRANDED_RECOVERY_HAND_BACK_RESIDUAL_PAGE_SIZE)),
     );
     const runEvidenceCutoff = new Date(now.getTime() - runEvidenceWindowMs);
+    const residualMarkers: Array<{ actionId: string; reason: string; detail: string | null }> = [];
+    const handedBackActionIds: string[] = [];
 
     const noteResidual = (
-      candidate: { issueId: string; identifier: string | null; returnOwnerAgentId: string | null },
+      candidate: { actionId: string; issueId: string; identifier: string | null; returnOwnerAgentId: string | null },
       reason: string,
       detail?: string,
     ) => {
@@ -11297,6 +11309,11 @@ export function recoveryService(
         reason,
         ...(detail ? { detail } : {}),
       });
+      // Keyed by action id rather than issue id: the durable marker lives on the recovery
+      // action, which is the row that carries `returnOwnerAgentId` and the one an operator
+      // resolves. Held separately from `result.residual` so the reported shape stays the
+      // caller's contract and is not widened by a persistence detail.
+      residualMarkers.push({ actionId: candidate.actionId, reason, detail: detail ?? null });
     };
 
     const filters = [
@@ -11505,6 +11522,7 @@ export function recoveryService(
 
         result.handedBack += 1;
         result.issueIds.push(candidate.issueId);
+        handedBackActionIds.push(candidate.actionId);
         await logActivity(db, {
           companyId: candidate.companyId,
           actorType: "system",
@@ -11601,7 +11619,92 @@ export function recoveryService(
       );
     }
 
+    // Make the residual inventory durable (BLO-19123, #1549 review). Up to here the inventory
+    // exists only in `result.residual`, and the scheduler — the sole production caller — logs a
+    // bounded sample and drops the rest when the promise resolves. That made the complete
+    // enumeration unobservable in production at exactly the backlog size that needs it: an
+    // operator could read the aggregate counts but could not name, let alone repair, row 51.
+    //
+    // Written to the action row rather than an append-only audit table because the residual is
+    // current state, not an event stream: "this row is still mis-owned, and this is the gate
+    // holding it" has exactly one true value at a time. Current-state storage also bounds
+    // growth at the candidate population instead of at population x tick count.
+    result.residualPersisted = await persistResidualMarkers(residualMarkers, now);
+    // Clear markers on rows this pass actually returned. Their actions are resolved, so the
+    // documented operator query (which filters on active status) already hides them — but a
+    // stale reason left on a resolved row would misread as a live diagnosis for anyone querying
+    // without that filter.
+    if (handedBackActionIds.length > 0) {
+      await clearResidualMarkers(handedBackActionIds);
+    }
+
     return result;
+  }
+
+  /**
+   * Batch size for the residual marker write. Bounds the size of a single generated statement;
+   * it is not an inventory bound, since the chunks loop until the set is exhausted.
+   */
+  const STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK = 500;
+
+  /** `db.execute` returns driver-shaped results; normalize to an array before counting. */
+  function toRows<T>(rows: unknown): T[] {
+    return Array.isArray(rows) ? rows as T[] : Array.from(rows as Iterable<T>);
+  }
+
+  /**
+   * Writes the per-row residual reasons onto their recovery actions, returning how many rows
+   * actually changed.
+   *
+   * The `is distinct from` guard is what makes this affordable on a 30s scheduler tick: the
+   * residual population is stable by nature — these rows are stuck, which is the whole
+   * complaint — so in steady state every chunk matches zero rows and the pass costs one
+   * statement per chunk and no row writes. It also gives `hand_back_residual_at` its meaning:
+   * the timestamp only moves when the diagnosis changes, so its age reads as how long the row
+   * has been stuck for this reason rather than when the sweep last ran.
+   */
+  async function persistResidualMarkers(
+    markers: ReadonlyArray<{ actionId: string; reason: string; detail: string | null }>,
+    now: Date,
+  ): Promise<number> {
+    let changed = 0;
+    for (let offset = 0; offset < markers.length; offset += STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK) {
+      const chunk = markers.slice(offset, offset + STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK);
+      const values = sql.join(
+        chunk.map((marker) => sql`(${marker.actionId}::uuid, ${marker.reason}::text, ${marker.detail}::text)`),
+        sql`, `,
+      );
+      const updated = await db.execute(sql<{ id: string }>`
+        UPDATE issue_recovery_actions AS a
+           SET hand_back_residual_reason = v.reason,
+               hand_back_residual_detail = v.detail,
+               -- ISO string + explicit cast: the raw-SQL driver serializes bound parameters
+               -- itself and rejects a Date instance outright.
+               hand_back_residual_at = ${now.toISOString()}::timestamptz
+          FROM (VALUES ${values}) AS v(id, reason, detail)
+         WHERE a.id = v.id
+           AND (a.hand_back_residual_reason IS DISTINCT FROM v.reason
+                OR a.hand_back_residual_detail IS DISTINCT FROM v.detail)
+        RETURNING a.id::text AS id
+      `);
+      changed += toRows<{ id: string }>(updated).length;
+    }
+    return changed;
+  }
+
+  /** Drops residual markers from actions that are no longer residual. */
+  async function clearResidualMarkers(actionIds: readonly string[]): Promise<void> {
+    for (let offset = 0; offset < actionIds.length; offset += STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK) {
+      const chunk = actionIds.slice(offset, offset + STRANDED_RECOVERY_HAND_BACK_MARKER_CHUNK);
+      await db.execute(sql`
+        UPDATE issue_recovery_actions
+           SET hand_back_residual_reason = NULL,
+               hand_back_residual_detail = NULL,
+               hand_back_residual_at = NULL
+         WHERE id IN (${sql.join(chunk.map((id) => sql`${id}::uuid`), sql`, `)})
+           AND hand_back_residual_reason IS NOT NULL
+      `);
+    }
   }
 
   /**
