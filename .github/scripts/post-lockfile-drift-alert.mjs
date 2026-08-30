@@ -34,7 +34,7 @@ export function buildAlert({ summary, runUrl, repo, now }) {
 async function main() {
   const base = (process.env.ALERTMANAGER_URL || DEFAULT_ALERTMANAGER_URL).replace(/\/+$/, '');
   const alert = buildAlert({
-    summary: { violations: process.env.DRIFT_SUMMARY ? [process.env.DRIFT_SUMMARY] : null },
+    summary: process.env.DRIFT_SUMMARY ? { violations: [process.env.DRIFT_SUMMARY] } : null,
     runUrl: process.env.RUN_URL ?? '',
     repo: process.env.GH_REPO ?? process.env.GITHUB_REPOSITORY ?? 'unknown/unknown',
     now: new Date(),
