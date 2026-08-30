@@ -7807,7 +7807,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       return sourceIssueId;
     }
 
-    it("enumerates every candidate the page limit deferred, with an explicit reason", async () => {
+    it("enumerates every candidate the processing limit deferred, with an explicit reason", async () => {
       const seeded = await seedMisownedBlockedRow();
       const { companyId, coderId, sourceIssueId } = seeded;
       const extraIssueIds = [
@@ -7820,12 +7820,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
       const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW, limit: 1 });
 
-      expect(result).toMatchObject({
-        checked: 1,
-        candidateLimitSkipped: 3,
-        residualComplete: true,
-        residualUnenumerated: 0,
-      });
+      expect(result).toMatchObject({ checked: 1, candidateLimitSkipped: 3 });
 
       const deferred = result.residual.filter((row) => row.reason === "candidate_limit_deferred");
       expect(deferred).toHaveLength(3);
@@ -7844,28 +7839,39 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(accountedFor).toHaveLength(allIssueIds.size);
     });
 
-    it("reports an inventory it could not complete rather than implying it is whole", async () => {
+    /**
+     * Ally review on #1549, second pass: a *capped* enumeration only moved the unnamed-rows
+     * problem to a higher threshold. The enumeration now pages until the deferred set is
+     * exhausted, so completeness must hold when the deferred population is larger than one
+     * enumeration page — the case a single bounded query silently got wrong.
+     */
+    it("pages through deferred candidates so completeness does not depend on page size", async () => {
       const seeded = await seedMisownedBlockedRow();
-      const { companyId } = seeded;
-      await seedAdditionalDrainableRow(seeded, 1);
-      await seedAdditionalDrainableRow(seeded, 2);
-      await seedAdditionalDrainableRow(seeded, 3);
+      const { companyId, sourceIssueId } = seeded;
+      const extraIssueIds = [
+        await seedAdditionalDrainableRow(seeded, 1),
+        await seedAdditionalDrainableRow(seeded, 2),
+        await seedAdditionalDrainableRow(seeded, 3),
+        await seedAdditionalDrainableRow(seeded, 4),
+      ];
+      const allIssueIds = new Set([sourceIssueId, ...extraIssueIds]);
       const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
 
+      // 4 deferred rows against a 1-row enumeration page: four round trips, not one truncated
+      // query. A capped implementation names 1 of 4 here and reports the rest as an aggregate.
       const result = await recovery.reconcileStrandedRecoveryHandBacks({
         companyId,
         now: NOW,
         limit: 1,
-        residualEnumerationLimit: 1,
+        residualPageSize: 1,
       });
 
-      expect(result).toMatchObject({
-        candidateLimitSkipped: 3,
-        residualComplete: false,
-        // 3 deferred, 1 enumerable: the 2 that stayed anonymous are counted, not hidden.
-        residualUnenumerated: 2,
-      });
-      expect(result.residual.filter((row) => row.reason === "candidate_limit_deferred")).toHaveLength(1);
+      expect(result.candidateLimitSkipped).toBe(4);
+      expect(result.residual.filter((row) => row.reason === "candidate_limit_deferred")).toHaveLength(4);
+
+      const accountedFor = [...result.issueIds, ...result.residual.map((row) => row.issueId)];
+      expect(new Set(accountedFor)).toEqual(allIssueIds);
+      expect(accountedFor).toHaveLength(allIssueIds.size);
     });
   });
 });
@@ -7955,40 +7961,6 @@ describe("summarizeStrandedRecoveryHandBackPass", () => {
     // The aggregate stays complete even when the sample does not, so the count never lies.
     expect(summary!.payload.residualCount).toBe(120);
     expect(summary!.payload.residualByReason).toEqual({ cooldown: 120 });
-  });
-
-  // Ally review on #1549. A sampled log line and an incomplete inventory are different
-  // failures: the first is a display bound the operator can page past, the second means rows
-  // exist that the pass cannot name at all. Only the second may claim completeness falsely,
-  // so it must not be reported with the sentence that asserts every candidate is enumerated.
-  it("does not claim every candidate is enumerated when the inventory is incomplete", () => {
-    const summary = summarizeStrandedRecoveryHandBackPass({
-      checked: 1,
-      handedBack: 0,
-      failed: 0,
-      residualComplete: false,
-      residualUnenumerated: 2,
-      residual: [residualRow("candidate_limit_deferred", 1)],
-    });
-
-    expect(summary!.level).toBe("warn");
-    expect(summary!.message).toContain("could not enumerate every candidate");
-    expect(summary!.message).not.toContain("every candidate is enumerated");
-    // The counter rides along so the line states how many rows went unnamed.
-    expect(summary!.payload.residualUnenumerated).toBe(2);
-  });
-
-  it("warns on an incomplete inventory even when rows were handed back", () => {
-    const summary = summarizeStrandedRecoveryHandBackPass({
-      checked: 1,
-      handedBack: 1,
-      failed: 0,
-      residualComplete: false,
-      residualUnenumerated: 4,
-      residual: [],
-    });
-
-    expect(summary!.level).toBe("warn");
   });
 });
 
