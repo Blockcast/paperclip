@@ -371,7 +371,7 @@ function resolveEntryShapes(
   }
   // Any concrete url sitting alongside the sentinel is still audited on its own.
   if (direct.hosts.length > 0) {
-    shapes.push({ label: name, hosts: direct.hosts, unresolved: [], declaresCommand });
+    shapes.push({ label: name, hosts: direct.hosts, unresolved: direct.unresolved, declaresCommand });
   }
   return shapes;
 }
@@ -386,16 +386,20 @@ function resolveEntryShapes(
  * so fail loudly and directly at the reader who changed it, rather than staying
  * green while describing a world that no longer exists.
  */
-function assertMergeTopologyUnchanged(): void {
+function assertMergeTopologyUnchanged(sourceOverride?: string): void {
   let source: string;
-  try {
-    source = readFileSync(jobManifestPath, "utf8");
-  } catch {
-    throw new Error(
-      `Could not read ${jobManifestPath}. This audit's scope boundary is stated in terms of the ` +
-        "per-agent MCP merge that lives there. If the adapter moved, re-point this probe and " +
-        "re-check whether adapterConfig.mcpServers can still add an unscrubbed agent-facing upstream.",
-    );
+  if (sourceOverride !== undefined) {
+    source = sourceOverride;
+  } else {
+    try {
+      source = readFileSync(jobManifestPath, "utf8");
+    } catch {
+      throw new Error(
+        `Could not read ${jobManifestPath}. This audit's scope boundary is stated in terms of the ` +
+          "per-agent MCP merge that lives there. If the adapter moved, re-point this probe and " +
+          "re-check whether adapterConfig.mcpServers can still add an unscrubbed agent-facing upstream.",
+      );
+    }
   }
 
   const probes: readonly { needle: RegExp; clause: string }[] = [
@@ -411,6 +415,12 @@ function assertMergeTopologyUnchanged(): void {
       clause:
         "the merged file is the only MCP config the agent reads, so this seed is genuinely " +
         "load-bearing rather than shadowed by something else on disk",
+    },
+    {
+      needle: /--mcp-config[\s\S]{0,80}\/tmp\/prompt\/mcp\.json/,
+      clause:
+        "Claude is explicitly pointed at the materialized merged MCP file; strict mode alone " +
+        "does not prove that this audited file is the one the agent consumes",
     },
   ];
 
@@ -592,6 +602,20 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
         "and the half that is unknown must be reported.",
     ).toContain("http://${TENANT}.svc.cluster.local");
 
+    // A concrete URL elsewhere in the same entry must not erase unresolved
+    // evidence from the seed URL itself. This is the second shape of the same
+    // fail-open bug: the concrete sibling is useful evidence, but cannot vouch
+    // for an interpolated host.
+    const concreteSibling = resolveEntryShapes(
+      "probe",
+      { type: "http", url: "http://fixed.svc.cluster.local:8080/mcp http://<shell:SVC>:8080/mcp" },
+      (v) => (v === "SVC" ? [] : []),
+    );
+    expect(concreteSibling.flatMap((s) => s.hosts)).toContain("fixed.svc.cluster.local");
+    expect(concreteSibling.flatMap((s) => s.unresolved)).toContain(
+      "http://<shell:SVC>:8080/mcp",
+    );
+
     // And the floor case: a sentinel with no assignment at all is unknowable from
     // this repo, so the url is unresolved rather than silently host-less.
     const unassigned = resolveEntryShapes("probe", entry, () => []);
@@ -636,5 +660,15 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     // We cannot enumerate that half — but we can make its shape a tested claim, so
     // a topology change trips here instead of silently invalidating the audit.
     expect(() => assertMergeTopologyUnchanged()).not.toThrow();
+  });
+
+  it("fails closed if the merged MCP file is no longer passed to Claude", () => {
+    const manifest = readFileSync(jobManifestPath, "utf8");
+    const withoutMcpConfig = manifest.replace(
+      /[\"']--mcp-config[\"'],\s*[\"']\/tmp\/prompt\/mcp\.json[\"'],\s*/,
+      "",
+    );
+    expect(withoutMcpConfig).not.toBe(manifest);
+    expect(() => assertMergeTopologyUnchanged(withoutMcpConfig)).toThrow(/materialized merged MCP file/);
   });
 });
