@@ -479,8 +479,12 @@ spec:
               # harnesses spawn non-login, non-interactive shells, so there `gh`
               # resolves straight to /usr/bin/gh and the egress scrubber above is
               # never reached — the choke point exists but sits off the traffic
-              # path. ${BASE}/bin IS on the image PATH ahead of /usr/bin for every
-              # shell, so publish `gh` there too.
+              # path. ${BASE}/bin is placed ahead of /usr/bin by the container
+              # PATH the chart sets ("paperclip.runtimePath"), for every shell,
+              # so publish `gh` there too. That PATH is chart-managed rather than
+              # image-supplied or set per-overlay on purpose: while it lived only
+              # in values.blockcast.yaml, every other deployment of this chart
+              # resolved `gh` to the unscrubbed image CLI.
               #
               # A symlink rather than a second copy: one canonical wrapper file
               # stays the only thing to edit, so the two locations cannot drift
@@ -849,6 +853,10 @@ spec:
               value: {{ .Values.env.serveUi | quote }}
             - name: PAPERCLIP_HOME
               value: {{ .Values.persistence.mountPath | quote }}
+            # Keeps the seeded GitHub egress wrappers ahead of /usr/bin for every
+            # shell, login or not. See "paperclip.runtimePath" (PEN-2527).
+            - name: PATH
+              value: {{ include "paperclip.runtimePath" . | quote }}
             - name: PAPERCLIP_INSTANCE_ID
               value: {{ .Values.env.instanceId | quote }}
             {{- if .Values.runtimeCache.enabled }}

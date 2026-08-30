@@ -161,6 +161,17 @@ env:
   serveUi: true
   # -- Paperclip instance identifier. Directory under `/paperclip/instances/` is named after this.
   instanceId: default
+  # -- PATH for the runtime containers. Leave empty to derive the chart default:
+  # the seeded GitHub egress wrappers (`persistence.mountPath` + `/.local/bin`
+  # and `/bin`) ahead of the system bin directories. Those wrappers are what
+  # scrubs credential-shaped material out of agent-authored GitHub content
+  # (PEN-2527); if they do not precede `/usr/bin`, agent `gh` resolves to the
+  # unscrubbed image CLI and the scrubber is off the traffic path entirely.
+  # An override must keep both wrapper directories ahead of `/usr/bin` — the
+  # chart fails the render rather than shipping an agent that publishes
+  # unscrubbed. Set this rather than a `PATH` entry in `env.extra`, which the
+  # chart rejects because a duplicate env var would silently win over it.
+  path: ""
   # -- Extra environment variables merged verbatim into the container spec.
   # Example: `[{name: NODE_OPTIONS, value: --max-old-space-size=3072}]`.
   extra: []
