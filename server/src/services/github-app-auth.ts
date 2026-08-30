@@ -214,6 +214,30 @@ export type PullRequestGateResult =
   | { state: "open" | "closed"; merged: boolean }
   | { error: string };
 
+export type GitHubCommitEvidenceResult =
+  | { found: true }
+  | { found: false }
+  | { error: string };
+
+export async function githubHasCommitEvidence(input: {
+  repoFullName: string;
+  sha: string;
+}): Promise<GitHubCommitEvidenceResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.sha}`,
+      { headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` } },
+    );
+    if (res.ok) return { found: true };
+    const classified = await classifyGithubHttpFailure("commit", res);
+    return classified.retryable ? { error: classified.reason } : { found: false };
+  } catch {
+    return { error: "commit_fetch_failed" };
+  }
+}
+
 export async function githubGetPullRequestGate(input: {
   repoFullName: string;
   prNumber: number;
