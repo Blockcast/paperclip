@@ -83,9 +83,11 @@ export type {
 // `blocked`-with-no-blocker backlog accumulated in the first place.
 export {
   resolveStrandedEscalationStatus,
+  shouldReuseStrandedRecoveryAction,
 } from "./stranded-escalation-status.js";
 export type {
   StrandedEscalationStatus,
   StrandedEscalationStatusInput,
   StrandedEscalationStatusDecision,
+  StrandedRecoveryActionReuseInput,
 } from "./stranded-escalation-status.js";
