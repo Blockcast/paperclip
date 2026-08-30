@@ -146,3 +146,46 @@ export function resolveStrandedEscalationStatus(
     hasNoRecoveryPath: true,
   };
 }
+
+export type StrandedRecoveryActionReuseInput = {
+  /** `status` on the existing active-source recovery action. */
+  existingStatus: string;
+  /** `ownerAgentId` on the existing action. */
+  existingOwnerAgentId: string | null;
+  /** Owner this sweep's routing resolved. */
+  routedOwnerAgentId: string | null;
+  /** True when cause AND fingerprint both match the existing action. */
+  isUnchangedAction: boolean;
+};
+
+/**
+ * Whether a stranded sweep should REUSE the existing recovery action instead of
+ * re-upserting it (BLO-30743).
+ *
+ * Re-upserting an action that has no wake budget left to spend does no work: it only
+ * increments `attemptCount` and re-runs the escalation's side effects — including
+ * `issue.escalation.needs_human_decision`, which is forwarded to Slack. Two shapes have
+ * no budget:
+ *
+ *   - **ownerless** — routing found nobody invokable, so no wake was ever armed.
+ *   - **escalated** — `escalateExpiredWakeHorizons` retired the action once its horizon
+ *     expired. That transition writes only `status`, so `ownerAgentId` stays populated and
+ *     the action still reads as owned while `reconcileStrandedRecoveryWakeBackstop` drops
+ *     every sweep for it at `exhaustedSkipped`.
+ *
+ * The owner-equality clause is what keeps this narrow, and it is the half most likely to be
+ * got wrong in either direction. Too broad and a genuine reassignment is swallowed — the new
+ * owner would never be woken, which is the deadlock BLO-18996 closed. Too narrow and the
+ * `needs_human_decision` spam continues. So an `escalated` action is reused ONLY while its
+ * owner is unchanged; routing a new owner resets the wake budget and must escalate normally.
+ */
+export function shouldReuseStrandedRecoveryAction(
+  input: StrandedRecoveryActionReuseInput,
+): boolean {
+  if (!input.isUnchangedAction) return false;
+  const routedOwnerAgentId = input.routedOwnerAgentId ?? null;
+  const isOwnerless = !routedOwnerAgentId && !input.existingOwnerAgentId;
+  const isStandingEscalation = input.existingStatus === "escalated" &&
+    routedOwnerAgentId === input.existingOwnerAgentId;
+  return isOwnerless || isStandingEscalation;
+}

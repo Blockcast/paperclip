@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { resolveStrandedEscalationStatus } from "./stranded-escalation-status.js";
+import {
+  resolveStrandedEscalationStatus,
+  shouldReuseStrandedRecoveryAction,
+} from "./stranded-escalation-status.js";
 
 /**
  * BLO-27635. These pin the *producer* half of the `blocked`-with-no-blocker
@@ -209,5 +212,89 @@ describe("resolveStrandedEscalationStatus", () => {
         recoveryOwnerAgentId: "agent-2",
       })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
     });
+  });
+});
+
+/**
+ * BLO-30743. The reuse gate that stops an unwakeable action being re-upserted every sweep.
+ * Its owner-equality clause is dangerous in BOTH directions, which is what these pin:
+ * too broad swallows a genuine reassignment (the new owner is never woken — the BLO-18996
+ * deadlock), too narrow lets the `needs_human_decision` Slack spam continue.
+ */
+describe("shouldReuseStrandedRecoveryAction", () => {
+  const standingEscalation = {
+    existingStatus: "escalated",
+    existingOwnerAgentId: "agent-1",
+    routedOwnerAgentId: "agent-1",
+    isUnchangedAction: true,
+  };
+
+  it("reuses a standing escalated action whose owner has not moved", () => {
+    // The BLO-27999 steady state: attemptCount 748 / maxAttempts 5, nothing changing.
+    expect(shouldReuseStrandedRecoveryAction(standingEscalation)).toBe(true);
+  });
+
+  it("does NOT reuse when the owner changed, so a reassignment still escalates", () => {
+    // Ally's review suggestion, and the failure mode that matters most: a fresh owner
+    // resets the wake budget, so this sweep must upsert and arm a real wake. Swallowing it
+    // would leave the new owner never woken and the action undischargeable.
+    expect(shouldReuseStrandedRecoveryAction({
+      ...standingEscalation,
+      routedOwnerAgentId: "agent-2",
+    })).toBe(false);
+  });
+
+  it("does NOT reuse when an escalated action gains an owner it did not have", () => {
+    expect(shouldReuseStrandedRecoveryAction({
+      ...standingEscalation,
+      existingOwnerAgentId: null,
+      routedOwnerAgentId: "agent-2",
+    })).toBe(false);
+  });
+
+  it("does NOT reuse when an escalated action loses its owner", () => {
+    // Routing found nobody this sweep. That is a real change of shape, not the standing
+    // state, so it takes the normal upsert path.
+    expect(shouldReuseStrandedRecoveryAction({
+      ...standingEscalation,
+      routedOwnerAgentId: null,
+    })).toBe(false);
+  });
+
+  it("does NOT reuse when the cause or fingerprint changed, even if the owner held", () => {
+    expect(shouldReuseStrandedRecoveryAction({
+      ...standingEscalation,
+      isUnchangedAction: false,
+    })).toBe(false);
+  });
+
+  it("still reuses the pre-existing ownerless shape", () => {
+    // The original BLO-27635 arm, unchanged by this ticket: no owner on either side.
+    expect(shouldReuseStrandedRecoveryAction({
+      existingStatus: "active",
+      existingOwnerAgentId: null,
+      routedOwnerAgentId: null,
+      isUnchangedAction: true,
+    })).toBe(true);
+  });
+
+  it("does NOT reuse an ACTIVE owned action — it still has budget to spend", () => {
+    // The load-bearing negative: an active owned action must keep escalating and waking,
+    // or this gate would silence live recovery rather than dead recovery.
+    expect(shouldReuseStrandedRecoveryAction({
+      existingStatus: "active",
+      existingOwnerAgentId: "agent-1",
+      routedOwnerAgentId: "agent-1",
+      isUnchangedAction: true,
+    })).toBe(false);
+  });
+
+  it("treats an ownerless routed value of undefined the same as null", () => {
+    expect(shouldReuseStrandedRecoveryAction({
+      existingStatus: "active",
+      existingOwnerAgentId: null,
+      routedOwnerAgentId: undefined as unknown as string | null,
+      isUnchangedAction: true,
+    })).toBe(true);
   });
 });

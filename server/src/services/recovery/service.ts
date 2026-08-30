@@ -115,7 +115,10 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { resolveStrandedEscalationStatus } from "./stranded-escalation-status.js";
+import {
+  resolveStrandedEscalationStatus,
+  shouldReuseStrandedRecoveryAction,
+} from "./stranded-escalation-status.js";
 import {
   recordBackstopCandidateSkipped,
   recordBackstopSweepCompleted,
@@ -5264,27 +5267,18 @@ export function recoveryService(
         blockerIssueIds: input.blockerIssueIds,
       });
 
-    // Neither shape below has a wake budget left to spend, so re-upserting an unchanged
-    // action would only increment attemptCount and re-run the escalation's side effects on
-    // every sweep. Reuse it instead. A changed cause or fingerprint, or a newly resolved
-    // owner, still takes the normal upsert path below.
-    //
-    //   - ownerless: routing found nobody invokable, so no wake was ever armed.
-    //   - escalated (BLO-30743): the creation-anchored horizon expired and
-    //     `escalateExpiredWakeHorizons` retired the action. Its `ownerAgentId` column stays
-    //     populated — the transition writes only `status` — so this branch used to read as
-    //     "owner resolved" and re-upsert forever, even though
-    //     `reconcileStrandedRecoveryWakeBackstop` drops every one of those sweeps at
-    //     `exhaustedSkipped`. Measured on BLO-27999: attemptCount 748 against maxAttempts 5,
-    //     re-emitting `issue.escalation.needs_human_decision` — each one a Slack forward —
-    //     208 times in 10.3h. Matching on an UNCHANGED owner keeps a genuine reassignment
-    //     escalating normally; only the standing, unwakeable state is deduplicated.
-    const hasNoWakeBudgetToSpend = existingAction != null && (
-      (!ownerAgentId && !existingAction.ownerAgentId) ||
-      (existingAction.status === "escalated" &&
-        (ownerAgentId ?? null) === existingAction.ownerAgentId)
-    );
-    if (existingAction && isUnchangedAction && hasNoWakeBudgetToSpend) {
+    // Neither shape has a wake budget left to spend, so re-upserting an unchanged action
+    // would only increment attemptCount and re-run the escalation's side effects on every
+    // sweep — including the Slack-forwarded `needs_human_decision`. Reuse it instead. See
+    // `shouldReuseStrandedRecoveryAction` for why the owner-equality clause is load-bearing
+    // in both directions. Measured on BLO-27999 before this: attemptCount 748 against
+    // maxAttempts 5, and 208 `needs_human_decision` emissions in 10.3h.
+    if (existingAction && shouldReuseStrandedRecoveryAction({
+      existingStatus: existingAction.status,
+      existingOwnerAgentId: existingAction.ownerAgentId ?? null,
+      routedOwnerAgentId: ownerAgentId ?? null,
+      isUnchangedAction,
+    })) {
       return { action: existingAction, hasNewActivitySinceLastAttempt, unchangedWithoutWakeBudget: true };
     }
 
