@@ -7297,6 +7297,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       returnOwnerStatus?: string;
       withRunEvidence?: boolean;
       priorHandBacks?: number;
+      kind?: string;
+      cause?: string;
+      actionCreatedAt?: Date;
     }) {
       const seeded = await seedCompany();
       const { companyId, managerId, coderId, sourceIssueId, prefix } = seeded;
@@ -7357,7 +7360,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         await db.insert(issueRecoveryActions).values({
           companyId,
           sourceIssueId,
-          kind: "source_scoped_recovery",
+          kind: "stranded_assigned_issue",
           cause: "stranded_assigned_issue",
           status: "resolved",
           outcome: "handed_back",
@@ -7376,8 +7379,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .values({
           companyId,
           sourceIssueId,
-          kind: "source_scoped_recovery",
-          cause: "stranded_assigned_issue",
+          // The values the production path actually writes: `strandedRecoveryActionKind`
+          // returns the canonical `stranded_assigned_issue` kind (`source_scoped_recovery`
+          // is the fingerprint prefix, not a kind — it is not in ISSUE_RECOVERY_ACTION_KINDS),
+          // and the cause is the default bucket a dependency-blocked strand falls into.
+          // The drain filters on both, so seeding anything else would not exercise it.
+          kind: overrides?.kind ?? "stranded_assigned_issue",
+          cause: overrides?.cause ?? "stranded_assigned_issue",
           status: "active",
           ownerType: "agent",
           ownerAgentId: managerId,
@@ -7386,6 +7394,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:drain`,
           evidence: {},
           nextAction: "wake_owner",
+          // Backdated past the run-evidence window, which is what the real population
+          // looks like — the drain exists for rows that have been mis-owned for weeks.
+          // It also has to be set explicitly: the column defaults to the DATABASE clock,
+          // which is real wall time and therefore ahead of the injected `NOW`, so a
+          // defaulted row would sit in the future relative to every seeded run.
+          createdAt: overrides?.actionCreatedAt ?? new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000),
         })
         .returning();
 
@@ -7415,6 +7429,84 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           eq(issueRecoveryActions.status, "resolved"),
         ));
       expect(resolved).toMatchObject({ status: "resolved", outcome: "handed_back" });
+    });
+
+    // Ally review on #1549: the candidate query previously filtered only on
+    // "active action + non-null returnOwnerAgentId + blocked + mis-owned", which also
+    // matches recovery shapes this drain's guards were never designed for. Both
+    // non-target shapes below are otherwise byte-identical to a drainable row, so a
+    // regression that drops either predicate fails here rather than in production
+    // against ~360 live rows.
+    it("leaves a provider_quota action untouched even though its row is blocked and mis-owned", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        cause: "provider_quota",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 0, handedBack: 0 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ status: "active", outcome: null });
+    });
+
+    it("leaves a pr_review_non_convergence action untouched", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedMisownedBlockedRow({
+        kind: "pr_review_non_convergence",
+        cause: "self_review_pr_non_convergence",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 0, handedBack: 0 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(managerId);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ status: "active", outcome: null });
+    });
+
+    // Ally review on #1549: the run-evidence guard is anchored to the candidate action,
+    // not to a flat window, so an owner that has not completed anything since the strand
+    // it caused cannot take the row back yet.
+    it("skips when the return owner's only positive run predates the strand", async () => {
+      // The action is RECENT, so the anchored floor is its `createdAt` rather than the
+      // 7-day window. The seeded run then sits comfortably inside the window but before
+      // the strand — so a skip here can only be the anchor, not the window.
+      const strandedAt = new Date(NOW.getTime() - 2 * 60 * 60 * 1000);
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow({
+        withRunEvidence: false,
+        actionCreatedAt: strandedAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "succeeded",
+        livenessState: "completed",
+        startedAt: new Date(strandedAt.getTime() - 2 * 60 * 60 * 1000),
+        finishedAt: new Date(strandedAt.getTime() - 60 * 60 * 1000),
+        lastUsefulActionAt: new Date(strandedAt.getTime() - 60 * 60 * 1000),
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, noRunEvidenceSkipped: 1 });
+      expect(result.residual).toContainEqual(
+        expect.objectContaining({ issueId: sourceIssueId, reason: "no_positive_run_evidence" }),
+      );
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).not.toBe(coderId);
     });
 
     it("enqueues no wake, leaving the blockers-resolved sweep to wake the new owner", async () => {
@@ -7624,7 +7716,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         await db.insert(issueRecoveryActions).values({
           companyId,
           sourceIssueId,
-          kind: "source_scoped_recovery",
+          kind: "stranded_assigned_issue",
           cause: "stranded_assigned_issue",
           status: "active",
           ownerType: "agent",
@@ -7633,6 +7725,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:${suffix}`,
           evidence: {},
           nextAction: "wake_owner",
+          createdAt: new Date(NOW.getTime() - 10 * 24 * 60 * 60 * 1000),
         });
       };
 

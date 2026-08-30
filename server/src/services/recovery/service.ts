@@ -11203,6 +11203,21 @@ export function recoveryService(
       inArray(issueRecoveryActions.status, ["active", "escalated"]),
       eq(issues.status, "blocked"),
       visibleIssueCondition(),
+      // The drain is scoped to ONE action shape: the stranded-assigned re-home. Without
+      // both predicates the query is "any active action carrying a return owner whose
+      // issue is blocked and mis-owned", which is a much larger population than this
+      // drain was designed and guarded for. `returnOwnerAgentId` has three writers —
+      // the source-scoped stranded path (any `StrandedRecoveryCause`, so including
+      // `provider_quota`), and the `pr_review_non_convergence` path at :13062 — and the
+      // other two produce actions whose issues can equally be blocked and mis-owned.
+      // Draining those would resolve them `handed_back` and move ownership on rows whose
+      // recovery semantics this sweep's guards say nothing about.
+      //
+      // `kind` alone is not sufficient: `strandedRecoveryActionKind` maps several causes
+      // (notably `provider_quota` and `process_lost`) onto `stranded_assigned_issue`, so
+      // the cause predicate is what actually excludes the quota-wait shape.
+      eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+      eq(issueRecoveryActions.cause, "stranded_assigned_issue"),
       sql`${issueRecoveryActions.returnOwnerAgentId} is not null`,
       sql`${issues.assigneeAgentId} is not null`,
       // Mis-owned is the whole population: the row already sits on someone other than the
@@ -11217,6 +11232,7 @@ export function recoveryService(
         companyId: issueRecoveryActions.companyId,
         actionOwnerAgentId: issueRecoveryActions.ownerAgentId,
         actionCause: issueRecoveryActions.cause,
+        actionCreatedAt: issueRecoveryActions.createdAt,
         actionLastAttemptAt: issueRecoveryActions.lastAttemptAt,
         returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
         issueId: issues.id,
@@ -11301,9 +11317,25 @@ export function recoveryService(
           continue;
         }
 
-        if (!(await hasPositiveRunEvidence(returnOwnerAgentId, runEvidenceCutoff))) {
+        // Anchored to THIS action, not just to a flat 7-day window: the floor is the later
+        // of the window and the moment this strand was recorded, so the evidence has to
+        // postdate the failure being repaired. An owner that stranded a row and has not
+        // completed anything since is not demonstrably able to take it back yet.
+        //
+        // Deliberately still agent-scoped rather than source-issue-scoped. Every candidate
+        // here is `blocked` behind a *verified* unresolved blocker (asserted below), and a
+        // blocked issue cannot be worked — its runs terminate `issue_dependencies_blocked`
+        // rather than succeeding. So a `status: succeeded` + `completed|advanced` run
+        // against the source issue cannot exist for any row in this population, and
+        // requiring one would skip 100% of candidates and drain nothing. Oscillation is
+        // bounded instead by the two guards that ARE source-scoped and do hold here: the
+        // permanent per-issue hand-back budget and the per-issue cooldown above.
+        const evidenceFloor = candidate.actionCreatedAt && candidate.actionCreatedAt > runEvidenceCutoff
+          ? candidate.actionCreatedAt
+          : runEvidenceCutoff;
+        if (!(await hasPositiveRunEvidence(returnOwnerAgentId, evidenceFloor))) {
           result.noRunEvidenceSkipped += 1;
-          noteResidual(candidate, "no_positive_run_evidence", runEvidenceCutoff.toISOString());
+          noteResidual(candidate, "no_positive_run_evidence", evidenceFloor.toISOString());
           continue;
         }
 
