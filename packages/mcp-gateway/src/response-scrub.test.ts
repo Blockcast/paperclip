@@ -1090,10 +1090,19 @@ describe("scrubJsonValue — env entries that are not objects", () => {
 
       for (const [label, scalar] of NAME_SHAPED_MATERIAL) {
         it(`redacts ${label} whole on every path that preserves names`, () => {
-          // JSON string-valued `env`, and the OCI/Docker `Config.Env` sequence
-          // entry — the two paths that print a name. Asserted together so they
-          // cannot drift apart again.
+          // THREE paths print a name, not two: the JSON string-valued `env`,
+          // the JSON `env` ARRAY entry (the OCI/Docker `Config.Env` shape as it
+          // actually arrives over JSON), and the YAML sequence entry. The first
+          // draft of this list named two of the three and called itself "every
+          // path" — so the array entry kept `indexOf("=")` while its siblings
+          // moved to the shared guard, and a padded base64 body printed in the
+          // name position beside its own redaction marker for four days.
+          //
+          // That is this ticket's own finding reproduced inside the test written
+          // to prevent it: an enumeration closes the paths someone listed, not
+          // the class. Asserted together so they cannot drift apart again.
           expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+          expectNoLeak(JSON.stringify(scrubJsonValue({ env: [scalar] })));
           for (const suffix of NON_VALUE_SUFFIXES) {
             expectNoLeak(scrubYamlText(`Env:\n  - ${scalar}${suffix}`));
             expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"${suffix}`));
@@ -1115,17 +1124,29 @@ describe("scrubJsonValue — env entries that are not objects", () => {
         // has never heard of it.
         const NAME_ONLY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 
-        for (const [, scalar] of NAME_SHAPED_MATERIAL) {
-          const out = scrubJsonValue({ env: scalar }) as { env: string };
-          const kept = out.env.endsWith(REDACTED)
-            ? out.env.slice(0, -REDACTED.length).replace(/=$/, "")
-            : "";
+        // Driven over every name-preserving path rather than one of them. The
+        // structural check is the strongest assertion in this file, and running
+        // it on a single path made it as narrow as the fixture lists it exists
+        // to replace — the array path failed this property while the scalar
+        // path passed it.
+        const namePreservingPaths: readonly ((s: string) => string)[] = [
+          (s) => (scrubJsonValue({ env: s }) as { env: string }).env,
+          (s) => (scrubJsonValue({ env: [s] }) as { env: string[] }).env[0]!,
+        ];
 
-          // Either nothing was kept, or what was kept is a plausible variable
-          // name AND is not simply the input with its padding shaved off.
-          if (kept !== "") {
-            expect(kept).toMatch(NAME_ONLY);
-            expect(scalar.startsWith(kept)).toBe(false);
+        for (const [, scalar] of NAME_SHAPED_MATERIAL) {
+          for (const path of namePreservingPaths) {
+            const out = path(scalar);
+            const kept = out.endsWith(REDACTED)
+              ? out.slice(0, -REDACTED.length).replace(/=$/, "")
+              : "";
+
+            // Either nothing was kept, or what was kept is a plausible variable
+            // name AND is not simply the input with its padding shaved off.
+            if (kept !== "") {
+              expect(kept).toMatch(NAME_ONLY);
+              expect(scalar.startsWith(kept)).toBe(false);
+            }
           }
         }
       });
@@ -1137,6 +1158,12 @@ describe("scrubJsonValue — env entries that are not objects", () => {
         // whole — which passes them all and destroys design note 2.
         expect(scrubJsonValue({ env: `TOKEN=${LEAK}==` })).toEqual({
           env: `TOKEN=${REDACTED}`,
+        });
+        // Same counterweight on the array path. It must pass BOTH before and
+        // after the guard moves there, which is what distinguishes tightening
+        // the array entry from simply redacting it whole.
+        expect(scrubJsonValue({ env: [`TOKEN=${LEAK}==`] })).toEqual({
+          env: [`TOKEN=${REDACTED}`],
         });
         expect(scrubYamlText(`Env:\n  - TOKEN=${LEAK}==`)).toContain(
           `TOKEN=${REDACTED}`,
