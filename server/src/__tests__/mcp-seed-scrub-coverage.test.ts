@@ -86,7 +86,9 @@ const jobManifestPath = path.join(
  * trips the host assertion below and cannot land while this audit still describes
  * the old topology.
  */
-const SCRUBBING_GATEWAY_HOSTS: readonly string[] = [];
+const SCRUBBING_GATEWAY_HOSTS: readonly string[] = [
+  "paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local",
+];
 
 type Coverage =
   /** Response bodies pass through `scrubResponseBody` in the gateway. */
@@ -143,12 +145,10 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
   gbrain: {
     kind: "unscrubbed",
     ticket: "PEN-2428",
-    why: "shell-interpolated entry; both shapes dial gbrain directly, and the admin shape carries a minted Authorization header for the shared paperclip:Blockcast:CEO OAuth client that PEN-2428 owns",
+    why: "optional shell-interpolated entry; when OAuth minting succeeds the admin shape dials gbrain directly and carries a minted Authorization header for the shared paperclip:Blockcast:CEO OAuth client that PEN-2428 owns",
   },
   "k8s-ro": {
-    kind: "unscrubbed",
-    ticket: "PEN-2429",
-    why: "THE PEN-2370 exposure: pods_get/resources_get return spec.containers[].env in the clear, and this dials the readonly Service directly, bypassing the gateway the scrubber lives in",
+    kind: "gateway-scrubbed",
   },
 };
 
@@ -180,6 +180,13 @@ function readSeededMcpServers(): Record<string, SeedEntry | string> {
 
   const normalised = source
     .slice(bodyStart, bodyEnd)
+    // The seed builds the optional gbrain member as a structural shell
+    // fragment (`GBRAIN_JSON`), so replace that fragment with a sentinel member
+    // before parsing the surrounding JSON.
+    .replace(
+      /\$\{GBRAIN_JSON\}/g,
+      ',\n                  "gbrain": "<shell:GBRAIN_ENTRY_OPTIONAL>"',
+    )
     // bare value position: `"gbrain": ${GBRAIN_ENTRY}` -> a quoted sentinel
     .replace(/:\s*\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, ': "<shell:$1>"')
     // remaining interpolations are already inside quotes
@@ -284,17 +291,22 @@ function resolveEntryShapes(
 
   if (wholeEntrySentinel) {
     const varName = wholeEntrySentinel[1]!;
-    const assignments = assignmentsOf(varName);
+    const optional = varName === "GBRAIN_ENTRY_OPTIONAL";
+    const assignmentVar = optional ? "GBRAIN_ENTRY" : varName;
+    const assignments = assignmentsOf(assignmentVar).filter((rhs) =>
+      optional ? urlsIn(rhs).hosts.length > 0 : true,
+    );
     if (assignments.length === 0) {
+      if (optional) return [];
       throw new Error(
-        `Upstream '${name}' is seeded as the shell variable ${varName}, but no '${varName}=' ` +
+        `Upstream '${name}' is seeded as the shell variable ${assignmentVar}, but no '${assignmentVar}=' ` +
           `assignment could be found in ${path.relative(repoRoot, statefulSetPath)}. Its runtime ` +
           "host is therefore unknown, so this audit cannot claim it is off the gateway. Re-point " +
           "this resolver at wherever the value is now built rather than deleting the check.",
       );
     }
     return assignments.map((rhs, index) => ({
-      label: `${name} (${varName} assignment ${index + 1} of ${assignments.length})`,
+      label: `${name} (${assignmentVar} assignment ${index + 1} of ${assignments.length})`,
       declaresCommand: /"command"\s*:/.test(rhs),
       ...urlsIn(rhs),
     }));
@@ -524,13 +536,9 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     // if the resolver ever silently stops resolving, it fails HERE — loudly and at
     // the person who broke it — rather than quietly draining the assertions above.
     const shapes = resolveEntryShapes("gbrain", seeded.gbrain!);
-    expect(
-      shapes.length,
-      "GBRAIN_ENTRY has a bridge fallback and a minted-Bearer admin form; both are agent-facing and both must be audited.",
-    ).toBeGreaterThanOrEqual(2);
+    expect(shapes.length, "GBRAIN_ENTRY has an optional minted-Bearer admin form that must be audited.").toBeGreaterThanOrEqual(1);
 
     const hosts = shapes.flatMap((s) => s.hosts);
-    expect(hosts).toContain("gbrain-mcp-internal.paperclip.svc.cluster.local");
     expect(hosts).toContain("gbrain-mcp-admin.paperclip.svc.cluster.local");
     expect(shapes.flatMap((s) => s.unresolved)).toEqual([]);
   });
@@ -612,13 +620,13 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     }
   });
 
-  it("records that the k8s-ro exposure is still open, so closing it must update this file", () => {
-    // Pins the specific instance PEN-2370 was filed for. When PEN-2429 moves this
-    // traffic behind the scrubber, this assertion fails and forces the
-    // classification to be corrected in the same change that fixes the topology.
+  it("records that the k8s-ro seed now traverses the scrubbing gateway", () => {
+    // Pins the specific instance PEN-2370 was filed for. If the deployment ever
+    // moves this traffic off the gateway again, this assertion fails and forces
+    // the classification to be corrected with the topology change.
     const k8sRo = SEED_COVERAGE["k8s-ro"];
-    expect(k8sRo.kind).toBe("unscrubbed");
-    expect(hostOf(seeded["k8s-ro"]!)).toBe("kubernetes-mcp-server-readonly.paperclip.svc.cluster.local");
+    expect(k8sRo.kind).toBe("gateway-scrubbed");
+    expect(hostOf(seeded["k8s-ro"]!)).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
   });
 
   it("the per-agent override axis this audit does NOT cover is still shaped as documented", () => {
