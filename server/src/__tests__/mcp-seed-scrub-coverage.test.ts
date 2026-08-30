@@ -114,9 +114,22 @@ type Coverage =
  *
  * Note also what `unscrubbed` claims: it is a statement about the **transport**,
  * not a finding about the **contents**. It means nothing scrubs these bodies, not
- * that anything sensitive is known to be in them. Assessing the contents of
- * `prometheus`/`tempo`/`linear` is PEN-2630's (b1) audit and is still open, so
- * their rationales below say "unassessed" rather than guessing at a severity.
+ * that anything sensitive is known to be in them.
+ *
+ * PEN-2630's (b1) audit closed on 2026-08-30 and assessed the contents of
+ * `prometheus`/`tempo`/`linear`, so their rationales below now record an outcome
+ * rather than "unassessed", and each points at the child row that owns its
+ * follow-up: PEN-2735 (prometheus, disclosure), PEN-2736 (linear, disclosure on
+ * the grant axis), PEN-2737 (tempo, no-disclosure but unenforced).
+ *
+ * ⚠️ An `ASSESSED no-disclosure` rationale is NOT grounds to reclassify an entry
+ * out of `unscrubbed`. The two axes are independent: `unscrubbed` describes
+ * whether `scrubResponseBody` is on the path, and it is not, for any of them. A
+ * contents verdict is also a *dated measurement* of what those bodies hold today
+ * — tempo's rests entirely on sender-side configuration that any in-cluster pod
+ * can change by pushing spans directly, which is exactly why PEN-2737 exists.
+ * Only a topology change may move an entry to `gateway-scrubbed`, and the host
+ * assertions below are what hold that line.
  */
 const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
   paperclip: {
@@ -129,18 +142,18 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
   },
   prometheus: {
     kind: "unscrubbed",
-    ticket: "PEN-2630",
-    why: "direct to prometheus-mcp-server; unassessed — whether any metric label or exemplar in this estate carries secret material is the (b1) audit question, not a settled 'low risk'",
+    ticket: "PEN-2735",
+    why: "direct to prometheus-mcp-server; ASSESSED disclosure (PEN-2630) — get_targets returns Prometheus's activeTargets/droppedTargets verbatim, and those carry discoveredLabels, which is pre-relabel and so includes __meta_kubernetes_*_annotation_* for every annotation on every scraped object across 12 namespaces incl. penstock and paperclip; kubectl.kubernetes.io/last-applied-configuration embeds inline env values, i.e. PEN-2370's material by a route no scrubber sits on",
   },
   tempo: {
     kind: "unscrubbed",
-    ticket: "PEN-2630",
-    why: "direct to tempo.monitoring; unassessed — span attributes can carry request headers, so what these bodies actually disclose needs demonstrating rather than assuming",
+    ticket: "PEN-2737",
+    why: "direct to tempo.monitoring; ASSESSED no-disclosure (PEN-2630) on contents — no instrumentation in this estate captures headers or bodies (headersToSpanAttributes, capture_headers, OTEL_INSTRUMENTATION_* all absent estate-wide; paperclip's tracer is unwired) — but the transport is still unscrubbed and nothing ENFORCES that verdict: no auth, no NetworkPolicy, no redaction processor, and any pod may write spans, so PEN-2737 tracks turning the observation into an invariant",
   },
   linear: {
     kind: "unscrubbed",
-    ticket: "PEN-2630",
-    why: "direct to linear-mcp-server; unassessed — issue and comment bodies are agent-authored text, which has historically contained material agents should not have pasted",
+    ticket: "PEN-2736",
+    why: "direct to linear-mcp-server; ASSESSED disclosure (PEN-2630) on the GRANT axis, which no response scrubber reaches — the seed entry carries no credential, but the endpoint is unauthenticated, is covered by no ingress policy, and fronts a privileged workspace-wide Linear credential with write tools (create/update/add_comment/archive_project), so any pod acts as the Linear identity unattributably; issue/comment/document bodies remain unassessed BY DESIGN, since sweeping them for pasted secrets is the harm PEN-2370 forbids reproducing",
   },
   gbrain: {
     kind: "unscrubbed",
