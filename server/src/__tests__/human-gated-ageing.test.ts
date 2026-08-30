@@ -9,6 +9,8 @@ import {
   humanGatedAgeHistogram,
   humanSilenceDays,
   isHumanGatedOpenIssue,
+  orderByHumanSilenceDescending,
+  rankableSilenceDays,
   selectAgedHumanGatedIssues,
   type HumanGatedIssue,
 } from "../services/human-gated-ageing.js";
@@ -784,5 +786,71 @@ describe("mis-mapped input is caught before the selection filter (BLO-19777)", (
     expect(rendered).not.toContain("malformed human-gated row");
     expect(rendered).not.toContain("fix the input mapping");
     expect(rendered).toContain("- None.");
+  });
+});
+
+describe("bounded probing ranks oldest-human-clock-first (BLO-30608)", () => {
+  it("a capped run probes the oldest candidates, not the input order", () => {
+    // The defect this pins: a bounded pass that slices its input as received
+    // spends the budget on whatever order the query or the API happened to
+    // return, so the reported split measures that order rather than staleness.
+    // Input here is deliberately newest-first so "took the first N" and "took
+    // the oldest N" cannot coincide.
+    const population = [
+      issue({ id: "newest", createdAt: daysAgo(1) }),
+      issue({ id: "newish", createdAt: daysAgo(10) }),
+      issue({ id: "old", createdAt: daysAgo(200) }),
+      issue({ id: "oldest", createdAt: daysAgo(400) }),
+    ];
+
+    const probed = orderByHumanSilenceDescending(population, NOW)
+      .slice(0, 2)
+      .map((candidate) => candidate.id);
+
+    expect(probed).toEqual(["oldest", "old"]);
+  });
+
+  it("ranks on the human clock, so a human touch makes a row younger than its creation date", () => {
+    // `humanClockAt` is max(createdAt, lastHumanTouchAt), so an ancient row a
+    // human tended yesterday is *not* stale and must not consume the budget
+    // ahead of an untouched one.
+    const population = [
+      issue({ id: "ancient-but-tended", createdAt: daysAgo(400), lastHumanTouchAt: daysAgo(1) }),
+      issue({ id: "untouched", createdAt: daysAgo(30), lastHumanTouchAt: null }),
+    ];
+
+    expect(orderByHumanSilenceDescending(population, NOW).map((row) => row.id)).toEqual([
+      "untouched",
+      "ancient-but-tended",
+    ]);
+  });
+
+  it("sorts a row the clock cannot read last, without throwing", () => {
+    // `loadHumanGatedIssues` emits `createdAt: ""` on purpose so
+    // `selectAgedHumanGatedIssues` can report the row as malformed and name the
+    // bad key. Ranking runs first, so it has to place that row without deciding
+    // its fate — last, since an unreadable clock is no evidence of staleness.
+    const population = [
+      issue({ id: "unreadable", createdAt: "", lastHumanTouchAt: null }),
+      issue({ id: "readable", createdAt: daysAgo(5) }),
+    ];
+
+    expect(orderByHumanSilenceDescending(population, NOW).map((row) => row.id)).toEqual([
+      "readable",
+      "unreadable",
+    ]);
+    expect(rankableSilenceDays(population[0]!, NOW)).toBe(Number.NEGATIVE_INFINITY);
+    expect(() => humanSilenceDays(population[0]!, NOW)).toThrow();
+  });
+
+  it("does not reorder the caller's array", () => {
+    // The producer ranks for probing but still renders ages from its original
+    // candidate list; an in-place sort would silently couple the two.
+    const population = [
+      issue({ id: "a", createdAt: daysAgo(1) }),
+      issue({ id: "b", createdAt: daysAgo(9) }),
+    ];
+    orderByHumanSilenceDescending(population, NOW);
+    expect(population.map((row) => row.id)).toEqual(["a", "b"]);
   });
 });

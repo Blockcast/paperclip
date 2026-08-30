@@ -71,6 +71,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+  type ExecutionWorkspaceConfig,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
@@ -104,7 +105,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
+import { buildInitialIssueMonitorFields, buildIssueMonitorEligibilityPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
@@ -590,15 +591,30 @@ async function resolveResponsibleUserIdForIssueCreate(
   return input.createdByUserId ?? null;
 }
 
+// BLO-27706: a reused execution workspace is shared by every issue bound to it, so
+// an issue update must patch only the config keys that issue actually supplies.
+// Emitting `null` for an absent key defeated mergeExecutionWorkspaceConfig's
+// leave-unchanged semantics (it keys off `!== undefined`), so updating issue A
+// silently wiped the runtime services issue B depends on. Absent now means "leave
+// unchanged"; deliberate clearing goes through PATCH /execution-workspaces/:id,
+// whose `config` body still honours an explicit null.
 function buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(
   settings: ReturnType<typeof parseIssueExecutionWorkspaceSettings>,
-) {
-  return {
-    environmentId: settings?.environmentId ?? null,
-    provisionCommand: settings?.workspaceStrategy?.provisionCommand ?? null,
-    teardownCommand: settings?.workspaceStrategy?.teardownCommand ?? null,
-    workspaceRuntime: settings?.workspaceRuntime ?? null,
-  };
+): Partial<ExecutionWorkspaceConfig> {
+  const patch: Partial<ExecutionWorkspaceConfig> = {};
+  if (settings?.environmentId !== undefined) {
+    patch.environmentId = settings.environmentId;
+  }
+  if (settings?.workspaceStrategy?.provisionCommand !== undefined) {
+    patch.provisionCommand = settings.workspaceStrategy.provisionCommand;
+  }
+  if (settings?.workspaceStrategy?.teardownCommand !== undefined) {
+    patch.teardownCommand = settings.workspaceStrategy.teardownCommand;
+  }
+  if (settings?.workspaceRuntime !== undefined) {
+    patch.workspaceRuntime = settings.workspaceRuntime;
+  }
+  return patch;
 }
 
 // Accepted-plan children are not realized yet, so carry only unresolved
@@ -1129,7 +1145,8 @@ export type BlockedIssueAutoResumeSuppression = {
 export type BlockedIssueAutoResumeTriggerPath =
   | "blocker_done"
   | "resolved_blocker_sweep"
-  | "stranded_blocked_reconciler";
+  | "stranded_blocked_reconciler"
+  | "eager_status_recompute";
 export type ChildIssueCompletionSummary = {
   id: string;
   identifier: string | null;
@@ -4133,6 +4150,158 @@ export async function listBlockedIssueAutoResumeSuppressions(
   return suppressions;
 }
 
+/**
+ * BLO-21523 phase 2: eager status recompute. Clearing a `blocked` issue's
+ * last unresolved blocker (blocker closed `done`, or the `blockedByIssueIds`
+ * edge removed directly) does not by itself move `status` off `blocked` —
+ * every write path up to this point only recomputed readiness to decide
+ * whether to send a wake, never to flip the row. Without this, a dependent is
+ * indistinguishable from a genuine block to any status-filtered scheduler or
+ * queue view until the next `stranded-blocked-issue-reconciler` sweep (or
+ * forever, for an unassigned issue no wake ever targets).
+ *
+ * Call this right after any write that can leave one or more `blocked`
+ * issues newly dependency-ready. Reuses the reconciler's own
+ * readiness/suppression predicate (`listIssueDependencyReadinessMap` +
+ * `listBlockedIssueAutoResumeSuppressions`) so the eager path and the sweep
+ * can never drift apart. `blocked` -> `todo` matches BLO-21523's accepted
+ * safe default.
+ *
+ * Runs the readiness/suppression read and the flip in ONE transaction with the
+ * candidate rows and their current blockers locked `FOR UPDATE`, mirroring
+ * `stranded-blocked-issue-reconciler.ts`'s `lockCandidatesAndCurrentBlockers`.
+ * A write-time `status = 'blocked'` re-check alone is NOT sufficient here:
+ * adding a blocker edge does not change `status`, so an issue re-blocked
+ * between an unlocked read and the write is still `blocked` at write time, the
+ * guard stays true, and the flip lands `todo` on a genuinely blocked row. That
+ * state is self-permanent, because the phase-1 sweep only moves
+ * `blocked` -> `todo` and would never repair it.
+ */
+export async function recomputeBlockedIssuesStatusIfReady(
+  dbOrTx: Db,
+  companyId: string,
+  issueIds: string[],
+  options: { triggerPath?: BlockedIssueAutoResumeTriggerPath } = {},
+): Promise<string[]> {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
+  if (uniqueIssueIds.length === 0) return [];
+
+  const flippedIds = await dbOrTx.transaction(async (tx) => {
+    // Lock the candidates, then their blocker rows. Relation writers lock the
+    // dependent before mutating its `blockedBy` edges, so once the candidates
+    // are locked the blocker set is stable; re-read it afterwards to catch a
+    // relation that committed immediately before the lock, and lock any newly
+    // visible blocker before the readiness check below.
+    await lockIssuesForUpdate(tx, uniqueIssueIds);
+    const initialBlockerIds = await listCurrentBlockerIssueIdsFor(tx, companyId, uniqueIssueIds);
+    const lockedIds = new Set([...uniqueIssueIds, ...initialBlockerIds]);
+    await lockIssuesForUpdate(tx, initialBlockerIds);
+    const currentBlockerIds = await listCurrentBlockerIssueIdsFor(tx, companyId, uniqueIssueIds);
+    await lockIssuesForUpdate(tx, currentBlockerIds.filter((id) => !lockedIds.has(id)));
+
+    const [readinessMap, suppressions] = await Promise.all([
+      listIssueDependencyReadinessMap(tx, companyId, uniqueIssueIds),
+      listBlockedIssueAutoResumeSuppressions(tx, companyId, uniqueIssueIds, options),
+    ]);
+
+    const eligibleIds = uniqueIssueIds.filter((issueId) => {
+      const readiness = readinessMap.get(issueId);
+      return readiness?.isDependencyReady === true && !suppressions.has(issueId);
+    });
+    if (eligibleIds.length === 0) return [];
+
+    const flipped = await tx
+      .update(issues)
+      .set({ status: "todo", updatedAt: new Date() })
+      .where(
+        and(
+          inArray(issues.id, eligibleIds),
+          eq(issues.companyId, companyId),
+          eq(issues.status, "blocked"),
+        ),
+      )
+      .returning({ id: issues.id, identifier: issues.identifier });
+    return flipped;
+  });
+
+  if (flippedIds.length > 0) {
+    // The sweep logs its flips; without this an eager flip leaves no trace on
+    // the issue or in the logs, making it impossible to attribute which
+    // mechanism drained a given row (BLO-21523's before/after verification).
+    logger.info(
+      {
+        companyId,
+        triggerPath: options.triggerPath ?? "eager_status_recompute",
+        reconciled: flippedIds.length,
+        sample: flippedIds.slice(0, 10).map((row) => row.identifier ?? row.id),
+      },
+      "eager status recompute flipped blocked issues with zero unresolved blockers to todo (BLO-21523)",
+    );
+  }
+  return flippedIds.map((row) => row.id);
+}
+
+/** `SELECT ... FOR UPDATE` over `issueIds`, ordered by id to avoid deadlocks. */
+async function lockIssuesForUpdate(dbOrTx: Pick<Db, "execute">, issueIds: string[]): Promise<void> {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))].sort();
+  if (uniqueIssueIds.length === 0) return;
+  await dbOrTx.execute(sql`
+    SELECT ${issues.id}
+    FROM ${issues}
+    WHERE ${inArray(issues.id, uniqueIssueIds)}
+    ORDER BY ${issues.id}
+    FOR UPDATE
+  `);
+}
+
+/** Distinct blocker issue ids currently blocking any of `dependentIssueIds`. */
+async function listCurrentBlockerIssueIdsFor(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  dependentIssueIds: string[],
+): Promise<string[]> {
+  if (dependentIssueIds.length === 0) return [];
+  const rows = await dbOrTx
+    .select({ blockerIssueId: issueRelations.issueId })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.relatedIssueId, dependentIssueIds),
+      ),
+    );
+  return [...new Set(rows.map((row) => row.blockerIssueId))];
+}
+
+/**
+ * All `blocked`-status dependents of `blockerIssueId`, regardless of
+ * assignee. Companion to `listWakeableBlockedDependents`, which drops
+ * unassigned candidates because it exists to decide wake targets — an eager
+ * status recompute has no such restriction, since an unassigned `blocked`
+ * issue with zero unresolved blockers is exactly as stranded as an assigned
+ * one and nothing else will ever flip it.
+ */
+export async function listBlockedDependentIssueIds(
+  dbOrTx: Db,
+  companyId: string,
+  blockerIssueId: string,
+): Promise<string[]> {
+  const rows = await dbOrTx
+    .select({ id: issues.id })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.issueId, blockerIssueId),
+        eq(issues.status, "blocked"),
+      ),
+    );
+  return rows.map((row) => row.id);
+}
+
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;
 // BLO-25410: NOT a lock predicate. Same reasoning as
 // BLOCKER_ATTENTION_ACTIVE_RUN_STATUSES — a run here suppresses the blocked-inbox
@@ -5224,6 +5393,29 @@ function isAlertEscalationCoverDedupConflict(error: unknown): boolean {
   return false;
 }
 
+function isAlertmanagerAggregateCreationConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = maybe.constraint ?? maybe.constraint_name;
+    if (
+      maybe.code === "23505" &&
+      constraint === "issues_active_alertmanager_aggregate_creation_uq"
+    ) {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
+}
+
 // PEN-2395: matches a 23505 violation of `issues_open_routine_execution_uq`
 // (partial unique index on companyId+originKind+originId+originFingerprint,
 // scoped to open routine-execution rows that hold an `execution_run_id`).
@@ -5250,6 +5442,21 @@ export function isOpenRoutineExecutionLockConflict(error: unknown): boolean {
     current = maybe.cause;
   }
   return false;
+}
+
+function alertmanagerAggregateCreationFingerprint(
+  issueData: Pick<typeof issues.$inferInsert, "originKind" | "originFingerprint">,
+): string | null {
+  const fingerprint = issueData.originFingerprint;
+  if (
+    issueData.originKind !== "plugin:paperclip-plugin-alertmanager" ||
+    typeof fingerprint !== "string" ||
+    fingerprint.trim() === "" ||
+    fingerprint === "default"
+  ) {
+    return null;
+  }
+  return fingerprint;
 }
 
 export function issueService(db: Db) {
@@ -9433,6 +9640,28 @@ export function issueService(db: Db) {
             .limit(1);
           if (existingIssue) deduplicationReason = "recent_open_title";
         }
+        const alertmanagerAggregateFingerprint =
+          alertmanagerAggregateCreationFingerprint(issueData);
+        if (!existingIssue && alertmanagerAggregateFingerprint) {
+          // This arbitration must run before allocateIdentifier(): Linear-backed
+          // companies mint the external issue there, so aggregate losers need to
+          // observe the retained row before any provider side effects occur.
+          const aggregateGuardKey =
+            `issue-create:alertmanager-aggregate:${companyId}:${alertmanagerAggregateFingerprint}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${aggregateGuardKey}, 0))`);
+          [existingIssue] = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.originKind, "plugin:paperclip-plugin-alertmanager"),
+              eq(issues.originFingerprint, alertmanagerAggregateFingerprint),
+              isNull(issues.hiddenAt),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ))
+            .orderBy(asc(issues.createdAt), asc(issues.id))
+            .limit(1);
+        }
         if (existingIssue) {
           if (idempotencyKey) {
             await tx
@@ -9857,6 +10086,12 @@ export function issueService(db: Db) {
           // alertmanager plugin can distinguish "I lost the race" from a
           // real failure and attach itself to the winning cover instead.
           throw conflict("Alert escalation cover conflict", {
+            companyId,
+            originFingerprint: issueData.originFingerprint,
+          });
+        }
+        if (isAlertmanagerAggregateCreationConflict(err)) {
+          throw conflict("Alertmanager aggregate creation conflict", {
             companyId,
             originFingerprint: issueData.originFingerprint,
           });
@@ -10732,30 +10967,37 @@ export function issueService(db: Db) {
           nextExecutionWorkspaceId &&
           nextExecutionWorkspacePreference === "reuse_existing"
         ) {
-          const workspace = await tx
-            .select({
-              id: executionWorkspaces.id,
-              metadata: executionWorkspaces.metadata,
-            })
-            .from(executionWorkspaces)
-            .where(
-              and(
-                eq(executionWorkspaces.id, nextExecutionWorkspaceId),
-                eq(executionWorkspaces.companyId, lockedExisting.companyId),
-              ),
-            )
-            .then((rows: Array<{ id: string; metadata: unknown }>) => rows[0] ?? null);
-          if (workspace) {
-            await tx
-              .update(executionWorkspaces)
-              .set({
-                metadata: mergeExecutionWorkspaceConfig(
-                  (workspace.metadata as Record<string, unknown> | null) ?? null,
-                  buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(nextExecutionWorkspaceSettings),
-                ),
-                updatedAt: new Date(),
+          const configPatch =
+            buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(nextExecutionWorkspaceSettings);
+          // BLO-27706: this issue said nothing about workspace config, and the
+          // workspace is shared. Leave the row untouched rather than rewriting a
+          // normalized copy of config other issues depend on.
+          if (Object.keys(configPatch).length > 0) {
+            const workspace = await tx
+              .select({
+                id: executionWorkspaces.id,
+                metadata: executionWorkspaces.metadata,
               })
-              .where(eq(executionWorkspaces.id, workspace.id));
+              .from(executionWorkspaces)
+              .where(
+                and(
+                  eq(executionWorkspaces.id, nextExecutionWorkspaceId),
+                  eq(executionWorkspaces.companyId, lockedExisting.companyId),
+                ),
+              )
+              .then((rows: Array<{ id: string; metadata: unknown }>) => rows[0] ?? null);
+            if (workspace) {
+              await tx
+                .update(executionWorkspaces)
+                .set({
+                  metadata: mergeExecutionWorkspaceConfig(
+                    (workspace.metadata as Record<string, unknown> | null) ?? null,
+                    configPatch,
+                  ),
+                  updatedAt: new Date(),
+                })
+                .where(eq(executionWorkspaces.id, workspace.id));
+            }
           }
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
@@ -11768,6 +12010,15 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: null,
             updatedAt: new Date(),
+            // BLO-28900: release strips BOTH monitor-eligibility conditions
+            // (status leaves `in_progress`, the agent assignee is dropped), so a
+            // monitor left armed here can never fire again. Reconcile against
+            // the post-write shape, not `existing`.
+            ...buildIssueMonitorEligibilityPatch({
+              ...existing,
+              status: "todo",
+              assigneeAgentId: null,
+            }),
           })
           .where(eq(issues.id, id))
           .returning()

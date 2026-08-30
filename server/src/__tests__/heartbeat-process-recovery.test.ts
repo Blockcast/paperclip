@@ -187,6 +187,18 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   listManagedAgentJobs: mockListManagedAgentJobs,
   listManagedAgentPods: mockListManagedAgentPods,
   deleteAgentPodExact: mockDeleteAgentPodExact,
+  // BLO-20251: this mock is an exhaustive stub (no `...actual` spread), so any
+  // new export the reaper calls must be listed or it arrives as `undefined` and
+  // the call throws. "unknown" = no pod-CPU evidence, which is the fail-closed
+  // branch that keeps the hard-stale kill these tests assert on.
+  probeAgentPodActivity: vi.fn(async () => "unknown" as const),
+  // BLO-30087: the two silence bounds now live in this module so the stale-lock
+  // sweeper resolves the same values as the reaper. They are plain numbers, not
+  // functions, and an `undefined` here is silently poisonous rather than loud:
+  // every `silentMs >= undefined` is false, so the hard-stale kill these tests
+  // assert on would simply never fire.
+  AGENT_POD_HARD_STALE_MS: 45 * 60 * 1000,
+  AGENT_POD_BUSY_MAX_STALE_MS: 4 * 45 * 60 * 1000,
   indexUniqueAgentJobRunStatuses: (jobs: Array<{
     runId: string | null;
     name: string;

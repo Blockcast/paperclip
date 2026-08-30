@@ -291,23 +291,25 @@ export async function logActivity(
     details: redactedDetails,
   });
 
+  // Built here rather than inside `publish` so the transactional path can persist
+  // the very same event the live path would have emitted.
   const pluginEventType = eventTypeForActivityAction(input.action);
+  // Event-only payload extras: merged into the emitted plugin event but never
+  // written to the activity_log row above. We apply the current-user / PII
+  // redactor but deliberately NOT the key-based secret scrubber
+  // (sanitizeRecord): it false-positives on legitimate field names such as
+  // "authorName" (the "auth" secret-key pattern) and would mangle the faithful
+  // comment body the Linear bridge exists to mirror. Comment-body secret
+  // scrubbing is not applied anywhere else in comment sync, so doing it only
+  // here would be both inconsistent and lossy.
+  const redactedEventExtra = input.pluginEventPayloadExtra
+    ? (redactCurrentUserValue(
+        input.pluginEventPayloadExtra,
+        currentUserRedactionOptions,
+      ) as Record<string, unknown>)
+    : null;
   let pluginEvent: PluginEvent | null = null;
   if (pluginEventType) {
-    // Event-only payload extras: merged into the emitted plugin event but never
-    // written to the activity_log row above. We apply the current-user / PII
-    // redactor but deliberately NOT the key-based secret scrubber
-    // (sanitizeRecord): it false-positives on legitimate field names such as
-    // "authorName" (the "auth" secret-key pattern) and would mangle the faithful
-    // comment body the Linear bridge exists to mirror. Comment-body secret
-    // scrubbing is not applied anywhere else in comment sync, so doing it only
-    // here would be both inconsistent and lossy.
-    const redactedEventExtra = input.pluginEventPayloadExtra
-      ? (redactCurrentUserValue(
-          input.pluginEventPayloadExtra,
-          currentUserRedactionOptions,
-        ) as Record<string, unknown>)
-      : null;
     pluginEvent = {
       eventId: randomUUID(),
       eventType: pluginEventType,

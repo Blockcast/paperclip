@@ -114,3 +114,68 @@ describe("BLO-28924: recoverable error codes resolve to a retry family", () => {
     ).toBeNull();
   });
 });
+
+// PEN-2462 — the same drift shape, one code over.
+//
+// `provider_throttled_no_progress` and `rate_limit_exhausted` are written from
+// the same two booleans in the same statement in `finalizeAgentStatus`, and
+// both are tagged `errorFamily: "rate_limit_exhausted"` there. But only
+// `rate_limit_exhausted` appeared in the errorCode fallback ladder in
+// `readHeartbeatRunErrorFamily`, so its twin was load-bearing on a single
+// field with no second line of defence.
+//
+// Not a live bug: because the two fields are co-written, no row exists today
+// with the code and without the tag, and the tag is consulted first. This is a
+// backstop for a row written by a future path that sets the code alone, or one
+// whose `resultJson` is dropped downstream. The tests below are written with
+// `resultJson: null` precisely because that is the only state that
+// discriminates — with the tag present, both codes already pass.
+describe("PEN-2462: provider_throttled_no_progress resolves from errorCode alone", () => {
+  it("maps to the rate_limit_exhausted family with no persisted errorFamily", () => {
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: "provider_throttled_no_progress",
+        resultJson: null,
+      }),
+    ).toBe("rate_limit_exhausted");
+  });
+
+  // The family is what selects the retry curve, so the fallback is only worth
+  // anything if it carries through to a contract and a scheduled retry.
+  it("yields a rate-limit recovery contract and schedules a retry", () => {
+    const run = { errorCode: "provider_throttled_no_progress", resultJson: null };
+
+    expect(readTransientRecoveryContractFromRun(run)?.errorFamily).toBe(
+      "rate_limit_exhausted",
+    );
+    expect(
+      shouldScheduleAutomaticRunRetry({ ...run, contextSnapshot: null }),
+    ).toBe(true);
+  });
+
+  // The asymmetry this closes: both codes are interchangeable at the point of
+  // write, so they must be interchangeable at the point of read.
+  it("resolves identically to its twin", () => {
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: "provider_throttled_no_progress",
+        resultJson: null,
+      }),
+    ).toBe(
+      readHeartbeatRunErrorFamily({
+        errorCode: "rate_limit_exhausted",
+        resultJson: null,
+      }),
+    );
+  });
+
+  // A persisted tag still wins; this arm is a fallback, not an override.
+  it("still prefers a persisted errorFamily", () => {
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: "provider_throttled_no_progress",
+        resultJson: { errorFamily: "transient_upstream" },
+      }),
+    ).toBe("transient_upstream");
+  });
+});

@@ -29,12 +29,17 @@ import {
   resolveEscalationSweepConfig,
 } from "./config-scope.js";
 import { getCredentialHealth } from "./credential-health.js";
+import {
+  handleRecoveryApiRequest,
+  registerRecoveryAction,
+} from "./recovery-action.js";
 
 let pluginCtx: PluginContext | null = null;
 
 export const plugin = definePlugin({
   async setup(ctx) {
     pluginCtx = ctx;
+    registerRecoveryAction(ctx);
     ctx.jobs.register("check-alert-escalations", async (job: PluginJobContext) => {
       const companyId = job.companyId;
       if (!companyId) {
@@ -86,6 +91,17 @@ export const plugin = definePlugin({
     if (!scope) return;
     const authenticated = await authenticateWebhook(ctx, scope.config, input);
     await handleWebhook(ctx, scope.config, authenticated, input);
+  },
+
+  async onApiRequest(input) {
+    const ctx = pluginCtx;
+    if (!ctx) {
+      return {
+        status: 503,
+        body: { error: "Alertmanager recovery API is not ready" },
+      };
+    }
+    return handleRecoveryApiRequest(ctx, input);
   },
 
   async onHealth() {

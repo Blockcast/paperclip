@@ -44,6 +44,6 @@ test("policy CI pins the merge-group concurrency contract", () => {
 
   assert.match(
     policy,
-    /- name: Test merge-group concurrency key\n        run: node --test \.\/scripts\/__tests__\/merge-group-concurrency\.test\.mjs/,
+    /- name: Test merge-group concurrency key\n(?:        if: \$\{\{ !cancelled\(\) \}\}\n)?        run: node --test \.\/scripts\/__tests__\/merge-group-concurrency\.test\.mjs/,
   );
 });

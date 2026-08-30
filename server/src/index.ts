@@ -882,7 +882,33 @@ export async function startServer(): Promise<StartedServer> {
         recursive: true,
       });
       if (await pathExists(workspaceSdkPkg)) {
-        await fs.promises.cp(workspaceSdkPkg, path.join(pluginsSdkDir, "package.json"));
+        // Merge, do NOT overwrite. We want the workspace `exports` map (the
+        // registry copy's points at different paths), but we must NOT adopt the
+        // workspace `version`: the workspace manifest is unstamped (1.0.0) while
+        // the plugin store's package-lock.json records the installed registry
+        // version. Copying it verbatim makes installed !== locked, and
+        // plugin-lifecycle's torn-store guard then fails closed on EVERY
+        // activation with "Torn plugin store detected", taking the whole plugin
+        // fleet down until someone reconciles the store by hand.
+        //
+        // Reinstalling the store does not fix that: this function re-vendors on
+        // the next boot and re-tears it. That is why `npm install
+        // @paperclipai/plugin-sdk@<version>` against the shared store carries a
+        // DO-NOT-RUN banner. Preserving the version here is what makes the
+        // deliberate fork vendoring and the torn-store guard coexist.
+        const installedSdkPkg = path.join(pluginsSdkDir, "package.json");
+        const merged = JSON.parse(await fs.promises.readFile(workspaceSdkPkg, "utf8"));
+        let installedVersion: unknown;
+        try {
+          installedVersion = JSON.parse(await fs.promises.readFile(installedSdkPkg, "utf8"))?.version;
+        } catch {
+          // No readable installed manifest — nothing to preserve; fall through
+          // and write the workspace version rather than failing the boot.
+        }
+        if (typeof installedVersion === "string" && installedVersion.length > 0) {
+          merged.version = installedVersion;
+        }
+        await fs.promises.writeFile(installedSdkPkg, `${JSON.stringify(merged, null, 2)}\n`);
       }
       logger.info("Copied workspace plugin SDK dist to local plugins directory");
     } catch (err) {
@@ -1799,6 +1825,42 @@ export async function startServer(): Promise<StartedServer> {
     startHumanGatedDigestSweep(db, config.humanGatedDigestIntervalMinutes * 60 * 1000, {
       periodDays: config.humanGatedDigestPeriodDays,
     });
+  }
+
+  // Open-PR review-state reconciler (BLO-30259). Worker-tier singleton. Feeds
+  // the digest's second producer: it polls each discovered repo's open PRs for
+  // pending review requests and submitted reviews and persists them, so the
+  // producer itself is a pure DB read. The split is required, not stylistic —
+  // producer collection runs inside the per-company digest transaction with the
+  // advisory lock held, and a GitHub call there would serialise every company's
+  // digest behind GitHub latency and rate limits.
+  //
+  // Gated on GitHub App credentials for the same reason as the approval-gate
+  // reconciler below: without them every probe is unreadable and the sweep is a
+  // no-op that would otherwise log once per pass.
+  if (config.prReviewStateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Open-PR review-state reconciler disabled: GitHub App credentials are not configured (BLO-30259)",
+      );
+    } else {
+      const { startPrReviewStateReconciler } = await import(
+        "./services/pr-review-state-reconciler.js"
+      );
+      logger.info(
+        {
+          intervalMinutes: config.prReviewStateReconcilerIntervalMinutes,
+          maxPullRequestsPerRepo: config.prReviewStateMaxPullRequestsPerRepo,
+        },
+        "Open-PR review-state reconciler enabled (BLO-30259)",
+      );
+      startPrReviewStateReconciler(
+        db,
+        config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
+        { maxPullRequests: config.prReviewStateMaxPullRequestsPerRepo },
+      );
+    }
   }
 
   // Approval-gate reconciler (BLO-29359). Closes board approval cards whose

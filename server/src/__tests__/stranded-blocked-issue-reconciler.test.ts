@@ -8,6 +8,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRuns,
   issueApprovals,
   issueComments,
   issueRecoveryActions,
@@ -62,6 +63,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(workspaceOperations);
     await db.delete(issueRecoveryActions);
     await db.delete(issueRelations);
@@ -184,6 +186,93 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(1);
     expect(await statusOf(stranded)).toBe("todo");
+    const activity = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, stranded));
+    expect(activity).toEqual([{
+      action: "issue.stranded_blocked_reconciled",
+      details: expect.objectContaining({
+        statusBefore: "blocked",
+        statusAfter: "todo",
+        disposition: "unclassified_external_wait_made_visible",
+      }),
+    }]);
+  });
+
+  it.each(["queued", "running", "scheduled_retry"] as const)(
+    "does not reconcile an issue with a %s active run",
+    async (runStatus) => {
+      const { companyId, agentId } = await createCompany(`SBA-${runStatus}`);
+      const stranded = await insertIssue({
+        companyId,
+        identifier: `SBA-${runStatus}`,
+        status: "blocked",
+        assigneeAgentId: agentId,
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: runStatus,
+        contextSnapshot: { issueId: stranded },
+        ...(runStatus === "running" ? { startedAt: new Date() } : {}),
+        ...(runStatus === "scheduled_retry" ? {
+          scheduledRetryAt: new Date(Date.now() + 60_000),
+          scheduledRetryReason: "transient_failure",
+        } : {}),
+      });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, stranded));
+
+      const result = await reconcileStrandedBlockedIssues(db);
+
+      expect(result.reconciled).toBe(0);
+      expect(await statusOf(stranded)).toBe("blocked");
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    },
+  );
+
+  it("does not reconcile an issue held only by a checkout lock", async () => {
+    const { companyId, agentId } = await createCompany("SBC");
+    const stranded = await insertIssue({
+      companyId,
+      identifier: "SBC-1",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: { issueId: stranded },
+    });
+    await db.update(issues)
+      .set({ checkoutRunId })
+      .where(eq(issues.id, stranded));
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(stranded)).toBe("blocked");
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+
+  it("does not reconcile an issue with a live monitor", async () => {
+    const { companyId } = await createCompany("SBM");
+    const stranded = await insertIssue({ companyId, identifier: "SBM-1", status: "blocked" });
+    await db.update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, stranded));
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(stranded)).toBe("blocked");
   });
 
   it("drains an issue whose sole blocker closed done but the edge was never cleared", async () => {
@@ -694,6 +783,40 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(0);
     expect(await statusOf(issueId)).toBe("in_progress");
+  });
+
+  it("does not reconcile when a checkout lock appears after candidate selection", async () => {
+    const { companyId, agentId } = await createCompany("SBRACE");
+    const issueId = await insertIssue({ companyId, identifier: "SBRACE-1", status: "blocked" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: { issueId },
+    });
+
+    const candidatesSelected = defer();
+    const releaseSelection = defer();
+    const reconcile = reconcileStrandedBlockedIssues(db, {
+      batchSize: 1,
+      afterCandidatesSelected: async (candidateIds) => {
+        expect(candidateIds).toContain(issueId);
+        candidatesSelected.resolve();
+        await releaseSelection.promise;
+      },
+    });
+    await candidatesSelected.promise;
+
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    releaseSelection.resolve();
+
+    const result = await reconcile;
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
   });
 });
 

@@ -20,7 +20,7 @@
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRelations, issues } from "@paperclipai/db";
+import { activityLog, issueRelations, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import {
   listBlockedIssueAutoResumeSuppressions,
@@ -87,6 +87,16 @@ async function listCandidateRows(
       i.updated_at AS "updatedAt"
     FROM issues i
     WHERE i.status = 'blocked'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM heartbeat_runs active_run
+        WHERE active_run.id IN (i.execution_run_id, i.checkout_run_id)
+          AND active_run.status IN ('queued', 'running', 'scheduled_retry')
+      )
+      AND NOT (
+        i.monitor_next_check_at IS NOT NULL
+        AND i.monitor_next_check_at > now()
+      )
       AND ${cursorPredicate}
     ORDER BY i.updated_at ASC, i.id ASC
     LIMIT ${batchSize}
@@ -154,8 +164,28 @@ async function listLockedBlockedCandidates(
   return rows.filter((row) => row.status === "blocked");
 }
 
+async function listLockedLivePathIssueIds(
+  dbOrTx: Pick<Db, "execute">,
+  candidateIds: string[],
+): Promise<Set<string>> {
+  if (candidateIds.length === 0) return new Set();
+  const rows = await dbOrTx.execute(sql<{ id: string }>`
+    SELECT DISTINCT i.id::text AS id
+    FROM issues i
+    LEFT JOIN heartbeat_runs active_run
+      ON active_run.id IN (i.execution_run_id, i.checkout_run_id)
+      AND active_run.status IN ('queued', 'running', 'scheduled_retry')
+    WHERE i.id IN (${sql.join(candidateIds.map((id) => sql`${id}::uuid`), sql`, `)})
+      AND (
+        active_run.id IS NOT NULL
+        OR (i.monitor_next_check_at IS NOT NULL AND i.monitor_next_check_at > now())
+      )
+  `);
+  return new Set(toRows<{ id: string }>(rows).map((row) => row.id));
+}
+
 async function reconcileCandidateBatch(
-  tx: Pick<Db, "execute" | "select" | "update">,
+  tx: Pick<Db, "execute" | "insert" | "select" | "update">,
   candidates: CandidateRow[],
 ) {
   const candidateIds = candidates.map((candidate) => candidate.id);
@@ -163,6 +193,7 @@ async function reconcileCandidateBatch(
 
   const lockedCandidates = await listLockedBlockedCandidates(tx, candidateIds);
   if (lockedCandidates.length === 0) return [];
+  const livePathIds = await listLockedLivePathIssueIds(tx, candidateIds);
 
   const candidatesByCompany = new Map<string, LockedCandidateRow[]>();
   for (const candidate of lockedCandidates) {
@@ -182,6 +213,7 @@ async function reconcileCandidateBatch(
     ]);
 
     for (const candidate of companyCandidates) {
+      if (livePathIds.has(candidate.id)) continue;
       const readiness = readinessMap.get(candidate.id);
       if (!readiness?.isDependencyReady) continue;
       if (suppressions.has(candidate.id)) continue;
@@ -190,11 +222,30 @@ async function reconcileCandidateBatch(
   }
 
   if (eligibleIds.length === 0) return [];
-  return tx
+  const reconciled = await tx
     .update(issues)
     .set({ status: "todo", updatedAt: new Date() })
     .where(and(inArray(issues.id, eligibleIds), eq(issues.status, "blocked")))
-    .returning({ id: issues.id, identifier: issues.identifier });
+    .returning({ id: issues.id, companyId: issues.companyId, identifier: issues.identifier });
+
+  if (reconciled.length > 0) {
+    await tx.insert(activityLog).values(reconciled.map((row) => ({
+      companyId: row.companyId,
+      actorType: "system" as const,
+      actorId: "stranded-blocked-issue-reconciler",
+      action: "issue.stranded_blocked_reconciled",
+      entityType: "issue",
+      entityId: row.id,
+      details: {
+        identifier: row.identifier,
+        statusBefore: "blocked",
+        statusAfter: "todo",
+        disposition: "unclassified_external_wait_made_visible",
+      },
+    })));
+  }
+
+  return reconciled;
 }
 
 /**
@@ -207,7 +258,12 @@ async function reconcileCandidateBatch(
  */
 export async function reconcileStrandedBlockedIssues(
   db: Db,
-  options: { batchSize?: number; maxIterations?: number; logger?: typeof defaultLogger } = {},
+  options: {
+    batchSize?: number;
+    maxIterations?: number;
+    logger?: typeof defaultLogger;
+    afterCandidatesSelected?: (candidateIds: string[]) => Promise<void>;
+  } = {},
 ): Promise<StrandedBlockedIssueReconcileResult> {
   const batchSize = Math.max(1, options.batchSize ?? RECONCILE_BATCH_SIZE);
   const maxIterations = Math.max(1, options.maxIterations ?? MAX_ITERATIONS);
@@ -221,6 +277,7 @@ export async function reconcileStrandedBlockedIssues(
     const { candidates, flipped } = await db.transaction(async (tx) => {
       const candidates = await listCandidateRows(tx, batchSize, cursor);
       if (candidates.length === 0) return { candidates, flipped: [] };
+      await options.afterCandidatesSelected?.(candidates.map((candidate) => candidate.id));
       return { candidates, flipped: await reconcileCandidateBatch(tx, candidates) };
     });
 

@@ -2943,6 +2943,280 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
   });
 
+
+  // BLO-25722: both BLO-19848 helpers read a single row — the issue's current
+  // `executionRunId` holder — so an episode made of a *chain* of runs kept
+  // silently re-absorbing every earlier row's queue wait. Once the last row
+  // reached `running` the tail clamp released, elapsed ran uncapped from
+  // issues.started_at, and `monitorGatingBreakdown` reported the lot as
+  // unattended. BLO-23547's review claimed "13h 23m unattended" for BLO-21395
+  // when 710 of those 802 minutes (88.5%) were queue->start latency across three
+  // sequential runs, each waiting hours for a slot while its agent sat pinned at
+  // maxConcurrentRuns (BLO-23699). Timings below are that episode's real chain.
+  async function insertRunChain(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runs: Array<{
+      createdAt: Date;
+      startedAt: Date | null;
+      finishedAt?: Date | null;
+      status: string;
+      lastOutputAt?: Date | null;
+    }>;
+    lockedAt: Date;
+  }) {
+    const rows = input.runs.map((run) => ({
+      id: randomUUID(),
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: run.status,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt ?? null,
+      lastOutputAt: run.lastOutputAt ?? null,
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      // Every run in this chain executed model turns; only their *queue* time is
+      // at issue, so none of them may be filtered as never-executed (BLO-21769).
+      livenessState: "advanced",
+      usageJson: { input_tokens: 1000, output_tokens: 500 },
+      logBytes: 4096,
+      createdAt: run.createdAt,
+      updatedAt: run.createdAt,
+    }));
+    await db.insert(heartbeatRuns).values(rows);
+    // The live run holds the lock; a merely-queued sibling never does. Callers
+    // therefore pass the holder last, whatever the createdAt ordering.
+    const holder = rows[rows.length - 1]!;
+    await db
+      .update(issues)
+      .set({ executionRunId: holder.id, checkoutRunId: holder.id, executionLockedAt: input.lockedAt })
+      .where(eq(issues.id, input.issueId));
+    return rows;
+  }
+
+  it("does not fire on a retry chain whose flagged time was queue wait (BLO-25722)", async () => {
+    // BLO-23547's chain, replayed: 232m + 301m + 178m queued across three
+    // sequential runs, the third live right now.
+    //
+    // Passes with and without the BLO-25722 union (measured 2026-08-15): the
+    // episode anchors on `max(startedAt)` = 09:44, so it spans 3h 16m and never
+    // sees the earlier queue wait at all. Kept as an end-to-end guard on that
+    // anchor — a regression to checkout-anchoring reads 15h 18m and fires.
+    const now = new Date("2026-08-09T13:00:00.000Z");
+    const episodeStart = new Date("2026-08-08T21:42:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          createdAt: episodeStart,
+          startedAt: new Date("2026-08-09T01:34:00.000Z"), // 232m queued
+          finishedAt: new Date("2026-08-09T01:36:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T01:36:00.000Z"),
+          startedAt: new Date("2026-08-09T06:37:00.000Z"), // 301m queued
+          finishedAt: new Date("2026-08-09T06:45:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T06:46:00.000Z"),
+          startedAt: new Date("2026-08-09T09:44:00.000Z"), // 178m queued
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // 3h 16m attributable from the last dispatch, under the 6h threshold.
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not charge a retry chain's queue wait to the assignee once the trigger does fire (BLO-25722)", async () => {
+    // Same chain, but the live segment is long enough that the trigger still
+    // fires, so the evidence block is generated and the elapsed figure is
+    // readable.
+    //
+    // This test originally asserted `Excluded as non-live execution hold:
+    // 11h 51m` (232+301+178) on the theory that the chain's queue wait reaches
+    // the numerator and has to be subtracted back out by the BLO-25722 union.
+    // Measured 2026-08-15, that theory is wrong: the episode anchors on
+    // `mostRecentDispatchAt` = `max(startedAt)` (BLO-19604), so it opens at the
+    // *last* dispatch (09:44) and every earlier queue wait is outside the
+    // window before any exclusion runs. Elapsed is 9h 16m — 11m *stricter* than
+    // the 9h 27m the union model predicted, because the anchor also drops the
+    // two earlier runs' live minutes. Control: this file's four BLO-25722 cases
+    // behave identically with and without the union (2 pass / 2 fail either
+    // way), which is what proved the pre-dispatch half of the fix is inert.
+    //
+    // So the property worth pinning here is the outcome, not the mechanism: the
+    // 21h 18m pre-BLO-19604 reading must never come back. The union's live
+    // surface is post-dispatch queue wait only — pinned by the population-3
+    // replay below, which does fail without it.
+    const now = new Date("2026-08-09T19:00:00.000Z");
+    const episodeStart = new Date("2026-08-08T21:42:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          createdAt: episodeStart,
+          startedAt: new Date("2026-08-09T01:34:00.000Z"),
+          finishedAt: new Date("2026-08-09T01:36:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T01:36:00.000Z"),
+          startedAt: new Date("2026-08-09T06:37:00.000Z"),
+          finishedAt: new Date("2026-08-09T06:45:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T06:46:00.000Z"),
+          startedAt: new Date("2026-08-09T09:44:00.000Z"),
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // Anchored at the last dispatch (09:44), not at checkout (21:42).
+    expect(review?.description).toContain("9h 16m unattended");
+    // The regression this exists to catch: charging the whole 21h 18m
+    // checkout-to-now span, queue wait included, to the assignee.
+    expect(review?.description).not.toContain("21h 18m unattended");
+  });
+
+  it("does not exclude a queue wait that overlapped another run's live work (BLO-25722)", async () => {
+    // The over-correction guard, and the one BLO-25722 case that still binds. A
+    // run sitting `queued` while a *different* run works the same issue is not
+    // idle time; unioning its wait unguarded would withhold real working time.
+    // The queued row here waits 6h 50m of a 7h episode, so dropping the overlap
+    // guard collapses elapsed to 10m and `created` falls to 0.
+    //
+    // It previously also asserted `Excluded as non-live execution hold: 10m` for
+    // the live run's own 11:50→12:00 wait. That is unreachable: the episode
+    // anchors on `max(startedAt)` = 12:00, so those 10m sit outside the window
+    // and are never in the numerator to exclude. Asserting the absence of the
+    // line instead — an exclusion appearing here would mean the anchor moved.
+    const now = new Date("2026-08-09T19:00:00.000Z");
+    const episodeStart = new Date("2026-08-09T11:50:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          // Enqueued while the run below is live, and still waiting for a slot.
+          createdAt: new Date("2026-08-09T12:10:00.000Z"),
+          startedAt: null,
+          status: "queued",
+        },
+        {
+          createdAt: new Date("2026-08-09T11:50:00.000Z"),
+          startedAt: new Date("2026-08-09T12:00:00.000Z"), // 10m queued
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // 430m episode, anchored at 12:00. The 6h 50m overlapping queue wait stays
+    // in: a live run was working the issue throughout.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("7h 0m unattended");
+    expect(review?.description).not.toContain("Excluded as non-live execution hold");
+  });
+
+  it("excludes queue wait from a retry chain longer than the streak sample cap (BLO-25722)", async () => {
+    // Review follow-up: duration accounting originally reused `latestRuns`,
+    // which is capped at MAX_RUNS_FOR_STREAK (100) for streak walking. A chain
+    // longer than the cap silently dropped its OLDEST queue-wait intervals —
+    // reviving the false positive first on the worst-wedged issues, the ones
+    // with the most runs. Duration accounting is now scoped by the episode
+    // window instead of by run count.
+    //
+    // 140 runs x (20m queued + 2m live). Correct attributable time is the 280m
+    // of live work, well under the 6h threshold. Capped at the newest 100, the
+    // 40 oldest runs' 800m of queue wait reverts to "elapsed" and the episode
+    // reads 18h — firing the exact review this change exists to prevent.
+    const episodeStart = new Date("2026-08-01T00:00:00.000Z");
+    const runCount = 140;
+    const cycleMs = 22 * 60 * 1000;
+    const now = new Date(episodeStart.getTime() + runCount * cycleMs);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const runs = Array.from({ length: runCount }, (_, i) => {
+      const createdAt = new Date(episodeStart.getTime() + i * cycleMs);
+      const startedAt = new Date(createdAt.getTime() + 20 * 60 * 1000);
+      const isLast = i === runCount - 1;
+      return isLast
+        ? {
+            createdAt,
+            startedAt,
+            status: "running",
+            lastOutputAt: new Date(now.getTime() - 60 * 1000),
+          }
+        : {
+            createdAt,
+            startedAt,
+            finishedAt: new Date(startedAt.getTime() + 2 * 60 * 1000),
+            status: "failed",
+          };
+    });
+    const inserted = await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs,
+    });
+    // Every run comments, so `no_comment_streak` cannot fire on a chain this
+    // long and confound what is under test here: `long_active_duration`'s
+    // duration accounting alone.
+    await db.insert(issueComments).values(
+      inserted.map((run, index) => ({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: run.id,
+        body: `Progress update ${index}`,
+        createdAt: run.createdAt as Date,
+        updatedAt: run.createdAt as Date,
+      })),
+    );
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("keeps long_active_duration monotonic just past the running silence boundary (BLO-19848)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
@@ -3553,6 +3827,116 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-22436 population 3, live reproduction (BLO-23179 / run `e646fcdb`): a run enqueued
+  // 3s after its PR merged sat `queued` for 6h05m against `maxConcurrentRuns: 5` with every
+  // slot occupied, and mid-gap the detector filed BLO-27289 reporting a "6h 0m active
+  // episode". Every minute of it was queue latency.
+  //
+  // Deliberately does NOT pin the queued run via `pinExecutionRun`, unlike the BLO-22016
+  // test above, and that is the whole point of keeping this case separate: `issues
+  // .executionRunId` is written only once the claim transaction observes the run already
+  // `running` (heartbeat.ts, the `lockedRun?.status !== "running"` guard), so an ordinary
+  // never-dispatched run is *not* the execution holder. Both single-row helpers therefore
+  // see nothing — `currentHolderNeverDispatched` cannot fire and `nonLiveExecutionHoldSince`
+  // has no hold to clamp — and before BLO-25722 the episode kept accruing against the
+  // *previous* run's `startedAt` for the entire queue wait. Verified against master
+  // (`dc466350e`): this seeding files a review, `expected 1 to be +0`.
+  it("does not raise long_active_duration while the assignee's next run sits queued and undispatched (BLO-22436 population 3 / BLO-23179)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const dispatchedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const enqueuedAt = new Date(now.getTime() - 6 * 60 * 60 * 1000 - 50 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: checkoutAt,
+    });
+
+    // The previous run: dispatched, executed, commented, finished. It anchors the episode
+    // at 7h ago — past the 6h threshold on raw wall-clock.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: dispatchedAt,
+      startedAt: dispatchedAt,
+      withRunComments: true,
+    });
+
+    // The successor, enqueued 10 minutes later and never given a pod. Carries no
+    // `errorCode` and is not terminal, so neither never-executed filter (BLO-21769's
+    // zero-token test, BLO-22436's `issue_dependencies_blocked` test) can reach it —
+    // this population is caught on the queued-and-undispatched signature or not at all.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: enqueuedAt,
+      status: "queued",
+      startedAt: null,
+      livenessState: null,
+      errorCode: null,
+      nextAction: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Scope control for the above. The queue-wait exclusion is confined to the
+  // elapsed-duration path: `no_comment_streak` counts terminal, turn-executing runs, so a
+  // dispatch enqueued *after* those runs was never pending for the flagged interval and
+  // does not excuse them. Suppressing the streak on any pending dispatch would blind the
+  // detector on every actively-woken issue, since a fresh `queued` run is the normal
+  // post-wake state.
+  it("still raises no_comment_streak when a genuinely silent executed streak is followed by a queued run (BLO-22436 population 3 scope)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const streakAt = new Date(now.getTime() - 90 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress" });
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now: streakAt,
+      spacingMs: 10 * 60 * 1000,
+    });
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 30 * 60 * 1000),
+      status: "queued",
+      startedAt: null,
+      livenessState: null,
+      nextAction: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  // Contrast case: no run row exists at all since checkout — nothing was even attempted,
+  // as distinct from "a run was queued but never started" above. This is the existing,
+  // deliberately-tested "unattended episode" scenario (see the monitor-gating tests
+  // below, e.g. "reports the whole episode as unattended when no monitor was ever
+  // armed") and must keep firing on raw wall-clock time; the BLO-22016 fix must not
+  // desensitize this case just because it also involves zero dispatched runs.
   it("still raises long_active_duration when a checked-out issue has no run at all, unlike a queued-never-started run", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);

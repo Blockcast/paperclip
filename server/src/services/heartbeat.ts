@@ -202,7 +202,10 @@ import {
   listManagedAgentPods,
   listLiveAgentJobRunIds,
   matchExactAgentJob,
+  probeAgentPodActivity,
   readAgentJobRunStatusByName,
+  AGENT_POD_HARD_STALE_MS,
+  AGENT_POD_BUSY_MAX_STALE_MS,
   type AgentJobRunStatus,
   type ManagedAgentPod,
 } from "./k8s-job-liveness.js";
@@ -404,6 +407,7 @@ import {
   recordProcessLostLivenessNull,
   recordGithubReviewRequestDelivery,
   recordGithubReviewRequestSuppressed,
+  recordGithubReviewCompletion,
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
   GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE,
   setGithubReviewRequestDeadLetterUnresolved,
@@ -427,6 +431,8 @@ import {
 import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
+  jitterTransientRetryFloor,
+  isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
   resolveCapacityEscalation,
   CAPACITY_ESCALATION_AFTER_MS,
@@ -969,22 +975,29 @@ export const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
 // on `dep_blocked_age_expired` as evidence there is no churn leak.
 //
 // HOW FAR THE CARRY ACTUALLY REACHES — read this before relying on the bound:
-//   - blocker-SET churn (`enqueueWakeup`, the `!setsMatch` branch): carried. The origin
-//     is read before `cancelDepBlockedScheduledRetry` and re-stamped on the replacement.
-//   - `blockedInteractionWake` (`enqueueWakeup`, ~L28204): NOT carried. That branch
-//     cancels the park inline and clears `issues.executionRunId`, and the re-park is
-//     suppressed in the same call by `&& !blockedInteractionWake`. On a later wake both
-//     `activeExecutionRun` and the in-memory carry are null, so a fresh origin is
-//     stamped. An issue taking interaction wakes more often than
-//     DEP_BLOCKED_MAX_PARK_AGE_MS therefore keeps this ceiling out of reach.
-//   - `cancelStaleScheduledRetry`: NOT carried, and that is arguably correct — a
-//     reassignment ends the episode. Left deliberately unchanged.
+//   - blocker-SET churn (`enqueueWakeup`, the `!setsMatch` branch): carried in memory.
+//     The origin is read before `cancelDepBlockedScheduledRetry` and re-stamped on the
+//     replacement, which is inserted in the SAME call.
+//   - `blockedInteractionWake` (`enqueueWakeup`): carried ACROSS CALLS since BLO-29729,
+//     which is what makes this bound hold under interaction traffic. That branch cancels
+//     the park inline and clears `issues.executionRunId`, and the re-park is suppressed
+//     in the same call by `&& !blockedInteractionWake` — so the replacement is inserted
+//     on a LATER call, by which time `activeExecutionRun` and the in-memory carry are
+//     both null. The origin survives on the cancelled row's contextSnapshot (that cancel
+//     writes only status/finishedAt/error/errorCode/updatedAt), so the re-park recovers
+//     it by query — see `recoverDepBlockedParkOriginAcrossInteractionWake`. No migration.
+//   - `cancelStaleScheduledRetry`: NOT carried, deliberately. A reassignment ends the
+//     episode: the park belonged to the previous assignee's wait, and the new assignee
+//     has not waited at all. Recovery declines it too, because the most recent terminal
+//     park for the issue then carries a different errorCode (see the helper's ordering
+//     rule), so the reset is consistent whichever path observes it.
 //
-// So this bound closes the churn leak but is not unconditional. Closing the interaction
-// -wake hole needs state that survives across calls (the origin does survive on the
-// CANCELLED run's contextSnapshot, so it is recoverable without a migration); tracked
-// separately rather than asserted away here. Corollary for anyone reading the metric:
-// `dep_blocked_age_expired == 0` does NOT mean no unbounded parks exist.
+// The residual, stated rather than asserted away: recovery is bounded by
+// DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS, so an episode that goes longer than that with
+// NO park row pending starts a fresh age budget. That gap is idle time, not park time —
+// nothing is parked during it — so it is outside what this ceiling measures. Corollary
+// for anyone reading the metric: `dep_blocked_age_expired == 0` still does not prove
+// there are no unbounded parks; pair it with the parked-agents measurement.
 export function readDepBlockedFirstParkedAt(run: {
   contextSnapshot: unknown;
   createdAt: Date;
@@ -996,6 +1009,118 @@ export function readDepBlockedFirstParkedAt(run: {
   }
   return run.createdAt;
 }
+
+// errorCode stamped by the inline cancel in the `blockedInteractionWake` branch. Named
+// because origin recovery matches on it: it is the one terminal reason that means "this
+// park was interrupted mid-wait", as opposed to ended.
+export const DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE = "dep_blocked_interaction_wake";
+
+// How long a gap between an interaction-wake cancel and the next re-park may be before
+// the recovered origin is treated as belonging to a dead episode (BLO-29729).
+//
+// The quantity bounded here is the GAP (cancel.finishedAt → re-park), NOT the origin's
+// own age. That choice is the whole design and it is deliberate: bounding the origin's
+// age — the `2 x DEP_BLOCKED_MAX_PARK_AGE_MS` shape originally floated on the issue —
+// declines precisely the LONGEST-RUNNING episodes, which are exactly the ones this
+// ceiling exists to terminate. An issue continuously blocked for 30h, briefly
+// interrupted by a comment, would have its 30h origin refused as "too old" and be handed
+// a fresh 12h budget: self-defeating. A 30h origin whose cancel was 1h ago, by contrast,
+// is obviously the same wait, and the gap bound carries it.
+//
+// Value: DEP_BLOCKED_MAX_PARK_AGE_MS itself, not a multiple of it, so there is no second
+// tunable to drift out of sync. The error cases are asymmetric and this picks the safer
+// side:
+//   - too loose → a genuinely new episode (blockers resolved, re-added later) inherits a
+//     dead origin and age-expires on contact. That misfire is silent, and it REPEATS on
+//     every re-park for as long as the stale candidate stays inside the window.
+//   - too tight → one extra age budget is granted after a long idle gap. Bounded at one
+//     ceiling per gap, and the resulting park is still visible in
+//     `paperclipListParkedAgents`, so it is observable rather than silent.
+// A repeating silent misfire is worse than a bounded observable one, so the bound is the
+// tighter of the two candidates.
+export const DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS = DEP_BLOCKED_MAX_PARK_AGE_MS;
+
+/**
+ * Recover the age origin for a dep-blocked re-park whose predecessor was cancelled by
+ * the `blockedInteractionWake` branch on an EARLIER call (BLO-29729).
+ *
+ * Returns null when there is nothing safe to carry, in which case the caller stamps a
+ * fresh origin.
+ *
+ * Two independent guards, because neither is sufficient alone:
+ *
+ *  1. **Most-recent-predecessor ordering.** We fetch the single most recently created
+ *     dep-blocked predecessor for this issue+agent and carry its origin ONLY if that
+ *     row is cancelled with the interaction-wake error code. Parks for one issue are
+ *     serial (the issue holds one `executionRunId` at a time), so most-recently-created
+ *     is the immediate lineage predecessor. Ordering before checking status is
+ *     essential: a newer row that promoted successfully means the old interaction-wake
+ *     cancel is no longer the predecessor and must not carry its origin into a fresh
+ *     episode. This is also what stops the origin outliving an episode that genuinely
+ *     ENDED: a `dep_blockers_resolved` cancel, a reassignment reset, or — critically —
+ *     an `issue_dependencies_blocked` termination. Without the ordering rule, an
+ *     already-age-expired episode would keep re-terminating every subsequent re-park in
+ *     a tight loop, since its older interaction-wake cancel would still match.
+ *
+ *  2. **Staleness bound** (DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS). Guard 1 cannot catch
+ *     the case this fix is actually about: after an interaction-wake cancel there is no
+ *     park pending, so if the blockers resolve during that window NOTHING writes a
+ *     `dep_blockers_resolved` row. The episode ends leaving no terminal marker at all,
+ *     and the interaction-wake cancel stays the most recent terminal park forever. Only
+ *     elapsed time separates "still the same wait" from "blockers came back weeks later".
+ *
+ * Indexed by migration 0104 `(company_id, agent_id, context_issue_id, created_at DESC,
+ * id DESC) WHERE context_issue_id IS NOT NULL`, so this is an index seek, not a scan.
+ * That index is why the zero-migration query beats a persisted column here: the column
+ * would be more robust against the guard-2 residual, but costs a migration to buy
+ * robustness against a window we are already bounding.
+ */
+async function recoverDepBlockedParkOriginAcrossInteractionWake(
+  dbOrTx: Pick<Db, "select">,
+  params: { companyId: string; agentId: string; issueId: string; now: Date },
+): Promise<Date | null> {
+  const previous = await dbOrTx
+    .select({
+      status: heartbeatRuns.status,
+      errorCode: heartbeatRuns.errorCode,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      createdAt: heartbeatRuns.createdAt,
+      finishedAt: heartbeatRuns.finishedAt,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, params.companyId),
+        eq(heartbeatRuns.agentId, params.agentId),
+        eq(heartbeatRuns.contextIssueId, params.issueId),
+        eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  // Guard 1: only the immediate predecessor counts, and only if it was interrupted
+  // rather than ended. Check status after ordering so a newer promoted row suppresses
+  // recovery from an older interaction-wake cancel.
+  if (
+    !previous ||
+    previous.status !== "cancelled" ||
+    previous.errorCode !== DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE
+  ) {
+    return null;
+  }
+
+  // Guard 2: `finishedAt` is what the inline cancel stamps; coalesce to createdAt so a
+  // row missing it degrades to declining rather than to an unbounded carry.
+  const cancelledAt = previous.finishedAt ?? previous.createdAt;
+  if (params.now.getTime() - cancelledAt.getTime() > DEP_BLOCKED_ORIGIN_RECOVERY_MAX_GAP_MS) {
+    return null;
+  }
+
+  return readDepBlockedFirstParkedAt(previous);
+}
+
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -1260,7 +1385,17 @@ export function readHeartbeatRunErrorFamily(
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
 
-  if (run.errorCode === "rate_limit_exhausted") {
+  // PEN-2462: `provider_throttled_no_progress` is tagged
+  // `errorFamily: "rate_limit_exhausted"` at the point of write, in the same
+  // statement and from the same two booleans that set `errorCode` -- so on
+  // every row that exists today the tag above has already answered, and this
+  // is a pure backstop. It is here because the alternative is an invisible
+  // asymmetry: the two codes are interchangeable at write time, and without
+  // this line only one of them survives losing its `resultJson`.
+  if (
+    run.errorCode === "rate_limit_exhausted" ||
+    run.errorCode === "provider_throttled_no_progress"
+  ) {
     return "rate_limit_exhausted";
   }
   // BLO-28924: `provider_quota_exhausted` shares `provider_quota`'s contract —
@@ -1915,7 +2050,14 @@ const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // with zero output. 45 min keys the destructive kill well past any healthy
 // quiet gap (which bumps lastUsefulActionAt) while still reclaiming the slot
 // and node CPU long before the multi-hour manual-reap point.
-const EXTERNAL_LIFECYCLE_HARD_STALE_MS = 45 * 60 * 1000;
+//
+// BLO-30087: hoisted into k8s-job-liveness.ts (the leaf module that owns
+// probeAgentPodActivity) so the stale-lock sweeper in recovery/service.ts
+// resolves the SAME bounds. heartbeat.ts imports recovery/service.js, so
+// recovery cannot import back — see the rationale on the constants there.
+// Re-aliased to the existing local names to keep this file's call sites stable.
+const EXTERNAL_LIFECYCLE_HARD_STALE_MS = AGENT_POD_HARD_STALE_MS;
+const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = AGENT_POD_BUSY_MAX_STALE_MS;
 // BLO-18030: bound on confirming a hard-stale-killed Job has actually quiesced
 // before its reviewer-evidence probe is trusted (see
 // confirmStaleKilledJobQuiesced). The Background-propagation delete returns
@@ -17458,10 +17600,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Age ceiling is evaluated BEFORE the attempt ceiling and independently of
           // it (BLO-29055). A blocker-set change resets `scheduledRetryAttempt` to 0,
           // so an attempt-only bound can be evaded indefinitely by churn; the age
-          // origin is carried across those re-parks, so churn cannot reset it.
-          // It is NOT carried across the `blockedInteractionWake` cancel — see the
-          // carry-reach notes on readDepBlockedFirstParkedAt. This bound closes the
-          // churn leak; it is not unconditional.
+          // origin is carried across those re-parks, so churn cannot reset it. Since
+          // BLO-29729 it is also carried across the `blockedInteractionWake` cancel,
+          // which happens on a different call — see the carry-reach notes on
+          // readDepBlockedFirstParkedAt for which paths carry and which reset.
           const firstParkedAt = readDepBlockedFirstParkedAt(dueRun);
           const parkAgeMs = now.getTime() - firstParkedAt.getTime();
           if (parkAgeMs > DEP_BLOCKED_MAX_PARK_AGE_MS) {
@@ -18034,14 +18176,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
         : null;
     const effectiveRetryNotBefore = clampedTransientRetry?.dueAt ?? transientRetryNotBefore;
-    const schedule =
+    // PEN-2509: the floor is adopted verbatim below, and an advertised floor is
+    // an absolute instant shared by every run that saw the same denial — so
+    // "adopt verbatim" is also "resume in lockstep". Disperse it forward before
+    // it becomes `dueAt`. See `jitterTransientRetryFloor` for why additive-only
+    // is the only safe direction and why the base curve's own jitter does not
+    // cover this path (it is discarded whenever the floor wins, which is
+    // whenever a floor is present).
+    //
+    // Only the *verbatim, undispersed* floor is dispersed here. Two floors
+    // reaching this point are already per-run and must be left exactly alone:
+    //
+    //  - A capacity floor. Its instant is owned end-to-end by the capacity
+    //    arithmetic — the resolver arm jitters it, and both arms are bounded by
+    //    `CCROTATE_CAPACITY_MAX_PARK_MS`. A second window here would stack on
+    //    the first and push the other arm past that ceiling, re-tuning another
+    //    mechanism's bound as a side effect of dispersing ours.
+    //  - A horizon-clamped floor. That value is `now + MAX_TRANSIENT_RETRY_
+    //    HORIZON_MS`, and `now` is each run's own park instant, so the cohort is
+    //    dispersed by construction; jitter would buy nothing and would push
+    //    `dueAt` past the ceiling BLO-23438 installed.
+    //
+    // What is left is the case the production census actually caught: a raw
+    // advertised instant, shared verbatim by every run that saw the same
+    // denial, parked as `transient_failure`. That is the only floor that forms
+    // a herd here, and the only one dispersed below.
+    const floorAlreadyDispersed =
+      clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson);
+    const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
-        ? {
-            ...baseSchedule,
-            dueAt: effectiveRetryNotBefore,
-            delayMs: Math.max(0, effectiveRetryNotBefore.getTime() - now.getTime()),
-          }
-        : baseSchedule;
+        ? floorAlreadyDispersed
+          ? effectiveRetryNotBefore
+          : jitterTransientRetryFloor({ dueAt: effectiveRetryNotBefore, now, random: opts?.random })
+              .dueAt
+        : null;
+    const schedule = flooredDueAt
+      ? {
+          ...baseSchedule,
+          dueAt: flooredDueAt,
+          delayMs: Math.max(0, flooredDueAt.getTime() - now.getTime()),
+        }
+      : baseSchedule;
 
     const requiresIssueGate =
       requiresIssueExecutionRetryLock(retryReason) ||
@@ -20968,6 +21143,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reviewEvidence.status === "missing" || reviewEvidence.status === "auth_expired"
           ? reviewEvidence
           : null;
+      // BLO-27608: record the FINAL verdict — after the GitHub re-verification
+      // above, which can turn a locally-`missing` run into a proven
+      // `posted_review` (and the reverse for an unverifiable claim). Recording
+      // before it would disagree with what the run is actually credited with.
+      recordGithubReviewCompletion(reviewEvidence.status);
       preserveRecordedOutcome = reviewEvidence.status === "posted_review" ||
         reviewEvidence.status === "already_reviewed" ||
         reviewEvidence.status === "archived_repo_skipped" ||
@@ -21374,6 +21554,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runTimestampMs(run.startedAt),
       runTimestampMs(run.createdAt),
     );
+  }
+
+  /**
+   * BLO-20251: should this hard-stale run be spared because its pod is
+   * demonstrably executing a long silent subprocess?
+   *
+   * The reaper's silence signal (externalLifecycleRecentRefTime, above) is fed
+   * by adapter stdout. While the agent sits in a Bash tool call the CLI emits
+   * nothing between tool_use and tool_result, so a legitimate `pnpm install`,
+   * test suite, or image build is byte-for-byte indistinguishable from a wedged
+   * pod. Run cf7f812b on BLO-20088 was force-killed mid-`pnpm install` on
+   * 2026-08-01, destroying ~30 min of completed critical-path work.
+   *
+   * Pod CPU is the corroborating signal (see probeAgentPodActivity for why it
+   * was chosen over workspace mtime, adapter stdout, and a longer grace).
+   *
+   * Deliberately fails CLOSED — anything other than positive "busy" evidence
+   * reaps exactly as it did before BLO-20251, so a cluster without
+   * metrics-server keeps the full BLO-12996 behaviour.
+   */
+  async function shouldDeferHardStaleKillForBusyPod(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "lastOutputAt" | "lastUsefulActionAt" | "startedAt" | "createdAt" | "finishedAt"
+    >,
+    now: Date,
+  ): Promise<boolean> {
+    const refTime = externalLifecycleRecentRefTime(run);
+    const silentMs = refTime ? now.getTime() - refTime : Number.POSITIVE_INFINITY;
+    // Past the ceiling a busy pod is treated as a CPU-burning zombie and reaped
+    // regardless, so it cannot hold the agent's dispatch slot forever.
+    if (silentMs >= EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS) return false;
+
+    const activity = await probeAgentPodActivity(run.id);
+    if (activity !== "busy") return false;
+
+    logger.info(
+      { runId: run.id, silentMs, activity },
+      "reapOrphanedRuns: deferring hard-stale kill — pod is executing a live subprocess (BLO-20251)",
+    );
+    return true;
   }
 
   function isExternalLifecycleRunInRecentGrace(
@@ -22349,6 +22570,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             !preAdapterRefTime ||
             now.getTime() - preAdapterRefTime >= EXTERNAL_LIFECYCLE_HARD_STALE_MS;
           if (preAdapterHardStale) {
+            // BLO-20251: a pre-adapter run is still doing real work during
+            // workspace setup (repo clone, dependency install). Spare it while
+            // its pod is demonstrably busy.
+            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -22456,6 +22681,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // hasActiveJobForAgent gate in startNextQueuedRunForAgent). Force-kill
           // it so newly-queued high-priority work can dispatch.
           if (jobStatus && jobStatus.phase === "active" && isHardStale) {
+            // BLO-20251: silence here may just be a long Bash tool call
+            // (dependency install, test suite, image build). Spare the run
+            // while its pod is demonstrably burning CPU.
+            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
             const finalized = await finalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
@@ -22496,6 +22725,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Below the hard floor we still honor the 2026-05-23 guard and
             // leave a live-but-quiet Job alone.
             if (isHardStale) {
+              // BLO-20251: same deferral as the rich-status path above — the
+              // snapshot says the Job is alive, so a busy pod means a live
+              // subprocess rather than a wedge.
+              if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
               const finalized = await finalizeExternalLifecycleTerminalRun({
                 run,
                 adapterType,
@@ -28471,6 +28704,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
       }
+      // BLO-27608: record the FINAL verdict — after the GitHub re-verification
+      // above, for the same reason as the missing-Job recovery path: a run whose
+      // local evidence read `missing` but which GitHub proves did post must be
+      // counted as `posted_review`, matching how it is credited. This is the
+      // run-side companion to the webhook-observed
+      // paperclip_github_review_posted_total; a run that dies at the model call
+      // reaches no verdict at all, which is what makes a drought silence on both.
+      recordGithubReviewCompletion(prReviewCompletionEvidence.status);
       const prReviewIncompleteOverride =
         prReviewCompletionEvidence.status === "missing" ||
         prReviewCompletionEvidence.status === "auth_expired"
@@ -31343,6 +31584,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         };
 
+        // Fires on reassignment or issue cancellation. The dep-blocked age origin RESETS
+        // BY DESIGN here — it is not carried, and that is the intended third case, not an
+        // oversight (BLO-29729). A reassignment ends the episode: the accumulated wait
+        // belonged to the previous assignee, and charging the new one for time they never
+        // waited would age-expire their first park on contact. Issue cancellation ends it
+        // outright. Note the reset needs no code to enforce: this sets errorCode to
+        // `issue_reassigned` / `issue_cancelled`, so the most-recent-terminal-park rule in
+        // recoverDepBlockedParkOriginAcrossInteractionWake declines the lineage on its
+        // own. If you ever change that errorCode, re-check the recovery guard.
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
           if (
@@ -31433,8 +31683,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null)
           : null;
 
-        // Set when a dep-blocked park is cancelled for blocker-set churn, so the
-        // replacement park inherits the original park instant (BLO-29055).
+        // Set when a dep-blocked park is cancelled earlier in THIS call — for
+        // blocker-set churn (BLO-29055) or by the interaction-wake branch (BLO-29729) —
+        // so the replacement park inherits the original park instant. A cancel on an
+        // earlier call is recovered by query instead; see
+        // recoverDepBlockedParkOriginAcrossInteractionWake.
         let carriedDepBlockedFirstParkedAt: Date | null = null;
 
         if (
@@ -31737,13 +31990,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeExecutionRun.scheduledRetryReason === DEP_BLOCKED_RETRY_REASON
         ) {
           const now = new Date();
+          // Capture the lineage origin BEFORE cancelling (BLO-29729). The re-park is
+          // suppressed later in THIS call by `&& !blockedInteractionWake`, so this
+          // in-memory carry is normally unused — the surviving path is the cancelled
+          // row's own contextSnapshot, recovered on a later call. Set it anyway so the
+          // invariant "a dep-blocked cancel hands its origin forward" holds locally and
+          // does not depend on that suppression guard staying in place.
+          const interruptedFirstParkedAt = readDepBlockedFirstParkedAt(activeExecutionRun);
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
               error: "Cancelled because an interaction wake must run while dependencies remain blocked",
-              errorCode: "dep_blocked_interaction_wake",
+              errorCode: DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE,
               updatedAt: now,
             })
             .where(
@@ -31781,6 +32041,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ),
               );
             activeExecutionRun = null;
+            carriedDepBlockedFirstParkedAt = interruptedFirstParkedAt;
           }
         }
 
@@ -31845,13 +32106,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
           const now = new Date();
           const scheduledRetryAt = new Date(now.getTime() + DEP_BLOCKED_BASE_DELAY_MS);
+          // No in-memory carry means this call did not itself cancel a predecessor. That
+          // is the shape the interaction-wake evasion takes (BLO-29729): the cancel
+          // happened on an earlier call and cleared `issues.executionRunId`, so
+          // `activeExecutionRun` is null here and nothing local remembers the origin.
+          // Recover it from the cancelled row before falling back to `now`.
+          const recoveredFirstParkedAt = carriedDepBlockedFirstParkedAt
+            ? null
+            : await recoverDepBlockedParkOriginAcrossInteractionWake(tx, {
+                companyId: agent.companyId,
+                agentId,
+                issueId: issue.id,
+                now,
+              });
+          if (recoveredFirstParkedAt) incrementDepBlockedMetric("dep_blocked_origin_recovered");
           const depBlockedSnapshot = {
             ...enrichedContextSnapshot,
             unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: dependencyReadiness.unresolvedBlockerCount,
-            // A first park stamps `now`; a re-park after blocker churn inherits the
-            // original instant so the age ceiling measures the whole wait (BLO-29055).
-            depBlockedFirstParkedAt: (carriedDepBlockedFirstParkedAt ?? now).toISOString(),
+            // A first park stamps `now`. A re-park inherits the original instant so the
+            // age ceiling measures the whole wait: from the in-memory carry after
+            // blocker-set churn in this call (BLO-29055), or recovered from the
+            // predecessor row after an interaction-wake cancel on an earlier one
+            // (BLO-29729).
+            depBlockedFirstParkedAt: (
+              carriedDepBlockedFirstParkedAt ?? recoveredFirstParkedAt ?? now
+            ).toISOString(),
           };
           const wakeupRequest = await tx
             .insert(agentWakeupRequests)

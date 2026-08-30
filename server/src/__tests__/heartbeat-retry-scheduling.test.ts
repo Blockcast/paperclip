@@ -42,7 +42,33 @@ import {
 import {
   MAX_TRANSIENT_RETRY_HORIZON_MS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+  TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
 } from "../services/ccrotate-capacity-retry.js";
+
+/**
+ * PEN-2509: a retry floor is no longer adopted verbatim as `dueAt`.
+ *
+ * Every run that saw the same denial holds the same absolute floor, so adopting
+ * it verbatim resumed whole cohorts on one millisecond (measured: 25 runs at 0ms
+ * spread). The floor is now dispersed forward by a bounded jitter, so the
+ * contract these assertions encode changed from "equals the floor" to "at or
+ * after the floor, by no more than the jitter cap".
+ *
+ * Asserted as a window rather than an exact value on purpose: pinning the exact
+ * jittered instant would just re-encode whichever `random` the test happens to
+ * seed, and would pass again if the jitter were silently removed. The lower
+ * bound is the load-bearing half — it is the "never probe before the advertised
+ * reset" invariant.
+ */
+function expectFlooredRetryAt(actualMs: number | undefined, floorMs: number, label: string) {
+  expect(actualMs, `${label}: no retry instant recorded`).toBeDefined();
+  expect(actualMs!, `${label}: retry probes before the advertised floor`).toBeGreaterThanOrEqual(
+    floorMs,
+  );
+  expect(actualMs!, `${label}: retry pushed beyond the jitter cap`).toBeLessThanOrEqual(
+    floorMs + TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
+  );
+}
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -337,7 +363,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .then((rows) => rows[0] ?? null);
     expect(retryRun?.status).toBe("scheduled_retry");
     expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
-    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2030-04-22T21:00:00.000Z");
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      new Date("2030-04-22T21:00:00.000Z").getTime(),
+      "provider_quota reset-time retry",
+    );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.errorFamily).toBe("provider_quota");
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerQuotaRetryNotBefore).toBe(
       "2030-04-22T21:00:00.000Z",
@@ -4101,7 +4131,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
-    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(scheduled.dueAt.getTime(), retryNotBefore.getTime(), "advertised retry-not-before floor");
 
     const retryRun = await db
       .select({
@@ -4113,7 +4143,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      retryNotBefore.getTime(),
+      "advertised retry-not-before floor (persisted)",
+    );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
@@ -4154,7 +4188,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
-    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(scheduled.dueAt.getTime(), retryNotBefore.getTime(), "advertised retry-not-before floor");
 
     const retryRun = await db
       .select({
@@ -4166,7 +4200,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      retryNotBefore.getTime(),
+      "advertised retry-not-before floor (persisted)",
+    );
     const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
     expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore.toISOString());
     // Claude does not participate in the Codex fallback-mode ladder.
@@ -4216,7 +4254,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
     // Clamped to the ceiling, not the (later) advertised horizon.
-    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expectFlooredRetryAt(
+      scheduled.dueAt.getTime(),
+      now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS,
+      "clamped horizon ceiling",
+    );
     expect(scheduled.attempt).toBe(1);
     // The family's ceiling was raised so 24h-per-attempt re-probing has
     // enough attempts left to reach BLO-22844's 124.8h worst case.
@@ -4229,7 +4271,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS,
+      "clamped horizon ceiling (persisted)",
+    );
     const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
     // The clamped instant is what downstream retry logic acts on...
     expect(contextSnapshot.transientRetryNotBefore).toBe(advertisedRetryNotBefore.toISOString());
@@ -4266,7 +4312,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(lastAllowedAttempt.outcome).toBe("scheduled");
     if (lastAllowedAttempt.outcome !== "scheduled") return;
     expect(lastAllowedAttempt.attempt).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
-    expect(lastAllowedAttempt.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expectFlooredRetryAt(
+      lastAllowedAttempt.dueAt.getTime(),
+      now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS,
+      "clamped horizon ceiling (last allowed attempt)",
+    );
 
     await cleanupRetryFixture();
 
