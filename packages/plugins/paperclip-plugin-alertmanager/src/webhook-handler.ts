@@ -86,6 +86,16 @@ type AggregateMemberResolution = {
   resolutionToken?: string;
 };
 
+/**
+ * Outcome of claiming the firing fence. On refusal it carries the phase that
+ * held the fence so the delivery error can name it, because that phase decides
+ * the operator's next move: `firing` and `cancelling` are both interrupted
+ * owners that never self-clear and need `recover-aggregate-firing`.
+ */
+type AggregateFiringClaim =
+  | { ok: true; token: string }
+  | { ok: false; blockingPhase: string | null };
+
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
 }
@@ -184,7 +194,7 @@ async function beginAggregateFiring(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
-): Promise<string | null> {
+): Promise<AggregateFiringClaim> {
   const ns = ctx.db.namespace;
   const token = randomUUID();
   const fences = q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE);
@@ -205,7 +215,21 @@ async function beginAggregateFiring(
      WHERE ${fences}.phase IN ('active', 'finalizing')`,
     [companyId, aggregateKey, token],
   );
-  return result.rowCount > 0 ? token : null;
+  if (result.rowCount > 0) return { ok: true, token };
+  // Read back the phase that actually refused the claim. The upsert admits
+  // 'active' and 'finalizing', so the blocker is necessarily 'firing' or
+  // 'cancelling' — an interrupted owner, not a live finalization. Naming it is
+  // what makes the wedge diagnosable from the delivery error alone; reporting a
+  // fixed phase here sent a six-day production investigation (PEN-2581) after
+  // `finalizing`, which is the one phase that cannot produce this failure.
+  const rows = await ctx.db.query<{ phase: string }>(
+    `SELECT phase
+       FROM ${fences}
+      WHERE company_id = $1
+        AND aggregate_key = $2`,
+    [companyId, aggregateKey],
+  );
+  return { ok: false, blockingPhase: rows[0]?.phase ?? null };
 }
 
 async function finishAggregateFiring(
@@ -234,9 +258,16 @@ async function finishAggregateFiring(
 }
 
 /**
- * Recover only the exact firing fence named by an operator. This deliberately
- * has no age check and never replaces a token: an interrupted delivery can be
- * released only by a principal that has the token from that delivery.
+ * Recover only the exact fence named by an operator. This deliberately has no
+ * age check and never replaces a token: an interrupted delivery can be released
+ * only by a principal that has the token from that delivery.
+ *
+ * Both phases that refuse a firing claim are recoverable here. `cancelling` is
+ * included because a resolver that dies between `beginAggregateCancellation`
+ * and `releaseAggregateFinalization` leaves the fence held by a token no live
+ * process has, which permanently wedges every later firing for that aggregate.
+ * The transition it performs is the same `cancelling` -> `active` release the
+ * withheld-cancellation path already takes, so it introduces no new state.
  */
 export async function recoverAggregateFiring(
   ctx: PluginContext,
@@ -244,8 +275,9 @@ export async function recoverAggregateFiring(
   aggregateKey: string,
   firingToken: string,
 ): Promise<boolean> {
+  const fences = q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE);
   const result = await ctx.db.execute(
-    `UPDATE ${q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+    `UPDATE ${fences}
      SET phase = 'active',
          firing_token = NULL,
          updated_at = now()
@@ -255,7 +287,22 @@ export async function recoverAggregateFiring(
        AND firing_token = $3`,
     [companyId, aggregateKey, firingToken],
   );
-  return result.rowCount > 0;
+  if (result.rowCount > 0) return true;
+  // Same compare-and-set discipline on the resolution token: a stale or wrong
+  // token releases nothing, so this cannot reopen a fence owned by a newer
+  // resolver.
+  const cancelling = await ctx.db.execute(
+    `UPDATE ${fences}
+     SET phase = 'active',
+         resolution_token = NULL,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'cancelling'
+       AND resolution_token = $3`,
+    [companyId, aggregateKey, firingToken],
+  );
+  return cancelling.rowCount > 0;
 }
 
 async function tryClaimAggregateFinalization(
@@ -797,12 +844,16 @@ export async function handleFiring(
     return;
   }
 
-  const firingToken = await beginAggregateFiring(ctx, companyId, aggregateKey);
-  if (!firingToken) {
+  const firingClaim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  if (!firingClaim.ok) {
     throw new Error(
-      `Alertmanager aggregate ${aggregateKey} is finalizing; retrying firing delivery`,
+      `Alertmanager aggregate ${aggregateKey} is held in phase ` +
+        `'${firingClaim.blockingPhase ?? "unknown"}' by an interrupted delivery; ` +
+        `retrying firing delivery. This does not self-clear: an operator must ` +
+        `release the fence via the plugin's recover-aggregate-firing route.`,
     );
   }
+  const firingToken = firingClaim.token;
 
   try {
     if (existing && existing.paperclipIssueId) {

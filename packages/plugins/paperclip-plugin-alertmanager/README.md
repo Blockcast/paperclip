@@ -41,18 +41,47 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   `plugin.alertmanager.alert.resolved` so sibling plugins (status pages,
   paging integrations) can subscribe.
 
-## Recovering an interrupted aggregate firing
+## Recovering an interrupted aggregate delivery
 
 The aggregate lifecycle fence intentionally fails closed: if the worker stops
-after it claims a firing fence but before it finishes the delivery, later
-firings and final resolution wait until an operator releases that exact fence.
-The recovery API is board-authenticated and company-scoped:
+after it claims a fence but before it finishes the delivery, later firings and
+final resolution wait until an operator releases that exact fence.
 
-The examples below use a Paperclip board token in
-`PAPERCLIP_BOARD_TOKEN` (a browser session cookie can be used instead). Keep
-that token in the environment, never in the command itself.
+Two phases hold a fence this way, and both are recoverable here:
 
-1. List the currently held firing fences. The response is sensitive and is
+| held phase | left behind by | token to release it |
+| --- | --- | --- |
+| `firing` | an interrupted firing delivery | `firing_token` |
+| `cancelling` | an interrupted terminal transition | `resolution_token` |
+
+Both are reported by the listing route as `phase`, with the token to use in
+`firingToken` regardless of which column it came from. `active` and `finalizing`
+never block a firing claim, so neither ever needs recovery.
+
+### Recognising the wedge
+
+Every delivery that touches a held aggregate fails with:
+
+```
+Alertmanager aggregate <key> is held in phase '<firing|cancelling>' by an
+interrupted delivery; retrying firing delivery. This does not self-clear: an
+operator must release the fence via the plugin's recover-aggregate-firing route.
+```
+
+The failure is per-alert, but one held aggregate fails the whole delivery batch
+so Alertmanager retries it — which is why a single wedged key can stall all
+webhook alert delivery until an operator intervenes. Watch for a sustained
+`alertmanager_notifications_failed_total{integration="webhook",reason="serverError"}`
+with `alertmanager_notifications_total` still advancing. Note that
+`paperclip_plugin_error` stays `0` throughout: the plugin is running and healthy
+at the lifecycle level, and is failing per alert.
+
+The recovery API is board-authenticated and company-scoped. The examples below
+use a Paperclip board token in `PAPERCLIP_BOARD_TOKEN` (a browser session cookie
+can be used instead). Keep that token in the environment, never in the command
+itself.
+
+1. List the currently held fences. The response is sensitive and is
    marked `Cache-Control: no-store`; only an authorized board user for the
    requested company can read it.
 
