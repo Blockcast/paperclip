@@ -1372,7 +1372,7 @@ function composeDocumentTransforms(...transforms: ResponseDocumentTransform[]): 
 function toolListFilterTransform(
   allow: (upstreamToolName: unknown) => boolean,
 ): ResponseDocumentTransform {
-  return (document, ctx) => {
+  const filterOne: ResponseDocumentTransform = (document, ctx) => {
     if (!document || typeof document !== "object" || Array.isArray(document)) return document;
     const result = (document as { result?: unknown }).result;
     if (!result || typeof result !== "object" || Array.isArray(result)) return document;
@@ -1391,6 +1391,21 @@ function toolListFilterTransform(
 
     ctx.changed = true;
     return { ...(document as object), result: { ...(result as object), tools: kept } };
+  };
+
+  return (document, ctx) => {
+    // A JSON-RPC batch response is an ARRAY of response objects, and the
+    // prefixed route forwards batch requests, so an upstream can answer a
+    // batched `tools/list` this way. Filtering only the single-object shape
+    // left that spelling open while the guard read as done — the same
+    // one-spelling-at-a-time failure this file already records for the BOM and
+    // CR-only bodies, and the exact asymmetry the request side does not have
+    // (it already inspects calls inside a batch). The redaction arm walks
+    // arrays too (`scrubDocument`), so a batch that skipped this transform was
+    // still credential-scrubbed but NOT tool-filtered: the two arms of one
+    // composed transform disagreed about what a document is.
+    if (Array.isArray(document)) return document.map((entry) => filterOne(entry, ctx));
+    return filterOne(document, ctx);
   };
 }
 
