@@ -691,25 +691,6 @@ export async function reconcileApprovalEnforcement(
     if (exhausted) break;
   }
 
-  if (iterations >= maxIterations) {
-    // Not a deferral: the sweep holds no state across runs and always restarts
-    // from the newest row, so the tail beyond `batchSize * maxIterations` is cut
-    // from every sweep alike rather than picked up by the next one. In practice
-    // each approval stays under observation from `decidedAt + grace` until that
-    // many newer approvals accumulate above it, so the cap bounds the
-    // observation window, not the coverage. `oldestDecidedAtScanned` is how far
-    // back this pass actually reached.
-    log.warn(
-      {
-        scanned,
-        drifted,
-        iterations,
-        oldestDecidedAtScanned: cursor ? toTimestampParam(cursor.decidedAt) : null,
-      },
-      "approval-enforcement reconciler hit its iteration cap; approvals older than the reported cursor are outside every sweep's window, not deferred to the next one (BLO-24631)",
-    );
-  }
-
   return { scanned, withAssertions, drifted, raised, iterations };
 }
 
