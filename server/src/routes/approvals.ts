@@ -19,8 +19,8 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactApprovalPayloadForDisplay } from "../redaction.js";
+import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
@@ -31,23 +31,36 @@ import {
   RECOVERY_ORIGIN_KINDS,
 } from "../services/recovery/origins.js";
 
+/**
+ * `includeAgentConfig` is the caller's `agent_config:read` verdict, not a
+ * formatting preference — see `withholdAgentConfigFromApprovalPayload`. It is a
+ * required argument so a new approval-serializing route has to state which side
+ * of that gate it is on rather than inheriting a permissive default.
+ */
 function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
-): T & { redactedFields: string[] } {
+  options: { includeAgentConfig: boolean },
+): T & { redactedFields: string[]; withheldFields: string[] } {
   const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
+  if (options.includeAgentConfig) {
+    return { ...approval, payload, redactedFields, withheldFields: [] };
+  }
+  const withheld = withholdAgentConfigFromApprovalPayload(approval.type, payload);
   return {
     ...approval,
-    payload,
+    payload: withheld.payload,
     redactedFields,
+    withheldFields: withheld.withheldFields,
   };
 }
 
 function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
-): T & { redactedFields: string[]; applied: boolean } {
+  options: { includeAgentConfig: boolean },
+): T & { redactedFields: string[]; withheldFields: string[]; applied: boolean } {
   return {
-    ...redactApprovalPayload(approval),
+    ...redactApprovalPayload(approval, options),
     applied,
   };
 }
@@ -125,6 +138,15 @@ export function approvalRoutes(
     if (decision.allowed) return true;
     res.status(403).json({ error: "Approvals are outside this actor's authorization boundary" });
     return false;
+  }
+
+  /**
+   * `company_scope:read` gets you the card; it does not get you the hire's
+   * embedded agent configuration. Second, narrower verdict resolved per request
+   * and threaded into every approval serialization. PEN-2777.
+   */
+  async function approvalReadOptions(req: Request, companyId: string) {
+    return { includeAgentConfig: await actorCanReadAgentConfig(req, access, companyId) };
   }
 
   async function assertApprovalMutationAllowedByRunContext(
@@ -344,7 +366,8 @@ export function approvalRoutes(
     }
 
     const result = await svc.list(companyId, filters);
-    res.json(result.map((approval) => redactApprovalPayload(approval)));
+    const readOptions = await approvalReadOptions(req, companyId);
+    res.json(result.map((approval) => redactApprovalPayload(approval, readOptions)));
   });
 
   router.get("/approvals/:id", async (req, res) => {
@@ -352,7 +375,7 @@ export function approvalRoutes(
     const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!approval) return;
     if (!(await assertApprovalAccessAllowed(req, res, approval.companyId))) return;
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
@@ -498,7 +521,7 @@ export function approvalRoutes(
     if (deduplicated) {
       const pendingForMs = Date.now() - new Date(approval.createdAt).getTime();
       res.status(200).json({
-        ...redactApprovalPayload(approval),
+        ...redactApprovalPayload(approval, await approvalReadOptions(req, companyId)),
         deduplicated: true,
         deduplicationReason: "idempotency_key",
         pendingSince: approval.createdAt,
@@ -511,7 +534,7 @@ export function approvalRoutes(
       return;
     }
 
-    res.status(201).json(redactApprovalPayload(approval));
+    res.status(201).json(redactApprovalPayload(approval, await approvalReadOptions(req, companyId)));
   });
 
   router.get("/approvals/:id/issues", async (req, res) => {
@@ -544,7 +567,7 @@ export function approvalRoutes(
       },
     });
 
-    res.json(approvalResolutionResponse(approval, applied));
+    res.json(approvalResolutionResponse(approval, applied, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
@@ -568,7 +591,7 @@ export function approvalRoutes(
       },
     });
 
-    res.json(approvalResolutionResponse(approval, applied));
+    res.json(approvalResolutionResponse(approval, applied, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post(
@@ -595,7 +618,7 @@ export function approvalRoutes(
         },
       });
 
-      res.json(approvalResolutionResponse(approval, applied));
+      res.json(approvalResolutionResponse(approval, applied, await approvalReadOptions(req, approval.companyId)));
     },
   );
 
@@ -644,7 +667,7 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
@@ -671,7 +694,7 @@ export function approvalRoutes(
       },
     });
 
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {

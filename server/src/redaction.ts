@@ -669,6 +669,63 @@ export function redactApprovalPayloadByType(type: unknown, payload: unknown): Re
   return redactEventPayload(payload) ?? {};
 }
 
+const WITHHELD_AGENT_CONFIG_KEYS = new Set(["adapterConfig", "runtimeConfig"]);
+
+/**
+ * Authorization filter for the approval read paths. Distinct in kind from the
+ * redactors above: those decide what is *secret*, this decides what the caller
+ * is *entitled to*.
+ *
+ * A `hire_agent` payload embeds the hire's `adapterConfig` / `runtimeConfig`.
+ * `redactAgentConfigPayload` masks the credential values inside them but
+ * deliberately keeps the config diagnosable, so the scheme, principal, host,
+ * port and path of every `mcpServers.*.url` survive. That residue is the
+ * agent's MCP upstream topology — which upstream a peer is pointed at and under
+ * which principal — and `GET /agents/:id` only hands it to a caller holding
+ * `agent_config:read` (`redactForRestrictedAgentView`). The approval card
+ * reaches the same material under `company_scope:read`, which every
+ * same-company agent is auto-allowed, so the weaker sibling path disclosed a
+ * reconnaissance surface the gated one withheld (PEN-2777).
+ *
+ * Applied at any depth: the payload already carries the pair twice
+ * (`requestedConfigurationSnapshot.adapterConfig`), and a new copy would
+ * otherwise reopen the hole silently.
+ *
+ * Blanked to `{}` rather than `REDACTED_EVENT_VALUE` to match
+ * `redactForRestrictedAgentView`'s restricted-agent shape, and to keep that
+ * sentinel meaning "a scanner blanked this" rather than "you may not see this".
+ *
+ * Read projection only — the stored snapshot `activatePendingApproval` replays
+ * over the agent row is untouched.
+ */
+export function withholdAgentConfigFromApprovalPayload(
+  type: unknown,
+  payload: Record<string, unknown>,
+): { payload: Record<string, unknown>; withheldFields: string[] } {
+  if (type !== "hire_agent" || !isPlainObject(payload)) return { payload, withheldFields: [] };
+  const withheldFields: string[] = [];
+
+  function walk(value: unknown, path: string): unknown {
+    if (Array.isArray(value)) return value.map((entry, index) => walk(entry, `${path}[${index}]`));
+    if (!isPlainObject(value)) return value;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const childPath = path ? `${path}.${key}` : key;
+      // Only object-shaped values can carry topology; a null or a string keeps
+      // its meaning ("no config was requested") without disclosing anything.
+      if (WITHHELD_AGENT_CONFIG_KEYS.has(key) && isPlainObject(entry)) {
+        withheldFields.push(childPath);
+        out[key] = {};
+        continue;
+      }
+      out[key] = walk(entry, childPath);
+    }
+    return out;
+  }
+
+  return { payload: walk(payload, "") as Record<string, unknown>, withheldFields };
+}
+
 /**
  * Approval payloads are a human-facing escalation channel (BLO-20810), so a
  * field the scanner actually blanked must read differently from one the
