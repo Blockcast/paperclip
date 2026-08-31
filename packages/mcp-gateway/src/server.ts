@@ -572,16 +572,46 @@ function jsonRpcMethodLabel(req: http.IncomingMessage, message: JsonRpcRequest |
   return message?.method ?? req.method ?? "unknown";
 }
 
+/**
+ * Wrap a body the gateway itself constructed (health, JSON-RPC errors, the
+ * aggregate replies) in the same shape a proxied result has, so it can leave
+ * through the one chokepoint below.
+ *
+ * PEN-2370: routing gateway-built bodies through the scrubber too is not
+ * defence against our own string literals — it is so that no author ever has
+ * to decide whether a given body is "upstream-derived enough" to need
+ * scrubbing. That judgement is what failed on `tools/list`, where a reply
+ * assembled from upstream records was written directly. The scrub is inert on
+ * a body carrying nothing it redacts, so the safe rule is also the cheap one.
+ */
+function gatewayResult(
+  status: number,
+  body: Buffer | string,
+  extraHeaders: Record<string, string> = {},
+): ForwardResult {
+  return {
+    status,
+    headers: new Headers({ "content-type": "application/json", ...extraHeaders }),
+    body: typeof body === "string" ? Buffer.from(body) : body,
+  };
+}
+
+/**
+ * The single place a response body reaches the client.
+ *
+ * PEN-2370: this is enforced, not merely intended — `server.test.ts` asserts
+ * that `res.end` is called with a body exactly once in this file. An earlier
+ * version of this comment claimed every proxied response left through here
+ * while the aggregate `tools/list` reply, built by spreading upstream tool
+ * records, was written directly and reached agents unscrubbed. A second
+ * response path is the recurring failure in this module; the test makes
+ * adding one fail CI instead of relying on the next author reading this.
+ */
 function writeResponse(
   res: http.ServerResponse,
   result: ForwardResult,
   exposedClientSessionId: string | null,
 ): void {
-  // PEN-2370: every proxied response leaves through here, which makes this the
-  // one place a scrubbing pass covers all of them. Applied unconditionally
-  // rather than per-upstream: an opt-in list is another thing to forget when a
-  // new upstream is added, and the scrub is inert for bodies carrying nothing
-  // it redacts.
   const body = scrubResponseBody(result.body, result.headers.get("content-type"));
 
   res.statusCode = result.status;
@@ -616,9 +646,7 @@ async function handleRequest(
 
   // Health endpoint.
   if (pathName === "/" || pathName === "/healthz") {
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
+    writeResponse(res, gatewayResult(200, JSON.stringify({
       ok: true,
       upstreams: Object.keys(state.upstreams),
       breakers: state.breaker.snapshot(),
@@ -626,7 +654,7 @@ async function handleRequest(
       sessions: Object.fromEntries(
         Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.size()]),
       ),
-    }));
+    })), null);
     return;
   }
 
@@ -637,13 +665,11 @@ async function handleRequest(
 
   const matched = matchUpstream(pathName, state.upstreams);
   if (!matched) {
-    res.statusCode = 404;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
+    writeResponse(res, gatewayResult(404, JSON.stringify({
       error: "no upstream matched",
       path: pathName,
       knownPrefixes: Object.keys(state.upstreams),
-    }));
+    })), null);
     return;
   }
   const prefix = (() => {
@@ -686,10 +712,9 @@ async function handleRequest(
   // unreachable), fail fast with 503 instead of forwarding into it and
   // accumulating buffered in-flight requests until the gateway OOMs.
   if (!state.breaker.tryAcquire(prefix)) {
-    res.statusCode = 503;
-    res.setHeader("content-type", "application/json");
-    res.setHeader("retry-after", String(Math.ceil(state.upstreamTimeoutMs / 1000)));
-    res.end(JSON.stringify({ error: "upstream circuit open", prefix }));
+    writeResponse(res, gatewayResult(503, JSON.stringify({ error: "upstream circuit open", prefix }), {
+      "retry-after": String(Math.ceil(state.upstreamTimeoutMs / 1000)),
+    }), null);
     return;
   }
 
@@ -759,9 +784,7 @@ async function handleAggregateRequest(
   logMcpRequest(req, requestId, logPrefix, logMethod, logTool);
 
   if (!message?.method) {
-    res.statusCode = 400;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ error: "invalid JSON-RPC request" }));
+    writeResponse(res, gatewayResult(400, JSON.stringify({ error: "invalid JSON-RPC request" })), null);
     return;
   }
 
@@ -787,14 +810,11 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate initialize skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }));
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-    res.end(buildJsonRpcResponse(message.id, {
+    writeResponse(res, gatewayResult(200, buildJsonRpcResponse(message.id, {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
       serverInfo: { name: "paperclip-mcp-gateway", version: "0.1.0" },
-    }));
+    })), clientSessionId);
     return;
   }
 
@@ -842,10 +862,7 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate tools/list skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-    res.end(buildJsonRpcResponse(message.id, { tools }));
+    writeResponse(res, gatewayResult(200, buildJsonRpcResponse(message.id, { tools })), clientSessionId);
     return;
   }
 
@@ -856,17 +873,13 @@ async function handleAggregateRequest(
     const upstreamToolName = separatorIndex > 0 ? toolName.slice(separatorIndex + 2) : "";
     const upstream = prefix ? state.upstreams[prefix] : undefined;
     if (!upstream || upstreamToolName.length === 0) {
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-      res.end(buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`));
+      writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`)), clientSessionId);
       return;
     }
     if (!state.breaker.tryAcquire(prefix)) {
-      res.statusCode = 503;
-      res.setHeader("content-type", "application/json");
-      res.setHeader("retry-after", String(Math.ceil(state.upstreamTimeoutMs / 1000)));
-      res.end(JSON.stringify({ error: "upstream circuit open", prefix }));
+      writeResponse(res, gatewayResult(503, JSON.stringify({ error: "upstream circuit open", prefix }), {
+        "retry-after": String(Math.ceil(state.upstreamTimeoutMs / 1000)),
+      }), null);
       return;
     }
     state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
@@ -887,9 +900,7 @@ async function handleAggregateRequest(
     );
     if (!result) {
       state.breaker.recordFailure(prefix);
-      res.statusCode = 502;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ error: "failed to initialize upstream session", prefix }));
+      writeResponse(res, gatewayResult(502, JSON.stringify({ error: "failed to initialize upstream session", prefix })), null);
       return;
     }
     if (result.status >= 500) state.breaker.recordFailure(prefix);
@@ -898,10 +909,7 @@ async function handleAggregateRequest(
     return;
   }
 
-  res.statusCode = 200;
-  res.setHeader("content-type", "application/json");
-  res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-  res.end(buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`));
+  writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`)), clientSessionId);
 }
 
 /**
@@ -1109,13 +1117,11 @@ function serveOAuthDiscovery(
 ): boolean {
   if (!config) return false;
   if (pathName === "/.well-known/oauth-protected-resource" || pathName === "/.well-known/oauth-protected-resource/mcp") {
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
+    writeResponse(res, gatewayResult(200, JSON.stringify({
       resource: config.resource,
       authorization_servers: [config.authorizationServer],
       bearer_methods_supported: ["header"],
-    }));
+    })), null);
     return true;
   }
   if (pathName === "/.well-known/oauth-authorization-server" || pathName === "/.well-known/openid-configuration") {
@@ -1170,12 +1176,14 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
     `[mcp-gateway] request handler error: method=${req.method} url=${req.url} cause=${causeCode ?? (e as Error).name}: ${causeMessage ?? (e as Error).message}`,
   );
   if (!res.headersSent) {
-    res.statusCode = e instanceof CredentialCustodyError ? e.statusCode : isTimeout ? 504 : 502;
-    res.setHeader("content-type", "application/json");
-    if (e instanceof CredentialCustodyError && e.retryAfter) {
-      res.setHeader("retry-after", e.retryAfter);
-    }
-    res.end(JSON.stringify({ error: isTimeout ? "gateway timeout" : "gateway error", detail: (e as Error).message }));
+    // `detail` is an error message, and an upstream failure can quote the body
+    // that caused it — so this path carries upstream text too, which is why it
+    // goes through the chokepoint rather than straight out.
+    writeResponse(res, gatewayResult(
+      e instanceof CredentialCustodyError ? e.statusCode : isTimeout ? 504 : 502,
+      JSON.stringify({ error: isTimeout ? "gateway timeout" : "gateway error", detail: (e as Error).message }),
+      e instanceof CredentialCustodyError && e.retryAfter ? { "retry-after": e.retryAfter } : {},
+    ), null);
   } else {
     res.end();
   }

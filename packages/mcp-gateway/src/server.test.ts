@@ -1880,3 +1880,52 @@ describe("upstream resilience: timeout + circuit breaker", () => {
     expect(gateway.state.breaker.stateOf("k8s-admin")).toBe("closed");
   });
 });
+
+/**
+ * PEN-2370 ask 3 — a control that closes the class rather than the spelling.
+ *
+ * This module's recurring failure is not any one leak: it is that a SECOND
+ * path to the client keeps appearing beside the one that scrubs. The scrubber
+ * was wired into `writeResponse`, whose comment claimed it covered every
+ * response — while the aggregate `tools/list` reply, assembled by spreading
+ * upstream tool records, was written straight to the socket and reached agents
+ * unscrubbed. Six earlier fixes each closed the spelling an observer had
+ * probed; none made the next bypass fail.
+ *
+ * So the invariant is asserted against the source itself, and it is an
+ * allowlist of exactly one: a body may reach the client through `writeResponse`
+ * and nowhere else. Adding a `res.end(body)` anywhere in `server.ts` fails
+ * here, whether or not anyone remembers the scrubber exists.
+ *
+ * A bodyless `res.end()` is not in scope: it carries nothing to disclose.
+ */
+describe("PEN-2370: response bodies have exactly one exit", () => {
+  const source = fs.readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+
+  it("calls res.end with a body in exactly one place", () => {
+    const bodyBearing = source
+      .split("\n")
+      .map((line, i) => ({ line: line.trim(), number: i + 1 }))
+      // `res.end(` followed by anything other than the closing paren.
+      .filter(({ line }) => /\bres\.end\(\s*[^)\s]/.test(line));
+
+    expect(
+      bodyBearing.map(({ number, line }) => `${number}: ${line}`),
+      "every response body must leave through writeResponse — see this suite's comment",
+    ).toHaveLength(1);
+  });
+
+  it("puts that one exit inside writeResponse, downstream of the scrubber", () => {
+    const start = source.indexOf("function writeResponse(");
+    expect(start).toBeGreaterThan(-1);
+
+    // The body of writeResponse: from its signature to the next top-level
+    // declaration.
+    const rest = source.slice(start);
+    const end = rest.indexOf("\n}\n");
+    const writeResponseBody = rest.slice(0, end);
+
+    expect(writeResponseBody).toContain("scrubResponseBody(");
+    expect(writeResponseBody).toMatch(/\bres\.end\(\s*[^)\s]/);
+  });
+});
