@@ -261,6 +261,7 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.ts";
+import { recoveryService } from "../services/recovery/service.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "../services/activity-log.js";
 import { pollOnce as drainPluginEventOutbox } from "../services/plugin-event-outbox.js";
 import {
@@ -9882,6 +9883,473 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(issue?.status).not.toBe("in_review");
+    });
+  });
+
+  // BLO-18106: `escalateStrandedAssignedIssue` commits `blocked` + the durable recovery
+  // action in one transaction, then enqueues the owner wake AFTER that commit. If the
+  // enqueue throws or the process exits in between, the issue is left `blocked` with an
+  // active action and nobody scheduled to look at it -- and
+  // `reconcileStrandedAssignedIssues` cannot repair it, because it scans only
+  // todo/in_progress/in_review. These cover the backstop that reads that repairable state.
+  describe("reconcileStrandedRecoveryWakeBackstop", () => {
+    // Reproduces the gap: escalate for real, then delete the wake the escalation
+    // enqueued. What remains is exactly the post-commit/pre-dispatch crash state.
+    async function seedUndeliveredRecoveryWake() {
+      const fixture = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "process_lost",
+        runError: "Process lost before external adapter invocation -- server may have restarted",
+      });
+      // Two prior process-lost runs exhaust the continuation retry budget, so the sweep
+      // escalates instead of requeueing another continuation.
+      await seedPriorProcessLostRun({
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        issueId: fixture.issueId,
+        retryReason: "issue_continuation_needed",
+        createdAt: new Date("2026-03-18T00:02:00.000Z"),
+      });
+      await seedPriorProcessLostRun({
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        issueId: fixture.issueId,
+        retryReason: "process_lost",
+        processLossRetryCount: 1,
+        createdAt: new Date("2026-03-18T00:00:00.000Z"),
+      });
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+      const escalation = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(escalation.escalated).toBe(1);
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue?.status).toBe("blocked");
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+      expect(action).toBeTruthy();
+
+      return { ...fixture, action };
+    }
+
+    // Drives the escalation's own dispatch to a dead end without deleting anything:
+    // the wake leaves `queued` and the run it spawned leaves the active-execution set,
+    // so `hasQueuedIssueWake` / `hasActiveExecutionPath` both read false. That is the
+    // observable state BLO-18106 actually produced -- an owner who was never brought to
+    // the issue -- and it covers the crash-before-enqueue case identically, since the
+    // backstop's eligibility check cannot distinguish "never enqueued" from "enqueued
+    // and died".
+    async function neutralizeRecoveryWake(agentId: string) {
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+          ),
+        );
+      if (wakes.length === 0) return;
+      const wakeIds = wakes.map((wake) => wake.id);
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(inArray(agentWakeupRequests.id, wakeIds));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(inArray(heartbeatRuns.wakeupRequestId, wakeIds));
+    }
+
+    async function backstopWakes(agentId: string) {
+      const wakes = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+          ),
+        );
+      return wakes.filter((wake) => {
+        const payload = wake.payload as Record<string, unknown> | null;
+        return payload?.backstop === "stranded_recovery_wake_backstop";
+      });
+    }
+
+    // Push lastAttemptAt outside the 30m cooldown so the backstop is eligible.
+    async function clearBackstopCooldown(actionId: string) {
+      await db
+        .update(issueRecoveryActions)
+        .set({ lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000) })
+        .where(eq(issueRecoveryActions.id, actionId));
+    }
+
+    it("redelivers the owner wake for a blocked issue whose recovery action was never dispatched", async () => {
+      const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const healedWakes = await backstopWakes(action.ownerAgentId ?? agentId);
+      expect(healedWakes).toHaveLength(1);
+      // `queued` or already `claimed` -- the harness may dispatch it within the same
+      // tick. Either way the owner was actually brought to the issue, which is the
+      // property under test; the status it is caught at is timing, not behaviour.
+      expect(["queued", "claimed"]).toContain(healedWakes[0]?.status);
+      expect(healedWakes[0]).toMatchObject({
+        companyId,
+        reason: "source_scoped_recovery_action",
+        payload: expect.objectContaining({
+          issueId,
+          recoveryActionId: action.id,
+          backstop: "stranded_recovery_wake_backstop",
+        }),
+      });
+
+      // The repair must not re-escalate: status and the action identity are untouched.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("blocked");
+      const actionsAfter = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(actionsAfter).toHaveLength(1);
+      expect(actionsAfter[0]?.id).toBe(action.id);
+    });
+
+    // The suppression regression: BLO-5681 escalates zero-token startup wedges straight
+    // to `blocked` WITHOUT a recovery action, precisely so nothing re-sweeps them. A
+    // backstop that healed on status alone would resurrect the BLO-5378 -> BLO-5676 loop.
+    it("leaves a blocked issue with no active recovery action alone", async () => {
+      const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.noActiveActionSkipped).toBe(1);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(0);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("blocked");
+    });
+
+    it("does not double-wake when the escalation's own dispatch already landed", async () => {
+      const { companyId, action } = await seedUndeliveredRecoveryWake();
+      // Deliberately do NOT delete the wake: this is the healthy path, where the
+      // escalation dispatched fine and the backstop must stay out of the way.
+      await clearBackstopCooldown(action.id);
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.livePathSkipped).toBe(1);
+    });
+
+    it("does not redeliver once the action's wake budget is exhausted", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000),
+          attemptCount: 99,
+          maxAttempts: 5,
+        })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.exhaustedSkipped).toBe(1);
+    });
+
+    it("rate-limits redelivery with a cooldown so a persistently undeliverable action cannot spin", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await db
+        .update(issueRecoveryActions)
+        .set({ lastAttemptAt: new Date() })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.cooldownSkipped).toBe(1);
+    });
+
+    // The test above only proves the eligibility READ works when `lastAttemptAt` is
+    // already recent. It cannot catch the actual gap, which is on the WRITE side: the
+    // success path used to bump counters and log activity without ever advancing
+    // `lastAttemptAt`. So once the original escalation timestamp aged past 30m, an owner
+    // run that failed fast -- leaving neither a queued wake nor an active execution --
+    // made the candidate eligible again on the very next pass, and every pass after that
+    // until `timeoutAt`: a dense redelivery loop the cooldown was supposed to bound.
+    // Re-running immediately after a successful heal is what distinguishes the two.
+    it("advances the cooldown on a successful redelivery so the next pass cannot immediately re-heal", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+
+      const healed = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+      expect(healed.healed).toBe(1);
+
+      const [afterHeal] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      const stampedAt = afterHeal?.lastAttemptAt
+        ? new Date(afterHeal.lastAttemptAt as Date | string).getTime()
+        : null;
+      expect(stampedAt).not.toBeNull();
+      // Inside the cooldown window, i.e. actually re-stamped rather than left at the
+      // hour-old value `clearBackstopCooldown` wrote.
+      expect(Date.now() - (stampedAt ?? 0)).toBeLessThan(30 * 60 * 1000);
+
+      // Put the candidate back into the exact eligible shape -- the healed wake is dead,
+      // so nothing but the cooldown stands between it and a second redelivery.
+      await neutralizeRecoveryWake(agentId);
+      const rerun = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(rerun.healed).toBe(0);
+      expect(rerun.cooldownSkipped).toBe(1);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(1);
+    });
+
+    it("runs as part of the issue-graph liveness pass", async () => {
+      const { companyId, agentId, issueId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+
+      const result = await heartbeat.reconcileIssueGraphLiveness({ force: true });
+
+      expect(result.strandedRecoveryWakesHealed).toBeGreaterThanOrEqual(1);
+      expect(result.strandedRecoveryWakeIssueIds).toContain(issueId);
+      expect(companyId).toBeTruthy();
+    });
+
+    // BLO-18106 review follow-up (Ally @ a2a5fcc38, important 1).
+    //
+    // The cooldown test above bounds redelivery *rate*, but nothing bounded the total.
+    // `claimWakeAttempt` advanced only `lastAttemptAt`, so a delivered backstop wake
+    // never consumed the action's per-owner budget the way the ordinary enqueue path
+    // does. With `attemptCount` frozen, `strandedRecoveryWakeAttemptsExhausted` could
+    // never trip, and the only remaining bound was `timeoutAt` -- roughly twelve owner
+    // wakes over a six-hour horizon on a budget of five, with the exhaustion notice
+    // reporting a count that never moved.
+    //
+    // Driving the pass repeatedly is what distinguishes budget-bounded from
+    // cooldown-bounded: each iteration re-clears the cooldown and re-kills the healed
+    // wake, so the *only* thing that can stop the loop is the budget.
+    it("consumes the action's wake budget on each delivered redelivery and stops at the ceiling", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      const maxAttempts = 3;
+      await db
+        .update(issueRecoveryActions)
+        .set({ attemptCount: 1, maxAttempts, timeoutAt: null })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const healedPerPass: number[] = [];
+      let exhaustedPasses = 0;
+      // Two more passes than the budget allows, so the stop is observed rather than assumed.
+      for (let pass = 0; pass < maxAttempts + 2; pass += 1) {
+        await neutralizeRecoveryWake(agentId);
+        await clearBackstopCooldown(action.id);
+        const result = await heartbeat.reconcileStrandedRecoveryWakeBackstop({ companyId });
+        healedPerPass.push(result.healed);
+        exhaustedPasses += result.exhaustedSkipped;
+      }
+
+      // BLO-18106 review follow-up (Ally @ 048350286, finding 1). An earlier revision of
+      // this test asserted `maxAttempts` FURTHER wakes on top of the one the escalation
+      // already spent, ending at `attemptCount === maxAttempts + 1` -- i.e. it codified a
+      // budget overrun as the expected behaviour, which is how the off-by-one survived a
+      // review round.
+      //
+      // `attemptCount` counts attempts ALREADY SPENT and starts at 1 (spent by the
+      // escalation that created the action). The claim spends one more, so it may only
+      // proceed while `attemptCount < maxAttempts`. With a budget of 3 that leaves room
+      // for 2 backstop redeliveries, and the total spend lands exactly ON the ceiling --
+      // the same number the ordinary enqueue path spends against the same column.
+      expect(healedPerPass).toEqual([1, 1, 0, 0, 0]);
+      // The three refused passes must be reported as BUDGET rejections, not cooldown ones.
+      // The first of them is the boundary case (`attemptCount === maxAttempts`), which the
+      // exhaustion helper's `>` test alone would misclassify -- the caller asks the
+      // post-increment question so the counter that is this path's post-deploy signal
+      // stays truthful.
+      expect(exhaustedPasses).toBe(3);
+
+      const [after] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(after?.attemptCount).toBe(maxAttempts);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(maxAttempts - 1);
+    });
+
+    // The negative half of the same finding: a wake that reached nobody must NOT spend
+    // the budget, or five deferrals would retire an action whose owner was never woken
+    // once. `releaseWakeAttempt` refunds the attempt; the cooldown stamp deliberately
+    // stands, because a deferral is exactly the case that would otherwise re-run on
+    // every pass.
+    it("refunds the attempt but keeps the cooldown when the wake reaches nobody", async () => {
+      const { companyId, agentId, action } = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(agentId);
+      await clearBackstopCooldown(action.id);
+      await db
+        .update(issueRecoveryActions)
+        .set({ attemptCount: 2, maxAttempts: 5 })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      // `enqueueWakeup` returning null is how it reports every non-delivery path
+      // (capacity deferral, tree hold, cooldown, wake-on-demand disabled).
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result.healed).toBe(0);
+      expect(result.deferredOrFailed).toBe(1);
+
+      const [after] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(after?.attemptCount).toBe(2);
+      const stampedAt = after?.lastAttemptAt
+        ? new Date(after.lastAttemptAt as Date | string).getTime()
+        : null;
+      expect(stampedAt).not.toBeNull();
+      expect(Date.now() - (stampedAt ?? 0)).toBeLessThan(30 * 60 * 1000);
+      expect(await backstopWakes(action.ownerAgentId ?? agentId)).toHaveLength(0);
+    });
+
+    // BLO-18106 review follow-up (Ally @ a2a5fcc38, important 2).
+    //
+    // Candidate selection and the claim are separated by four awaited checks
+    // (`hasActiveExecutionPath`, `hasQueuedIssueWake`, `hasPendingWakeInteraction`,
+    // `isAutomaticRecoverySuppressedByPauseHold`). An operator who unblocks or
+    // reassigns the issue inside that window used to get a wake anyway, sent to the
+    // owner their newer disposition had just removed.
+    //
+    // Injecting the mutation through `enqueueWakeup` reproduces the window faithfully
+    // rather than by construction: both issues are selected as candidates while still
+    // `blocked`, and the first candidate's delivery is what unblocks the second -- so
+    // the second's claim is evaluated against state that changed after it was chosen.
+    it("does not wake an owner whose issue was unblocked after candidate selection", async () => {
+      const first = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(first.agentId);
+      await clearBackstopCooldown(first.action.id);
+      const second = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(second.agentId);
+      await clearBackstopCooldown(second.action.id);
+      // Each fixture seeds its own company, so the pass is run unfiltered. That is
+      // faithful to the race regardless: candidate selection is a single global query
+      // that runs before any processing, and the per-company grouping happens after it.
+      // Candidates are walked in `issues.id` order; unblock whichever is processed last.
+      const [earlier, later] =
+        first.issueId < second.issueId ? [first, second] : [second, first];
+
+      let unblocked = false;
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async (agentId: string) => {
+          if (!unblocked) {
+            unblocked = true;
+            await db
+              .update(issues)
+              .set({ status: "in_progress" })
+              .where(eq(issues.id, later.issueId));
+          }
+          return { id: randomUUID(), agentId } as never;
+        }),
+      });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop();
+
+      expect(unblocked).toBe(true);
+      expect(result.issueIds).toContain(earlier.issueId);
+      expect(result.issueIds).not.toContain(later.issueId);
+      expect(result.staleSnapshotSkipped).toBeGreaterThanOrEqual(1);
+      // The claim must not have spent a budget attempt for the wake it refused to send.
+      const [staleAction] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, later.action.id));
+      expect(staleAction?.attemptCount).toBe(later.action.attemptCount);
+    });
+
+    // BLO-22795: the selection-window race above is FENCED by the claim. This one is the
+    // accepted residual -- a disposition committed after the claim commits, which the
+    // claim cannot fence because `enqueueWakeup` runs in its own transaction. The
+    // decision was to measure it rather than close it (an outbox only relocates the
+    // window; an in-transaction enqueue self-blocks). This test pins the measurement, so
+    // the decision stays revisitable on evidence.
+    it("counts a delivered wake whose issue was unblocked after the claim committed", async () => {
+      const seeded = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(seeded.agentId);
+      await clearBackstopCooldown(seeded.action.id);
+
+      let mutated = false;
+      const recovery = recoveryService(db, {
+        // Mutating inside the enqueue is the only faithful injection point for this
+        // window: it commits strictly after the claim committed and no later than the
+        // moment the wake lands, which is exactly the interval under test.
+        enqueueWakeup: vi.fn(async (agentId: string) => {
+          if (!mutated) {
+            mutated = true;
+            await db
+              .update(issues)
+              .set({ status: "in_progress" })
+              .where(eq(issues.id, seeded.issueId));
+          }
+          return { id: randomUUID(), agentId } as never;
+        }),
+      });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+        companyId: seeded.companyId,
+      });
+
+      expect(mutated).toBe(true);
+      // The wake really was delivered -- this is a spoiled delivery, not a skip. Asserting
+      // both keeps the counter honest: it must never be reachable via the fenced path.
+      expect(result.issueIds).toContain(seeded.issueId);
+      expect(result.healed).toBe(1);
+      expect(result.staleAfterClaimDelivered).toBe(1);
+      expect(result.staleSnapshotSkipped).toBe(0);
+      // Budget accounting is unchanged by the measurement: a delivered wake still spends
+      // exactly one attempt and is NOT refunded (the owner was genuinely woken).
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, seeded.action.id));
+      expect(action?.attemptCount).toBe(seeded.action.attemptCount + 1);
+    });
+
+    it("does not count a clean delivery as a post-claim stale wake", async () => {
+      const seeded = await seedUndeliveredRecoveryWake();
+      await neutralizeRecoveryWake(seeded.agentId);
+      await clearBackstopCooldown(seeded.action.id);
+
+      const recovery = recoveryService(db, {
+        enqueueWakeup: vi.fn(async (agentId: string) => ({ id: randomUUID(), agentId } as never)),
+      });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+        companyId: seeded.companyId,
+      });
+
+      expect(result.issueIds).toContain(seeded.issueId);
+      expect(result.healed).toBe(1);
+      // The control for the test above: without a concurrent mutation the counter stays
+      // at zero, so a nonzero reading in production means the window, not the detector.
+      expect(result.staleAfterClaimDelivered).toBe(0);
     });
   });
 });

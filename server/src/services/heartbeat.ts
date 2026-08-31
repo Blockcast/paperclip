@@ -18835,6 +18835,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
+  async function reconcileStrandedRecoveryWakeBackstop(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    cooldownMs?: number;
+  }) {
+    return recovery.reconcileStrandedRecoveryWakeBackstop(opts);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -28405,6 +28414,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
+
+    reconcileStrandedRecoveryWakeBackstop,
 
     scanSilentActiveRuns,
 

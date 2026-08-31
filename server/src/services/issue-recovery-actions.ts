@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -519,20 +519,174 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
   // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
   // Scoped to active statuses and matched on company so it cannot touch a resolved row.
-  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
-    await db
+  //
+  // BLO-18106 (review follow-up): the refund must also be scoped to the RESERVATION that
+  // created it, not just to the action id. The row is long-lived and reused in place across
+  // reassignments, and `upsertSourceScoped` RESETS `attemptCount` to 1 on a change of owner.
+  // So an owner change between claim and refund would decrement the replacement owner's
+  // freshly-reset counter — silently granting that owner an extra uncounted wake, which is
+  // the opposite of what a refund is for.
+  //
+  // `expectedAttemptCount` is the post-claim count returned by `claimWakeAttempt`. Matching
+  // on it makes the refund idempotent for free: the successful refund moves the column off
+  // the expected value, so a duplicate or retried call simply matches no row. That matters
+  // because the ordinary path deliberately retries a failed refund once.
+  //
+  // Returns whether a row was actually refunded, so a caller that cares (the retrying one)
+  // can tell "no matching reservation" apart from "database refused".
+  async function releaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId?: string | null;
+    expectedAttemptCount?: number;
+  }): Promise<boolean> {
+    const predicates = [
+      eq(issueRecoveryActions.id, input.actionId),
+      eq(issueRecoveryActions.companyId, input.companyId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+    ];
+    if (input.expectedOwnerAgentId !== undefined) {
+      predicates.push(
+        input.expectedOwnerAgentId === null
+          ? isNull(issueRecoveryActions.ownerAgentId)
+          : eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+      );
+    }
+    if (input.expectedAttemptCount !== undefined) {
+      predicates.push(eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount));
+    }
+    const refunded = await db
       .update(issueRecoveryActions)
       .set({
         attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
         updatedAt: new Date(),
       })
-      .where(
+      .where(and(...predicates))
+      .returning({ id: issueRecoveryActions.id });
+    return refunded.length > 0;
+  }
+
+  /**
+   * Atomically claims a redelivery slot: advances `lastAttemptAt` *and* spends one
+   * attempt, but only when the action is cooled down, still inside its budget, and
+   * still matches the snapshot the caller made its decision on. Returns the claimed
+   * attempt number only for the caller that won.
+   *
+   * The conditional UPDATE is what makes this safe: a read-then-write would let two
+   * concurrent liveness passes both observe a cooled-down action and both redeliver.
+   * Pushing every predicate into the WHERE clause makes the database the arbiter,
+   * so exactly one pass can claim per window.
+   *
+   * Three things are fenced here, all for the same reason -- the caller's reads happen
+   * several `await`s before this call, so anything read earlier may already be stale:
+   *
+   * 1. **Cooldown** -- `lastAttemptAt` outside `cooldownMs`.
+   * 2. **Budget** (BLO-18106 review follow-up) -- a delivered backstop wake must consume
+   *    the same per-owner budget the ordinary enqueue path spends, or the action's
+   *    `maxAttempts` ceiling is bypassed entirely: with only a cooldown bound, a 30m
+   *    cooldown against a 6h `timeoutAt` horizon permits ~12 wakes on a budget of 5,
+   *    while `attemptCount` stays put and the exhaustion notice under-reports. The claim
+   *    spends an attempt, so the bound is the POST-increment one: `attemptCount <
+   *    maxAttempts`. (`strandedRecoveryWakeAttemptsExhausted` tests `>` on already-spent
+   *    counts; matching it literally here would permit one extra wake -- see the predicate.)
+   * 3. **Snapshot** -- the action's observed owner and the issue's observed
+   *    status/assignee. Without this, an operator who unblocks or reassigns the issue
+   *    between candidate selection and this claim still gets a wake sent to the owner
+   *    their newer disposition removed.
+   *
+   * Only the attempt is refundable (via `releaseWakeAttempt`) when the enqueue reaches
+   * nobody; the cooldown stamp deliberately stands, because a deferral is exactly the
+   * case that would otherwise re-run on every pass.
+   */
+  async function claimWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    cooldownMs: number;
+    now?: Date;
+    expectedOwnerAgentId?: string | null;
+    expectedIssue?: { id: string; status: string; assigneeAgentId: string | null } | null;
+  }): Promise<{ claimed: boolean; attemptCount: number | null }> {
+    const now = input.now ?? new Date();
+    const cutoff = new Date(now.getTime() - Math.max(0, input.cooldownMs));
+    const predicates = [
+      eq(issueRecoveryActions.id, input.actionId),
+      eq(issueRecoveryActions.companyId, input.companyId),
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      // A never-attempted action (NULL) is claimable; `lte` alone would drop it,
+      // because every SQL comparison against NULL is NULL rather than true.
+      or(
+        isNull(issueRecoveryActions.lastAttemptAt),
+        lte(issueRecoveryActions.lastAttemptAt, cutoff),
+      ),
+      // Unbudgeted actions (`maxAttempts` NULL) are bounded only by their caller; a
+      // budgeted one must still be inside both its ceiling and its horizon.
+      //
+      // The invariant is POST-increment: this claim spends an attempt, so it may only
+      // proceed when the resulting count still satisfies the ceiling --
+      // `attemptCount + 1 <= maxAttempts`, i.e. `attemptCount < maxAttempts`.
+      //
+      // An earlier revision used `<=` here, reasoning that it "mirrors
+      // `strandedRecoveryWakeAttemptsExhausted` exactly" because that helper trips on `>`
+      // rather than `>=`. That conflated two counts taken on opposite sides of the
+      // increment, and cost one extra delivered wake per action:
+      //
+      //   ordinary path  -- `upsertSourceScoped` increments FIRST, then the caller tests
+      //                     the POST-increment row (service.ts, `...Exhausted(input.action)`),
+      //                     so it delivers for attemptCount 1..maxAttempts -> maxAttempts wakes.
+      //   backstop (old) -- tested the PRE-increment row with `<=`, so it delivered while
+      //                     the pre-count was <= maxAttempts, leaving a post-count of
+      //                     maxAttempts + 1 -> maxAttempts + 1 wakes.
+      //
+      // With `lt` both paths spend exactly `maxAttempts` attempts against the same column.
+      // The helper itself is deliberately NOT retightened to `>=`: it is applied to
+      // post-increment counts everywhere else, and `>=` there would silently cut the
+      // ordinary path to `maxAttempts - 1` wakes.
+      //
+      // The caller's miss classifier stays in step by asking the same post-increment
+      // question (`...Exhausted({ ...current, attemptCount: current.attemptCount + 1 })`),
+      // so a rejection at the boundary is reported as a budget rejection rather than a
+      // cooldown one.
+      or(
+        isNull(issueRecoveryActions.maxAttempts),
         and(
-          eq(issueRecoveryActions.id, input.actionId),
-          eq(issueRecoveryActions.companyId, input.companyId),
-          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          lt(issueRecoveryActions.attemptCount, issueRecoveryActions.maxAttempts),
+          or(
+            isNull(issueRecoveryActions.timeoutAt),
+            gt(issueRecoveryActions.timeoutAt, now),
+          ),
         ),
+      ),
+    ];
+    if (input.expectedOwnerAgentId !== undefined) {
+      predicates.push(
+        input.expectedOwnerAgentId === null
+          ? isNull(issueRecoveryActions.ownerAgentId)
+          : eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
       );
+    }
+    if (input.expectedIssue) {
+      const expected = input.expectedIssue;
+      predicates.push(
+        sql`exists (select 1 from ${issues} where ${issues.id} = ${expected.id} and ${issues.status} = ${expected.status} and ${
+          expected.assigneeAgentId === null
+            ? sql`${issues.assigneeAgentId} is null`
+            : sql`${issues.assigneeAgentId} = ${expected.assigneeAgentId}`
+        })`,
+      );
+    }
+    const [claimed] = await db
+      .update(issueRecoveryActions)
+      .set({
+        lastAttemptAt: now,
+        updatedAt: now,
+        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+      })
+      .where(and(...predicates))
+      .returning({
+        id: issueRecoveryActions.id,
+        attemptCount: issueRecoveryActions.attemptCount,
+      });
+    return { claimed: Boolean(claimed), attemptCount: claimed?.attemptCount ?? null };
   }
 
   async function resolveActiveForIssue(
@@ -579,5 +733,6 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     resolveActiveForIssue,
     upsertSourceScoped,
     releaseWakeAttempt,
+    claimWakeAttempt,
   };
 }
