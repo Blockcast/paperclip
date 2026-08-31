@@ -95,6 +95,12 @@ const COUNTED_FINDINGS_BUCKET_PATTERN =
 // rather than as a merged regression.
 const RESOLVED_PRIOR_DISPOSITIONS = new Set(["fixed", "no-longer-applicable"]);
 
+// The verb that asserts a prior finding still stands. Kept separate from the
+// unrecognized case so callers can tell them apart: a head held red by
+// `still-present` is self-explanatory, whereas one held red by a verb nobody
+// taught this parser is a mystery worth naming.
+const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
+
 /** One finding, identified the way Ally's ledger identifies it. */
 export interface AllyFindingRef {
   severity: string;
@@ -108,33 +114,60 @@ export interface AllyDispositionedPriorFinding extends AllyFindingRef {
 }
 
 /**
- * Prior findings this review explicitly reports as resolved.
+ * What a ledger verb does to the finding it names.
+ *
+ * `unrecognized` is not an error state — it is the fail-closed branch. It
+ * exists as its own kind purely so a gate can say *why* a finding was not
+ * retired instead of leaving a silently unexplained red.
+ */
+export type PriorDispositionKind = "retires" | "blocks" | "unrecognized";
+
+export interface AllyPriorFindingDisposition extends AllyDispositionedPriorFinding {
+  /** The verb exactly as written, lowercased. */
+  disposition: string;
+  kind: PriorDispositionKind;
+}
+
+export function classifyPriorDisposition(disposition: string): PriorDispositionKind {
+  const verb = disposition.trim().toLowerCase();
+  if (RESOLVED_PRIOR_DISPOSITIONS.has(verb)) return "retires";
+  if (BLOCKING_PRIOR_DISPOSITIONS.has(verb)) return "blocks";
+  return "unrecognized";
+}
+
+/**
+ * Every prior-finding ledger entry in this review, classified.
+ *
+ * The single parse point for the ledger. Callers filter by `kind` rather than
+ * calling separate extractors, so the retiring and non-retiring views cannot
+ * drift on what counts as an entry.
  *
  * Ally re-states each earlier finding it has re-examined under a "Prior
  * Findings Dispositioned" heading, naming the head the finding was raised
  * against plus its severity and index. That is a direct assertion about a
- * specific earlier finding, which is why it can disposition one that a merely
- * clean review of an unrelated head cannot.
- *
- * Severity and index are carried because a head can raise several findings and
- * a ledger may retire only some of them.
+ * specific earlier finding, which is why a `retires` entry can disposition one
+ * that a merely clean review of an unrelated head cannot. Severity and index
+ * are carried because a head can raise several findings and a ledger may
+ * retire only some of them.
  */
-export function extractAllyDispositionedPriorFindings(
+export function extractAllyPriorFindingDispositions(
   body: string | null | undefined,
-): AllyDispositionedPriorFinding[] {
+): AllyPriorFindingDisposition[] {
   if (typeof body !== "string") return [];
-  const resolved: AllyDispositionedPriorFinding[] = [];
+  const entries: AllyPriorFindingDisposition[] = [];
   for (const [, shortSha, severity, index, disposition] of body.matchAll(
     PRIOR_FINDING_DISPOSITION_PATTERN,
   )) {
-    if (!RESOLVED_PRIOR_DISPOSITIONS.has(disposition!.toLowerCase())) continue;
-    resolved.push({
+    const verb = disposition!.toLowerCase();
+    entries.push({
       shortSha: shortSha!.toLowerCase(),
       severity: severity!.toLowerCase(),
       index: Number(index),
+      disposition: verb,
+      kind: classifyPriorDisposition(verb),
     });
   }
-  return resolved;
+  return entries;
 }
 
 /**

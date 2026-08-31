@@ -13,12 +13,13 @@
  */
 import { loadConfig } from "../config.js";
 import {
-  extractAllyDispositionedPriorFindings,
+  extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
-  type AllyDispositionedPriorFinding,
+  type AllyFindingRef,
+  type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
   githubFetchPrHeadSha,
@@ -30,6 +31,12 @@ import {
 } from "./github-app-auth.js";
 
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
+
+// Characters of the unrecognized-verb list a carried-finding reason may spend.
+// Sized so the message stays inside GitHub's 140-character commit-status cap
+// with the head and the explanatory phrase intact, since those are what make
+// the red actionable.
+const UNRECOGNIZED_VERB_BUDGET = 48;
 
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
@@ -97,6 +104,15 @@ interface AttestingComment {
   attestedHeadSha: string;
 }
 
+interface CarriedFinding extends AttestingComment {
+  /**
+   * Ledger verbs that named a still-unretired finding on this head but that
+   * the parser does not recognize. Empty in the ordinary case; non-empty means
+   * the red is explainable by vocabulary drift rather than by an open finding.
+   */
+  unrecognizedVerbs: string[];
+}
+
 /**
  * Latest Ally consolidated-review comment attesting exactly one head, matching
  * the requested head. Comments with an absent or ambiguous attestation are
@@ -160,9 +176,9 @@ function latestAttestingAllyComment(
 function headsWithUndispositionedFinding(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
-): AttestingComment[] {
+): CarriedFinding[] {
   const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
-  const resolvedPriors: { finding: AllyDispositionedPriorFinding; timeMs: number; attestedHeadSha: string }[] = [];
+  const ledger: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -171,8 +187,8 @@ function headsWithUndispositionedFinding(
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
 
-    for (const finding of extractAllyDispositionedPriorFindings(comment.body)) {
-      resolvedPriors.push({ finding, timeMs: commentTime, attestedHeadSha });
+    for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
+      ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
     }
 
     const existing = newestPerHead.get(attestedHeadSha);
@@ -184,22 +200,29 @@ function headsWithUndispositionedFinding(
   }
 
   // A ledger entry speaks only to findings that already existed when it was
-  // written, so it must be at least as new as the attestation it clears, and it
+  // written, so it must be at least as new as the attestation it names, and it
   // must come from a review of a different head — a review cannot disposition
   // its own finding. That second condition is what makes `>=` safe against the
   // second-resolution timestamps.
-  const isRetired = (
+  //
+  // Shared by the retirement check and the unrecognized-verb diagnostic so the
+  // explanation can only ever name an entry that would otherwise have retired
+  // the finding.
+  const namesFinding = (
+    prior: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string },
     headSha: string,
     attestedAtMs: number,
-    finding: { severity: string; index: number },
+    finding: AllyFindingRef,
   ): boolean =>
-    resolvedPriors.some(
-      (prior) =>
-        prior.attestedHeadSha !== headSha &&
-        prior.timeMs >= attestedAtMs &&
-        headSha.startsWith(prior.finding.shortSha) &&
-        prior.finding.severity === finding.severity &&
-        prior.finding.index === finding.index,
+    prior.attestedHeadSha !== headSha &&
+    prior.timeMs >= attestedAtMs &&
+    headSha.startsWith(prior.entry.shortSha) &&
+    prior.entry.severity === finding.severity &&
+    prior.entry.index === finding.index;
+
+  const isRetired = (headSha: string, attestedAtMs: number, finding: AllyFindingRef): boolean =>
+    ledger.some(
+      (prior) => prior.entry.kind === "retires" && namesFinding(prior, headSha, attestedAtMs, finding),
     );
 
   // A head is dispositioned only once *every* finding it raised has been
@@ -216,12 +239,35 @@ function headsWithUndispositionedFinding(
     );
   };
 
+  // Verbs that named a still-unretired finding on this head but that this
+  // parser does not know. Failing closed on those is correct, but leaving the
+  // red unexplained is not: without this the status says a finding is
+  // undispositioned while Ally's ledger visibly dispositions it, and nothing
+  // tells a reader that the verb is the reason.
+  const unrecognizedVerbsBlocking = (entry: {
+    attesting: AttestingComment;
+    timeMs: number;
+  }): string[] => {
+    const headSha = entry.attesting.attestedHeadSha;
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported) return [];
+    const verbs = new Set<string>();
+    for (const finding of reported) {
+      if (isRetired(headSha, entry.timeMs, finding)) continue;
+      for (const prior of ledger) {
+        if (prior.entry.kind !== "unrecognized") continue;
+        if (namesFinding(prior, headSha, entry.timeMs, finding)) verbs.add(prior.entry.disposition);
+      }
+    }
+    return [...verbs];
+  };
+
   return [...newestPerHead.values()]
     .filter(
       (entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body) && !isFullyDispositioned(entry),
     )
     .sort((a, b) => b.timeMs - a.timeMs)
-    .map((entry) => entry.attesting);
+    .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
 }
 
 /**
@@ -275,12 +321,26 @@ export function evaluateCommentReviewGate(input: {
   // strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
+    const shortHead = carried.attestedHeadSha.slice(0, 7);
+    // GitHub caps a commit-status description at 140 characters, so this is a
+    // replacement message rather than a suffix on the ordinary one: appending
+    // would push the part that explains the red past the cap and lose exactly
+    // the detail this branch exists to surface. The verb list is budgeted for
+    // the same reason — the regex accepts an arbitrarily long verb, and the
+    // head plus the "unrecognized ledger verb" phrase must survive intact.
+    const verbList = carried.unrecognizedVerbs
+      .map((verb) => `"${verb}"`)
+      .join(", ")
+      .slice(0, UNRECOGNIZED_VERB_BUDGET);
+    const reason = carried.unrecognizedVerbs.length
+      ? `A finding from Ally's review of ${shortHead} is undispositioned: unrecognized ledger ` +
+        `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} ${verbList}.`
+      : `An unresolved finding from Ally's review of ${shortHead} ` +
+        "is still undispositioned; no comment attests the current head.";
     return {
       state: "failure",
       outcome: "carried_finding",
-      reason:
-        `An unresolved finding from Ally's review of ${carried.attestedHeadSha.slice(0, 7)} ` +
-        "is still undispositioned; no comment attests the current head.",
+      reason,
       commentCreatedAt: new Date(toEpochMs(carried.comment.createdAt)).toISOString(),
       carriedFromHeadSha: carried.attestedHeadSha,
     };
