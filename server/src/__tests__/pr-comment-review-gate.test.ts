@@ -525,6 +525,40 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.reason).not.toContain("unrecognized");
   });
 
+  it("prefers an explicit still-present over an unrecognized verb for the same finding", () => {
+    // Two later reviews disposition the same finding differently: one says it
+    // still stands, one uses a verb this parser does not know. `still-present`
+    // is an explicit answer, so it is the real reason the head is blocked.
+    // Naming the unknown verb here would blame vocabulary drift for a finding
+    // Ally deliberately left open — a wrong explanation, which is worse than
+    // the bare one this diagnostic replaces.
+    const stillPresent = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — still-present — the assertion is still missing.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+    const unknownVerb = reviewBody("d".repeat(40), [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — deferred — revisit next cycle.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(stillPresent, "2026-08-04T21:09:19Z"),
+        allyComment(unknownVerb, "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).not.toContain("unrecognized");
+    expect(verdict.reason).not.toContain("deferred");
+  });
+
   it("reports not_evaluated rather than clean when nothing attests the head", () => {
     const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
 

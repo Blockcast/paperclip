@@ -225,6 +225,18 @@ function headsWithUndispositionedFinding(
       (prior) => prior.entry.kind === "retires" && namesFinding(prior, headSha, attestedAtMs, finding),
     );
 
+  // Ally saying a finding still stands is an explicit answer, not a gap in this
+  // parser's vocabulary. When both dispositions name one finding, the known one
+  // is the true reason it is still blocking.
+  const isExplicitlyBlocked = (
+    headSha: string,
+    attestedAtMs: number,
+    finding: AllyFindingRef,
+  ): boolean =>
+    ledger.some(
+      (prior) => prior.entry.kind === "blocks" && namesFinding(prior, headSha, attestedAtMs, finding),
+    );
+
   // A head is dispositioned only once *every* finding it raised has been
   // retired by name. Matching on the head alone would let one `fixed` entry
   // clear a review that reported several findings, dropping the ones the ledger
@@ -243,7 +255,9 @@ function headsWithUndispositionedFinding(
   // parser does not know. Failing closed on those is correct, but leaving the
   // red unexplained is not: without this the status says a finding is
   // undispositioned while Ally's ledger visibly dispositions it, and nothing
-  // tells a reader that the verb is the reason.
+  // tells a reader that the verb is the reason. A finding Ally has explicitly
+  // marked `still-present` is excluded — reporting drift there would name the
+  // wrong cause, which is worse than saying nothing.
   const unrecognizedVerbsBlocking = (entry: {
     attesting: AttestingComment;
     timeMs: number;
@@ -254,6 +268,7 @@ function headsWithUndispositionedFinding(
     const verbs = new Set<string>();
     for (const finding of reported) {
       if (isRetired(headSha, entry.timeMs, finding)) continue;
+      if (isExplicitlyBlocked(headSha, entry.timeMs, finding)) continue;
       for (const prior of ledger) {
         if (prior.entry.kind !== "unrecognized") continue;
         if (namesFinding(prior, headSha, entry.timeMs, finding)) verbs.add(prior.entry.disposition);
