@@ -92,6 +92,21 @@ function classifyKeyTier(key: string): 1 | 2 | null {
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
+/**
+ * `args` is the spelling real MCP stdio server configs use — see
+ * `services/tool-access.ts` (`Array.isArray(server.args)`) — so the three
+ * synonyms above covered every form except the one actually on the wire, and
+ * `adapterConfig.mcpServers.*.args: ["--api-key", "…"]` went out in the clear
+ * while `argv` carrying the identical value was masked (PEN-2747).
+ *
+ * Kept OUT of `COMMAND_ARGS_PAYLOAD_KEY_RE` and gated on `agentConfig`
+ * on purpose: a bare `args` array in a *generic* event payload is not command
+ * argv (tool-call arguments, job parameters), and treating it as such is an
+ * exclusion this module already made deliberately — see the "does not treat
+ * bare args payloads as command args" case in `redaction.test.ts`. Inside an
+ * agent config the key is unambiguous, so widen there and only there.
+ */
+const AGENT_CONFIG_ARGS_KEY_RE = /^args$/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
@@ -134,6 +149,16 @@ const URI_SEPARATOR_HINT = "://";
 // URL (`https://example.com:8080/path`) has no `@`, and a bare userinfo URL
 // (`https://user@host`) has no `:` before it, so neither can match.
 const URI_CREDENTIAL_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s:/@]*):([^\s/@]+)@/gi;
+/**
+ * Replacing sibling of {@link URL_CREDENTIAL_QUERY_RE}, which is a detector
+ * (boolean) used by the Tier-2 value gate. The boundary class includes `#` so a
+ * fragment-borne credential (`…#access_token=…`, the OAuth2 implicit-flow
+ * shape) is covered by the same rule as a query-borne one, rather than needing
+ * the synthesized-`?` re-test `looksLikeCredentialValue` does.
+ */
+const URL_CREDENTIAL_PARAM_VALUE_RE =
+  /([?&#](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|passwd|password|credential|x-amz-signature)=)[^&\s#]+/gi;
+
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -163,6 +188,46 @@ function maybeContainsSecretText(input: string) {
   return SECRET_TEXT_HINTS.some((hint) => lower.includes(hint))
     || lower.includes(URI_SEPARATOR_HINT)
     || input.includes(".");
+}
+
+/**
+ * PEN-2747: value-shaped credential masking on the *structured* path.
+ *
+ * `sanitizeRecord`'s fallthrough hands an unrecognized key's string value back
+ * verbatim, so credential material carried inside a URL escaped every rule in
+ * this file. Three separate near-misses lined up:
+ *
+ *  - `url` is in no tier. `SECRET_TIER2_STEMS` spells `base[-_]?url`, which
+ *    requires the literal `base`, so `baseUrl` matched and a plain `url` did
+ *    not — nor did `endpoint`, `webhookUrl`, `serverUrl`, `proxyUrl`.
+ *  - The repo already owned {@link URI_CREDENTIAL_RE} and never called it here:
+ *    it was wired only into {@link redactSensitiveText}, which `sanitizeRecord`
+ *    reaches only for keys matching `COMMAND_PAYLOAD_KEY_RE`.
+ *  - The one test covering `mcpServers.*.url` used a credential-free fixture,
+ *    so it asserted the pass-through as correct output.
+ *
+ * Fixed by matching the *value*, in one place, rather than by adding four more
+ * key names: a key-name denylist fails open on the fifth spelling, and
+ * `adapterConfig.mcpServers.*.url` is precisely where an agent's k8s MCP
+ * upstream is swapped for a privileged (`ns-rw` / `admin`) tier.
+ *
+ * Deliberately surgical — only the credential component is masked, so scheme,
+ * principal, host, port and path survive. Knowing *which* upstream and *which*
+ * principal an agent is pointed at is the diagnostic value these read paths
+ * exist for; blanking the whole URL would destroy it, and over-redaction is the
+ * failure mode this module has been corrected for repeatedly (see the
+ * `looksLikeReadableSlug` comments). It also means a credential-free URL still
+ * round-trips byte-identical.
+ *
+ * Gated on the scheme separator so prose that merely contains `token=` is left
+ * alone; a bare `user@host` (no `:`) and a credential-free
+ * `https://host:8080/path` (no `@`) cannot match `URI_CREDENTIAL_RE` either.
+ */
+function redactUriCredentialsInValue(value: string): string {
+  if (!value.includes(URI_SEPARATOR_HINT)) return value;
+  return value
+    .replace(URI_CREDENTIAL_RE, `$1$2:${REDACTED_EVENT_VALUE}@`)
+    .replace(URL_CREDENTIAL_PARAM_VALUE_RE, `$1${REDACTED_EVENT_VALUE}`);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -235,6 +300,7 @@ function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
       ? { type: "plain", value: REDACTED_EVENT_VALUE }
       : { type: "plain", value: sanitizeValue(value.value, options) };
   }
+  if (typeof value === "string") return redactUriCredentialsInValue(value);
   if (!isPlainObject(value)) return value;
   return sanitizeRecord(value, options);
 }
@@ -261,6 +327,41 @@ function sanitizeAgentEnvRecord(record: Record<string, unknown>): Record<string,
       continue;
     }
     redacted[key] = REDACTED_EVENT_VALUE;
+  }
+  return redacted;
+}
+
+/**
+ * The header map of an MCP server entry is credential-bearing by construction
+ * in the same way an `env` map is, so it gets the same allowlist treatment
+ * (PEN-2747). `Authorization` was masked only incidentally — "auth" is a Tier-1
+ * stem — which left every differently-spelled credential header in the clear:
+ * `X-Tenant-Signature`, `X-Gbrain-Bearer`, `Cookie`-adjacent vendor spellings.
+ * A denylist over header names has no bounded vocabulary to enumerate; a
+ * request header that is *not* content negotiation is, on this surface,
+ * overwhelmingly authorization or tenant-routing material.
+ *
+ * The exemption list is deliberately short and closed: headers whose value can
+ * never itself be a credential. Anything else masks, and the round-trip guard
+ * in `routes/agents.ts` (`restoreRedactedAdapterValue`) puts the stored value
+ * back if a caller PATCHes the redacted config in.
+ */
+const BENIGN_HEADER_NAMES = new Set([
+  "accept",
+  "accept-charset",
+  "accept-encoding",
+  "accept-language",
+  "cache-control",
+  "content-type",
+  "user-agent",
+]);
+
+function sanitizeAgentHeaderRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    redacted[key] = BENIGN_HEADER_NAMES.has(key.trim().toLowerCase())
+      ? sanitizeValue(value, options)
+      : REDACTED_EVENT_VALUE;
   }
   return redacted;
 }
@@ -501,7 +602,14 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
       redacted[key] = isPlainObject(value) ? sanitizeAgentEnvRecord(value) : REDACTED_EVENT_VALUE;
       continue;
     }
-    if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
+    if (options?.agentConfig && key === "headers") {
+      redacted[key] = isPlainObject(value) ? sanitizeAgentHeaderRecord(value, options) : REDACTED_EVENT_VALUE;
+      continue;
+    }
+    const argsLikeKey =
+      COMMAND_ARGS_PAYLOAD_KEY_RE.test(key)
+      || (options?.agentConfig === true && AGENT_CONFIG_ARGS_KEY_RE.test(key));
+    if (argsLikeKey && Array.isArray(value)) {
       redacted[key] = sanitizeCommandArgs(value, options);
       continue;
     }
