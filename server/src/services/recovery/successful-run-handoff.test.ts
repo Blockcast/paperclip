@@ -101,7 +101,7 @@ describe("successful run handoff decision", () => {
     expect(decision.instruction).toContain("Resolve the missing disposition before creating or revising any new artifacts");
     expect(decision.instruction).toContain("Choose **exactly one** outcome");
     expect(decision.instruction).toContain(
-      "Mark it `done` only after verifying the acceptance criteria against a committed, remotely resolvable artifact",
+      "Mark it `done` only after verifying the acceptance criteria and one qualifying completion artifact: a committed, remotely resolvable artifact or PR, a run-attributed durable issue artifact, or the valid checked-out execution path",
     );
     expect(decision.instruction).toContain("record an explicit continuation path");
   });
