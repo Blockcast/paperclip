@@ -2582,6 +2582,187 @@ describe("company portability", () => {
     expect(extension).toContain('kind: "secret"');
   });
 
+  describe("export credential redaction (PEN-2778)", () => {
+    // Every value below is a fabricated fixture. The export routes are
+    // agent-reachable (a CEO agent can POST /companies/:id/export), so each of
+    // these reached a sibling agent's response in the clear: the portable-config
+    // filter is a key skip-list whose `env` entry is top-level only.
+    const ADAPTER_API_KEY = "sk-adapter-api-key-value";
+    const ADAPTER_HEADER_TOKEN = "Bearer adapter-header-token";
+    const MCP_UPSTREAM_TOKEN = "Bearer mcp-upstream-token";
+    const MCP_ARG_TOKEN = "mcp-arg-token-value";
+    const NESTED_PROFILE_KEY = "sk-nested-profile-key";
+    const NESTED_SIGNING_MATERIAL = "nested-signing-material-value";
+    const METADATA_TOKEN = "metadata-support-token-value";
+
+    const secretBearingAgent = () => ({
+      id: "agent-1",
+      name: "ClaudeCoder",
+      status: "idle",
+      role: "engineer",
+      title: "Software Engineer",
+      icon: "code",
+      reportsTo: null,
+      capabilities: "Writes code",
+      adapterType: "claude_local",
+      adapterConfig: {
+        promptTemplate: "You are ClaudeCoder.",
+        apiKey: ADAPTER_API_KEY,
+        headers: { Authorization: ADAPTER_HEADER_TOKEN },
+        mcpServers: {
+          gbrain: {
+            url: "https://gbrain.example.com/mcp",
+            headers: { Authorization: MCP_UPSTREAM_TOKEN },
+            args: ["--token", MCP_ARG_TOKEN],
+          },
+        },
+      },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              env: {
+                OPENAI_API_KEY: { type: "plain", value: NESTED_PROFILE_KEY },
+                SIGNING_MATERIAL: { type: "plain", value: NESTED_SIGNING_MATERIAL },
+              },
+            },
+          },
+        },
+      },
+      budgetMonthlyCents: 0,
+      permissions: {},
+      metadata: { supportContactToken: METADATA_TOKEN },
+    });
+
+    const leakedValues = [
+      ADAPTER_API_KEY,
+      ADAPTER_HEADER_TOKEN,
+      MCP_UPSTREAM_TOKEN,
+      MCP_ARG_TOKEN,
+      NESTED_PROFILE_KEY,
+      NESTED_SIGNING_MATERIAL,
+      METADATA_TOKEN,
+    ];
+
+    const exportInput = {
+      include: {
+        company: true,
+        agents: true,
+        projects: false,
+        issues: false,
+      },
+    };
+
+    beforeEach(() => {
+      agentSvc.list.mockResolvedValue([secretBearingAgent()]);
+    });
+
+    it("keeps no credential value in an export bundle, at any depth", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      const extension = asTextFile(exported.files[".paperclip.yaml"]);
+
+      for (const value of leakedValues) {
+        expect(extension).not.toContain(value);
+      }
+      // Nothing may carry a value out through a file other than the extension
+      // either — the bundle is what ships, not one entry in it. Binary entries
+      // are scanned as their serialized form rather than skipped.
+      for (const [, entry] of Object.entries(exported.files)) {
+        const serialized = typeof entry === "string" ? entry : JSON.stringify(entry);
+        for (const value of leakedValues) {
+          expect(serialized).not.toContain(value);
+        }
+      }
+      // The manifest is a second exit on the same response. It happens to be
+      // derived from the emitted files today, so it inherits the redaction —
+      // assert it rather than rely on that, because a refactor that re-sourced
+      // it from the agent rows would reopen the leak with the file scan green.
+      for (const value of leakedValues) {
+        expect(JSON.stringify(exported.manifest)).not.toContain(value);
+      }
+    });
+
+    it("preserves the field names, so the export stays diagnostically useful", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      const extension = asTextFile(exported.files[".paperclip.yaml"]);
+
+      expect(extension).toContain("mcpServers:");
+      expect(extension).toContain("gbrain:");
+      expect(extension).toContain("apiKey:");
+      expect(extension).toContain("modelProfiles:");
+      expect(extension).toContain("OPENAI_API_KEY:");
+      expect(extension).toContain("SIGNING_MATERIAL:");
+    });
+
+    it("names every redacted field in the warnings so an import can be re-supplied", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      const redactionWarnings = exported.warnings.filter((warning) =>
+        warning.includes("redacted credential material"),
+      );
+
+      expect(redactionWarnings.some((warning) => warning.includes("adapter config"))).toBe(true);
+      expect(redactionWarnings.some((warning) => warning.includes("runtime config"))).toBe(true);
+      expect(redactionWarnings.some((warning) => warning.includes("metadata"))).toBe(true);
+      expect(
+        redactionWarnings.some((warning) =>
+          warning.includes("modelProfiles.cheap.adapterConfig.env.OPENAI_API_KEY"),
+        ),
+      ).toBe(true);
+      // A warning that quoted the value would reintroduce the disclosure.
+      for (const warning of redactionWarnings) {
+        for (const value of leakedValues) {
+          expect(warning).not.toContain(value);
+        }
+      }
+    });
+
+    it("redacts on the preview route too — it returns the same bundle body", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const preview = await portability.previewExport("company-1", exportInput);
+      const extension = asTextFile(preview.files[".paperclip.yaml"]);
+
+      for (const value of leakedValues) {
+        expect(extension).not.toContain(value);
+      }
+    });
+    it("round-trips without installing the redaction placeholder as a credential", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+      accessSvc.ensureMembership.mockResolvedValue(undefined);
+      agentSvc.create.mockResolvedValue({ id: "agent-created", name: "ClaudeCoder" });
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      agentSvc.list.mockResolvedValue([]);
+
+      const imported = await portability.importBundle({
+        source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+        include: { company: true, agents: true, projects: false, issues: false },
+        target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+        agents: "all",
+        collisionStrategy: "rename",
+      }, "user-1");
+
+      // Importing the mask verbatim would turn a disclosure into an agent that
+      // authenticates with the string "***REDACTED***".
+      const createCall = agentSvc.create.mock.calls.at(-1);
+      expect(JSON.stringify(createCall)).not.toContain("***REDACTED***");
+      expect(createCall?.[1].adapterConfig).not.toHaveProperty("apiKey");
+      expect(
+        imported.warnings.some((warning: string) =>
+          warning.includes("imported without redacted values"),
+        ),
+      ).toBe(true);
+    });
+  });
+
   it("imports packaged skills and restores desired skill refs on agents", async () => {
     const portability = companyPortabilityService({} as any);
 
