@@ -82,6 +82,7 @@ import {
 } from "./catalog-provenance.js";
 import { readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
 import { normalizePortablePath } from "./portable-path.js";
+import { redactAgentConfigPayload, REDACTED_EVENT_VALUE } from "../redaction.js";
 
 /** Build OrgNode tree from manifest agent list (slug + reportsToSlug). */
 function buildOrgTreeFromManifest(agents: CompanyPortabilityManifest["agents"]): OrgNode[] {
@@ -1800,6 +1801,121 @@ function normalizePortableConfig(
   }
 
   return next;
+}
+
+/**
+ * Record every leaf whose value changed between the pre- and post-redaction
+ * trees, as a dotted path. Paths only — a warning that quoted the value would
+ * reintroduce the disclosure it exists to report.
+ */
+function collectRedactedPaths(before: unknown, after: unknown, prefix: string, out: string[]) {
+  if (isPlainRecord(before) && isPlainRecord(after)) {
+    for (const key of Object.keys(before)) {
+      collectRedactedPaths(before[key], after[key], prefix ? `${prefix}.${key}` : key, out);
+    }
+    return;
+  }
+  if (Array.isArray(before) && Array.isArray(after) && before.length === after.length) {
+    for (let index = 0; index < before.length; index += 1) {
+      collectRedactedPaths(before[index], after[index], `${prefix}[${index}]`, out);
+    }
+    return;
+  }
+  if (JSON.stringify(before ?? null) !== JSON.stringify(after ?? null)) {
+    out.push(prefix || "(root)");
+  }
+}
+
+/**
+ * Last gate before an agent's config leaves in an export bundle.
+ *
+ * Export is agent-reachable — a CEO agent can call `POST /companies/:id/export`
+ * and read every sibling agent's config — so everything emitted here must pass
+ * the same redactor as every other agent-config read path
+ * (`redactAgentConfigPayload`, `server/src/redaction.ts`).
+ *
+ * `normalizePortableConfig` above is a *portability* filter, not a secrecy one:
+ * it drops host-specific keys, and its `env` skip is top-level only. Nothing
+ * else was ever masked, so `adapterConfig.apiKey`,
+ * `adapterConfig.mcpServers.*.headers` and the per-profile
+ * `runtimeConfig.modelProfiles.*.adapterConfig.env` maps left in the clear
+ * (PEN-2778) — the same `env` the top-level skip exists to protect, one level
+ * down.
+ *
+ * Sharing the redactor rather than lengthening that skip list is the point: a
+ * credential-bearing key added anywhere else in the codebase is covered here
+ * without a second edit, which a per-surface denylist can never promise.
+ *
+ * Redacted fields are named in `warnings` because a bundle is meant to be
+ * re-importable: an import of this bundle recreates the agent without usable
+ * credentials, and the operator has to be told which ones to re-supply rather
+ * than discovering it from a runtime auth failure.
+ */
+function redactPortableAgentRecord<T extends Record<string, unknown> | null>(
+  value: T,
+  context: { agentSlug: string; field: string; warnings: string[] },
+): T {
+  if (value === null) return value;
+  const redacted = (redactAgentConfigPayload(value) ?? {}) as T;
+  const paths: string[] = [];
+  collectRedactedPaths(value, redacted, "", paths);
+  if (paths.length > 0) {
+    context.warnings.push(
+      `Agent ${context.agentSlug} ${context.field} exported with redacted credential material at ${paths.join(", ")}; re-supply these values after import.`,
+    );
+  }
+  return redacted;
+}
+
+/**
+ * Import-side counterpart of {@link redactPortableAgentRecord}.
+ *
+ * Export masks credential leaves as `REDACTED_EVENT_VALUE`. Importing that
+ * literal would install it *as* the credential — turning a disclosure into a
+ * silent misconfiguration that only surfaces as an opaque upstream auth
+ * failure. Drop the placeholder instead, so the field is honestly absent, and
+ * say so in the warnings.
+ *
+ * Matching on the sentinel is deliberate: it is the one value the redactor
+ * writes, so this stays correct without re-deriving which keys were secret.
+ */
+function stripRedactedPlaceholders(
+  value: unknown,
+  found: string[],
+  prefix = "",
+): unknown {
+  if (value === REDACTED_EVENT_VALUE) {
+    found.push(prefix || "(root)");
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => stripRedactedPlaceholders(entry, found, `${prefix}[${index}]`));
+  }
+  if (isPlainRecord(value)) {
+    const next: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const childPrefix = prefix ? `${prefix}.${key}` : key;
+      const cleaned = stripRedactedPlaceholders(entry, found, childPrefix);
+      if (cleaned === undefined) continue;
+      next[key] = cleaned;
+    }
+    return next;
+  }
+  return value;
+}
+
+function withoutRedactedPlaceholders<T>(
+  value: T,
+  context: { agentSlug: string; field: string; warnings: string[] },
+): T {
+  const found: string[] = [];
+  const cleaned = stripRedactedPlaceholders(value, found);
+  if (found.length > 0) {
+    context.warnings.push(
+      `Agent ${context.agentSlug} ${context.field} was imported without redacted values at ${found.join(", ")}; supply them before the agent runs.`,
+    );
+  }
+  return (cleaned === undefined ? value : cleaned) as T;
 }
 
 function isAbsoluteCommand(value: string) {
@@ -3762,13 +3878,24 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           capabilities: agent.capabilities ?? null,
           adapter: {
             type: agent.adapterType,
-            config: portableAdapterConfig,
+            config: redactPortableAgentRecord(portableAdapterConfig, {
+              agentSlug: slug,
+              field: "adapter config",
+              warnings,
+            }),
           },
-          runtime: portableRuntimeConfig,
+          runtime: redactPortableAgentRecord(portableRuntimeConfig, {
+            agentSlug: slug,
+            field: "runtime config",
+            warnings,
+          }),
           permissions: portablePermissions,
           permissionGrants: portablePermissionGrants.length > 0 ? portablePermissionGrants : undefined,
           budgetMonthlyCents: (agent.budgetMonthlyCents ?? 0) > 0 ? agent.budgetMonthlyCents : undefined,
-          metadata: (agent.metadata as Record<string, unknown> | null) ?? null,
+          metadata: redactPortableAgentRecord(
+            (agent.metadata as Record<string, unknown> | null) ?? null,
+            { agentSlug: slug, field: "metadata", warnings },
+          ),
         });
         if (isPlainRecord(extension) && agentEnvInputs.length > 0) {
           extension.inputs = {
@@ -4722,9 +4849,13 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
 
           // Apply adapter overrides from request if present
           const adapterOverride = input.adapterOverrides?.[planAgent.slug];
-          const baseAdapterConfig = adapterOverride?.adapterConfig
-            ? { ...adapterOverride.adapterConfig }
-            : { ...manifestAgent.adapterConfig } as Record<string, unknown>;
+          const redactionContext = { agentSlug: planAgent.slug, warnings };
+          const baseAdapterConfig = withoutRedactedPlaceholders(
+            adapterOverride?.adapterConfig
+              ? { ...adapterOverride.adapterConfig }
+              : { ...manifestAgent.adapterConfig } as Record<string, unknown>,
+            { ...redactionContext, field: "adapter config" },
+          );
 
           const desiredSkills = (manifestAgent.skills ?? []).map((skillRef) => desiredSkillRefMap.get(skillRef) ?? skillRef);
           const normalizedAdapter = await prepareImportedAgentAdapter(
@@ -4743,10 +4874,18 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             reportsTo: null,
             adapterType: normalizedAdapter.adapterType,
             adapterConfig: normalizedAdapter.adapterConfig,
-            runtimeConfig: disableImportedTimerHeartbeat(manifestAgent.runtimeConfig),
+            runtimeConfig: disableImportedTimerHeartbeat(
+              withoutRedactedPlaceholders(manifestAgent.runtimeConfig, {
+                ...redactionContext,
+                field: "runtime config",
+              }),
+            ),
             budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
             permissions: manifestAgent.permissions,
-            metadata: manifestAgent.metadata,
+            metadata: withoutRedactedPlaceholders(manifestAgent.metadata, {
+              ...redactionContext,
+              field: "metadata",
+            }),
           };
 
           if (planAgent.action === "update" && planAgent.existingAgentId) {
