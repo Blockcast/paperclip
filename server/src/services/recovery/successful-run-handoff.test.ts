@@ -99,6 +99,9 @@ describe("successful run handoff decision", () => {
     );
     expect(decision.instruction).toContain("Resolve the missing disposition before creating or revising any new artifacts");
     expect(decision.instruction).toContain("Choose **exactly one** outcome");
+    expect(decision.instruction).toContain(
+      "Mark it `done` only after verifying the acceptance criteria against a committed, remotely resolvable artifact",
+    );
     expect(decision.instruction).toContain("record an explicit continuation path");
   });
 
