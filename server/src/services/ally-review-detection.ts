@@ -71,7 +71,14 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
 // syntax and deliberately do not match: those are open findings, not
 // dispositions.
 const PRIOR_FINDING_DISPOSITION_PATTERN =
-  /^[ \t]*-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})\b[^\n*]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)/gim;
+  /^[ \t]*-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)/gim;
+
+// The counted finding buckets a review reports, e.g. `### Important Issues (2)`.
+// Ally numbers findings within a bucket from 1, and its ledger entries name
+// that same (severity, index) pair, so these counts enumerate exactly which
+// finding identities a head raised.
+const COUNTED_FINDINGS_BUCKET_PATTERN =
+  /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
 
 // Only a disposition that asserts the finding is resolved clears it. Ally's
 // other observed verb, `still-present`, asserts the opposite — the sibling
@@ -80,27 +87,71 @@ const PRIOR_FINDING_DISPOSITION_PATTERN =
 // merge before anyone decides it should.
 const RESOLVED_PRIOR_DISPOSITIONS = new Set(["fixed"]);
 
+/** One finding, identified the way Ally's ledger identifies it. */
+export interface AllyFindingRef {
+  severity: string;
+  /** 1-based position within its severity bucket. */
+  index: number;
+}
+
+export interface AllyDispositionedPriorFinding extends AllyFindingRef {
+  /** As written by Ally — abbreviated, so callers must compare by prefix. */
+  shortSha: string;
+}
+
 /**
- * Abbreviated head SHAs this review explicitly reports as resolved.
+ * Prior findings this review explicitly reports as resolved.
  *
  * Ally re-states each earlier finding it has re-examined under a "Prior
  * Findings Dispositioned" heading, naming the head the finding was raised
- * against. That is a direct assertion about a specific prior tree, which is
- * why it can disposition a finding that a merely-clean review of an unrelated
- * head cannot.
+ * against plus its severity and index. That is a direct assertion about a
+ * specific earlier finding, which is why it can disposition one that a merely
+ * clean review of an unrelated head cannot.
  *
- * SHAs are returned exactly as written — Ally abbreviates them, so callers
- * must compare by prefix against the full 40-character head.
+ * Severity and index are carried because a head can raise several findings and
+ * a ledger may retire only some of them.
  */
-export function extractAllyDispositionedPriorHeads(body: string | null | undefined): string[] {
+export function extractAllyDispositionedPriorFindings(
+  body: string | null | undefined,
+): AllyDispositionedPriorFinding[] {
   if (typeof body !== "string") return [];
-  const resolved = new Set<string>();
-  for (const [, shortSha, disposition] of body.matchAll(PRIOR_FINDING_DISPOSITION_PATTERN)) {
-    if (RESOLVED_PRIOR_DISPOSITIONS.has(disposition!.toLowerCase())) {
-      resolved.add(shortSha!.toLowerCase());
+  const resolved: AllyDispositionedPriorFinding[] = [];
+  for (const [, shortSha, severity, index, disposition] of body.matchAll(
+    PRIOR_FINDING_DISPOSITION_PATTERN,
+  )) {
+    if (!RESOLVED_PRIOR_DISPOSITIONS.has(disposition!.toLowerCase())) continue;
+    resolved.push({
+      shortSha: shortSha!.toLowerCase(),
+      severity: severity!.toLowerCase(),
+      index: Number(index),
+    });
+  }
+  return resolved;
+}
+
+/**
+ * The findings a review reports, as the identities Ally's ledger would use, or
+ * `null` when they cannot be enumerated.
+ *
+ * `null` is returned when the body carries no counted bucket at all — its
+ * blocking feedback came from an uncounted heading or from prose such as
+ * `changes requested`, neither of which yields identities a ledger could name.
+ * A caller deciding whether every finding has been retired must treat that as
+ * "unknown", not as "none".
+ */
+export function extractAllyReportedFindingRefs(
+  body: string | null | undefined,
+): AllyFindingRef[] | null {
+  if (typeof body !== "string") return null;
+  const refs: AllyFindingRef[] = [];
+  let sawBucket = false;
+  for (const [, severity, count] of body.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
+    sawBucket = true;
+    for (let index = 1; index <= Number(count); index += 1) {
+      refs.push({ severity: severity!.toLowerCase(), index });
     }
   }
-  return [...resolved];
+  return sawBucket ? refs : null;
 }
 
 /** Return whether a formal or comment-shaped review contains blocking feedback. */

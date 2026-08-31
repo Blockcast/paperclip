@@ -292,6 +292,90 @@ describe("evaluateCommentReviewGate", () => {
     }
   });
 
+  it("keeps a head carried when its ledger retires only some of its findings", () => {
+    // A head can raise several findings, and Ally numbers them within their
+    // severity bucket. Matching the ledger on the head alone would let a single
+    // `fixed` entry clear all of them, dropping an unresolved Important finding
+    // out of a merge gate.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The terminator is missing.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const partialLedger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — the terminator is back.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(partialLedger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
+  });
+
+  it("clears a head once its ledger retires every finding it raised", () => {
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The terminator is missing.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const fullLedger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (2)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — the terminator is back.`,
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — the assertion is back.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(fullLedger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("does not disposition a head whose findings cannot be enumerated", () => {
+    // Blocking feedback from prose rather than a counted bucket yields no
+    // finding identities for a ledger to name, so the head stays carried
+    // rather than being cleared by an unrelated entry.
+    const uncounted = reviewBody(OLD_HEAD, [
+      "### Recommended Action",
+      "Fix the gate before merge.",
+    ]);
+    const ledger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — re-checked.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(uncounted, "2026-08-04T20:09:19Z"),
+        allyComment(ledger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
   it("reports not_evaluated rather than clean when nothing attests the head", () => {
     const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
 
