@@ -19,7 +19,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { scrubResponseBody } from "./response-scrub.js";
+import { scrubResponseBody, stripLeadingBom } from "./response-scrub.js";
 import {
   CredentialCustodyError,
   applyCustodiedAuthorization,
@@ -33,6 +33,7 @@ import {
 } from "./credential-custody.js";
 import {
   buildCredentialHeaders,
+  isToolAllowed,
   loadUpstreams,
   matchUpstream,
   upstreamsPrincipalHash,
@@ -277,12 +278,57 @@ function isSuccess(status: number): boolean {
 
 function parseJsonRpcRequest(bodyText: string): JsonRpcRequest | null {
   try {
-    const parsed = JSON.parse(bodyText) as unknown;
+    // `stripLeadingBom` for the reason it documents: `JSON.parse` rejects a
+    // leading BOM, so without this a BOM-prefixed body reads as unparseable.
+    // That is not only an audit gap (the request logs as its HTTP verb rather
+    // than its JSON-RPC method) — it is a fail-open, because a body we cannot
+    // classify is a body the PEN-2735 tool guard cannot examine.
+    const parsed = JSON.parse(stripLeadingBom(bodyText)) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     return parsed as JsonRpcRequest;
   } catch {
     return null;
   }
+}
+
+/**
+ * The tool named by an inbound `tools/call` that this upstream may not expose,
+ * or `null` if there is nothing to refuse (PEN-2735).
+ *
+ * Enforced on the REQUEST, before the forward, because the response filter can
+ * only remove a tool from a listing — it cannot un-execute a call. Filtering
+ * `tools/list` alone would leave every denied tool advertised-but-absent and
+ * still perfectly callable by name, which is a partial fix that reads as a whole
+ * one.
+ *
+ * Two shapes are checked, not one. `parseJsonRpcRequest` rejects arrays, so a
+ * JSON-RPC *batch* reaches `serveMatched` with `inboundMessage === null` and is
+ * forwarded unexamined — a guard written against the single-object shape alone
+ * would be bypassed by wrapping the same call in `[ ]`. A batch containing any
+ * denied call is refused whole rather than split: partial execution of a batch
+ * is a worse contract than refusing it, and refusing is the fail-closed side.
+ */
+function deniedToolCall(bodyText: string, upstream: UpstreamConfig): string | null {
+  if (!Array.isArray(upstream.tools)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripLeadingBom(bodyText));
+  } catch {
+    // Not JSON, so not a JSON-RPC tools/call. The upstream will reject it on its
+    // own terms; there is no tool name here to authorize.
+    return null;
+  }
+  for (const message of Array.isArray(parsed) ? parsed : [parsed]) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    const record = message as { method?: unknown; params?: unknown };
+    if (record.method !== "tools/call") continue;
+    const params = record.params;
+    const name = params && typeof params === "object" && !Array.isArray(params)
+      ? (params as { name?: unknown }).name
+      : undefined;
+    if (!isToolAllowed(upstream, name)) return typeof name === "string" ? name : "";
+  }
+  return null;
 }
 
 function buildJsonRpcResponse(id: JsonRpcRequest["id"], result: unknown): Buffer {
@@ -606,13 +652,24 @@ function gatewayResult(
  * records, was written directly and reached agents unscrubbed. A second
  * response path is the recurring failure in this module; the test makes
  * adding one fail CI instead of relying on the next author reading this.
+ *
+ * PEN-2735: `upstream` is REQUIRED rather than optional, and that is the whole
+ * design. It carries the tool allowlist to apply to this body, and a required
+ * parameter means a new call site that forgets it is a compile error instead of
+ * a route where filtering silently stops. Pass `null` only where the body is
+ * gateway-built and belongs to no upstream (health, 404, circuit-open, the
+ * error path) — an explicit `null` is a statement a reviewer can check, which an
+ * omitted argument is not.
  */
 function writeResponse(
   res: http.ServerResponse,
   result: ForwardResult,
   exposedClientSessionId: string | null,
+  upstream: UpstreamConfig | null,
 ): void {
-  const body = scrubResponseBody(result.body, result.headers.get("content-type"));
+  const body = scrubResponseBody(result.body, result.headers.get("content-type"), {
+    toolFilter: (toolName) => (upstream ? isToolAllowed(upstream, toolName) : true),
+  });
 
   res.statusCode = result.status;
   for (const [k, v] of result.headers.entries()) {
@@ -654,7 +711,7 @@ async function handleRequest(
       sessions: Object.fromEntries(
         Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.size()]),
       ),
-    })), null);
+    })), null, null);
     return;
   }
 
@@ -669,7 +726,7 @@ async function handleRequest(
       error: "no upstream matched",
       path: pathName,
       knownPrefixes: Object.keys(state.upstreams),
-    })), null);
+    })), null, null);
     return;
   }
   const prefix = (() => {
@@ -708,13 +765,29 @@ async function handleRequest(
     : undefined;
   logMcpRequest(req, requestId, prefix, logMethod, logTool);
 
+  // PEN-2735: refuse a call to a tool this upstream is not permitted to expose,
+  // before it reaches the upstream. Placed after the audit line on purpose — a
+  // refused attempt is exactly the event an audit trail should carry — and
+  // before the breaker, since a call we never forwarded is not evidence about
+  // upstream health either way.
+  const denied = deniedToolCall(bodyText, matched.config);
+  if (denied !== null) {
+    writeResponse(
+      res,
+      gatewayResult(200, buildJsonRpcError(inboundMessage?.id ?? null, -32602, `unknown tool "${denied}"`)),
+      clientSessionId ?? null,
+      null,
+    );
+    return;
+  }
+
   // Circuit breaker: if this upstream has been failing (hung / OOMing /
   // unreachable), fail fast with 503 instead of forwarding into it and
   // accumulating buffered in-flight requests until the gateway OOMs.
   if (!state.breaker.tryAcquire(prefix)) {
     writeResponse(res, gatewayResult(503, JSON.stringify({ error: "upstream circuit open", prefix }), {
       "retry-after": String(Math.ceil(state.upstreamTimeoutMs / 1000)),
-    }), null);
+    }), null, null);
     return;
   }
 
@@ -784,7 +857,7 @@ async function handleAggregateRequest(
   logMcpRequest(req, requestId, logPrefix, logMethod, logTool);
 
   if (!message?.method) {
-    writeResponse(res, gatewayResult(400, JSON.stringify({ error: "invalid JSON-RPC request" })), null);
+    writeResponse(res, gatewayResult(400, JSON.stringify({ error: "invalid JSON-RPC request" })), null, null);
     return;
   }
 
@@ -814,7 +887,7 @@ async function handleAggregateRequest(
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
       serverInfo: { name: "paperclip-mcp-gateway", version: "0.1.0" },
-    })), clientSessionId);
+    })), clientSessionId, null);
     return;
   }
 
@@ -854,6 +927,10 @@ async function handleAggregateRequest(
           if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
           const record = tool as Record<string, unknown>;
           if (typeof record.name !== "string" || record.name.length === 0) continue;
+          // PEN-2735: authorize on the UPSTREAM name, before the `prefix__` is
+          // added — the same question the prefixed route asks of the same
+          // predicate, so the two routes cannot disagree about what is exposed.
+          if (!isToolAllowed(upstream, record.name)) continue;
           tools.push({ ...record, name: `${prefix}__${record.name}` });
         }
       } catch (e) {
@@ -862,7 +939,7 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate tools/list skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }
-    writeResponse(res, gatewayResult(200, buildJsonRpcResponse(message.id, { tools })), clientSessionId);
+    writeResponse(res, gatewayResult(200, buildJsonRpcResponse(message.id, { tools })), clientSessionId, null);
     return;
   }
 
@@ -872,14 +949,20 @@ async function handleAggregateRequest(
     const prefix = separatorIndex > 0 ? toolName.slice(0, separatorIndex) : "";
     const upstreamToolName = separatorIndex > 0 ? toolName.slice(separatorIndex + 2) : "";
     const upstream = prefix ? state.upstreams[prefix] : undefined;
-    if (!upstream || upstreamToolName.length === 0) {
-      writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`)), clientSessionId);
+    // A tool the allowlist denies is reported exactly as a tool that does not
+    // exist. That is not obfuscation for its own sake — it is the truthful
+    // answer, because the same allowlist kept it out of `tools/list`, so from
+    // this client's view it genuinely is not an aggregated tool. Splitting this
+    // into a distinct "forbidden" branch would make the gateway advertise the
+    // existence of what it just refused to expose.
+    if (!upstream || upstreamToolName.length === 0 || !isToolAllowed(upstream, upstreamToolName)) {
+      writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`)), clientSessionId, null);
       return;
     }
     if (!state.breaker.tryAcquire(prefix)) {
       writeResponse(res, gatewayResult(503, JSON.stringify({ error: "upstream circuit open", prefix }), {
         "retry-after": String(Math.ceil(state.upstreamTimeoutMs / 1000)),
-      }), null);
+      }), null, null);
       return;
     }
     state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
@@ -900,16 +983,16 @@ async function handleAggregateRequest(
     );
     if (!result) {
       state.breaker.recordFailure(prefix);
-      writeResponse(res, gatewayResult(502, JSON.stringify({ error: "failed to initialize upstream session", prefix })), null);
+      writeResponse(res, gatewayResult(502, JSON.stringify({ error: "failed to initialize upstream session", prefix })), null, null);
       return;
     }
     if (result.status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
-    writeResponse(res, result, clientSessionId);
+    writeResponse(res, result, clientSessionId, upstream);
     return;
   }
 
-  writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`)), clientSessionId);
+  writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`)), clientSessionId, null);
 }
 
 /**
@@ -956,7 +1039,7 @@ async function serveMatched(
         // Replay path: re-issue the cached initialize, get a fresh upstream id, retry.
         if (!record.initializePayload) {
           // No cached initialize — can't recover. Pass the failure through.
-          writeResponse(res, result, clientSessionId);
+          writeResponse(res, result, clientSessionId, matched.config);
           return result.status;
         }
         const retryResult = await store.runLifecycleExclusive(async () => {
@@ -992,14 +1075,14 @@ async function serveMatched(
           );
         });
         if (retryResult) {
-          writeResponse(res, retryResult, clientSessionId);
+          writeResponse(res, retryResult, clientSessionId, matched.config);
           return retryResult.status;
         }
         // Re-init failed; pass the original 404 through so the client can recover its own way.
-        writeResponse(res, result, clientSessionId);
+        writeResponse(res, result, clientSessionId, matched.config);
         return result.status;
       }
-      writeResponse(res, result, clientSessionId);
+      writeResponse(res, result, clientSessionId, matched.config);
       return result.status;
     }
     // Client supplied a sessionId we don't know — treat as new init below.
@@ -1057,7 +1140,7 @@ async function serveMatched(
       return { result, clientSessionId: record.clientSessionId };
     });
     if (bootstrapResult) {
-      writeResponse(res, bootstrapResult.result, bootstrapResult.clientSessionId);
+      writeResponse(res, bootstrapResult.result, bootstrapResult.clientSessionId, matched.config);
       if (bootstrapResult.result.status === 401 && custodyConfig) {
         invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, bootstrapResult.clientSessionId);
       }
@@ -1080,7 +1163,7 @@ async function serveMatched(
         upstreamSessionId: upstreamId,
         initializePayload: body,
       });
-      writeResponse(res, result, record.clientSessionId);
+      writeResponse(res, result, record.clientSessionId, matched.config);
       await persistSessionStore?.();
       if (result.status === 401 && custodyConfig) {
         invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
@@ -1088,7 +1171,7 @@ async function serveMatched(
       return result.status;
     }
   }
-  writeResponse(res, result, clientSessionId ?? null);
+  writeResponse(res, result, clientSessionId ?? null, matched.config);
   if (result.status === 401 && custodyConfig) {
     invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, nextClientSessionId);
   }
@@ -1121,7 +1204,7 @@ function serveOAuthDiscovery(
       resource: config.resource,
       authorization_servers: [config.authorizationServer],
       bearer_methods_supported: ["header"],
-    })), null);
+    })), null, null);
     return true;
   }
   if (pathName === "/.well-known/oauth-authorization-server" || pathName === "/.well-known/openid-configuration") {
@@ -1183,7 +1266,7 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
       e instanceof CredentialCustodyError ? e.statusCode : isTimeout ? 504 : 502,
       JSON.stringify({ error: isTimeout ? "gateway timeout" : "gateway error", detail: (e as Error).message }),
       e instanceof CredentialCustodyError && e.retryAfter ? { "retry-after": e.retryAfter } : {},
-    ), null);
+    ), null, null);
   } else {
     res.end();
   }

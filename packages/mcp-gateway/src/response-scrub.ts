@@ -1317,20 +1317,117 @@ function scrubTextTracked(text: string, ctx: ScrubContext): string {
  * entry point. The per-string filter inside the walk sees decoded strings and is
  * sound, so that is where the cheap check belongs.
  */
-export function scrubResponseBody(body: Buffer, contentType?: string | null): Buffer {
+export function scrubResponseBody(
+  body: Buffer,
+  contentType?: string | null,
+  options?: ResponseScrubOptions,
+): Buffer {
+  const toolFilter = options?.toolFilter;
+  const transform = toolFilter
+    ? composeDocumentTransforms(toolListFilterTransform(toolFilter), scrubDocument)
+    : scrubDocument;
+  return transformResponseBody(body, contentType, transform);
+}
+
+export interface ResponseScrubOptions {
+  /**
+   * Drop `result.tools[]` entries whose *upstream* tool name this rejects
+   * (PEN-2735). Applied in the same pass as the redaction, on the same parsed
+   * document — see `transformResponseBody`.
+   */
+  toolFilter?: (upstreamToolName: unknown) => boolean;
+}
+
+/**
+ * A rewrite applied to one parsed JSON-RPC document from a response body.
+ *
+ * Set `ctx.changed` when the returned document differs from its input;
+ * `transformResponseBody` uses that flag to decide between re-serializing and
+ * handing back the original bytes.
+ */
+type ResponseDocumentTransform = (document: unknown, ctx: ScrubContext) => unknown;
+
+/** The redaction pass. Not optional at any entry point — see `scrubResponseBody`. */
+const scrubDocument: ResponseDocumentTransform = (document, ctx) =>
+  scrubJsonValueTracked(document, ctx, false, false);
+
+/** Compose transforms into one, applied left to right, over a single parse. */
+function composeDocumentTransforms(...transforms: ResponseDocumentTransform[]): ResponseDocumentTransform {
+  return (document, ctx) => transforms.reduce((node, transform) => transform(node, ctx), document);
+}
+
+/**
+ * Drop the `result.tools[]` entries an upstream is not permitted to expose.
+ *
+ * Filtering by rewriting the parsed document — rather than by intercepting the
+ * one code path that happens to build a tool list — is what makes this reach the
+ * *prefixed* route (`/<prefix>/mcp`), where the reply is the upstream's own and
+ * the gateway never assembles anything. That route is the one the agent seed
+ * actually dials, and a filter written only against the aggregate assembly would
+ * have left it open while reading as done.
+ *
+ * `allow` is asked about the upstream name verbatim; the aggregate endpoint adds
+ * its `prefix__` only after filtering, so both routes ask the same question.
+ */
+function toolListFilterTransform(
+  allow: (upstreamToolName: unknown) => boolean,
+): ResponseDocumentTransform {
+  return (document, ctx) => {
+    if (!document || typeof document !== "object" || Array.isArray(document)) return document;
+    const result = (document as { result?: unknown }).result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) return document;
+    const tools = (result as { tools?: unknown }).tools;
+    if (!Array.isArray(tools)) return document;
+
+    const kept = tools.filter((tool) => {
+      // A record with no usable name is not a tool we can authorize, and the
+      // permitted set is an allowlist: drop it rather than pass it through.
+      const name = tool && typeof tool === "object" && !Array.isArray(tool)
+        ? (tool as { name?: unknown }).name
+        : undefined;
+      return allow(name);
+    });
+    if (kept.length === tools.length) return document;
+
+    ctx.changed = true;
+    return { ...(document as object), result: { ...(result as object), tools: kept } };
+  };
+}
+
+/**
+ * Apply `transform` to every JSON-RPC document in a response body, whatever
+ * framing carries it.
+ *
+ * PEN-2735: this is deliberately not exported. Adding a *second* kind of
+ * response rewrite must not add a second answer to "where does a document
+ * begin". Every fail-open this file records — the BOM-prefixed JSON body, the
+ * CR-only event stream, the stream opening on `id:` — was a classifier that had
+ * drifted from its peer, and the fix each time was to share the definition
+ * rather than teach both copies. A tool-allowlist filter that re-sniffed the
+ * body would have rebuilt exactly that shape one release after it was closed.
+ * New rewrites belong here as a `ResponseDocumentTransform`, reached through
+ * `scrubResponseBody`, whose redaction arm cannot be opted out of.
+ */
+function transformResponseBody(
+  body: Buffer,
+  contentType: string | null | undefined,
+  transform: ResponseDocumentTransform,
+): Buffer {
   const isSse = (contentType ?? "").includes("text/event-stream") || startsWithSseField(body);
   if (!isSse && !startsWithJsonPunctuation(body)) return body;
 
   const text = body.toString("utf8");
   const ctx: ScrubContext = { changed: false };
-  const scrubbed = isSse ? scrubSseFrames(text, ctx) : scrubJsonRpcBody(text, ctx);
+  const rewritten = isSse
+    ? transformSseFrames(text, ctx, transform)
+    : transformJsonRpcBody(text, ctx, transform);
 
   // Returning the original Buffer — not a re-serialized equal-looking one — is
   // what keeps pass-through byte-exact. `JSON.parse`/`JSON.stringify` is lossy
   // for integers above 2^53 and normalizes `1.0` to `1`, and this gateway also
   // proxies GitHub and Paperclip bodies that legitimately mention `env:`.
-  if (scrubbed === null || !ctx.changed) return body;
-  return Buffer.from(scrubbed, "utf8");
+  if (rewritten === null || !ctx.changed) return body;
+  return Buffer.from(rewritten, "utf8");
 }
 
 /**
@@ -1379,7 +1476,7 @@ function startsWithJsonPunctuation(body: Buffer): boolean {
  * through unscrubbed.
  *
  * Widening this is safe in the other direction. A non-SSE body that happens to
- * open on one of these tokens still has no `data:` lines for `scrubSseFrames`
+ * open on one of these tokens still has no `data:` lines for `transformSseFrames`
  * to rewrite, so it comes back unchanged and `ctx.changed` stays false — which
  * returns the original Buffer byte-for-byte.
  */
@@ -1412,6 +1509,13 @@ function startsWithSseField(body: Buffer): boolean {
  * functions, but each representation gets exactly *one* — the failure this file
  * keeps re-learning is a second private copy, not a second representation.
  *
+ * Exported because the same rule has to hold on the REQUEST side (PEN-2735:
+ * deciding whether an inbound body is a `tools/call` for a denied tool). A
+ * request parser that did not strip the BOM would read a BOM-prefixed body as
+ * unparseable and forward it unexamined — the mirror image, one direction over,
+ * of the response fail-open documented below. Keeping one definition for both
+ * directions is what stops that from being rediscovered as a new door.
+ *
  * `JSON.parse` tolerates leading whitespace but rejects a leading BOM, while
  * both of our JSON *detectors* accept one (`significantByteOffset` skips it
  * explicitly; `String.prototype.trimStart` treats U+FEFF as whitespace per
@@ -1424,7 +1528,7 @@ function startsWithSseField(body: Buffer): boolean {
  * that pass a body through unchanged must return their *original* string or
  * Buffer, not this one, to stay byte-exact.
  */
-function stripLeadingBom(text: string): string {
+export function stripLeadingBom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
@@ -1432,15 +1536,19 @@ function stripLeadingBom(text: string): string {
  * Teaching only the *sniff* about BOMs would have moved this fail-open one step
  * down rather than closing it — the body would classify as JSON and then fail to
  * parse, and a `null` return sends it through unscrubbed exactly as before. That
- * is the same half-fix `scrubSseFrames` documents for its own framing regex:
+ * is the same half-fix `transformSseFrames` documents for its own framing regex:
  * detection and parsing have to agree about where a body begins.
  *
  * A body we did not change is returned as the original Buffer by
  * `scrubResponseBody` and keeps its BOM.
  */
-function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
+function transformJsonRpcBody(
+  text: string,
+  ctx: ScrubContext,
+  transform: ResponseDocumentTransform,
+): string | null {
   try {
-    return JSON.stringify(scrubJsonValueTracked(JSON.parse(stripLeadingBom(text)), ctx, false, false));
+    return JSON.stringify(transform(JSON.parse(stripLeadingBom(text)), ctx));
   } catch {
     return null;
   }
@@ -1477,15 +1585,19 @@ function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
  */
 const SSE_DATA_FIELD = /^[﻿\s]*data:/;
 
-function scrubSseFrames(text: string, ctx: ScrubContext): string {
+function transformSseFrames(
+  text: string,
+  ctx: ScrubContext,
+  transform: ResponseDocumentTransform,
+): string {
   const out: string[] = [];
   let pending: string[] = [];
 
   const flush = (): void => {
     if (pending.length === 0) return;
     const joined = pending.join("");
-    const scrubbed = scrubJsonRpcBody(joined, ctx);
-    out.push(`data: ${scrubbed ?? joined}`);
+    const rewritten = transformJsonRpcBody(joined, ctx, transform);
+    out.push(`data: ${rewritten ?? joined}`);
     pending = [];
   };
 

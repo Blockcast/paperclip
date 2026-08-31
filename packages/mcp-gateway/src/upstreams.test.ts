@@ -6,6 +6,7 @@ import {
   buildCredentialHeaders,
   loadUpstreams,
   matchUpstream,
+  isToolAllowed,
   parseUpstreamMap,
   upstreamsPrincipalHash,
 } from "./upstreams.js";
@@ -367,5 +368,77 @@ describe("loadUpstreams", () => {
     expect(map.github.execution).toBe("tenant_node");
     expect(map.github.url).toBe("https://penstock.example/v1/mcp/apps/github/mcp");
     expect(map.github.relayAuthorization).toBe("Bearer tenant-token");
+  });
+});
+
+/**
+ * PEN-2735: the tool allowlist is the gateway's GRANT axis — which tools an
+ * upstream may expose at all, as distinct from PEN-2370's response-content axis.
+ * `isToolAllowed` is the single predicate every enforcement point asks, so these
+ * pin its edges directly rather than only through the proxy.
+ */
+describe("upstream tool allowlist", () => {
+  const withTools = (tools: unknown): ReturnType<typeof parseUpstreamMap> =>
+    parseUpstreamMap(JSON.stringify({ prometheus: { url: "http://p:9090/mcp", tools } }), "test");
+
+  it("parses a list of tool names off an upstream's metadata", () => {
+    expect(withTools(["execute_query", "list_metrics"]).prometheus.tools).toEqual([
+      "execute_query",
+      "list_metrics",
+    ]);
+  });
+
+  it("rejects a non-array tools field rather than ignoring it", () => {
+    // Silently ignoring a malformed allowlist is the fail-open: the operator
+    // believes the grant is scoped and every tool stays exposed.
+    expect(() => withTools("execute_query")).toThrow(/tools must be an array/);
+    expect(() => withTools({ execute_query: true })).toThrow(/tools must be an array/);
+  });
+
+  it("rejects non-string and empty entries", () => {
+    expect(() => withTools(["execute_query", 7])).toThrow(/non-empty strings/);
+    expect(() => withTools([""])).toThrow(/non-empty strings/);
+  });
+
+  it("leaves tools undefined when the upstream declares none", () => {
+    const map = parseUpstreamMap('{"prometheus":"http://p:9090/mcp"}', "test");
+    expect(map.prometheus.tools).toBeUndefined();
+  });
+
+  it("allows everything when no allowlist is declared", () => {
+    const config = parseUpstreamMap('{"prometheus":"http://p:9090/mcp"}', "test").prometheus;
+    expect(isToolAllowed(config, "get_targets")).toBe(true);
+    expect(isToolAllowed(config, "anything_at_all")).toBe(true);
+  });
+
+  it("admits only listed names once an allowlist exists", () => {
+    const config = withTools(["execute_query"]).prometheus;
+    expect(isToolAllowed(config, "execute_query")).toBe(true);
+    expect(isToolAllowed(config, "get_targets")).toBe(false);
+  });
+
+  it("matches exactly, with no prefix, case, or substring latitude", () => {
+    // The aggregate endpoint adds `prometheus__` only AFTER authorizing, so the
+    // predicate must never see or accept a prefixed name. A substring or
+    // case-insensitive match would turn the allowlist into a pattern language
+    // whose blast radius nobody reviewed.
+    const config = withTools(["execute_query"]).prometheus;
+    expect(isToolAllowed(config, "prometheus__execute_query")).toBe(false);
+    expect(isToolAllowed(config, "Execute_Query")).toBe(false);
+    expect(isToolAllowed(config, "execute_quer")).toBe(false);
+    expect(isToolAllowed(config, "execute_query_extra")).toBe(false);
+  });
+
+  it("denies a malformed name so a bad request is not the way past the guard", () => {
+    const config = withTools(["execute_query"]).prometheus;
+    for (const name of [undefined, null, "", 42, {}, ["execute_query"]]) {
+      expect(isToolAllowed(config, name), String(name)).toBe(false);
+    }
+  });
+
+  it("treats an empty allowlist as deny-all, not as unrestricted", () => {
+    const config = withTools([]).prometheus;
+    expect(config.tools).toEqual([]);
+    expect(isToolAllowed(config, "execute_query")).toBe(false);
   });
 });
