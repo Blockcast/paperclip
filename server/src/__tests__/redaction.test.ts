@@ -782,6 +782,48 @@ describe("redactAgentConfigPayload", () => {
     ]);
   });
 
+  it("withholds non-object agent-config values, which the payload schema permits (PEN-2777)", () => {
+    // `approvalPayloadSchema` is a `.catchall(z.unknown())` and
+    // `normalizeHireApprovalPayloadForPersistence` only normalizes a record, so
+    // `POST /companies/:companyId/approvals` can persist any shape under these
+    // keys. An array of configs and a JSON-encoded string both carry the
+    // upstream topology, so letting the shape decide entitlement would reopen
+    // the hole through the generic create route.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload("hire_agent", {
+      name: "Worker",
+      adapterConfig: [{ mcpServers: { k8s: { url: upstream } } }],
+      runtimeConfig: JSON.stringify({ mcpServers: { k8s: { url: upstream } } }),
+      requestedConfigurationSnapshot: { adapterConfig: [{ mcpServers: { k8s: { url: upstream } } }] },
+    });
+
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      name: "Worker",
+      adapterConfig: {},
+      runtimeConfig: {},
+      requestedConfigurationSnapshot: { adapterConfig: {} },
+    });
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+  });
+
+  it("keeps an absent agent config readable rather than reporting it withheld (PEN-2777)", () => {
+    // `null` carries no topology, and blanking it would make the board queue
+    // unable to tell "you may not see this" from "no config was requested".
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload("hire_agent", {
+      name: "Worker",
+      adapterConfig: null,
+      runtimeConfig: undefined,
+    });
+
+    expect(withheld).toEqual({ name: "Worker", adapterConfig: null, runtimeConfig: undefined });
+    expect(withheldFields).toEqual([]);
+  });
+
   it("leaves non-hire approval payloads untouched when withholding agent config", () => {
     const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
     const { payload: untouched, withheldFields } = withholdAgentConfigFromApprovalPayload(
