@@ -10,6 +10,7 @@ import { z } from "zod";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
@@ -100,6 +101,7 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
+import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
@@ -2680,6 +2682,37 @@ export function agentRoutes(
         );
       },
     }));
+  });
+
+  // PEN-2756: a recovery action names an OWNER agent and a `nextAction` addressed
+  // to that owner, so it is a real assigned obligation — but every agent-facing
+  // surface for it is keyed by ISSUE, not by owner. `inbox-lite` does carry
+  // `activeRecoveryAction`, yet only for rows the agent is the ASSIGNEE of, and a
+  // beacon routinely lands on a row assigned to someone else (escalation reassigns
+  // away from the stranded agent). The owner's sweep therefore reads clean while
+  // the obligation is live, and the only way to find it was to scan every issue in
+  // the company.
+  //
+  // The owner-filtered query already existed (`recoveryObservability.listActions`)
+  // but only behind the company-wide dashboard route, which has no self-scoping and
+  // requires the caller to already know its own agent id. This is that same query,
+  // self-scoped from the authenticated actor — deliberately a SIBLING of
+  // `inbox-lite` rather than extra rows inside it, because inbox-lite rows are
+  // offered work that consumers check out, and these rows are someone else's issue.
+  router.get("/agents/me/recovery-actions", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+
+    const query = agentMeRecoveryActionsQuerySchema.parse(req.query);
+    const actions = await recoveryObservabilityService(db).listActions(req.actor.companyId, {
+      ownerAgentId: req.actor.agentId,
+      status: query.status,
+      kind: query.kind,
+      limit: query.limit,
+    });
+    res.json(actions);
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {

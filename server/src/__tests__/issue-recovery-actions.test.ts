@@ -31,6 +31,7 @@ import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
+import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { loadConfig } from "../config.js";
 import {
@@ -4394,6 +4395,188 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       nextAction: "Repair the worktree, then return the issue to the coder.",
       routingFallbackReason: null,
     });
+  });
+
+  it("lets a beacon owner enumerate obligations on rows assigned to someone else (PEN-2756)", async () => {
+    // The dark case, precisely. A beacon names an OWNER and a `nextAction` addressed
+    // to that owner, but escalation reassigns the row AWAY from the stranded agent, so
+    // the beacon routinely lands on an issue the owner is not the assignee of.
+    // `inbox-lite` does carry `activeRecoveryAction` — but it is keyed by the issues
+    // the agent is ASSIGNEE of, so this row can never appear there and the owner's
+    // sweep reads clean while the obligation is live.
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:owner-surface:fingerprint",
+      evidence: {},
+      nextAction: "Re-home the stranded issue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // Precondition: the row belongs to the coder, not to the beacon owner. Without
+    // this the test would pass for the wrong reason (owner == assignee).
+    const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(row!.assigneeAgentId).toBe(coderId);
+    expect(row!.assigneeAgentId).not.toBe(managerId);
+
+    // Owner-scoped enumeration: one query keyed on ownerAgentId, no full-table scan.
+    const owned = await recoveryObservabilityService(db).listActions(companyId, {
+      ownerAgentId: managerId,
+      status: "active,escalated",
+    });
+    expect(owned).toHaveLength(1);
+    expect(owned[0]).toMatchObject({
+      sourceIssueId,
+      ownerAgentId: managerId,
+      kind: "stranded_assigned_issue",
+    });
+    // It carries the addressed obligation and the bound, so the owner can triage
+    // from the list without opening each row.
+    expect(owned[0]!.nextAction).toBe("Re-home the stranded issue.");
+
+    // And it is genuinely owner-scoped: the coder holds no beacons.
+    expect(
+      await recoveryObservabilityService(db).listActions(companyId, {
+        ownerAgentId: coderId,
+        status: "active,escalated",
+      }),
+    ).toHaveLength(0);
+  });
+
+  it("bounds a pr_review_non_convergence beacon that wakes an owner (PEN-2756)", async () => {
+    // The rule this restores: a shape that WAKES AN OWNER is bounded; the
+    // monitor-only and manual-repair shapes are not, because they wake nobody.
+    // This path wakes an owner and yet minted `maxAttempts: null` with no
+    // `timeoutAt`, which put it outside every bound in the system at once:
+    // `strandedRecoveryWakeAttemptsExhausted` short-circuits on a null budget
+    // before it reads the horizon, and `escalateExpiredWakeHorizons` — the only
+    // sweep that retires a spent action — requires BOTH columns to be non-null.
+    // So the beacon could not expire, exhaust, or be retired. Observed on PEN-2190
+    // (active 5 days; its PR merged 4h11m after the beacon fired).
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup } as any);
+
+    const result = await recovery.escalateStalledSelfReviewPr({
+      issueId: sourceIssueId,
+      prNumber: 1196,
+      repoFullName: "Blockcast/paperclip",
+      cycleCount: 4,
+    });
+
+    expect(result.ownerType).toBe("agent");
+    expect(result.ownerAgentId).not.toBeNull();
+    expect(result.ownerAgentId).not.toBe(coderId);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(action!.kind).toBe("pr_review_non_convergence");
+    // Both columns, not just one: either being null re-opens the immortality.
+    expect(action!.maxAttempts).not.toBeNull();
+    expect(action!.timeoutAt).not.toBeNull();
+    expect(new Date(action!.timeoutAt as unknown as string).getTime()).toBeGreaterThan(Date.now());
+    // The bound must not cost the first wake — it retires the beacon later, it
+    // does not suppress the escalation it exists to deliver.
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a beacon on an in_progress row without writing a status (PEN-2756)", async () => {
+    // The row seeded here is `in_progress` and assigned to the coder — the exact
+    // shape 4 of the 6 beacons found in the fleet census sat on. `in_progress` is
+    // not in the `sourceIssueStatus` enum, so every resolution available before
+    // this asserted something false about the row: `todo`/`done` contradict a live
+    // run, `blocked` invents a gate, `in_review` drops the row out of inbox-lite.
+    // The cheapest correct action was therefore to leave the beacon active, which
+    // is what made them accumulate.
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "pr_review_non_convergence",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "self_review_pr_non_convergence",
+      fingerprint: "pr-review-non-convergence:fingerprint",
+      evidence: { prNumber: 1196 },
+      nextAction: "Take over the PR or record a disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        resolutionNote: "PR merged 4h11m after the beacon fired; the run is still live.",
+      })
+      .expect(200);
+
+    // The beacon is gone and NOTHING else moved: not the status, not the assignee.
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "restored",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(row!.status).toBe("in_progress");
+    expect(row!.assigneeAgentId).toBe(coderId);
+  });
+
+  it("clears a beacon on a board-approved backlog park without un-parking it (PEN-2756)", async () => {
+    // PEN-989 was strictly undisposable: every enum value moved a board-approved
+    // PARK back out of `backlog` and into recovery/stall scope — recreating the
+    // re-checkout loop the park existed to break. Omitting the status is the only
+    // disposal that does not undo the park.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "backlog", assigneeAgentId: null })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:parked:fingerprint",
+      evidence: {},
+      nextAction: "Re-home the stranded issue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        resolutionNote: "Board-approved park; beacon retired without disturbing the park.",
+      })
+      .expect(200);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(row!.status).toBe("backlog");
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
   it("resolves an active recovery action and removes it from active projections", async () => {

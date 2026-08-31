@@ -560,8 +560,14 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           // preserving it would exhaust the new owner on its first wake — the deadlock this
           // ticket exists to fix, reintroduced through the back door. So on
           // unbounded -> bounded, adopt the fresh wake horizon; thereafter never rewrite it.
-          // Staying unbounded still preserves, which keeps the quota `retryAt` intact and the
-          // `pr_review_non_convergence` caller (also `maxAttempts: null`) unaffected.
+          // Staying unbounded still preserves, which keeps the quota `retryAt` intact.
+          //
+          // PEN-2756: this used to also name `pr_review_non_convergence` as an unbounded
+          // caller. It is bounded at creation now (it wakes an owner, so the same rule that
+          // bounds every other waking shape applies), which means it reaches the
+          // unbounded -> bounded arm above on its first sweep after rollout, exactly like the
+          // ROLLOUT NOTE describes. Only the ownerless board-escalation variant of that kind
+          // stays unbounded, and that one wakes nobody.
           timeoutAt: inputMaxAttempts !== null
             ? (wakeHorizonAt ?? input.timeoutAt ?? null)
             : (existingTimeoutAt ?? input.timeoutAt ?? null),
