@@ -465,7 +465,8 @@ async function findOpenDriftIssue(db: Db, companyId: string, approvalId: string)
  * always hands back a `Date` and `toTimestampParam` always re-serializes at
  * millisecond precision. The keyset is still exact, but for a narrower reason
  * than "the round-trip is avoided" — every write to `decided_at` is a JS `Date`
- * (the decide path in `approvals.ts`) and the column carries no `now()` default,
+ * every `decidedAt:` write in `approvals.ts` binds a JS `Date`, and the column
+ * carries no `now()` default,
  * so the stored values have no sub-millisecond component for that round-trip to
  * lose.
  *

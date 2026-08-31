@@ -256,10 +256,12 @@ describe("parseJsonBodyStrict — SPA catch-all guard", () => {
 describe("isApprovalEnforcementDriftConflict", () => {
   it("recognizes the dedup constraint when Postgres wraps it as a cause", () => {
     const wrapped = new Error("reconciliation insert failed", {
-      cause: {
-        code: "23505",
-        constraint_name: "issues_active_approval_enforcement_drift_uq",
-      },
+      cause: new Error("database operation failed", {
+        cause: {
+          code: "23505",
+          constraint_name: "issues_active_approval_enforcement_drift_uq",
+        },
+      }),
     });
 
     expect(isApprovalEnforcementDriftConflict(wrapped)).toBe(true);
