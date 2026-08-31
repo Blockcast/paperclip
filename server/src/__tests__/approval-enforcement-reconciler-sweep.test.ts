@@ -390,6 +390,29 @@ describeEmbeddedPostgres("reconcileApprovalEnforcement", () => {
     expect(second.length).toBeGreaterThan(0);
   });
 
+  it("scans the tail beyond the former iteration ceiling", async () => {
+    // With batchSize 2, the old 50-iteration cap stopped after 100 cards.
+    // Keep the oldest card drifted so a capped sweep is observably incomplete.
+    const base = Date.now() - 24 * 60 * 60 * 1000;
+    let oldest: { companyId: string; approvalId: string } | undefined;
+    for (let i = 0; i < 101; i += 1) {
+      const card = await seed({
+        enforcedCents: i === 0 ? PRE_APPROVAL_CENTS : DECIDED_CENTS,
+        decidedAt: new Date(base + i * 60_000),
+        issuePrefix: `TAIL${i}`,
+      });
+      if (i === 0) oldest = card;
+    }
+
+    const result = await reconcileApprovalEnforcement(db, { batchSize: 2 });
+
+    expect(result.scanned).toBe(101);
+    expect(result.drifted).toBe(1);
+    expect(result.raised).toBe(1);
+    expect(oldest).toBeDefined();
+    expect(await driftIssuesFor(oldest!.companyId, oldest!.approvalId)).toHaveLength(1);
+  });
+
   it("handles the canonical declared assertion shape end to end", async () => {
     const { companyId, approvalId } = await seed({
       enforcedCents: PRE_APPROVAL_CENTS,

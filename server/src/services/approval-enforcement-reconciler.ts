@@ -85,9 +85,6 @@ export function isApprovalEnforcementDriftConflict(error: unknown): boolean {
 /** Approvals scanned per batch. */
 const RECONCILE_BATCH_SIZE = 200;
 
-/** Batches per sweep — backstop against an unbounded loop. */
-const MAX_ITERATIONS = 50;
-
 /**
  * How long after `decidedAt` a decision is expected to have reached the
  * enforcing object. Below this, disagreement is "not applied *yet*" rather than
@@ -572,14 +569,12 @@ export async function reconcileApprovalEnforcement(
   db: Db,
   options: {
     batchSize?: number;
-    maxIterations?: number;
     graceHours?: number;
     now?: Date;
     logger?: typeof defaultLogger;
   } = {},
 ): Promise<ApprovalEnforcementReconcileResult> {
   const batchSize = Math.max(1, options.batchSize ?? RECONCILE_BATCH_SIZE);
-  const maxIterations = Math.max(1, options.maxIterations ?? MAX_ITERATIONS);
   const graceHours = Math.max(0, options.graceHours ?? DEFAULT_GRACE_HOURS);
   const now = options.now ?? new Date();
   const log = options.logger ?? defaultLogger;
@@ -592,7 +587,7 @@ export async function reconcileApprovalEnforcement(
   let iterations = 0;
   let cursor: ApprovalCursor | null = null;
 
-  while (iterations < maxIterations) {
+  while (true) {
     const candidates = await listCandidateApprovals(db, cutoff, batchSize, cursor);
     iterations += 1;
     if (candidates.length === 0) break;
@@ -725,7 +720,7 @@ export async function reconcileApprovalEnforcement(
 export function startApprovalEnforcementReconciler(
   db: Db,
   intervalMs: number,
-  options: { batchSize?: number; maxIterations?: number; graceHours?: number } = {},
+  options: { batchSize?: number; graceHours?: number } = {},
   scheduler: ApprovalEnforcementReconcilerScheduler = defaultScheduler,
 ): () => void {
   let inFlight: Promise<void> | null = null;
