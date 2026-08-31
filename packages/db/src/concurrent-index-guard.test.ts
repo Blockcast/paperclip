@@ -15,6 +15,7 @@ import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
 import {
   ensurePendingConcurrentIndexes,
+  PENDING_CONCURRENT_INDEXES,
   SERIALIZING_LOCK_KEY,
   type ConcurrentIndexSpec,
 } from "./concurrent-index-guard.js";
@@ -27,6 +28,9 @@ const INDEX_NAME = "heartbeat_runs_crash_recovery_pending_idx";
 const INDEX_DEFINITION =
   "ON heartbeat_runs USING btree (finished_at, id) "
   + "WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL";
+const CRASH_RECOVERY_SPEC = PENDING_CONCURRENT_INDEXES.find(
+  (spec) => spec.migration === "0226_heartbeat_runs_crash_recovery_index.sql",
+)!;
 
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -63,10 +67,17 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
   it("builds the deferred index migration 0226 leaves absent on a populated table", async () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
 
-    const results = await ensurePendingConcurrentIndexes(database.connectionString);
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     expect(results).toEqual([
-      { name: INDEX_NAME, table: "heartbeat_runs", action: "created" },
+      {
+        migration: CRASH_RECOVERY_SPEC.migration,
+        name: INDEX_NAME,
+        table: "heartbeat_runs",
+        action: "created",
+      },
     ]);
     const [{ indisvalid }] = await sql<{ indisvalid: boolean }[]>`
       select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
@@ -78,10 +89,17 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
     await sql.unsafe(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME} ${INDEX_DEFINITION}`);
 
-    const results = await ensurePendingConcurrentIndexes(database.connectionString);
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     expect(results).toEqual([
-      { name: INDEX_NAME, table: "heartbeat_runs", action: "already-valid" },
+      {
+        migration: CRASH_RECOVERY_SPEC.migration,
+        name: INDEX_NAME,
+        table: "heartbeat_runs",
+        action: "already-valid",
+      },
     ]);
   }, 60_000);
 
@@ -93,10 +111,17 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await sql.unsafe(`CREATE INDEX CONCURRENTLY ${INDEX_NAME} ${INDEX_DEFINITION}`);
     await sql.unsafe(`UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = '${INDEX_NAME}'::regclass`);
 
-    const results = await ensurePendingConcurrentIndexes(database.connectionString);
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     expect(results).toEqual([
-      { name: INDEX_NAME, table: "heartbeat_runs", action: "rebuilt" },
+      {
+        migration: CRASH_RECOVERY_SPEC.migration,
+        name: INDEX_NAME,
+        table: "heartbeat_runs",
+        action: "rebuilt",
+      },
     ]);
     const [{ indisvalid }] = await sql<{ indisvalid: boolean }[]>`
       select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
@@ -107,12 +132,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
   it("throws — rather than reporting success — when the online build does not leave a valid index", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
     const brokenSpec: ConcurrentIndexSpec = {
-      migration: "0226_heartbeat_runs_crash_recovery_index.sql",
-      name: INDEX_NAME,
-      table: "heartbeat_runs",
-      accessMethod: "btree",
-      keyColumns: ["finished_at", "id"],
-      predicate: "error_code = 'worker_crashed'::text AND crash_recovery_completed_at IS NULL",
+      ...CRASH_RECOVERY_SPEC,
       // References a column that does not exist, so the build itself fails
       // and this must surface as a thrown error, not a silently-empty result.
       createStatement:
@@ -138,7 +158,9 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
         "WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
     );
 
-    await expect(ensurePendingConcurrentIndexes(database.connectionString)).rejects.toThrow(
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, { specs: [CRASH_RECOVERY_SPEC] }),
+    ).rejects.toThrow(
       /does not match migration 0226_heartbeat_runs_crash_recovery_index\.sql's definition/,
     );
 
@@ -167,7 +189,9 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     cleanups.push(async () => holder.end());
     await holder.unsafe(`select pg_advisory_lock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0))`);
 
-    const second = ensurePendingConcurrentIndexes(database.connectionString);
+    const second = ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     // While the holder keeps the lock, the second caller must not resolve --
     // race it against a short timer and confirm the timer wins.
@@ -181,6 +205,11 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await holder.unsafe(`select pg_advisory_unlock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0))`);
 
     const results = await second;
-    expect(results).toEqual([{ name: INDEX_NAME, table: "heartbeat_runs", action: "created" }]);
+    expect(results).toEqual([{
+      migration: CRASH_RECOVERY_SPEC.migration,
+      name: INDEX_NAME,
+      table: "heartbeat_runs",
+      action: "created",
+    }]);
   }, 60_000);
 });

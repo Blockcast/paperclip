@@ -1333,7 +1333,7 @@ async function seedWorktreeDatabase(input: {
       connectionString: targetConnectionString,
       backupFile: backup.backupFile,
     });
-    await applyPendingMigrations(targetConnectionString);
+    await applyPendingMigrations(targetConnectionString, { prepareOnlineIndexes: true });
     const executionQuarantine = input.preserveLiveWork
       ? { ...EMPTY_SEEDED_WORKTREE_EXECUTION_QUARANTINE_SUMMARY }
       : await quarantineSeededWorktreeExecutionState(targetConnectionString);
