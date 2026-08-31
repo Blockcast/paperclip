@@ -1915,7 +1915,11 @@ function withoutRedactedPlaceholders<T>(
       `Agent ${context.agentSlug} ${context.field} was imported without redacted values at ${found.join(", ")}; supply them before the agent runs.`,
     );
   }
-  return (cleaned === undefined ? value : cleaned) as T;
+  // `undefined` means the root itself was the placeholder. Unreachable from the
+  // call sites (all pass a record or null), but resolve it to null rather than
+  // back to `value` — falling back to the input here would reinstate the very
+  // placeholder this function exists to remove.
+  return (cleaned === undefined ? null : cleaned) as T;
 }
 
 function isAbsoluteCommand(value: string) {
