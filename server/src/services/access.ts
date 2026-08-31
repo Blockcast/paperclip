@@ -1,4 +1,4 @@
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companyMemberships,
@@ -499,6 +499,31 @@ export function accessService(db: Db) {
             throw conflict("Cannot remove the last active owner");
           }
         }
+      }
+      const archivedCompanyIds = toArchive.map((row) => row.companyId);
+      const assignedIssues = archivedCompanyIds.length > 0
+        ? await tx
+            .select()
+            .from(issues)
+            .where(
+              and(
+                eq(issues.assigneeUserId, userId),
+                isNotNull(issues.monitorNextCheckAt),
+                sql`${issues.status} not in ('done', 'cancelled')`,
+                inArray(issues.companyId, archivedCompanyIds),
+              ),
+            )
+        : [];
+      for (const issue of assignedIssues) {
+        const monitorPatch = buildIssueMonitorEligibilityPatch(issue);
+        if (Object.keys(monitorPatch).length === 0) continue;
+        await tx.update(issues).set({ ...monitorPatch, updatedAt: new Date() }).where(and(
+          eq(issues.id, issue.id),
+          eq(issues.assigneeUserId, userId),
+          issue.monitorNextCheckAt
+            ? eq(issues.monitorNextCheckAt, issue.monitorNextCheckAt)
+            : sql`${issues.monitorNextCheckAt} is null`,
+        ));
       }
       if (toArchive.length > 0) {
         await tx
