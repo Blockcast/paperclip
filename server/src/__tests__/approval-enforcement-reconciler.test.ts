@@ -20,6 +20,7 @@ import {
   BUDGET_POLICY_AMOUNT_ASSERTION,
   diffEnforcementAssertions,
   extractEnforcementAssertions,
+  isApprovalEnforcementDriftConflict,
   parseJsonBodyStrict,
   type EnforcedBudgetPolicy,
 } from "../services/approval-enforcement-reconciler.ts";
@@ -249,5 +250,18 @@ describe("parseJsonBodyStrict — SPA catch-all guard", () => {
       ok: false,
       reason: "http_404",
     });
+  });
+});
+
+describe("isApprovalEnforcementDriftConflict", () => {
+  it("recognizes the dedup constraint when Postgres wraps it as a cause", () => {
+    const wrapped = new Error("reconciliation insert failed", {
+      cause: {
+        code: "23505",
+        constraint_name: "issues_active_approval_enforcement_drift_uq",
+      },
+    });
+
+    expect(isApprovalEnforcementDriftConflict(wrapped)).toBe(true);
   });
 });

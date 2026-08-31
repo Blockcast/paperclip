@@ -56,15 +56,30 @@ export const APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.appr
 /** Backstop index for the check-then-insert race between worker replicas. */
 const APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX = "issues_active_approval_enforcement_drift_uq";
 
-function isApprovalEnforcementDriftConflict(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const maybe = error as { code?: string; constraint?: string; message?: string };
-  if (maybe.code !== "23505") return false;
-  return (
-    maybe.constraint === APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX ||
-    (typeof maybe.message === "string" &&
-      maybe.message.includes(APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX))
-  );
+export function isApprovalEnforcementDriftConflict(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      message?: string;
+      cause?: unknown;
+    };
+    if (
+      maybe.code === "23505" &&
+      (maybe.constraint === APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX ||
+        maybe.constraint_name === APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX ||
+        (typeof maybe.message === "string" &&
+          maybe.message.includes(APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX)))
+    ) {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
 }
 
 /** Approvals scanned per batch. */
@@ -418,7 +433,7 @@ function buildDriftIssueBody(input: {
     "- The reconciler's next pass reports zero drift for this approval.",
     "",
     "## Verifying signal",
-    `- The approval-enforcement reconciler (\`${APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND}\`) stops raising for approval \`${input.approvalId}\`. It re-reads \`budget_policies\` every pass, so a real fix closes this automatically on the next sweep; editing a mirror column will not.`,
+    `- The approval-enforcement reconciler (\`${APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND}\`) reports zero drift for approval \`${input.approvalId}\` after re-reading \`budget_policies\`; the assigned owner must then close this issue. Editing a mirror column will not satisfy the check.`,
     "",
     "---",
     "Raised automatically by the approval-enforcement reconciler (BLO-24631). An approved decision that never reaches its enforcing object is invisible to everyone: the board reads it as approved and the requester reads it as resolved.",
