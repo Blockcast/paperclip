@@ -97,6 +97,13 @@ function registerModuleMocks() {
 
 const AGENT_ID = "11111111-1111-4111-8111-111111111111";
 
+function expectProtectedProfileDecision() {
+  expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+    action: "agent_config:update",
+    scope: expect.objectContaining({ requiresChangeGrant: true }),
+  }));
+}
+
 function selfAgentActor() {
   return {
     type: "agent",
@@ -229,11 +236,7 @@ describe("agent profile-change gate fails closed on mixed patches (BLO-27751)", 
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(mockAgentService.update).not.toHaveBeenCalled();
-    // The strong branch is identified by the scope it decides with.
-    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
-      action: "agent_config:update",
-      scope: expect.objectContaining({ requiresChangeGrant: true }),
-    }));
+    expectProtectedProfileDecision();
   });
 
   it("refuses a self-PATCH that mixes `role` with a nested adapterConfig write", async () => {
@@ -243,6 +246,7 @@ describe("agent profile-change gate fails closed on mixed patches (BLO-27751)", 
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(mockAgentService.update).not.toHaveBeenCalled();
+    expectProtectedProfileDecision();
   });
 
   // `role` is enum-validated before the authorization gate runs, so each field
@@ -262,6 +266,7 @@ describe("agent profile-change gate fails closed on mixed patches (BLO-27751)", 
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(mockAgentService.update).not.toHaveBeenCalled();
+      expectProtectedProfileDecision();
     },
   );
 
