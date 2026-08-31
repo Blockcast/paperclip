@@ -426,6 +426,105 @@ describe("evaluateCommentReviewGate", () => {
     }
   });
 
+  it("names the unrecognized verb that left a finding unretired", () => {
+    // Failing closed on an unknown verb is correct, but the ordinary reason
+    // says the finding is "undispositioned" while Ally's ledger visibly
+    // dispositions it — leaving a reader no way to tell vocabulary drift from
+    // a genuinely open finding. The missing `no-longer-applicable` verb was
+    // expensive to diagnose for exactly this reason.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "deferred"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).toContain('unrecognized ledger verb "deferred"');
+    expect(verdict.reason).toContain(OLD_HEAD.slice(0, 7));
+  });
+
+  it("keeps the ordinary reason when no unrecognized verb is involved", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).toContain("is still undispositioned");
+    expect(verdict.reason).not.toContain("unrecognized");
+  });
+
+  it("does not blame an unrecognized verb for a finding it never named", () => {
+    // `still-present` is a known verb, and the head is also held by a second,
+    // unmentioned finding. Neither is vocabulary drift, so the diagnostic must
+    // stay quiet rather than attach itself to any unretired finding it can see.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The terminator is missing.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const ledger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — still-present — the terminator is still gone.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(twoFindings, "2026-08-04T20:09:19Z"), allyComment(ledger, "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).not.toContain("unrecognized");
+  });
+
+  it("keeps every carried reason inside GitHub's 140-character status cap", () => {
+    // The reason becomes the commit-status description, which GitHub truncates
+    // at 140 characters. A diagnostic that gets cut off is the failure this
+    // branch exists to fix, so pin the budget with a maximal verb.
+    const longVerb = "superseded-by-a-later-architectural-decision-recorded-elsewhere";
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, longVerb), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    // Truncating the verb must not cost the reader the head it applies to.
+    expect(verdict.reason).toContain(OLD_HEAD.slice(0, 7));
+  });
+
+  it("does not blame an unrecognized verb that names a finding this head never raised", () => {
+    // `blockingReview` reports Important (1) and Critical (0), so the ledger's
+    // `critical 1` entry corresponds to no finding here. The head is carried
+    // because of the Important finding, which the ledger never mentions — so
+    // the unknown verb is not the reason and must not be offered as one.
+    const ledger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — deferred — names a finding this head never raised.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(ledger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).not.toContain("unrecognized");
+  });
+
   it("reports not_evaluated rather than clean when nothing attests the head", () => {
     const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
 
