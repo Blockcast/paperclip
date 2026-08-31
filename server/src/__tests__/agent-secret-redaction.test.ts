@@ -30,6 +30,25 @@ const baseAgent = {
           "x-safe-routing-header": "paperclip",
         },
       },
+      // PEN-2747: the three shapes that carried a credential straight past the
+      // key-name denylist. They live on the SHARED fixture on purpose, so every
+      // `expectNoPlaintextSecrets` case below sweeps them rather than only the
+      // one route someone remembered to write a bespoke test for — the original
+      // `gbrain` entry is credential-free, which is exactly why a test asserting
+      // its `url` unmasked read as correct for so long.
+      k8s_admin: {
+        type: "http",
+        url: "https://svcacct:k8s_userinfo_secret_24680@k8s-mcp-admin.internal:3130/mcp",
+      },
+      k8s_query: {
+        type: "http",
+        url: "https://k8s-mcp.internal/mcp?token=k8s_query_secret_13579",
+        headers: { "X-Tenant-Signature": "tenant_sig_secret_97531" },
+      },
+      stdio_local: {
+        command: "npx",
+        args: ["-y", "some-mcp-server", "--api-key", "stdio_args_secret_86420"],
+      },
     },
     env: {
       OPENAI_API_KEY: "sk-secret-key-12345",
@@ -253,12 +272,75 @@ describe("agent secret redaction in API responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig.mcpServers.gbrain).toEqual({
       type: "http",
+      // Credential-free, so it must round-trip byte-identical: the fix masks
+      // the credential component of a URL, never the whole URL. Knowing which
+      // upstream an agent is pointed at is the diagnostic value this read path
+      // exists for.
       url: "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp",
       headers: {
         Authorization: "***REDACTED***",
-        "x-safe-routing-header": "paperclip",
+        // PEN-2747: headers are now masked allowlist-style, the way the
+        // variable map already was. `Authorization` had been masked only
+        // incidentally (the "auth" Tier-1 stem), so every differently-spelled
+        // credential header went out in the clear. A denylist over header
+        // names has no bounded vocabulary to enumerate, so anything outside a
+        // short content-negotiation exemption list masks -- including this
+        // benign routing header. Over-masking a response is recoverable;
+        // `restoreRedactedAdapterValue` puts the stored value back if a caller
+        // PATCHes the redacted config in.
+        "x-safe-routing-header": "***REDACTED***",
       },
     });
+  });
+
+  // PEN-2747. Each case below is a route around the key-name denylist that
+  // `redactAgentConfigPayload` used to fail open on. `adapterConfig.mcpServers`
+  // is where an agent's k8s MCP upstream is swapped for a privileged `ns-rw` or
+  // `admin` tier, so a credential surfacing here is a privilege-escalation
+  // shape, not a hygiene one.
+  it("GET /agents/me masks the credential in a userinfo URL but keeps the upstream readable", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app).get("/api/agents/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.mcpServers.k8s_admin.url).toBe(
+      "https://svcacct:***REDACTED***@k8s-mcp-admin.internal:3130/mcp",
+    );
+  });
+
+  it("GET /agents/me masks a query-borne credential but keeps the upstream readable", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app).get("/api/agents/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.mcpServers.k8s_query.url).toBe(
+      "https://k8s-mcp.internal/mcp?token=***REDACTED***",
+    );
+  });
+
+  it("GET /agents/me masks a credential header that is not spelled Authorization", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app).get("/api/agents/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.mcpServers.k8s_query.headers).toEqual({
+      "X-Tenant-Signature": "***REDACTED***",
+    });
+  });
+
+  it("GET /agents/me masks a secret passed through mcpServers args", async () => {
+    const app = createApp(agentActor);
+    const res = await request(app).get("/api/agents/me");
+
+    expect(res.status).toBe(200);
+    // The flag name survives so the config stays diagnosable; only the value
+    // it introduces is masked.
+    expect(res.body.adapterConfig.mcpServers.stdio_local.args).toEqual([
+      "-y",
+      "some-mcp-server",
+      "--api-key",
+      "***REDACTED***",
+    ]);
   });
 
   it("GET /agents/:id redacts env values", async () => {
@@ -351,6 +433,15 @@ describe("agent secret redaction on mutating responses", () => {
     "sk-ant-secret-67890",
     "postgres://user:pass@host/db",
     "gbrain_at_secret_12345",
+    // PEN-2747. Every one of these is credential material that a key-name
+    // denylist waves through: userinfo and query components of a URL, a
+    // credential header that is not spelled `Authorization`, and a secret
+    // passed as an `args` element (the spelling real MCP stdio configs use --
+    // `argv` and `commandArgs` were masked, `args` was not).
+    "k8s_userinfo_secret_24680",
+    "k8s_query_secret_13579",
+    "tenant_sig_secret_97531",
+    "stdio_args_secret_86420",
   ];
 
   function expectNoPlaintextSecrets(body: unknown) {
