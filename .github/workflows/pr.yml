@@ -107,6 +107,16 @@ jobs:
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
         timeout-minutes: 1
 
+      # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
+      # are load-bearing: running it after the rollout starts reports the
+      # problem only once the 30-minute timeout has already burned, and an
+      # inconclusive check that exits 0 hands back the blind rollout it exists
+      # to prevent.
+      - name: Validate pending-migration deploy pre-flight
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-pending-migration-preflight.test.js
+        timeout-minutes: 1
+
       # BLO-29008: executes the two-tier convergence gate's shell against
       # recorded cluster states. The gate fails OPEN if its string accumulation
       # breaks, so a render-level test cannot cover it — the negative cases here

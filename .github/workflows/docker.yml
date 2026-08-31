@@ -796,6 +796,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Refuse to start a rollout whose pending migrations need an index built
+      # online first. Those migrations raise from inside worker startup, so
+      # without this the only symptom is `helm upgrade --wait` timing out 30
+      # minutes later with `context deadline exceeded` and `--atomic` spending
+      # a second timeout failing to evict the crashlooping pod. Read-only, runs
+      # the candidate image so the pending set is the one about to be applied.
+      - name: pending-migration pre-flight
+        env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+        run: .github/scripts/check-pending-migrations.sh
+
       # Pin the manifest digest resolved above so the image inspected for the
       # approved commit is exactly the image Kubernetes pulls. The committed
       # tag remains the readable source reference for non-CI deploys.
