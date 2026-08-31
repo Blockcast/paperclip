@@ -1889,7 +1889,14 @@ function stripRedactedPlaceholders(
     return undefined;
   }
   if (Array.isArray(value)) {
-    return value.map((entry, index) => stripRedactedPlaceholders(entry, found, `${prefix}[${index}]`));
+    // Filter, not map: a mapped `undefined` leaves a hole that serializes to
+    // `null`, so a redacted `args: ["--token", "<mask>"]` would import as
+    // `["--token", null]` — a malformed argv instead of an absent one. Object
+    // and array branches must drop the placeholder the same way; an asymmetry
+    // between them is how this class of bug survives a fix.
+    return value
+      .map((entry, index) => stripRedactedPlaceholders(entry, found, `${prefix}[${index}]`))
+      .filter((entry) => entry !== undefined);
   }
   if (isPlainRecord(value)) {
     const next: Record<string, unknown> = {};
@@ -1898,6 +1905,12 @@ function stripRedactedPlaceholders(
       const cleaned = stripRedactedPlaceholders(entry, found, childPrefix);
       if (cleaned === undefined) continue;
       next[key] = cleaned;
+    }
+    // A `{type:"plain"}` that lost its `value` no longer satisfies
+    // `envBindingPlainSchema`, so keeping the husk would persist an invalid
+    // binding. Drop the whole entry — the warning already names it.
+    if (value.type === "plain" && "value" in value && !("value" in next)) {
+      return undefined;
     }
     return next;
   }
