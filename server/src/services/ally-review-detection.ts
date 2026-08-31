@@ -80,12 +80,20 @@ const PRIOR_FINDING_DISPOSITION_PATTERN =
 const COUNTED_FINDINGS_BUCKET_PATTERN =
   /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
 
-// Only a disposition that asserts the finding is resolved clears it. Ally's
-// other observed verb, `still-present`, asserts the opposite — the sibling
-// consistency guard treats it as a blocking verdict. An unrecognized verb also
-// does not clear: a new word in Ally's vocabulary must not silently unblock a
-// merge before anyone decides it should.
-const RESOLVED_PRIOR_DISPOSITIONS = new Set(["fixed"]);
+// Ally's disposition vocabulary is three words: `fixed` and
+// `no-longer-applicable` retire a prior finding, `still-present` asserts it
+// stands. That matches scripts/check-ally-review-consistency.mjs, which treats
+// `still-present` alone as a blocking verdict (I2c). `no-longer-applicable`
+// means the finding does not apply to this code — often that it was incorrect
+// as filed — so it retires without implying anything changed.
+//
+// An unrecognized verb deliberately does NOT retire. The failure modes are
+// asymmetric: failing closed on a new verb leaves a PR visibly red until
+// someone updates this set, while failing open would silently clear a live
+// finding, which is the outcome this gate exists to prevent. The omission of
+// `no-longer-applicable` here was itself caught that way — as a red gate,
+// rather than as a merged regression.
+const RESOLVED_PRIOR_DISPOSITIONS = new Set(["fixed", "no-longer-applicable"]);
 
 /** One finding, identified the way Ally's ledger identifies it. */
 export interface AllyFindingRef {

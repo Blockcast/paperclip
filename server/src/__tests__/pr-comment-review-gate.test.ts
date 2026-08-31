@@ -376,6 +376,56 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
   });
 
+  it("retires a prior finding marked no-longer-applicable", () => {
+    // The third verb in Ally's vocabulary: the finding does not apply to this
+    // code, often because it was incorrect as filed. It retires without
+    // implying anything changed. Observed in Blockcast/onprem-k8s#2881,
+    // Blockcast/paperclip#1126 and Blockcast/go-amt#93.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "no-longer-applicable"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("keeps unrelated findings when no-longer-applicable retires only one", () => {
+    // The retiring verbs must stay per-finding. `no-longer-applicable` gets the
+    // same identity matching as `fixed`, so it cannot clear a sibling finding
+    // the ledger never named.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The selector is inverted.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const partialLedger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — no-longer-applicable — the policy does not select that target.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(partialLedger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
+  });
+
   it("reports not_evaluated rather than clean when nothing attests the head", () => {
     const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
 
