@@ -1,0 +1,105 @@
+# Dispatch the production deploy on a cadence, so drift is not discovered by an alert.
+#
+# THE PROBLEM THIS SOLVES
+# -----------------------
+# docker.yml's deploy job runs ONLY on workflow_dispatch — a `push` to master builds
+# an image but leaves `deploy` skipped. Nobody owned dispatching, so production drifted
+# until paperclip_api_oldest_missing_commit_age_hours crossed 24h and BLO-29399 fired.
+# Someone then dispatched, approved, and the cycle restarted. That happened at least
+# five times (BLO-25414, BLO-26718, BLO-29907, BLO-29399 twice), and by 2026-08-30
+# production was 169 commits behind.
+#
+# The gap was never the gate or the tooling — both work every time they are used. It
+# was that a manual step had no owner and no schedule.
+#
+# WHAT THIS DOES NOT DO
+# ---------------------
+# It does NOT approve anything. docker.yml's `deploy` job stays gated on the
+# paperclip-production environment and its three named human reviewers. This only
+# performs the mechanical step (dispatch), so there is always a build ready to approve
+# and approving means reviewing a day of commits instead of a quarter's worth.
+#
+# Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
+# code builds, not that a human intends to ship it. That reasoning is unchanged.
+name: Scheduled production deploy dispatch
+
+on:
+  schedule:
+    # 07:23 UTC daily. Deliberately not :00 — every scheduler on the planet fires there.
+    # Daily is chosen to sit inside the 24h drift threshold: a same-day approval keeps
+    # the metric under its alert line without a second cadence to maintain.
+    - cron: "23 7 * * *"
+  workflow_dispatch: # manual kick, e.g. after a hotfix merge
+
+permissions:
+  contents: read
+  actions: write # required to dispatch docker.yml
+
+concurrency:
+  group: scheduled-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: ${{ github.repository == 'Blockcast/paperclip' }}
+    runs-on: arc-deploy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Dispatch deploy if master is ahead and nothing is already pending
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MASTER_SHA="$(git rev-parse origin/master)"
+          echo "master head: $MASTER_SHA"
+
+          # (1) Never stack approval requests. If a dispatch is already waiting on a
+          # human or still building, a second one just splits the reviewer's attention
+          # and risks a double roll. Observed live on 2026-08-30: two dispatches 28min
+          # apart, and docker.yml's own guard had to skip the second one's deploy.
+          PENDING="$(gh run list --repo "$REPO" --workflow=docker.yml \
+              --event=workflow_dispatch --limit 20 \
+              --json databaseId,status \
+              --jq '[.[] | select(.status == "waiting" or .status == "in_progress" or .status == "queued")] | length')"
+          if [ "${PENDING:-0}" -gt 0 ]; then
+            echo "::notice::$PENDING dispatch(es) already waiting or running — not dispatching."
+            exit 0
+          fi
+
+          # (2) Don't ask a human to approve a no-op. Compare master against the head of
+          # the last run whose deploy job actually SUCCEEDED — not merely the last run,
+          # since a run can succeed overall with deploy skipped (guard, or unapproved).
+          LAST_DEPLOYED=""
+          for id in $(gh run list --repo "$REPO" --workflow=docker.yml \
+                        --event=workflow_dispatch --status=success --limit 20 \
+                        --json databaseId --jq '.[].databaseId'); do
+            ok="$(gh run view "$id" --repo "$REPO" --json jobs \
+                  --jq '[.jobs[] | select(.name == "deploy" and .conclusion == "success")] | length')"
+            if [ "${ok:-0}" -gt 0 ]; then
+              LAST_DEPLOYED="$(gh run view "$id" --repo "$REPO" --json headSha --jq .headSha)"
+              echo "last successful deploy: $id @ $LAST_DEPLOYED"
+              break
+            fi
+          done
+
+          if [ -n "$LAST_DEPLOYED" ] && [ "$LAST_DEPLOYED" = "$MASTER_SHA" ]; then
+            echo "::notice::Production already at master ($MASTER_SHA) — nothing to dispatch."
+            exit 0
+          fi
+
+          if [ -n "$LAST_DEPLOYED" ]; then
+            AHEAD="$(git rev-list --count "$LAST_DEPLOYED..$MASTER_SHA" 2>/dev/null || echo "?")"
+            echo "master is $AHEAD commit(s) ahead of the last successful deploy"
+          else
+            # Not fatal: a pruned run history looks identical to "never deployed".
+            # Dispatching is the safe reading — worst case a human declines it.
+            echo "::warning::No successful deploy found in the last 20 dispatch runs; dispatching anyway."
+          fi
+
+          gh workflow run docker.yml --repo "$REPO" --ref master -f target_sha="$MASTER_SHA"
+          echo "::notice::Dispatched docker.yml at $MASTER_SHA — awaiting human approval on paperclip-production."
