@@ -268,12 +268,17 @@ async function finishAggregateFiring(
  * process has, which permanently wedges every later firing for that aggregate.
  * The transition it performs is the same `cancelling` -> `active` release the
  * withheld-cancellation path already takes, so it introduces no new state.
+ *
+ * `token` is therefore a firing token or a resolution token depending on which
+ * phase holds the fence. The operator-facing request field is still named
+ * `firingToken` because that is the published wire contract; the listing route
+ * reports `phase` so the caller knows which one they are holding.
  */
 export async function recoverAggregateFiring(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
-  firingToken: string,
+  token: string,
 ): Promise<boolean> {
   const fences = q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE);
   const result = await ctx.db.execute(
@@ -285,7 +290,7 @@ export async function recoverAggregateFiring(
        AND aggregate_key = $2
        AND phase = 'firing'
        AND firing_token = $3`,
-    [companyId, aggregateKey, firingToken],
+    [companyId, aggregateKey, token],
   );
   if (result.rowCount > 0) return true;
   // Same compare-and-set discipline on the resolution token: a stale or wrong
@@ -300,7 +305,7 @@ export async function recoverAggregateFiring(
        AND aggregate_key = $2
        AND phase = 'cancelling'
        AND resolution_token = $3`,
-    [companyId, aggregateKey, firingToken],
+    [companyId, aggregateKey, token],
   );
   return cancelling.rowCount > 0;
 }
