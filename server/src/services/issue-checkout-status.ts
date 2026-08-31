@@ -95,16 +95,47 @@ export async function releaseIssueRunOwnership(
 }
 
 /**
+ * BLO-29554 — a row parked on a monitor the run deliberately armed.
+ *
+ * These are `tickDueIssueMonitors`'s own dispatch columns minus the due-time
+ * check, so this is the dispatcher's eligibility test rather than a restatement
+ * of it: while it holds, the only thing standing between the row and its wake is
+ * the `in_progress` status the restore is about to take away.
+ */
+const holdsDispatchableMonitor = sql`(
+  ${issues.monitorNextCheckAt} is not null
+  and ${issues.assigneeAgentId} is not null
+  and ${issues.assigneeUserId} is null
+)`;
+
+/**
  * The guard shared by both restore entry points: a checkout promotion may only be
  * undone while nothing else has a claim on the row.
  *
  * Kept as one expression so the single-issue and batch variants can never drift
  * apart — a divergence here would show up as an issue demoted out from under a
  * live run, which is the failure mode this whole guard exists to prevent.
+ *
+ * An armed monitor is one of those claims (BLO-29554). Checkout promotes a
+ * queue-tier row to `in_progress`, a run parks the issue on a timed re-check and
+ * arms a monitor against that status, and teardown used to restore the
+ * queue-tier status underneath it. BLO-28900 made the outcome visible by
+ * clearing the stranded monitor, which stops the row *lying* about being
+ * scheduled — but the scheduled work is still lost, and losing it is the actual
+ * cost: on BLO-30563 it was two nights of a nightly CronJob log that only exists
+ * inside a retention window of hours.
+ *
+ * So keep the promotion rather than tidy up the corpse. While a dispatchable
+ * monitor is armed, `in_progress` is not a stale checkout artifact — it is the
+ * state the monitor needs in order to fire. The restore marker is deliberately
+ * left in place, so the demotion still happens at the end of whichever run the
+ * monitor wakes: deferred, not cancelled, and `in_progress` does not decay back
+ * into the high-water mark BLO-20649 removed.
  */
 const restorableCheckoutPromotion = and(
   eq(issues.status, "in_progress"),
   isNotNull(issues.checkoutRestoreStatus),
+  sql`not ${holdsDispatchableMonitor}`,
   // `x IN (NULL)` is NULL rather than true, so a row with both lock columns
   // already cleared correctly matches NOT EXISTS and is restored.
   sql`not exists (
@@ -167,6 +198,13 @@ type RestoredRow = {
  * against that transient status; teardown restores the original status. The
  * monitor survives reading `scheduled` while `tickDueIssueMonitors` can no
  * longer select the row, so the issue goes dark looking like an idle assignee.
+ *
+ * Since BLO-29554 the restore declines outright while a *dispatchable* monitor
+ * is armed, so the status half of that conflict no longer reaches here. What
+ * still does is the assignee half: a row whose monitor outlived its agent
+ * assignee is undeliverable no matter which status it lands on, and there is no
+ * promotion worth keeping for it. This pass is also shared with
+ * `issueService.release()`, which strips the assignee deliberately.
  *
  * The restore itself stays one set-based statement — the batch form exists
  * precisely so cleanup scales without N round-trips. Reconciliation is a
