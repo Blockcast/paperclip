@@ -113,6 +113,7 @@ import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
+  AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
@@ -3400,6 +3401,12 @@ export function agentRoutes(
     const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
     if (touchesProfileFields) {
       await assertCanApplyAgentProfileChange(req, existing);
+      const mixesNonProfileKeys = Object.keys(patchData).some((key) =>
+        !(AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+      );
+      // Consent for the profile diff must not authorize unrelated keys in a
+      // mixed patch; require the ordinary update grant as well.
+      if (mixesNonProfileKeys) await assertCanUpdateAgent(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
     }
