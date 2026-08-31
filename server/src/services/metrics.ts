@@ -198,6 +198,9 @@ export const SCHEDULED_RETRY_PARK_HORIZON_METRIC =
   "paperclip_scheduled_retry_park_horizon_seconds";
 export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
   "paperclip_scheduled_retry_park_horizon_refresh_success";
+/** Queue wait observed when a sanctioned GitHub PR-review run starts. */
+export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
+export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -1298,6 +1301,7 @@ let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
+let prReviewQueueWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -1342,6 +1346,7 @@ function ensureRegistry(): {
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
+  prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -1386,6 +1391,7 @@ function ensureRegistry(): {
     || !scheduledRetryParkHorizonRefreshSuccess
     || !pluginError
     || !pluginStatusCollectorLastSuccess
+    || !prReviewQueueWait
     || !authRequest
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
@@ -1865,6 +1871,14 @@ function ensureRegistry(): {
       labelNames: ["role"],
       registers: [registry],
     });
+    prReviewQueueWait = new Histogram({
+      name: PR_REVIEW_QUEUE_WAIT_METRIC,
+      help:
+        "Seconds from creation until start for heartbeat runs with a pr_review: task key. "
+        + "Observed once at the guarded queued-to-running transition; no repo, PR, agent, or other unbounded labels.",
+      buckets: PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
+      registers: [registry],
+    });
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -1985,6 +1999,7 @@ function ensureRegistry(): {
     scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
     pluginErrorGauge: pluginError,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
+    prReviewQueueWaitHistogram: prReviewQueueWait,
     authRequestCounter: authRequest,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
@@ -2295,6 +2310,29 @@ export function setExternalRuntimeReservationStrandedOldestAgeMetrics(
 /** Mark whether the stranded-reservation gauge was refreshed from the database. */
 export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().externalRuntimeReservationStrandMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+export function computePrReviewQueueWaitSeconds(
+  taskKey: string | null | undefined,
+  createdAt: Date | string | null | undefined,
+  startedAt: Date | string | null | undefined,
+): number | null {
+  if (typeof taskKey !== "string" || !taskKey.startsWith("pr_review:") || !createdAt || !startedAt) return null;
+  const createdMs = new Date(createdAt).getTime();
+  const startedMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(createdMs) || !Number.isFinite(startedMs)) return null;
+  return Math.max(0, (startedMs - createdMs) / 1000);
+}
+
+export function recordPrReviewQueueWait(input: {
+  taskKey: string | null | undefined;
+  createdAt: Date | string | null | undefined;
+  startedAt: Date | string | null | undefined;
+}): number | null {
+  const waitSeconds = computePrReviewQueueWaitSeconds(input.taskKey, input.createdAt, input.startedAt);
+  if (waitSeconds === null) return null;
+  ensureRegistry().prReviewQueueWaitHistogram.observe(waitSeconds);
+  return waitSeconds;
 }
 
 /**
@@ -2843,6 +2881,7 @@ export function __resetMetricsForTest(): void {
   scheduledRetryParkHorizonRefreshSuccess = null;
   pluginError = null;
   pluginStatusCollectorLastSuccess = null;
+  prReviewQueueWait = null;
   authRequest = null;
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;

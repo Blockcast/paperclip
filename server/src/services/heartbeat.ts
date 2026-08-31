@@ -415,6 +415,7 @@ import {
   terminalFailedWakeScopeForTaskKey,
   setExternalLifecycleRunningRuns,
   recordExternalLifecycleRunSilenceGap,
+  recordPrReviewQueueWait,
   setAgentLivenessMetrics,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -19509,6 +19510,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? initiallyClaimed)
       : initiallyClaimed;
     if (!claimed) return null;
+
+    recordPrReviewQueueWait({
+      taskKey: claimed.contextTaskKey,
+      createdAt: claimed.createdAt,
+      startedAt: claimed.startedAt,
+    });
 
     publishLiveEvent({
       companyId: claimed.companyId,
