@@ -1219,11 +1219,32 @@ describe("scrubResponseBody — every entry point skips the same leading bytes",
   // it fails on the next classifier that does not derive its offset from
   // `significantByteOffset`, rather than on the one spelling someone happened to
   // probe. Enumerating the cases we know is what let this reach production twice.
+  //
+  // The nested `content[].text` row is that prediction coming true. The matrix
+  // above shipped green while a *fourth* classifier — the JSON sniff inside
+  // `scrubTextTracked` — still disagreed with its own parse: `trimStart` counts
+  // U+FEFF as whitespace, `JSON.parse` rejects it, so a BOM-prefixed resource
+  // nested in `content[].text` classified as JSON, threw, fell through to the
+  // YAML scanner (which does not match compact single-line JSON) and passed
+  // through in the clear. Every entry point means every entry point, including
+  // the ones reached by recursion rather than by dispatch.
   const payload = `{"env":[{"name":"OPENAI_API_KEY","value":"${LEAK}"}]}`;
 
+  // Each entry point places the prefix where that shape actually begins — for
+  // the nested row that is the *inner* document, which is the byte offset the
+  // recursive classifier sees.
   const ENTRY_POINTS = [
-    ["an SSE stream", `data: ${payload}\n\n`],
-    ["a JSON-RPC body", payload],
+    ["an SSE stream", (prefix: string) => `${prefix}data: ${payload}\n\n`],
+    ["a JSON-RPC body", (prefix: string) => `${prefix}${payload}`],
+    [
+      "a resource nested in content[].text",
+      (prefix: string) =>
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: `${prefix}${payload}` }] },
+        }),
+    ],
   ] as const;
 
   const PREFIXES = [
@@ -1235,10 +1256,10 @@ describe("scrubResponseBody — every entry point skips the same leading bytes",
     ["a BOM then a blank line", "﻿\n"],
   ] as const;
 
-  for (const [entryLabel, body] of ENTRY_POINTS) {
+  for (const [entryLabel, build] of ENTRY_POINTS) {
     for (const [prefixLabel, prefix] of PREFIXES) {
       it(`scrubs ${entryLabel} that opens on ${prefixLabel}`, () => {
-        const out = scrubResponseBody(Buffer.from(prefix + body, "utf8"), null).toString("utf8");
+        const out = scrubResponseBody(Buffer.from(build(prefix), "utf8"), null).toString("utf8");
 
         expectNoLeak(out);
         expect(out).toContain(REDACTED);
@@ -1254,6 +1275,22 @@ describe("scrubResponseBody — every entry point skips the same leading bytes",
 
   it("still leaves a BOM-prefixed body that carries no resource byte-exact", () => {
     const body = Buffer.from(`﻿{"issues":[{"title":"env: notes"}]}`, "utf8");
+
+    expect(scrubResponseBody(body, null)).toBe(body);
+  });
+
+  it("still leaves a BOM-prefixed nested text that carries no resource byte-exact", () => {
+    // The BOM strip feeds `JSON.parse` only. A nested document we did not redact
+    // must come back as the original Buffer, BOM included, rather than a
+    // re-serialized copy that happens to look equal.
+    const body = Buffer.from(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { content: [{ type: "text", text: `﻿{"issues":[{"title":"env: notes"}]}` }] },
+      }),
+      "utf8",
+    );
 
     expect(scrubResponseBody(body, null)).toBe(body);
   });

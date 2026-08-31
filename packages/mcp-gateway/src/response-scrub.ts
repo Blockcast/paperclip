@@ -1263,10 +1263,23 @@ export function scrubText(text: string): string {
 }
 
 function scrubTextTracked(text: string, ctx: ScrubContext): string {
-  const trimmed = text.trimStart();
+  // `stripLeadingBom` before both the sniff and the parse, for the reason that
+  // function documents: `trimStart` counts U+FEFF as whitespace, so this sniff
+  // already accepted a BOM while the `JSON.parse` below still rejected one. A
+  // k8s resource nested in `content[].text` whose text opened on a BOM therefore
+  // classified as JSON, threw, and fell through to the YAML scanner — which does
+  // not match a compact single-line JSON document, so the entry passed through
+  // with its `env` values in the clear.
+  //
+  // That is the *same* fail-open the byte-level sniffs were unified to close,
+  // surviving one layer down because this classifier kept its own idea of where
+  // a document begins. Sharing the definition is what makes the class
+  // unreachable rather than patched at the two spellings someone probed.
+  const source = stripLeadingBom(text);
+  const trimmed = source.trimStart();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
-      const parsed: unknown = JSON.parse(text);
+      const parsed: unknown = JSON.parse(source);
       const nested: ScrubContext = { changed: false };
       const scrubbed = JSON.stringify(scrubJsonValueTracked(parsed, nested, false, false));
       if (nested.changed) {
@@ -1281,6 +1294,9 @@ function scrubTextTracked(text: string, ctx: ScrubContext): string {
       // degrades gracefully on arbitrary text.
     }
   }
+  // The YAML scanner gets the *original* text: it is line-based and tolerates a
+  // leading BOM, and passing it the stripped copy would drop that byte from
+  // every YAML body we pass through unchanged.
   return scrubYamlTextTracked(text, ctx);
 }
 
@@ -1389,24 +1405,42 @@ function startsWithSseField(body: Buffer): boolean {
 }
 
 /**
- * `JSON.parse` tolerates leading whitespace but rejects a leading BOM, so the
- * strip here is the parse-side half of `significantByteOffset`.
+ * The string-side half of `significantByteOffset`'s BOM rule.
  *
+ * `significantByteOffset` governs the byte-level sniffs; this governs every
+ * place we hand a decoded string to `JSON.parse`. Two representations need two
+ * functions, but each representation gets exactly *one* — the failure this file
+ * keeps re-learning is a second private copy, not a second representation.
+ *
+ * `JSON.parse` tolerates leading whitespace but rejects a leading BOM, while
+ * both of our JSON *detectors* accept one (`significantByteOffset` skips it
+ * explicitly; `String.prototype.trimStart` treats U+FEFF as whitespace per
+ * ECMAScript). Detection and parsing therefore disagree by default, and every
+ * caller that does not strip fails open: the body classifies as JSON, throws on
+ * parse, and the catch hands it back unscrubbed.
+ *
+ * Dropping the BOM is safe only where the return value is a re-serialized
+ * document, which already does not preserve the original byte layout. Callers
+ * that pass a body through unchanged must return their *original* string or
+ * Buffer, not this one, to stay byte-exact.
+ */
+function stripLeadingBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
  * Teaching only the *sniff* about BOMs would have moved this fail-open one step
  * down rather than closing it — the body would classify as JSON and then fail to
  * parse, and a `null` return sends it through unscrubbed exactly as before. That
  * is the same half-fix `scrubSseFrames` documents for its own framing regex:
  * detection and parsing have to agree about where a body begins.
  *
- * Dropping the BOM from the output is safe because this function only ever
- * returns a re-serialized document, which already does not preserve the original
- * byte layout; a body we did not change is returned as the original Buffer by
+ * A body we did not change is returned as the original Buffer by
  * `scrubResponseBody` and keeps its BOM.
  */
 function scrubJsonRpcBody(text: string, ctx: ScrubContext): string | null {
-  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   try {
-    return JSON.stringify(scrubJsonValueTracked(JSON.parse(source), ctx, false, false));
+    return JSON.stringify(scrubJsonValueTracked(JSON.parse(stripLeadingBom(text)), ctx, false, false));
   } catch {
     return null;
   }
