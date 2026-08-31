@@ -1521,12 +1521,13 @@ describe("aggregate firing fence recovery", () => {
     expect(JSON.stringify(mocks.activity.log.mock.calls)).not.toContain(token);
   });
 
-  it("lists only firing fences through the board operator API and marks the token response non-cacheable", async () => {
+  it("returns a held fence with its phase through the board operator API and marks the token response non-cacheable", async () => {
     const { ctx, mocks } = mkCtx();
     const token = "firing-token-for-operator";
     mocks.db.query.mockResolvedValueOnce([
       {
         aggregate_key: aggregateKey,
+        phase: "firing",
         firing_token: token,
         updated_at: "2026-08-11T19:10:00.000Z",
       },
@@ -1555,6 +1556,7 @@ describe("aggregate firing fence recovery", () => {
       body: {
         fences: [{
           aggregateKey,
+          phase: "firing",
           firingToken: token,
           updatedAt: "2026-08-11T19:10:00.000Z",
         }],
