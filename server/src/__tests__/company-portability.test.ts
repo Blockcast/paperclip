@@ -2755,6 +2755,17 @@ describe("company portability", () => {
       const createCall = agentSvc.create.mock.calls.at(-1);
       expect(JSON.stringify(createCall)).not.toContain("***REDACTED***");
       expect(createCall?.[1].adapterConfig).not.toHaveProperty("apiKey");
+      // Dropping the placeholder out of an array must remove the entry, not
+      // leave a hole: a mapped `undefined` serializes to `null` and would hand
+      // the adapter a malformed argv instead of an absent one.
+      expect(JSON.stringify(createCall)).not.toContain("null]");
+      expect(createCall?.[1].adapterConfig?.mcpServers?.gbrain?.args).toEqual(["--token"]);
+      // Same rule for an env binding: `{type:"plain"}` without `value` fails
+      // envBindingPlainSchema, so the husk must go rather than persist as an
+      // invalid binding.
+      expect(
+        createCall?.[1].runtimeConfig?.modelProfiles?.cheap?.adapterConfig?.env ?? {},
+      ).toEqual({});
       expect(
         imported.warnings.some((warning: string) =>
           warning.includes("imported without redacted values"),
