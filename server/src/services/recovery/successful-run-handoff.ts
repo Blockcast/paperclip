@@ -367,7 +367,7 @@ export function buildSuccessfulRunHandoffInstruction(input: {
       : "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
     "",
     "**Is the issue finished?**",
-    "1. Mark it `done` (scope complete) or `cancelled` (intentionally stopped).",
+    "1. Mark it `done` only after verifying the acceptance criteria against a committed, remotely resolvable artifact; otherwise keep it open on the correct continuation path. Mark it `cancelled` only when intentionally stopped.",
     "",
     "**Does someone else need to look at it?**",
     "2. Move it to `in_review` with a real reviewer path — `executionState.currentParticipant`, a human owner via `assigneeUserId`, a pending issue-thread interaction, or a linked pending approval.",
