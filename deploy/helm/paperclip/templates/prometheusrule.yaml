@@ -658,6 +658,19 @@ spec:
             summary: "Paperclip stranded-reservation metric refresh is failing"
             description: "The most recent /metrics stranded-reservation database refresh failed (BLO-28865), so strand ages may be stale and PaperclipExternalRuntimeReservationStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as a healthy launch path."
             runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
+    - name: paperclip-pr-review-queue
+      rules:
+        - alert: PaperclipPrReviewQueueWaitSaturated
+          expr: histogram_quantile(0.95, sum by (le) (rate(paperclip_pr_review_queue_wait_seconds_bucket[{{ .Values.prometheusRule.prReviewQueueWaitWindow }}]))) > {{ .Values.prometheusRule.prReviewQueueWaitThresholdSeconds }}
+          for: {{ .Values.prometheusRule.prReviewQueueWaitFor }}
+          labels:
+            severity: warning
+            service: paperclip
+            signal: pr_review_queue_wait
+          annotations:
+            summary: "Paperclip PR-review queue wait p95 exceeds 60 minutes"
+            description: "The rolling p95 time from heartbeat_runs.created_at to started_at for sanctioned pr_review runs has exceeded {{ .Values.prometheusRule.prReviewQueueWaitThresholdSeconds }} seconds. Check reviewer concurrency, queued heartbeat_runs, and provider capacity."
+            runbook_url: {{ .Values.prometheusRule.prReviewQueueWaitRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

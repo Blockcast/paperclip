@@ -13,9 +13,12 @@
  */
 import { loadConfig } from "../config.js";
 import {
+  extractAllyDispositionedPriorFindings,
+  extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  type AllyDispositionedPriorFinding,
 } from "./ally-review-detection.js";
 import {
   githubFetchPrHeadSha,
@@ -130,12 +133,25 @@ function latestAttestingAllyComment(
  * Heads whose own newest attestation still carries an unresolved finding,
  * newest attestation first.
  *
- * Disposition is tracked per attested head, not by global comment recency. A
- * later clean attestation of head H disposes a finding raised against H: Ally
- * re-examined that exact tree and found nothing. A clean attestation of some
- * *other* head does not, because nothing available here establishes that the
- * other head contains the fix — comment chronology is not commit ancestry, and
- * reviews can land out of order relative to pushes.
+ * Disposition is tracked per attested head, not by global comment recency.
+ * Two things dispose a finding raised against head H:
+ *
+ *   - A later clean attestation of H itself: Ally re-examined that exact tree
+ *     and found nothing.
+ *   - A later review retiring *every* finding H raised, by name, under "Prior
+ *     Findings Dispositioned": Ally asserting directly that it re-checked those
+ *     specific findings and they are gone. Retiring only some of them leaves H
+ *     carried — one `fixed` entry must not clear a review that reported several
+ *     findings.
+ *
+ * A clean attestation of some *other* head disposes nothing by itself, because
+ * nothing in that alone establishes that the other head contains the fix —
+ * comment chronology is not commit ancestry, and reviews can land out of order
+ * relative to pushes. The ledger is what supplies that missing link, and
+ * reading only the first rule wedged PRs whose finding Ally had already marked
+ * resolved: on Blockcast/libmmt#362 the review of c9a1765 recorded
+ * `prior:731ced5 critical 1 — fixed`, and this gate still reported 731ced5
+ * undispositioned once the head moved on again.
  *
  * Reading only the globally newest attestation instead let A(blocking) ->
  * B(clean) -> C(unattested) drop A's finding silently (BLO-29711, Ally review
@@ -146,6 +162,7 @@ function headsWithUndispositionedFinding(
   reviewerBotLogin: string,
 ): AttestingComment[] {
   const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
+  const resolvedPriors: { finding: AllyDispositionedPriorFinding; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -153,6 +170,10 @@ function headsWithUndispositionedFinding(
     if (!attestedHeadSha) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
+
+    for (const finding of extractAllyDispositionedPriorFindings(comment.body)) {
+      resolvedPriors.push({ finding, timeMs: commentTime, attestedHeadSha });
+    }
 
     const existing = newestPerHead.get(attestedHeadSha);
     // Ties prefer the later item, matching latestAttestingAllyComment: the
@@ -162,8 +183,43 @@ function headsWithUndispositionedFinding(
     }
   }
 
+  // A ledger entry speaks only to findings that already existed when it was
+  // written, so it must be at least as new as the attestation it clears, and it
+  // must come from a review of a different head — a review cannot disposition
+  // its own finding. That second condition is what makes `>=` safe against the
+  // second-resolution timestamps.
+  const isRetired = (
+    headSha: string,
+    attestedAtMs: number,
+    finding: { severity: string; index: number },
+  ): boolean =>
+    resolvedPriors.some(
+      (prior) =>
+        prior.attestedHeadSha !== headSha &&
+        prior.timeMs >= attestedAtMs &&
+        headSha.startsWith(prior.finding.shortSha) &&
+        prior.finding.severity === finding.severity &&
+        prior.finding.index === finding.index,
+    );
+
+  // A head is dispositioned only once *every* finding it raised has been
+  // retired by name. Matching on the head alone would let one `fixed` entry
+  // clear a review that reported several findings, dropping the ones the ledger
+  // never mentioned. `null` means the blocking feedback came from prose or an
+  // uncounted heading, so no finding identities exist to match against and the
+  // head stays carried.
+  const isFullyDispositioned = (entry: { attesting: AttestingComment; timeMs: number }): boolean => {
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported || reported.length === 0) return false;
+    return reported.every((finding) =>
+      isRetired(entry.attesting.attestedHeadSha, entry.timeMs, finding),
+    );
+  };
+
   return [...newestPerHead.values()]
-    .filter((entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body))
+    .filter(
+      (entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body) && !isFullyDispositioned(entry),
+    )
     .sort((a, b) => b.timeMs - a.timeMs)
     .map((entry) => entry.attesting);
 }
@@ -211,11 +267,12 @@ export function evaluateCommentReviewGate(input: {
 
   // Nothing attests this head. A finding raised against an earlier head is not
   // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). Only a later clean review of that same earlier
-  // head disposes it — see headsWithUndispositionedFinding. It clears the
-  // moment Ally attests the current head, which the push that produced this
-  // head already triggers, so this cannot wedge a PR that keeps being reviewed
-  // on the same surface.
+  // going green (BLO-29711). It is disposed by a later clean review of that
+  // same earlier head, or by a later review that names it as resolved in its
+  // prior-findings ledger — see headsWithUndispositionedFinding. It also clears
+  // the moment Ally attests the current head. Note that none of those routes
+  // exists while the reviewer itself is failing to run, which is the state that
+  // strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
     return {

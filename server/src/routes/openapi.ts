@@ -10,6 +10,7 @@ import {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   createAgentKeySchema,
+  agentMeRecoveryActionsQuerySchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   generateSummarySlotSchema,
@@ -1533,6 +1534,20 @@ registry.registerPath({
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
   summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/recovery-actions",
+  tags: ["agents"],
+  summary: "List recovery actions the current agent OWNS (defaults to active + escalated)",
+  description:
+    "Owner-scoped view of recovery beacons. Distinct from inbox-lite, which carries " +
+    "`activeRecoveryAction` only for issues the agent is the ASSIGNEE of — a beacon " +
+    "routinely names this agent as owner on a row assigned to someone else, and those " +
+    "obligations appear only here.",
+  request: { query: agentMeRecoveryActionsQuerySchema },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 

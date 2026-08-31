@@ -32,6 +32,19 @@ function allyComment(body: string, createdAt: string) {
   return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
 }
 
+/**
+ * A clean review that also carries a prior-findings ledger entry, in the shape
+ * Ally emits: `- **prior:<short sha> <severity> <n>** — <verb> — <detail>`.
+ */
+function dispositioningReview(headSha: string, priorHeadSha: string, disposition: string): string {
+  return reviewBody(headSha, [
+    "### Prior Findings Dispositioned (1)",
+    `- **prior:${priorHeadSha.slice(0, 7)} important 1** — ${disposition} — re-checked against this head.`,
+    "### Critical Issues (0)",
+    "### Important Issues (0)",
+  ]);
+}
+
 describe("evaluateCommentReviewGate", () => {
   it("fails the #1022 shape: an Ally comment finding for the current head", () => {
     const verdict = evaluateCommentReviewGate({
@@ -179,6 +192,238 @@ describe("evaluateCommentReviewGate", () => {
     });
 
     expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("lets a later review's ledger disposition a finding from a head it replaced", () => {
+    // The Blockcast/libmmt#362 shape. Ally found a Critical on OLD_HEAD, the
+    // author fixed it, Ally reviewed INTERMEDIATE_HEAD clean and recorded
+    // `prior:<old> — fixed`, then the author pushed once more. Ally's ledger is
+    // a direct assertion that it re-checked that finding, which is exactly the
+    // evidence a merely-clean review of an unrelated head lacks. Without this,
+    // #362 sat red on a finding its own reviewer had already closed.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("does not let a still-present disposition clear the finding it reports", () => {
+    // `still-present` asserts the opposite of `fixed`; the sibling consistency
+    // guard treats it as a blocking verdict (I2c). Reading the ledger without
+    // reading the verb would invert its meaning.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "still-present"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
+  });
+
+  it("does not let an unrecognized disposition verb clear a finding", () => {
+    // Fail closed on vocabulary we have not seen: a new word in Ally's ledger
+    // must not silently unblock a merge before anyone decides that it should.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "acknowledged"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("does not let a ledger entry disposition a finding raised after it", () => {
+    // Ally re-raising a finding on a head it previously cleared is the newer
+    // fact. A ledger entry can only speak to findings that existed when it was
+    // written.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T20:09:19Z"),
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
+  });
+
+  it("matches the ledger's abbreviated SHA as a prefix, not a substring", () => {
+    // SUFFIX_MATCH_HEAD contains `d4d4d4d` seven characters in. Matching the
+    // abbreviated SHA anywhere in the head would clear a finding the ledger
+    // never named — git abbreviations identify a commit by its leading
+    // characters, so only a prefix match means "this commit".
+    const suffixMatchHead = `eeeeeee${"d4d4d4d"}${"f".repeat(26)}`;
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(suffixMatchHead), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, "d4d4d4d4d4d4d4d4", "fixed"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(suffixMatchHead);
+    }
+  });
+
+  it("keeps a head carried when its ledger retires only some of its findings", () => {
+    // A head can raise several findings, and Ally numbers them within their
+    // severity bucket. Matching the ledger on the head alone would let a single
+    // `fixed` entry clear all of them, dropping an unresolved Important finding
+    // out of a merge gate.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The terminator is missing.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const partialLedger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — the terminator is back.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(partialLedger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
+  });
+
+  it("clears a head once its ledger retires every finding it raised", () => {
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The terminator is missing.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const fullLedger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (2)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — the terminator is back.`,
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — the assertion is back.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(fullLedger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("does not disposition a head whose findings cannot be enumerated", () => {
+    // Blocking feedback from prose rather than a counted bucket yields no
+    // finding identities for a ledger to name, so the head stays carried
+    // rather than being cleared by an unrelated entry.
+    const uncounted = reviewBody(OLD_HEAD, [
+      "### Recommended Action",
+      "Fix the gate before merge.",
+    ]);
+    const ledger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — re-checked.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(uncounted, "2026-08-04T20:09:19Z"),
+        allyComment(ledger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("retires a prior finding marked no-longer-applicable", () => {
+    // The third verb in Ally's vocabulary: the finding does not apply to this
+    // code, often because it was incorrect as filed. It retires without
+    // implying anything changed. Observed in Blockcast/onprem-k8s#2881,
+    // Blockcast/paperclip#1126 and Blockcast/go-amt#93.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "no-longer-applicable"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("keeps unrelated findings when no-longer-applicable retires only one", () => {
+    // The retiring verbs must stay per-finding. `no-longer-applicable` gets the
+    // same identity matching as `fixed`, so it cannot clear a sibling finding
+    // the ledger never named.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- The selector is inverted.",
+      "### Important Issues (1)",
+      "- The assertion was deleted.",
+    ]);
+    const partialLedger = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — no-longer-applicable — the policy does not select that target.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(partialLedger, "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    if (verdict.outcome === "carried_finding") {
+      expect(verdict.carriedFromHeadSha).toBe(OLD_HEAD);
+    }
   });
 
   it("reports not_evaluated rather than clean when nothing attests the head", () => {

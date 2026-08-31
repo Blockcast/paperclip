@@ -73,6 +73,10 @@ import {
   PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
   setPluginErrorStatus,
   setPluginStatusCollectorLastSuccessSeconds,
+  PR_REVIEW_QUEUE_WAIT_METRIC,
+  PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
+  computePrReviewQueueWaitSeconds,
+  recordPrReviewQueueWait,
 } from "../services/metrics.js";
 import {
   incrementRoutineDispatchMetric,
@@ -88,6 +92,33 @@ import {
 
 afterEach(() => {
   __resetMetricsForTest();
+});
+
+describe("PR-review queue-wait metrics (BLO-30623)", () => {
+  it("computes only valid pr_review queue waits and ignores other or never-started runs", () => {
+    expect(computePrReviewQueueWaitSeconds(
+      "pr_review:Blockcast/paperclip:123",
+      "2026-08-31T00:00:00.000Z",
+      "2026-08-31T01:05:00.000Z",
+    )).toBe(3900);
+    expect(computePrReviewQueueWaitSeconds("issue_board:123", "2026-08-31T00:00:00Z", "2026-08-31T01:00:00Z")).toBeNull();
+    expect(computePrReviewQueueWaitSeconds("pr_review:repo:123", "2026-08-31T00:00:00Z", null)).toBeNull();
+    expect(computePrReviewQueueWaitSeconds("pr_review:repo:123", "not-a-date", "2026-08-31T01:00:00Z")).toBeNull();
+  });
+
+  it("emits the bounded histogram buckets without unbounded labels", async () => {
+    expect(recordPrReviewQueueWait({
+      taskKey: "pr_review:Blockcast/paperclip:123",
+      createdAt: "2026-08-31T00:00:00.000Z",
+      startedAt: "2026-08-31T01:05:00.000Z",
+    })).toBe(3900);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_bucket{le="3600"} 0`);
+    expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_bucket{le="7200"} 1`);
+    expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_count 1`);
+    expect(PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS).toEqual([60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800]);
+    expect(body).not.toContain("Blockcast");
+  });
 });
 
 describe("authentication request metrics", () => {

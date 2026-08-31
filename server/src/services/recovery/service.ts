@@ -13377,7 +13377,24 @@ export function recoveryService(
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }
         : { type: "board_escalation", reason: "no_invokable_recovery_owner" },
       monitorPolicy: null,
-      maxAttempts: null,
+      // PEN-2756: bound this the same way every other owner-waking shape is bounded.
+      // The rule stated on `strandedRecoveryWakeAttemptsExhausted` and at the stranded
+      // creation site is "a shape that wakes an owner is bounded; the monitor-only and
+      // manual-repair shapes are not, because they wake nobody". This path wakes an owner
+      // (`enqueueWakeup` below) and yet passed `maxAttempts: null` with no `timeoutAt`,
+      // which put it on the wrong side of that rule.
+      //
+      // The consequence was not merely an unbounded wake budget. `maxAttempts === null`
+      // short-circuits `strandedRecoveryWakeAttemptsExhausted` before it reads the horizon,
+      // and `escalateExpiredWakeHorizons` — the only sweep that retires a spent action —
+      // requires BOTH `maxAttempts` and `timeoutAt` to be non-null. So this shape could not
+      // expire, could not exhaust, and could not be retired: once minted it stayed `active`
+      // until an agent resolved it by hand. Observed on PEN-2190 (5 days active; its PR
+      // merged 4h11m after the beacon fired) and PEN-2370 (9.4h; PR merged after 42m).
+      //
+      // Bounded only when an owner is actually woken. The board-escalation shape below
+      // (`ownerAgentId === null`) wakes nobody and stays unbounded, consistent with the rule.
+      ...(ownerAgentId ? recoveryActionBoundsAtCreation(new Date()) : { maxAttempts: null }),
       lastAttemptAt: new Date(),
     });
 
