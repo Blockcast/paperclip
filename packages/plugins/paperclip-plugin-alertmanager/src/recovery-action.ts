@@ -12,12 +12,14 @@ export const RECOVER_AGGREGATE_FIRING_ROUTE = "recover-aggregate-firing";
 
 type AggregateFiringFenceRow = {
   aggregate_key: string;
+  phase: string;
   firing_token: string;
   updated_at: string;
 };
 
 export type AggregateFiringFence = {
   aggregateKey: string;
+  phase: string;
   firingToken: string;
   updatedAt: string;
 };
@@ -40,28 +42,40 @@ function isBoardUser(input: PluginApiRequestInput): boolean {
 }
 
 /**
- * List only currently-held firing fences for the already host-authorized
- * company. The token is intentionally present here: it is the capability an
- * operator needs to identify the interrupted owner, and this route is
- * declared `auth: board` so the host applies normal board/company access
- * checks before the worker sees it. Callers must treat this response as
- * sensitive and non-cacheable.
+ * List only currently-held fences for the already host-authorized company. Both
+ * phases that block a new firing claim are listed: `firing` (an interrupted
+ * firing delivery) and `cancelling` (an interrupted terminal transition). A
+ * `cancelling` fence was previously omitted, which left it both unlistable and
+ * unrecoverable — the operator could not discover the token needed to release
+ * it, so the aggregate stayed wedged permanently.
+ *
+ * The token is intentionally present here: it is the capability an operator
+ * needs to identify the interrupted owner, and this route is declared
+ * `auth: board` so the host applies normal board/company access checks before
+ * the worker sees it. Callers must treat this response as sensitive and
+ * non-cacheable.
  */
 export async function listAggregateFiringFences(
   ctx: PluginContext,
   companyId: string,
 ): Promise<AggregateFiringFence[]> {
   const rows = await ctx.db.query<AggregateFiringFenceRow>(
-    `SELECT aggregate_key, firing_token, updated_at
+    `SELECT aggregate_key,
+            phase,
+            COALESCE(firing_token, resolution_token) AS firing_token,
+            updated_at
        FROM ${ctx.db.namespace}.alertmanager_aggregate_lifecycle_fences
       WHERE company_id = $1
-        AND phase = 'firing'
-        AND firing_token IS NOT NULL
+        AND (
+          (phase = 'firing' AND firing_token IS NOT NULL)
+          OR (phase = 'cancelling' AND resolution_token IS NOT NULL)
+        )
       ORDER BY updated_at ASC`,
     [companyId],
   );
   return rows.map((row) => ({
     aggregateKey: row.aggregate_key,
+    phase: row.phase,
     firingToken: row.firing_token,
     updatedAt: row.updated_at,
   }));

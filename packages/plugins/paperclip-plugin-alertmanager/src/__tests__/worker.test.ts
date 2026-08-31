@@ -19,6 +19,7 @@ import {
 } from "../webhook-handler.js";
 import {
   handleRecoveryApiRequest,
+  listAggregateFiringFences,
   LIST_AGGREGATE_FIRING_FENCES_ROUTE,
   RECOVER_AGGREGATE_FIRING_ROUTE,
   RECOVER_AGGREGATE_FIRING_ACTION,
@@ -1683,6 +1684,143 @@ describe("aggregate firing fence recovery", () => {
       body: { error: "Alertmanager aggregate firing recovery failed" },
     });
     expect(mocks.db.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("PEN-2581 — a wedged aggregate fence names the phase that actually blocked it", () => {
+  const aggregateKey = 'alert-aggregate:v1:["CiliumPolicyDropsHigh",null]';
+
+  /**
+   * Refuse the firing-fence upsert and report `heldPhase` on read-back, which is
+   * exactly what production looked like: the conditional upsert matched no row,
+   * so the delivery threw and Alertmanager retried the whole batch forever.
+   */
+  const wedgeFenceAt = (mocks: MockClients, heldPhase: string) => {
+    mocks.db.execute.mockImplementation(async (sql: string) => {
+      if (/INSERT INTO alertmanager\.alertmanager_aggregate_lifecycle_fences/i.test(sql)) {
+        return { rowCount: 0 };
+      }
+      if (
+        /INSERT INTO alertmanager\.alertmanager_aggregate_creation_claims/i.test(sql) ||
+        /INSERT INTO alertmanager\.alertmanager_aggregate_members/i.test(sql) ||
+        /DELETE FROM alertmanager\.alertmanager_aggregate_creation_claims/i.test(sql) ||
+        /UPDATE alertmanager\.alertmanager_aggregate_lifecycle_fences/i.test(sql)
+      ) {
+        return { rowCount: 1 };
+      }
+      return { rowCount: 0 };
+    });
+    mocks.db.query.mockImplementation(async (sql: string) =>
+      /SELECT phase/i.test(sql) ? [{ phase: heldPhase }] : [],
+    );
+  };
+
+  // The regression that cost six days of fleet-wide alert loss. The upsert
+  // admits 'active' and 'finalizing', so 'finalizing' is the one phase that
+  // CANNOT refuse a firing claim — yet the old message named it unconditionally.
+  // Operators diagnosed against a condition that was never occurring.
+  it.each(["firing", "cancelling"])(
+    "reports the real holding phase %s, and never claims 'finalizing'",
+    async (heldPhase) => {
+      const { ctx, mocks } = mkCtx();
+      wedgeFenceAt(mocks, heldPhase);
+
+      await expect(
+        handleWebhook(ctx, baseConfig(), true, baseInput()),
+      ).rejects.toThrow(AlertDeliveryIncompleteError);
+
+      const logged = mocks.logger.error.mock.calls
+        .map((call) => String(call[0]))
+        .join("\n");
+      expect(logged).toContain(`is held in phase '${heldPhase}'`);
+      expect(logged).toContain(aggregateKey);
+      // The precise false statement that misdirected the investigation.
+      expect(logged).not.toContain("is finalizing");
+      // The wedge never self-clears, so the error must say what ends it.
+      expect(logged).toContain("recover-aggregate-firing");
+    },
+  );
+
+  it("reports 'unknown' rather than a phase it did not read when the fence row is gone", async () => {
+    const { ctx, mocks } = mkCtx();
+    wedgeFenceAt(mocks, "firing");
+    mocks.db.query.mockImplementation(async () => []);
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput()),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+
+    const logged = mocks.logger.error.mock.calls
+      .map((call) => String(call[0]))
+      .join("\n");
+    expect(logged).toContain("is held in phase 'unknown'");
+  });
+});
+
+describe("PEN-2581 — an interrupted cancellation is listable and recoverable", () => {
+  const aggregateKey = 'alert-aggregate:v1:["CdnEdgePublicPrDown",null]';
+  const resolutionToken = "resolution-token-interrupted";
+
+  // A resolver that dies between beginAggregateCancellation and
+  // releaseAggregateFinalization leaves phase='cancelling' held by a token no
+  // live process has. That refuses every later firing claim, so without these
+  // two paths the aggregate is wedged permanently: previously it was neither
+  // listed (the query filtered phase='firing') nor releasable.
+  it("lists a stuck cancelling fence so the operator can find its token", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.db.query.mockResolvedValueOnce([
+      {
+        aggregate_key: aggregateKey,
+        phase: "cancelling",
+        firing_token: resolutionToken,
+        updated_at: "2026-08-25T21:20:24.000Z",
+      },
+    ]);
+
+    await expect(listAggregateFiringFences(ctx, "company-1")).resolves.toEqual([
+      {
+        aggregateKey,
+        phase: "cancelling",
+        firingToken: resolutionToken,
+        updatedAt: "2026-08-25T21:20:24.000Z",
+      },
+    ]);
+
+    const [sql] = mocks.db.query.mock.calls[0];
+    expect(sql).toContain("phase = 'cancelling'");
+    expect(sql).toContain("resolution_token IS NOT NULL");
+  });
+
+  it("releases a cancelling fence on its resolution token, and only that token", async () => {
+    const { ctx, mocks } = mkCtx();
+    let phase: "cancelling" | "active" = "cancelling";
+    mocks.db.execute.mockImplementation(async (sql: string, params?: unknown[]) => {
+      const [companyId, requestedKey, requestedToken] = params ?? [];
+      const matches =
+        companyId === "company-1" &&
+        requestedKey === aggregateKey &&
+        requestedToken === resolutionToken;
+      if (/AND phase = 'cancelling'/i.test(sql) && phase === "cancelling" && matches) {
+        phase = "active";
+        return { rowCount: 1 };
+      }
+      return { rowCount: 0 };
+    });
+
+    // Wrong token releases nothing — the same CAS discipline as the firing path.
+    await expect(
+      recoverAggregateFiring(ctx, "company-1", aggregateKey, "wrong-token"),
+    ).resolves.toBe(false);
+    expect(phase).toBe("cancelling");
+
+    await expect(
+      recoverAggregateFiring(ctx, "company-1", aggregateKey, resolutionToken),
+    ).resolves.toBe(true);
+    expect(phase).toBe("active");
+    expect(mocks.db.execute).toHaveBeenLastCalledWith(
+      expect.stringContaining("AND resolution_token = $3"),
+      ["company-1", aggregateKey, resolutionToken],
+    );
   });
 });
 
