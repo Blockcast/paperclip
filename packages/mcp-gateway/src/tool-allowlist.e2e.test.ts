@@ -92,7 +92,17 @@ async function createToolUpstream(format: "json" | "sse" = "json"): Promise<Upst
   const received: UpstreamRecorder["received"] = [];
   const server = http.createServer(async (req, res) => {
     const raw = await readBody(req);
-    const message = JSON.parse(raw) as { id?: number; method?: string; params?: { name?: string } };
+    // A JSON-RPC request may be a single object or a BATCH array, and a batch
+    // is answered with an array of responses. Deriving that from the request
+    // rather than from a `format` flag keeps the fake honest: the array-shaped
+    // reply exists here for the same reason it exists in a real upstream.
+    const parsed = JSON.parse(raw) as unknown;
+    const batched = Array.isArray(parsed);
+    const message = (batched ? (parsed as unknown[])[0] : parsed) as {
+      id?: number;
+      method?: string;
+      params?: { name?: string };
+    };
 
     if (message.method === "initialize") {
       res.statusCode = 200;
@@ -118,7 +128,7 @@ async function createToolUpstream(format: "json" | "sse" = "json"): Promise<Upst
     received.push({ method: message.method ?? "?", ...(message.params?.name ? { tool: message.params.name } : {}) });
 
     if (message.method === "tools/list") {
-      const payload = JSON.stringify({
+      const response = {
         jsonrpc: "2.0",
         id: message.id ?? 1,
         result: {
@@ -128,7 +138,9 @@ async function createToolUpstream(format: "json" | "sse" = "json"): Promise<Upst
             { name: ALLOWED_TOOLS[1], description: "Lists metric names." },
           ],
         },
-      });
+      };
+      const payload = JSON.stringify(batched ? [response] : response);
+
       res.statusCode = 200;
       if (format === "sse") {
         res.setHeader("content-type", "text/event-stream");
@@ -195,6 +207,17 @@ function callRequest(name: string): string {
   return JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: {} } });
 }
 
+/**
+ * Lift the JSON-RPC document out of whichever framing carried it, so a test can
+ * assert on its *shape* rather than only on substrings of the wire body.
+ */
+function documentOf(text: string, format: "json" | "sse"): string {
+  if (format !== "sse") return text;
+  const data = text.split(/\r\n|\n|\r/).find((line) => line.startsWith("data:"));
+  if (!data) throw new Error(`no SSE data line in response: ${text}`);
+  return data.slice("data:".length).trim();
+}
+
 describe("PEN-2735: an upstream can only expose the tools its grant allows", () => {
   describe.each(["json", "sse"] as const)("tools/list filtering (%s framing)", (format) => {
     it("omits the denied tool from the prefixed route, the one the agent seed dials", async () => {
@@ -208,6 +231,50 @@ describe("PEN-2735: an upstream can only expose the tools its grant allows", () 
       for (const allowed of ALLOWED_TOOLS) expect(text).toContain(allowed);
     });
   });
+
+  describe.each(["json", "sse"] as const)(
+    "tools/list filtering inside a JSON-RPC BATCH response (%s framing)",
+    (format) => {
+      it("omits the denied tool when the upstream answers with an array of responses", async () => {
+        // A batch request is answered with an ARRAY of response objects. The
+        // filter previously bailed on any array document, so a batched
+        // `tools/list` returned denied tool definitions in full while
+        // single-object listings were filtered — the guard read as done and was
+        // open on the sibling spelling. The request side already inspects calls
+        // inside a batch (see "refuses a denied call wrapped in a JSON-RPC batch
+        // array"), so this was the response-side mirror of a hole already closed
+        // in the other direction, which is this file's recurring shape.
+        const upstream = await createToolUpstream(format);
+        const { prefixed } = await createGatewayEndpoints(upstream.url, ALLOWED_TOOLS);
+
+        const { status, text } = await post(prefixed, `[${listRequest()}]`);
+
+        expect(status).toBe(200);
+        // Assert the batch framing actually survived, so a future change that
+        // unwraps the array cannot make this pass for the wrong reason. The
+        // document has to be lifted out of its SSE frame first — the response
+        // keeps whatever framing the upstream used.
+        expect(JSON.parse(documentOf(text, format))).toBeInstanceOf(Array);
+        expect(text).not.toContain(DENIED_TOOL);
+        for (const allowed of ALLOWED_TOOLS) expect(text).toContain(allowed);
+      });
+
+      it("still redacts env material inside a batch, so both arms agree on what a document is", async () => {
+        // The redaction arm always walked arrays; the tool filter did not. That
+        // disagreement inside one composed transform is the actual defect, so
+        // pin both arms on the same batch body rather than the filter alone.
+        const upstream = await createToolUpstream(format);
+        const { prefixed } = await createGatewayEndpoints(upstream.url, ALLOWED_TOOLS);
+
+        const { text } = await post(prefixed, `[${listRequest()}]`);
+
+        expect(text).not.toContain(LEAK);
+        expect(text).toContain("<redacted>");
+        expect(text).toContain("OPENAI_API_KEY");
+        expect(text).toContain(ALLOWED_TOOLS[0]!);
+      });
+    },
+  );
 
   it("omits the denied tool from the aggregate route", async () => {
     const upstream = await createToolUpstream("json");
