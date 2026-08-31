@@ -13,6 +13,7 @@
  */
 import { loadConfig } from "../config.js";
 import {
+  extractAllyDispositionedPriorHeads,
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
@@ -130,12 +131,23 @@ function latestAttestingAllyComment(
  * Heads whose own newest attestation still carries an unresolved finding,
  * newest attestation first.
  *
- * Disposition is tracked per attested head, not by global comment recency. A
- * later clean attestation of head H disposes a finding raised against H: Ally
- * re-examined that exact tree and found nothing. A clean attestation of some
- * *other* head does not, because nothing available here establishes that the
- * other head contains the fix — comment chronology is not commit ancestry, and
- * reviews can land out of order relative to pushes.
+ * Disposition is tracked per attested head, not by global comment recency.
+ * Two things dispose a finding raised against head H:
+ *
+ *   - A later clean attestation of H itself: Ally re-examined that exact tree
+ *     and found nothing.
+ *   - A later review naming H under "Prior Findings Dispositioned" with a
+ *     resolving verb: Ally asserting directly that it re-checked that specific
+ *     finding and it is gone.
+ *
+ * A clean attestation of some *other* head disposes nothing by itself, because
+ * nothing in that alone establishes that the other head contains the fix —
+ * comment chronology is not commit ancestry, and reviews can land out of order
+ * relative to pushes. The ledger is what supplies that missing link, and
+ * reading only the first rule wedged PRs whose finding Ally had already marked
+ * resolved: on Blockcast/libmmt#362 the review of c9a1765 recorded
+ * `prior:731ced5 critical 1 — fixed`, and this gate still reported 731ced5
+ * undispositioned once the head moved on again.
  *
  * Reading only the globally newest attestation instead let A(blocking) ->
  * B(clean) -> C(unattested) drop A's finding silently (BLO-29711, Ally review
@@ -146,6 +158,7 @@ function headsWithUndispositionedFinding(
   reviewerBotLogin: string,
 ): AttestingComment[] {
   const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
+  const resolvedPriors: { shortSha: string; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -153,6 +166,10 @@ function headsWithUndispositionedFinding(
     if (!attestedHeadSha) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
+
+    for (const shortSha of extractAllyDispositionedPriorHeads(comment.body)) {
+      resolvedPriors.push({ shortSha, timeMs: commentTime, attestedHeadSha });
+    }
 
     const existing = newestPerHead.get(attestedHeadSha);
     // Ties prefer the later item, matching latestAttestingAllyComment: the
@@ -162,8 +179,25 @@ function headsWithUndispositionedFinding(
     }
   }
 
+  // A ledger entry speaks only to findings that already existed when it was
+  // written, so it must be at least as new as the attestation it clears, and it
+  // must come from a review of a different head — a review cannot disposition
+  // its own finding. That second condition is what makes `>=` safe against the
+  // second-resolution timestamps.
+  const isDispositioned = (headSha: string, attestedAtMs: number): boolean =>
+    resolvedPriors.some(
+      (prior) =>
+        prior.attestedHeadSha !== headSha &&
+        prior.timeMs >= attestedAtMs &&
+        headSha.startsWith(prior.shortSha),
+    );
+
   return [...newestPerHead.values()]
-    .filter((entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body))
+    .filter(
+      (entry) =>
+        hasActionablePrReviewFeedback(entry.attesting.comment.body) &&
+        !isDispositioned(entry.attesting.attestedHeadSha, entry.timeMs),
+    )
     .sort((a, b) => b.timeMs - a.timeMs)
     .map((entry) => entry.attesting);
 }
@@ -211,11 +245,12 @@ export function evaluateCommentReviewGate(input: {
 
   // Nothing attests this head. A finding raised against an earlier head is not
   // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). Only a later clean review of that same earlier
-  // head disposes it — see headsWithUndispositionedFinding. It clears the
-  // moment Ally attests the current head, which the push that produced this
-  // head already triggers, so this cannot wedge a PR that keeps being reviewed
-  // on the same surface.
+  // going green (BLO-29711). It is disposed by a later clean review of that
+  // same earlier head, or by a later review that names it as resolved in its
+  // prior-findings ledger — see headsWithUndispositionedFinding. It also clears
+  // the moment Ally attests the current head. Note that none of those routes
+  // exists while the reviewer itself is failing to run, which is the state that
+  // strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
     return {

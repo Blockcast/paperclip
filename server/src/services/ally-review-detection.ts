@@ -63,6 +63,46 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
   return false;
 }
 
+// A "Prior Findings Dispositioned" ledger entry, e.g.
+//   - **prior:731ced5 critical 1** — fixed — the terminator is gone.
+// Anchored to the bold list-item form Ally emits, matching the shape
+// scripts/check-ally-review-consistency.mjs already parses. The mirrored
+// `[prior:...]` references inside a Critical/Important bucket use bracket
+// syntax and deliberately do not match: those are open findings, not
+// dispositions.
+const PRIOR_FINDING_DISPOSITION_PATTERN =
+  /^[ \t]*-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})\b[^\n*]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)/gim;
+
+// Only a disposition that asserts the finding is resolved clears it. Ally's
+// other observed verb, `still-present`, asserts the opposite — the sibling
+// consistency guard treats it as a blocking verdict. An unrecognized verb also
+// does not clear: a new word in Ally's vocabulary must not silently unblock a
+// merge before anyone decides it should.
+const RESOLVED_PRIOR_DISPOSITIONS = new Set(["fixed"]);
+
+/**
+ * Abbreviated head SHAs this review explicitly reports as resolved.
+ *
+ * Ally re-states each earlier finding it has re-examined under a "Prior
+ * Findings Dispositioned" heading, naming the head the finding was raised
+ * against. That is a direct assertion about a specific prior tree, which is
+ * why it can disposition a finding that a merely-clean review of an unrelated
+ * head cannot.
+ *
+ * SHAs are returned exactly as written — Ally abbreviates them, so callers
+ * must compare by prefix against the full 40-character head.
+ */
+export function extractAllyDispositionedPriorHeads(body: string | null | undefined): string[] {
+  if (typeof body !== "string") return [];
+  const resolved = new Set<string>();
+  for (const [, shortSha, disposition] of body.matchAll(PRIOR_FINDING_DISPOSITION_PATTERN)) {
+    if (RESOLVED_PRIOR_DISPOSITIONS.has(disposition!.toLowerCase())) {
+      resolved.add(shortSha!.toLowerCase());
+    }
+  }
+  return [...resolved];
+}
+
 /** Return whether a formal or comment-shaped review contains blocking feedback. */
 export function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
   const normalizedState = state?.trim().toLowerCase();
