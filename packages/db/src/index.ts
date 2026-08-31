@@ -15,6 +15,15 @@ export {
   type Db,
 } from "./client.js";
 export {
+  checkPendingMigrationPreflight,
+  formatPreflightFailure,
+  selectGuardedPendingIndexes,
+  PRECREATE_REQUIRED_INDEXES,
+  type PrecreateRequiredIndex,
+  type PreflightBlocker,
+  type PendingMigrationPreflightResult,
+} from "./pending-migration-preflight.js";
+export {
   ensurePendingConcurrentIndexes,
   PENDING_CONCURRENT_INDEXES,
   type ConcurrentIndexSpec,
