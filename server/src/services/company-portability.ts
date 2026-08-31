@@ -1878,13 +1878,36 @@ function redactPortableAgentRecord<T extends Record<string, unknown> | null>(
  *
  * Matching on the sentinel is deliberate: it is the one value the redactor
  * writes, so this stays correct without re-deriving which keys were secret.
+ *
+ * It matches `includes`, not `===`, because the redactor does not always write
+ * the sentinel as the whole value — in three reachable places it splices it
+ * into a longer string:
+ *
+ *  - `redactUriCredentialsInValue` rewrites a URI's userinfo
+ *    (`https://user:<mask>@host/path`) and a credential query parameter
+ *    (`?access_token=<mask>`). Reached through `sanitizeValue`, so it applies
+ *    to any string key — `adapterConfig.mcpServers.*.url` above all.
+ *  - `redactSensitiveText` rewrites JSON and env-assignment secret fields
+ *    *inside* a blob. Reached for `COMMAND_PAYLOAD_KEY_RE` keys, and per
+ *    element for `args` via `sanitizeCommandArgs`.
+ *
+ * An equality test let all of them through, and the surviving string is worse
+ * than the bare sentinel: `https://user:***REDACTED***@host` looks like a
+ * working URL, so it is persisted as `adapterConfig` and the agent
+ * authenticates as the literal mask. `includes` closes the class rather than
+ * those spellings, so a fourth splice site added to the redactor later is
+ * covered here by construction.
+ *
+ * A real config value that legitimately contains `***REDACTED***` would be
+ * dropped too. That is the safe direction — the field is re-suppliable and the
+ * warning names it, whereas the other error installs a mask as a credential.
  */
 function stripRedactedPlaceholders(
   value: unknown,
   found: string[],
   prefix = "",
 ): unknown {
-  if (value === REDACTED_EVENT_VALUE) {
+  if (typeof value === "string" && value.includes(REDACTED_EVENT_VALUE)) {
     found.push(prefix || "(root)");
     return undefined;
   }
