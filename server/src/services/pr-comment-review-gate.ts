@@ -13,10 +13,12 @@
  */
 import { loadConfig } from "../config.js";
 import {
-  extractAllyDispositionedPriorHeads,
+  extractAllyDispositionedPriorFindings,
+  extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  type AllyDispositionedPriorFinding,
 } from "./ally-review-detection.js";
 import {
   githubFetchPrHeadSha,
@@ -136,9 +138,11 @@ function latestAttestingAllyComment(
  *
  *   - A later clean attestation of H itself: Ally re-examined that exact tree
  *     and found nothing.
- *   - A later review naming H under "Prior Findings Dispositioned" with a
- *     resolving verb: Ally asserting directly that it re-checked that specific
- *     finding and it is gone.
+ *   - A later review retiring *every* finding H raised, by name, under "Prior
+ *     Findings Dispositioned": Ally asserting directly that it re-checked those
+ *     specific findings and they are gone. Retiring only some of them leaves H
+ *     carried — one `fixed` entry must not clear a review that reported several
+ *     findings.
  *
  * A clean attestation of some *other* head disposes nothing by itself, because
  * nothing in that alone establishes that the other head contains the fix —
@@ -158,7 +162,7 @@ function headsWithUndispositionedFinding(
   reviewerBotLogin: string,
 ): AttestingComment[] {
   const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
-  const resolvedPriors: { shortSha: string; timeMs: number; attestedHeadSha: string }[] = [];
+  const resolvedPriors: { finding: AllyDispositionedPriorFinding; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -167,8 +171,8 @@ function headsWithUndispositionedFinding(
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
 
-    for (const shortSha of extractAllyDispositionedPriorHeads(comment.body)) {
-      resolvedPriors.push({ shortSha, timeMs: commentTime, attestedHeadSha });
+    for (const finding of extractAllyDispositionedPriorFindings(comment.body)) {
+      resolvedPriors.push({ finding, timeMs: commentTime, attestedHeadSha });
     }
 
     const existing = newestPerHead.get(attestedHeadSha);
@@ -184,19 +188,37 @@ function headsWithUndispositionedFinding(
   // must come from a review of a different head — a review cannot disposition
   // its own finding. That second condition is what makes `>=` safe against the
   // second-resolution timestamps.
-  const isDispositioned = (headSha: string, attestedAtMs: number): boolean =>
+  const isRetired = (
+    headSha: string,
+    attestedAtMs: number,
+    finding: { severity: string; index: number },
+  ): boolean =>
     resolvedPriors.some(
       (prior) =>
         prior.attestedHeadSha !== headSha &&
         prior.timeMs >= attestedAtMs &&
-        headSha.startsWith(prior.shortSha),
+        headSha.startsWith(prior.finding.shortSha) &&
+        prior.finding.severity === finding.severity &&
+        prior.finding.index === finding.index,
     );
+
+  // A head is dispositioned only once *every* finding it raised has been
+  // retired by name. Matching on the head alone would let one `fixed` entry
+  // clear a review that reported several findings, dropping the ones the ledger
+  // never mentioned. `null` means the blocking feedback came from prose or an
+  // uncounted heading, so no finding identities exist to match against and the
+  // head stays carried.
+  const isFullyDispositioned = (entry: { attesting: AttestingComment; timeMs: number }): boolean => {
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported || reported.length === 0) return false;
+    return reported.every((finding) =>
+      isRetired(entry.attesting.attestedHeadSha, entry.timeMs, finding),
+    );
+  };
 
   return [...newestPerHead.values()]
     .filter(
-      (entry) =>
-        hasActionablePrReviewFeedback(entry.attesting.comment.body) &&
-        !isDispositioned(entry.attesting.attestedHeadSha, entry.timeMs),
+      (entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body) && !isFullyDispositioned(entry),
     )
     .sort((a, b) => b.timeMs - a.timeMs)
     .map((entry) => entry.attesting);
