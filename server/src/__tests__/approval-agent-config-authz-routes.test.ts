@@ -207,6 +207,34 @@ describe("hire_agent approval reads withhold agent config without agent_config:r
     expect(res.body[0].payload.requestedConfigurationSnapshot.adapterConfig).toEqual({});
   }, 15000);
 
+  it("hides the topology when the config arrives in a non-object shape", async () => {
+    // Cards filed through `POST /companies/:companyId/approvals` carry whatever
+    // the filer sent: `approvalPayloadSchema` is a `.catchall(z.unknown())` and
+    // `normalizeHireApprovalPayloadForPersistence` only normalizes a record, so
+    // these keys can hold an array or a JSON string in a persisted hire payload.
+    // Both carry the upstream, so entitlement must not depend on the shape.
+    decideWithAgentConfigRead(false);
+    mockApprovalService.getById.mockResolvedValue(
+      hireApproval({
+        payload: {
+          name: "New Worker",
+          adapterType: "claude_k8s",
+          adapterConfig: [{ mcpServers: { k8s: { url: ADMIN_UPSTREAM } } }],
+          runtimeConfig: JSON.stringify({ mcpServers: { k8s: { url: ADMIN_UPSTREAM } } }),
+        },
+      }),
+    );
+
+    const res = await request(await createAppWithActor(peerAgentActor)).get("/api/approvals/approval-1");
+
+    expect(res.status).toBe(200);
+    expect(serializedBody(res.body)).not.toContain("k8s-mcp-admin.internal");
+    expect(res.body.payload.adapterConfig).toEqual({});
+    expect(res.body.payload.runtimeConfig).toEqual({});
+    expect(res.body.payload.name).toBe("New Worker");
+    expect(res.body.withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+  }, 15000);
+
   it("still shows the config to an agent that does hold agent_config:read", async () => {
     decideWithAgentConfigRead(true);
     mockApprovalService.getById.mockResolvedValue(hireApproval());

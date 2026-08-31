@@ -36,9 +36,12 @@ topology.
 Reading the card needs `company_scope:read`; reading that embedded configuration
 needs `agent_config:read`, the same grant `GET /api/agents/{agentId}` requires.
 Callers without it get the card with every `adapterConfig` / `runtimeConfig`
-subtree blanked to `{}` (at any depth, including
-`requestedConfigurationSnapshot`) and the blanked paths listed in a
-`withheldFields` array. Board members of the company keep the configuration.
+value blanked to `{}` (at any depth, including
+`requestedConfigurationSnapshot`, and whatever shape the value has — the payload
+schema does not constrain these keys) and the blanked paths listed in a
+`withheldFields` array. An absent config (`null`) stays readable, so "you may
+not see this" is still distinguishable from "no config was requested". Board
+members of the company keep the configuration.
 
 The same rule applies to `GET /api/companies/{companyId}/approvals` and
 `GET /api/issues/{issueId}/approvals`. It is a read projection only: the stored

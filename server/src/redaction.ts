@@ -687,9 +687,10 @@ const WITHHELD_AGENT_CONFIG_KEYS = new Set(["adapterConfig", "runtimeConfig"]);
  * same-company agent is auto-allowed, so the weaker sibling path disclosed a
  * reconnaissance surface the gated one withheld (PEN-2777).
  *
- * Applied at any depth: the payload already carries the pair twice
- * (`requestedConfigurationSnapshot.adapterConfig`), and a new copy would
- * otherwise reopen the hole silently.
+ * Applied at any depth and to any shape: the payload already carries the pair
+ * twice (`requestedConfigurationSnapshot.adapterConfig`), and a new copy — or a
+ * caller-chosen shape under the same key — would otherwise reopen the hole
+ * silently.
  *
  * Blanked to `{}` rather than `REDACTED_EVENT_VALUE` to match
  * `redactForRestrictedAgentView`'s restricted-agent shape, and to keep that
@@ -711,9 +712,17 @@ export function withholdAgentConfigFromApprovalPayload(
     const out: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {
       const childPath = path ? `${path}.${key}` : key;
-      // Only object-shaped values can carry topology; a null or a string keeps
-      // its meaning ("no config was requested") without disclosing anything.
-      if (WITHHELD_AGENT_CONFIG_KEYS.has(key) && isPlainObject(entry)) {
+      // Entitlement cannot depend on shape. Every path that builds a hire card
+      // server-side writes an object here, but `approvalPayloadSchema` is a
+      // `.catchall(z.unknown())`, so `POST /companies/:companyId/approvals` and
+      // the resubmit route persist whatever the filer sent, and
+      // `normalizeHireApprovalPayloadForPersistence` passes a non-record through
+      // untouched. An array of configs or a JSON-encoded string carries exactly
+      // the topology this gate withholds, so an object-only test would let the
+      // shape pick the authorization outcome. `null`/`undefined` stay readable:
+      // they carry no topology and are the honest "no config was requested" the
+      // board queue renders.
+      if (WITHHELD_AGENT_CONFIG_KEYS.has(key) && entry !== null && entry !== undefined) {
         withheldFields.push(childPath);
         out[key] = {};
         continue;
