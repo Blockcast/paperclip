@@ -698,6 +698,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         .select({
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           executionPolicy: issues.executionPolicy,
           executionState: issues.executionState,
@@ -738,7 +739,10 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         .toBe("scheduled");
     }
 
-    it("clears a monitor the checkout-restore demotion would otherwise strand", async () => {
+    // BLO-29554: BLO-28900 cleared the monitor a restore stranded, which stopped
+    // the row lying about being scheduled but still threw the scheduled work
+    // away. The restore now declines instead, so the wake survives.
+    it("keeps the checkout promotion while a dispatchable monitor is armed", async () => {
       const { agentId, issue, runId } = await seedCheckoutFixture("todo");
 
       await svc.checkout(issue.id, agentId, ["todo"], runId);
@@ -747,14 +751,66 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       await finishRun(runId);
       await svc.clearCheckoutRunIfTerminal(issue.id);
 
+      const held = await readMonitor(issue.id);
+      // `in_progress` plus an agent assignee is exactly what
+      // `tickDueIssueMonitors` selects on, so this row can still be dispatched.
+      expect(held.status).toBe("in_progress");
+      expect(held.assigneeAgentId).toBe(agentId);
+      expect(held.monitorNextCheckAt).toEqual(new Date(MONITOR_CHECK_AT));
+      expect(held.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      // Deferred, not cancelled: the marker is what lets the demotion still
+      // happen at the end of the run this monitor wakes.
+      expect(held.checkoutRestoreStatus).toBe("todo");
+    });
+
+    it("restores the deferred demotion once the monitor is no longer armed", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+      expect(await readMonitor(issue.id)).toMatchObject({ status: "in_progress" });
+
+      // Stand in for the woken run finishing without re-arming. Without this the
+      // test above only proves the demotion was skipped, not that it was merely
+      // postponed — a skip that never resolves is the BLO-20649 high-water mark.
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: null })
+        .where(eq(issues.id, issue.id));
+
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(true);
+      expect(await readMonitor(issue.id)).toMatchObject({
+        status: "todo",
+        checkoutRestoreStatus: null,
+      });
+    });
+
+    it("clears a monitor the restore strands when the agent assignee is gone", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      // An unassigned monitor is undeliverable at every status, so there is no
+      // promotion worth holding and the reconciler still has to run here.
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: null })
+        .where(eq(issues.id, issue.id));
+      await finishRun(runId);
+
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(true);
+
       const restored = await readMonitor(issue.id);
       expect(restored.status).toBe("todo");
-      // The assignee survives a checkout-restore, so status is the only failed
-      // eligibility condition.
-      expect(restored.assigneeAgentId).toBe(agentId);
       expect(restored.monitorNextCheckAt).toBeNull();
       expect(restored.executionState).toMatchObject({
-        monitor: { status: "cleared", clearReason: "invalid_status" },
+        monitor: { status: "cleared", clearReason: "invalid_assignee" },
       });
       expect((restored.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
     });
