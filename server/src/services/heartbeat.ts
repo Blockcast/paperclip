@@ -21939,7 +21939,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // run-labelled pods have stopped. Reuse the same fail-closed probe as
         // cancellation: an active or unobservable external runtime keeps the
         // lease until a later reconciliation pass can prove quiescence.
-        const externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
+        const externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced({ id: run.runId });
         if (!externalRuntimeQuiesced) continue;
       }
       const releaseResult = await releaseEnvironmentLeasesForRun({
