@@ -11,6 +11,7 @@ import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -377,12 +378,23 @@ export function accessService(db: Db) {
           executionLockedAt: null,
         })
         .where(and(assignedOpenIssueWhere, eq(issues.status, "in_progress")))
-        .returning({ id: issues.id });
+        .returning();
       const reassigned = await tx
         .update(issues)
         .set(assignmentPatch)
         .where(and(assignedOpenIssueWhere, ne(issues.status, "in_progress")))
-        .returning({ id: issues.id });
+        .returning();
+
+      for (const issue of [...resetInProgress, ...reassigned]) {
+        const monitorPatch = buildIssueMonitorEligibilityPatch(issue);
+        if (Object.keys(monitorPatch).length === 0) continue;
+        await tx.update(issues).set({ ...monitorPatch, updatedAt: new Date() }).where(and(
+          eq(issues.id, issue.id),
+          issue.monitorNextCheckAt
+            ? eq(issues.monitorNextCheckAt, issue.monitorNextCheckAt)
+            : sql`${issues.monitorNextCheckAt} is null`,
+        ));
+      }
 
       await tx
         .delete(principalPermissionGrants)
