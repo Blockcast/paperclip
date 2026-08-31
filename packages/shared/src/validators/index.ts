@@ -312,6 +312,7 @@ export {
   skillTestAgentKeyScopeSchema,
   createAgentKeySchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
