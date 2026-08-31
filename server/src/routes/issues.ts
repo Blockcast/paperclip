@@ -143,7 +143,7 @@ import {
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -10046,7 +10046,9 @@ export function issueRoutes(
     if (!issue) return;
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+    });
     res.json(approvals);
   });
 
@@ -10077,7 +10079,9 @@ export function issueRoutes(
       details: { approvalId: req.body.approvalId },
     });
 
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+    });
     res.status(201).json(approvals);
   });
 

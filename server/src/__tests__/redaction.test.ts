@@ -7,6 +7,7 @@ import {
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
+  withholdAgentConfigFromApprovalPayload,
 } from "../redaction.js";
 
 describe("redaction", () => {
@@ -743,6 +744,53 @@ describe("redactAgentConfigPayload", () => {
       env: { target: REDACTED_EVENT_VALUE },
       colorChoice: { type: "plain", value: REDACTED_EVENT_VALUE },
     });
+  });
+
+  it("withholds every agent-config subtree from a hire payload, at any depth (PEN-2777)", () => {
+    // The redactors above decide what is secret; this decides what an
+    // ungranted caller is entitled to. The masked-but-diagnosable upstream is
+    // exactly what survives them, so it is what has to be withheld here.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const payload = {
+      name: "Worker",
+      adapterType: "claude_k8s",
+      adapterConfig: { mcpServers: { k8s: { url: upstream } } },
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { mcpServers: {} } } } },
+      requestedConfigurationSnapshot: {
+        adapterType: "claude_k8s",
+        adapterConfig: { mcpServers: { k8s: { url: upstream } } },
+      },
+    };
+
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload(
+      "hire_agent",
+      structuredClone(payload),
+    );
+
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      name: "Worker",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      requestedConfigurationSnapshot: { adapterType: "claude_k8s", adapterConfig: {} },
+    });
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+  });
+
+  it("leaves non-hire approval payloads untouched when withholding agent config", () => {
+    const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
+    const { payload: untouched, withheldFields } = withholdAgentConfigFromApprovalPayload(
+      "request_board_approval",
+      structuredClone(payload),
+    );
+
+    expect(untouched).toEqual(payload);
+    expect(withheldFields).toEqual([]);
   });
 
   it("leaves redactEventPayload unchanged for the same input", () => {
