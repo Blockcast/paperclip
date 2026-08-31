@@ -181,6 +181,49 @@ describeEmbeddedPostgres("access service", () => {
     expect(historicalIssue.assigneeUserId).toBe(member.principalId);
   });
 
+  it("clears monitors when bulk company-access removal demotes a user-assigned issue", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const member = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `member-${randomUUID()}`,
+        status: "active",
+        membershipRole: "operator",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const monitorAt = new Date("2026-08-31T17:00:00.000Z");
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "Bulk access assigned issue",
+        status: "in_progress",
+        assigneeUserId: member.principalId,
+        monitorNextCheckAt: monitorAt,
+        executionPolicy: {
+          monitor: { nextCheckAt: monitorAt.toISOString(), scheduledBy: "assignee" },
+        },
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    await accessService(db).setUserCompanyAccess(member.principalId, [], {
+      actorUserId: owner.principalId,
+    });
+
+    const reconciled = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issue.id))
+      .then((rows) => rows[0]!);
+    expect(reconciled.monitorNextCheckAt).toBeNull();
+    expect((reconciled.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
+      .toMatchObject({ status: "cleared", clearReason: "invalid_assignee" });
+  });
+
   it("rejects instance-level company access removal for self and protected users", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const access = accessService(db);
