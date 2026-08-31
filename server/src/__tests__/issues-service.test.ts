@@ -763,6 +763,37 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       expect(held.checkoutRestoreStatus).toBe("todo");
     });
 
+    // BLO-29554 review follow-up: `holdsDispatchableMonitor` deliberately omits
+    // the `companies.status = 'active'` condition that `tickDueIssueMonitors`
+    // also joins on. Both non-active statuses are reversible, so folding it in
+    // would let a pause restore the row and clear the monitor as
+    // `invalid_status` — destroying an armed wake that reactivation would
+    // otherwise have fired. This pins the divergence as intended, not an
+    // oversight to be tidied away.
+    it("holds the promotion for a paused company so reactivation can still fire", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await db
+        .update(companies)
+        .set({ status: "paused" })
+        .where(eq(companies.id, companyId));
+
+      await finishRun(runId);
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(false);
+
+      const held = await readMonitor(issue.id);
+      expect(held.status).toBe("in_progress");
+      expect(held.monitorNextCheckAt).toEqual(new Date(MONITOR_CHECK_AT));
+      // The wake survives the pause intact — this is the assertion that fails if
+      // company status is ever added to the guard.
+      expect(held.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(held.checkoutRestoreStatus).toBe("todo");
+    });
+
     it("restores the deferred demotion once the monitor is no longer armed", async () => {
       const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
 

@@ -97,10 +97,30 @@ export async function releaseIssueRunOwnership(
 /**
  * BLO-29554 — a row parked on a monitor the run deliberately armed.
  *
- * These are `tickDueIssueMonitors`'s own dispatch columns minus the due-time
- * check, so this is the dispatcher's eligibility test rather than a restatement
- * of it: while it holds, the only thing standing between the row and its wake is
- * the `in_progress` status the restore is about to take away.
+ * These are the per-issue columns `tickDueIssueMonitors` dispatches on, minus
+ * the due-time check: while this holds, the only thing about the *row* standing
+ * between it and its wake is the `in_progress` status the restore is about to
+ * take away.
+ *
+ * It is deliberately not the dispatcher's whole predicate. `tickDueIssueMonitors`
+ * also joins `companies` and requires `status = 'active'`, and that condition is
+ * excluded here on purpose, because the two predicates are answering different
+ * questions. The dispatcher asks "can this fire *now*"; this guard asks "is the
+ * scheduled work still worth keeping". Company status is the one input where
+ * those diverge: `paused` and `archived` are both reversible administrative
+ * states — `routes/companies.ts` handles `paused → active` and
+ * `archived → active` explicitly, un-pausing the agents it parked — so a
+ * non-active company means "not yet", not "never".
+ *
+ * Folding company status in would therefore make teardown during a pause restore
+ * the row and let {@link reconcileRestoredMonitors} clear the monitor as
+ * `invalid_status`, destroying the armed wake permanently. Reactivating the
+ * company could not bring it back. That is precisely the loss this fix exists to
+ * prevent, triggered by a routine admin action instead of a run ending. Holding
+ * the promotion instead costs a stale-looking `in_progress` in a company where
+ * nothing dispatches at all — inert while it stays non-active, and correct the
+ * moment it comes back, because the monitor is still there to fire and the
+ * preserved marker still lands the demotion at the end of the run it wakes.
  */
 const holdsDispatchableMonitor = sql`(
   ${issues.monitorNextCheckAt} is not null
