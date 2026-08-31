@@ -397,6 +397,14 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
   );
 });
 
+test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and runbook", () => {
+  const rendered = renderChart(["--show-only", "templates/prometheusrule.yaml", "--set", "prometheusRule.enabled=true"]);
+  assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated/);
+  assert.match(rendered, /histogram_quantile\(0\.95, sum by \(le\) \(rate\(paperclip_pr_review_queue_wait_seconds_bucket\[6h\]\)\)\) > 3600/);
+  assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?for: 10m/);
+  assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?runbook_url: "[^\"]*runbooks\/pr-review-queue-wait\.md"/);
+});
+
 test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
   // BLO-23413: this alert was verified structurally unable to fire on the
   // live cluster (kube-state-metrics only ever emits ONE post-failure

@@ -575,6 +575,11 @@ prometheusRule:
   externalRuntimeReservationStrandMetricsRefreshFailureFor: 5m
   # -- Runbook for the stranded-reservation and metric-freshness alerts, linked from their annotations.
   externalRuntimeReservationStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/external-runtime-reservation-stranded.md"
+  # -- Rolling window and hold time for PR-review queue-wait saturation.
+  prReviewQueueWaitWindow: 6h
+  prReviewQueueWaitFor: 10m
+  prReviewQueueWaitThresholdSeconds: 3600
+  prReviewQueueWaitRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/pr-review-queue-wait.md"
   # -- Prometheus regex of suppression causes that mean an outage rather than a deliberate decline (BLO-18859). Expected policy declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded so they never page. `other` is included: it is the bucket for a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES, and an untriaged cause is not a known-good decline.
   githubDeliverySuppressionOutageCauses: "heartbeat.scheduling_suppressed|dispatch_rejected|other"
   # -- How long an installed plugin may sit at status='error' before firing (BLO-21092/BLO-20410). Long enough to ride out a deploy's brief activation retries (BLO-978 makes activation timeouts retry rather than latch), short enough that a genuinely dead plugin -- a bad manifest, an expired credential in `initialize` -- pages within the hour. Unlike the wake-terminal-failed alert above, a plain `for:` is safe here: paperclip_plugin_error already carries plugin_id/plugin_key labels, so Prometheus tracks continuity per plugin series rather than summing plugins together.
