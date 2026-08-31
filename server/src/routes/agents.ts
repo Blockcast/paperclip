@@ -149,14 +149,21 @@ export function isRedactedEnvBinding(binding: unknown): boolean {
 const OMIT_REDACTED_ADAPTER_VALUE = Symbol("omit-redacted-adapter-value");
 
 function containsRedactedAdapterValue(value: unknown): boolean {
-  if (value === REDACTED_EVENT_VALUE) return true;
+  if (typeof value === "string") return value.includes(REDACTED_EVENT_VALUE);
   if (Array.isArray(value)) return value.some(containsRedactedAdapterValue);
   if (!value || typeof value !== "object") return false;
   return Object.values(value as Record<string, unknown>).some(containsRedactedAdapterValue);
 }
 
 function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
-  if (incoming === REDACTED_EVENT_VALUE) {
+  // PEN-2747: the URI-credential rule masks only the credential *component* of
+  // a URL, so the round-tripped value is `https://user:***REDACTED***@host/mcp`
+  // — a string that merely CONTAINS the sentinel rather than equalling it. An
+  // equality test misses it and persists a broken upstream URL, which is the
+  // BLO-5xxx failure mode described above (a sentinel written back into live
+  // config killed every run) with a different shape. Substring-test instead:
+  // no legitimate configured value contains this sentinel.
+  if (typeof incoming === "string" && incoming.includes(REDACTED_EVENT_VALUE)) {
     return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
   }
   if (
