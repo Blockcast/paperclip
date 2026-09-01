@@ -170,6 +170,7 @@
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",
       "multer": ">=2.2.0 <3",
+      "browserslist": ">=4.28.7 <5",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
       "lexical": "0.46.0",
