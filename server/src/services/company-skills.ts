@@ -97,6 +97,7 @@ import { issueDocumentSelect, mapIssueDocumentRow } from "./documents.js";
 import { toIssueWorkProduct } from "./work-products.js";
 import { projectService } from "./projects.js";
 import { normalizePortablePath } from "./portable-path.js";
+import { redactAgentConfigPayload, withholdAgentConfigKeys } from "../redaction.js";
 import { folderService } from "./folders.js";
 import {
   copyCatalogSkillFile,
@@ -1915,6 +1916,27 @@ function emptyTestRunCost() {
   };
 }
 
+/**
+ * Read projection for `agent_config_snapshot` (PEN-2839, door #10 on the
+ * PEN-2370 series).
+ *
+ * The column holds a point-in-time copy of the *subject* agent's config, and
+ * `GET /companies/:companyId/skills/:skillId/test-runs[/:runId]` is gated by
+ * `assertCompanyAccess` alone — which admits any same-company agent actor.
+ * That is a weaker entitlement than `GET /agents/:id`, which hands the same
+ * material only to a caller holding `agent_config:read`. Same asymmetry the
+ * `hire_agent` approval card had in PEN-2777, so it takes the same control
+ * rather than a second one.
+ *
+ * Applied on read, not only on write, because rows persisted before the write
+ * path was fixed still hold the pair in the clear. A write-only fix would leave
+ * every existing test run disclosing.
+ */
+function withheldAgentConfigSnapshot(value: unknown): Record<string, unknown> {
+  if (!isPlainRecord(value)) return {};
+  return withholdAgentConfigKeys(value).payload;
+}
+
 function toCompanySkillTestRun(
   row: CompanySkillTestRunRow,
   cost = emptyTestRunCost(),
@@ -1923,7 +1945,7 @@ function toCompanySkillTestRun(
   return {
     ...row,
     inputId: row.inputId ?? null,
-    agentConfigSnapshot: isPlainRecord(row.agentConfigSnapshot) ? row.agentConfigSnapshot : {},
+    agentConfigSnapshot: withheldAgentConfigSnapshot(row.agentConfigSnapshot),
     templateId: row.templateId ?? null,
     templateName: row.templateName ?? null,
     templateBody: row.templateBody ?? null,
@@ -5892,8 +5914,18 @@ export function companySkillService(db: Db) {
 
   function snapshotAgentConfig(agent: Awaited<ReturnType<typeof agents.getById>>) {
     if (!agent) return {};
-    const adapterConfig = isPlainRecord(agent.adapterConfig) ? agent.adapterConfig : {};
-    const runtimeConfig = isPlainRecord(agent.runtimeConfig) ? agent.runtimeConfig : {};
+    // `agents.getById` returns the raw row — redaction of this material lives at
+    // the route layer (`routes/agents.ts`), so a service-layer caller receives
+    // `adapterConfig.env` in plaintext. Redact before persisting so the column
+    // is not credential material at rest (PEN-2839). The read projection in
+    // `withheldAgentConfigSnapshot` withholds the pair independently; neither
+    // end is load-bearing for the other.
+    const adapterConfig = redactAgentConfigPayload(
+      isPlainRecord(agent.adapterConfig) ? agent.adapterConfig : {},
+    ) ?? {};
+    const runtimeConfig = redactAgentConfigPayload(
+      isPlainRecord(agent.runtimeConfig) ? agent.runtimeConfig : {},
+    ) ?? {};
     return {
       agentId: agent.id,
       name: agent.name,

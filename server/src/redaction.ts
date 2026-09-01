@@ -704,6 +704,33 @@ export function withholdAgentConfigFromApprovalPayload(
   payload: Record<string, unknown>,
 ): { payload: Record<string, unknown>; withheldFields: string[] } {
   if (type !== "hire_agent" || !isPlainObject(payload)) return { payload, withheldFields: [] };
+  return withholdAgentConfigKeys(payload);
+}
+
+/**
+ * The entitlement filter itself, with no payload-type precondition, so every
+ * read projection that reaches an agent's config pair under a weaker
+ * entitlement than `agent_config:read` can share one implementation.
+ *
+ * Extracted from `withholdAgentConfigFromApprovalPayload` rather than copied.
+ * This class propagates by copying: each of doors #7-#10 was the same
+ * disclosure re-derived on a path whose author could not see the others, and
+ * the array bypass Ally caught in #1574 is exactly the sort of correction a
+ * second copy silently misses. One walk means a finding against it lands
+ * everywhere at once.
+ *
+ * Callers, all reaching the pair under `company_scope:read`:
+ * - `hire_agent` approval cards (PEN-2777)
+ * - skill test-run `agentConfigSnapshot` (PEN-2839) — which additionally
+ *   persisted the pair unredacted, so this read projection is what repairs
+ *   rows already written.
+ *
+ * Read projection only: nothing here rewrites a stored row.
+ */
+export function withholdAgentConfigKeys(
+  payload: Record<string, unknown>,
+): { payload: Record<string, unknown>; withheldFields: string[] } {
+  if (!isPlainObject(payload)) return { payload, withheldFields: [] };
   const withheldFields: string[] = [];
 
   function walk(value: unknown, path: string): unknown {

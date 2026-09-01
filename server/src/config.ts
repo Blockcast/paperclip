@@ -102,6 +102,8 @@ export interface Config {
   // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
   strandedBlockedIssueReconcilerEnabled: boolean;
   strandedRecoveryHandBackDrainEnabled: boolean;
+  strandedRecoveryHandBackMaxPerPass: number;
+  strandedRecoveryHandBackIntervalMinutes: number;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
   // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
   // to a durable, human-assigned issue refreshed in place each period. Worker-tier
@@ -320,6 +322,57 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  // BLO-19123. Per-tick ceiling on how many *distinct* rows the hand-back drain returns.
+  //
+  // The pass already had two per-issue guards — max 2 hand-backs per source issue and a 6h
+  // source-scoped cooldown — but those bound how often a single row can bounce, not how many
+  // rows move in a tick. Volume was governed only by the candidate limit's 500 default, so
+  // the first tick after the drain flag flipped would have returned the entire backlog at
+  // once (89 rows on the CEO alone, ~360 estate-wide when the plan was written).
+  //
+  // The original justification for metering was destination load: a single pass would take the
+  // CTO from 369 open `todo` to 458, and at ~7.8 closures/day that is weeks of queue. That
+  // reasoning was checked against the implementation on 2026-09-01 and does **not** hold at flip
+  // time. The pass is ownership-only: it rewrites the owner on rows that are already `blocked`
+  // (`recovery/service.ts`, `status: "blocked"`) and enqueues no wake, so at the moment the flag
+  // flips it adds zero dispatchable work to any destination queue. The deferred load arrives
+  // later, spread across the natural blocker-resolution rate — which is the rate at which that
+  // work becomes real anyway.
+  //
+  // The meter is still correct, for a different and better reason: **blast-radius reversibility
+  // against a bug in the gates.** A mis-routing defect in the eligibility or evidence checks
+  // costs one bounded pass of rows, not the whole backlog. Do not read the collapse of the load
+  // argument as grounds to widen the count or shorten the interval — the reason changed, the
+  // requirement did not.
+  //
+  // Deferred rows are not lost. They are enumerated per row with reason
+  // `candidate_limit_deferred` and picked up on the next tick, so a low ceiling trades drain
+  // latency for observability rather than completeness. Ceiling is the service-side candidate
+  // default, which is the most this ever did before it was metered.
+  strandedRecoveryHandBackMaxPerPass: { fallback: 10, min: 1, max: 500 },
+  // BLO-19123. How often that bounded pass is allowed to run — the other half of the meter.
+  //
+  // The count above bounds one pass; this bounds the rate. They are only useful together: the
+  // drain rides the heartbeat tick (30s by default), so a count alone still returns ~90 rows
+  // in under five minutes, which is the bulk move the meter exists to prevent. At the 60m
+  // default, 10 rows/hour clears a ~90-row backlog over about nine passes.
+  //
+  // What those nine passes buy is a window to catch a *gate* defect — a row routed to the wrong
+  // owner by a bug in the eligibility or evidence checks — while it has cost one batch instead
+  // of the backlog. It is explicitly **not** about giving the destination queue time to absorb
+  // load; that premise was checked and dropped (see the count above). An earlier draft of this
+  // comment reasoned in "ticks" as if a tick were an observation interval: it is 30 seconds, so
+  // nine of them is 4.5 minutes — a bulk return with extra steps, not a rate anyone can watch.
+  // The hour is what makes the passes separable events.
+  //
+  // Floor of 1m rather than 0: "no delay" would silently restore the per-tick behaviour this
+  // setting exists to remove, and an operator who wants the drain faster should raise the
+  // count, where the blast radius of the change is legible.
+  strandedRecoveryHandBackIntervalMinutes: {
+    fallback: 60,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   humanGatedDigestIntervalMinutes: {
     fallback: 360,
     min: 1,
@@ -368,6 +421,11 @@ export const TIMER_SETTING_MS_FACTOR = {
   databaseBackupIntervalMinutes: 60_000,
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  // Minute-denominated like its neighbours, though it gates an elapsed-time comparison rather
+  // than a `setInterval` delay. Registered anyway: the guard that requires this entry keys off
+  // the name, and an unregistered minute setting is exactly the omission that guard exists to
+  // catch — being exempt on a technicality would make the next real one invisible too.
+  strandedRecoveryHandBackIntervalMinutes: 60_000,
   humanGatedDigestIntervalMinutes: 60_000,
   prReviewStateReconcilerIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
@@ -682,6 +740,19 @@ export function loadConfig(): Config {
   // keeps those two decisions separate — enabling the flag is the drain.
   const strandedRecoveryHandBackDrainEnabled =
     process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED === "true";
+  // The rate, separate from the on/off above so it can be tuned without a second deploy:
+  // the flag decides *whether* rows return, this decides *how fast*. See the bound's
+  // rationale in NUMERIC_SETTING_BOUNDS.
+  const strandedRecoveryHandBackMaxPerPass = resolveNumericSetting(
+    [process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_MAX_PER_PASS],
+    NUMERIC_SETTING_BOUNDS.strandedRecoveryHandBackMaxPerPass,
+    "strandedRecoveryHandBackMaxPerPass",
+  );
+  const strandedRecoveryHandBackIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.strandedRecoveryHandBackIntervalMinutes,
+    "strandedRecoveryHandBackIntervalMinutes",
+  );
   // Human-gated ageing digest (BLO-29420). Enabled by default, consistent with
   // the reconcilers above: BLO-19130's escalation shipped inert and never fired
   // once, so an opt-in flag would just be a second way to stay silent. The sweep
@@ -835,6 +906,8 @@ export function loadConfig(): Config {
     prReconcilerEnrichLoc,
     strandedBlockedIssueReconcilerEnabled,
     strandedRecoveryHandBackDrainEnabled,
+    strandedRecoveryHandBackMaxPerPass,
+    strandedRecoveryHandBackIntervalMinutes,
     strandedBlockedIssueReconcilerIntervalMinutes,
     humanGatedDigestEnabled,
     humanGatedDigestIntervalMinutes,
