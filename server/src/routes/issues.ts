@@ -194,6 +194,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  isMonitorNextCheckAtLive,
   mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -1013,15 +1014,34 @@ function hasExecutionParticipant(value: unknown) {
   return false;
 }
 
+/**
+ * Is there a monitor that will actually wake this issue after the write lands?
+ *
+ * PEN-2853: this used to accept any non-null check instant, including one already in
+ * the past, while the stranded-assigned sweep counted only a future one. Both
+ * readings are now `isMonitorNextCheckAtLive`, so the validator cannot admit an
+ * `in_review` the sweep would treat as unattended off the same column.
+ *
+ * The clause order is the write's own precedence and is unchanged: an explicit
+ * `monitorNextCheckAt` in the patch is what this write is arming, so it decides;
+ * otherwise a monitor the row already carries stands; otherwise the policy being
+ * written is consulted. Only the acceptance test moved.
+ */
 function hasScheduledMonitor(input: {
   existingMonitorNextCheckAt?: Date | null;
   patchMonitorNextCheckAt?: unknown;
   executionPolicy?: unknown;
+  nowMs: number;
 }) {
-  if (input.patchMonitorNextCheckAt instanceof Date && !Number.isNaN(input.patchMonitorNextCheckAt.getTime())) return true;
-  if (input.patchMonitorNextCheckAt === undefined && input.existingMonitorNextCheckAt) return true;
+  if (input.patchMonitorNextCheckAt instanceof Date && !Number.isNaN(input.patchMonitorNextCheckAt.getTime())) {
+    return isMonitorNextCheckAtLive(input.patchMonitorNextCheckAt, input.nowMs);
+  }
+  if (
+    input.patchMonitorNextCheckAt === undefined &&
+    isMonitorNextCheckAtLive(input.existingMonitorNextCheckAt, input.nowMs)
+  ) return true;
   const policy = normalizeIssueExecutionPolicy(input.executionPolicy ?? null);
-  return Boolean(policy?.monitor?.nextCheckAt);
+  return isMonitorNextCheckAtLive(policy?.monitor?.nextCheckAt, input.nowMs);
 }
 
 function successfulRunHandoffStateFromActivity(row: {
@@ -1889,7 +1909,8 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
-  "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
+  "or schedule an issue monitor for an external review/check with a nextCheckAt in the future — a lapsed or past-dated monitor is not a review path, " +
+  "because the strandedness sweep has already stopped counting it. After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
   return interaction.status === "pending" && REVIEW_PATH_INTERACTION_KINDS.has(interaction.kind);
@@ -3908,6 +3929,7 @@ export function issueRoutes(
       existingMonitorNextCheckAt: input.existing.monitorNextCheckAt ?? null,
       patchMonitorNextCheckAt: input.updateFields.monitorNextCheckAt,
       executionPolicy: nextExecutionPolicy,
+      nowMs: Date.now(),
     })) return;
 
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);

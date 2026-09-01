@@ -5,6 +5,7 @@ import {
   applyIssueMonitorPolicyTransition,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorEligibilityPatch,
+  isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
@@ -1831,5 +1832,35 @@ describe("issue execution policy transitions", () => {
 
       expect(result.patch.status).not.toBe("in_progress");
     });
+  });
+});
+
+describe("isMonitorNextCheckAtLive", () => {
+  // PEN-2853: one definition of "the monitor is still a live wake path", shared by the
+  // stranded-assigned sweep and the in_review disposition validator. Before this, the
+  // sweep required a future instant and the validator accepted any non-null one, so the
+  // two disagreed about the same column in the direction that admits a row to in_review
+  // while the sweep treats it as unattended.
+  const nowMs = Date.parse("2026-09-01T12:00:00.000Z");
+
+  it("counts an instant strictly in the future", () => {
+    expect(isMonitorNextCheckAtLive(new Date(nowMs + 1), nowMs)).toBe(true);
+    expect(isMonitorNextCheckAtLive("2026-09-01T13:00:00.000Z", nowMs)).toBe(true);
+  });
+
+  it("does not count a lapsed or exactly-now instant", () => {
+    expect(isMonitorNextCheckAtLive(new Date(nowMs - 1), nowMs)).toBe(false);
+    // Exactly `now` is not in the future. `>` matches the sweep's own comparison; a
+    // `>=` here would re-open the divergence by one millisecond.
+    expect(isMonitorNextCheckAtLive(new Date(nowMs), nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive("2026-08-25T12:00:00.000Z", nowMs)).toBe(false);
+  });
+
+  it("does not count an absent or unparseable instant", () => {
+    expect(isMonitorNextCheckAtLive(null, nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive(undefined, nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive("", nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive("not a date", nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive(new Date("not a date"), nowMs)).toBe(false);
   });
 });
