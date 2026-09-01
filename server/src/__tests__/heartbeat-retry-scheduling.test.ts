@@ -16,6 +16,9 @@ import {
   issueRelations,
   issues,
   projects,
+  routineRuns,
+  routineTriggers,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -913,6 +916,124 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // the latter at insert time -- an artifact of the test harness, not of
     // the promotion logic under test.)
     expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
+  });
+
+  it("bounds a retry owned by a periodic routine and persists the pre-clamp instant", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const routineId = randomUUID();
+    const routineRunId = randomUUID();
+    const triggerId = randomUUID();
+    const failedAt = new Date("2026-08-19T00:19:17.166Z");
+    const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Routine Retry Test",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Six-hour routine",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(routineTriggers).values({
+      id: triggerId,
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "0 */6 * * *",
+      timezone: "UTC",
+      nextRunAt: windowClosesAt,
+    });
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId,
+      triggerId,
+      source: "schedule",
+      status: "issue_created",
+      triggeredAt: new Date("2026-08-19T00:00:00.000Z"),
+      linkedIssueId: null,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Routine retry fixture",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+      originKind: "routine_execution",
+      originId: routineId,
+      originRunId: routineRunId,
+    });
+    await db
+      .update(routineRuns)
+      .set({ linkedIssueId: issueId })
+      .where(eq(routineRuns.id, routineRunId));
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: failedAt,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-20T00:19:17.166Z",
+      },
+      resultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-20T00:19:17.166Z",
+      },
+      updatedAt: failedAt,
+      createdAt: failedAt,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now: failedAt,
+      random: () => 0,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(scheduled.dueAt.getTime() - failedAt.getTime()).toBeLessThanOrEqual(6 * 60 * 60 * 1000);
+
+    const retryRun = await db
+      .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      routineRetryDecision: "clamp",
+      routineRetryPreClampAt: "2026-08-20T00:19:17.166Z",
+      routineRetryClampedFrom: "2026-08-20T00:19:17.166Z",
+    });
   });
 
   // BLO-24166 (split from BLO-23699 AC3): a provider blip on 2026-08-08 burned
