@@ -24,6 +24,15 @@ function isVulnerableNanoidVersion([major, minor, patch]: number[]) {
   );
 }
 
+// GHSA-c83g-rgw3-j3cx / CVE-2026-73089 lists every browserslist <= 4.28.6 as
+// vulnerable, so the range is open-ended downwards rather than a specific
+// major like nanoid's.
+function isVulnerableBrowserslistVersion([major, minor, patch]: number[]) {
+  return (
+    major < 4 || (major === 4 && (minor < 28 || (minor === 28 && patch <= 6)))
+  );
+}
+
 async function copyLockfileFixture(fixtureRoot: string) {
   const { stdout } = await execFileAsync(
     "git",
@@ -146,6 +155,70 @@ describe("PEN-1198 audit dependency remediation", () => {
           .map((version) => version.join("."));
 
         expect(vulnerableVersions).toEqual([]);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
+});
+
+describe("BLO-31121 browserslist advisory remediation", () => {
+  it(
+    "keeps browserslist outside the GHSA-c83g-rgw3-j3cx vulnerable range",
+    async () => {
+      const tmpRoot = await mkdtemp(join(tmpdir(), "paperclip-browserslist-"));
+      const fixtureRoot = join(tmpRoot, "repo");
+
+      try {
+        await copyLockfileFixture(fixtureRoot);
+
+        // browserslist is transitive (via @babel/helper-compilation-targets),
+        // so only the override moves it. Regenerate from the manifests for the
+        // same reason the nanoid check does: a manifest-only PR leaves the
+        // tracked lockfile at base, and asserting against that would report on
+        // the base graph rather than this PR's.
+        await execFileAsync(
+          "pnpm",
+          [
+            "install",
+            "--lockfile-only",
+            "--ignore-scripts",
+            "--no-frozen-lockfile",
+          ],
+          { cwd: fixtureRoot, maxBuffer: 1024 * 1024 * 20 },
+        );
+
+        const fixturePackageJson = JSON.parse(
+          await readFile(join(fixtureRoot, "package.json"), "utf8"),
+        );
+        const lockfile = await readFile(
+          join(fixtureRoot, "pnpm-lock.yaml"),
+          "utf8",
+        );
+
+        expect(fixturePackageJson.pnpm.overrides.browserslist).toBe(
+          ">=4.28.7 <5",
+        );
+
+        const resolvedVersions = Array.from(
+          lockfile.matchAll(/^  browserslist@(\d+)\.(\d+)\.(\d+)(?=[:(])/gm),
+          ([, major, minor, patch]) => [
+            Number(major),
+            Number(minor),
+            Number(patch),
+          ],
+        );
+
+        // Without this the check passes vacuously if browserslist ever drops
+        // out of the graph or the entry format changes underneath the regex.
+        expect(resolvedVersions.length).toBeGreaterThan(0);
+
+        expect(
+          resolvedVersions
+            .filter(isVulnerableBrowserslistVersion)
+            .map((version) => version.join(".")),
+        ).toEqual([]);
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
       }
