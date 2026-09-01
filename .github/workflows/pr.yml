@@ -156,6 +156,11 @@ jobs:
         run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
         timeout-minutes: 1
 
+      - name: Test @penstock publish-drift comparison
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
+        timeout-minutes: 1
+
       - name: Reject git push in adapter/runtime code
         if: ${{ !cancelled() }}
         run: node ./scripts/check-no-git-push.mjs
