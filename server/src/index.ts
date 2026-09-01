@@ -1205,6 +1205,20 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * BLO-19123. Last time the hand-back drain actually ran, so its cadence is decoupled from
+   * the scheduler's.
+   *
+   * The drain rides the heartbeat tick, which is 30s by default. A per-pass *count* alone is
+   * therefore not a rate: at 10 rows per 30s a ~90-row backlog returns in under five minutes,
+   * which is a bulk move with extra steps. The count bounds the blast radius of a single pass;
+   * this bounds how often that pass happens, and only the two together make the drain
+   * something an operator can watch the destination queue against and stop mid-way.
+   *
+   * Deliberately in-memory and not persisted: on restart the drain runs one pass early, which
+   * costs at most one extra bounded batch and keeps the mechanism free of schema.
+   */
+  let lastStrandedRecoveryHandBackAt = 0;
   // Single-flight latch for the crash-reconciliation → stale-lock-sweep pair
   // (BLO-20822). Awaiting one before the other inside a single tick does NOT
   // serialize them across ticks: `setInterval` starts the next callback on
@@ -1508,9 +1522,28 @@ export async function startServer(): Promise<StartedServer> {
         // there must not starve the drain that returns mis-owned rows to their real owners.
         // The pass is internally serialized, so a slow tick cannot overlap itself. Opt-in —
         // see the flag's rationale in config.ts.
-        if (config.strandedRecoveryHandBackDrainEnabled) {
+        //
+        // The limit is passed explicitly rather than left to the service-side default: that
+        // default (500) bounds the candidates a pass *works*, which was never a rate. It let
+        // the first tick after the flag flipped return the whole backlog in one sweep, moving
+        // hundreds of rows onto a destination queue in a single irreversible step. Metering
+        // here keeps the return observable and reversible, and defers — not drops — the rest.
+        //
+        // Count and cadence are both required, and neither substitutes for the other. This
+        // block runs on the heartbeat tick (30s by default), so a count alone would still
+        // drain ~90 rows in under five minutes. The elapsed-time gate is what turns "10 rows"
+        // into "10 rows per hour" — slow enough that an operator who sees the destination
+        // queue degrade can unset the flag having lost one batch rather than the backlog.
+        if (
+          config.strandedRecoveryHandBackDrainEnabled &&
+          Date.now() - lastStrandedRecoveryHandBackAt >=
+            config.strandedRecoveryHandBackIntervalMinutes * 60_000
+        ) {
+          // Stamped before the await, not after: the pass is async and the next tick fires in
+          // 30s, so stamping on completion would let several passes start inside one interval.
+          lastStrandedRecoveryHandBackAt = Date.now();
           trackHeartbeatSchedulerWork(heartbeat
-            .reconcileStrandedRecoveryHandBacks()
+            .reconcileStrandedRecoveryHandBacks({ limit: config.strandedRecoveryHandBackMaxPerPass })
             .then((result) => {
               // The all-skipped pass is reported too: its residual is the repair list, and
               // dropping it left operators no way to recover what stayed mis-owned or why.
