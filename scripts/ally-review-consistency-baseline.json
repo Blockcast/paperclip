@@ -1,0 +1,49 @@
+{
+  "$schema": "Consumed by scripts/check-ally-review-consistency.mjs; see parseBaseline() and PEN-2847.",
+  "$comment": [
+    "Known, accepted violations. Anything not listed here fails the run.",
+    "Each fingerprint pins the invariant code, PR number, head SHA and review IDs, so an entry",
+    "stops matching the moment the PR is pushed to or another review lands — a baselined PR that",
+    "comes back to life is re-audited automatically. Entries are therefore expected to go stale;",
+    "the guard warns about ones that match nothing and pruning them never changes the verdict.",
+    "Adding an entry suppresses a real finding: name the PR, the owning issue, and why."
+  ],
+  "entries": [
+    {
+      "fingerprint": "I1:1525:05325ee7:5043498525,5059936287",
+      "pr": 1525,
+      "issue": "PEN-2847",
+      "note": "Two operative Ally App reviews at 05325ee7. PR is BEHIND and untouched since 2026-08-30; disposition belongs to its author. Entry expires on the next push."
+    },
+    {
+      "fingerprint": "I3:1525:05325ee7:5059936287",
+      "pr": 1525,
+      "issue": "PEN-2847",
+      "note": "The second of the two reviews above is non-canonical. Same disposition as the I1 entry for this PR."
+    },
+    {
+      "fingerprint": "I1:1360:6a7e86b8:5002830694,5003133252",
+      "pr": 1360,
+      "issue": "PEN-2847",
+      "note": "Two operative Ally App reviews at 6a7e86b8. PR is DIRTY (conflicting) and untouched since 2026-08-23; cannot merge in this state."
+    },
+    {
+      "fingerprint": "I1:1316:0110ccd1:4911401804,4913256943",
+      "pr": 1316,
+      "issue": "PEN-2847",
+      "note": "Two operative Ally App reviews at 0110ccd1. PR untouched since 2026-08-12."
+    },
+    {
+      "fingerprint": "I3:1316:0110ccd1:4913256943",
+      "pr": 1316,
+      "issue": "PEN-2847",
+      "note": "The second of the two reviews above is non-canonical. Same disposition as the I1 entry for this PR."
+    },
+    {
+      "fingerprint": "I1:1304:61360b5a:5062643059,5062648138",
+      "pr": 1304,
+      "issue": "PEN-2847",
+      "note": "Two operative Ally App reviews at 61360b5a. PR is DIRTY (conflicting); cannot merge in this state."
+    }
+  ]
+}
