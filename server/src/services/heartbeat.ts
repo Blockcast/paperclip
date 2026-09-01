@@ -18182,7 +18182,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await db
           .select({
             triggeredAt: routineRuns.triggeredAt,
-            nextRunAt: routineTriggers.nextRunAt,
+            triggerPayload: routineRuns.triggerPayload,
           })
           .from(issues)
           .innerJoin(routineRuns, sql`${routineRuns.id}::text = ${issues.originRunId}`)
@@ -18198,16 +18198,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .limit(1)
           .then((rows) => rows[0] ?? null)
       : null;
-    const routinePeriodMs = routineSchedule?.nextRunAt && routineSchedule.triggeredAt
-      ? routineSchedule.nextRunAt.getTime() - routineSchedule.triggeredAt.getTime()
+    const routineWindowClosesAt = routineSchedule?.triggerPayload
+      ? readNonEmptyString(parseObject(routineSchedule.triggerPayload).__paperclipRoutineWindowClosesAt)
+      : null;
+    const routineWindowDeadline = routineWindowClosesAt ? new Date(routineWindowClosesAt) : null;
+    const routinePeriodMs = routineWindowDeadline && !Number.isNaN(routineWindowDeadline.getTime()) && routineSchedule?.triggeredAt
+      ? routineWindowDeadline.getTime() - routineSchedule.triggeredAt.getTime()
       : null;
     const routineRetryDecision =
-      routinePeriodMs !== null && routineSchedule?.nextRunAt
+      routinePeriodMs !== null && routineWindowDeadline
         ? resolveRoutineScopedRetry({
             dueAt: preRoutineDueAt,
             failedAt: run.finishedAt ?? run.updatedAt ?? now,
             routinePeriodMs,
-            windowClosesAt: routineSchedule.nextRunAt,
+            windowClosesAt: routineWindowDeadline,
           })
         : null;
 
