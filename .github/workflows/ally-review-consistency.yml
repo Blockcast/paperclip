@@ -9,6 +9,14 @@ name: Ally Review Consistency Guard
 # recorded it against.
 # See scripts/check-ally-review-consistency.mjs and BLO-19778 for the incident
 # this guards.
+#
+# Findings are ratcheted: every open PR is still audited and every violation is
+# still printed, but the run fails only on violations absent from
+# scripts/ally-review-consistency-baseline.json. Without that, one abandoned PR
+# holding a duplicate review pins the run red forever and a new violation moves
+# it from red to red — an auditor whose output is a constant carries no more
+# information than no auditor. A baseline entry is keyed on the head SHA and
+# review IDs, so it expires as soon as the PR is pushed to. See PEN-2847.
 
 on:
   schedule:
