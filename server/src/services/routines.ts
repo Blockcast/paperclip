@@ -1775,6 +1775,7 @@ export function routineService(
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
     descriptionAppendix?: string | null;
+    triggeredAtOverride?: Date | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
   }) {
@@ -1810,7 +1811,7 @@ export function routineService(
       automaticVariables,
     });
     const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
-    const triggeredAt = new Date();
+    const triggeredAt = input.triggeredAtOverride ?? new Date();
     const nextRunAt = input.nextRunAtOverride !== undefined
       ? input.nextRunAtOverride
       : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
@@ -3149,6 +3150,7 @@ export function routineService(
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        let runTriggeredAtOverrides: Array<Date | null> = [row.trigger.nextRunAt];
         let runNextRunAtOverrides: Array<Date | null> = [claimedNextRunAt];
 
         if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
@@ -3157,10 +3159,13 @@ export function routineService(
           } else {
             let cursor: Date | null = row.trigger.nextRunAt;
             runCount = 0;
+            runTriggeredAtOverrides = [];
             runNextRunAtOverrides = [];
             while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
+              const missedAt = cursor;
               runCount += 1;
               claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
+              runTriggeredAtOverrides.push(missedAt);
               runNextRunAtOverrides.push(claimedNextRunAt);
               cursor = claimedNextRunAt;
             }
@@ -3221,6 +3226,7 @@ export function routineService(
             routine: row.routine,
             trigger: row.trigger,
             source: "schedule",
+            triggeredAtOverride: runTriggeredAtOverrides[i] ?? row.trigger.nextRunAt,
             nextRunAtOverride: runNextRunAtOverrides[i] ?? claimedNextRunAt,
           });
           triggered += 1;
