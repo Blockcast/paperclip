@@ -132,7 +132,7 @@ export function buildProjectWorkspaceSummaries(input: {
         executionWorkspaceStatus: executionWorkspace.status,
         ...runtimeSummary,
         // PEN-2852: presence flags, not the values. `config.workspaceRuntime` is withheld from
-        // readers without `runtime:manage`, so `Boolean(config?.workspaceRuntime)` reports false
+        // readers without `workspace_runtime:read`, so `Boolean(config?.workspaceRuntime)` reports false
         // for a withheld config and would silently hide the workspace from this tab.
         hasRuntimeConfig:
           executionWorkspace.hasWorkspaceRuntimeConfig

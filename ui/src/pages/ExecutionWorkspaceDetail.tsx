@@ -273,7 +273,7 @@ function formStateFromWorkspace(workspace: ExecutionWorkspace): WorkspaceFormSta
     provisionCommand: readText(workspace.config?.provisionCommand),
     teardownCommand: readText(workspace.config?.teardownCommand),
     cleanupCommand: readText(workspace.config?.cleanupCommand),
-    // PEN-2852: `config.workspaceRuntime` is withheld from readers without `runtime:manage`, so
+    // PEN-2852: `config.workspaceRuntime` is withheld from readers without `workspace_runtime:read`, so
     // its absence does not mean the workspace inherits. Use the presence flag, which is always
     // computed from the stored row, or the form misreports an own-config workspace as inheriting.
     inheritRuntime: !workspace.hasWorkspaceRuntimeConfig,

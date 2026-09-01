@@ -24,11 +24,24 @@ import type { accessService } from "../services/index.js";
  *    `.metadata` off a service result and write it BACK to the row. A masked mapper would not
  *    merely hide the config — it would persist the masked value and destroy it.
  *
- * Entitlement: the raw value is disclosed to actors holding `runtime:manage`, the same action that
- * gates writing it (`PATCH /execution-workspaces/:id`, the runtime-control routes). That action is
- * already grouped with `secrets:read` throughout `services/authorization.ts` — company `viewer`
- * members and `low_trust_review` agents are refused it — so this introduces no new permission and
- * no new vocabulary; it aligns reading this material with the privilege tier that already writes it.
+ * Entitlement: the raw value is disclosed on `workspace_runtime:read`, an action that exists for
+ * exactly this disclosure and for nothing else.
+ *
+ * It is deliberately NOT `runtime:manage`, which was the first thing tried and was wrong. That
+ * action reads like the right one — it is what gates *writing* this material — but it sits in the
+ * standard same-company agent allow-list (`services/authorization.ts`, the `allow_company_agent`
+ * branch) alongside `company_scope:read` and even `secrets:read`. Gating on it would have handed
+ * every ordinary agent `revealRuntimeConfig: true`, withholding from nothing but low-trust and
+ * task-bridge principals — i.e. it would have left the exact disclosure path this ticket is about
+ * wide open while looking like a fix. The lesson generalizes: for an agent-facing boundary, the
+ * question is never "is this action privileged-sounding" but "is this action in the blanket agent
+ * allow-list".
+ *
+ * Who gets the raw value under the new action:
+ *   - active non-viewer company members (so the workspace and project-workspace runtime EDITORS
+ *     keep working — masking them unconditionally would break both), and instance admins;
+ *   - nobody else by default: ordinary same-company agents, `viewer` members, `low_trust_review`
+ *     agents, task-bridge keys and skill-test run tokens all get the withheld projection.
  *
  * Callers keep `hasWorkspaceRuntimeConfig` regardless of entitlement, so a UI that only needs to
  * know whether a runtime config exists never needs the contents. `runtimeServices` is unaffected:
@@ -52,7 +65,7 @@ export async function resolveWorkspaceRuntimeViewer(
 ): Promise<WorkspaceRuntimeViewer> {
   const decision = await access.decide({
     actor: req.actor,
-    action: "runtime:manage",
+    action: "workspace_runtime:read",
     resource: { type: "company", companyId },
   });
   return { revealRuntimeConfig: decision.allowed };

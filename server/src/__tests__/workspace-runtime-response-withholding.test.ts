@@ -134,10 +134,19 @@ function projectWorkspaceFixture(): ProjectWorkspace {
   };
 }
 
-/** Allows `company_scope:read` but refuses `runtime:manage` — the reachability this door describes. */
+/**
+ * Allows every action EXCEPT `workspace_runtime:read` — the reachability this door describes.
+ *
+ * Note the mock deliberately still allows `runtime:manage`: that models the real policy, in which
+ * a standard same-company agent holds `runtime:manage` (`allow_company_agent`) and so gating on it
+ * would disclose. These route-level cases prove the projection is applied when the decision is
+ * denied; that the decision actually IS denied for such an agent is proven against the real
+ * authorization service in `authorization-service.test.ts` ("PEN-2852 workspace_runtime:read"),
+ * because no mock can establish that.
+ */
 function decideAsUnprivilegedReader() {
   mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
-    allowed: input.action !== "runtime:manage",
+    allowed: input.action !== "workspace_runtime:read",
     action: input.action,
     reason: "test",
     explanation: "Allowed by test mock.",
@@ -239,7 +248,7 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
   });
 
   describe("GET /execution-workspaces/:id", () => {
-    it("withholds the runtime config from a reader without runtime:manage", async () => {
+    it("withholds the runtime config from a reader without workspace_runtime:read", async () => {
       const res = await request(createApp("execution-workspaces")).get("/api/execution-workspaces/workspace-1");
 
       expect(res.status).toBe(200);
@@ -249,7 +258,7 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.body.hasWorkspaceRuntimeConfig).toBe(true);
     });
 
-    it("discloses it to a reader holding runtime:manage", async () => {
+    it("discloses it to a reader holding workspace_runtime:read", async () => {
       decideAsRuntimeManager();
 
       const res = await request(createApp("execution-workspaces")).get("/api/execution-workspaces/workspace-1");
@@ -302,7 +311,7 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.body[0].hasWorkspaceRuntimeConfig).toBe(true);
     });
 
-    it("discloses it to a reader holding runtime:manage", async () => {
+    it("discloses it to a reader holding workspace_runtime:read", async () => {
       decideAsRuntimeManager();
 
       const res = await request(createApp("projects")).get("/api/projects/project-1/workspaces");
