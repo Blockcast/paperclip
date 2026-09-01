@@ -1422,10 +1422,15 @@ export async function handleFiring(
         fencing: firingFence(companyId, aggregateKey, firingToken),
       });
 
-      // Same generation, checked immediately before dispatch. This is the
-      // weaker of the two guarantees — see `PluginEventsClient.emit` — but it
-      // is what stops a displaced predecessor announcing a re-fire for an
-      // aggregate a newer owner now holds.
+      // Same generation, re-read immediately before dispatch — but an
+      // ownership *check*, not a fence, and named accordingly. It stops a
+      // displaced predecessor announcing a re-fire in the common case, where
+      // the displacement happened long before this point. It does not make
+      // delivery authoritative: a steal landing between the check and the
+      // fan-out still delivers. Nothing in this repo subscribes to this event,
+      // and any future subscriber must re-establish ownership before acting on
+      // it rather than trusting delivery. See `PluginEventOwnershipCheck` and
+      // BLO-31113 for the authoritative-delivery follow-up.
       await ctx.events.emit(
         "alertmanager.alert.firing",
         tracked.paperclipCompanyId,
@@ -1440,7 +1445,7 @@ export async function handleFiring(
           assigneeAgentId: tracked.assigneeAgentId ?? null,
           reFired: true,
         },
-        { fencing: firingFence(companyId, aggregateKey, firingToken) },
+        { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
       );
       await ctx.metrics.write("alertmanager.firing.deduped", 1, {
         alertname,
@@ -1689,7 +1694,7 @@ export async function handleFiring(
       assigneeAgentId: effectiveAssigneeAgentId,
       reFired: !created,
     },
-    { fencing: firingFence(companyId, aggregateKey, firingToken) },
+    { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
   );
 
   await ctx.activity.log({

@@ -1368,22 +1368,33 @@ export function buildHostServices(
         if (params.companyId) {
           await ensurePluginAvailableForCompany(params.companyId);
         }
-        // Weaker than the `issues.*` / `state.set` fence, on purpose. Those join
-        // the mutation's transaction and hold the lock to commit; a bus emit is
-        // an in-memory fan-out with no transaction to join, so the best
-        // available guarantee is "check immediately before dispatch, and refuse
-        // once the generation is gone". That is what stops a displaced worker
-        // announcing a firing it no longer owns.
+        // A best-effort pre-dispatch ownership check, NOT a fence — which is
+        // why the param is `ownershipCheck` and carries its own type rather
+        // than reusing `fencing`. The `issues.*` / `state.set` fences join the
+        // mutation's own transaction and hold the lock to commit, so a
+        // displaced caller's write cannot land. A bus emit is an in-memory
+        // fan-out with no transaction to join, so the best available guarantee
+        // is "re-read the generation immediately before dispatch, and refuse
+        // once it is gone".
         //
-        // The lock is deliberately not held across the fan-out. Subscriber
-        // handlers run arbitrary plugin code, so holding it would let one slow
-        // handler block a steal — recreating the unstealable fence this whole
-        // mechanism exists to prevent (BLO-31036). A bounded notification race
-        // is the better trade than an unbounded lock on the recovery path.
-        const fencingPrecondition = await resolveCallerFencingPrecondition(params.fencing);
-        if (fencingPrecondition) {
+        // The residual window is real and deliberate: a steal committing
+        // between this check's commit and the fan-out below still results in
+        // delivery. Holding the lock across the fan-out would close it and is
+        // rejected on purpose — subscriber handlers run arbitrary plugin code,
+        // so one slow handler would block a steal, recreating the unstealable
+        // fence this whole mechanism exists to prevent (BLO-31036).
+        //
+        // Consequence for consumers, and it is part of the contract: an event
+        // is a notification, not an authorization to act on the named
+        // aggregate. A subscriber doing anything durable must re-establish
+        // ownership itself. Making delivery authoritative needs a
+        // transactional outbox in this event subsystem (BLO-31113) and cannot be
+        // done from the emitting side. Both halves are pinned by
+        // `server/src/__tests__/plugin-events-ownership-check.test.ts`.
+        const ownershipCheck = await resolveCallerFencingPrecondition(params.ownershipCheck);
+        if (ownershipCheck) {
           await db.transaction(async (tx) => {
-            await assertPluginFencingGeneration(tx, fencingPrecondition);
+            await assertPluginFencingGeneration(tx, ownershipCheck);
           });
         }
         await scopedBus.emit(params.name, params.companyId, params.payload);

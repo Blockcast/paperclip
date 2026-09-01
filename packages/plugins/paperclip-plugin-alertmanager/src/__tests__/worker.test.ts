@@ -53,25 +53,37 @@ import type {
 } from "@paperclipai/plugin-sdk";
 
 /**
- * BLO-31036 — the firing tail is fenced, so `ctx.state.set` and
+ * BLO-31036 — the firing tail is guarded, so `ctx.state.set` and
  * `ctx.events.emit` take one more argument on that path: the generation the
- * host enforces inside the write's own transaction.
+ * host checks.
+ *
+ * The two are pinned separately and under different option names on purpose,
+ * because the guarantees differ. `state.set`'s `fencing` is a true fence — the
+ * host takes the generation lock inside the write's own transaction and holds
+ * it to commit. `events.emit`'s `ownershipCheck` is a best-effort pre-dispatch
+ * check on an in-memory fan-out that has no transaction to join; a steal in the
+ * check -> dispatch window still delivers. Both halves are pinned at the host in
+ * `server/src/__tests__/plugin-events-ownership-check.test.ts`.
  *
  * Pinned, not ignored. Relaxing these to `expect.anything()` — or dropping the
  * trailing argument so vitest only checks a prefix — would leave them green
- * with the fence removed, which is the exact regression they now guard. The
+ * with the guard removed, which is the exact regression they now catch. The
  * token itself is a per-claim UUID, so its presence and the phase holding it
  * are the strongest things assertable without reaching into the fence table.
  */
-const FIRING_FENCE_ARG = {
-  fencing: {
-    table: "alertmanager_aggregate_lifecycle_fences",
-    match: expect.objectContaining({
-      phase: "firing",
-      firing_token: expect.any(String),
-    }),
-  },
+const FIRING_GENERATION_MATCH = {
+  table: "alertmanager_aggregate_lifecycle_fences",
+  match: expect.objectContaining({
+    phase: "firing",
+    firing_token: expect.any(String),
+  }),
 };
+
+/** `ctx.state.set(..., { fencing })` — a true transactional fence. */
+const FIRING_FENCE_ARG = { fencing: FIRING_GENERATION_MATCH };
+
+/** `ctx.events.emit(..., { ownershipCheck })` — best-effort, not a fence. */
+const FIRING_EMIT_OWNERSHIP_ARG = { ownershipCheck: FIRING_GENERATION_MATCH };
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -633,7 +645,7 @@ describe("handleWebhook — firing first time", () => {
         assigneeUserId: "user-42",
         reFired: false,
       }),
-      FIRING_FENCE_ARG,
+      FIRING_EMIT_OWNERSHIP_ARG,
     );
     // Activity + metric
     expect(mocks.activity.log).toHaveBeenCalled();
@@ -986,7 +998,7 @@ describe("handleWebhook — dedup on re-fire", () => {
       "alertmanager.alert.firing",
       "company-1",
       expect.objectContaining({ fingerprint: "legacy-info-1", reFired: true }),
-      FIRING_FENCE_ARG,
+      FIRING_EMIT_OWNERSHIP_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.deduped",
@@ -1112,7 +1124,7 @@ describe("handleWebhook — dedup on re-fire", () => {
         paperclipIssueId: "issue-winner",
         reFired: true,
       }),
-      FIRING_FENCE_ARG,
+      FIRING_EMIT_OWNERSHIP_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.aggregate.rebound",

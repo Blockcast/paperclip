@@ -73,6 +73,7 @@ import type {
   JsonRpcResponse,
   InitializeParams,
   InitializeResult,
+  PluginEventOwnershipCheck,
   PluginFencingPrecondition,
   ConfigChangedParams,
   ValidateConfigParams,
@@ -540,9 +541,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           name: string,
           companyId: string,
           payload: unknown,
-          options?: { fencing?: PluginFencingPrecondition },
+          options?: { ownershipCheck?: PluginEventOwnershipCheck },
         ): Promise<void> {
-          await callHost("events.emit", { name, companyId, payload, fencing: options?.fencing });
+          await callHost("events.emit", {
+            name,
+            companyId,
+            payload,
+            ownershipCheck: options?.ownershipCheck,
+          });
         },
       },
 
