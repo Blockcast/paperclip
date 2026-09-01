@@ -8,7 +8,7 @@
  */
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
@@ -232,6 +232,32 @@ export class AggregateGenerationLostError extends Error {
 }
 
 /**
+ * The same generation, expressed so the *host* can enforce it.
+ *
+ * `assertFiringGeneration` below can only prove ownership at the moment it
+ * runs. Passing this alongside a mutating `issues.*` call moves the check into
+ * the transaction that performs the mutation, where it is held under a share
+ * lock until commit — so a steal can no longer land between "still mine?" and
+ * the write. That is the difference between a barrier and a fence, and it is
+ * why the barrier is now only a fast path (BLO-31049).
+ */
+function firingFence(
+  companyId: string,
+  aggregateKey: string,
+  firingToken: string,
+): PluginFencingPrecondition {
+  return {
+    table: AGGREGATE_LIFECYCLE_FENCES_TABLE,
+    match: {
+      company_id: companyId,
+      aggregate_key: aggregateKey,
+      phase: "firing",
+      firing_token: firingToken,
+    },
+  };
+}
+
+/**
  * Throw unless this delivery still holds the firing fence under `firingToken`.
  *
  * `upsertAggregateMember` gates the member row on the generation atomically,
@@ -246,16 +272,16 @@ export class AggregateGenerationLostError extends Error {
  * into "is rejected before mutating". A predecessor already displaced when it
  * reaches the barrier cannot touch the issue at all.
  *
- * What it does NOT do — stated plainly because the honest bound matters more
- * than the appearance of one: it cannot make a remote RPC atomic with a local
- * generation check. A steal that commits *between* this barrier and an RPC
- * already in flight is still not caught here. Closing that last window
- * requires the resource being mutated to enforce the fencing token itself —
- * the issues service would have to accept and check it — which is the standard
- * result for fencing tokens and is out of this plugin's reach. What is in
- * reach, and is what this does, is to shrink the window from "the entire
- * re-fire path" to "one in-flight RPC", and to make the common case — a
- * predecessor resumed long after its replacement took over — deterministic.
+ * It is now a *fast path* rather than the authoritative check. Every mutating
+ * `issues.*` call below also carries `firingFence(...)`, which the host checks
+ * under a share lock inside the mutation's own transaction (BLO-31049). That is
+ * what closes the window this barrier alone could not: a steal committing
+ * between here and an RPC already in flight is caught server-side, because the
+ * steal cannot commit while the mutation holds the lock.
+ *
+ * Kept rather than deleted because it is strictly cheaper — one local SELECT
+ * rejects a long-displaced predecessor before it makes any RPC at all, instead
+ * of letting it round-trip to the host to be refused there.
  *
  * Deliberately a SELECT: it must not touch `updated_at`. That column is what
  * the wedged-fence detector ages off (`phase in ('firing','cancelling') and
@@ -1201,6 +1227,8 @@ export async function handleFiring(
                 activeAggregateIssue.id,
                 { description: newDescription },
                 existing.paperclipCompanyId,
+                undefined,
+                { fencing: firingFence(companyId, aggregateKey, firingToken) },
               );
               await ctx.metrics.write("alertmanager.aggregate.rebound", 1, {
                 alertname,
@@ -1212,6 +1240,8 @@ export async function handleFiring(
                   existing.paperclipIssueId,
                   { status: "todo", description: newDescription },
                   existing.paperclipCompanyId,
+                  undefined,
+                  { fencing: firingFence(companyId, aggregateKey, firingToken) },
                 );
                 await ctx.metrics.write("alertmanager.firing.reopened", 1, {
                   alertname,
@@ -1237,6 +1267,8 @@ export async function handleFiring(
                   reboundIssue.id,
                   { description: newDescription },
                   existing.paperclipCompanyId,
+                  undefined,
+                  { fencing: firingFence(companyId, aggregateKey, firingToken) },
                 );
                 await ctx.metrics.write("alertmanager.aggregate.rebound", 1, {
                   alertname,
@@ -1249,6 +1281,8 @@ export async function handleFiring(
               existing.paperclipIssueId,
               { status: "todo", description: newDescription },
               existing.paperclipCompanyId,
+              undefined,
+              { fencing: firingFence(companyId, aggregateKey, firingToken) },
             );
             // Say why the close did not stick, on the issue itself — an
             // operator who closed this yesterday needs to know it re-opened
@@ -1259,6 +1293,7 @@ export async function handleFiring(
                 existing.paperclipIssueId,
                 `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
                 existing.paperclipCompanyId,
+                { fencing: firingFence(companyId, aggregateKey, firingToken) },
               );
             } catch (commentErr) {
               // The re-open is the load-bearing half and has already landed.
@@ -1276,6 +1311,8 @@ export async function handleFiring(
             existing.paperclipIssueId,
             { description: newDescription },
             existing.paperclipCompanyId,
+            undefined,
+            { fencing: firingFence(companyId, aggregateKey, firingToken) },
           );
         } else if (decision.kind === "suppressed") {
           // The whole point of BLO-24234: this path used to be entirely silent,
@@ -1540,6 +1577,7 @@ export async function handleFiring(
       if (!issue) {
         issue = await ctx.issues.create({
           companyId,
+          fencing: firingFence(companyId, aggregateKey, firingToken),
           title,
           description,
           priority,

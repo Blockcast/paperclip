@@ -550,3 +550,103 @@ describe("BLO-31036 — an overlapping predecessor cannot write behind the new f
     expect(mocks.issues.get).toHaveBeenCalled();
   });
 });
+
+/**
+ * BLO-31049 — the barrier is a fast path; the authoritative check is the host's.
+ *
+ * `assertFiringGeneration` can only prove ownership at the instant it runs, so
+ * a steal landing between it and an in-flight `issues.*` RPC was not caught.
+ * Every mutating call now also carries `firingFence(...)`, which the host
+ * checks under a share lock inside the mutation's own transaction.
+ *
+ * These cases pin the plugin's half of that contract: that the generation it
+ * hands the host is the one it *currently* holds. They read the live fence row
+ * at the moment of the call rather than comparing against a constant, because
+ * `firing_token` is minted per claim and cleared by the `finally` — a test that
+ * asserted a fixed value could pass while the plugin sent a stale token.
+ *
+ * The host half — that an obsolete generation is refused and that a racing
+ * steal is serialized rather than interleaved — is proven against a real
+ * PostgreSQL in `server/src/__tests__/issues-plugin-fencing-generation.test.ts`.
+ */
+describe("BLO-31049 — issue mutations carry the generation the host enforces", () => {
+  /** The fence row as it stands *right now*, mid-delivery. */
+  async function liveFencePrecondition() {
+    const result = await db.query<{ firing_token: string | null; phase: string }>(
+      `SELECT phase, firing_token FROM ${FENCES}
+        WHERE company_id = $1 AND aggregate_key = $2`,
+      [COMPANY_ID, AGGREGATE_KEY],
+    );
+    const row = result.rows[0];
+    return {
+      table: "alertmanager_aggregate_lifecycle_fences",
+      match: {
+        company_id: COMPANY_ID,
+        aggregate_key: AGGREGATE_KEY,
+        phase: row?.phase,
+        firing_token: row?.firing_token,
+      },
+    };
+  }
+
+  it("sends the live generation with a re-fire description refresh", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-open",
+      paperclipCompanyId: COMPANY_ID,
+      aggregateKey: AGGREGATE_KEY,
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+      alertname: ALERTNAME,
+      severity: "critical",
+      firstSeenAt: "2026-08-31T00:00:00Z",
+      lastFiredAt: "2026-08-31T00:00:00Z",
+      resolvedAt: null,
+      operatorSuppressedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: true,
+      escalationIntervalMs: null,
+    } as never);
+    // Not terminal => `decideRefire` returns `refresh`, the simplest path that
+    // mutates the issue.
+    mocks.issues.get.mockResolvedValue({ id: "issue-open", status: "todo" } as never);
+
+    // Capture at call time: the fence is still held here, and released after.
+    let sent: unknown;
+    let live: unknown;
+    mocks.issues.update.mockImplementation((async (...args: unknown[]) => {
+      sent = (args[4] as { fencing?: unknown } | undefined)?.fencing;
+      live = await liveFencePrecondition();
+      return { id: "issue-open" };
+    }) as never);
+
+    await deliver(ctx);
+
+    expect(mocks.issues.update).toHaveBeenCalled();
+    // A held fence, and the exact generation holding it — not merely "some
+    // fencing object was present".
+    expect((live as { match: { firing_token: string | null } }).match.firing_token)
+      .toEqual(expect.any(String));
+    expect(sent).toEqual(live);
+  });
+
+  it("sends the live generation when it files the aggregate issue", async () => {
+    const { ctx, mocks } = mkCtx();
+
+    let sent: unknown;
+    let live: unknown;
+    mocks.issues.create.mockImplementation((async (input: { fencing?: unknown }) => {
+      sent = input?.fencing;
+      live = await liveFencePrecondition();
+      return { id: "issue-created" };
+    }) as never);
+
+    await deliver(ctx);
+
+    expect(mocks.issues.create).toHaveBeenCalled();
+    expect((live as { match: { firing_token: string | null } }).match.firing_token)
+      .toEqual(expect.any(String));
+    expect(sent).toEqual(live);
+  });
+});

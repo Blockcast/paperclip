@@ -53,6 +53,11 @@ import path from "node:path";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import {
+  resolvePluginFencingPrecondition,
+  type PluginFencingPreconditionInput,
+  type ResolvedPluginFencingPrecondition,
+} from "./plugin-fencing.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
@@ -599,6 +604,21 @@ export function buildHostServices(
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
   const issues = issueService(db);
+  /**
+   * Bind a caller-supplied fencing generation to *this* plugin's own schema.
+   *
+   * The namespace is resolved from the authenticated `pluginId`, never from the
+   * request, so a plugin can only ever fence on a table it already owns — this
+   * adds no SQL reach. Table and column names are validated as bare identifiers
+   * before quoting; values are bound as parameters.
+   */
+  const resolveCallerFencingPrecondition = async (
+    fencing: PluginFencingPreconditionInput | null | undefined,
+  ): Promise<ResolvedPluginFencingPrecondition | null> => {
+    if (!fencing) return null;
+    const namespace = await pluginDb.getRuntimeNamespace(pluginId);
+    return resolvePluginFencingPrecondition(namespace, fencing);
+  };
   const documents = documentService(db);
   const goals = goalService(db);
   const milestoneSvc = createMilestonesService(db);
@@ -1918,7 +1938,8 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
+        const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, fencing, ...issueInput } = params;
+        const fencingPrecondition = await resolveCallerFencingPrecondition(fencing);
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
             ? pluginOperationIssueOriginKind(pluginKey)
@@ -1926,6 +1947,7 @@ export function buildHostServices(
         );
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          fencingPrecondition,
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
@@ -1990,6 +2012,7 @@ export function buildHostServices(
         }
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
+          fencingPrecondition: await resolveCallerFencingPrecondition(params.fencing),
           ...(expectedCurrentCheckoutRunId === undefined ? {} : { expectedCurrentCheckoutRunId }),
           ...(expectedCurrentExecutionRunId === undefined ? {} : { expectedCurrentExecutionRunId }),
           actorAgentId,
@@ -2416,11 +2439,25 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const comment = (await issues.addComment(
-          params.issueId,
-          params.body,
-          { agentId: params.authorAgentId },
-        )) as IssueComment;
+        const fencingPrecondition = await resolveCallerFencingPrecondition(params.fencing);
+        // `addComment` does not open its own transaction, and a share lock only
+        // fences for as long as its transaction lives — so when a generation is
+        // supplied, open one here and hand it down.
+        const comment = (fencingPrecondition
+          ? await db.transaction((tx) =>
+              issues.addComment(
+                params.issueId,
+                params.body,
+                { agentId: params.authorAgentId },
+                { fencingPrecondition },
+                tx,
+              ),
+            )
+          : await issues.addComment(
+              params.issueId,
+              params.body,
+              { agentId: params.authorAgentId },
+            )) as IssueComment;
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",

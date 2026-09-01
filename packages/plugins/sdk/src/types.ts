@@ -51,7 +51,7 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginPerformActionContext, WorkerToHostMethods } from "./protocol.js";
+import type { PluginFencingPrecondition, PluginPerformActionContext, WorkerToHostMethods } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -1603,6 +1603,12 @@ export interface PluginIssuesClient {
      * row points at the duplicate, not the original.
      */
     linkedLinearIssue?: { id: string; identifier: string };
+    /**
+     * Only create the issue while this fencing generation is still held. The
+     * host checks it under a share lock inside the create transaction, so a
+     * displaced caller cannot file an issue behind the current owner's back.
+     */
+    fencing?: PluginFencingPrecondition;
   }): Promise<Issue>;
   update(
     issueId: string,
@@ -1645,6 +1651,18 @@ export interface PluginIssuesClient {
     },
     companyId: string,
     actor?: PluginIssueMutationActor,
+    options?: {
+      /**
+       * Only apply the patch while this fencing generation is still held.
+       *
+       * Distinct from the `expectedCurrent*` preconditions above: those compare
+       * columns of *this* issue against a snapshot, while this locks a row in
+       * the calling plugin's own schema for the life of the update transaction.
+       * That is what makes it a fence rather than a barrier — a steal cannot
+       * commit between the check and the write.
+       */
+      fencing?: PluginFencingPrecondition;
+    },
   ): Promise<Issue>;
   assertCheckoutOwner(input: {
     issueId: string;
@@ -1684,7 +1702,14 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string },
+    options?: {
+      authorAgentId?: string;
+      /**
+       * Only write the comment while this fencing generation is still held.
+       * Checked under a share lock inside the insert's transaction.
+       */
+      fencing?: PluginFencingPrecondition;
+    },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
