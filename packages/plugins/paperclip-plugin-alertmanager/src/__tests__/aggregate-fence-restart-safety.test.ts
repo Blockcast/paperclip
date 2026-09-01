@@ -475,4 +475,78 @@ describe("BLO-31036 — an overlapping predecessor cannot write behind the new f
     expect(fence?.firing_token).toBe("token-replacement");
     expect(fence?.owner_instance_id).toBe("instance-replacement");
   });
+
+  // The member write is the *last* aggregate side effect in a delivery. Gating
+  // only that one still let a displaced predecessor run every side effect ahead
+  // of it and merely fail afterwards — the issue was already mutated. These two
+  // cases assert the property the guard actually has to have: a predecessor
+  // that has lost the generation performs NO aggregate side effect at all.
+  it("files no issue, state, or event when displaced before creating one", async () => {
+    const { ctx, mocks } = mkCtx();
+    stealFenceOnClaim(mocks);
+
+    await expect(deliver(ctx)).rejects.toThrow();
+
+    // Without the barrier the predecessor created a real issue for an aggregate
+    // it no longer owned, then lost the race at the member write — leaving an
+    // orphan no member row and no resolver ever refers to.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.events.emit).not.toHaveBeenCalled();
+  });
+
+  it("does not resurrect a cancelled issue when displaced mid re-fire", async () => {
+    const { ctx, mocks } = mkCtx();
+    // The re-fire path, at its most damaging: the plugin had already resolved
+    // this fingerprint and cancelled its issue, so `decideRefire` returns
+    // `reopen`/`plugin_resolved` and the delivery would set it back to `todo`.
+    // A predecessor doing that after a resolver finished the terminal
+    // transition reopens an aggregate nothing will ever close again.
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-cancelled",
+      paperclipCompanyId: COMPANY_ID,
+      aggregateKey: AGGREGATE_KEY,
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+      alertname: ALERTNAME,
+      severity: "critical",
+      firstSeenAt: "2026-08-31T00:00:00Z",
+      lastFiredAt: "2026-08-31T00:00:00Z",
+      resolvedAt: "2026-08-31T01:00:00Z",
+      operatorSuppressedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: true,
+      escalationIntervalMs: null,
+    } as never);
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-cancelled",
+      status: "cancelled",
+    } as never);
+    stealFenceOnClaim(mocks);
+
+    await expect(deliver(ctx)).rejects.toThrow();
+
+    // No status flip, no description rewrite, no re-open comment, and the
+    // delivery banks nothing about a decision it was not entitled to apply.
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.events.emit).not.toHaveBeenCalled();
+
+    // And it stopped at the barrier specifically, asserted on the reachability
+    // boundary rather than on error text: the delivery got far enough to read
+    // the issue and decide `reopen`, and then performed none of that decision.
+    // Without the barrier this exact fixture reaches `issues.update` — the
+    // aggregate has no members, so the rebind lookup finds no winner and the
+    // else-branch reopens `issue-cancelled` outright.
+    //
+    // Error text is deliberately not asserted: the `finally` runs
+    // `finishAggregateFiring`, which also fails once the token is gone, and a
+    // throwing `finally` discards the in-flight exception. The surviving
+    // message ("fence was lost ... retrying delivery") is still true and still
+    // fails the delivery, so this is a diagnosability wrinkle rather than a
+    // correctness one — but it means no test here can pin the barrier by name.
+    expect(mocks.issues.get).toHaveBeenCalled();
+  });
 });
