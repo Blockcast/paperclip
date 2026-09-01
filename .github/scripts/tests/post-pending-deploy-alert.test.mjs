@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ALERT_TTL_MS,
   DEFAULT_ALERT_AFTER_HOURS,
+  UnreadableWaitingRunError,
   buildAlert,
   selectStuckApproval,
 } from '../post-pending-deploy-alert.mjs';
@@ -72,17 +73,56 @@ test('selectStuckApproval: reports the OLDEST waiting run, not the first listed'
   assert.equal(verdict.waitingCount, 2);
 });
 
-test('selectStuckApproval: runs with an unparseable createdAt are ignored, not treated as age 0', () => {
-  // A NaN age silently compares false against any threshold, which would read
-  // as "not stuck" — a failed read must never look like health.
+test('selectStuckApproval: an unparseable createdAt on a waiting run is FATAL, not filtered out', () => {
+  // Previously these were dropped from the candidate list. That fails open:
+  // a NaN age compares false against any threshold, and excluding the record
+  // entirely means an unjudgeable approval reads as absent. Either way the step
+  // exits 0 and nothing escalates — the silent green PEN-2848 is about. We
+  // cannot age it, so we say so and let the step fail.
+  assert.throws(
+    () =>
+      selectStuckApproval({
+        pendingRuns: [waitingRun('not-a-date'), waitingRun('2026-09-01T00:00:00.000Z')],
+        alertAfterHours: 6,
+        now: NOW,
+      }),
+    UnreadableWaitingRunError,
+  );
+});
+
+test('selectStuckApproval: a malformed waiting run cannot be masked by a younger valid one', () => {
+  // The case that makes this fail-open rather than merely lossy. Filtering the
+  // malformed record left only a 1h-old run, so the verdict was `stuck: false`
+  // and the genuinely stuck approval — the one we could not read — escalated
+  // nothing. Reporting healthy state from unreadable input is the failure mode.
+  assert.throws(
+    () =>
+      selectStuckApproval({
+        pendingRuns: [
+          waitingRun('2026-09-01T11:00:00.000Z', { databaseId: 7 }),
+          waitingRun(undefined, { databaseId: 8 }),
+        ],
+        alertAfterHours: 6,
+        now: NOW,
+      }),
+    (err) => err instanceof UnreadableWaitingRunError && /run 8/.test(err.message),
+  );
+});
+
+test('selectStuckApproval: a malformed createdAt on a NON-waiting run is ignored, not fatal', () => {
+  // queued/in_progress ages are never read, so a bad timestamp there tells us
+  // nothing about a human sitting on a button. Failing the dispatcher over it
+  // would be noise on the path we just made loud.
   const verdict = selectStuckApproval({
-    pendingRuns: [waitingRun('not-a-date'), waitingRun('2026-09-01T00:00:00.000Z')],
+    pendingRuns: [
+      waitingRun('nonsense', { status: 'queued' }),
+      waitingRun('2026-09-01T02:00:00.000Z'),
+    ],
     alertAfterHours: 6,
     now: NOW,
   });
 
   assert.equal(verdict.stuck, true);
-  assert.equal(verdict.oldest.createdAt, '2026-09-01T00:00:00.000Z');
   assert.equal(verdict.waitingCount, 1);
 });
 

@@ -46,10 +46,10 @@
  * true) once a run stops re-pushing it — so approving or rejecting produces a
  * "resolved" Slack message without this script detecting the fix itself.
  *
- * Delivery failure, an unreadable pending-runs file, and a malformed threshold
- * are all deliberately fatal. A silent success in any of those cases would
- * recreate the exact defect this check exists to close: a control everyone
- * believes is in place.
+ * Delivery failure, an unreadable pending-runs file, a malformed threshold, and
+ * an unparseable timestamp on a waiting run are all deliberately fatal. A silent
+ * success in any of those cases would recreate the exact defect this check
+ * exists to close: a control everyone believes is in place.
  */
 import { appendFileSync, readFileSync } from 'node:fs';
 
@@ -59,18 +59,46 @@ export const ALERT_TTL_MS = 25 * 60 * 60 * 1000;
 export const DEFAULT_ALERT_AFTER_HOURS = 6;
 
 /**
+ * Raised when a `waiting` run carries a timestamp we cannot age. Fatal by
+ * design — see selectStuckApproval.
+ */
+export class UnreadableWaitingRunError extends Error {}
+
+/**
  * Pick the oldest run parked on the human reviewer gate and decide whether it
  * has been there too long.
  *
  * Only `waiting` counts. `queued` and `in_progress` also block the dispatcher's
  * anti-stacking guard, but they are runner/build states — no human is being
  * waited on, and paging three named reviewers for a slow build would be the
- * wrong people and the start of alert fatigue.
+ * wrong people and the start of alert fatigue. Their timestamps are never read,
+ * so a malformed one on a non-waiting run is ignored rather than fatal.
+ *
+ * A `waiting` run whose `createdAt` will not parse is fatal, NOT skipped.
+ * Excluding it fails open in the one case that matters: if the malformed record
+ * is the genuinely stuck approval and some other waiting run is younger than the
+ * threshold, dropping it lets this step report "not stuck" and exit 0 — the
+ * silent green that PEN-2848 is entirely about. We cannot judge the age, so we
+ * say so loudly and let the step fail; `conclusion: failure` is itself one of
+ * this change's escalation paths.
  */
 export function selectStuckApproval({ pendingRuns, alertAfterHours, now }) {
-  const waiting = (pendingRuns ?? [])
-    .filter((run) => run?.status === 'waiting' && Number.isFinite(Date.parse(run?.createdAt)))
-    .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  const waiting = (pendingRuns ?? []).filter((run) => run?.status === 'waiting');
+
+  const unreadable = waiting.filter((run) => !Number.isFinite(Date.parse(run?.createdAt)));
+  if (unreadable.length > 0) {
+    const detail = unreadable
+      .map(
+        (run) => `run ${run?.databaseId ?? '(no id)'} createdAt=${JSON.stringify(run?.createdAt)}`,
+      )
+      .join('; ');
+    throw new UnreadableWaitingRunError(
+      `${unreadable.length} waiting deploy(s) have an unparseable createdAt, so their ` +
+        `approval age cannot be judged: ${detail}`,
+    );
+  }
+
+  waiting.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 
   const oldest = waiting[0] ?? null;
   if (!oldest) {
@@ -167,11 +195,24 @@ async function main() {
   const base = (process.env.ALERTMANAGER_URL || DEFAULT_ALERTMANAGER_URL).replace(/\/+$/, '');
 
   const now = new Date();
-  const verdict = selectStuckApproval({
-    pendingRuns: readPendingRuns(process.env.PENDING_JSON_PATH),
-    alertAfterHours,
-    now,
-  });
+  let verdict;
+  try {
+    verdict = selectStuckApproval({
+      pendingRuns: readPendingRuns(process.env.PENDING_JSON_PATH),
+      alertAfterHours,
+      now,
+    });
+  } catch (err) {
+    if (!(err instanceof UnreadableWaitingRunError)) throw err;
+    // Same reasoning as an unreadable pending-runs file: this step only runs
+    // because the dispatcher already reported something pending, so being
+    // unable to age it is a failed read, not a clean bill of health.
+    console.error(
+      `::error::Cannot judge production approval age: ${err.message}. ` +
+        'Failing rather than reporting no stuck approval.',
+    );
+    process.exit(1);
+  }
 
   if (!verdict.stuck) {
     setOutput('escalated', 'false');
@@ -221,5 +262,11 @@ async function main() {
 
 import { fileURLToPath } from 'node:url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main();
+  // An unhandled rejection would still exit non-zero, but without an ::error::
+  // annotation naming the cause — on a path whose whole purpose is being legible
+  // from the Actions list, that is worth the four lines.
+  main().catch((err) => {
+    console.error(`::error::post-pending-deploy-alert failed unexpectedly: ${err?.stack ?? err}`);
+    process.exit(1);
+  });
 }
