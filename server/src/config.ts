@@ -330,12 +330,20 @@ export const NUMERIC_SETTING_BOUNDS = {
   // the first tick after the drain flag flipped would have returned the entire backlog at
   // once (89 rows on the CEO alone, ~360 estate-wide when the plan was written).
   //
-  // That is a bulk data move dressed as a scheduler tick, and its cost lands on the
-  // *destination* queue rather than this one: the CTO sat at 369 open `todo` when this was
-  // measured, so a single pass would have taken it to 458 — roughly 47 to 59 days deep at the
-  // observed ~7.8 closures/day — while closing nothing. Metering makes the return reversible:
-  // if the destination degrades, unsetting the flag costs one tick of progress, not the
-  // whole backlog.
+  // The original justification for metering was destination load: a single pass would take the
+  // CTO from 369 open `todo` to 458, and at ~7.8 closures/day that is weeks of queue. That
+  // reasoning was checked against the implementation on 2026-09-01 and does **not** hold at flip
+  // time. The pass is ownership-only: it rewrites the owner on rows that are already `blocked`
+  // (`recovery/service.ts`, `status: "blocked"`) and enqueues no wake, so at the moment the flag
+  // flips it adds zero dispatchable work to any destination queue. The deferred load arrives
+  // later, spread across the natural blocker-resolution rate — which is the rate at which that
+  // work becomes real anyway.
+  //
+  // The meter is still correct, for a different and better reason: **blast-radius reversibility
+  // against a bug in the gates.** A mis-routing defect in the eligibility or evidence checks
+  // costs one bounded pass of rows, not the whole backlog. Do not read the collapse of the load
+  // argument as grounds to widen the count or shorten the interval — the reason changed, the
+  // requirement did not.
   //
   // Deferred rows are not lost. They are enumerated per row with reason
   // `candidate_limit_deferred` and picked up on the next tick, so a low ceiling trades drain
@@ -347,8 +355,15 @@ export const NUMERIC_SETTING_BOUNDS = {
   // The count above bounds one pass; this bounds the rate. They are only useful together: the
   // drain rides the heartbeat tick (30s by default), so a count alone still returns ~90 rows
   // in under five minutes, which is the bulk move the meter exists to prevent. At the 60m
-  // default, 10 rows/hour clears a ~90-row backlog over about nine passes — slow enough to
-  // watch the destination queue between them and stop after one batch rather than all of them.
+  // default, 10 rows/hour clears a ~90-row backlog over about nine passes.
+  //
+  // What those nine passes buy is a window to catch a *gate* defect — a row routed to the wrong
+  // owner by a bug in the eligibility or evidence checks — while it has cost one batch instead
+  // of the backlog. It is explicitly **not** about giving the destination queue time to absorb
+  // load; that premise was checked and dropped (see the count above). An earlier draft of this
+  // comment reasoned in "ticks" as if a tick were an observation interval: it is 30 seconds, so
+  // nine of them is 4.5 minutes — a bulk return with extra steps, not a rate anyone can watch.
+  // The hour is what makes the passes separable events.
   //
   // Floor of 1m rather than 0: "no delay" would silently restore the per-tick behaviour this
   // setting exists to remove, and an operator who wants the drain faster should raise the

@@ -26,18 +26,31 @@ import { NUMERIC_SETTING_BOUNDS } from "../config.js";
 const repoRoot = join(import.meta.dirname, "../../..");
 const serverSource = readFileSync(join(repoRoot, "server/src/index.ts"), "utf8");
 
+const START_ANCHOR = "config.strandedRecoveryHandBackDrainEnabled";
+const END_ANCHOR = "stranded-recovery hand-back pass failed";
+
 describe("stranded-recovery hand-back drain is metered per tick (BLO-19123)", () => {
-  const callSite = serverSource.slice(
-    serverSource.indexOf("config.strandedRecoveryHandBackDrainEnabled"),
-    serverSource.indexOf("stranded-recovery hand-back pass failed"),
-  );
+  const startIndex = serverSource.indexOf(START_ANCHOR);
+  const endIndex = serverSource.indexOf(END_ANCHOR);
+
+  // The two anchors fail in *opposite* directions, which is why neither may be left unchecked
+  // and why the slice is conditional rather than direct:
+  //
+  //   - START missing => `slice(-1, endIndex)` yields "", and every positive `toContain` below
+  //     asserts nothing.
+  //   - END missing   => `slice(startIndex, -1)` yields nearly the whole remaining file. That
+  //     is the dangerous one: the assertions keep passing, against a scope that now spans
+  //     unrelated scheduler blocks, so this file would still read green while having lost the
+  //     bounded call site it exists to pin.
+  //
+  // Collapsing to "" on either failure makes both modes loud, and the ordering check (END must
+  // follow START) also catches the anchors being reordered into a backwards slice.
+  const callSite =
+    startIndex > -1 && endIndex > startIndex ? serverSource.slice(startIndex, endIndex) : "";
 
   it("has a locatable call site", () => {
-    // Guards the two slice anchors above: if either string is renamed, every assertion in this
-    // file would silently pass against an empty string. `indexOf` returning -1 is the specific
-    // failure mode — `slice(-1, n)` yields "" and every `toContain` below would then be
-    // asserting nothing.
-    expect(serverSource.indexOf("config.strandedRecoveryHandBackDrainEnabled")).toBeGreaterThan(-1);
+    expect(startIndex).toBeGreaterThan(-1);
+    expect(endIndex).toBeGreaterThan(startIndex);
     expect(callSite).toContain("reconcileStrandedRecoveryHandBacks");
   });
 
