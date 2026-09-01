@@ -8,6 +8,7 @@ import {
   redactSensitiveText,
   sanitizeRecord,
   withholdAgentConfigFromApprovalPayload,
+  withholdAgentConfigKeys,
 } from "../redaction.js";
 
 describe("redaction", () => {
@@ -833,6 +834,45 @@ describe("redactAgentConfigPayload", () => {
 
     expect(untouched).toEqual(payload);
     expect(withheldFields).toEqual([]);
+  });
+
+  it("withholds the agent config pair from any read projection, not only hire cards (PEN-2839)", () => {
+    // Door #10: the skill test-run `agentConfigSnapshot` reaches the same pair
+    // under `company_scope:read`, the same weaker entitlement PEN-2777 closed
+    // on the approval card. It shares this walk rather than copying it, so the
+    // array/JSON-string bypass Ally caught in #1574 cannot be re-derived and
+    // re-missed on the second path.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const { payload: withheld, withheldFields } = withholdAgentConfigKeys({
+      agentId: "agent-1",
+      name: "Worker",
+      adapterConfig: { env: { OPENAI_API_KEY: SECRET }, mcpServers: { k8s: { url: upstream } } },
+      runtimeConfig: [{ mcpServers: { k8s: { url: upstream } } }],
+    });
+
+    expect(JSON.stringify(withheld)).not.toContain(SECRET);
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      agentId: "agent-1",
+      name: "Worker",
+      adapterConfig: {},
+      runtimeConfig: {},
+    });
+    expect(withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+  });
+
+  it("keeps withholdAgentConfigFromApprovalPayload's hire-only precondition after the extraction (PEN-2839)", () => {
+    // The extraction must not widen the approval filter. `withholdAgentConfigKeys`
+    // has no type precondition by design; the approval wrapper must still refuse
+    // to touch a non-hire card, or PEN-2777's scoping silently becomes global.
+    const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
+
+    expect(withholdAgentConfigFromApprovalPayload("request_board_approval", structuredClone(payload)))
+      .toEqual({ payload, withheldFields: [] });
+    expect(withholdAgentConfigKeys(structuredClone(payload))).toEqual({
+      payload: { title: "Ship it", adapterConfig: {} },
+      withheldFields: ["adapterConfig"],
+    });
   });
 
   it("leaves redactEventPayload unchanged for the same input", () => {
