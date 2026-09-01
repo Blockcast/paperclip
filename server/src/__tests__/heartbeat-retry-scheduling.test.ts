@@ -971,6 +971,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       source: "schedule",
       status: "issue_created",
       triggeredAt: new Date("2026-08-19T00:00:00.000Z"),
+      triggerPayload: {
+        __paperclipRoutineWindowClosesAt: windowClosesAt.toISOString(),
+      },
       linkedIssueId: null,
     });
     await db.insert(issues).values({
@@ -990,6 +993,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .update(routineRuns)
       .set({ linkedIssueId: issueId })
       .where(eq(routineRuns.id, routineRunId));
+    // The trigger has already advanced by the time a delayed execution fails.
+    // Retry resolution must continue using the origin run's saved boundary.
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date("2026-08-19T12:00:00.000Z") })
+      .where(eq(routineTriggers.id, triggerId));
     await db.insert(heartbeatRuns).values({
       id: sourceRunId,
       companyId,

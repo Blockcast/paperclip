@@ -1810,12 +1810,27 @@ export function routineService(
       automaticVariables,
     });
     const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
+    const triggeredAt = new Date();
+    const nextRunAt = input.nextRunAtOverride !== undefined
+      ? input.nextRunAtOverride
+      : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
+        ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
+        : undefined;
     const title = interpolateRoutineTemplate(input.routine.title, allVariables) ?? input.routine.title;
     const baseDescription = interpolateRoutineTemplate(input.routine.description, allVariables);
     const description = [baseDescription, input.descriptionAppendix]
       .filter((part): part is string => Boolean(part && part.trim()))
       .join("\n\n");
     const triggerPayload = mergeRoutineRunPayload(input.payload, { ...automaticVariables, ...resolvedVariables });
+    // Keep the window boundary attached to this run. The scheduler advances the
+    // trigger before dispatching, so reading the trigger later can identify the
+    // next window rather than the one that owns this execution.
+    const persistedTriggerPayload = input.source === "schedule" && nextRunAt
+      ? {
+        ...(triggerPayload ?? {}),
+        __paperclipRoutineWindowClosesAt: nextRunAt.toISOString(),
+      }
+      : triggerPayload;
     const managedRoutineBinding = await getManagedRoutineBinding(input.routine);
     const managedIssueTemplate = readManagedRoutineIssueTemplate(managedRoutineBinding?.defaultsJson);
     const issueOriginKind = managedIssueTemplate?.surfaceVisibility === "plugin_operation" && managedRoutineBinding
@@ -1861,7 +1876,6 @@ export function routineService(
         if (existing) return existing;
       }
 
-      const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
       const latestRevisionResponsibleUserId = input.routine.latestRevisionId
         ? await txDb
@@ -1893,18 +1907,12 @@ export function routineService(
           status: "received",
           triggeredAt,
           idempotencyKey: input.idempotencyKey ?? null,
-          triggerPayload,
+          triggerPayload: persistedTriggerPayload,
           dispatchFingerprint,
           routineRevisionId: input.routine.latestRevisionId,
           responsibleUserId,
         })
         .returning();
-
-      const nextRunAt = input.nextRunAtOverride !== undefined
-        ? input.nextRunAtOverride
-        : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
-          ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
-          : undefined;
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
