@@ -69,6 +69,48 @@ const AGGREGATE_CREATION_CLAIMS_TABLE = "alertmanager_aggregate_creation_claims"
 const AGGREGATE_MEMBERS_TABLE = "alertmanager_aggregate_members";
 const AGGREGATE_LIFECYCLE_FENCES_TABLE = "alertmanager_aggregate_lifecycle_fences";
 
+/**
+ * Identity of *this* worker process, minted once at module load (BLO-31036).
+ *
+ * This is deliberately not the host's `instanceInfo.instanceId`, which the SDK
+ * documents as the UUID of the Paperclip *instance* and which therefore
+ * survives a restart — the one property that makes it useless as proof of
+ * death.
+ *
+ * Every concurrent delivery inside this process shares this id. That is the
+ * point, not an accident: the RPC layer pipelines `handleWebhook` calls into
+ * the single worker child, so two firing deliveries genuinely interleave, and
+ * a per-*delivery* id would let them steal each other's live fences — the
+ * exact race the fence exists to prevent.
+ */
+const WORKER_INSTANCE_ID = randomUUID();
+
+/**
+ * The worker's slot: stable across restarts, unique per concurrent host.
+ *
+ * Ownership is only ever stolen within the same slot. The plugin worker is a
+ * cluster-wide singleton today (StatefulSet `paperclip` runs `replicas: 1` with
+ * `PAPERCLIP_NODE_ROLE=worker`, while the api replicas swap in a plugin-worker
+ * stub that never forks a child), but that singleton rests partly on chart
+ * configuration: an unknown `PAPERCLIP_NODE_ROLE` value falls back to `"all"`,
+ * so a typo on an api replica would silently add a second plugin host.
+ *
+ * Keying the steal on the slot means correctness does not depend on that
+ * config being right. Within one slot, a new process proves the old one is gone
+ * (Kubernetes recreates a StatefulSet ordinal only after the previous pod has
+ * fully terminated); across slots, nothing is ever assumed dead.
+ *
+ * Falls back to a per-process value when `HOSTNAME` is unset, which is
+ * fail-safe: an unidentifiable slot matches no stored slot, so it steals
+ * nothing.
+ */
+const WORKER_SLOT = process.env.HOSTNAME?.trim() || `unknown-slot:${WORKER_INSTANCE_ID}`;
+
+/** Test seam: the identity this process claims fences under. */
+export function workerFenceIdentity(): { instanceId: string; slot: string } {
+  return { instanceId: WORKER_INSTANCE_ID, slot: WORKER_SLOT };
+}
+
 type IssueReference = {
   id: string;
   status?: string | null;
@@ -89,8 +131,13 @@ type AggregateMemberResolution = {
 /**
  * Outcome of claiming the firing fence. On refusal it carries the phase that
  * held the fence so the delivery error can name it, because that phase decides
- * the operator's next move: `firing` and `cancelling` are both interrupted
- * owners that never self-clear and need `recover-aggregate-firing`.
+ * the operator's next move: `firing` and `cancelling` are both owners that a
+ * new claim will not displace while they may still be live.
+ *
+ * Since BLO-31036 a refusal no longer implies a permanent wedge — a fence whose
+ * owner has provably died is released by the next worker in that slot, either
+ * by the startup sweep or by the next firing claim. A refusal that *persists*
+ * therefore means the owner is live, or holds the fence from another slot.
  */
 type AggregateFiringClaim =
   | { ok: true; token: string }
@@ -200,20 +247,34 @@ async function beginAggregateFiring(
   const fences = q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE);
   // This is intentionally a fence rather than a lease. A delayed worker can
   // resume after an arbitrary timeout, so stealing `firing` or `cancelling`
-  // would allow it to attach a member after a newer resolver has started the
-  // terminal transition. A stuck owner therefore fails closed and needs an
-  // explicit recovery action, rather than silently reintroducing that race.
+  // on the strength of *elapsed time* would allow it to attach a member after a
+  // newer resolver has started the terminal transition. That race stays closed:
+  // nothing below releases a fence because it is old.
+  //
+  // What is admitted (BLO-31036) is a fence whose owner is provably gone: same
+  // slot, different process. A slot's previous occupant cannot resume — the
+  // StatefulSet only recreates an ordinal after the prior pod has fully
+  // terminated — so this is a fact about liveness, not a guess about latency.
+  // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
+  // therefore excluded, as is any owner in another slot.
   const result = await ctx.db.execute(
     `INSERT INTO ${fences}
-       (company_id, aggregate_key, phase, firing_token)
-     VALUES ($1, $2, 'firing', $3)
+       (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
+     VALUES ($1, $2, 'firing', $3, $4, $5)
      ON CONFLICT (company_id, aggregate_key) DO UPDATE
      SET phase = 'firing',
          firing_token = EXCLUDED.firing_token,
          resolution_token = NULL,
+         owner_instance_id = EXCLUDED.owner_instance_id,
+         owner_slot = EXCLUDED.owner_slot,
          updated_at = now()
-     WHERE ${fences}.phase IN ('active', 'finalizing')`,
-    [companyId, aggregateKey, token],
+     WHERE ${fences}.phase IN ('active', 'finalizing')
+        OR (
+          ${fences}.phase IN ('firing', 'cancelling')
+          AND ${fences}.owner_slot = $5
+          AND ${fences}.owner_instance_id IS DISTINCT FROM $4
+        )`,
+    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
   );
   if (result.rowCount > 0) return { ok: true, token };
   // Read back the phase that actually refused the claim. The upsert admits
@@ -232,6 +293,64 @@ async function beginAggregateFiring(
   return { ok: false, blockingPhase: rows[0]?.phase ?? null };
 }
 
+/**
+ * Release fences abandoned by a previous occupant of this slot (BLO-31036).
+ *
+ * Runs once per worker process, from `setup()`. The per-claim steal in
+ * `beginAggregateFiring` already unwedges any aggregate that keeps firing, but
+ * that is not sufficient on its own: an aggregate whose alert has since stopped
+ * firing receives no further delivery, so nothing would ever reclaim it and the
+ * row would sit in `firing` forever. This sweep is what makes "no fence stays
+ * held after the owner dies" an invariant rather than a property of alerts that
+ * happen to repeat.
+ *
+ * Release is justified by identity, never by age:
+ *   - `owner_instance_id IS DISTINCT FROM` this process — never touches a fence
+ *     held by a live sibling delivery in this same process. A delivery can
+ *     arrive while setup is still running, so this exclusion is load-bearing.
+ *   - same `owner_slot`, or NULL. NULL means the row was written before this
+ *     column existed, i.e. by a strictly older image, which the running process
+ *     has by definition replaced.
+ *
+ * Deliberately non-fatal: a failed sweep leaves fences wedged, which the
+ * per-claim steal can still recover. Throwing here would prevent the worker
+ * from starting at all and turn a partial outage into a total one.
+ */
+export async function reconcileAbandonedAggregateFences(
+  ctx: PluginContext,
+): Promise<number> {
+  try {
+    const fences = q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE);
+    const result = await ctx.db.execute(
+      `UPDATE ${fences}
+       SET phase = 'active',
+           firing_token = NULL,
+           resolution_token = NULL,
+           owner_instance_id = NULL,
+           owner_slot = NULL,
+           updated_at = now()
+       WHERE phase IN ('firing', 'cancelling')
+         AND owner_instance_id IS DISTINCT FROM $1
+         AND (owner_slot IS NULL OR owner_slot = $2)`,
+      [WORKER_INSTANCE_ID, WORKER_SLOT],
+    );
+    if (result.rowCount > 0) {
+      ctx.logger.warn(
+        `paperclip-plugin-alertmanager: released ${result.rowCount} aggregate lifecycle fence(s) ` +
+          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
+          `every firing delivery for its aggregate until now.`,
+      );
+    }
+    return result.rowCount;
+  } catch (err) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: aggregate lifecycle fence reconciliation failed: ${String(err)}. ` +
+        `Aggregates abandoned by a previous process stay wedged until their next firing delivery reclaims them.`,
+    );
+    return 0;
+  }
+}
+
 async function finishAggregateFiring(
   ctx: PluginContext,
   companyId: string,
@@ -243,6 +362,8 @@ async function finishAggregateFiring(
     `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
      SET phase = 'active',
          firing_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
@@ -285,6 +406,8 @@ export async function recoverAggregateFiring(
     `UPDATE ${fences}
      SET phase = 'active',
          firing_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
@@ -300,6 +423,8 @@ export async function recoverAggregateFiring(
     `UPDATE ${fences}
      SET phase = 'active',
          resolution_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
@@ -331,6 +456,8 @@ async function tryClaimAggregateFinalization(
      SET phase = 'finalizing',
          firing_token = NULL,
          resolution_token = $4,
+         owner_instance_id = $5,
+         owner_slot = $6,
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
@@ -343,7 +470,14 @@ async function tryClaimAggregateFinalization(
            AND issue_id = $3
            AND resolved_at IS NULL
        )`,
-    [companyId, aggregateKey, issueId, token],
+    [
+      companyId,
+      aggregateKey,
+      issueId,
+      token,
+      WORKER_INSTANCE_ID,
+      WORKER_SLOT,
+    ],
   );
   return result.rowCount > 0 ? token : null;
 }
@@ -355,15 +489,22 @@ async function beginAggregateCancellation(
   token: string,
 ): Promise<boolean> {
   const ns = ctx.db.namespace;
+  // Re-stamp ownership as this process enters `cancelling`. Without it the
+  // fence would carry whatever identity claimed finalization, and a concurrent
+  // firing in this same process could then read the owner as "not me" and steal
+  // a terminal transition that is genuinely live — reintroducing exactly the
+  // race the fence exists to prevent (BLO-31036).
   const result = await ctx.db.execute(
     `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
      SET phase = 'cancelling',
+         owner_instance_id = $4,
+         owner_slot = $5,
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
        AND phase = 'finalizing'
        AND resolution_token = $3`,
-    [companyId, aggregateKey, token],
+    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
   );
   return result.rowCount > 0;
 }
@@ -379,6 +520,8 @@ async function releaseAggregateFinalization(
     `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
      SET phase = 'active',
          resolution_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
@@ -873,9 +1016,11 @@ export async function handleFiring(
   if (!firingClaim.ok) {
     throw new Error(
       `Alertmanager aggregate ${aggregateKey} is held in phase ` +
-        `'${firingClaim.blockingPhase ?? "unknown"}' by an interrupted delivery; ` +
-        `retrying firing delivery. This does not self-clear: an operator must ` +
-        `release the fence via the plugin's recover-aggregate-firing route.`,
+        `'${firingClaim.blockingPhase ?? "unknown"}' by a delivery in progress; ` +
+        `retrying firing delivery. A fence abandoned by a dead process is released ` +
+        `automatically by its slot's next worker; if this persists, the holder is ` +
+        `either live or in another slot, and an operator can release it via the ` +
+        `plugin's recover-aggregate-firing route.`,
     );
   }
   const firingToken = firingClaim.token;
