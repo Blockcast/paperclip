@@ -234,6 +234,18 @@ jobs:
             ./.github/scripts/tests/post-environment-protection-alert.test.mjs
         timeout-minutes: 1
 
+      # The stuck-approval escalation only ever runs inside the scheduled
+      # dispatcher, and only on the branch where a deploy is already pending —
+      # so without this it could regress for weeks unnoticed, and the first
+      # signal would be another silent no-op. The suite pins the two properties
+      # that cannot be re-checked after the fact: that severity stays `critical`
+      # (anything else routes to the paperclip webhook only, which is not a
+      # human), and that queued/building runs never page the reviewers.
+      - name: Test stuck production-approval escalation (PEN-2848)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-pending-deploy-alert.test.mjs
+        timeout-minutes: 1
+
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
       # ONLY inside the scheduled `review-gate-sweep` job, where a non-zero exit
       # is the deliberate stranded-PR alarm (EXIT_ALARM=1). That conflates two

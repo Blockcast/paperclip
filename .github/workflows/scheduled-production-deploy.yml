@@ -21,6 +21,21 @@
 #
 # Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
 # code builds, not that a human intends to ship it. That reasoning is unchanged.
+#
+# THE THREE EXITS ARE DISTINGUISHABLE (PEN-2848)
+# ----------------------------------------------
+# This workflow can end three ways, and originally all three were an identical
+# green `exit 0`. On 2026-09-01 the first-ever real slot skipped because a deploy
+# had been waiting on a human since 00:52Z, reported `conclusion: success`, and
+# nothing escalated — production reached 45 commits behind. Guard (1) is correct;
+# what was missing was any way to tell "declined to dispatch" from "dispatched".
+#
+#   dispatched       -> ::notice:: + step summary, green
+#   up-to-date       -> ::notice:: + step summary, green (nothing to do, nobody to chase)
+#   skipped-pending  -> ::warning:: + step summary; and if the pending approval is
+#                       older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
+#                       ProductionDeployApprovalStuck alert to Alertmanager plus a
+#                       RED run, so `conclusion` itself carries the signal.
 name: Scheduled production deploy dispatch
 
 on:
@@ -50,9 +65,11 @@ jobs:
           fetch-depth: 0
 
       - name: Dispatch deploy if master is ahead and nothing is already pending
+        id: dispatch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
         run: |
           set -euo pipefail
           MASTER_SHA="$(git rev-parse origin/master)"
@@ -62,12 +79,28 @@ jobs:
           # human or still building, a second one just splits the reviewer's attention
           # and risks a double roll. Observed live on 2026-08-30: two dispatches 28min
           # apart, and docker.yml's own guard had to skip the second one's deploy.
-          PENDING="$(gh run list --repo "$REPO" --workflow=docker.yml \
+          gh run list --repo "$REPO" --workflow=docker.yml \
               --event=workflow_dispatch --limit 20 \
-              --json databaseId,status \
-              --jq '[.[] | select(.status == "waiting" or .status == "in_progress" or .status == "queued")] | length')"
+              --json databaseId,status,createdAt,url \
+              --jq '[.[] | select(.status == "waiting" or .status == "in_progress" or .status == "queued")]' \
+              > "$PENDING_JSON_PATH"
+          PENDING="$(jq 'length' "$PENDING_JSON_PATH")"
           if [ "${PENDING:-0}" -gt 0 ]; then
-            echo "::notice::$PENDING dispatch(es) already waiting or running — not dispatching."
+            WAITING="$(jq '[.[] | select(.status == "waiting")] | length' "$PENDING_JSON_PATH")"
+            # ::warning:: rather than ::notice:: so the Actions list marks the run.
+            # A skip must not read as an identical green success to a real dispatch
+            # (PEN-2848) — same convention as .github/scripts/guard-pending-deploy.sh.
+            echo "::warning::$PENDING dispatch(es) already waiting or running ($WAITING awaiting a human) — not dispatching."
+            {
+              echo "### Dispatch skipped — a deploy is already pending"
+              echo
+              echo "\`$PENDING\` non-terminal \`docker.yml\` dispatch(es); \`$WAITING\` awaiting a human reviewer."
+              jq -r '.[] | "- `\(.status)` since \(.createdAt) — \(.url)"' "$PENDING_JSON_PATH"
+              echo
+              echo "Guard (1) holds: a second dispatch would split the reviewer's attention and risk a double roll."
+              echo "**Production stays at its current commit until the pending approval is approved or rejected.**"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=skipped-pending" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -88,7 +121,16 @@ jobs:
           done
 
           if [ -n "$LAST_DEPLOYED" ] && [ "$LAST_DEPLOYED" = "$MASTER_SHA" ]; then
+            # Stays ::notice::, unlike guard (1): there is genuinely nothing to do
+            # and no one to chase, so marking the run would be noise. The step
+            # summary still distinguishes it from a real dispatch.
             echo "::notice::Production already at master ($MASTER_SHA) — nothing to dispatch."
+            {
+              echo "### No dispatch needed"
+              echo
+              echo "Production is already at \`master\` (\`$MASTER_SHA\`). No drift."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=up-to-date" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -98,8 +140,71 @@ jobs:
           else
             # Not fatal: a pruned run history looks identical to "never deployed".
             # Dispatching is the safe reading — worst case a human declines it.
+            AHEAD="?"
             echo "::warning::No successful deploy found in the last 20 dispatch runs; dispatching anyway."
           fi
 
           gh workflow run docker.yml --repo "$REPO" --ref master -f target_sha="$MASTER_SHA"
           echo "::notice::Dispatched docker.yml at $MASTER_SHA — awaiting human approval on paperclip-production."
+          {
+            echo "### Dispatched"
+            echo
+            echo "Dispatched \`docker.yml\` at \`$MASTER_SHA\` (\`$AHEAD\` commit(s) ahead of the last successful deploy)."
+            echo "It now awaits human approval on \`paperclip-production\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "outcome=dispatched" >> "$GITHUB_OUTPUT"
+
+      # Only on the skip path, so the common dispatch run pays nothing for it.
+      # `node` is not guaranteed on the arc-deploy image (it carries helm,
+      # kubectl, jq and ruby; actions/checkout runs on the runner's own bundled
+      # node, which is not on PATH for `run:` steps). setup-node explicitly, for
+      # the same reason pr.yml pins setup-python rather than trusting a bare
+      # `python3`: an unproven `command not found` on the escalation path would
+      # be worse than the gap it closes.
+      - name: Set up Node for the escalation step
+        if: steps.dispatch.outputs.outcome == 'skipped-pending'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # The daily cadence exists to keep drift inside the 24h alert threshold.
+      # A pending approval defeats it silently: guard (1) skips, the run reports
+      # success, and nothing measures how long a human has been sitting on the
+      # button. This pushes a severity=critical alert straight to Alertmanager,
+      # which routes critical|page to the slack-relay receiver — a path
+      # independent of the paperclip webhook receiver, whose own outage is one
+      # of the things an approval may be needed to fix (PEN-2581).
+      #
+      # No Prometheus rule and no exporter change: both candidate Argo apps
+      # (monitoring-rules, paperclip-api-deploy-drift) are manual-sync and were
+      # already OutOfSync, so a rule added there would merge green and deploy
+      # nothing. Delivery here is proven live — the sibling
+      # production-environment-protection-guard has been pushing to this same
+      # endpoint from the same arc-runners network namespace.
+      - name: Escalate a production approval that is stuck past its threshold
+        id: escalate
+        if: steps.dispatch.outputs.outcome == 'skipped-pending'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
+          # 6h default: measured against the incident that prompted this
+          # (PEN-2848). Run 33456522759 had been waiting 6h40m when the 07:23
+          # slot skipped it, so this threshold catches that case at the very
+          # first skipped slot rather than after a second silent day. Tune via
+          # the repo variable without a code change.
+          ALERT_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_ALERT_HOURS || '6' }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENVIRONMENT_NAME: ${{ vars.PRODUCTION_ENVIRONMENT_NAME || 'paperclip-production' }}
+        run: node .github/scripts/post-pending-deploy-alert.mjs
+
+      # Backstop, not the alerting path: a red run only emails the last
+      # committer, which for a `schedule` trigger is nobody useful. The alert
+      # above is what reaches a human. This makes `conclusion` itself carry the
+      # signal, so a stuck approval is visible in `gh run list` and any
+      # dashboard without opening the log.
+      - name: Fail the run when a production approval is stuck
+        if: steps.escalate.outputs.escalated == 'true'
+        run: |
+          echo "::error::A production deploy has been awaiting human approval past the alert threshold, so this dispatcher has been a no-op since. ProductionDeployApprovalStuck (severity=critical) was pushed to Alertmanager. See the step summary for the pending run."
+          exit 1
