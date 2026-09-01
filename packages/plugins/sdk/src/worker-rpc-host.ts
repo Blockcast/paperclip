@@ -73,6 +73,7 @@ import type {
   JsonRpcResponse,
   InitializeParams,
   InitializeResult,
+  PluginFencingPrecondition,
   ConfigChangedParams,
   ValidateConfigParams,
   OnEventParams,
@@ -905,10 +906,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             actorUserId: input.actor?.actorUserId,
             actorRunId: input.actor?.actorRunId,
             linkedLinearIssue: input.linkedLinearIssue,
+            fencing: input.fencing,
           });
         },
 
-        async update(issueId: string, patch, companyId: string, actor) {
+        async update(issueId: string, patch, companyId: string, actor, options) {
           return callHost("issues.update", {
             issueId,
             patch: {
@@ -918,6 +920,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
               actorRunId: actor?.actorRunId,
             },
             companyId,
+            fencing: options?.fencing,
           });
         },
 
@@ -967,8 +970,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.listComments", { issueId, companyId });
         },
 
-        async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string }) {
-          return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId });
+        async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string; fencing?: PluginFencingPrecondition }) {
+          return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId, fencing: options?.fencing });
         },
 
         async createInteraction(issueId: string, interaction, companyId: string, options?: { authorAgentId?: string }) {

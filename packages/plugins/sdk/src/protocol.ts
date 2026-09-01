@@ -394,6 +394,36 @@ export interface GetDataParams {
 }
 
 /**
+ * A fencing generation the caller must still hold for a mutating `issues.*`
+ * call to be applied.
+ *
+ * A plugin can enforce its own fence on its own database writes, but not on a
+ * host RPC — leaving a check-before-act window between "am I still the owner?"
+ * and the call. Supplying this closes it: the host takes a share lock on the
+ * named row inside the very transaction that performs the mutation and holds it
+ * to commit, so a concurrent steal either loses (and the mutation proceeds) or
+ * wins (and the mutation is rejected). There is no interleaving.
+ *
+ * `table` and the keys of `match` are resolved inside *this plugin's own*
+ * database namespace, which the host derives from the authenticated plugin — a
+ * plugin cannot name another schema, so this grants no additional SQL reach.
+ *
+ * Omit it and the call behaves exactly as it always has; this is opt-in.
+ *
+ * Rejection surfaces as an error carrying `code: "fencing_generation_lost"`, so
+ * a caller can distinguish "I was displaced" from "the RPC failed".
+ */
+export type PluginFencingPrecondition = {
+  /** Table in the calling plugin's namespace that holds the generation. */
+  table: string;
+  /** Column -> required value. One row must match all of them. */
+  match: Record<string, string | number | null>;
+};
+
+/** Error code returned when a supplied {@link PluginFencingPrecondition} no longer holds. */
+export const PLUGIN_FENCING_GENERATION_LOST_CODE = "fencing_generation_lost";
+
+/**
  * Input for the `performAction` RPC method.
  *
  * @see PLUGIN_SPEC.md §13.9 — `performAction`
@@ -1464,6 +1494,7 @@ export interface WorkerToHostMethods {
        * import an existing Linear issue rather than create one.
        */
       linkedLinearIssue?: { id: string; identifier: string };
+      fencing?: PluginFencingPrecondition;
     },
     result: Issue,
   ];
@@ -1472,6 +1503,7 @@ export interface WorkerToHostMethods {
       issueId: string;
       patch: Record<string, unknown>;
       companyId: string;
+      fencing?: PluginFencingPrecondition;
     },
     result: Issue,
   ];
@@ -1573,7 +1605,13 @@ export interface WorkerToHostMethods {
     result: IssueComment[],
   ];
   "issues.createComment": [
-    params: { issueId: string; body: string; companyId: string; authorAgentId?: string },
+    params: {
+      issueId: string;
+      body: string;
+      companyId: string;
+      authorAgentId?: string;
+      fencing?: PluginFencingPrecondition;
+    },
     result: IssueComment,
   ];
   "issues.createInteraction": [

@@ -74,6 +74,10 @@ import {
   type ExecutionWorkspaceConfig,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import {
+  assertPluginFencingGeneration,
+  type ResolvedPluginFencingPrecondition,
+} from "./plugin-fencing.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import {
   checkoutRestoreStatusExpression,
@@ -1043,6 +1047,14 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   prReviewTarget?: { repoFullName: string; prNumber: number } | null;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title" | "pr_review_target") => void;
   beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
+  /**
+   * Fencing generation the caller must still hold for this create to run. Set
+   * only by the plugin RPC host, which resolves the namespace from the
+   * authenticated plugin. Checked under a share lock as the transaction's first
+   * statement, so a displaced caller is rejected before it takes the aggregate
+   * advisory lock or mints a provider-side issue. See `plugin-fencing.ts`.
+   */
+  fencingPrecondition?: ResolvedPluginFencingPrecondition | null;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -9541,6 +9553,7 @@ export function issueService(db: Db) {
         prReviewTarget,
         onDeduplicated,
         beforeSideEffects,
+        fencingPrecondition,
         ...issueData
       } = data;
       // GitHub owner/repo identity is case-insensitive, so the persisted
@@ -9590,6 +9603,11 @@ export function issueService(db: Db) {
       let createdIssue;
       try {
         createdIssue = await db.transaction(async (tx) => {
+        // First statement in the transaction, deliberately. A caller that has
+        // already lost its fence must not reach the aggregate advisory lock or
+        // any provider-side create below; the share lock taken here also blocks
+        // a steal from committing while this create is in flight.
+        await assertPluginFencingGeneration(tx, fencingPrecondition);
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (issueData.assigneeAgentId) {
@@ -10313,6 +10331,16 @@ export function issueService(db: Db) {
          *   absent  -> leave the park exactly as it is
          */
         parkedDisposition?: IssueParkedDispositionInput | null;
+        /**
+         * Fencing generation the caller must still hold for this update to
+         * apply. Set only by the plugin RPC host, which resolves the namespace
+         * from the authenticated plugin. Unlike the `expectedCurrent*`
+         * preconditions above — which compare against a snapshot read before
+         * the transaction — this is checked under a share lock held to commit,
+         * so a steal cannot interleave between the check and the write. See
+         * `plugin-fencing.ts`.
+         */
+        fencingPrecondition?: ResolvedPluginFencingPrecondition | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -10338,6 +10366,7 @@ export function issueService(db: Db) {
         expectedCurrentExecutionPolicy,
         suppressRoutineSchedulerFailureHeartbeat,
         parkedDisposition,
+        fencingPrecondition,
         ...issueData
       } = data;
 
@@ -10675,6 +10704,11 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        // Before any row or advisory lock below: a caller that has already lost
+        // its fence is rejected without contending for them, and the share lock
+        // this takes is held to commit, so a steal cannot land between here and
+        // the UPDATE.
+        await assertPluginFencingGeneration(tx, fencingPrecondition);
         // Parent and blocker edges share issue rows. Take one company-scoped graph
         // lock before either path starts row-level locks, so combined parent/blocker
         // patches cannot invert against blocker-only patches.
@@ -12551,9 +12585,29 @@ export function issueService(db: Db) {
         idempotencyKey?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
+        /**
+         * Fencing generation the caller must still hold for this comment to be
+         * written. Set only by the plugin RPC host. Unlike `update`/`create`,
+         * this function does not open its own transaction, so the caller must
+         * supply one via `dbOrTx` — enforced below rather than silently
+         * degraded. See `plugin-fencing.ts`.
+         */
+        fencingPrecondition?: ResolvedPluginFencingPrecondition | null;
       },
       dbOrTx: any = db,
     ) => {
+      if (options?.fencingPrecondition && dbOrTx === db) {
+        // A share lock is only a lock for as long as its transaction lives. On
+        // the default handle each statement autocommits, so the lock would be
+        // released before the insert and this would degrade back into the
+        // check-before-act barrier it exists to replace. Fail loudly instead of
+        // appearing to fence.
+        throw new Error(
+          "issues.addComment with a fencingPrecondition requires an explicit transaction",
+        );
+      }
+      await assertPluginFencingGeneration(dbOrTx, options?.fencingPrecondition);
+
       const issue = await dbOrTx
         .select({ companyId: issues.companyId })
         .from(issues)

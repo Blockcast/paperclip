@@ -884,6 +884,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-existing",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     const updatePatch = mocks.issues.update.mock.calls[0][1];
     expect(updatePatch.status).toBeUndefined();
@@ -929,6 +940,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-existing",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
@@ -974,6 +996,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-existing",
       expect.objectContaining({ status: "todo" }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.reopened",
@@ -1024,6 +1057,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-winner",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
@@ -1163,6 +1207,17 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
       "issue-existing",
       expect.objectContaining({ status: "todo" }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.suppression_expired",
@@ -1173,6 +1228,16 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
       "issue-existing",
       expect.stringContaining("kept firing past"),
       "company-1",
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
     expect(written.operatorSuppressedAt).toBeNull();
@@ -2654,6 +2719,17 @@ describe("handleWebhook — resolved", () => {
       "issue-aggregate-winner",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.objectContaining({
