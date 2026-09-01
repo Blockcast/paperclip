@@ -3245,11 +3245,14 @@ describe("realizeExecutionWorkspace", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = "default";
     const managedCwd = path.resolve(paperclipHome, "instances", "default", "projects", "company-repo-mismatch", "project-repo-mismatch", "paperclip");
-    await fs.mkdir(managedCwd, { recursive: true });
-    await runGit(managedCwd, ["init"]);
-    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
+    await fs.mkdir(path.dirname(managedCwd), { recursive: true });
+    const managedFixture = await createTempRepoWithSubmodule();
+    await fs.rename(managedFixture.repoRoot, managedCwd);
 
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
     try {
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      process.env.GIT_ALLOW_PROTOCOL = "file";
       const realized = await ensurePersistedExecutionWorkspaceAvailable({
         base: {
           baseCwd: repoRoot,
@@ -3280,10 +3283,15 @@ describe("realizeExecutionWorkspace", () => {
           name: "Codex Coder",
           companyId: "company-repo-mismatch",
         },
+        recorder,
       });
       expect(realized?.cwd).toBe(managedCwd);
       expect(realized?.warnings.some((warning) => warning.includes(repoRoot) && warning.includes(managedCwd))).toBe(true);
+      expect(realized?.warnings).toContain(`Initialized git submodules before starting: ${managedFixture.submodulePath}`);
+      expect(operations.some((operation) => operation.metadata?.action === "repair_uninitialized_submodules")).toBe(true);
     } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol;
       if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
       else process.env.PAPERCLIP_HOME = previousHome;
       if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -3301,11 +3309,14 @@ describe("realizeExecutionWorkspace", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = "default";
     const managedCwd = path.resolve(paperclipHome, "instances", "default", "projects", "company-fresh-repo-mismatch", "project-fresh-repo-mismatch", "paperclip");
-    await fs.mkdir(managedCwd, { recursive: true });
-    await runGit(managedCwd, ["init"]);
-    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
+    await fs.mkdir(path.dirname(managedCwd), { recursive: true });
+    const managedFixture = await createTempRepoWithSubmodule();
+    await fs.rename(managedFixture.repoRoot, managedCwd);
 
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
     try {
+      process.env.GIT_ALLOW_PROTOCOL = "file";
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
       const realized = await realizeExecutionWorkspace({
         base: {
           baseCwd: repoRoot,
@@ -3326,10 +3337,15 @@ describe("realizeExecutionWorkspace", () => {
           name: "Codex Coder",
           companyId: "company-fresh-repo-mismatch",
         },
+        recorder,
       });
       expect(realized.cwd).toBe(managedCwd);
       expect(realized.warnings.some((warning) => warning.includes(repoRoot) && warning.includes(managedCwd))).toBe(true);
+      expect(realized.warnings).toContain(`Initialized git submodules before starting: ${managedFixture.submodulePath}`);
+      expect(operations.some((operation) => operation.metadata?.action === "repair_uninitialized_submodules")).toBe(true);
     } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol;
       if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
       else process.env.PAPERCLIP_HOME = previousHome;
       if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;

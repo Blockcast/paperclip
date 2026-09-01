@@ -3802,6 +3802,10 @@ export async function realizeExecutionWorkspace(input: {
         : null;
       if (managedCwd) {
         warnings.push(`Rebound stale project_primary cwd "${input.base.baseCwd}" to managed checkout "${managedCwd}".`);
+        const submoduleWarnings = await ensureGitSubmodulesReady({
+          cwd: managedCwd,
+          recorder: input.recorder ?? null,
+        });
         return {
           ...input.base,
           baseCwd: managedCwd,
@@ -3809,7 +3813,7 @@ export async function realizeExecutionWorkspace(input: {
           strategy: "project_primary",
           branchName: null,
           worktreePath: null,
-          warnings: [...warnings, ...(await stampCheckoutIdentity(managedCwd, input.agent))],
+          warnings: [...warnings, ...submoduleWarnings, ...(await stampCheckoutIdentity(managedCwd, input.agent))],
           created: false,
           baseRefSha: null,
         };
@@ -4174,12 +4178,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           })
         : null;
       if (managedCwd) {
+        const submoduleWarnings = await ensureGitSubmodulesReady({
+          cwd: managedCwd,
+          recorder: input.recorder ?? null,
+        });
         return {
           ...realized,
           cwd: managedCwd,
           baseCwd: managedCwd,
           warnings: [
             `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
+            ...submoduleWarnings,
             ...(await stampCheckoutIdentity(managedCwd, input.agent)),
           ],
         };
