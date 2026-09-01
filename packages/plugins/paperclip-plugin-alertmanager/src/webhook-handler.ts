@@ -210,25 +210,71 @@ async function releaseAggregateCreationClaim(
   );
 }
 
+/**
+ * Attach a member to the aggregate, but only while the caller still holds the
+ * firing fence under `firingToken`.
+ *
+ * This guard is what makes the ownership steal in `beginAggregateFiring` safe
+ * *without* relying on the predecessor being dead. `firing_token` is a fresh
+ * UUID minted on every claim and replaced on every steal, so it is already a
+ * per-claim generation in the fencing-token sense: a process that has been
+ * displaced — by a steal, by the startup sweep, or by its own `finally` — can
+ * no longer satisfy this predicate, and therefore cannot attach a member behind
+ * a newer owner's back.
+ *
+ * That matters because same-slot/different-instance is strong evidence of
+ * death, not proof of it: Kubernetes' at-most-one guarantee for a StatefulSet
+ * ordinal is suspended by force deletion, and by `podManagementPolicy:
+ * Parallel`. Rather than rest the fence's safety on that assumption holding,
+ * the mutation the fence exists to protect is gated on the generation directly.
+ * An overlapping predecessor loses the race deterministically instead of
+ * silently attaching a live member to an aggregate a resolver has begun to
+ * cancel — the race the design comment in `beginAggregateFiring` refuses to
+ * reopen.
+ *
+ * The guard and the write are one statement, so they are evaluated against a
+ * single committed snapshot: a concurrent steal either commits first (this
+ * write is refused) or after (this write already landed, and the steal's new
+ * owner sees it). There is no check-then-act window between them.
+ *
+ * Refusal throws rather than returning silently: the delivery must fail so
+ * Alertmanager retries against whichever owner now holds the fence.
+ */
 async function upsertAggregateMember(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
   issueId: string,
   fingerprint: string,
+  firingToken: string,
 ): Promise<void> {
   const ns = ctx.db.namespace;
-  await ctx.db.execute(
+  const result = await ctx.db.execute(
     `INSERT INTO ${q(ns, AGGREGATE_MEMBERS_TABLE)}
        (company_id, aggregate_key, fingerprint, issue_id)
-     VALUES ($1, $2, $3, $4)
+     SELECT $1, $2, $3, $4
+     WHERE EXISTS (
+       SELECT 1 FROM ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+        WHERE company_id = $1
+          AND aggregate_key = $2
+          AND phase = 'firing'
+          AND firing_token = $5
+     )
      ON CONFLICT (company_id, aggregate_key, fingerprint)
      DO UPDATE SET
        issue_id = EXCLUDED.issue_id,
        resolved_at = NULL,
        updated_at = now()`,
-    [companyId, aggregateKey, fingerprint, issueId],
+    [companyId, aggregateKey, fingerprint, issueId, firingToken],
   );
+  if (result.rowCount === 0) {
+    throw new Error(
+      `Alertmanager aggregate ${aggregateKey} was reclaimed by another owner ` +
+        `while this firing delivery was in flight; refusing to attach member ` +
+        `${fingerprint} behind the current fence holder. Failing the delivery so ` +
+        `Alertmanager retries against the owner that now holds the fence.`,
+    );
+  }
 }
 
 /**
@@ -251,10 +297,23 @@ async function beginAggregateFiring(
   // newer resolver has started the terminal transition. That race stays closed:
   // nothing below releases a fence because it is old.
   //
-  // What is admitted (BLO-31036) is a fence whose owner is provably gone: same
-  // slot, different process. A slot's previous occupant cannot resume — the
-  // StatefulSet only recreates an ordinal after the prior pod has fully
-  // terminated — so this is a fact about liveness, not a guess about latency.
+  // What is admitted (BLO-31036) is a fence held by a different process in this
+  // same slot. A slot's previous occupant has ordinarily been replaced, because
+  // a StatefulSet recreates an ordinal only after the prior pod terminated — but
+  // that is strong evidence of death, NOT proof of it. Kubernetes suspends the
+  // at-most-one guarantee under force deletion (`--grace-period=0`) and under
+  // `podManagementPolicy: Parallel`, and a partitioned node can leave an old
+  // process running and able to do work while its replacement starts.
+  //
+  // So the steal is deliberately NOT load-bearing for safety. `firing_token` is
+  // a fresh UUID per claim, replaced on every steal, i.e. a generation in the
+  // fencing-token sense — and `upsertAggregateMember` and `finishAggregateFiring`
+  // both gate on it. An overlapping predecessor that loses this race can no
+  // longer attach a member or complete its delivery; its write is refused and
+  // the delivery fails loudly for Alertmanager to retry. Correctness therefore
+  // rests on the generation check at the mutation site, and this predicate only
+  // decides who is allowed to *proceed*, not whose writes count.
+  //
   // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
   // therefore excluded, as is any owner in another slot.
   const result = await ctx.db.execute(
@@ -1212,6 +1271,7 @@ export async function handleFiring(
         aggregateKey,
         tracked.paperclipIssueId,
         alert.fingerprint,
+        firingToken,
       );
 
       const updated: AlertStateRecord = {
@@ -1465,6 +1525,7 @@ export async function handleFiring(
     aggregateKey,
     issue.id,
     alert.fingerprint,
+    firingToken,
   );
   await ctx.state.set(stateRef, record);
 

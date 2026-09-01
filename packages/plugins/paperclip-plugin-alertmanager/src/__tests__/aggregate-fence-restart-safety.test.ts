@@ -408,3 +408,71 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     );
   });
 });
+
+/**
+ * The steal in `beginAggregateFiring` rests on same-slot/different-instance,
+ * which is strong evidence that the predecessor is gone but not proof: force
+ * deletion and `podManagementPolicy: Parallel` both suspend the StatefulSet
+ * at-most-one guarantee, and a partitioned node can leave an old process alive
+ * and still able to do work.
+ *
+ * So safety must not depend on the predecessor being dead. `firing_token` is a
+ * fresh UUID per claim, replaced on every steal — a generation — and the writes
+ * the fence exists to protect are gated on it. These cases model a genuinely
+ * overlapping predecessor: one still running, mid-delivery, when a replacement
+ * takes the fence. It must lose deterministically.
+ */
+describe("BLO-31036 — an overlapping predecessor cannot write behind the new fence owner", () => {
+  /** Steal the fence out from under the in-flight delivery, as a replacement process would. */
+  function stealFenceOnClaim(mocks: ReturnType<typeof mkCtx>["mocks"]) {
+    const passthrough = mocks.db.execute.getMockImplementation()!;
+    let stolen = false;
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      const result = await passthrough(sql, params);
+      if (!stolen && sql.includes(FENCES) && sql.includes("INSERT INTO")) {
+        stolen = true;
+        await db.query(
+          `UPDATE ${FENCES}
+              SET firing_token = $1, owner_instance_id = $2, owner_slot = $3
+            WHERE company_id = $4 AND aggregate_key = $5`,
+          ["token-replacement", "instance-replacement", SELF.slot, COMPANY_ID, AGGREGATE_KEY],
+        );
+      }
+      return result;
+    });
+  }
+
+  it("refuses the predecessor's member write once its generation is superseded", async () => {
+    const { ctx, mocks } = mkCtx();
+    stealFenceOnClaim(mocks);
+
+    // The delivery must fail rather than attach a member behind the new owner.
+    await expect(deliver(ctx)).rejects.toThrow();
+
+    const members = await db.query(
+      `SELECT fingerprint FROM ${NAMESPACE}.alertmanager_aggregate_members
+        WHERE company_id = $1 AND aggregate_key = $2`,
+      [COMPANY_ID, AGGREGATE_KEY],
+    );
+    expect(members.rows).toHaveLength(0);
+  });
+
+  it("cannot release or overwrite the replacement's fence on its way out", async () => {
+    // Regression lock on behaviour that already held: `finishAggregateFiring`
+    // was token-guarded before this change, so this case still passes with the
+    // new member-write guard mutated out. It is kept because it pins the other
+    // half of the property Ally asked about — a displaced predecessor must not
+    // be able to clear or steal back the fence — not because it covers the fix.
+    const { ctx, mocks } = mkCtx();
+    stealFenceOnClaim(mocks);
+
+    await expect(deliver(ctx)).rejects.toThrow();
+
+    // The replacement still holds the fence under its own generation: the
+    // predecessor's `finally` could not clear it, and nothing downgraded it.
+    const fence = await readFence();
+    expect(fence?.phase).toBe("firing");
+    expect(fence?.firing_token).toBe("token-replacement");
+    expect(fence?.owner_instance_id).toBe("instance-replacement");
+  });
+});
