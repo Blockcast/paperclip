@@ -78,6 +78,7 @@ import {
   applyIssueMonitorPolicyTransition,
   buildIssueMonitorClearedPatch,
   derivePersistedMonitorState,
+  isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -6043,7 +6044,7 @@ export function recoveryService(
    */
   function hasActiveMonitorPath(issue: typeof issues.$inferSelect, graceMs: number) {
     if (issue.status === "blocked") return false;
-    if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()) return true;
+    if (isMonitorNextCheckAtLive(issue.monitorNextCheckAt, Date.now())) return true;
 
     // BLO-18643: a monitor that has already fired (`status: "triggered"`) but has not
     // yet been rescheduled or cleared is still an active watch, not an absent one --
