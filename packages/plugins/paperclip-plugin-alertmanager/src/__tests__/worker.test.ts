@@ -1738,7 +1738,10 @@ describe("PEN-2581 — a wedged aggregate fence names the phase that actually bl
       expect(logged).toContain(aggregateKey);
       // The precise false statement that misdirected the investigation.
       expect(logged).not.toContain("is finalizing");
-      // The wedge never self-clears, so the error must say what ends it.
+      // A fence abandoned by a dead process now self-clears via its slot's next
+      // worker (BLO-31036), so a *persistent* refusal means the holder is live
+      // or in another slot. The error must still name the operator escape hatch
+      // for that case.
       expect(logged).toContain("recover-aggregate-firing");
     },
   );
@@ -2259,9 +2262,18 @@ describe("handleWebhook — resolved", () => {
         /INSERT INTO alertmanager\.alertmanager_aggregate_lifecycle_fences/i.test(sql) &&
         /phase, firing_token/i.test(sql)
       ) {
-        // A cancellation fence is never leaseable: a delayed canceller could
+        // Refuse the claim: the fence is held by a canceller that could still
+        // act — either a live delivery in this same process, or a holder in
+        // another slot. Neither is stealable, because a delayed canceller could
         // otherwise close the issue after this firing attached a live member.
-        return { rowCount: /'cancelling'/i.test(sql) ? 1 : 0 };
+        //
+        // Refused unconditionally rather than by sniffing the SQL for
+        // `'cancelling'`: since BLO-31036 the claim statement names that phase
+        // in its own steal predicate, so the literal is no longer a proxy for
+        // the stored phase. Which owners are and are not stealable is asserted
+        // against a modelled fence table in
+        // `aggregate-fence-restart-safety.test.ts`.
+        return { rowCount: 0 };
       }
       return { rowCount: 1 };
     });
