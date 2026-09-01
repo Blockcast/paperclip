@@ -3338,6 +3338,71 @@ describe("realizeExecutionWorkspace", () => {
     }
   });
 
+  it("rejects a reused shared project_primary cwd when the managed checkout has the wrong origin", async () => {
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-wrong-managed-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const managedCwd = path.resolve(
+      paperclipHome,
+      "instances",
+      "default",
+      "projects",
+      "company-wrong-managed-repo",
+      "project-wrong-managed-repo",
+      "paperclip",
+    );
+    await fs.mkdir(managedCwd, { recursive: true });
+    await runGit(managedCwd, ["init"]);
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/trafficcontrol.git"]);
+
+    try {
+      await expect(ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-wrong-managed-repo",
+          workspaceId: "workspace-wrong-managed-repo",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          repoRef: "master",
+        },
+        workspace: {
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+          cwd: repoRoot,
+          providerRef: null,
+          projectId: "project-wrong-managed-repo",
+          projectWorkspaceId: "workspace-wrong-managed-repo",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          baseRef: "master",
+          branchName: null,
+        },
+        issue: {
+          id: "issue-wrong-managed-repo",
+          identifier: "PAP-WRONG-MANAGED-REPO",
+          title: "Wrong managed repo workspace",
+        },
+        agent: {
+          id: "agent-wrong-managed-repo",
+          name: "Codex Coder",
+          companyId: "company-wrong-managed-repo",
+        },
+      })).rejects.toMatchObject({
+        code: "workspace_repo_mismatch",
+        name: WorkspaceRepoMismatchError.name,
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a freshly realized project_primary cwd when no verified managed checkout exists", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
