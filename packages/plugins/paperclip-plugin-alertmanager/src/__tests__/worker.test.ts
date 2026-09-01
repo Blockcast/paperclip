@@ -52,6 +52,27 @@ import type {
   PluginWebhookInput,
 } from "@paperclipai/plugin-sdk";
 
+/**
+ * BLO-31036 — the firing tail is fenced, so `ctx.state.set` and
+ * `ctx.events.emit` take one more argument on that path: the generation the
+ * host enforces inside the write's own transaction.
+ *
+ * Pinned, not ignored. Relaxing these to `expect.anything()` — or dropping the
+ * trailing argument so vitest only checks a prefix — would leave them green
+ * with the fence removed, which is the exact regression they now guard. The
+ * token itself is a per-claim UUID, so its presence and the phase holding it
+ * are the strongest things assertable without reaching into the fence table.
+ */
+const FIRING_FENCE_ARG = {
+  fencing: {
+    table: "alertmanager_aggregate_lifecycle_fences",
+    match: expect.objectContaining({
+      phase: "firing",
+      firing_token: expect.any(String),
+    }),
+  },
+};
+
 // ---------------------------------------------------------------------------
 // Test fixtures
 // ---------------------------------------------------------------------------
@@ -599,6 +620,7 @@ describe("handleWebhook — firing first time", () => {
         severity: "critical",
         resolvedAt: null,
       }),
+      FIRING_FENCE_ARG,
     );
 
     // Firing event emitted
@@ -611,6 +633,7 @@ describe("handleWebhook — firing first time", () => {
         assigneeUserId: "user-42",
         reFired: false,
       }),
+      FIRING_FENCE_ARG,
     );
     // Activity + metric
     expect(mocks.activity.log).toHaveBeenCalled();
@@ -665,6 +688,7 @@ describe("handleWebhook — firing first time", () => {
         paperclipIssueId: "issue-winner",
         assigneeAgentId: "agent-owner",
       }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -729,6 +753,7 @@ describe("handleWebhook — firing first time", () => {
         assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
         assigneeUserId: null,
       }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -955,11 +980,13 @@ describe("handleWebhook — dedup on re-fire", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({ lastFiredAt: expect.any(String), resolvedAt: null }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.firing",
       "company-1",
       expect.objectContaining({ fingerprint: "legacy-info-1", reFired: true }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.deduped",
@@ -1076,6 +1103,7 @@ describe("handleWebhook — dedup on re-fire", () => {
         assigneeAgentId: "agent-owner",
         resolvedAt: null,
       }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.firing",
@@ -1084,6 +1112,7 @@ describe("handleWebhook — dedup on re-fire", () => {
         paperclipIssueId: "issue-winner",
         reFired: true,
       }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.aggregate.rebound",
@@ -2359,6 +2388,7 @@ describe("handleWebhook — resolved", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.objectContaining({ stateKey: "alert:concurrent-firing" }),
       expect.objectContaining({ paperclipIssueId: "issue-winner", resolvedAt: null }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -2743,6 +2773,7 @@ describe("handleWebhook — resolved", () => {
         assigneeAgentId: "agent-winner",
         resolvedAt: null,
       }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.db.query).toHaveBeenCalledWith(
       expect.stringContaining("resolved_at IS NULL"),
@@ -3216,6 +3247,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.objectContaining({ stateKey: "alert:series-loser" }),
       expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.aggregate.joined",
@@ -3247,6 +3279,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.issues.list).toHaveBeenCalledWith(
       expect.objectContaining({ status: "blocked", limit: 1 }),
@@ -3314,10 +3347,12 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       { scopeKind: "company", scopeId: "company-A", stateKey: `alert:${alert.fingerprint}` },
       expect.objectContaining({ paperclipIssueId: "issue-A", paperclipCompanyId: "company-A" }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       { scopeKind: "company", scopeId: "company-B", stateKey: `alert:${alert.fingerprint}` },
       expect.objectContaining({ paperclipIssueId: "issue-B", paperclipCompanyId: "company-B" }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -3574,6 +3609,7 @@ describe("BLO-20467 — firing retries are idempotent across create/state-write"
     expect(mocks.state.set).toHaveBeenLastCalledWith(
       expect.objectContaining({ scopeKind: "company", stateKey: "alert:9a3b1e4c5f6d7890" }),
       expect.objectContaining({ paperclipIssueId: "issue-from-attempt-1", resolvedAt: null }),
+      FIRING_FENCE_ARG,
     );
   });
 

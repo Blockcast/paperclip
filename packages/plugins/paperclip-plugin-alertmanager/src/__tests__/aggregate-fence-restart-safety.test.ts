@@ -650,3 +650,161 @@ describe("BLO-31049 — issue mutations carry the generation the host enforces",
     expect(sent).toEqual(live);
   });
 });
+
+/**
+ * BLO-31036 — the tail after the member write is fenced too.
+ *
+ * `upsertAggregateMember` proves ownership *at that statement* and nowhere
+ * else. Ally's Critical was about what came next: `ctx.state.set` and
+ * `ctx.events.emit` ran unguarded, so a steal committing in the gap let a
+ * displaced predecessor overwrite the aggregate's alert state and announce a
+ * firing for an aggregate it no longer owned. Winning the member write and
+ * then losing the fence is a real interleaving, not a hypothetical — it is the
+ * same rollout-mid-delivery sequence that wedged the 19 fences this ticket
+ * exists to drain.
+ *
+ * Both call sites now carry `firingFence(...)`. As with the `issues.*` cases
+ * above, these pin the *plugin's* half — that the generation it hands the host
+ * is the one it currently holds, and that after a steal it is provably the
+ * superseded one. The host's half (refusing an obsolete generation, and
+ * serializing a racing steal rather than interleaving with it) is proven
+ * against a real PostgreSQL in
+ * `server/src/__tests__/issues-plugin-fencing-generation.test.ts`.
+ */
+describe("BLO-31036 — state and event publication carry the generation too", () => {
+  const MEMBERS = `${NAMESPACE}.alertmanager_aggregate_members`;
+
+  /** The fence row as it stands *right now*, mid-delivery. */
+  async function liveFence() {
+    const result = await db.query<{ firing_token: string | null; phase: string }>(
+      `SELECT phase, firing_token FROM ${FENCES}
+        WHERE company_id = $1 AND aggregate_key = $2`,
+      [COMPANY_ID, AGGREGATE_KEY],
+    );
+    const row = result.rows[0];
+    return {
+      table: "alertmanager_aggregate_lifecycle_fences",
+      match: {
+        company_id: COMPANY_ID,
+        aggregate_key: AGGREGATE_KEY,
+        phase: row?.phase,
+        firing_token: row?.firing_token,
+      },
+    };
+  }
+
+  /**
+   * Steal the fence in the one window the member guard cannot cover: *after*
+   * its INSERT has already committed. The predecessor is admitted as a member
+   * and only then displaced, so it reaches the state/event tail believing it
+   * still owns the aggregate. This is deliberately a different instant from
+   * `stealFenceOnClaim` above, which lands early enough for the barrier to
+   * reject the whole delivery.
+   */
+  function stealFenceAfterMemberWrite(mocks: ReturnType<typeof mkCtx>["mocks"]) {
+    const passthrough = mocks.db.execute.getMockImplementation()!;
+    let stolen = false;
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      const result = await passthrough(sql, params);
+      if (!stolen && sql.includes(MEMBERS) && sql.includes("INSERT INTO")) {
+        stolen = true;
+        await db.query(
+          `UPDATE ${FENCES}
+              SET firing_token = $1, owner_instance_id = $2, owner_slot = $3
+            WHERE company_id = $4 AND aggregate_key = $5`,
+          ["token-replacement", "instance-replacement", SELF.slot, COMPANY_ID, AGGREGATE_KEY],
+        );
+      }
+      return result;
+    });
+  }
+
+  /** The `fencing` option passed to `ctx.state.set(ref, value, options)`. */
+  const stateSetFencing = (mocks: ReturnType<typeof mkCtx>["mocks"]) =>
+    (mocks.state.set.mock.calls[0]?.[2] as { fencing?: unknown } | undefined)?.fencing;
+
+  /** The `fencing` option passed to `ctx.events.emit(name, company, payload, options)`. */
+  const emitFencing = (mocks: ReturnType<typeof mkCtx>["mocks"]) =>
+    (mocks.events.emit.mock.calls[0]?.[3] as { fencing?: unknown } | undefined)?.fencing;
+
+  it("sends the live generation with the creation path's state write and firing event", async () => {
+    const { ctx, mocks } = mkCtx();
+
+    await deliver(ctx);
+
+    expect(mocks.state.set).toHaveBeenCalled();
+    expect(mocks.events.emit).toHaveBeenCalled();
+    // The member write proves the delivery held the fence; both tail calls must
+    // carry that same generation, not merely "some fencing object".
+    const token = (stateSetFencing(mocks) as { match: { firing_token: string | null } })
+      ?.match?.firing_token;
+    expect(token).toEqual(expect.any(String));
+    expect(emitFencing(mocks)).toEqual(stateSetFencing(mocks));
+  });
+
+  it("sends the live generation with the re-fire path's state write and firing event", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValue({
+      paperclipIssueId: "issue-open",
+      paperclipCompanyId: COMPANY_ID,
+      aggregateKey: AGGREGATE_KEY,
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+      alertname: ALERTNAME,
+      severity: "critical",
+      firstSeenAt: "2026-08-31T00:00:00Z",
+      lastFiredAt: "2026-08-31T00:00:00Z",
+      resolvedAt: null,
+      operatorSuppressedAt: null,
+      nextEscalationAt: null,
+      escalationAttempt: 0,
+      escalationComplete: true,
+      escalationIntervalMs: null,
+    } as never);
+    mocks.issues.get.mockResolvedValue({ id: "issue-open", status: "todo" } as never);
+
+    // Captured at call time: the fence is still held here and cleared by the
+    // `finally`, so reading it after `deliver` would compare against nothing.
+    let live: unknown;
+    mocks.state.set.mockImplementation((async () => {
+      live = await liveFence();
+    }) as never);
+
+    await deliver(ctx);
+
+    expect(mocks.state.set).toHaveBeenCalled();
+    expect((live as { match: { firing_token: string | null } }).match.firing_token)
+      .toEqual(expect.any(String));
+    expect(stateSetFencing(mocks)).toEqual(live);
+    expect(emitFencing(mocks)).toEqual(live);
+  });
+
+  it("hands the host a superseded generation when displaced after the member write", async () => {
+    const { ctx, mocks } = mkCtx();
+    stealFenceAfterMemberWrite(mocks);
+
+    // The delivery is *not* rejected locally, and that is the point: the member
+    // write already succeeded, and the barrier ahead of it ran while the fence
+    // was still held. Nothing inside the plugin can see the steal. The only
+    // thing standing between this predecessor and a stale publish is that the
+    // generation it sends no longer matches the row.
+    await deliver(ctx).catch(() => {
+      /* the `finally` also fails once the token is gone; irrelevant here */
+    });
+
+    const sent = stateSetFencing(mocks) as
+      | { match: { firing_token: string | null } }
+      | undefined;
+    expect(sent).toBeDefined();
+    expect(emitFencing(mocks)).toEqual(sent);
+
+    // The fence now belongs to the replacement, and what the predecessor sent
+    // does not match it — so `assertPluginFencingGeneration` rejects both the
+    // state write and the emit. Asserting the mismatch rather than the refusal
+    // is deliberate: the refusal happens in the host, which this suite mocks.
+    const fence = await readFence();
+    expect(fence?.firing_token).toBe("token-replacement");
+    expect(sent!.match.firing_token).not.toBe("token-replacement");
+    expect(sent!.match.firing_token).toEqual(expect.any(String));
+  });
+});

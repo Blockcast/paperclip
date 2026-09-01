@@ -394,8 +394,8 @@ export interface GetDataParams {
 }
 
 /**
- * A fencing generation the caller must still hold for a mutating `issues.*`
- * call to be applied.
+ * A fencing generation the caller must still hold for a mutating host call —
+ * `issues.*`, `state.set`, or `events.emit` — to be applied.
  *
  * A plugin can enforce its own fence on its own database writes, but not on a
  * host RPC — leaving a check-before-act window between "am I still the owner?"
@@ -403,6 +403,12 @@ export interface GetDataParams {
  * named row inside the very transaction that performs the mutation and holds it
  * to commit, so a concurrent steal either loses (and the mutation proceeds) or
  * wins (and the mutation is rejected). There is no interleaving.
+ *
+ * `events.emit` is the one exception, and it is weaker on purpose — see the
+ * note on that method in `PluginEventsClient`. Event delivery is an in-memory
+ * fan-out, not a database write, so there is no transaction to join: the host
+ * evaluates the generation immediately before dispatch and refuses to emit once
+ * it is gone, but cannot hold a lock across the handlers.
  *
  * `table` and the keys of `match` are resolved inside *this plugin's own*
  * database namespace, which the host derives from the authenticated plugin — a
@@ -1038,7 +1044,14 @@ export interface WorkerToHostMethods {
     },
   ];
   "state.set": [
-    params: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string; value: unknown },
+    params: {
+      scopeKind: string;
+      scopeId?: string;
+      namespace?: string;
+      stateKey: string;
+      value: unknown;
+      fencing?: PluginFencingPrecondition;
+    },
     result: void,
   ];
   "state.delete": [
@@ -1109,7 +1122,12 @@ export interface WorkerToHostMethods {
 
   // Events
   "events.emit": [
-    params: { name: string; companyId: string; payload: unknown },
+    params: {
+      name: string;
+      companyId: string;
+      payload: unknown;
+      fencing?: PluginFencingPrecondition;
+    },
     result: void,
   ];
   "events.subscribe": [

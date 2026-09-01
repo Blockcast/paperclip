@@ -54,6 +54,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import {
+  assertPluginFencingGeneration,
   resolvePluginFencingPrecondition,
   type PluginFencingPreconditionInput,
   type ResolvedPluginFencingPrecondition,
@@ -1321,13 +1322,17 @@ export function buildHostServices(
         };
       },
       async set(params) {
-        await stateStore.set(pluginId, {
-          scopeKind: params.scopeKind as any,
-          scopeId: params.scopeId,
-          namespace: params.namespace,
-          stateKey: params.stateKey,
-          value: params.value,
-        });
+        await stateStore.set(
+          pluginId,
+          {
+            scopeKind: params.scopeKind as any,
+            scopeId: params.scopeId,
+            namespace: params.namespace,
+            stateKey: params.stateKey,
+            value: params.value,
+          },
+          await resolveCallerFencingPrecondition(params.fencing),
+        );
       },
       async delete(params) {
         await stateStore.delete(pluginId, params.scopeKind as any, params.stateKey, {
@@ -1362,6 +1367,24 @@ export function buildHostServices(
       async emit(params) {
         if (params.companyId) {
           await ensurePluginAvailableForCompany(params.companyId);
+        }
+        // Weaker than the `issues.*` / `state.set` fence, on purpose. Those join
+        // the mutation's transaction and hold the lock to commit; a bus emit is
+        // an in-memory fan-out with no transaction to join, so the best
+        // available guarantee is "check immediately before dispatch, and refuse
+        // once the generation is gone". That is what stops a displaced worker
+        // announcing a firing it no longer owns.
+        //
+        // The lock is deliberately not held across the fan-out. Subscriber
+        // handlers run arbitrary plugin code, so holding it would let one slow
+        // handler block a steal — recreating the unstealable fence this whole
+        // mechanism exists to prevent (BLO-31036). A bounded notification race
+        // is the better trade than an unbounded lock on the recovery path.
+        const fencingPrecondition = await resolveCallerFencingPrecondition(params.fencing);
+        if (fencingPrecondition) {
+          await db.transaction(async (tx) => {
+            await assertPluginFencingGeneration(tx, fencingPrecondition);
+          });
         }
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },

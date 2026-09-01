@@ -536,8 +536,13 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           };
         },
 
-        async emit(name: string, companyId: string, payload: unknown): Promise<void> {
-          await callHost("events.emit", { name, companyId, payload });
+        async emit(
+          name: string,
+          companyId: string,
+          payload: unknown,
+          options?: { fencing?: PluginFencingPrecondition },
+        ): Promise<void> {
+          await callHost("events.emit", { name, companyId, payload, fencing: options?.fencing });
         },
       },
 
@@ -674,13 +679,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
-        async set(input: ScopeKey, value: unknown): Promise<void> {
+        async set(
+          input: ScopeKey,
+          value: unknown,
+          options?: { fencing?: PluginFencingPrecondition },
+        ): Promise<void> {
           await callHost("state.set", {
             scopeKind: input.scopeKind,
             scopeId: input.scopeId,
             namespace: input.namespace,
             stateKey: input.stateKey,
             value,
+            fencing: options?.fencing,
           });
         },
 
