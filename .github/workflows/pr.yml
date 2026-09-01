@@ -376,6 +376,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:ip-address-security-override
 
+      - name: Test browserslist security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:browserslist-security-override
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
