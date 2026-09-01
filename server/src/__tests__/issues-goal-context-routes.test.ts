@@ -683,4 +683,61 @@ describe.sequential("issue goal context routes", () => {
       ],
     }));
   });
+
+  // PEN-2846, door #12 of the PEN-2370 series. `compactIssueExecutionWorkspace`
+  // withholds `metadata` but passed `config.workspaceRuntime` through verbatim, and
+  // that field is an open `Record<string, unknown>` an operator authors by hand.
+  // Three tools in every agent's MCP grant read this projection —
+  // `paperclipGetHeartbeatContext` and `paperclipGetIssueWorkspaceRuntime` off
+  // `/heartbeat-context`, `paperclipGetIssue` off `GET /issues/:id` — all under
+  // `assertIssueReadAllowed`, which admits same-company agents. Both routes are
+  // asserted because they share the projection but not the test, so a future
+  // refactor that only rewires one is caught here.
+  //
+  // The fixture value is invented. The real endpoint was never called: reading it
+  // is the exposure.
+  describe("workspaceRuntime masking (PEN-2846)", () => {
+    const CONFIGURED_SECRET = "invented-fixture-value-not-a-real-credential";
+    const workspaceWithRuntime = {
+      id: "55555555-5555-4555-8555-555555555555",
+      name: "PAP-581 workspace",
+      mode: "isolated_workspace",
+      status: "active",
+      config: {
+        environmentId: null,
+        provisionCommand: null,
+        teardownCommand: null,
+        cleanupCommand: null,
+        desiredState: null,
+        workspaceRuntime: {
+          services: [
+            { name: "api", command: "pnpm dev", GRAFANA_API_TOKEN: CONFIGURED_SECRET },
+          ],
+        },
+      },
+      runtimeServices: [],
+    };
+
+    for (const path of ["heartbeat-context", ""] as const) {
+      const route = `/api/issues/11111111-1111-4111-8111-111111111111${path ? `/${path}` : ""}`;
+
+      it(`masks configured workspaceRuntime values on GET ${route || "/issues/:id"}`, async () => {
+        mockIssueService.getById.mockResolvedValue({
+          ...legacyProjectLinkedIssue,
+          executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
+        });
+        mockExecutionWorkspaceService.getById.mockResolvedValue(structuredClone(workspaceWithRuntime));
+
+        const res = await request(createApp()).get(route);
+
+        expect(res.status).toBe(200);
+        expect(JSON.stringify(res.body)).not.toContain(CONFIGURED_SECRET);
+        const runtime = res.body.currentExecutionWorkspace.config.workspaceRuntime;
+        // Structure and names survive so the config stays legible; values do not.
+        expect(runtime.services[0].name).toBe("api");
+        expect(Object.keys(runtime.services[0])).toEqual(["name", "command", "GRAFANA_API_TOKEN"]);
+        expect(runtime.services[0].GRAFANA_API_TOKEN).toBe("***REDACTED***");
+      });
+    }
+  });
 });

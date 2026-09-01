@@ -763,6 +763,110 @@ export function withholdAgentConfigKeys(
 }
 
 /**
+ * `commands` / `services` / `jobs` are the three arrays `listWorkspaceCommandDefinitions`
+ * (`packages/shared/src/workspace-commands.ts`) reads command entries out of. The
+ * identity set below is the subset of an entry's keys that same parser reads into a
+ * typed field *and* that a caller has to be able to see to keep addressing the entry:
+ * `buildWorkspaceCommandDefinition` derives the command id from `id`/`name`/`label`/
+ * `title`, and `paperclipControlIssueWorkspaceServices` targets a configured command by
+ * that id. Masking them would leave the control tools unable to name what they act on.
+ *
+ * Deliberately absent: `command`, `cwd`, `disabledReason`. Those are free-text operator
+ * strings — a service command is one of the more likely places for an inline credential
+ * (`psql postgres://user:pw@host/db`) — and nothing addresses an entry by them.
+ */
+const WORKSPACE_RUNTIME_COMMAND_LIST_KEYS = new Set(["commands", "services", "jobs"]);
+const WORKSPACE_RUNTIME_IDENTITY_KEYS = new Set(["id", "name", "label", "title"]);
+/** Closed enums the same parser reads. Any value outside the set is masked. */
+const WORKSPACE_RUNTIME_ENUM_KEYS = new Map<string, ReadonlySet<string>>([
+  ["kind", new Set(["service", "job"])],
+  ["lifecycle", new Set(["shared", "ephemeral"])],
+]);
+const WORKSPACE_RUNTIME_MAX_DEPTH = 12;
+
+/**
+ * Mask every value inside an execution workspace's `workspaceRuntime`, keeping the
+ * structure and every key *name* (PEN-2846, door #12 of the PEN-2370 series; ask 1 —
+ * names survive, values elided).
+ *
+ * `compactIssueExecutionWorkspace` in `routes/issues.ts` is a projection, not a spread:
+ * it enumerates ~24 named fields and sets `metadata: null`, so it is a deliberate
+ * withholding boundary. `config.workspaceRuntime` crossed it verbatim. That field is
+ * typed `Record<string, unknown> | null` — an *open* shape an operator authors by hand —
+ * and `buildWorkspaceCommandDefinition` keeps the whole entry (`rawConfig: {...entry}`),
+ * so any `..._TOKEN`/`..._KEY` an operator put in a service definition reached the
+ * response. Three tools in every agent's MCP grant read that response
+ * (`paperclipGetIssue`, `paperclipGetHeartbeatContext`, `paperclipGetIssueWorkspaceRuntime`)
+ * under `assertIssueReadAllowed`, which admits same-company agents.
+ *
+ * ## Why this is not a denylist, and why neither existing helper fits
+ *
+ * A `SENSITIVE_KEYS`-style name list cannot close this: the leaves are arbitrary
+ * operator-authored key names, and a credential can sit as a *direct sibling* of `name`
+ * rather than under any container anybody could enumerate in advance. So the burden is
+ * inverted — the default is mask, and the only values that cross are the handful the
+ * shared parser reads into a typed field and the control tools address entries by. A key
+ * added to a service definition next month is covered without anyone editing this file,
+ * which is the property a name list cannot have (PEN-2370 criterion b2).
+ *
+ * `withholdAgentConfigKeys` above was checked first and does not fit twice over: it is
+ * keyed on the literal names `adapterConfig`/`runtimeConfig`, and it blanks its target to
+ * `{}` — which is the right answer for an approval card nobody reads the config off, and
+ * the wrong one here, where erasing the names is exactly what ask 1 forbids.
+ *
+ * ## Shapes
+ *
+ * Anything that is not an object or array is masked outright rather than returned, so an
+ * array-shaped or JSON-string-shaped runtime config cannot walk past the mask — the two
+ * bypasses this series has already shipped once each (#1574, #1583). `null`/`undefined`
+ * pass through: they carry nothing and are the honest "no runtime configured" every
+ * caller already branches on. Beyond the depth cap the walk masks rather than recursing,
+ * so a pathological nesting fails closed.
+ */
+export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+
+  function maskEntry(entry: unknown, depth: number, identityScope: boolean): unknown {
+    if (entry === null || entry === undefined) return entry;
+    if (depth > WORKSPACE_RUNTIME_MAX_DEPTH) return REDACTED_EVENT_VALUE;
+    if (Array.isArray(entry)) return entry.map((item) => maskEntry(item, depth + 1, false));
+    if (!isPlainObject(entry)) return REDACTED_EVENT_VALUE;
+
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(entry)) {
+      // Identity keys are honoured only on an entry sitting directly inside a
+      // `commands`/`services`/`jobs` array — the one position the parser reads them
+      // from. Honouring them at any depth would let a variable that happens to be
+      // named `name` inside an `env` map survive on the strength of its spelling,
+      // which is the denylist failure this walk exists to avoid.
+      if (identityScope && WORKSPACE_RUNTIME_IDENTITY_KEYS.has(key)) {
+        out[key] = typeof child === "string" ? child : REDACTED_EVENT_VALUE;
+        continue;
+      }
+      const enumValues = identityScope ? WORKSPACE_RUNTIME_ENUM_KEYS.get(key) : undefined;
+      if (enumValues) {
+        out[key] = typeof child === "string" && enumValues.has(child) ? child : REDACTED_EVENT_VALUE;
+        continue;
+      }
+      out[key] = maskEntry(child, depth + 1, false);
+    }
+    return out;
+  }
+
+  if (!isPlainObject(value)) return REDACTED_EVENT_VALUE;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (WORKSPACE_RUNTIME_COMMAND_LIST_KEYS.has(key) && Array.isArray(child)) {
+      out[key] = child.map((item) => maskEntry(item, 1, isPlainObject(item)));
+      continue;
+    }
+    out[key] = maskEntry(child, 1, false);
+  }
+  return out;
+}
+
+/**
  * Approval payloads are a human-facing escalation channel (BLO-20810), so a
  * field the scanner actually blanked must read differently from one the
  * filer simply left empty — a bare `***REDACTED***` is ambiguous on its own.
