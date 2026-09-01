@@ -6,11 +6,63 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPullRequestWorkProductFields,
+  OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
   pullRequestWorkProductSourceEventActionOrder,
   pullRequestWorkProductStatus,
+  TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES,
 } from "../services/pull-request-work-products.js";
+
+// PEN-2791: the stranded-assigned sweep reads the open/terminal split to decide whether
+// an issue still has an external event-wake path, so a misclassification here does not
+// merely mislabel a card -- it decides whether a live assignee keeps its issue.
+describe("open/terminal pull request status partition", () => {
+  const EVERY_PR_EVENT_SHAPE = [
+    { action: "opened", prDraft: false, prMerged: false },
+    { action: "opened", prDraft: true, prMerged: false },
+    { action: "reopened", prDraft: false, prMerged: false },
+    { action: "ready_for_review", prDraft: false, prMerged: false },
+    { action: "converted_to_draft", prDraft: true, prMerged: false },
+    { action: "synchronize", prDraft: false, prMerged: false },
+    { action: "synchronize", prDraft: true, prMerged: false },
+    { action: "closed", prDraft: false, prMerged: false },
+    { action: "closed", prDraft: false, prMerged: true },
+    { action: "closed", prDraft: true, prMerged: true },
+  ];
+
+  it("classifies every status the producer can emit as exactly one of open or terminal", () => {
+    const open = new Set<string>(OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES);
+    const terminal = new Set<string>(TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES);
+
+    // No overlap: a status that is both would make the sweep's verdict order-dependent.
+    for (const status of open) expect(terminal.has(status)).toBe(false);
+
+    // No gap: an unclassified status would be silently dropped by the sweep's `inArray`
+    // filter, reading as "no PR" and reopening the seizure this partition prevents.
+    const emitted = new Set(EVERY_PR_EVENT_SHAPE.map((shape) => pullRequestWorkProductStatus(shape)));
+    expect(emitted.size).toBe(open.size + terminal.size);
+    for (const status of emitted) {
+      expect(open.has(status) || terminal.has(status)).toBe(true);
+    }
+  });
+
+  it("treats merged and closed as terminal, because neither emits a further webhook", () => {
+    expect(pullRequestWorkProductStatus({ action: "closed", prMerged: true })).toBe("merged");
+    expect(pullRequestWorkProductStatus({ action: "closed", prMerged: false })).toBe("closed");
+    for (const status of ["merged", "closed"]) {
+      expect(TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES).toContain(status);
+    }
+  });
+
+  it("treats draft as open, because a draft PR still emits ready_for_review and closed", () => {
+    // Easy to get backwards: a draft is not "not yet real work", it is a PR GitHub will
+    // keep sending events for. Excluding it would seize exactly the rows whose author is
+    // still pushing to them.
+    expect(OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES).toContain("draft");
+    expect(OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES).toContain("ready_for_review");
+  });
+});
 
 describe("pullRequestExternalId", () => {
   it("keys on repo and number only, so a push does not fork the identity", () => {

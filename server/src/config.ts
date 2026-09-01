@@ -165,6 +165,12 @@ export interface Config {
   // are independently choosable and collapsing them would make raising either
   // one silently move the other.
   lapsedMonitorGraceMs: number;
+  // PEN-2791. Ceiling on how long an open GitHub PR recorded against an issue counts as
+  // that issue's external event-wake path in the stranded-assigned sweep. See the bounds
+  // entry for why this is a separate knob from `lapsedMonitorGraceMs` rather than a
+  // reuse of it: one bounds belief in an anomaly, this one bounds belief in a normal
+  // multi-day wait, so a shared value would be wrong for whichever it was not tuned for.
+  openPullRequestAttendanceGraceMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -434,6 +440,38 @@ export const NUMERIC_SETTING_BOUNDS = {
     fallback: 6 * 60 * 60_000,
     min: 15 * 60_000,
     max: 7 * 24 * 60 * 60_000,
+  },
+  // PEN-2791. How long an open GitHub PR recorded against an issue is believed to be a
+  // live external event-wake path.
+  //
+  // Deliberately NOT `lapsedMonitorGraceMs`, despite bounding a superficially similar
+  // "how long do we keep believing this watch" question, because the two bound opposite
+  // kinds of state. A monitor left `triggered` and never re-armed is an ANOMALY — the
+  // wake that should have re-armed it did not arrive — so believing it for long is
+  // believing a fault, and 6h is generous. An open PR awaiting human merge is the NORMAL
+  // resting state of correct work: the measured review queue routinely holds PRs across
+  // a weekend, and `review/ally-complete` plus a human merge press is a multi-day path
+  // on the repositories this fleet actually ships to. A 6h bound here would re-seize
+  // exactly the rows this setting exists to protect, on the second morning.
+  //
+  // The bound is nonetheless required, and it is the honest limit of the evidence: an
+  // open PR row proves a wake will arrive when the PR next MOVES, not that one arrives
+  // on a schedule. An abandoned PR emits nothing forever, so without a ceiling this
+  // disjunct would hold its issue `in_progress` and unattended indefinitely — the same
+  // silent-darkness failure PEN-2791 was filed about, entered from the other side.
+  //
+  // Recency is read from `issue_work_products.updatedAt`, which `upsertByExternalId`
+  // advances only when it ACCEPTS a strictly-newer PR event. Redeliveries and
+  // out-of-order webhooks are rejected without touching it, so this cannot be refreshed
+  // by webhook noise on a PR that is not really moving.
+  //
+  // Floor is 1h rather than 15m: below about an hour a PR that is merely waiting on a CI
+  // run reads as abandoned. Ceiling is 30d, past which "waiting on a human" is not a
+  // description of the PR but of a problem nobody is holding.
+  openPullRequestAttendanceGraceMs: {
+    fallback: 7 * 24 * 60 * 60_000,
+    min: 60 * 60_000,
+    max: 30 * 24 * 60 * 60_000,
   },
 } as const satisfies Record<string, NumericSettingBounds>;
 
@@ -1025,6 +1063,11 @@ export function loadConfig(): Config {
       [process.env.LAPSED_MONITOR_GRACE_MS],
       NUMERIC_SETTING_BOUNDS.lapsedMonitorGraceMs,
       "lapsedMonitorGraceMs",
+    ),
+    openPullRequestAttendanceGraceMs: resolveNumericSetting(
+      [process.env.OPEN_PULL_REQUEST_ATTENDANCE_GRACE_MS],
+      NUMERIC_SETTING_BOUNDS.openPullRequestAttendanceGraceMs,
+      "openPullRequestAttendanceGraceMs",
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
