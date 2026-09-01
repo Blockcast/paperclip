@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   REDACTED_EVENT_VALUE,
+  maskWorkspaceRuntimeForRead,
   redactAgentConfigPayload,
   redactApprovalPayloadByType,
   redactApprovalPayloadForDisplay,
@@ -889,5 +890,130 @@ describe("redactAgentConfigPayload", () => {
   it("returns null for nullish payloads", () => {
     expect(redactAgentConfigPayload(null)).toBeNull();
     expect(redactAgentConfigPayload(undefined)).toBeNull();
+  });
+});
+
+// PEN-2846, door #12. `compactIssueExecutionWorkspace` is a withholding boundary
+// (it enumerates ~24 fields and sets `metadata: null`) that `config.workspaceRuntime`
+// crossed verbatim. That field is an open `Record<string, unknown>` an operator
+// authors by hand, so its leaf key names are unknowable in advance and no denylist
+// can cover them. The walk therefore defaults to masking and lets through only the
+// few keys `listWorkspaceCommandDefinitions` reads into a typed field.
+//
+// The control these tests are written against is the *unfixed* behaviour — the
+// projection returning `workspace.config.workspaceRuntime` unchanged — so each case
+// below is stated as "this value must not survive an identity pass-through", except
+// the two marked as over-reach guards, which exist to fail if the walk masks more
+// than it should.
+describe("maskWorkspaceRuntimeForRead (PEN-2846)", () => {
+  const SECRET = "operator-authored-value-no-list-could-name";
+
+  it("masks an operator-authored credential beside a service definition, keeping its name", () => {
+    // The shape the finding turns on: the credential is a *direct sibling* of
+    // `name`, not nested under an `env`/`headers` container anyone could enumerate,
+    // because `buildWorkspaceCommandDefinition` keeps the whole entry
+    // (`rawConfig: { ...entry }`) after reading only its six typed fields.
+    const masked = maskWorkspaceRuntimeForRead({
+      services: [{ name: "api", command: "pnpm dev", GRAFANA_API_TOKEN: SECRET }],
+    }) as any;
+
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+    // Name of the variable survives; its value does not. PEN-2370 ask 1.
+    expect(Object.keys(masked.services[0])).toEqual(["name", "command", "GRAFANA_API_TOKEN"]);
+    expect(masked.services[0].GRAFANA_API_TOKEN).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("masks a variable that merely happens to be named like an identity key", () => {
+    // The hole a "honour `id`/`name` at any depth" implementation opens: an `env`
+    // map's keys are arbitrary, so a variable literally called `name` would survive
+    // on the strength of its spelling. Identity keys are honoured only on an entry
+    // sitting directly inside a `commands`/`services`/`jobs` array.
+    const masked = maskWorkspaceRuntimeForRead({
+      services: [{ name: "api", env: { name: SECRET, id: SECRET } }],
+    }) as any;
+
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+    expect(masked.services[0].name).toBe("api");
+    expect(masked.services[0].env).toEqual({ name: REDACTED_EVENT_VALUE, id: REDACTED_EVENT_VALUE });
+  });
+
+  it("masks an ARRAY-shaped runtime config instead of recursing past it", () => {
+    // The bypass class Ally caught in #1574: a walk that guards only plain objects
+    // recurses into an array-shaped config and blanks nothing while reporting success.
+    expect(JSON.stringify(maskWorkspaceRuntimeForRead([{ services: [{ TOKEN: SECRET }] }])))
+      .not.toContain(SECRET);
+  });
+
+  it("masks a STRING-shaped runtime config instead of passing it through", () => {
+    // `workspaceRuntime` is persisted as jsonb and typed `Record<string, unknown>`,
+    // but the type is not a runtime guarantee; a JSON string carries the same
+    // material and a walk handling only objects hands it back verbatim.
+    expect(maskWorkspaceRuntimeForRead(`{"services":[{"TOKEN":"${SECRET}"}]}`))
+      .toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("masks values under a top-level key the shared parser does not read", () => {
+    // Default-deny: `commands`/`services`/`jobs` are the only keys
+    // `listWorkspaceCommandDefinitions` reads. Anything else an operator adds is
+    // masked without this file changing — the property a name list cannot have.
+    const masked = maskWorkspaceRuntimeForRead({ compose: { secrets: { db: SECRET } } }) as any;
+
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+    expect(masked.compose.secrets.db).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("masks a service entry's free-text command and cwd", () => {
+    // Not identity keys, and nothing addresses an entry by them. A command line is
+    // one of the likelier places for an inline credential.
+    const masked = maskWorkspaceRuntimeForRead({
+      services: [{ name: "db", command: `psql postgres://u:${SECRET}@h/db`, cwd: `/srv/${SECRET}` }],
+    }) as any;
+
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+    expect(masked.services[0].command).toBe(REDACTED_EVENT_VALUE);
+    expect(masked.services[0].cwd).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("fails closed past the depth cap rather than recursing", () => {
+    let nested: Record<string, unknown> = { leaf: SECRET };
+    for (let i = 0; i < 40; i += 1) nested = { deeper: nested };
+
+    expect(JSON.stringify(maskWorkspaceRuntimeForRead(nested))).not.toContain(SECRET);
+  });
+
+  // Over-reach guards. These are green against the unfixed pass-through by
+  // construction — they are not fail-first evidence, and are here to fail if the
+  // walk masks more than it should. Stated explicitly so the suite's red count is
+  // not read as covering them.
+  it("keeps the identity a control tool addresses a configured command by", () => {
+    // `paperclipControlIssueWorkspaceServices` targets a command by the id
+    // `buildWorkspaceCommandDefinition` derives from `id`/`name`/`label`/`title`;
+    // `kind` and `lifecycle` are closed enums the same parser reads. Masking these
+    // would leave the tool unable to name what it acts on.
+    const masked = maskWorkspaceRuntimeForRead({
+      services: [{ id: "svc-api", name: "api", label: "API", title: "API", kind: "service", lifecycle: "shared" }],
+    }) as any;
+
+    expect(masked.services[0]).toEqual({
+      id: "svc-api",
+      name: "api",
+      label: "API",
+      title: "API",
+      kind: "service",
+      lifecycle: "shared",
+    });
+  });
+
+  it("masks a non-enum value under an enum key, and passes nullish through", () => {
+    const masked = maskWorkspaceRuntimeForRead({
+      services: [{ name: "api", kind: SECRET, lifecycle: SECRET }],
+    }) as any;
+
+    expect(JSON.stringify(masked)).not.toContain(SECRET);
+    expect(masked.services[0].kind).toBe(REDACTED_EVENT_VALUE);
+    // `null` carries nothing and is the honest "no runtime configured" every
+    // caller already branches on, including the UI's `Boolean(...)` presence check.
+    expect(maskWorkspaceRuntimeForRead(null)).toBeNull();
+    expect(maskWorkspaceRuntimeForRead(undefined)).toBeUndefined();
   });
 });
