@@ -51,7 +51,12 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginFencingPrecondition, PluginPerformActionContext, WorkerToHostMethods } from "./protocol.js";
+import type {
+  PluginEventOwnershipCheck,
+  PluginFencingPrecondition,
+  PluginPerformActionContext,
+  WorkerToHostMethods,
+} from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -611,30 +616,37 @@ export interface PluginEventsClient {
    * @param name - Bare event name (e.g. `"sync-done"`)
    * @param companyId - UUID of the company this event belongs to
    * @param payload - JSON-serializable event payload
-   * @param options.fencing - Only dispatch while this generation is still held.
+   * @param options.ownershipCheck - Best-effort pre-dispatch ownership check.
    *
-   * Note this is deliberately weaker than the `issues.*` / `state.set` fence,
-   * and the difference is not an oversight. Those mutate a row, so the host can
-   * take the generation lock inside the mutation's own transaction and hold it
-   * to commit — no interleaving is possible. Event delivery is an in-memory
-   * fan-out to subscriber handlers; there is no transaction to join. The host
-   * therefore evaluates the generation immediately before dispatch and refuses
-   * to emit once it is gone, which turns "a displaced worker still announces a
-   * firing it does not own" into "it cannot" — but a steal committing between
-   * that check and the fan-out is not excluded.
+   * **This is not a fence, and the option is deliberately not called
+   * `fencing`.** The `issues.*` and `state.set` options of that name mutate a
+   * row, so the host takes the generation lock inside the mutation's own
+   * transaction and holds it to commit — no interleaving is possible, and a
+   * displaced caller's write cannot land. Event delivery is an in-memory
+   * fan-out to subscriber handlers with no transaction to join, so no lock can
+   * be held from the check through the dispatch.
    *
-   * Holding the share lock across the handlers *would* exclude it, and is
-   * rejected on purpose: subscriber handlers run arbitrary plugin code, so a
-   * slow or wedged handler would block the steal path — reintroducing exactly
-   * the unstealable-fence failure this mechanism exists to prevent. A bounded,
-   * documented notification race is the better trade than an unbounded lock on
-   * the recovery path.
+   * What you get: the host re-reads the generation immediately before fan-out
+   * and refuses to dispatch if it is already gone. A steal committing in the
+   * remaining window between that check and the fan-out still results in
+   * delivery. Holding the share lock across the handlers would close it and is
+   * rejected on purpose — handlers run arbitrary plugin code, so a slow or
+   * wedged handler would block the steal path, reintroducing the
+   * unstealable-fence failure this mechanism exists to prevent (BLO-31036).
+   *
+   * Consequently a subscriber must treat an event as a notification, not as an
+   * authorization to act: anything durable or side-effecting has to
+   * re-establish ownership itself. Making delivery authoritative requires a
+   * transactional outbox in the host event subsystem (BLO-31113) and cannot be
+   * fixed from the emitting side.
+   *
+   * @see PluginEventOwnershipCheck
    */
   emit(
     name: string,
     companyId: string,
     payload: unknown,
-    options?: { fencing?: PluginFencingPrecondition },
+    options?: { ownershipCheck?: PluginEventOwnershipCheck },
   ): Promise<void>;
 }
 

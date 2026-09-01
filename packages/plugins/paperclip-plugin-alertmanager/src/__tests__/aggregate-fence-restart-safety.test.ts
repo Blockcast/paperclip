@@ -726,9 +726,15 @@ describe("BLO-31036 — state and event publication carry the generation too", (
   const stateSetFencing = (mocks: ReturnType<typeof mkCtx>["mocks"]) =>
     (mocks.state.set.mock.calls[0]?.[2] as { fencing?: unknown } | undefined)?.fencing;
 
-  /** The `fencing` option passed to `ctx.events.emit(name, company, payload, options)`. */
-  const emitFencing = (mocks: ReturnType<typeof mkCtx>["mocks"]) =>
-    (mocks.events.emit.mock.calls[0]?.[3] as { fencing?: unknown } | undefined)?.fencing;
+  /**
+   * The `ownershipCheck` option passed to
+   * `ctx.events.emit(name, company, payload, options)`. Deliberately a
+   * different option name from `state.set`'s `fencing`: the emit path is a
+   * best-effort pre-dispatch check, not a fence, and the API says so.
+   */
+  const emitOwnershipCheck = (mocks: ReturnType<typeof mkCtx>["mocks"]) =>
+    (mocks.events.emit.mock.calls[0]?.[3] as { ownershipCheck?: unknown } | undefined)
+      ?.ownershipCheck;
 
   it("sends the live generation with the creation path's state write and firing event", async () => {
     const { ctx, mocks } = mkCtx();
@@ -742,7 +748,7 @@ describe("BLO-31036 — state and event publication carry the generation too", (
     const token = (stateSetFencing(mocks) as { match: { firing_token: string | null } })
       ?.match?.firing_token;
     expect(token).toEqual(expect.any(String));
-    expect(emitFencing(mocks)).toEqual(stateSetFencing(mocks));
+    expect(emitOwnershipCheck(mocks)).toEqual(stateSetFencing(mocks));
   });
 
   it("sends the live generation with the re-fire path's state write and firing event", async () => {
@@ -779,7 +785,7 @@ describe("BLO-31036 — state and event publication carry the generation too", (
     expect((live as { match: { firing_token: string | null } }).match.firing_token)
       .toEqual(expect.any(String));
     expect(stateSetFencing(mocks)).toEqual(live);
-    expect(emitFencing(mocks)).toEqual(live);
+    expect(emitOwnershipCheck(mocks)).toEqual(live);
   });
 
   it("hands the host a superseded generation when displaced after the member write", async () => {
@@ -799,7 +805,7 @@ describe("BLO-31036 — state and event publication carry the generation too", (
       | { match: { firing_token: string | null } }
       | undefined;
     expect(sent).toBeDefined();
-    expect(emitFencing(mocks)).toEqual(sent);
+    expect(emitOwnershipCheck(mocks)).toEqual(sent);
 
     // The fence now belongs to the replacement, and what the predecessor sent
     // does not match it — so `assertPluginFencingGeneration` rejects both the
