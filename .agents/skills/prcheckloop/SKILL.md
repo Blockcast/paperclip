@@ -87,8 +87,36 @@ query($owner:String!, $repo:String!, $pr:Int!) {
 
 ### 4. Wait for checks to actually run
 
-After a new push, checks can take a moment to appear. Poll every 15-30 seconds
-until one of these is true:
+After a new push, checks can take a moment to appear. Never use an unbounded
+`gh pr checks --watch`. Poll the API with a hard deadline (default 15 minutes)
+and a minimum interval of one minute. Re-read PR state on every iteration and
+stop immediately when the PR is merged or closed, because legacy pending status
+contexts may never become terminal after the PR settles.
+
+```bash
+CHECK_DEADLINE_SEC=${CHECK_DEADLINE_SEC:-900}
+CHECK_INTERVAL_SEC=${CHECK_INTERVAL_SEC:-60}
+CHECK_INTERVAL_SEC=$((CHECK_INTERVAL_SEC < 60 ? 60 : CHECK_INTERVAL_SEC))
+poll_started=$SECONDS
+while :; do
+  PR_STATE=$(gh pr view "$PR_NUMBER" --json state,mergedAt --jq '.state + " " + (.mergedAt // "")')
+  case "$PR_STATE" in
+    MERGED*|CLOSED*) printf 'PR settled (%s); stopping checks.\n' "$PR_STATE"; break ;;
+  esac
+
+  # Inventory current-head checks and statuses; do not leave a watcher behind.
+  gh api "repos/$OWNER_REPO/commits/$HEAD_SHA/check-runs?per_page=100" >/tmp/check-runs.json
+  gh api "repos/$OWNER_REPO/commits/$HEAD_SHA/status" >/tmp/commit-status.json
+  # Continue with the terminal/pending classification below.
+  if (( SECONDS - poll_started >= CHECK_DEADLINE_SEC )); then
+    echo "Timed out waiting for checks after ${CHECK_DEADLINE_SEC}s." >&2
+    exit 124
+  fi
+  sleep "$CHECK_INTERVAL_SEC"
+done
+```
+
+Poll until one of these is true:
 
 - checks have appeared and every item is in a terminal state
 - checks have appeared and at least one failed

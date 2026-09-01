@@ -112,7 +112,71 @@ Key Perforce CL fields:
 
 ### 3. Wait for pending checks
 
-Before analyzing, ensure all status checks have completed. If any checks are `PENDING` or `IN_PROGRESS` (GitHub) / `running` or `pending` (GitLab), poll every 30 seconds until all checks reach a terminal state.
+Never start an unbounded `gh pr checks --watch` process. Before polling a GitHub
+PR, read its lifecycle state and return immediately for merged or closed PRs;
+there is no useful check transition left to await, and legacy status contexts can
+remain pending forever after merge. For an open PR, use a bounded loop with a
+minimum interval of one minute and a deadline appropriate to the caller (the
+default below is 15 minutes):
+
+```bash
+CHECK_DEADLINE_SEC=${CHECK_DEADLINE_SEC:-900}
+CHECK_INTERVAL_SEC=${CHECK_INTERVAL_SEC:-60}
+CHECK_INTERVAL_SEC=$((CHECK_INTERVAL_SEC < 60 ? 60 : CHECK_INTERVAL_SEC))
+
+pr_state=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json state,mergedAt --jq '.state + " " + (.mergedAt // "")')
+case "$pr_state" in
+  MERGED*|CLOSED*)
+    printf 'PR is settled (%s); skipping check watch.\n' "$pr_state"
+    exit 0
+    ;;
+esac
+
+watch_started=$SECONDS
+checks_output=$(mktemp)
+trap 'rm -f "$checks_output"' EXIT INT TERM
+while :; do
+  # A fresh state read prevents a watch from surviving a merge/close race.
+  pr_state=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json state,mergedAt --jq '.state + " " + (.mergedAt // "")')
+  case "$pr_state" in
+    MERGED*|CLOSED*)
+      printf 'PR settled while polling (%s); stopping.\n' "$pr_state"
+      exit 0
+      ;;
+  esac
+
+  if gh pr checks "$PR_NUMBER" --repo "$OWNER_REPO" >"$checks_output"; then
+    cat "$checks_output"
+    break
+  fi
+  cat "$checks_output"
+  if (( SECONDS - watch_started >= CHECK_DEADLINE_SEC )); then
+    printf 'Timed out waiting for checks after %ss.\n' "$CHECK_DEADLINE_SEC" >&2
+    exit 124
+  fi
+  sleep "$CHECK_INTERVAL_SEC"
+done
+```
+
+If a child process is started for a longer-running equivalent, keep its PID and
+install a trap that terminates and waits for it on normal exit and signals:
+
+```bash
+watch_pid=''
+cleanup_watch() {
+  if [[ -n "$watch_pid" ]] && kill -0 "$watch_pid" 2>/dev/null; then
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup_watch EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+```
+
+The bounded loop applies to GitHub; for GitLab, use the same deadline and
+interval rules around the pipeline-status query. Do not wait forever for a
+remote status provider.
 
 **GitHub:** poll `statusCheckRollup` from `gh pr view`.
 
