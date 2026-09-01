@@ -211,6 +211,75 @@ async function releaseAggregateCreationClaim(
 }
 
 /**
+ * Raised when this delivery no longer holds the firing generation it claimed.
+ *
+ * Distinct from a generic failure because the re-fire path tolerates issue
+ * RPC errors (it records that the decision was not applied and carries on).
+ * Losing the generation is not a tolerable re-sync failure — it means another
+ * owner has taken the aggregate — so it must escape that catch, not be logged
+ * and swallowed.
+ */
+export class AggregateGenerationLostError extends Error {
+  constructor(aggregateKey: string) {
+    super(
+      `Alertmanager aggregate ${aggregateKey} was reclaimed by another owner ` +
+        `while this firing delivery was in flight; abandoning before mutating ` +
+        `the tracked issue. Failing the delivery so Alertmanager retries ` +
+        `against the owner that now holds the fence.`,
+    );
+    this.name = "AggregateGenerationLostError";
+  }
+}
+
+/**
+ * Throw unless this delivery still holds the firing fence under `firingToken`.
+ *
+ * `upsertAggregateMember` gates the member row on the generation atomically,
+ * but the aggregate's other side effects are host RPCs — `issues.update`,
+ * `issues.create`, `issues.createComment` — which cannot join a transaction in
+ * this plugin's database. Without a check in front of them, a displaced
+ * predecessor ran the *whole* re-fire path (reopening a cancelled issue,
+ * rewriting its description, creating an orphan issue) and only lost the race
+ * at the member write, several RPCs later. The damage was already done.
+ *
+ * So this is a barrier, not a lock: it converts "always mutates, then fails"
+ * into "is rejected before mutating". A predecessor already displaced when it
+ * reaches the barrier cannot touch the issue at all.
+ *
+ * What it does NOT do — stated plainly because the honest bound matters more
+ * than the appearance of one: it cannot make a remote RPC atomic with a local
+ * generation check. A steal that commits *between* this barrier and an RPC
+ * already in flight is still not caught here. Closing that last window
+ * requires the resource being mutated to enforce the fencing token itself —
+ * the issues service would have to accept and check it — which is the standard
+ * result for fencing tokens and is out of this plugin's reach. What is in
+ * reach, and is what this does, is to shrink the window from "the entire
+ * re-fire path" to "one in-flight RPC", and to make the common case — a
+ * predecessor resumed long after its replacement took over — deterministic.
+ *
+ * Deliberately a SELECT: it must not touch `updated_at`. That column is what
+ * the wedged-fence detector ages off (`phase in ('firing','cancelling') and
+ * updated_at < now() - interval '15 minutes'`), so a guard that bumped it
+ * would hide from monitoring exactly the fences this ticket exists to surface.
+ */
+async function assertFiringGeneration(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  firingToken: string,
+): Promise<void> {
+  const rows = await ctx.db.query(
+    `SELECT 1 FROM ${q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+      WHERE company_id = $1
+        AND aggregate_key = $2
+        AND phase = 'firing'
+        AND firing_token = $3`,
+    [companyId, aggregateKey, firingToken],
+  );
+  if (rows.length === 0) throw new AggregateGenerationLostError(aggregateKey);
+}
+
+/**
  * Attach a member to the aggregate, but only while the caller still holds the
  * firing fence under `firingToken`.
  *
@@ -1105,6 +1174,13 @@ export async function handleFiring(
         );
         decision = decideRefire(issue, existing, config, Date.now());
 
+        // Barrier before the first issue mutation. Placed *after* the reads
+        // above so the window between proving ownership and acting on it holds
+        // no RPC of our own: everything from here to `upsertAggregateMember` is
+        // a write, and a predecessor displaced before this point performs none
+        // of them. The reads are unguarded on purpose — they mutate nothing.
+        await assertFiringGeneration(ctx, companyId, aggregateKey, firingToken);
+
         if (decision.kind === "reopen") {
           if (decision.reason === "plugin_resolved") {
             // A different firing in this aggregate may already have created a
@@ -1234,6 +1310,11 @@ export async function handleFiring(
         }
         decisionApplied = true;
       } catch (err) {
+        // Losing the generation is not a re-sync failure to be tolerated: this
+        // delivery no longer owns the aggregate, so it must not fall through to
+        // the state write and event emission below on the strength of a
+        // decision it was never entitled to apply.
+        if (err instanceof AggregateGenerationLostError) throw err;
         ctx.logger.warn(
           `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
         );
@@ -1430,6 +1511,13 @@ export async function handleFiring(
 
   let created = retainedIssue === null;
   let issue = retainedIssue;
+  // Same barrier as the re-fire path, before the creation path's own aggregate
+  // side effects. Without it a displaced predecessor filed a brand-new issue
+  // for an aggregate it no longer owned and only lost the race at the member
+  // write below, leaving an orphan issue no member row and no resolver refers
+  // to. All the owner/route resolution above is reads, so proving ownership
+  // here rather than at the claim keeps the window free of our own RPCs.
+  await assertFiringGeneration(ctx, companyId, aggregateKey, firingToken);
   if (!issue) {
     let claimToken: string | null = null;
     try {

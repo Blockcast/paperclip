@@ -153,6 +153,14 @@ function buildFakeAlertmanagerStore() {
     },
     async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
       const text = sql.replace(/\s+/g, " ").trim();
+      // The firing-generation barrier (BLO-31036) checks that the delivery still
+      // holds the fence it claimed. These are uncontended single deliveries, so
+      // it does — matching `execute`'s existing rowCount-1 answer for the same
+      // table. Contention is covered against real SQL in
+      // aggregate-fence-restart-safety.test.ts.
+      if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
+        return [{ "?column?": 1 }] as T[];
+      }
       if (text.includes("alertmanager_aggregate_members")) return [];
       if (text.startsWith("SELECT DISTINCT cover_issue_id")) {
         const [alertIssueId] = params as [string];

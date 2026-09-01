@@ -65,6 +65,21 @@ const TOKEN = "super-secret-token";
 const FALLBACK_AGENT_NAME = "Ops Triage";
 const FALLBACK_AGENT_ID = "agent-fallback-1";
 
+/**
+ * The firing-generation barrier's read (BLO-31036): "do I still hold the fence
+ * I claimed?", issued before the delivery's first aggregate side effect.
+ *
+ * Every firing scenario in this file is a single uncontended delivery, so the
+ * truthful answer is yes. A mock that answered `[]` would be asserting that
+ * each of them was displaced mid-flight, which is not what they are about.
+ * Fence *contention* is exercised against a real PostgreSQL in
+ * aggregate-fence-restart-safety.test.ts — reproducing it here would only
+ * re-assert the mock, the trap that file's header documents.
+ */
+const FENCE_GENERATION_SELECT =
+  /SELECT 1[\s\S]*alertmanager_aggregate_lifecycle_fences[\s\S]*firing_token/i;
+const HELD_FENCE = [{ "?column?": 1 }];
+
 const baseAlert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAlert => ({
   status: "firing",
   labels: {
@@ -198,7 +213,10 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
         }
         return { rowCount: 0 };
       }),
-      query: vi.fn(async () => []),
+      query: vi.fn(async (sql: string) => {
+        if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
+        return [];
+      }),
     },
     events: { emit: vi.fn(async () => {}) },
     metrics: { write: vi.fn(async () => {}) },
@@ -2234,6 +2252,7 @@ describe("handleWebhook — resolved", () => {
       return { rowCount: 0 };
     });
     mocks.db.query.mockImplementation(async (sql: string) => {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
       if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
@@ -2601,6 +2620,7 @@ describe("handleWebhook — resolved", () => {
       },
     ]);
     mocks.db.query.mockImplementation(async (sql: string) => {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
       if (/SELECT issue_id, aggregate_key/i.test(sql)) return [resolvedMember];
       return [];
     });
