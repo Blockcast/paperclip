@@ -7,7 +7,7 @@
  * `unknownCast` helper to keep us inside strict TS.
  */
 
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   AlertDeliveryIncompleteError,
   WebhookUnauthorizedError,
@@ -227,12 +227,47 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
   // The cast is contained to test code where it's documented and the
   // mocks satisfy the subset of the surface the handler actually touches.
   const ctx = mocks as unknown as PluginContext;
+  issuedContexts.push(mocks);
   return { ctx, mocks };
 };
 
+// Every `ctx.db.query` the plugin issues has to satisfy the host's SELECT-only
+// contract (`validatePluginRuntimeQuery`, server/src/services/plugin-database.ts).
+// This mock used to accept any SQL, so an `UPDATE ... RETURNING` routed through
+// `ctx.db.query` passed every test in this file and then threw
+// "ctx.db.query only allows SELECT statements" against the real host, 502-ing
+// every resolve delivery for an aggregate-tracked fingerprint for ~26.5h
+// (BLO-31035). Asserting the rule over the recorded calls — rather than inside
+// the mock implementation — keeps the guard in force for the tests that install
+// their own `db.query` implementation, so each of them covers the bug class too.
+const issuedContexts: MockClients[] = [];
+
+const assertQueryIsSelectOnly = (sql: string) => {
+  const normalized = sql.trim().toLowerCase().replace(/\s+/g, " ");
+  const preview = sql.trim().slice(0, 140);
+  expect(
+    normalized.startsWith("select ") || normalized.startsWith("with "),
+    `ctx.db.query only allows SELECT statements, got: ${preview}`,
+  ).toBe(true);
+  expect(
+    /\b(insert|update|delete|alter|create|drop|truncate)\b/.test(normalized),
+    `ctx.db.query cannot contain mutation or DDL keywords, got: ${preview}`,
+  ).toBe(false);
+};
+
 beforeEach(() => {
+  issuedContexts.length = 0;
   vi.clearAllMocks();
   resetCredentialHealth();
+});
+
+afterEach(() => {
+  for (const mocks of issuedContexts) {
+    for (const call of mocks.db.query.mock.calls) {
+      const sql = call[0];
+      if (typeof sql === "string") assertQueryIsSelectOnly(sql);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1974,7 +2009,7 @@ describe("handleWebhook — resolved", () => {
     };
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.db.query.mockImplementation(async (sql: string) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
       if (/SELECT 1 AS one/i.test(sql)) return [{ one: 1 }];
@@ -2023,7 +2058,7 @@ describe("handleWebhook — resolved", () => {
     };
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.db.query.mockImplementation(async (sql: string) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
       if (/SELECT 1 AS one/i.test(sql)) return [];
@@ -2072,7 +2107,7 @@ describe("handleWebhook — resolved", () => {
     };
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.db.query.mockImplementation(async (sql: string, params?: unknown[]) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         expect(params).toEqual([
           "company-1",
           firingAggregateKey,
@@ -2196,7 +2231,7 @@ describe("handleWebhook — resolved", () => {
       return { rowCount: 0 };
     });
     mocks.db.query.mockImplementation(async (sql: string) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
       if (/SELECT 1 AS one/i.test(sql)) return hasConcurrentMember ? [{ one: 1 }] : [];

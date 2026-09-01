@@ -397,18 +397,38 @@ async function resolveAggregateMember(
   claimFinalization: boolean,
 ): Promise<AggregateMemberResolution> {
   const ns = ctx.db.namespace;
-  const [resolved] = await ctx.db.query<{ issue_id: string }>(
+  // Read the membership and mark it resolved as two statements, not one
+  // `UPDATE ... RETURNING`. `ctx.db.query` is SELECT-only and `ctx.db.execute`
+  // reports only a row count, so there is no host call that both writes and
+  // returns a column; issuing the `UPDATE ... RETURNING` through `ctx.db.query`
+  // is rejected with "ctx.db.query only allows SELECT statements", which threw
+  // on every resolve delivery for an aggregate-tracked fingerprint and 502'd the
+  // whole batch (BLO-31035).
+  //
+  // The split is exact rather than approximate here: both statements are keyed
+  // on the members primary key (company_id, aggregate_key, fingerprint), so the
+  // read matches at most the single row the write targets. Nothing deletes
+  // member rows, so the row cannot vanish between the two, and the write is
+  // idempotent (`COALESCE(resolved_at, now())`), so a concurrent delivery that
+  // resolves the same member in between lands on the same terminal state and
+  // keeps the earlier `resolved_at`.
+  const [member] = await ctx.db.query<{ issue_id: string }>(
+    `SELECT issue_id
+     FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+     WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3`,
+    [companyId, aggregateKey, fingerprint],
+  );
+  const resolvedIssueId = member?.issue_id ?? issueId;
+  if (!member) {
+    return { disposition: "no-membership", issueId: resolvedIssueId };
+  }
+  await ctx.db.execute(
     `UPDATE ${q(ns, AGGREGATE_MEMBERS_TABLE)}
      SET resolved_at = COALESCE(resolved_at, now()),
          updated_at = now()
-     WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3
-     RETURNING issue_id`,
+     WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3`,
     [companyId, aggregateKey, fingerprint],
   );
-  const resolvedIssueId = resolved?.issue_id ?? issueId;
-  if (!resolved) {
-    return { disposition: "no-membership", issueId: resolvedIssueId };
-  }
 
   const unresolved = await ctx.db.query<{ one: number }>(
     `SELECT 1 AS one
