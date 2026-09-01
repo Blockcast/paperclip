@@ -3149,7 +3149,7 @@ export function routineService(
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
-        let runNextRunAtOverrides: Date[] = [claimedNextRunAt];
+        let runNextRunAtOverrides: Array<Date | null> = [claimedNextRunAt];
 
         if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           if (isSubHourlyCronExpression(row.trigger.cronExpression, row.trigger.timezone, now)) {
