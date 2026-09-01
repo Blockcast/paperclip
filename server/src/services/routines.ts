@@ -3149,6 +3149,7 @@ export function routineService(
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        let runNextRunAtOverrides: Date[] = [claimedNextRunAt];
 
         if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           if (isSubHourlyCronExpression(row.trigger.cronExpression, row.trigger.timezone, now)) {
@@ -3156,9 +3157,11 @@ export function routineService(
           } else {
             let cursor: Date | null = row.trigger.nextRunAt;
             runCount = 0;
+            runNextRunAtOverrides = [];
             while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
               runCount += 1;
               claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
+              runNextRunAtOverrides.push(claimedNextRunAt);
               cursor = claimedNextRunAt;
             }
           }
@@ -3218,7 +3221,7 @@ export function routineService(
             routine: row.routine,
             trigger: row.trigger,
             source: "schedule",
-            nextRunAtOverride: claimedNextRunAt,
+            nextRunAtOverride: runNextRunAtOverrides[i] ?? claimedNextRunAt,
           });
           triggered += 1;
         }
