@@ -27,6 +27,15 @@ const SETTINGS = {
   prReconcilerWindowDays: "PAPERCLIP_PR_RECONCILER_WINDOW_DAYS",
   strandedBlockedIssueReconcilerIntervalMinutes:
     "PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES",
+  // BLO-19123. Not a timer period but a per-tick work ceiling, so the overflow
+  // block below correctly ignores it. It still belongs here: an operator who
+  // sets this to `Infinity` while tuning the drain rate would restore exactly
+  // the unbounded bulk return the setting exists to prevent, and the clamp is
+  // the only thing standing between that typo and the whole backlog moving in
+  // one tick.
+  strandedRecoveryHandBackMaxPerPass: "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_MAX_PER_PASS",
+  strandedRecoveryHandBackIntervalMinutes:
+    "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_INTERVAL_MINUTES",
   humanGatedDigestIntervalMinutes: "PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES",
   humanGatedDigestPeriodDays: "PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS",
   // Added by the ratchet below, not by the original survey: this site landed on
