@@ -38,8 +38,10 @@ export const ISOLATED_SDK_PLUGIN_PACKAGES: readonly string[] = Object.freeze([
 /**
  * Directory under the plugins home that holds one isolated install per
  * package in `ISOLATED_SDK_PLUGIN_PACKAGES`. Sibling to (not inside) the
- * shared `plugins/node_modules` tree that `copyWorkspaceSdkFiles()` and the
- * full fork-copy in `index.ts` touch.
+ * shared `plugins/node_modules` tree that per-plugin `npm install` runs
+ * write to. (Until 2026-09-01 a boot-time fork-vendor copy in `index.ts`
+ * wrote there too; the store now resolves the fork through an npm alias, so
+ * that copy is gone — but the shared tree still has uncoordinated writers.)
  */
 export function isolatedPluginsRoot(pluginsHomeDir: string): string {
   return path.join(pluginsHomeDir, "plugins-isolated");
