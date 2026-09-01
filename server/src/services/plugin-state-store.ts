@@ -7,6 +7,10 @@ import type {
   ListPluginState,
 } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
+import {
+  assertPluginFencingGeneration,
+  type ResolvedPluginFencingPrecondition,
+} from "./plugin-fencing.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -132,39 +136,63 @@ export function pluginStateStore(db: Db) {
      *
      * Requires `plugin.state.write` capability (enforced by the caller).
      *
+     * When `fencingPrecondition` is supplied the upsert runs inside a
+     * transaction that first takes a share lock on the plugin's own generation
+     * row and holds it to commit. That is what makes this a fence rather than a
+     * barrier: a plugin that has been displaced since it read its own generation
+     * cannot land a stale value, because a concurrent steal either commits first
+     * (this write is rejected) or blocks on the lock until this write is done.
+     * Without it the write is unconditional, exactly as before.
+     *
      * @param pluginId - UUID of the owning plugin
      * @param input - Scope key and value to store
+     * @param fencingPrecondition - Optional generation the caller must still hold
      */
-    set: async (pluginId: string, input: SetPluginState): Promise<void> => {
+    set: async (
+      pluginId: string,
+      input: SetPluginState,
+      fencingPrecondition?: ResolvedPluginFencingPrecondition | null,
+    ): Promise<void> => {
       await assertPluginExists(pluginId);
 
       const namespace = input.namespace ?? DEFAULT_NAMESPACE;
       const scopeId = input.scopeId ?? null;
 
-      await db
-        .insert(pluginState)
-        .values({
-          pluginId,
-          scopeKind: input.scopeKind,
-          scopeId,
-          namespace,
-          stateKey: input.stateKey,
+      const values = {
+        pluginId,
+        scopeKind: input.scopeKind,
+        scopeId,
+        namespace,
+        stateKey: input.stateKey,
+        valueJson: input.value,
+        updatedAt: new Date(),
+      };
+      const onConflict = {
+        target: [
+          pluginState.pluginId,
+          pluginState.scopeKind,
+          pluginState.scopeId,
+          pluginState.namespace,
+          pluginState.stateKey,
+        ],
+        set: {
           valueJson: input.value,
           updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: [
-            pluginState.pluginId,
-            pluginState.scopeKind,
-            pluginState.scopeId,
-            pluginState.namespace,
-            pluginState.stateKey,
-          ],
-          set: {
-            valueJson: input.value,
-            updatedAt: new Date(),
-          },
-        });
+        },
+      };
+
+      if (!fencingPrecondition) {
+        await db.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+        return;
+      }
+
+      await db.transaction(async (tx) => {
+        // First statement in the transaction, deliberately: a displaced caller
+        // is rejected before the upsert, and the share lock taken here is held
+        // to commit so a steal cannot interleave with the write below.
+        await assertPluginFencingGeneration(tx, fencingPrecondition);
+        await tx.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+      });
     },
 
     /**

@@ -26,13 +26,14 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { companies, createDb, issueComments, issues } from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
+import { companies, createDb, issueComments, issues, pluginState, plugins } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.js";
+import { pluginStateStore } from "../services/plugin-state-store.js";
 import {
   assertPluginFencingGeneration,
   resolvePluginFencingPrecondition,
@@ -312,5 +313,198 @@ describeEmbeddedPostgres("plugin fencing generation enforced by the issues servi
         fencingPrecondition: precondition(company.id, token),
       }),
     ).rejects.toMatchObject({ details: { code: "fencing_generation_lost" } });
+  });
+});
+
+/**
+ * BLO-31036 — the same enforcement, for the state write at the end of a firing
+ * delivery.
+ *
+ * The `issues.*` cases above cover the mutations in the *middle* of a delivery.
+ * Ally's re-review of #1582 found the tail was still open: `upsertAggregateMember`
+ * is generation-checked, but the `ctx.state.set` that follows it was not, so a
+ * steal landing in that gap let a displaced predecessor overwrite the
+ * aggregate's alert state with its own stale view. `state.set` now takes the
+ * same precondition and applies it inside the upsert's own transaction.
+ *
+ * The concurrency case is again the load-bearing one and again needs two
+ * connections: dropping `FOR SHARE` from `assertPluginFencingGeneration` leaves
+ * the rejection cases green and fails only that one.
+ */
+describeEmbeddedPostgres("plugin fencing generation enforced by the state store", () => {
+  let db!: ReturnType<typeof createDb>;
+  let store!: ReturnType<typeof pluginStateStore>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let pluginId!: string;
+
+  const STATE_KEY = "alert:fp-restart-safety";
+  const COMPANY = "company-1";
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-state-fencing-");
+    db = createDb(tempDb.connectionString);
+    store = pluginStateStore(db);
+    await db.execute(sql.raw(`CREATE SCHEMA IF NOT EXISTS ${NAMESPACE}`));
+    await db.execute(
+      sql.raw(`CREATE TABLE IF NOT EXISTS ${NAMESPACE}.${FENCE_TABLE} (
+         company_id text NOT NULL,
+         aggregate_key text NOT NULL,
+         phase text NOT NULL,
+         firing_token text,
+         PRIMARY KEY (company_id, aggregate_key)
+       )`),
+    );
+    const [plugin] = await db
+      .insert(plugins)
+      .values({
+        pluginKey: `alertmanager-fencing-${randomUUID().slice(0, 8)}`,
+        packageName: "@paperclipai/plugin-alertmanager",
+        version: "0.0.0-test",
+        manifestJson: {} as never,
+      })
+      .returning();
+    pluginId = plugin.id;
+  });
+
+  afterEach(async () => {
+    await db.execute(sql.raw(`DELETE FROM ${NAMESPACE}.${FENCE_TABLE}`));
+    await db.delete(pluginState);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function claimFence(token: string) {
+    await db.execute(
+      sql`INSERT INTO ${sql.raw(`${NAMESPACE}.${FENCE_TABLE}`)}
+            (company_id, aggregate_key, phase, firing_token)
+          VALUES (${COMPANY}, ${AGGREGATE_KEY}, 'firing', ${token})
+          ON CONFLICT (company_id, aggregate_key)
+          DO UPDATE SET phase = 'firing', firing_token = EXCLUDED.firing_token`,
+    );
+  }
+
+  async function stealFence(nextToken: string) {
+    await db.execute(
+      sql`UPDATE ${sql.raw(`${NAMESPACE}.${FENCE_TABLE}`)}
+             SET firing_token = ${nextToken}
+           WHERE company_id = ${COMPANY} AND aggregate_key = ${AGGREGATE_KEY}`,
+    );
+  }
+
+  function precondition(token: string) {
+    return resolvePluginFencingPrecondition(NAMESPACE, {
+      table: FENCE_TABLE,
+      match: {
+        company_id: COMPANY,
+        aggregate_key: AGGREGATE_KEY,
+        phase: "firing",
+        firing_token: token,
+      },
+    });
+  }
+
+  const write = (value: unknown, token?: string) =>
+    store.set(
+      pluginId,
+      { scopeKind: "company", scopeId: COMPANY, stateKey: STATE_KEY, value },
+      token === undefined ? null : precondition(token),
+    );
+
+  const readBack = async () => {
+    const [row] = await db
+      .select()
+      .from(pluginState)
+      .where(and(eq(pluginState.pluginId, pluginId), eq(pluginState.stateKey, STATE_KEY)));
+    return row?.valueJson as { by?: string } | undefined;
+  };
+
+  it("applies the state write while the caller still holds the generation", async () => {
+    const token = randomUUID();
+    await claimFence(token);
+
+    await write({ by: "fence-holder" }, token);
+
+    expect(await readBack()).toEqual({ by: "fence-holder" });
+  });
+
+  it("rejects the state write whose generation was stolen after the caller's barrier", async () => {
+    const token = randomUUID();
+    await claimFence(token);
+    await write({ by: "fence-holder" }, token);
+
+    // The predecessor won its member write, then a replacement claimed the
+    // aggregate. Its `ctx.state.set` must not land.
+    await stealFence(randomUUID());
+
+    await expect(write({ by: "displaced-predecessor" }, token)).rejects.toMatchObject({
+      details: { code: "fencing_generation_lost" },
+    });
+    expect(await readBack()).toEqual({ by: "fence-holder" });
+  });
+
+  it("rejects the state write once the fence has been released outright", async () => {
+    const token = randomUUID();
+    await claimFence(token);
+    await db.execute(sql.raw(`DELETE FROM ${NAMESPACE}.${FENCE_TABLE}`));
+
+    await expect(write({ by: "displaced-predecessor" }, token)).rejects.toMatchObject({
+      details: { code: "fencing_generation_lost" },
+    });
+    expect(await readBack()).toBeUndefined();
+  });
+
+  it("behaves exactly as before when no generation is supplied", async () => {
+    // Every other plugin calls `state.set` without a fence; the new parameter
+    // must not make those writes conditional on anything.
+    await write({ by: "unfenced" });
+
+    expect(await readBack()).toEqual({ by: "unfenced" });
+  });
+
+  it("serializes a steal that races an in-flight state write, instead of interleaving", async () => {
+    const token = randomUUID();
+    await claimFence(token);
+
+    const order: string[] = [];
+    let releaseSteal!: () => void;
+    const lockTaken = new Promise<void>((resolve) => {
+      releaseSteal = resolve;
+    });
+
+    const mutation = db.transaction(async (tx) => {
+      await assertPluginFencingGeneration(tx, precondition(token));
+      // Lock held. Give the steal every chance to commit — if it can, the write
+      // below is stale and this test fails, which is the point.
+      releaseSteal();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await tx.insert(pluginState).values({
+        pluginId,
+        scopeKind: "company",
+        scopeId: COMPANY,
+        namespace: "default",
+        stateKey: STATE_KEY,
+        valueJson: { by: "written-under-the-fence" },
+        updatedAt: new Date(),
+      });
+      order.push("mutation-committed");
+    });
+
+    const steal = (async () => {
+      await lockTaken;
+      await stealFence(randomUUID());
+      order.push("steal-committed");
+    })();
+
+    await Promise.all([mutation, steal]);
+
+    expect(order).toEqual(["mutation-committed", "steal-committed"]);
+    expect(await readBack()).toEqual({ by: "written-under-the-fence" });
+
+    // And the displaced predecessor is locked out from here on.
+    await expect(write({ by: "stale" }, token)).rejects.toMatchObject({
+      details: { code: "fencing_generation_lost" },
+    });
   });
 });

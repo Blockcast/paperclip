@@ -1412,8 +1412,20 @@ export async function handleFiring(
           ? escalationDeadlineMs(alert, config)
           : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
       };
-      await ctx.state.set(stateRef, updated);
+      // Fenced, like the member write above and for the same reason. Winning
+      // `upsertAggregateMember` proves ownership *at that statement*, not for
+      // the rest of the delivery: a steal committing right after it would
+      // otherwise let this displaced worker overwrite the aggregate's alert
+      // state with its own stale view. The host holds the generation lock to
+      // commit, so the steal and this write cannot interleave.
+      await ctx.state.set(stateRef, updated, {
+        fencing: firingFence(companyId, aggregateKey, firingToken),
+      });
 
+      // Same generation, checked immediately before dispatch. This is the
+      // weaker of the two guarantees — see `PluginEventsClient.emit` — but it
+      // is what stops a displaced predecessor announcing a re-fire for an
+      // aggregate a newer owner now holds.
       await ctx.events.emit(
         "alertmanager.alert.firing",
         tracked.paperclipCompanyId,
@@ -1428,6 +1440,7 @@ export async function handleFiring(
           assigneeAgentId: tracked.assigneeAgentId ?? null,
           reFired: true,
         },
+        { fencing: firingFence(companyId, aggregateKey, firingToken) },
       );
       await ctx.metrics.write("alertmanager.firing.deduped", 1, {
         alertname,
@@ -1653,19 +1666,31 @@ export async function handleFiring(
     alert.fingerprint,
     firingToken,
   );
-  await ctx.state.set(stateRef, record);
-
-  await ctx.events.emit("alertmanager.alert.firing", companyId, {
-    fingerprint: alert.fingerprint,
-    alertname,
-    severity,
-    labels: alert.labels,
-    annotations: alert.annotations,
-    paperclipIssueId: issue.id,
-    assigneeUserId: effectiveAssigneeUserId,
-    assigneeAgentId: effectiveAssigneeAgentId,
-    reFired: !created,
+  // Fenced for the same reason as the re-fire path above: winning the member
+  // write proves ownership at that statement only, and the creation path has
+  // the same unguarded tail. Ally flagged this site specifically — a creation
+  // delivery displaced right after the member upsert would otherwise publish
+  // alert state and a firing event for an aggregate it no longer owns.
+  await ctx.state.set(stateRef, record, {
+    fencing: firingFence(companyId, aggregateKey, firingToken),
   });
+
+  await ctx.events.emit(
+    "alertmanager.alert.firing",
+    companyId,
+    {
+      fingerprint: alert.fingerprint,
+      alertname,
+      severity,
+      labels: alert.labels,
+      annotations: alert.annotations,
+      paperclipIssueId: issue.id,
+      assigneeUserId: effectiveAssigneeUserId,
+      assigneeAgentId: effectiveAssigneeAgentId,
+      reFired: !created,
+    },
+    { fencing: firingFence(companyId, aggregateKey, firingToken) },
+  );
 
   await ctx.activity.log({
     companyId,

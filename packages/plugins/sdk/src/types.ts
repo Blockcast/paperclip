@@ -611,8 +611,31 @@ export interface PluginEventsClient {
    * @param name - Bare event name (e.g. `"sync-done"`)
    * @param companyId - UUID of the company this event belongs to
    * @param payload - JSON-serializable event payload
+   * @param options.fencing - Only dispatch while this generation is still held.
+   *
+   * Note this is deliberately weaker than the `issues.*` / `state.set` fence,
+   * and the difference is not an oversight. Those mutate a row, so the host can
+   * take the generation lock inside the mutation's own transaction and hold it
+   * to commit — no interleaving is possible. Event delivery is an in-memory
+   * fan-out to subscriber handlers; there is no transaction to join. The host
+   * therefore evaluates the generation immediately before dispatch and refuses
+   * to emit once it is gone, which turns "a displaced worker still announces a
+   * firing it does not own" into "it cannot" — but a steal committing between
+   * that check and the fan-out is not excluded.
+   *
+   * Holding the share lock across the handlers *would* exclude it, and is
+   * rejected on purpose: subscriber handlers run arbitrary plugin code, so a
+   * slow or wedged handler would block the steal path — reintroducing exactly
+   * the unstealable-fence failure this mechanism exists to prevent. A bounded,
+   * documented notification race is the better trade than an unbounded lock on
+   * the recovery path.
    */
-  emit(name: string, companyId: string, payload: unknown): Promise<void>;
+  emit(
+    name: string,
+    companyId: string,
+    payload: unknown,
+    options?: { fencing?: PluginFencingPrecondition },
+  ): Promise<void>;
 }
 
 /**
@@ -896,8 +919,17 @@ export interface PluginStateClient {
    *
    * @param input - Scope key identifying the entry to write
    * @param value - JSON-serializable value to store
+   * @param options.fencing - Only apply the write while this fencing generation
+   *   is still held. The host takes a share lock on the named row inside the
+   *   upsert's own transaction and holds it to commit, so a concurrent steal
+   *   cannot land between the check and the write. Rejection throws with
+   *   `code: "fencing_generation_lost"`.
    */
-  set(input: ScopeKey, value: unknown): Promise<void>;
+  set(
+    input: ScopeKey,
+    value: unknown,
+    options?: { fencing?: PluginFencingPrecondition },
+  ): Promise<void>;
 
   /**
    * Delete a state value. No-ops silently if the entry does not exist
