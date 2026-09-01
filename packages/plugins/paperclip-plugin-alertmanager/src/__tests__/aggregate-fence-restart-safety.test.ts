@@ -177,7 +177,10 @@ function mkCtx() {
   const mocks = {
     state: {
       get: vi.fn(async () => null),
-      set: vi.fn(async () => {}),
+      // Rest-typed so `.mock.calls[n]` is a real argument list: the tail-fencing
+      // assertions below read the third argument, which a bare `async () => {}`
+      // would type as an empty tuple.
+      set: vi.fn(async (..._args: unknown[]) => {}),
       delete: vi.fn(async () => {}),
     },
     users: { get: vi.fn(async () => null), findByEmail: vi.fn(async () => null) },
@@ -195,7 +198,7 @@ function mkCtx() {
       createComment: vi.fn(async () => ({ id: "comment-1" })),
     },
     db: realDb(db),
-    events: { emit: vi.fn(async () => {}) },
+    events: { emit: vi.fn(async (..._args: unknown[]) => {}) },
     metrics: { write: vi.fn(async () => {}) },
     activity: { log: vi.fn(async () => {}) },
     actions: { register: vi.fn() },
