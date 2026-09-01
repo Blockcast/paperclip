@@ -3138,6 +3138,7 @@ describe("realizeExecutionWorkspace", () => {
       );
       await fs.mkdir(managedCwd, { recursive: true });
       await runGit(managedCwd, ["init"]);
+      await runGit(managedCwd, ["remote", "add", "origin", repoUrl]);
       await runGit(managedCwd, ["config", "user.email", "paperclip@example.com"]);
       await runGit(managedCwd, ["config", "user.name", "Paperclip Test"]);
       await fs.writeFile(path.join(managedCwd, "README.md"), "managed\n", "utf8");
@@ -3201,7 +3202,7 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 120_000);
 
-  it("leaves a shared project_primary cwd alone when it already contains a git checkout", async () => {
+  it("leaves a shared project_primary cwd alone when it already contains the expected git checkout", async () => {
     const repoRoot = await createTempRepo();
     const realized = await ensurePersistedExecutionWorkspaceAvailable({
       base: {
@@ -3235,12 +3236,22 @@ describe("realizeExecutionWorkspace", () => {
     expect(realized?.warnings).toEqual([]);
   });
 
-  it("rejects a reused shared project_primary cwd when its git origin is for a different repo", async () => {
+  it("rebinds a reused shared project_primary cwd when its git origin is wrong and the managed checkout is verified", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-existing-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const managedCwd = path.resolve(paperclipHome, "instances", "default", "projects", "company-repo-mismatch", "project-repo-mismatch", "paperclip");
+    await fs.mkdir(managedCwd, { recursive: true });
+    await runGit(managedCwd, ["init"]);
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
 
-    await expect(ensurePersistedExecutionWorkspaceAvailable({
-      base: {
+    try {
+      const realized = await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
         baseCwd: repoRoot,
         source: "project_primary",
         projectId: "project-repo-mismatch",
@@ -3248,7 +3259,7 @@ describe("realizeExecutionWorkspace", () => {
         repoUrl: "https://example.test/Blockcast/paperclip.git",
         repoRef: "master",
       },
-      workspace: {
+        workspace: {
         mode: "shared_workspace",
         strategyType: "project_primary",
         cwd: repoRoot,
@@ -3259,27 +3270,43 @@ describe("realizeExecutionWorkspace", () => {
         baseRef: "master",
         branchName: null,
       },
-      issue: {
+        issue: {
         id: "issue-repo-mismatch",
         identifier: "PAP-REPO-MISMATCH",
         title: "Wrong repo workspace",
       },
-      agent: {
+        agent: {
         id: "agent-repo-mismatch",
         name: "Codex Coder",
         companyId: "company-repo-mismatch",
-      },
-    })).rejects.toMatchObject({
-      code: "workspace_repo_mismatch",
-      name: WorkspaceRepoMismatchError.name,
-    });
+        },
+      });
+      expect(realized?.cwd).toBe(managedCwd);
+      expect(realized?.warnings.some((warning) => warning.includes(repoRoot) && warning.includes(managedCwd))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
   });
 
-  it("rejects a freshly realized project_primary cwd when its git origin is for a different repo", async () => {
+  it("rebinds a freshly realized project_primary cwd to a verified managed checkout", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-fresh-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const managedCwd = path.resolve(paperclipHome, "instances", "default", "projects", "company-fresh-repo-mismatch", "project-fresh-repo-mismatch", "paperclip");
+    await fs.mkdir(managedCwd, { recursive: true });
+    await runGit(managedCwd, ["init"]);
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
 
-    await expect(realizeExecutionWorkspace({
+    try {
+      const realized = await realizeExecutionWorkspace({
       base: {
         baseCwd: repoRoot,
         source: "project_primary",
@@ -3298,6 +3325,42 @@ describe("realizeExecutionWorkspace", () => {
         id: "agent-fresh-repo-mismatch",
         name: "Codex Coder",
         companyId: "company-fresh-repo-mismatch",
+      },
+      });
+      expect(realized.cwd).toBe(managedCwd);
+      expect(realized.warnings.some((warning) => warning.includes(repoRoot) && warning.includes(managedCwd))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a freshly realized project_primary cwd when no verified managed checkout exists", async () => {
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+
+    await expect(realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-fresh-repo-mismatch-no-managed",
+        workspaceId: "workspace-fresh-repo-mismatch-no-managed",
+        repoUrl: "https://example.test/Blockcast/paperclip.git",
+        repoRef: "master",
+      },
+      config: {},
+      issue: {
+        id: "issue-fresh-repo-mismatch-no-managed",
+        identifier: "PAP-FRESH-REPO-MISMATCH-NO-MANAGED",
+        title: "Wrong fresh repo workspace without managed checkout",
+      },
+      agent: {
+        id: "agent-fresh-repo-mismatch-no-managed",
+        name: "Codex Coder",
+        companyId: "company-fresh-repo-mismatch-no-managed",
       },
     })).rejects.toMatchObject({
       code: "workspace_repo_mismatch",

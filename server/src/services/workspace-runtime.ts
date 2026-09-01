@@ -2717,6 +2717,24 @@ async function validateProjectPrimaryRepoOrigin(input: {
   );
 }
 
+async function findVerifiedManagedProjectPrimaryCheckout(input: {
+  companyId: string;
+  projectId: string;
+  expectedRepoUrl: string;
+  currentCwd: string;
+}): Promise<string | null> {
+  const managedCwd = resolveManagedProjectWorkspaceDir({
+    companyId: input.companyId,
+    projectId: input.projectId,
+    repoName: deriveRepoNameFromRepoUrlForRuntime(input.expectedRepoUrl),
+  });
+  if (managedCwd === path.resolve(input.currentCwd) || !await isGitCheckout(managedCwd)) return null;
+
+  const actualUrl = await runGit(["config", "--get", "remote.origin.url"], managedCwd).catch(() => null);
+  if (normalizeRepoIdentity(actualUrl) !== normalizeRepoIdentity(input.expectedRepoUrl)) return null;
+  return managedCwd;
+}
+
 type GitSubmoduleReadinessEntry = {
   path: string;
   state: "uninitialized" | "conflicted";
@@ -3771,10 +3789,32 @@ export async function realizeExecutionWorkspace(input: {
     const baseIsGitCheckout = await isGitCheckout(input.base.baseCwd);
     let warnings: string[] = [];
     if (input.base.source === "project_primary" && baseIsGitCheckout) {
-      await validateProjectPrimaryRepoOrigin({
-        cwd: input.base.baseCwd,
-        expectedRepoUrl: input.base.repoUrl,
-      });
+      const expectedRepoUrl = asString(input.base.repoUrl, "").trim();
+      const projectId = asString(input.base.projectId, "").trim();
+      const companyId = asString(input.agent.companyId, "").trim();
+      const managedCwd = expectedRepoUrl && projectId && companyId
+        ? await findVerifiedManagedProjectPrimaryCheckout({
+            companyId,
+            projectId,
+            expectedRepoUrl,
+            currentCwd: input.base.baseCwd,
+          })
+        : null;
+      if (managedCwd) {
+        warnings.push(`Rebound stale project_primary cwd "${input.base.baseCwd}" to managed checkout "${managedCwd}".`);
+        return {
+          ...input.base,
+          baseCwd: managedCwd,
+          cwd: managedCwd,
+          strategy: "project_primary",
+          branchName: null,
+          worktreePath: null,
+          warnings: [...warnings, ...(await stampCheckoutIdentity(managedCwd, input.agent))],
+          created: false,
+          baseRefSha: null,
+        };
+      }
+      await validateProjectPrimaryRepoOrigin({ cwd: input.base.baseCwd, expectedRepoUrl });
     }
     if (baseIsGitCheckout) {
       warnings = await ensureGitSubmodulesReady({
@@ -4123,31 +4163,33 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     const repoUrl = asString(input.workspace.repoUrl ?? input.base.repoUrl, "").trim();
     if (input.workspace.mode === "shared_workspace") {
       const cwdIsGitCheckout = await isGitCheckout(cwd);
-      if (cwdIsGitCheckout) {
-        await validateProjectPrimaryRepoOrigin({
-          cwd,
-          expectedRepoUrl: repoUrl,
-        });
-      } else {
-        const projectId = asString(input.workspace.projectId ?? input.base.projectId, "").trim();
-        const companyId = asString(input.agent.companyId, "").trim();
-        if (repoUrl && projectId && companyId) {
-          const managedCwd = resolveManagedProjectWorkspaceDir({
+      const projectId = asString(input.workspace.projectId ?? input.base.projectId, "").trim();
+      const companyId = asString(input.agent.companyId, "").trim();
+      const managedCwd = repoUrl && projectId && companyId
+        ? await findVerifiedManagedProjectPrimaryCheckout({
             companyId,
             projectId,
-            repoName: deriveRepoNameFromRepoUrlForRuntime(repoUrl),
-          });
-          if (managedCwd !== cwd && (await isGitCheckout(managedCwd))) {
-            return {
-              ...realized,
-              cwd: managedCwd,
-              warnings: [
-                `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
-                ...(await stampCheckoutIdentity(managedCwd, input.agent)),
-              ],
-            };
-          }
-        }
+            expectedRepoUrl: repoUrl,
+            currentCwd: cwd,
+          })
+        : null;
+      if (managedCwd) {
+        return {
+          ...realized,
+          cwd: managedCwd,
+          baseCwd: managedCwd,
+          warnings: [
+            `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
+            ...(await stampCheckoutIdentity(managedCwd, input.agent)),
+          ],
+        };
+      }
+      if (cwdIsGitCheckout) {
+        await validateProjectPrimaryRepoOrigin({ cwd, expectedRepoUrl: repoUrl });
+      } else if (repoUrl && projectId && companyId) {
+        throw new WorkspaceRepoMismatchError(
+          `No verified managed checkout exists for expected repository "${repoUrl}"; refusing to start from "${cwd}".`,
+        );
       }
     }
     if (!await directoryExists(cwd)) {
