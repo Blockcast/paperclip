@@ -25,6 +25,7 @@ function makeExecutionWorkspace(overrides: Partial<ExecutionWorkspace> = {}): Ex
     closedAt: null,
     cleanupEligibleAt: null,
     cleanupReason: null,
+    hasWorkspaceRuntimeConfig: false,
     config: null,
     metadata: null,
     lastUsedAt: new Date("2026-04-07T00:00:00.000Z"),

@@ -131,10 +131,12 @@ export function buildProjectWorkspaceSummaries(input: {
         executionWorkspaceId: executionWorkspace.id,
         executionWorkspaceStatus: executionWorkspace.status,
         ...runtimeSummary,
-        hasRuntimeConfig: Boolean(
-          executionWorkspace.config?.workspaceRuntime
-          ?? projectWorkspacesById.get(executionWorkspace.projectWorkspaceId ?? issue.projectWorkspaceId ?? "")?.runtimeConfig?.workspaceRuntime,
-        ),
+        // PEN-2852: presence flags, not the values. `config.workspaceRuntime` is withheld from
+        // readers without `runtime:manage`, so `Boolean(config?.workspaceRuntime)` reports false
+        // for a withheld config and would silently hide the workspace from this tab.
+        hasRuntimeConfig:
+          executionWorkspace.hasWorkspaceRuntimeConfig
+          || Boolean(projectWorkspacesById.get(executionWorkspace.projectWorkspaceId ?? issue.projectWorkspaceId ?? "")?.hasWorkspaceRuntimeConfig),
         linkedIssueCount: nextIssues.length,
         issues: nextIssues,
       });
@@ -163,7 +165,7 @@ export function buildProjectWorkspaceSummaries(input: {
       executionWorkspaceId: null,
       executionWorkspaceStatus: null,
       ...runtimeSummary,
-      hasRuntimeConfig: Boolean(projectWorkspace.runtimeConfig?.workspaceRuntime),
+      hasRuntimeConfig: projectWorkspace.hasWorkspaceRuntimeConfig,
       linkedIssueCount: nextIssues.length,
       issues: nextIssues,
     });
@@ -174,7 +176,7 @@ export function buildProjectWorkspaceSummaries(input: {
     if (summaries.has(key)) continue;
     const shouldSurfaceWorkspace =
       projectWorkspace.isPrimary
-      || Boolean(projectWorkspace.runtimeConfig?.workspaceRuntime)
+      || projectWorkspace.hasWorkspaceRuntimeConfig
       || (projectWorkspace.runtimeServices?.length ?? 0) > 0;
     if (!shouldSurfaceWorkspace) continue;
     const runtimeSummary = runtimeServiceSummary(projectWorkspace.runtimeServices);
@@ -190,7 +192,7 @@ export function buildProjectWorkspaceSummaries(input: {
       executionWorkspaceId: null,
       executionWorkspaceStatus: null,
       ...runtimeSummary,
-      hasRuntimeConfig: Boolean(projectWorkspace.runtimeConfig?.workspaceRuntime),
+      hasRuntimeConfig: projectWorkspace.hasWorkspaceRuntimeConfig,
       linkedIssueCount: 0,
       issues: [],
     });

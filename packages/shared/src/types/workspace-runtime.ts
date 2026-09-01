@@ -271,6 +271,14 @@ export interface ExecutionWorkspace {
   cleanupEligibleAt: Date | null;
   cleanupReason: string | null;
   config: ExecutionWorkspaceConfig | null;
+  /**
+   * Whether this workspace carries its own `workspaceRuntime` block, independent of whether the
+   * reader is entitled to see its contents. `config.workspaceRuntime` and `metadata` are withheld
+   * from readers without `runtime:manage` (PEN-2852), so callers must NOT infer presence from
+   * `Boolean(config?.workspaceRuntime)` — that predicate is false for a withheld value and for an
+   * absent one alike. This flag is always computed from the stored row.
+   */
+  hasWorkspaceRuntimeConfig: boolean;
   metadata: Record<string, unknown> | null;
   runtimeServices?: WorkspaceRuntimeService[];
   createdAt: Date;

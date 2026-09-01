@@ -160,6 +160,7 @@ function createExecutionWorkspace(): ExecutionWorkspace {
     closedAt: null,
     cleanupEligibleAt: null,
     cleanupReason: null,
+    hasWorkspaceRuntimeConfig: false,
     config: {
       provisionCommand: null,
       teardownCommand: null,
