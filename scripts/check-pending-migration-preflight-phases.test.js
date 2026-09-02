@@ -69,6 +69,10 @@ function runPreflight(env = {}) {
       // Deliberately tiny so a budget being charged the wrong phase is loud.
       PREFLIGHT_TIMEOUT_SECONDS: "2",
       PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "60",
+      // These tests wait on real clocks, so the production 5s poll would make
+      // the file cost ~32s against the policy job's one-minute step bound. The
+      // waits stay real; only their granularity shrinks.
+      PREFLIGHT_POLL_SECONDS: "1",
       ...env,
     },
   };
@@ -98,7 +102,7 @@ test("a pull slower than the run budget still passes", () => {
 test("a container that never starts is reported as infrastructure, not a migration verdict", () => {
   const { code, output } = runPreflight({
     STUB_READY_AFTER: "9999",
-    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "6",
+    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "4",
   });
 
   assert.equal(code, 1, "an unstarted check must still fail closed");
@@ -122,7 +126,7 @@ test("a started-but-unfinished check is reported as migrations in trouble", () =
 });
 
 test("the two INCONCLUSIVE causes are distinguishable from the log alone", () => {
-  const startup = runPreflight({ STUB_READY_AFTER: "9999", PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "6" }).output;
+  const startup = runPreflight({ STUB_READY_AFTER: "9999", PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "4" }).output;
   const run = runPreflight({ STUB_JOB_RESULT: "timeout" }).output;
 
   const line = (out) => out.split("\n").find((l) => l.includes("INCONCLUSIVE"));
@@ -159,7 +163,7 @@ test("a config error fails fast instead of riding out the startup budget", () =>
 
   assert.equal(code, 1);
   assert.match(output, /CreateContainerConfigError/);
-  assert.ok(elapsed < 30, `must not burn the whole 60s startup budget on a terminal error (took ${elapsed}s)`);
+  assert.ok(elapsed < 10, `must not burn the whole 60s startup budget on a terminal error (took ${elapsed}s)`);
   // Bailing early and exhausting the budget are different facts. Claiming the
   // container "never started within its 60s startup budget" after 0s would
   // point an operator at the budget when the budget was never the constraint.
@@ -178,10 +182,15 @@ test("a transient pull error rides out the startup budget rather than failing fa
   const { output } = runPreflight({
     STUB_READY_AFTER: "9999",
     STUB_WAITING_REASON: "ImagePullBackOff",
-    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "8",
+    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "5",
   });
   const elapsed = (Date.now() - began) / 1000;
 
-  assert.ok(elapsed >= 8, `must keep waiting through a recoverable pull error (took ${elapsed}s)`);
+  // The budget is 5s, but the script's deadline is compared in whole seconds,
+  // so it can round down to ~1s early against this wall clock. The claim under
+  // test is "kept polling" rather than "bailed on sight" -- the terminal-error
+  // path returns in ~0.2s, so anything in seconds settles it without making the
+  // assertion a hostage to second-granularity slop.
+  assert.ok(elapsed >= 3.5, `must keep waiting through a recoverable pull error (took ${elapsed}s)`);
   assert.match(output, /ImagePullBackOff/);
 });
