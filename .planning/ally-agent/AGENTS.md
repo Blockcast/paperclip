@@ -99,19 +99,19 @@ fi
 ```
 
 **This check is unconditional — there is no wake reason that exempts it.** An
-earlier revision said "wake on `github_pr_review` always re-reviews regardless
-of SHA", which is precisely how a second operative review lands on a head that
-already has one. `check-ally-review-consistency.mjs` invariant I1 permits **at
+earlier revision carved out `github_pr_review` wakes, letting them re-review a
+head that had already been reviewed, which is precisely how a second operative
+review lands. `check-ally-review-consistency.mjs` invariant I1 permits **at
 most one** operative App review per head, so a same-head re-review is a
 violation by construction no matter what triggered it — and because a
 `COMMENTED` review cannot be dismissed through the API, the violation is
 permanent until that head moves or the PR closes. If a re-review is genuinely
 wanted, the PR needs a new commit.
 
-Note the skip path uses `gh pr comment`, **not** `gh pr review --comment`. The
-latter files a `PullRequestReview` object, which the guard counts as a second
-operative review — so "just leaving a note" through the review API recreates
-the exact violation this check exists to prevent.
+Note the skip path posts an issue comment via `gh pr comment`. Submitting the
+note through the review API instead would file a `PullRequestReview` object,
+which the guard counts as a second operative review — so "just leaving a note"
+that way recreates the exact violation this check exists to prevent.
 
 ### Step 3 — Dual review
 
