@@ -225,6 +225,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     body: string;
     updatedAt?: Date;
     sourceTrust?: SourceTrustMetadata;
+    createdByRunId?: string;
   }) {
     const documentId = randomUUID();
     const revisionId = randomUUID();
@@ -250,6 +251,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       format: "markdown",
       body: input.body,
       createdByAgentId: input.agentId,
+      ...(input.createdByRunId ? { createdByRunId: input.createdByRunId } : {}),
     });
     await db.insert(issueDocuments).values({
       companyId: input.companyId,
@@ -1967,6 +1969,10 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       title: string;
       summaryUpdatedAt: Date;
       sourceTrust?: SourceTrustMetadata;
+      // When set, the summary revision is attributed to a finalized run whose
+      // id is returned as `summaryRunId`, so a test can reproduce the
+      // summary-then-own-comment ordering that run finalization emits.
+      attributeSummaryToFinalizedRun?: boolean;
     }) {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
@@ -1978,6 +1984,21 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         priority: "high",
         assigneeAgentId: agentId,
       });
+      let summaryRunId: string | null = null;
+      if (input.attributeSummaryToFinalizedRun) {
+        summaryRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: summaryRunId,
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "succeeded",
+          startedAt: new Date(input.summaryUpdatedAt.getTime() - 60_000),
+          finishedAt: input.summaryUpdatedAt,
+          contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
+        });
+      }
       await seedContinuationSummary({
         companyId,
         issueId,
@@ -1985,8 +2006,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         body: PARKING_SUMMARY,
         updatedAt: input.summaryUpdatedAt,
         sourceTrust: input.sourceTrust,
+        ...(summaryRunId ? { createdByRunId: summaryRunId } : {}),
       });
-      return { companyId, agentId, issueId };
+      return { companyId, agentId, issueId, summaryRunId };
     }
 
     async function resumeContinuationRetry(input: {
@@ -2118,6 +2140,87 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       // runs that do execute, and an execution still settling past their end
       // leaks a call into this one (see the note on resumeQueuedRuns above).
       expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    // The ordering above is hand-written and is the OPPOSITE of what run
+    // finalization emits. Finalization refreshes the summary first and then
+    // posts its own run-summary comment, so in production the agent comment is
+    // always strictly NEWER than the summary it accompanies. Without excluding
+    // the summary-writing run's own comment, that inversion supersedes the park
+    // on the ordinary success path and disables the gate for every genuinely
+    // review-waiting issue — the exact population BLO-16146 / BLO-18643 exist
+    // to protect.
+    it("still cancels when the summary-writing run's own finalization comment lands after the summary", async () => {
+      const summaryUpdatedAt = new Date("2026-08-15T09:00:00.000Z");
+      const { companyId, agentId, issueId, summaryRunId } = await seedParkedContinuationRetry({
+        title: "Finalization comment must not supersede its own summary",
+        summaryUpdatedAt,
+        attributeSummaryToFinalizedRun: true,
+      });
+      // Mirrors the finalizer: summary at T, then the run's own comment at T+ε,
+      // authored `agent` (not `system`) and stamped with the same run id.
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: summaryRunId,
+        body: "Run finished. Waiting for reviewer feedback or approval before continuing.",
+        createdAt: new Date(summaryUpdatedAt.getTime() + 250),
+      });
+
+      const { runId, run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+
+      expect(run?.status).toBe("cancelled");
+      expect(run?.errorCode).toBe("issue_continuation_waiting_on_review");
+      expect(run?.startedAt).toBeNull();
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    // Guards the fix above against over-tightening: only the summary-writing
+    // run's own writes are discounted. A DIFFERENT run's comment at the same
+    // instant is genuine new instruction and must still release the park,
+    // otherwise the deadlock this issue exists to fix comes back.
+    it("executes when a different run comments after the summary-writing run's own comment", async () => {
+      const summaryUpdatedAt = new Date("2026-08-15T09:00:00.000Z");
+      const { companyId, agentId, issueId, summaryRunId } = await seedParkedContinuationRetry({
+        title: "Another run's comment still supersedes",
+        summaryUpdatedAt,
+        attributeSummaryToFinalizedRun: true,
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: summaryRunId,
+        body: "Run finished. Waiting for reviewer feedback or approval before continuing.",
+        createdAt: new Date(summaryUpdatedAt.getTime() + 250),
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        body: "Ruling: the blocker is removed. Nothing is waiting on review any more — proceed.",
+        createdAt: new Date(summaryUpdatedAt.getTime() + 3_600_000),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+      expect(run?.startedAt).not.toBeNull();
     });
 
     // The park cancellation posts a system comment (AC3). If system comments

@@ -19890,10 +19890,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // the stall (recovery takeovers, and this gate's own cancellation notice),
   // not new instruction for the executor — counting them would let the gate's
   // own comment unpark the next retry and disable itself.
+  //
+  // The summary-writing run's OWN writes are excluded for the same reason, and
+  // this one is load-bearing rather than defensive: run finalization refreshes
+  // the summary FIRST and then posts its run-summary comment (see the
+  // `refreshContinuationSummaryForRun` → `addComment` pair in the finalizer),
+  // so that comment's `createdAt` is always strictly greater than the summary's
+  // `updatedAt`, and it is authored `agent` (issues.ts resolves an actor with
+  // `agentId` to `authorType: "agent"`), not `system`. Without this exclusion a
+  // park-shaped summary would be superseded by the very run that wrote it, on
+  // the ordinary success path — disabling the gate on exactly the population it
+  // exists to park and regressing BLO-16146 / BLO-18643. The summary write and
+  // the run comment are two halves of one finalization, not new activity.
+  // BLO-27639: which run authored the summary revision currently on the issue.
+  // `refreshIssueContinuationSummary` stamps `createdByRunId` on every revision
+  // it writes, so this is the run whose finalization writes must not be counted
+  // as superseding its own summary. Null when the revision predates that
+  // stamping or cannot be resolved — the fail-open direction.
+  async function resolveContinuationSummaryRunId(
+    companyId: string,
+    latestRevisionId: string | null,
+  ): Promise<string | null> {
+    if (!latestRevisionId) return null;
+    const revision = await db
+      .select({ createdByRunId: documentRevisions.createdByRunId })
+      .from(documentRevisions)
+      .where(and(
+        eq(documentRevisions.id, latestRevisionId),
+        eq(documentRevisions.companyId, companyId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return revision?.createdByRunId ?? null;
+  }
+
   async function isContinuationParkSuperseded(
     companyId: string,
     issueId: string,
     summaryUpdatedAt: Date | null,
+    summaryRunId: string | null,
   ): Promise<boolean> {
     // An undateable summary cannot be shown to be current. Fail open: the
     // deadlock is unrecoverable without an executing run, while a spurious
@@ -19910,6 +19945,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isNull(issueComments.deletedAt),
         or(isNull(issueComments.authorType), ne(issueComments.authorType, "system")),
         gt(issueComments.createdAt, summaryUpdatedAt),
+        summaryRunId
+          ? or(isNull(issueComments.createdByRunId), ne(issueComments.createdByRunId, summaryRunId))
+          : undefined,
       ))
       .limit(1)
       .then((rows) => rows[0] ?? null);
@@ -19923,11 +19961,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eq(activityLog.entityType, "issue"),
         eq(activityLog.entityId, issueId),
         gt(activityLog.createdAt, summaryUpdatedAt),
+        summaryRunId
+          ? or(isNull(activityLog.runId), ne(activityLog.runId, summaryRunId))
+          : undefined,
         or(
           eq(activityLog.action, "issue.blockers_updated"),
           and(
             eq(activityLog.action, "issue.updated"),
-            sql`${activityLog.details} ->> 'status' is not null`,
+            // `details` is the request payload, not a computed diff, so
+            // `->> 'status'` matches any PATCH that merely CARRIED status —
+            // including a no-op `{"status":"in_progress"}` rewrite. `_previous`
+            // is populated only for fields whose value actually changed, which
+            // is the "status change" both the comment above and the issue-facing
+            // park notice claim. Same predicate the issue-route precedent uses.
+            sql`${activityLog.details} -> '_previous' ? 'status'`,
           ),
         ),
       ))
@@ -20003,19 +20050,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentContinuationSummary = liveContinuationSummary
         ? redactQuarantinedBodyForHigherTrust(liveContinuationSummary)
         : null;
-      const continuationSummaryBody =
-        currentContinuationSummary?.body ??
-        readNonEmptyString(queuedSummary.body) ??
-        readNonEmptyString(queuedWakeSummary.body) ??
-        null;
-      const continuationSummaryUpdatedAt =
-        currentContinuationSummary?.updatedAt ??
-        parseTimestamp(readNonEmptyString(queuedSummary.updatedAt) ?? readNonEmptyString(queuedWakeSummary.updatedAt));
+      // The live document is preferred as a UNIT — body, timestamp and
+      // authoring run all come from the same revision or none of them do.
+      // Sourcing the body from the snapshot while keeping the live timestamp
+      // (which `??` chains independently would do for an empty live body) would
+      // date stale park text with a fresh timestamp and make the freshness
+      // comparison below meaningless.
+      const liveContinuationSummaryBody = readNonEmptyString(currentContinuationSummary?.body);
+      const useLiveContinuationSummary = liveContinuationSummaryBody !== null;
+      const continuationSummaryBody = useLiveContinuationSummary
+        ? liveContinuationSummaryBody
+        : readNonEmptyString(queuedSummary.body) ?? readNonEmptyString(queuedWakeSummary.body) ?? null;
+      const continuationSummaryUpdatedAt = useLiveContinuationSummary
+        ? currentContinuationSummary?.updatedAt ?? null
+        : parseTimestamp(readNonEmptyString(queuedSummary.updatedAt) ?? readNonEmptyString(queuedWakeSummary.updatedAt));
+      // Only the live document can be attributed to the run that wrote it. The
+      // frozen snapshot carries no revision id, so it yields null — no
+      // self-write exclusion, which is the fail-open direction.
+      const continuationSummaryRunId = useLiveContinuationSummary
+        ? await resolveContinuationSummaryRunId(
+            run.companyId,
+            currentContinuationSummary?.latestRevisionId ?? null,
+          )
+        : null;
       if (continuationSummaryParksExecutor(continuationSummaryBody)) {
         const superseded = await isContinuationParkSuperseded(
           run.companyId,
           issueId,
           continuationSummaryUpdatedAt,
+          continuationSummaryRunId,
         );
         if (!superseded) {
           return {
@@ -20208,7 +20271,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           authorType: "system",
           idempotencyKey: `continuation-park-gate:${issueId}:${summaryUpdatedAt}`,
         },
-      ).catch(() => null);
+      ).catch((err) => {
+        // Dedupe does not need a swallow: addComment inserts with
+        // onConflictDoNothing and re-selects under the idempotency author
+        // scope, so a repeat notice returns the existing row rather than
+        // throwing. Anything reaching here is a genuine fault, and silently
+        // dropping it would negate the issue-visible park notice this change
+        // exists to deliver.
+        logger.warn(
+          { err, runId: run.id, issueId },
+          "failed to post continuation park notice",
+        );
+        return null;
+      });
     }
 
     return cancelled;
