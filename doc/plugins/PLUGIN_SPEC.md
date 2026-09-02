@@ -325,6 +325,12 @@ export interface PaperclipPluginManifestV1 {
   /** @deprecated Use `minimumHostVersion` instead. Retained for backwards compatibility. */
   minimumPaperclipVersion?: string;
   capabilities: string[];
+  /**
+   * Tag keys this plugin may promote to Prometheus labels on
+   * `paperclip_plugin_metric_total`. Max 5, `snake_case`. Promotion also
+   * requires the key to be in the host's allow-list — see §26.4.
+   */
+  metricLabels?: string[];
   entrypoints: {
     worker: string;
     ui?: string;
@@ -1643,6 +1649,56 @@ The host should emit internal events when plugin health degrades. These use the 
 - `plugin.worker.restarted` — worker restarted after crash
 
 These events can be consumed by other plugins (e.g. a notification plugin) or surfaced in the dashboard.
+
+### 26.4 Metric Exposition
+
+`ctx.metrics.write(name, value, tags)` does two independent things:
+
+1. writes a `plugin_logs` row at `level='metric'` (queryable per-tenant detail), and
+2. increments the Prometheus counter `paperclip_plugin_metric_total`, which is what an alert rule can actually fire on.
+
+Both happen on every call; (2) runs first, so a `plugin_logs` write or flush failure cannot cost you the alertable signal.
+
+**The metric name is a label, not a series name.** The series is always `paperclip_plugin_metric_total`, labelled `plugin_id`, `plugin_key`, `metric` (your name), plus any promoted tags. Plugin metric names are frequently built by interpolation, so mapping them into series names would let an installed plugin mint arbitrary `paperclip_*` series in the host's namespace — and rule authors cannot enumerate plugin metric names in advance.
+
+**`write` is a counter increment.** The value must be finite and `>= 0`. Anything else is rejected, not clamped. There is no gauge form; if one is added it will be a separate method with its own series family, so that recompiling a plugin can never silently change what an existing series means.
+
+**Tag promotion is a two-sided gate.** A tag key becomes a Prometheus label only when it appears in *both*:
+
+- your manifest's `metricLabels` (max 5, `snake_case`), and
+- the host's `PLUGIN_METRIC_PROMOTABLE_TAG_KEYS` allow-list.
+
+Your manifest chooses what *you* promote; the host list bounds what *any* plugin may ever promote, so installing a third-party plugin cannot introduce an unbounded label. Both are required because Prometheus client libraries fix a counter's label names when the counter is constructed, while a manifest is read per write.
+
+Keys outside the gate are **not** dropped from the metric — only from its labels. The increment still lands, and the full tag set is still on the `plugin_logs` row. Declaring nothing is safe and is the default: you get aggregate-only series.
+
+`company_id` is never a label (unbounded per tenant). It stays on the `plugin_logs` row.
+
+**Cardinality is bounded, and exhaustion is visible rather than silent.** Each plugin may occupy at most 100 distinct `(metric, promoted-label-values)` combinations per worker process. Beyond that, further new combinations collapse into a single `metric="_overflow"` series — they are still counted, just not broken out. Every rejection or collapse increments `paperclip_plugin_metric_dropped_total{reason}`:
+
+| `reason` | meaning |
+|---|---|
+| `bad_name` | name failed shape (`^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$`) or exceeded 64 chars |
+| `bad_value` | value was non-finite or negative |
+| `budget` | per-plugin cardinality budget exhausted; folded into the overflow series |
+
+If a metric you expect is missing, query that series first — it is the answer, and it exists so the answer never requires reading host source.
+
+Example manifest fragment:
+
+```ts
+capabilities: ["metrics.write"],
+metricLabels: ["alertname", "severity", "version"],
+```
+
+and a rule written against it:
+
+```promql
+sum by (plugin_key, metric) (
+  rate(paperclip_plugin_metric_total{plugin_key="paperclip-plugin-alertmanager",
+                                     metric="alertmanager.owner.fallback_failed"}[10m])
+) > 0
+```
 
 ## 27. Plugin Development And Testing
 

@@ -49,6 +49,12 @@ const manifest: PaperclipPluginManifestV1 = {
     "database.namespace.read",
     "database.namespace.write",
   ],
+  // PEN-2799: promote these tag keys to Prometheus labels so this plugin's own
+  // failure counters are alertable per alert rather than only in aggregate.
+  // `alertname` is the load-bearing one — it is what distinguishes "one rule
+  // cannot be owned" from "delivery is broken", a distinction that cost 89h on
+  // PEN-2581. Bounded by the number of alert rules, not by traffic.
+  metricLabels: ["alertname", "severity", "version"],
   entrypoints: {
     worker: "./dist/worker.js",
   },

@@ -621,6 +621,22 @@ export interface PaperclipPluginManifestV1 {
   minimumPaperclipVersion?: PluginMinimumHostVersion;
   /** Capabilities this plugin requires from the host. Enforced at runtime. */
   capabilities: PluginCapability[];
+  /**
+   * Tag keys from this plugin's `ctx.metrics.write` calls that may be promoted
+   * to Prometheus labels on `paperclip_plugin_metric_total` (PEN-2799).
+   *
+   * This is only one half of a two-sided gate: a key becomes a label when it
+   * appears here **and** in the host's `PLUGIN_METRIC_PROMOTABLE_TAG_KEYS`
+   * allow-list. This field chooses what *this* plugin promotes; the host list
+   * bounds what *any* plugin may ever promote, so installing a third-party
+   * plugin cannot introduce an unbounded label. Both are needed because
+   * prom-client fixes a counter's label names at construction while a manifest
+   * is read per write.
+   *
+   * Omitting it is safe and is the default: the plugin's metrics still publish,
+   * just without per-tag breakdown. Max 5 keys, `snake_case`.
+   */
+  metricLabels?: string[];
   /** Entrypoint paths relative to the package root. */
   entrypoints: {
     /** Path to the worker entrypoint (required). */
