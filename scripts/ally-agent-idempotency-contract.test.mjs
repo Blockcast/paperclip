@@ -1,16 +1,19 @@
-// The Ally agent's Step 2 idempotency check lives in a markdown instruction
-// file, but it depends on a constant that lives in code: the login the guard
-// treats as the canonical Ally App reviewer. Nothing linked the two, so when
-// the instruction referenced `ally-paperclip[bot]` — a login that has never
-// posted a review in this repo — the check silently matched nothing,
-// `LAST_REVIEW_SHA` was always empty, the skip never fired, and every wake
-// re-reviewed the same head. That produced the duplicate operative reviews
-// `one-verdict-per-head` has been failing on since 2026-08-28.
+// Pins `.planning/ally-agent/AGENTS.md` against the guard's own exported
+// constants and against the live operating policy it documents.
 //
-// A stale identifier in prose fails silently and looks exactly like working
-// code, so this pins the instruction against the guard's own exported
-// constants. If either side is renamed, this test fails instead of the agent
-// quietly re-reviewing forever.
+// IMPORTANT SCOPE NOTE: this file is documentation, not runtime. Ally's live
+// instructions are a managed bundle on the paperclip volume, reachable at
+// `GET /api/agents/:id/instructions-bundle/file`; nothing in this repository
+// syncs this doc into it. So these assertions keep the *document* honest — they
+// cannot and do not change agent behaviour.
+//
+// The two had drifted far enough to contradict each other. This doc last saw a
+// substantive edit on 2026-05-16 while the live bundle accumulated dated policy
+// through 2026-08-30, and an earlier revision of this doc told Ally to skip
+// self-review entirely — the exact over-generalisation the live bundle records
+// as false and as having already cost real reviews (BLO-22488, BLO-22493).
+// A stale instruction in prose fails silently and reads like working policy,
+// which is what these tests exist to prevent.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -91,13 +94,67 @@ test("no stale reviewer identity survives anywhere in the document", () => {
     "the canonical App login must appear somewhere in the document");
 });
 
-test("the self-review guard names the identities Ally actually authors under", () => {
-  const line = agentsDoc.split("\n").find((l) => l.includes("Don't review your own work"));
+test("the self-review guard requires a COMMENTED review, not a skip", () => {
+  const line = agentsDoc.split("\n").find((l) => l.includes("review your own work"));
   assert.ok(line, "the self-review guard must remain present");
   assert.ok(line.includes(ALLY_APP_REVIEWER_LOGIN),
     `the self-review guard must name ${ALLY_APP_REVIEWER_LOGIN}`);
-  assert.ok(line.includes(`\`${ALLY_USER_REVIEWER_LOGIN}\``),
-    `the self-review guard must also cover the ${ALLY_USER_REVIEWER_LOGIN} seat`);
+
+  // The live managed bundle is explicit that self-review is PERMITTED and is the
+  // required delivery form: GitHub bars a PR's author from APPROVE and
+  // REQUEST_CHANGES, but not from COMMENTED. It records the blanket
+  // "the App cannot review its own PR" reading as the self-*approval* bar
+  // over-generalised — false, and already responsible for lost reviews
+  // (BLO-22488, BLO-22493). An earlier revision of this file encoded exactly
+  // that over-generalisation as a skip; this pins it from coming back.
+  // Match the DIRECTIVE, not the word: this line has to stay free to say
+  // "never a skip" in order to forbid one, so `/\bskip\b/` would fire on the
+  // prohibition itself. `author=self` was the actual suppressing instruction.
+  assert.doesNotMatch(line, /author=self/i,
+    "`author=self, skipping` was the directive that suppressed self-review");
+  assert.doesNotMatch(line, /Don't review your own work/i,
+    "the blanket prohibition is the over-generalisation the live bundle records"
+    + " as false and already costly (BLO-22488, BLO-22493)");
+  assert.match(line, /COMMENTED/,
+    "the guard must name COMMENTED as the delivery form");
+});
+
+// Executable lines only. The surrounding comments have to stay free to NAME the
+// anti-patterns in order to explain them, so an assertion over the raw fence
+// would fire on the explanation rather than on the command.
+function idempotencyCommands() {
+  const fence = /```bash\n([\s\S]*?)```/.exec(idempotencyBlock());
+  assert.ok(fence, "Step 2 must retain an executable bash block");
+  const code = fence[1]
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+  assert.match(code, /gh api .*\/reviews/, "the fence must be the reviews query");
+  return code;
+}
+
+test("idempotency counts only the App identity, not the User seat", () => {
+  const code = idempotencyCommands();
+
+  // The `allyblockcast` User seat is a second hat on this same agent, not an
+  // independent reviewer — the live bundle says to count only `user.type == Bot`.
+  // REST may expose the App's normalized login as bare `allyblockcast`, so
+  // matching on login alone silently lets a User-seat review satisfy the skip.
+  assert.match(code, /\.user\.type\s*==\s*"Bot"/,
+    "the query must gate on user.type == \"Bot\", not on login alone");
+});
+
+test("idempotency attests the head from the body, never from commit_id", () => {
+  const code = idempotencyCommands();
+
+  // GitHub rewrites review.commit_id after an "Update branch", so a review that
+  // attested an older head can start reporting the current one — the skip then
+  // fires for a head that was never reviewed. The immutable attestation is the
+  // `Reviewed head: <40-hex>` line in the review body.
+  assert.match(code, /Reviewed head: /,
+    "the query must parse the immutable `Reviewed head:` attestation");
+  assert.doesNotMatch(code, /\.commit_id/,
+    "commit_id is mutable across Update branch and must not decide idempotency");
 });
 
 test("the skip path posts a comment, not a review", () => {
