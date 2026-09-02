@@ -43,6 +43,7 @@ import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../provider-capacity-horizon-bound.js";
+import { truncateText } from "../truncate-text.js";
 // BLO-30087: the stale-lock sweeper below is the second consumer of the
 // "output silence means the holder is dead" heuristic. k8s-job-liveness is a
 // leaf module (k8s client + logger + redactor only), so importing it here adds
@@ -1129,10 +1130,7 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
     .map((line) => line.trim())
     .find(Boolean) ?? null;
   const summarySource = apiMessageMatch?.[1] ?? firstLine;
-  const truncated =
-    summarySource && summarySource.length > 240
-      ? `${summarySource.slice(0, 237)}...`
-      : summarySource;
+  const truncated = summarySource ? truncateText(summarySource, 240) : null;
   const summary = truncated ? redactSensitiveText(truncated) : null;
 
   if (errorCode && summary) return ` Latest retry failure: \`${errorCode}\` — ${summary}.`;
