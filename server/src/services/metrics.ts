@@ -681,6 +681,113 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
 export const PLUGIN_ERROR_METRIC = "paperclip_plugin_error";
 
 /**
+ * Prometheus exposition for plugin-contributed metrics (PEN-2799).
+ *
+ * `ctx.metrics.write` used to write a `plugin_logs` row and nothing else, so
+ * no alert rule could fire on any plugin metric — ever. That is not
+ * theoretical: `paperclip-plugin-alertmanager` emitted
+ * `alertmanager.owner.fallback_failed` on every single failed delivery for 89
+ * hours while ~93% of fleet alert delivery was lost (PEN-2581), and the series
+ * did not exist. The metric that *named the root cause* was being published
+ * into a channel nothing can observe.
+ *
+ * The plugin's metric name is a **label, never part of the series name**. Two
+ * reasons, and the second is the load-bearing one:
+ *   1. Rule authors cannot enumerate plugin metric names ahead of time, so a
+ *      name-per-series family is unwritable against.
+ *   2. It is already attacker-shaped. Two bundled call sites build the name by
+ *      interpolation (`demo.${name}` in kitchen-sink, `slack.tool.${name}.error`
+ *      in the Slack plugin), so mapping it into the series name would let any
+ *      installed plugin mint arbitrary `paperclip_*` series in the platform's
+ *      own namespace.
+ *
+ * `company_id` is deliberately NOT a label — it is unbounded per tenant. It
+ * stays on the `plugin_logs` row, which is where per-tenant detail belongs.
+ */
+export const PLUGIN_METRIC_TOTAL_METRIC = "paperclip_plugin_metric_total";
+
+/**
+ * Companion to {@link PLUGIN_METRIC_TOTAL_METRIC}: what we refused to publish
+ * and why. A drop is never silent — every rejected or collapsed write lands
+ * here under a `reason`, so "my plugin metric is missing" is answerable from
+ * Prometheus instead of by reading host source.
+ */
+export const PLUGIN_METRIC_DROPPED_METRIC = "paperclip_plugin_metric_dropped_total";
+
+/**
+ * Tag keys any plugin may ever promote to a Prometheus label.
+ *
+ * This is the platform half of a two-sided gate: a tag key becomes a label
+ * only if it is in **both** this list and the emitting plugin's manifest
+ * `metricLabels`. The manifest chooses which keys *that* plugin promotes; this
+ * list bounds what *any* plugin may promote, so installing a third-party
+ * plugin cannot introduce an unbounded label.
+ *
+ * Two sides are required rather than one because prom-client fixes a counter's
+ * `labelNames` at construction and throws on any label it was not built with,
+ * while a manifest is read per-write — long after the counter exists. So the
+ * label *set* must be known statically here; the manifest can only narrow it.
+ *
+ * Seeded from every tag key actually in use across the bundled plugins
+ * (measured, not guessed: `source` ×7, `event_type` ×5, `decision` ×5,
+ * `severity` ×4, `error_code` ×4, `action` ×3, `alertname` ×2, then
+ * `version` / `scope` / `trigger` / `exit_code` as singletons). Each is a
+ * closed vocabulary.
+ *
+ * Deliberately EXCLUDED, because each is unbounded in principle and would
+ * blow up cardinality on a plugin that never intended it:
+ *   - `command` / `command_name` — operator-defined custom command names;
+ *   - `turns` / `threshold` — numeric measurements, not categories;
+ *   - `by` — an actor identity;
+ *   - `mimetype` — plugin-supplied and effectively open.
+ * Their metrics still publish; they just publish without those labels. Adding
+ * a key here is an explicit cardinality decision, not a convenience.
+ */
+export const PLUGIN_METRIC_PROMOTABLE_TAG_KEYS = [
+  "action",
+  "alertname",
+  "decision",
+  "error_code",
+  "event_type",
+  "exit_code",
+  "scope",
+  "severity",
+  "source",
+  "trigger",
+  "version",
+] as const;
+
+export type PluginMetricPromotableTagKey =
+  (typeof PLUGIN_METRIC_PROMOTABLE_TAG_KEYS)[number];
+
+/**
+ * A plugin metric name must look like a metric name. Rejecting a mis-shaped
+ * name is cheaper than carrying it as a label value forever, because
+ * prom-client never retires a label combination.
+ */
+export const PLUGIN_METRIC_NAME_REGEX = /^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$/;
+export const PLUGIN_METRIC_NAME_MAX_LENGTH = 64;
+
+/**
+ * Hard ceiling on distinct `(metric, promoted-label-values)` combinations a
+ * single plugin may occupy, **per process lifetime**. Past it, further new
+ * combinations collapse into one `metric="_overflow"` series rather than being
+ * discarded, so an over-cardinality plugin degrades to an aggregate instead of
+ * going dark.
+ *
+ * Bounded over combinations *ever observed*, not currently active, because
+ * prom-client never retires a label combination — bounding "active" would
+ * bound nothing. The budget resets on a worker restart, which is correct for a
+ * counter and does mean a plugin churning names gets a fresh allowance each
+ * restart; the alternative is persisting the ledger, which is not worth a DB
+ * write per metric.
+ */
+export const PLUGIN_METRIC_CARDINALITY_BUDGET = 100;
+
+/** Label value that over-budget combinations collapse into. */
+export const PLUGIN_METRIC_OVERFLOW_NAME = "_overflow";
+
+/**
  * Unix timestamp (seconds) of the plugin-status collector's last successful
  * tick (BLO-21092 review follow-up). Set ONLY on success, never on failure —
  * a `listInstalled()` rejection (first tick or any later one) leaves this
@@ -1375,6 +1482,23 @@ let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
+let pluginMetric: Counter<
+  "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
+> | null = null;
+let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason"> | null = null;
+
+/**
+ * Per-plugin ledger of `(metric, promoted-label-values)` combinations already
+ * published, enforcing {@link PLUGIN_METRIC_CARDINALITY_BUDGET}.
+ *
+ * Keys are joined with a NUL, matching this file's existing composite-key
+ * idiom. That is not cosmetic: with a printable separator two different
+ * combinations can render to the same ledger key, and the second write then
+ * reads as already-seen — so it consumes no budget slot and still publishes.
+ * Every such collision buys a free series and the bound leaks. NUL cannot
+ * appear in a Prometheus label value, so the key is injective.
+ */
+const pluginMetricCombinations = new Map<string, Set<string>>();
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
@@ -1419,6 +1543,10 @@ function ensureRegistry(): {
   scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
+  pluginMetricCounter: Counter<
+    "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
+  >;
+  pluginMetricDroppedCounter: Counter<"plugin_id" | "plugin_key" | "reason">;
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
@@ -1467,6 +1595,8 @@ function ensureRegistry(): {
     || !scheduledRetryParkHorizon
     || !scheduledRetryParkHorizonRefreshSuccess
     || !pluginError
+    || !pluginMetric
+    || !pluginMetricDropped
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
     || !authRequest
@@ -1939,6 +2069,40 @@ function ensureRegistry(): {
       labelNames: ["plugin_id", "plugin_key"],
       registers: [registry],
     });
+    pluginMetric = new Counter({
+      name: PLUGIN_METRIC_TOTAL_METRIC,
+      help:
+        "Plugin-contributed metric increments from ctx.metrics.write (PEN-2799). "
+        + "The plugin's own metric name is the 'metric' LABEL, not part of this "
+        + "series name -- plugins build metric names by interpolation, so "
+        + "name-mapping would let any installed plugin mint arbitrary "
+        + "paperclip_* series. Tag keys become labels only when present in BOTH "
+        + "the plugin manifest's metricLabels and "
+        + "PLUGIN_METRIC_PROMOTABLE_TAG_KEYS; unpromoted tags stay on the "
+        + "plugin_logs row. company_id is deliberately not a label (unbounded "
+        + "per tenant). Combinations beyond the per-plugin budget collapse into "
+        + "metric=\"" + PLUGIN_METRIC_OVERFLOW_NAME + "\" rather than vanishing.",
+      labelNames: [
+        "plugin_id",
+        "plugin_key",
+        "metric",
+        ...PLUGIN_METRIC_PROMOTABLE_TAG_KEYS,
+      ],
+      registers: [registry],
+    });
+    pluginMetricDropped = new Counter({
+      name: PLUGIN_METRIC_DROPPED_METRIC,
+      help:
+        "Plugin metric writes not published as-submitted, by reason "
+        + "(PEN-2799): 'bad_name' (name failed shape/length validation), "
+        + "'bad_value' (non-finite or negative -- ctx.metrics.write is a "
+        + "counter increment), 'budget' (per-plugin cardinality budget "
+        + "exhausted, so the write was folded into the overflow series). A drop "
+        + "is never silent: this is the series that answers 'why is my plugin "
+        + "metric missing', which otherwise required reading host source.",
+      labelNames: ["plugin_id", "plugin_key", "reason"],
+      registers: [registry],
+    });
     pluginStatusCollectorLastSuccess = new Gauge({
       name: PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
       help:
@@ -2100,6 +2264,8 @@ function ensureRegistry(): {
     scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
     scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
     pluginErrorGauge: pluginError,
+    pluginMetricCounter: pluginMetric,
+    pluginMetricDroppedCounter: pluginMetricDropped,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
     authRequestCounter: authRequest,
@@ -2803,6 +2969,116 @@ export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEnt
   }
 }
 
+export interface RecordPluginMetricInput {
+  /** `plugins.id` (uuid). */
+  pluginId: string;
+  /** `plugins.plugin_key` — the routable identity an alert rule selects on. */
+  pluginKey: string;
+  /** The plugin-supplied metric name. Becomes the `metric` label. */
+  name: string;
+  /** Counter increment. Must be finite and `>= 0`. */
+  value: number;
+  /** Plugin-supplied tags. Untrusted input. */
+  tags?: Readonly<Record<string, unknown>> | null;
+  /**
+   * Tag keys this plugin's manifest declares as promotable (`metricLabels`).
+   * A key is promoted only if it appears here AND in
+   * {@link PLUGIN_METRIC_PROMOTABLE_TAG_KEYS}. Omitted/empty means promote
+   * nothing, so a plugin that has not opted in gets aggregate-only series.
+   */
+  declaredLabels?: readonly string[] | null;
+}
+
+/**
+ * Publish one plugin-contributed metric increment to Prometheus (PEN-2799).
+ *
+ * **Never throws.** This runs inside the plugin host's `ctx.metrics.write`,
+ * which plugins call from inside alert/webhook processing. prom-client's
+ * `inc()` *does* throw on a negative value, and an exception escaping here
+ * would escalate "a plugin submitted a mis-shaped metric" into "the delivery
+ * that carried it failed" — turning an instrumentation defect into the exact
+ * dropped-alert class this function exists to make visible. Every rejection is
+ * therefore a counted drop, not a raised error.
+ *
+ * The `plugin_logs` write in the caller is independent and unchanged; this is
+ * additive exposition, so no plugin needs recompiling for its existing
+ * counters to become alertable.
+ */
+export function recordPluginMetric(input: RecordPluginMetricInput): void {
+  try {
+    const metrics = ensureRegistry();
+    const pluginId = String(input.pluginId ?? "");
+    const pluginKey = String(input.pluginKey ?? "");
+    const identity = { plugin_id: pluginId, plugin_key: pluginKey };
+
+    const name = String(input.name ?? "").trim();
+    if (
+      name.length === 0
+      || name.length > PLUGIN_METRIC_NAME_MAX_LENGTH
+      || !PLUGIN_METRIC_NAME_REGEX.test(name)
+    ) {
+      metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "bad_name" });
+      return;
+    }
+
+    // A counter increment, so a negative or non-finite value has no meaning.
+    // Rejected rather than clamped: clamping would publish a number the plugin
+    // did not submit, and a silently-altered counter is worse than a counted
+    // drop.
+    const value = typeof input.value === "number" ? input.value : Number(input.value);
+    if (!Number.isFinite(value) || value < 0) {
+      metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "bad_value" });
+      return;
+    }
+
+    // Two-sided gate: manifest-declared AND platform-promotable.
+    const declared = new Set(
+      (input.declaredLabels ?? []).map((key) => String(key)),
+    );
+    const labels: Record<string, string> = { ...identity, metric: name };
+    const comboParts: string[] = [name];
+    for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
+      const raw = declared.has(key) ? input.tags?.[key] : undefined;
+      const promoted =
+        raw === undefined || raw === null ? "" : String(raw);
+      if (promoted.length > 0) labels[key] = promoted;
+      comboParts.push(promoted);
+    }
+
+    // Budget is over combinations ever observed. `combo` is NUL-joined so two
+    // distinct combinations cannot render to one ledger key (see
+    // pluginMetricCombinations) — a collision there would hand out a free
+    // series and leak the bound.
+    const combo = comboParts.join("\0");
+    let seen = pluginMetricCombinations.get(pluginId);
+    if (!seen) {
+      seen = new Set<string>();
+      pluginMetricCombinations.set(pluginId, seen);
+    }
+    if (!seen.has(combo)) {
+      if (seen.size >= PLUGIN_METRIC_CARDINALITY_BUDGET) {
+        // Collapse, don't discard: an over-cardinality plugin degrades to one
+        // aggregate series instead of going dark, and the drop is counted so
+        // the collapse is visible rather than inferred from a flat graph.
+        metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "budget" });
+        metrics.pluginMetricCounter.inc(
+          { ...identity, metric: PLUGIN_METRIC_OVERFLOW_NAME },
+          value,
+        );
+        return;
+      }
+      seen.add(combo);
+    }
+
+    metrics.pluginMetricCounter.inc(labels, value);
+  } catch (err) {
+    // Deliberately swallowed — see the "never throws" contract above. Logged at
+    // debug because a metrics defect must not become a log flood on the same
+    // hot path it already failed on.
+    console.debug("[metrics] recordPluginMetric failed:", err);
+  }
+}
+
 /**
  * Record a successful plugin-status collector tick (BLO-21092 review
  * follow-up). Callers pass unix seconds, not milliseconds -- the collector
@@ -2994,6 +3270,9 @@ export function __resetMetricsForTest(): void {
   scheduledRetryParkHorizon = null;
   scheduledRetryParkHorizonRefreshSuccess = null;
   pluginError = null;
+  pluginMetric = null;
+  pluginMetricDropped = null;
+  pluginMetricCombinations.clear();
   pluginStatusCollectorLastSuccess = null;
   prReviewQueueWait = null;
   authRequest = null;
