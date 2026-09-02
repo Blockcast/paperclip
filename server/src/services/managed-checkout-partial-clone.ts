@@ -185,13 +185,27 @@ export async function countMissingObjects(cwd: string): Promise<{ count: number;
       if (stderr.length < 4_000) stderr += chunk;
     });
 
-    child.on("error", (error) => finish(error instanceof Error ? error : new Error(String(error))));
+    // Once the cap is hit the answer is settled, and we killed the process
+    // ourselves to stop paying for the walk. Both the kill and the resulting
+    // write-to-closed-stdout can surface as an `error` event, and racing `close`
+    // it would otherwise turn a decided "missing objects, cannot serve" into
+    // `indeterminate` -- i.e. warn-and-proceed on the very worst repository,
+    // which then dies later reporting fake corruption. Truncation wins over any
+    // error, in both handlers.
+    child.on("error", (error) => {
+      if (truncated) return finish(null);
+      finish(error instanceof Error ? error : new Error(String(error)));
+    });
+    child.stdout.on("error", () => {
+      if (truncated) finish(null);
+    });
     child.on("close", (code, signal) => {
       if (pending.length > 0) consume(pending);
-      // A cap-triggered SIGTERM is our own doing, and the count it stopped at is
-      // the answer -- not a failure.
       if (truncated) return finish(null);
       if (code === 0) return finish(null);
+      // A genuine non-zero exit is reported, never swallowed as a low count: the
+      // caller turns it into `indeterminate` and leaves the checkout alone
+      // rather than "repairing" a repo whose object state is unknown.
       finish(new Error(`git rev-list exited ${code ?? signal ?? "unknown"}: ${stderr.trim()}`));
     });
   });

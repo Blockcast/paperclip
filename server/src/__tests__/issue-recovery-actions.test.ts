@@ -2363,6 +2363,77 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  // BLO-31351: a git transport fault during workspace bootstrap escalates to
+  // `workspace_validation_failed` rather than `configuration_incomplete`, and the
+  // point of that routing is the wake-attempt budget: `wakesOwner` excludes the
+  // cause, so `boundsAtCreation` is null and the action is created unbounded.
+  //
+  // This test is what proves the counter is untouched. `evidence.infraClassCause`
+  // is asserted too, but it is audit-only — one write in
+  // `buildStrandedRecoveryActionEvidence`, zero production readers — so it cannot
+  // stand in for the exemption. Only the null bounds and the absent wake can.
+  //
+  // The error text is the incident's verbatim pod log, and `usageJson: null` is the
+  // pre-model-call gate: no recorded usage means no model call, hence the failure
+  // came from the bootstrap rather than from work the agent did.
+  it("escalates a pre-model-call git transport failure without spending the recovery wake budget (BLO-31351)", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: [
+        "Claude run failed: exit 128",
+        "error: git upload-pack: git-pack-objects died with error.",
+        "fatal: git upload-pack: aborting due to possible repository corruption on the remote side.",
+        "fatal: early EOF",
+        "fatal: fetch-pack: invalid index-pack output",
+      ].join("\n"),
+      errorCode: "adapter_failed",
+      usageJson: null,
+      startedAt: new Date("2026-09-02T20:00:00.000Z"),
+      finishedAt: new Date("2026-09-02T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 1, skipped: 0 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue?.status).toBe("blocked");
+
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("workspace_validation_failed");
+    expect(updatedRun?.resultJson).toMatchObject({
+      errorFamily: "workspace_git_transport",
+      recoveryClassification: "workspace_git_transport",
+    });
+
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({
+      sourceIssueId,
+      cause: "workspace_validation_failed",
+      kind: "workspace_validation",
+      recoveryIssueId: null,
+      wakePolicy: { type: "manual_repair_required", reason: "workspace_validation_failed" },
+    });
+    // The budget exemption itself. Guarded against reading as vacuous: the
+    // wake-owner shape would have been stamped with these defaults at creation,
+    // and both are non-null, so `null` here is the exemption and not the default.
+    expect(defaultRecoveryActionMaxAttempts).toBeGreaterThan(0);
+    expect(defaultRecoveryActionTimeoutMs).toBeGreaterThan(0);
+    expect(action?.maxAttempts).toBeNull();
+    expect(action?.timeoutAt).toBeNull();
+
+    expect(action?.evidence).toMatchObject({ infraClassCause: true });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("does not classify stale configuration failures from a non-assignee run", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     const runId = randomUUID();
