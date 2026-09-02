@@ -99,17 +99,31 @@ Before reviewing, check whether you already reviewed this exact SHA:
 #      review BODY. Do NOT use `.commit_id`: GitHub rewrites it after an
 #      "Update branch", so a review that attests an older head can silently
 #      start reporting the current one, and the skip then fires on a head that
-#      was never actually reviewed.
+#      was never actually reviewed. Step 4 emits this line; the two are a pair.
+#
+# REGEX ENGINE — do not "simplify" this pattern. `gh api --jq` is gojq (Go
+# RE2), NOT jq's Oniguruma, and the two disagree about flags: jq's `"m"` flag
+# maps to DOTALL in gojq, not to multiline anchoring, so
+# `test("^Reviewed head: …$"; "m")` matches NOTHING once the body has a heading
+# above the attestation. `(?m)` would work but means dotall in Oniguruma, so it
+# is engine-dependent too. `(^|\n)` needs no flag and behaves identically in
+# both engines — verified against both. The leading `[ \t>]*[_*]*` and trailing
+# `[ \t_*`]*` tolerate the quoted/emphasised attestation forms already in
+# circulation (`> _Reviewed head:_ `<sha>``).
+#
+# PAGINATION — emit one line per match and count lines. `--paginate` with a
+# trailing `| length` prints one integer PER PAGE, so a PR with >30 reviews
+# yields "0\n1" and `-gt 0` then dies with "integer expression expected".
 #
 # DISMISSED reviews are excluded because the consistency guard does not count
 # them as operative.
 ALREADY=$(HEAD_SHA="$HEAD_SHA" gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq '
-  [ .[]
-    | select(.user.type == "Bot")
-    | select(.user.login == "allyblockcast[bot]" or .user.login == "allyblockcast")
-    | select((.state | ascii_downcase) != "dismissed")
-    | select((.body // "") | test("^Reviewed head: " + env.HEAD_SHA + "\\s*$"; "m"))
-  ] | length')
+  .[]
+  | select(.user.type == "Bot")
+  | select(.user.login == "allyblockcast[bot]" or .user.login == "allyblockcast")
+  | select((.state | ascii_downcase) != "dismissed")
+  | select((.body // "") | test("(^|\\n)[ \\t>]*[_*]*Reviewed head:[ \\t_*`]*" + env.HEAD_SHA))
+  | .id' | wc -l)
 if [ "${ALREADY:-0}" -gt 0 ]; then
   echo "Already reviewed at $HEAD_SHA ($ALREADY operative review(s)), skipping."
   gh pr comment "$PR" --repo "$REPO" \
@@ -150,6 +164,8 @@ Merge findings from both pipelines into one consolidated review. Follow this str
 ```markdown
 ## 🔍 Automated Review — PR #<N> @ <sha-short>
 
+Reviewed head: <full 40-character lowercase HEAD_SHA>
+
 ### 🚨 Critical
 *(Must fix before merge. Bugs, security issues, broken contracts.)*
 - **[pipeline]** Description [file:line]
@@ -176,6 +192,8 @@ Merge findings from both pipelines into one consolidated review. Follow this str
 ```
 
 **Dedup rule**: if both pipelines flag the same line for similar reasons, merge into one bullet with both `[pipeline]` tags. Don't double-count.
+
+**`Reviewed head:` is mandatory, in every state.** It is the immutable attestation Step 2 reads, and it is the *only* thing that makes the skip work — the heading's `<sha-short>` is not a substitute. Emit the full 40-character lowercase SHA on its own line. Omit it and Step 2 counts zero forever, so every wake re-reviews the same head; that is one of the two ways this guard has previously gone inert, and it is invisible until duplicate reviews pile up.
 
 **Severity rule**: trust the higher of the two pipelines' severities. If pr-review-toolkit's `code-reviewer` sub-agent marks something Critical and codex marks the same thing Suggestion, treat it as Critical.
 
