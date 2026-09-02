@@ -1335,6 +1335,34 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "periodic agent-liveness gauge publication failed");
           }));
 
+        // Same decoupling for the two wake-dispatch gauges (BLO-31335). They
+        // used to publish from the tail of `reconcileFailedWakeDispatches`,
+        // which made them fragile twice over: that pass's periodic call site
+        // sits *below* the suppression gate, so a suppressed replica emitted
+        // neither gauge, and it is the fourth-from-last link of a long
+        // sequential `.then` chain, so any earlier reconciliation rejection
+        // skipped both silently. A stale gauge and a healthy-but-unchanged
+        // gauge render identically, so neither failure was visible on the
+        // dashboard.
+        //
+        // Registered as two independent units, not one: inside the reconcile
+        // pass they were sequential awaits, so the dead-letter gauge rejecting
+        // also erased the terminal-failed emission.
+        //
+        // One timestamp for both, preserving the shared `now` they had as
+        // consecutive statements — both derive age windows from it.
+        const wakeDispatchGaugeNow = new Date();
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishGithubReviewDeadLetterGauge(wakeDispatchGaugeNow)
+          .catch((err) => {
+            logger.error({ err }, "periodic github-review dead-letter gauge publication failed");
+          }));
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentWakeupTerminalFailedGauge(wakeDispatchGaugeNow)
+          .catch((err) => {
+            logger.error({ err }, "periodic wake-terminal-failed gauge publication failed");
+          }));
+
         const timerSuppression = await heartbeat.resolveSchedulingSuppression();
         // Re-check AFTER the await, not just before it (BLO-20822). This
         // callback is handed to `setInterval` and is not itself registered with

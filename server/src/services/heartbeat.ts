@@ -34844,8 +34844,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    await publishGithubReviewDeadLetterGauge(now);
-    await publishAgentWakeupTerminalFailedGauge(now);
     return { recovered, superseded, exhausted, stillFailing };
   }
 
@@ -34985,9 +34983,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * path expression here would be a second, silently-drifting copy of the
    * predicate the increment sites use.
    *
-   * Best-effort: a failure here must not break the reconcile pass, whose real
-   * job is re-driving dispatches. A stale gauge is worse than a fresh one but
-   * far better than a stalled retry chain.
+   * The scheduler invokes this independently once per tick (BLO-31335) so
+   * suppression or an earlier recovery failure cannot erase the emission — the
+   * same decoupling BLO-26727 applied to the liveness gauges.
+   *
+   * Best-effort: a failure here must not take down the rest of the tick. A
+   * stale gauge is worse than a fresh one but far better than a scheduler
+   * callback that stops registering its other work.
    */
   async function publishGithubReviewDeadLetterGauge(now: Date) {
     try {
@@ -35180,8 +35182,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *    A row whose taskKey is null cannot be checked and is counted — it is
    *    genuinely unmonitored, which is the thing this gauge exists to surface.
    *
-   * Best-effort: a failure here must not break the reconcile pass, whose real
-   * job is re-driving dispatches.
+   * The scheduler invokes this independently once per tick (BLO-31335) so
+   * suppression or an earlier recovery failure cannot erase the emission — the
+   * same decoupling BLO-26727 applied to the liveness gauges. Note the
+   * `reconcileFailedWakeDispatches` reference above is about which rows that
+   * pass *selects*, not about this gauge's emission path; the two are
+   * deliberately independent.
+   *
+   * Best-effort: a failure here must not take down the rest of the tick.
    */
   async function publishAgentWakeupTerminalFailedGauge(now: Date) {
     try {
@@ -36053,6 +36061,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,
     sweepExpiredRuntimeStatuses: sweepExpiredHeartbeatRunRuntimeStatuses,
     publishAgentLivenessGauges,
+    publishGithubReviewDeadLetterGauge,
+    publishAgentWakeupTerminalFailedGauge,
 
     getRunLogAccess,
 

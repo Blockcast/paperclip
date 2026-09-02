@@ -1329,6 +1329,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(await deliveryCount("dead_lettered")).toBe(0);
         // ...and yet the loss is still visible. That difference is the whole
         // point of the gauge.
+        await heartbeat.publishGithubReviewDeadLetterGauge(now);
         expect(await deadLetterGauge()).toBe(1);
       });
 
@@ -1363,6 +1364,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         expect(result.exhausted).toBe(0);
         expect(await deliveryCount("dead_lettered")).toBe(0);
         // Both buried deliveries are visible to the alert after the restart.
+        await heartbeat.publishGithubReviewDeadLetterGauge(now);
         expect(await deadLetterGauge()).toBe(2);
       });
 
@@ -1383,6 +1385,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         });
 
         await heartbeat.reconcileFailedWakeDispatches(now);
+        await heartbeat.publishGithubReviewDeadLetterGauge(now);
         expect(await deadLetterGauge()).toBe(0);
       });
 
@@ -1412,6 +1415,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         });
 
         await heartbeat.reconcileFailedWakeDispatches(now);
+        await heartbeat.publishGithubReviewDeadLetterGauge(now);
         expect(await deadLetterGauge()).toBe(0);
       });
     });
