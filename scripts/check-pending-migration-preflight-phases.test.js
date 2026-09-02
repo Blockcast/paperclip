@@ -15,8 +15,8 @@ import { test } from "node:test";
 const SCRIPT = new URL("../.github/scripts/check-pending-migrations.sh", import.meta.url).pathname;
 const DIGEST = `sha256:${"ab".repeat(32)}`;
 
-// Stands in for the cluster. Pod phase is a function of elapsed time so a slow
-// image pull can be simulated without one.
+// Stands in for the cluster. Container start is a function of elapsed time so a
+// slow image pull can be simulated without one.
 const STUB = `#!/usr/bin/env bash
 args="$*"
 now=$(date +%s)
@@ -27,6 +27,14 @@ case "$args" in
   *"apply -f"*)            cat >/dev/null; exit 0 ;;
   *"delete job"*)          exit 0 ;;
   *"get pods -l job-name"*) [ "\${STUB_NO_POD:-0}" = 1 ] || echo "preflight-pod-0"; exit 0 ;;
+  *"startedAt"*)
+    # The kubelet stamps a start time only once the container actually runs.
+    # STUB_NEVER_STARTS models eviction/preemption: the pod reaches a terminal
+    # phase straight from Pending and no stamp is ever written.
+    if [ "\${STUB_NEVER_STARTS:-0}" != 1 ] && [ "$elapsed" -ge "\${STUB_READY_AFTER:-0}" ]; then
+      echo "2026-09-02T00:00:00Z"
+    fi
+    exit 0 ;;
   *"{.status.phase}"*)
     if [ "$elapsed" -ge "\${STUB_READY_AFTER:-0}" ]; then echo "\${STUB_TERMINAL_PHASE:-Running}"; else echo "Pending"; fi
     exit 0 ;;
@@ -92,7 +100,7 @@ test("a pull slower than the run budget still passes", () => {
 
   assert.equal(code, 0, `slow pull must not fail the gate:\n${output}`);
   assert.match(output, /PASSED/);
-  const started = Number(output.match(/container started in (\d+)s/)?.[1]);
+  const started = Number(output.match(/container started within (\d+)s/)?.[1]);
   assert.ok(
     started > 2,
     `startup must have outlasted the 2s run budget, proving the pull was not charged to it (got ${started}s)`,
@@ -148,6 +156,40 @@ test("a check that completes between polls is not mistaken for never having star
 
   assert.equal(code, 0, `a already-succeeded pod must be read as started:\n${output}`);
   assert.match(output, /PASSED/);
+});
+
+test("a pod that dies before its container runs is not reported as a migration verdict", () => {
+  // A pod can reach Failed straight from Pending -- evicted under node pressure,
+  // or preempted -- having never started a container. Reading pod phase alone
+  // would call that "started", hand phase 2 a job whose `condition=failed` is
+  // already true, and print "a pending migration needs its index precreated":
+  // a migration verdict from a check that never inspected a migration. The
+  // stub returns exactly that verdict if the script asks for it.
+  const began = Date.now();
+  const { code, output } = runPreflight({
+    STUB_NEVER_STARTS: "1",
+    STUB_TERMINAL_PHASE: "Failed",
+    STUB_JOB_RESULT: "failed",
+    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "60",
+  });
+  const elapsed = (Date.now() - began) / 1000;
+
+  assert.equal(code, 1, "an unstarted check must still fail closed");
+  assert.match(output, /INCONCLUSIVE/);
+  assert.doesNotMatch(
+    output,
+    /needs its index precreated/,
+    "a container that never ran cannot have produced a migration verdict",
+  );
+  assert.match(
+    output,
+    /without ever starting its container/,
+    "the message must name the real cause",
+  );
+  assert.match(output, /migration check itself never ran/, "it must disclaim any migration verdict");
+  // backoffLimit is 0, so nothing will replace the pod; the rest of the budget
+  // cannot change the answer.
+  assert.ok(elapsed < 10, `a terminal phase with no start stamp must not ride out the budget (took ${elapsed}s)`);
 });
 
 test("a config error fails fast instead of riding out the startup budget", () => {

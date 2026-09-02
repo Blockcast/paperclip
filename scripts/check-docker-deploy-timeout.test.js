@@ -7,6 +7,25 @@ const imageHelper = readFileSync(
   new URL("../deploy/helm/paperclip/templates/_helpers.tpl", import.meta.url),
   "utf8",
 );
+const preflightScript = readFileSync(
+  new URL("../.github/scripts/check-pending-migrations.sh", import.meta.url),
+  "utf8",
+);
+
+// BLO-31254 split the pre-flight into a startup budget (scheduling + image
+// transfer) and a run budget (the migration check), and the two are serial
+// ahead of Helm. Read both defaults out of the script rather than restating
+// them here, so raising either one has to be paid for in timeout-minutes
+// instead of silently eating the margin.
+function getPreflightBudgetMinutes() {
+  const startup = preflightScript.match(/\$\{PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-(\d+)\}/);
+  const run = preflightScript.match(/\$\{PREFLIGHT_TIMEOUT_SECONDS:-(\d+)\}/);
+
+  assert.ok(startup, "pre-flight must declare a default PREFLIGHT_STARTUP_TIMEOUT_SECONDS");
+  assert.ok(run, "pre-flight must declare a default PREFLIGHT_TIMEOUT_SECONDS");
+
+  return Math.ceil((Number(startup[1]) + Number(run[1])) / 60);
+}
 
 function getDeployJobBlock(source = workflow) {
   const marker = "\n  deploy:\n";
@@ -48,13 +67,26 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
     "deploy job must wait on BOTH tiers (api Deployment and worker StatefulSet) — BLO-29008",
   );
 
+  // The same drift class as BLO-29008, arriving through a door this test did
+  // not watch: the pre-flight's budgets are serial with Helm but live in a
+  // shell script, so a budget raise there used to consume the margin silently.
+  // The worst case that still proceeds to Helm is a slow-but-successful pull
+  // (full startup budget) followed by the full run budget; the abort path exits
+  // non-zero and Helm never runs, so it cannot overrun the job.
+  assert.match(
+    deployJob,
+    /check-pending-migrations\.sh/,
+    "deploy job must run the pending-migration pre-flight — otherwise folding its budget in is vacuous",
+  );
+  const preflightMinutes = getPreflightBudgetMinutes();
+
   const jobTimeoutMinutes = Number(jobTimeoutMatch[1]);
   const helmTimeoutMinutes = Number(helmTimeoutMatch[1]);
   const rolloutTimeoutMinutes = rolloutTimeouts.reduce((sum, minutes) => sum + minutes, 0);
 
   assert.ok(
-    jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + 10,
-    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + 10m margin`,
+    jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + preflightMinutes + 10,
+    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + pre-flight (${preflightMinutes}m) + 10m margin`,
   );
 });
 

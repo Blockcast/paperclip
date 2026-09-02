@@ -84,10 +84,10 @@ YAML
 
 # Phase 1: wait for the container to actually start. The migration budget must
 # not be spent on image transfer, so nothing is charged to TIMEOUT_SECONDS
-# until we have seen the pod leave Pending.
+# until the kubelet has stamped a start time on the container.
 pod_name=""
 container_started=0
-startup_terminal=0
+startup_terminal_cause=""
 waiting_reason=""
 startup_began="$(date +%s)"
 startup_deadline=$(( startup_began + STARTUP_TIMEOUT_SECONDS ))
@@ -95,15 +95,21 @@ while :; do
   pod_name="$(kubectl -n "${NS}" get pods -l "job-name=${JOB_NAME}" \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   if [ -n "${pod_name}" ]; then
-    # Succeeded and Failed are terminal but still mean the container ran: a
-    # fast check can complete between two polls, and treating that as "never
-    # started" would discard a conclusive answer.
-    case "$(kubectl -n "${NS}" get pod "${pod_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)" in
-      Running|Succeeded|Failed)
-        container_started=1
-        break
-        ;;
-    esac
+    # The container ran iff the kubelet stamped a start time on it. Pod phase is
+    # NOT that fact: a pod can reach Failed straight from Pending (eviction under
+    # node pressure, preemption) having never started a container, and reading
+    # that as "started" hands phase 2 a job it reports as "a pending migration
+    # needs its index precreated" -- a migration verdict from a check that never
+    # ran, which is the most misleading output available here.
+    # terminated.startedAt is what covers the fast-check-between-polls race:
+    # backoffLimit is 0, so a job that finished already still has a real answer
+    # and treating it as "never started" would discard one.
+    if [ -n "$(kubectl -n "${NS}" get pod "${pod_name}" \
+      -o jsonpath='{.status.containerStatuses[0].state.running.startedAt}{.status.containerStatuses[0].state.terminated.startedAt}' \
+      2>/dev/null || true)" ]; then
+      container_started=1
+      break
+    fi
     waiting_reason="$(kubectl -n "${NS}" get pod "${pod_name}" \
       -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)"
     case "${waiting_reason}" in
@@ -112,7 +118,16 @@ while :; do
       # NOT in this list: ErrImagePull/ImagePullBackOff routinely recover, and
       # failing fast on them would recreate the defect this phase fixes.
       InvalidImageName|CreateContainerConfigError)
-        startup_terminal=1
+        startup_terminal_cause="hit a terminal container error (${waiting_reason})"
+        break
+        ;;
+    esac
+    # A terminal phase with no start stamp means the pod died before the
+    # container ran. backoffLimit is 0, so nothing will replace it and the rest
+    # of the startup budget cannot change the answer.
+    case "$(kubectl -n "${NS}" get pod "${pod_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)" in
+      Succeeded|Failed)
+        startup_terminal_cause="reached terminal pod phase without ever starting its container (evicted or preempted before the image ran)"
         break
         ;;
     esac
@@ -122,6 +137,9 @@ while :; do
   fi
   sleep "${POLL_SECONDS}"
 done
+# Quantized to POLL_SECONDS plus up to three kubectl round-trips, so it
+# over-reports: read and report it as an upper bound, never as a measurement to
+# size the next budget from.
 startup_seconds=$(( $(date +%s) - startup_began ))
 
 if [ "${container_started}" -ne 1 ]; then
@@ -136,11 +154,11 @@ if [ "${container_started}" -ne 1 ]; then
     echo "(no pod was created for job/${JOB_NAME})"
   fi
   echo "--- end pod events ---"
-  # Bailing early on a terminal error and exhausting the budget are different
+  # Bailing early on a decided error and exhausting the budget are different
   # facts; saying "within Ns of the ${STARTUP_TIMEOUT_SECONDS}s budget" for the
   # former would imply the budget was the constraint when it was not.
-  if [ "${startup_terminal}" -eq 1 ]; then
-    cause="hit a terminal container error (${waiting_reason}) after ${startup_seconds}s; waiting out the remaining startup budget would not have cleared it"
+  if [ -n "${startup_terminal_cause}" ]; then
+    cause="${startup_terminal_cause} within ${startup_seconds}s; waiting out the remaining startup budget would not have cleared it"
   else
     cause="never started${waiting_reason:+ (${waiting_reason})} within its ${STARTUP_TIMEOUT_SECONDS}s startup budget"
   fi
@@ -163,7 +181,7 @@ kubectl -n "${NS}" logs "job/${JOB_NAME}" --tail=200 2>&1 || echo "(no logs avai
 echo "--- end pre-flight output ---"
 
 if [ "${completed}" -eq 0 ]; then
-  echo "pending-migration pre-flight: PASSED (container started in ${startup_seconds}s)"
+  echo "pending-migration pre-flight: PASSED (container started within ${startup_seconds}s)"
   exit 0
 fi
 
@@ -172,6 +190,6 @@ fi
 if kubectl -n "${NS}" wait --for=condition=failed "job/${JOB_NAME}" --timeout=10s >/dev/null 2>&1; then
   echo "pending-migration pre-flight: FAILED — a pending migration needs its index precreated (see remediation above)" >&2
 else
-  echo "pending-migration pre-flight: INCONCLUSIVE — the container started after ${startup_seconds}s but the migration check produced no result within its ${TIMEOUT_SECONDS}s run budget. The image pull is NOT implicated; treat this as migrations actually in trouble. Not starting the rollout blind" >&2
+  echo "pending-migration pre-flight: INCONCLUSIVE — the container started within ${startup_seconds}s but the migration check produced no result within its ${TIMEOUT_SECONDS}s run budget. The image pull is NOT implicated; treat this as migrations actually in trouble. Not starting the rollout blind" >&2
 fi
 exit 1
