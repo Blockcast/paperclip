@@ -6342,6 +6342,36 @@ export function buildK8sRunIsolationDescriptor(input: {
   // Stateless PR reviews stay fully ephemeral by design: they take the first
   // branch of `resolveK8sRunIsolationIdentity` ahead of any persisted workspace
   // and must not be pinned to a durable checkout.
+  //
+  // KNOWN, DELIBERATE NARROWING OF EXCLUSIVITY — read before widening this.
+  // The `run:<runId>` workspace path was unique *by construction*, so it also
+  // acted as a de-facto exclusion on the workspace. `cwd` under the default
+  // `per_issue` runScope is keyed by issue, not run, so that incidental
+  // exclusivity is gone: two runs of one issue hold distinct `run:` keys, both
+  // satisfy the single-writer guard on
+  // `external_runtime_reservations_active_isolation_writer_idx`, and both now
+  // resolve to the same worktree.
+  //
+  // Same-issue concurrency is REACHABLE — do not assume the checkout lock
+  // prevents it. `claimQueuedRun` normally requires
+  // `executionRunId IS NULL OR = <claiming run>` (see the
+  // `executionRunClaimCondition` guard), but that lock is skipped entirely when
+  // `allowsIssueInteractionWake` holds — an issue-interaction wake carrying a
+  // comment id is deliberately allowed to run while another run holds the
+  // issue, so a human can talk to the assignee mid-flight.
+  //
+  // This is still strictly better than the behavior it replaces, which is why
+  // it ships: the pre-fix run did not get an exclusive workspace either, it got
+  // an empty scratch dir and then reached for the project BASE checkout, which
+  // is shared across every issue AND every agent. Narrowing that to "two runs
+  // of the same issue share that issue's own worktree" is the sharing model
+  // `per_issue` runScope already describes.
+  //
+  // The principled repair is to key the isolation reservation off the resolved
+  // workspace PATH rather than the run id, so different issues still get
+  // distinct keys (preserving BLO-16842 sibling concurrency) while same-issue
+  // runs serialize. That changes BLO-16842's invariant and is tracked
+  // separately rather than smuggled in here.
   const hasProvisionedWorktree =
     !input.statelessPrReview &&
     input.executionWorkspace.strategy === "git_worktree" &&
