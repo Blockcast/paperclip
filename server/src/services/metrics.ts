@@ -761,6 +761,44 @@ export type PluginMetricPromotableTagKey =
   (typeof PLUGIN_METRIC_PROMOTABLE_TAG_KEYS)[number];
 
 /**
+ * Namespace every promoted tag lands in, so a plugin-supplied tag key can never
+ * collide with a label Prometheus itself assigns.
+ *
+ * This is not cosmetic. An alerting rule OVERWRITES `alertname` with the rule's
+ * own name and then applies its `labels:` block (conventionally including
+ * `severity`) before checking for duplicate label sets. Both keys were in the
+ * allow-list above, so without this prefix:
+ *
+ *   - `alertname` HARD-FAILS rule evaluation. Two series differing only in
+ *     `alertname` become identical once the rule name overwrites it, and the
+ *     rule dies with "vector contains metrics with the same labelset after
+ *     applying alert labels". Measured on 2026-09-02 with promtool against
+ *     onprem-k8s#3022, by adding `alertname` to that rule's by-clause.
+ *   - `severity` collides SILENTLY: the rule's own severity overwrites the
+ *     plugin's, so the alert routes on a value neither side chose. No error.
+ *
+ * The bare form fails on the most obvious rule anyone would write against this
+ * metric -- `paperclip_plugin_metric_total{metric="..."} > 0`, unaggregated,
+ * which is exactly the shape PEN-2799 exists to make possible. The rule in
+ * onprem-k8s#3022 only escapes it by aggregating the labels away.
+ *
+ * Prefixing closes the whole class rather than these two members: `job` and
+ * `instance` are the same hazard from the scrape side (with the default
+ * `honor_labels: false` they are silently renamed to `exported_*`), and any key
+ * added to the allow-list later inherits the immunity instead of re-opening the
+ * hole. Nothing in Prometheus reserves a `tag_` prefix.
+ *
+ * The PLUGIN-FACING contract is unprefixed: a manifest declares `alertname` and
+ * `ctx.metrics.write` is called with `{ alertname }`. Only the published label
+ * is namespaced, so this costs plugin authors nothing.
+ */
+export const PLUGIN_METRIC_TAG_LABEL_PREFIX = "tag_";
+
+/** The published label name for a promotable tag key. */
+export const pluginMetricTagLabel = (key: string): string =>
+  PLUGIN_METRIC_TAG_LABEL_PREFIX + key;
+
+/**
  * A plugin metric name must look like a metric name. Rejecting a mis-shaped
  * name is cheaper than carrying it as a label value forever, because
  * prom-client never retires a label combination.
@@ -1602,10 +1640,17 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * disabled mid-process keeps its ledger for the worker's lifetime. That is
  * deliberate, not an oversight. The residue is bounded by the same two budgets
  * this ledger exists to enforce (at most 50 names and 100 combinations per
- * plugin, so ~150 short strings), and pruning on uninstall would hand a
- * reinstall a fresh budget — turning install/uninstall into a way to mint
- * unbounded series, which is exactly what the bound refuses. A worker restart
- * is the reclaim path.
+ * plugin, so ~150 short strings), and on the *default* uninstall path pruning
+ * would hand a reinstall a fresh budget — turning install/uninstall into a way
+ * to mint unbounded series, which is exactly what the bound refuses.
+ *
+ * That default is a soft delete: the row survives as `uninstalled` and a
+ * reinstall reuses it, so `pluginId` — and with it the ledger key — is stable
+ * across the cycle. `uninstall(id, removeData = true)` instead hard-deletes the
+ * row, so the reinstall inserts under a fresh `defaultRandom()` id and gets a
+ * clean budget whether or not we prune; there the retained entry is an orphan
+ * rather than a hole this closes. The rule is kept unconditional because the
+ * exploitable path is the default one. A worker restart is the reclaim path.
  */
 const pluginMetricCombinations = new Map<string, Set<string>>();
 
@@ -2195,7 +2240,11 @@ function ensureRegistry(): {
         + "name-mapping would let any installed plugin mint arbitrary "
         + "paperclip_* series. Tag keys become labels only when present in BOTH "
         + "the plugin manifest's metricLabels and "
-        + "PLUGIN_METRIC_PROMOTABLE_TAG_KEYS; unpromoted tags stay on the "
+        + "PLUGIN_METRIC_PROMOTABLE_TAG_KEYS, and publish under a '"
+        + PLUGIN_METRIC_TAG_LABEL_PREFIX + "' prefix so a plugin tag can never "
+        + "collide with a label the alerting engine assigns ('alertname' would "
+        + "hard-fail rule evaluation, 'severity' would corrupt routing "
+        + "silently); unpromoted tags stay on the "
         + "plugin_logs row. company_id is deliberately not a label (unbounded "
         + "per tenant). Two cardinality tiers degrade on DIFFERENT axes: past "
         + "the per-plugin tag-value budget a write keeps its 'metric' label and "
@@ -2207,7 +2256,7 @@ function ensureRegistry(): {
         "plugin_id",
         "plugin_key",
         "metric",
-        ...PLUGIN_METRIC_PROMOTABLE_TAG_KEYS,
+        ...PLUGIN_METRIC_PROMOTABLE_TAG_KEYS.map(pluginMetricTagLabel),
       ],
       registers: [registry],
     });
@@ -3251,7 +3300,11 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
           promoted = cleaned;
         }
       }
-      if (promoted.length > 0) labels[key] = promoted;
+      // Published under the `tag_` namespace so a plugin-supplied key cannot
+      // collide with a label the alerting engine assigns -- see
+      // PLUGIN_METRIC_TAG_LABEL_PREFIX. The combination ledger below keys on
+      // the VALUE, not the label name, so the prefix does not perturb it.
+      if (promoted.length > 0) labels[pluginMetricTagLabel(key)] = promoted;
       comboParts.push(promoted);
     }
 

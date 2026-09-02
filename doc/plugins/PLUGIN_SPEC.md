@@ -1670,6 +1670,14 @@ Both happen on every call; (2) runs first, so a `plugin_logs` write or flush fai
 
 Your manifest chooses what *you* promote; the host list bounds what *any* plugin may ever promote, so installing a third-party plugin cannot introduce an unbounded label. Both are required because Prometheus client libraries fix a counter's label names when the counter is constructed, while a manifest is read per write.
 
+**A promoted tag is published under a `tag_` prefix.** You declare and write `alertname`; the series carries `tag_alertname`. The prefix exists because Prometheus assigns some label names itself, and a plugin tag sharing one of those names breaks the rules this metric exists to feed:
+
+- An alerting rule **overwrites `alertname` with the rule's own name** before checking for duplicate label sets. Two series differing only in `alertname` therefore become identical, and the rule dies at evaluation with `vector contains metrics with the same labelset after applying alert labels` — measured with promtool, not inferred.
+- A rule's `labels:` block conventionally sets `severity`, which would **silently** overwrite a promoted `severity` and route the alert on a value neither side chose.
+- From the scrape side `job` and `instance` are the same hazard: under the default `honor_labels: false` they are quietly renamed to `exported_*`.
+
+Writing your queries against `tag_alertname` rather than `alertname` is the whole cost, and it buys the ability to write the obvious unaggregated rule — `paperclip_plugin_metric_total{metric="your.metric.name"} > 0` — without it hard-failing.
+
 Keys outside the gate are **not** dropped from the metric — only from its labels. The increment still lands, and the full tag set is still on the `plugin_logs` row. Declaring nothing is safe and is the default: you get aggregate-only series.
 
 `company_id` is never a label (unbounded per tenant). It stays on the `plugin_logs` row.
