@@ -756,6 +756,7 @@ export const KNOWN_GITHUB_SUPPRESSION_CAUSES = [
   "issue_tree_hold_active",
   "dispatch_rejected",
   "scheduled_retry_gate_declined",
+  "reviewer_lock_contended",
 ] as const;
 
 /**
@@ -789,6 +790,22 @@ export const GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED = "dispatch_rejected";
  */
 export const GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE = "scheduled_retry_gate_declined";
 
+/**
+ * A reviewer wake lost the PR-scope dispatch lock AND no durable contended-wake
+ * row was recorded, so nothing will ever retry it (BLO-31075 review follow-up).
+ * Like {@link GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED} this writes no
+ * `skipped` row, so it cannot be joined back to `agent_wakeup_requests` — this
+ * counter is the only record it happened.
+ *
+ * Pageable, and in {@link ALERTING_GITHUB_SUPPRESSION_CAUSES}, because it is
+ * genuinely terminal: the delivery is failed for manual redelivery, which
+ * nobody may ever perform. It was previously invisible to the funnel entirely —
+ * `recordGithubReviewRequestDelivery({state:"received"})` runs INSIDE the lock,
+ * so a lock-ACQUISITION timeout incremented neither `received` nor `queued` and
+ * showed up only as a dip indistinguishable from a quiet hour.
+ */
+export const GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED = "reviewer_lock_contended";
+
 export const UNKNOWN_GITHUB_SUPPRESSION_CAUSE = "other";
 
 /**
@@ -798,11 +815,12 @@ export const UNKNOWN_GITHUB_SUPPRESSION_CAUSE = "other";
  * before the first event. The expected policy declines are left to appear
  * lazily — they are read as a breakdown when something already fired, never
  * alerted on, so a missing series costs nothing and this keeps the constant
- * series count at `3 * 8` instead of `12 * 8`.
+ * series count at `4 * 8` instead of `13 * 8`.
  */
 export const ALERTING_GITHUB_SUPPRESSION_CAUSES = [
   "heartbeat.scheduling_suppressed",
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+  GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
   UNKNOWN_GITHUB_SUPPRESSION_CAUSE,
 ] as const;
 
@@ -1626,10 +1644,11 @@ function ensureRegistry(): {
         "Cause breakdown of GitHub review-request reviewer wakes that ended in the terminal "
         + "'suppressed' state (BLO-18859). Equals "
         + "paperclip_github_review_request_delivery_total{state=\"suppressed\"} by construction. "
-        + "Every cause but 'dispatch_rejected'/'other' is a literal "
+        + "Every cause but 'dispatch_rejected'/'reviewer_lock_contended'/'other' is a literal "
         + "agent_wakeup_requests.reason on the durable skipped row, so a firing series joins "
-        + "straight back to rows. Alert on outage-like causes only "
-        + "(heartbeat.scheduling_suppressed, dispatch_rejected, other); the rest — an inactive "
+        + "straight back to rows; those three wrote no row, which is precisely why they are "
+        + "counted here. Alert on outage-like causes only (heartbeat.scheduling_suppressed, "
+        + "dispatch_rejected, reviewer_lock_contended, other); the rest — an inactive "
         + "company, a cooldown, wake-on-demand off, a blocked budget, a non-invokable agent — "
         + "are the fleet correctly declining and must not page.",
       labelNames: ["cause", "reason"],

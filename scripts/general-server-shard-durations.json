@@ -345,6 +345,7 @@
     "server/src/__tests__/pr-comment-review-gate.test.ts": 8,
     "server/src/__tests__/pr-reconciler-sweep.test.ts": 18,
     "server/src/__tests__/pr-review-gate-status-target.test.ts": 17,
+    "server/src/__tests__/pr-review-issue-scope-locks.test.ts": 2026,
     "server/src/__tests__/pr-review-request-ageing.test.ts": 34,
     "server/src/__tests__/private-hostname-guard.test.ts": 81,
     "server/src/__tests__/process-crash-guard-exit.test.ts": 2859,

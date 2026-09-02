@@ -75,7 +75,9 @@ import {
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 import { recoveryService } from "../services/recovery/service.js";
 import {
+  GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
   recordGithubReviewRequestDelivery,
+  recordGithubReviewRequestSuppressed,
   recordGithubReviewPosted,
   recordGithubWorkflowRunConclusion,
   type GithubReviewSurface,
@@ -4446,8 +4448,21 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               prNumber: context.prNumber,
               repoFullName: context.repoFullName,
             },
-            "github webhook reviewer lock timed out and no durable retry was recorded; asking GitHub to retry",
+            "github webhook reviewer lock timed out and no durable retry was recorded; "
+              + "failing the delivery so it stays manually redeliverable. NOTE: this throw "
+              + "escapes the whole route handler, so the Dependabot remediation wake and the "
+              + "paperclip-identifier issue-assignee path are skipped for this delivery too — "
+              + "neither contends for this lock. That collateral loss is accepted only because "
+              + "this branch is the rare fallback after persistContendedPrReviewerWake failed.",
           );
+          // Count the loss. Nothing else records it: the `received` counter is
+          // incremented INSIDE the lock, so a lock-ACQUISITION timeout moves
+          // neither `received` nor `queued` and this permanent drop is
+          // invisible on the funnel it is supposed to appear in.
+          recordGithubReviewRequestSuppressed({
+            reason: context.wakeReason,
+            cause: GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+          });
           throw new PrReviewerTaskLockContentionError();
         }
         logger.error(

@@ -11,21 +11,28 @@
  * the duplicates contend for the same `maxConcurrentRuns` budget as genuine
  * review wakes (BLO-20526, parent BLO-20491).
  *
- * The guard fires only on a genuine collision — all three must hold:
+ * The guard fires only on a genuine collision — all four must hold:
  *   1. the assignee is a configured PR reviewer (PAPERCLIP_PR_REVIEWER_AGENT_IDS),
  *   2. the issue resolves to a GitHub PR — either from the structured
- *      `prReviewTarget` or from a canonical PR URL in its text, and
+ *      `prReviewTarget` or from a canonical PR URL in its text,
  *   3. that exact PR already has a queued/running review run in the configured
- *      reviewer pool.
+ *      reviewer pool, and
+ *   4. the issue does not carry the `paperclip:not-a-review-request` marker.
+ *
+ * Condition 4 is the escape hatch for the one false-positive class this guard
+ * cannot detect: an issue ABOUT the review rather than a request for one. Those
+ * cite the permalink exactly like a duplicate request does. The 409 names the
+ * marker so a blocked filer can discover it without reading this file.
  *
  * Keying on the collision rather than on the assignee is deliberate: issues
  * about the reviewer's own tooling stay creatable, and creator identity is
  * useless as a signal here (68% of the measured duplicates were attributed to
  * a user rather than to the filing agent).
  *
- * Failure direction is open. An unparseable reference or lookup error lets the
- * issue through — a duplicate review issue is a cost problem, whereas wrongly
- * blocking issue creation is a correctness problem.
+ * Failure direction is open. An unparseable reference, a lookup error, or a
+ * failed advisory-lock statement all let the issue through — a duplicate review
+ * issue is a cost problem, whereas wrongly blocking issue creation is a
+ * correctness problem.
  *
  * Eligible creates take the normalized PR-scope advisory locks before the
  * issue-create title and idempotency locks. The webhook takes the same
@@ -75,17 +82,78 @@ const GITHUB_PULL_REQUEST_URL_PATTERN =
 /** Bounds the work done on a hostile or pathological description. */
 const MAX_SCANNED_PULL_REQUEST_REFS = 20;
 
+/**
+ * Truncation is fail-open — the unscanned tail is simply unguarded, which is
+ * the right direction — but it must not be silent. Returning 20 of 40 refs with
+ * no record makes "the guard did not fire" indistinguishable from "the guard
+ * decided not to fire".
+ */
+function warnScanCapReached(): void {
+  logger.warn(
+    { cap: MAX_SCANNED_PULL_REQUEST_REFS },
+    "pr review duplicate guard hit its PR-reference scan cap; references beyond the cap "
+      + "are not guarded",
+  );
+}
+
+/**
+ * Explicit opt-out for the false-positive class this guard cannot detect.
+ *
+ * The guard fires on any canonical PR permalink in the title, description, or
+ * structured target, and does NOT check that the issue is a review *request*.
+ * That is deliberate — the measured duplicates put the reference in the title
+ * 91.8% of the time, and every intent heuristic tried (title prefix, position,
+ * keyword) also matched legitimate meta-issues. So rather than guess, let the
+ * filer declare intent:
+ *
+ *   "Ally's review of <PR URL> exited with pr_review_output_missing"
+ *
+ * is a real issue that must stay creatable. Before this marker the only way
+ * past the 409 was the global kill switch, and the rejection's remediation
+ * ("post a review-request marker comment on the PR") was actively wrong there —
+ * following it queues a second review of a PR whose review is already broken.
+ */
+export const NOT_A_REVIEW_REQUEST_MARKER = "<!-- paperclip:not-a-review-request -->";
+
+function declaresNotAReviewRequest(candidate: DuplicatePrReviewIssueCandidate): boolean {
+  // Case-insensitive on purpose, not redundantly: the marker is an opt-OUT of a
+  // hard block, so a filer who typed `<!-- Paperclip:Not-A-Review-Request -->`
+  // should not be left staring at a 409 that quotes back what looks like the
+  // string they already used.
+  return `${candidate.title ?? ""}\n${candidate.description ?? ""}`
+    .toLowerCase()
+    .includes(NOT_A_REVIEW_REQUEST_MARKER);
+}
+
 export const DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE = "duplicate_pr_review_issue";
 
 /**
  * Kill switch. This guard rejects writes on the issue-creation path for every
  * company, so it needs an off switch that does NOT also disable webhook
- * reviewer routing (clearing PAPERCLIP_PR_REVIEWER_AGENT_IDS would). Set to
- * "1"/"true" to disable the guard while leaving review dispatch intact.
+ * reviewer routing (clearing PAPERCLIP_PR_REVIEWER_AGENT_IDS would).
+ *
+ * Accepts the usual truthy spellings, not just "1"/"true". This is the one
+ * place in the module that fails toward BLOCKING writes, so an operator who
+ * sets the variable to "yes" mid-incident and gets a still-enforcing guard has
+ * been handed the worst outcome silently. Anything set but unrecognized is
+ * logged rather than quietly ignored.
  */
+const TRUTHY_KILL_SWITCH_VALUES = new Set(["1", "true", "yes", "on", "enabled"]);
+const FALSEY_KILL_SWITCH_VALUES = new Set(["", "0", "false", "no", "off", "disabled"]);
+
 function guardDisabled(): boolean {
   const raw = process.env.PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD?.trim().toLowerCase();
-  return raw === "1" || raw === "true";
+  if (raw === undefined) return false;
+  if (TRUTHY_KILL_SWITCH_VALUES.has(raw)) return true;
+  if (!FALSEY_KILL_SWITCH_VALUES.has(raw)) {
+    logger.warn(
+      { value: raw },
+      "PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD is set to an unrecognized value; the "
+        + "duplicate-review guard remains ENABLED and will reject issue creates. Use one of: "
+        + [...TRUTHY_KILL_SWITCH_VALUES].join(", "),
+    );
+  }
+  return false;
 }
 
 export type PullRequestRef = {
@@ -214,7 +282,10 @@ function parsePullRequestRefsWithCasing(
       };
       const key = `${ref.repoFullName}:${ref.prNumber}`;
       if (!seen.has(key)) seen.set(key, ref);
-      if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) return [...seen.values()];
+      if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) {
+        warnScanCapReached();
+        return [...seen.values()];
+      }
     }
   }
   return [...seen.values()];
@@ -274,7 +345,10 @@ function candidatePullRequestRefs(
   for (const ref of parsePullRequestRefsWithCasing(preserveRepoCasing, candidate.title, candidate.description)) {
     const key = `${ref.repoFullName}:${ref.prNumber}`;
     if (!seen.has(key)) seen.set(key, ref);
-    if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) break;
+    if (seen.size >= MAX_SCANNED_PULL_REQUEST_REFS) {
+      warnScanCapReached();
+      break;
+    }
   }
   return [...seen.values()];
 }
@@ -321,9 +395,18 @@ const PR_REVIEW_ISSUE_LOCK_RETRY_MS = 10;
  * errors, so this cannot poison the caller's transaction the way a
  * `lock_timeout` on the blocking variant would.
  *
- * A give-up can leave a prefix of `taskKeys` held. That is deliberate and
- * harmless: the success path holds the whole set for the same duration, so a
- * prefix is strictly less blocking than the outcome we were aiming for.
+ * Acquisition is ALL-OR-NOTHING, scoped to a SAVEPOINT. On give-up the
+ * savepoint is rolled back, which releases every key acquired inside it —
+ * verified behaviour, see packages/db/src/advisory-xact-lock-savepoint.test.ts.
+ *
+ * That matters because the webhook's dispatch path acquires the same
+ * `prReviewTaskLockSpellings` PAIR all-or-nothing. An earlier revision returned
+ * from here still holding whichever prefix it had taken, and since a create
+ * cannot reconstruct GitHub's canonical casing from user-authored URL text it
+ * routinely parked exactly one half of that pair. The webhook could then never
+ * complete its set for the rest of the create transaction — starving every
+ * reviewer wake for that PR while this side had already abandoned
+ * serialization itself. A create that stops trying now stops blocking.
  */
 export async function lockPrReviewIssueScopes(
   db: Pick<DbTransaction, "execute">,
@@ -343,19 +426,54 @@ export async function lockPrReviewIssueScopes(
   );
   const taskKeys = [...new Set([...normalizedTaskKeys, ...sourceTaskKeys])].sort();
 
+  // Fixed identifier, never interpolated from input.
+  const SAVEPOINT = sql.raw("pr_review_scope_locks");
+  try {
+    await db.execute(sql`savepoint ${SAVEPOINT}`);
+  } catch (error) {
+    logger.warn(
+      { err: error },
+      "pr review duplicate guard could not open its lock savepoint; proceeding unserialized",
+    );
+    return;
+  }
+
+  const rollback = async () => {
+    try {
+      await db.execute(sql`rollback to savepoint ${SAVEPOINT}`);
+    } catch (error) {
+      // The caller's transaction is already unusable if this fails; it will
+      // surface on their next statement. Nothing useful to do but say so.
+      logger.warn({ err: error }, "pr review duplicate guard could not roll back its lock savepoint");
+    }
+  };
+
   const deadline = Date.now() + PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS;
   for (const taskKey of taskKeys) {
     while (!(await tryLockPrReviewScope(db, taskKey))) {
       if (Date.now() >= deadline) {
+        await rollback();
         logger.warn(
-          { taskKey, timeoutMs: PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS },
-          "pr review duplicate guard gave up acquiring the PR scope lock; "
-            + "proceeding unserialized (BLO-21790)",
+          { taskKey, keysAttempted: taskKeys.length, timeoutMs: PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS },
+          "pr review duplicate guard gave up acquiring the PR scope locks; released "
+            + "every key it held and is proceeding unserialized (BLO-21790)",
         );
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, PR_REVIEW_ISSUE_LOCK_RETRY_MS));
     }
+  }
+
+  // Releasing the savepoint hands the locks to the parent transaction, which
+  // holds them until the issue row is durable — the serialization we wanted.
+  try {
+    await db.execute(sql`release savepoint ${SAVEPOINT}`);
+  } catch (error) {
+    logger.warn(
+      { err: error },
+      "pr review duplicate guard could not release its lock savepoint; "
+        + "locks remain held by the caller's transaction",
+    );
   }
 }
 
@@ -363,11 +481,40 @@ async function tryLockPrReviewScope(
   db: Pick<DbTransaction, "execute">,
   taskKey: string,
 ): Promise<boolean> {
-  const rows = await db.execute(
-    sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
-  );
+  let rows: unknown;
+  try {
+    rows = await db.execute(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${taskKey}, 0)) as acquired`,
+    );
+  } catch (error) {
+    // Fail OPEN, matching this module's stated posture. The docstring above
+    // claims pg_try_advisory_xact_lock "never errors", which is true of the
+    // function but not of the statement: a reset connection, a
+    // statement_timeout, or the role losing EXECUTE on hashtextextended all
+    // throw here, and an uncaught throw aborts the caller's issue-create
+    // transaction and 500s the create. Report "not acquired" so the retry
+    // budget expires and the create proceeds unserialized.
+    logger.warn(
+      { err: error, taskKey },
+      "pr review duplicate guard could not evaluate the PR scope lock; proceeding unserialized",
+    );
+    return false;
+  }
   const row = Array.isArray(rows) ? rows[0] : null;
-  return !!row && typeof row === "object" && (row as Record<string, unknown>).acquired === true;
+  if (row && typeof row === "object" && "acquired" in row) {
+    return (row as Record<string, unknown>).acquired === true;
+  }
+  // Not "someone else holds it" — the driver's result shape is unrecognized
+  // (drizzle's postgres-js execute returns an array; node-postgres returns a
+  // QueryResult). Silently reporting contention would spin the entire retry
+  // budget on every create and look identical to real contention, so say it
+  // once and let the caller give up.
+  logger.warn(
+    { taskKey, rowType: Array.isArray(rows) ? "array" : typeof rows },
+    "pr review duplicate guard got an unrecognized advisory-lock result shape; "
+      + "treating the PR scope as unserializable",
+  );
+  return false;
 }
 
 /**
@@ -383,6 +530,15 @@ export async function assertNotDuplicatePrReviewIssue(
   const assigneeAgentId = candidate.assigneeAgentId?.trim();
   const taskKeys = guardTaskKeys(candidate, options);
   if (!assigneeAgentId || taskKeys.length === 0) return;
+
+  if (declaresNotAReviewRequest(candidate)) {
+    logger.info(
+      { companyId: candidate.companyId, assigneeAgentId, taskKeys },
+      "duplicate PR review issue guard bypassed by an explicit "
+        + "paperclip:not-a-review-request marker",
+    );
+    return;
+  }
 
   const refs = candidatePullRequestRefs(candidate, false);
   const reviewerAgentIds = configuredPrReviewerAgentIds(options.reviewerAgentIds);
@@ -444,7 +600,10 @@ export async function assertNotDuplicatePrReviewIssue(
         `Do not file an issue to wake the reviewer. To request or re-request a review, post a comment on ${prUrl} ` +
         `whose literal first byte is the marker \`<!-- paperclip:review-request -->\`, followed by \`@ally\` and ` +
         `the specific review focus. A markerless \`@ally\` from an agent is dropped. If the existing run is ` +
-        `starved rather than missing, escalate the queue wait — do not re-file.`,
+        `starved rather than missing, escalate the queue wait — do not re-file. ` +
+        `If this issue is ABOUT the review rather than a request for one (a bug in the reviewer, ` +
+        `a postmortem, a tracking issue that merely cites the PR), add ` +
+        `\`${NOT_A_REVIEW_REQUEST_MARKER}\` to the description and re-submit.`,
       taskKey: liveRun.contextTaskKey,
       repoFullName: matchedRef.repoFullName,
       prNumber: matchedRef.prNumber,
