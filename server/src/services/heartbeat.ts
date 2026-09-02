@@ -6874,8 +6874,13 @@ function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
 }
 
 function isSameTaskScope(left: string | null, right: string | null) {
-  // Shared with the SQL predicate so the execution path and the coalescing
-  // query agree about legacy mixed-case pr_review keys during the transition.
+  // MIRRORS the SQL predicate `matchesTaskKey` — it does not share an
+  // implementation with it. `taskKeysMatch` (JS) and `matchesTaskKey` (SQL) are
+  // two separate functions in pr-review-duplicate-issue-guard.ts that must stay
+  // behaviourally identical, or the execution path and the coalescing query
+  // disagree about legacy mixed-case pr_review keys during the transition.
+  // Saying "shared" here would imply a single source of truth and is exactly
+  // how the two drift unnoticed in a refactor.
   return taskKeysMatch(left, right);
 }
 
@@ -7021,8 +7026,9 @@ async function coalescePendingTaskScopeWake(input: {
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, input.agentId),
         inArray(heartbeatRuns.status, coalescibleStatuses),
-        // Shared casing-compatibility predicate: a normalized pr_review key must
-        // still coalesce into a legacy mixed-case run while those drain.
+        // SQL half of the casing-compatibility pair (the JS half is
+        // `taskKeysMatch`, used by isSameTaskScope): a normalized pr_review key
+        // must still coalesce into a legacy mixed-case run while those drain.
         matchesTaskKey(heartbeatRuns.contextTaskKey, input.taskKey),
       ),
     )

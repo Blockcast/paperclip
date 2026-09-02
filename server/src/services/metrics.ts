@@ -424,6 +424,7 @@ export const KNOWN_GITHUB_SUPPRESSION_CAUSES = [
   "issue_tree_hold_active",
   "dispatch_rejected",
   "scheduled_retry_gate_declined",
+  "reviewer_lock_contended",
 ] as const;
 
 /**
@@ -456,6 +457,23 @@ export const GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED = "dispatch_rejected";
  * `dead_lettered` on the delivery counter and pages via the dead-letter alert.
  */
 export const GITHUB_SUPPRESSION_CAUSE_SCHEDULED_RETRY_GATE = "scheduled_retry_gate_declined";
+
+/**
+ * The reviewer wake could not acquire the PR-scope dispatch lock within its
+ * budget, so it declined rather than dispatching outside the lock (BLO-31075
+ * review follow-up). Like {@link GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED}
+ * this writes no durable `skipped` row, so it cannot be joined back to
+ * `agent_wakeup_requests`; this counter is the only record it happened.
+ *
+ * Usually benign and deliberately NOT in {@link ALERTING_GITHUB_SUPPRESSION_CAUSES}:
+ * the normal contender is a second webhook delivery for the same PR scope,
+ * which is dispatching the very wake this one would have duplicated. It is
+ * counted rather than silent because the *other* contender — an issue create
+ * holding PR-scope locks — is a real loss, and a rate that climbs while
+ * issue-create volume climbs is the signal that
+ * `lockPrReviewIssueScopes` is holding locks longer than its own budget.
+ */
+export const GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED = "reviewer_lock_contended";
 
 export const UNKNOWN_GITHUB_SUPPRESSION_CAUSE = "other";
 

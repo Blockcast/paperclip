@@ -53,14 +53,17 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { recordGithubReviewRequestDelivery } from "../services/metrics.js";
+import {
+  GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+  recordGithubReviewRequestDelivery,
+  recordGithubReviewRequestSuppressed,
+} from "../services/metrics.js";
 import {
   recordMergedPullRequest,
   enrichAuthoredLocForRow,
   type RecordMergedPullRequestInput,
 } from "../services/issue-pull-requests.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
-import { HttpError } from "../errors.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -72,21 +75,18 @@ type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 // createDb's default pool satisfies the required minimum of two.
 const PR_REVIEWER_TASK_LOCK_TIMEOUT_MS = 2_000;
 const PR_REVIEWER_TASK_LOCK_RETRY_MS = 25;
+/**
+ * Mirrors `LIVE_PR_REVIEW_RUN_STATUSES` in services/pr-review-duplicate-issue-guard.ts
+ * and `EXECUTION_PATH_HEARTBEAT_RUN_STATUSES` in services/heartbeat.ts. All
+ * three must agree on what "this reviewer is already busy with this scope"
+ * means, or the guard rejects an issue the webhook would happily wake for.
+ */
 const ACTIVE_PR_REVIEWER_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
 class PrReviewerTaskLockTimeoutError extends Error {
   constructor() {
     super("timed out acquiring PR reviewer task assignment lock");
     this.name = "PrReviewerTaskLockTimeoutError";
-  }
-}
-
-class PrReviewerTaskLockContentionError extends HttpError {
-  constructor() {
-    super(503, "PR reviewer dispatch is contended; retry this webhook delivery", {
-      code: "pr_reviewer_dispatch_contended",
-    });
-    this.name = "PrReviewerTaskLockContentionError";
   }
 }
 
@@ -1418,19 +1418,28 @@ function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: numb
 }
 
 /**
- * Advisory-lock namespaces to hold while dispatching one PR's reviewer wake.
+ * Advisory-lock namespaces to hold while dispatching one PR's reviewer wake:
+ * BOTH the normalized and the canonical mixed-case spelling.
  *
  * The lock id is `hashtextextended(taskKey, 0)`, so changing the *spelling* of
  * the task key changes the namespace. Phase one keeps writing the raw,
  * mixed-case `repoFullName` so old readers can still see new rows, but
  * compatibility-aware pods lock both that namespace and the future normalized
- * namespace. A later release can switch producers only after every pod can read
- * and lock both spellings.
+ * namespace. Locking only one spelling would let old and new pods serialize on
+ * different ids and dispatch the same PR concurrently for the whole rolling
+ * deployment — two reviewers on one PR, the exact duplicate cost this work
+ * exists to remove. A later release can switch producers only after every pod
+ * can read and lock both spellings.
  *
- * Hold BOTH namespaces until no pre-normalization pod remains. Sorted, so
- * every caller acquires the pair in one order and two peers contending for the
- * same PR cannot livelock each other by grabbing opposite halves. Retire this
- * alongside the `lower()` legs in pr-review-duplicate-issue-guard.
+ * Sorted, so every caller acquires the pair in one order and two peers
+ * contending for the same PR cannot livelock each other by grabbing opposite
+ * halves. Retire this alongside the `lower()` legs in
+ * pr-review-duplicate-issue-guard.
+ *
+ * This set being a PAIR is why `lockPrReviewIssueScopes` must acquire its own
+ * keys all-or-nothing (see the savepoint there): acquisition here is
+ * all-or-nothing, so a peer that parks a single half of the pair makes this
+ * unsatisfiable until that peer's transaction ends.
  */
 function buildPrReviewerTaskLockKeys(
   context: ResolvedEventContext & { prNumber: number },
@@ -2229,19 +2238,44 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           );
         } catch (err) {
           if (!(err instanceof PrReviewerTaskLockTimeoutError)) throw err;
+          // Decline rather than dispatch outside the lock — but decline
+          // LOCALLY. An earlier revision threw an HttpError here, which
+          // escaped the whole route handler (there is no handler-level
+          // catch), so a contended delivery also skipped the Dependabot
+          // remediation wake, the PR->issue back-link, and the entire
+          // paperclip-identifier issue-assignee path including CI-completion
+          // handling. None of that work contends for this lock.
+          //
+          // The 503 it returned could not buy a retry either: GitHub does not
+          // automatically redeliver failed deliveries. So the trade was "lose
+          // unrelated work in every contended delivery" for "a row in the
+          // deliveries UI someone might replay by hand".
+          //
+          // Counted instead, via the sanctioned terminal-suppression path, so
+          // the loss is visible on the funnel rather than showing up only as a
+          // dip in `received`.
+          recordGithubReviewRequestSuppressed({
+            reason: context.wakeReason,
+            cause: GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+          });
           logger.warn(
             {
               agentIds: reviewerAgentIds,
               event: eventName,
               prNumber: context.prNumber,
               repoFullName: context.repoFullName,
+              wakeReason: context.wakeReason,
             },
-            "github webhook reviewer lock timed out; asking GitHub to retry",
+            "github webhook reviewer wake declined: PR-scope dispatch lock contended. "
+              + "Normally benign — the lock holder is another delivery for the same PR "
+              + "scope and is dispatching the wake this one would have duplicated. "
+              + "GitHub does NOT auto-redeliver, so if the holder was an issue create "
+              + "(see lockPrReviewIssueScopes) this review request is lost and needs a "
+              + "manual redelivery or an @ally review comment",
           );
-          throw new PrReviewerTaskLockContentionError();
+          return false;
         }
       } catch (err) {
-        if (err instanceof PrReviewerTaskLockContentionError) throw err;
         logger.error(
           {
             err,

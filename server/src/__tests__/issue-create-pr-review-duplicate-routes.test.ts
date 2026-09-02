@@ -21,12 +21,14 @@ import {
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 import {
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerTaskLockKeys,
 } from "../routes/github-webhook.js";
 import {
   DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE,
+  NOT_A_REVIEW_REQUEST_MARKER,
   buildPrReviewTaskKey,
   parsePullRequestRefs,
   taskKeysMatch,
@@ -48,6 +50,31 @@ describe("pr review duplicate issue guard (pure helpers)", () => {
     expect(webhookKey).toBe(`pr_review:${REPO}:${PR_NUMBER}`);
     expect(taskKeysMatch(buildPrReviewTaskKey({ repoFullName: REPO, prNumber: PR_NUMBER }), webhookKey))
       .toBe(true);
+  });
+
+  it("does NOT case-fold task keys outside the pr_review scope", () => {
+    // The JS predicate must stay behaviourally identical to the SQL one, which
+    // only adds its lower() leg for pr_review keys. Without this case a
+    // regression that dropped the isPrReviewTaskKey guard would widen equality
+    // for EVERY task scope in the system and still ship green: the SQL half has
+    // its negative (heartbeat-pr-review-task-key-casing.test.ts), the JS half
+    // had only a positive.
+    expect(taskKeysMatch("issue:ABC-1", "issue:abc-1")).toBe(false);
+    expect(taskKeysMatch("ISSUE:abc-1", "issue:abc-1")).toBe(false);
+    // ...while the pr_review scope still folds, in both directions.
+    expect(taskKeysMatch(`pr_review:${REPO}:${PR_NUMBER}`, TASK_KEY)).toBe(true);
+    expect(taskKeysMatch(TASK_KEY, `pr_review:${REPO}:${PR_NUMBER}`)).toBe(true);
+  });
+
+  it("caps how many PR references it will scan from one issue", () => {
+    // MAX_SCANNED_PULL_REQUEST_REFS bounds the work a hostile description can
+    // cause. Truncation is fail-open (the tail is unguarded), so this pins the
+    // bound rather than leaving it as an untested constant.
+    const many = Array.from(
+      { length: 25 },
+      (_, i) => `https://github.com/${NORMALIZED_REPO}/pull/${1000 + i}`,
+    ).join("\n");
+    expect(parsePullRequestRefs("scan cap", many)).toHaveLength(20);
   });
 
   it("locks both the normalized and legacy-casing namespaces during rollout", () => {
@@ -362,6 +389,96 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     }
   }, 20_000);
 
+  it("releases every PR-scope lock it acquired when it gives up on the rest", async () => {
+    // Finding from review: the guard used to `return` from inside its
+    // acquisition loop while still holding whichever keys it had already taken.
+    // Those are pg_try_advisory_xact_lock, so they were held until the CREATE
+    // transaction committed — seconds, not the guard's 1s budget.
+    //
+    // That is not merely wasteful. The webhook's dispatch path locks a PAIR of
+    // spellings all-or-nothing, so a create parking exactly one half made the
+    // webhook's acquisition unsatisfiable for the rest of the create — starving
+    // every reviewer wake for that PR while the create had itself given up on
+    // serializing. Acquisition is now scoped to a SAVEPOINT rolled back on
+    // give-up.
+    //
+    // Keys sort as ["pr_review:Blockcast/...", "pr_review:blockcast/..."]
+    // ('B' 0x42 < 'b' 0x62), so holding the LOWERCASE key forces the guard to
+    // acquire the mixed-case one FIRST and then fail — the exact prefix-held
+    // shape under test.
+    const companyId = await seedCompany();
+    const reviewer = await seedAgent(companyId, "Ally");
+    configureReviewer(reviewer.id);
+    const SOURCE_KEY = `pr_review:${REPO}:${PR_NUMBER}`;
+
+    let releaseHolder!: () => void;
+    let reportHeld!: () => void;
+    const held = new Promise<void>((resolve) => { reportHeld = resolve; });
+    const holderRelease = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${TASK_KEY}, 0))`);
+      reportHeld();
+      await holderRelease;
+    });
+    await held;
+
+    let releaseCreate!: () => void;
+    let reportPaused!: () => void;
+    const paused = new Promise<void>((resolve) => { reportPaused = resolve; });
+    const createRelease = new Promise<void>((resolve) => { releaseCreate = resolve; });
+
+    // Pauses INSIDE the create transaction, after the guard has run and given
+    // up. If the guard still held the mixed-case key, it would still be held
+    // at this point.
+    const issueCreate = issueService(db).create(companyId, {
+      title: `Review ${REPO} PR #${PR_NUMBER}`,
+      description: `Please review ${PR_URL}.`,
+      assigneeAgentId: reviewer.id,
+      status: "todo",
+      priority: "medium",
+      beforeSideEffects: async () => {
+        reportPaused();
+        await createRelease;
+      },
+    });
+
+    const probe = createDb(tempDb!.connectionString);
+    const tryLock = async (key: string) =>
+      await probe.transaction(async (tx) => {
+        const rows = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${key}, 0)) as acquired`,
+        );
+        const row = Array.isArray(rows) ? rows[0] : null;
+        return (row as Record<string, unknown> | null)?.acquired === true;
+      });
+
+    try {
+      await Promise.race([
+        paused,
+        issueCreate.then(() => {
+          throw new Error("issue create committed before reaching the guarded pause");
+        }),
+      ]);
+
+      // THE ASSERTION: the key the guard acquired and then abandoned is free
+      // again, while the create transaction is still open. Before the savepoint
+      // fix this was false.
+      expect(await tryLock(SOURCE_KEY)).toBe(true);
+
+      // CONTROL: the key the holder still owns must NOT be acquirable. Without
+      // this, the assertion above would also pass on a build where advisory
+      // locks did nothing at all.
+      expect(await tryLock(TASK_KEY)).toBe(false);
+    } finally {
+      releaseCreate();
+      releaseHolder();
+      await holder.catch(() => undefined);
+      // Fail-open is unchanged: no live review run exists, so the create is
+      // legitimate and must still succeed.
+      await expect(issueCreate).resolves.toBeTruthy();
+    }
+  }, 30_000);
+
   it("rejects when the PR URL appears only in the description", async () => {
     const { companyId, reviewer, app } = await setup();
     await seedReviewRun(companyId, reviewer.id);
@@ -427,6 +544,48 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
       .post(`/api/companies/${companyId}/issues`)
       .send(reviewIssueBody(reviewer.id))
       .expect(201);
+  });
+
+  it("accepts an issue about the SAME PR when it declares it is not a review request", async () => {
+    // The guard fires on any canonical PR permalink and cannot tell a review
+    // REQUEST from an issue that is merely ABOUT the review. Without an escape
+    // hatch, a legitimate meta-issue like this one is hard-rejected and the
+    // 409's remediation ("post a review-request marker comment on the PR") is
+    // actively wrong advice — following it would queue a second review of a PR
+    // whose review is already broken. Before the marker existed the only way
+    // past this was the global kill switch.
+    const { companyId, reviewer, app } = await setup();
+    await seedReviewRun(companyId, reviewer.id);
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: `Ally's review of ${PR_URL} exited with pr_review_output_missing`,
+        description:
+          `${NOT_A_REVIEW_REQUEST_MARKER}\nThe adapter produced no verdict; investigate.`,
+        assigneeAgentId: reviewer.id,
+      })
+      .expect(201);
+  });
+
+  it("still rejects the same issue text without the marker", async () => {
+    // Discriminator for the case above: identical body minus the marker must
+    // still 409, or the marker test proves nothing about the marker.
+    const { companyId, reviewer, app } = await setup();
+    await seedReviewRun(companyId, reviewer.id);
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: `Ally's review of ${PR_URL} exited with pr_review_output_missing`,
+        description: "The adapter produced no verdict; investigate.",
+        assigneeAgentId: reviewer.id,
+      })
+      .expect(409);
+    expect(res.body).toMatchObject({ code: DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE });
+    // The rejection must advertise the escape hatch, or a blocked filer has no
+    // way to discover it.
+    expect(res.body.remediation).toContain(NOT_A_REVIEW_REQUEST_MARKER);
   });
 
   it("rejects when the live review is already running on another configured reviewer", async () => {

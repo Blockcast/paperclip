@@ -1740,7 +1740,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(runs).toHaveLength(1);
   });
 
-  it("returns a retryable error instead of bypassing an issue-create PR lock", async () => {
+  it("declines a contended reviewer wake locally without failing the whole delivery", async () => {
     const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({ prReviewerAgentIds: [reviewerId] });
     const taskKey = "pr_review:blockcast/paperclip:20526";
@@ -1792,10 +1792,21 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .set("content-type", "application/json")
         .send(body);
 
-      expect(contended.status).toBe(503);
-      expect(contended.body).toMatchObject({
-        code: "pr_reviewer_dispatch_contended",
-      });
+      // The wake is declined, but the DELIVERY is not failed. An earlier
+      // revision threw an HttpError out of the reviewer closure, which escaped
+      // the whole route handler (there is no handler-level catch) and so also
+      // skipped the Dependabot remediation wake, the PR->issue back-link, and
+      // the paperclip-identifier issue-assignee path — none of which contend
+      // for this lock. A 503 could not buy a retry either: GitHub does not
+      // automatically redeliver failed deliveries.
+      expect(contended.status).toBe(200);
+      expect(contended.body).toMatchObject({ reviewerWakeFired: false });
+      // The handler reached its normal terminal branch rather than being
+      // unwound by a throw — this is the assertion that the rest of the
+      // delivery still ran.
+      expect(typeof contended.body.ignored).toBe("string");
+      // The actual invariant under test: the wake was NOT dispatched outside
+      // the lock the issue create holds.
       expect(await db
         .select({ contextTaskKey: heartbeatRuns.contextTaskKey })
         .from(heartbeatRuns)
