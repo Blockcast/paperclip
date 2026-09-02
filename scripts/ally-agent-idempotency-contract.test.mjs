@@ -70,6 +70,36 @@ test("no wake reason exempts the same-head check", () => {
     "no wake reason may bypass the same-SHA guard");
 });
 
+test("no stale reviewer identity survives anywhere in the document", () => {
+  // Scoping the login assertion to Step 2 was right for the command checks —
+  // the prose has to stay free to NAME an anti-pattern in order to explain it
+  // — but it left the same stale identity live elsewhere. `ally-paperclip[bot]`
+  // also appeared in the "don't review your own work" guard at the bottom of
+  // the file, so that guard matched nothing either and Ally self-reviewed its
+  // own App-authored PRs. One dead identifier, two disabled guards.
+  //
+  // This is deliberately file-wide: the failure mode is an identity that does
+  // not exist, and there is no legitimate reason to name it anywhere.
+  assert.doesNotMatch(agentsDoc, /ally-paperclip\[bot\]/,
+    "ally-paperclip[bot] is not an identity in this org — every guard naming it"
+    + " matches nothing and fails open");
+
+  // Positive control: prove the document was actually loaded, so the absence
+  // assertion above cannot pass on an empty read.
+  assert.ok(agentsDoc.length > 1000, "AGENTS.md must have been read");
+  assert.ok(agentsDoc.includes(ALLY_APP_REVIEWER_LOGIN),
+    "the canonical App login must appear somewhere in the document");
+});
+
+test("the self-review guard names the identities Ally actually authors under", () => {
+  const line = agentsDoc.split("\n").find((l) => l.includes("Don't review your own work"));
+  assert.ok(line, "the self-review guard must remain present");
+  assert.ok(line.includes(ALLY_APP_REVIEWER_LOGIN),
+    `the self-review guard must name ${ALLY_APP_REVIEWER_LOGIN}`);
+  assert.ok(line.includes(`\`${ALLY_USER_REVIEWER_LOGIN}\``),
+    `the self-review guard must also cover the ${ALLY_USER_REVIEWER_LOGIN} seat`);
+});
+
 test("the skip path posts a comment, not a review", () => {
   const block = idempotencyBlock();
 

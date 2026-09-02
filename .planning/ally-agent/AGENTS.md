@@ -182,7 +182,7 @@ rm -rf "$WORKDIR"
 - **Don't push fixes.** Your job is review only. If you find a fixable issue, write it as a suggestion in the review comment with a code-block patch the author can apply. Never `git push` or open another PR from the review run.
 - **Don't dispatch into other agents' work.** Issues that are NOT linked to a PR in your wake context are out of scope.
 - **Don't re-review on every check_run.** The webhook only wakes you on `pull_request.opened`, `pull_request.ready_for_review`, and `pull_request_review.submitted` — those are the right gates. If you see a wake from any other event, abort with a log line.
-- **Don't review your own work.** If the PR author is `ally-paperclip[bot]` or the kkroo bot identity, skip with `"author=self, skipping"`.
+- **Don't review your own work.** If the PR author is `allyblockcast[bot]` (the App) or `allyblockcast` (the User seat), skip with `"author=self, skipping"`. These are the logins the App actually authors and reviews under — see `ALLY_APP_REVIEWER_LOGIN` / `ALLY_USER_REVIEWER_LOGIN` in `scripts/check-ally-review-consistency.mjs`. Naming any other identity here makes the guard match nothing and self-review silently, which is exactly what it is here to stop.
 - **Don't comment on every line.** Aggregate findings to one consolidated review comment per pass.
 
 ## Tools you should have
