@@ -5,6 +5,7 @@ import {
   PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH,
   PLUGIN_METRIC_NAME_BUDGET,
   PLUGIN_METRIC_OVERFLOW_NAME,
+  PLUGIN_METRIC_TAG_LABEL_PREFIX,
   PLUGIN_METRIC_TOTAL_METRIC,
   __resetMetricsForTest,
   recordPluginMetric,
@@ -52,9 +53,53 @@ describe("recordPluginMetric — exposition", () => {
     expect(series).toHaveLength(1);
     expect(series[0]).toContain('metric="alertmanager.owner.fallback_failed"');
     expect(series[0]).toContain('plugin_key="paperclip-plugin-alertmanager"');
-    expect(series[0]).toContain('alertname="PaperclipAdmissionPolicyExpectationStale"');
-    expect(series[0]).toContain('severity="critical"');
+    expect(series[0]).toContain('tag_alertname="PaperclipAdmissionPolicyExpectationStale"');
+    expect(series[0]).toContain('tag_severity="critical"');
     expect(series[0]?.trimEnd().endsWith(" 1")).toBe(true);
+  });
+
+  it("namespaces promoted tags so they cannot collide with alerting labels", async () => {
+    // `alertname` and `severity` are assigned by the alerting engine itself: a
+    // firing rule overwrites `alertname` with its own name before checking for
+    // duplicate label sets, and its `labels:` block overwrites `severity`. A
+    // BARE `alertname` label therefore hard-fails rule evaluation with "vector
+    // contains metrics with the same labelset after applying alert labels"
+    // (measured with promtool on onprem-k8s#3022) whenever two series differ
+    // only in that tag -- i.e. on the most obvious rule anyone would write
+    // against this metric, which is the shape PEN-2799 exists to enable.
+    //
+    // This asserts the ABSENCE of the bare form, which the sibling test above
+    // cannot: `toContain('alertname="X"')` is satisfied by `tag_alertname="X"`
+    // as a substring, so a regression that dropped the prefix would leave every
+    // other assertion in this file green.
+    recordPluginMetric({
+      ...PLUGIN,
+      name: "alertmanager.alert.error",
+      value: 1,
+      tags: { alertname: "SomeAlert", severity: "critical" },
+      declaredLabels: ["alertname", "severity"],
+    });
+
+    const line = (await seriesFor(PLUGIN_METRIC_TOTAL_METRIC))[0] ?? "";
+    const labels = /\{([^}]*)\}/.exec(line)?.[1] ?? "";
+    const names = labels
+      .split(",")
+      .map((pair) => pair.split("=")[0]?.trim())
+      .filter((name): name is string => Boolean(name));
+
+    expect(names).toContain("tag_alertname");
+    expect(names).toContain("tag_severity");
+    // The point of the test: parsed as label NAMES, not as substrings.
+    expect(names).not.toContain("alertname");
+    expect(names).not.toContain("severity");
+    // Every promoted tag is namespaced, not just the two that collide today --
+    // so a key added to the allow-list later inherits the immunity.
+    for (const name of names) {
+      expect(
+        ["plugin_id", "plugin_key", "metric"].includes(name)
+          || name.startsWith(PLUGIN_METRIC_TAG_LABEL_PREFIX),
+      ).toBe(true);
+    }
   });
 
   it("keeps the plugin's metric name as a LABEL, never as a series name", async () => {
@@ -108,7 +153,7 @@ describe("recordPluginMetric — promoted label values", () => {
 
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
     expect(series).toHaveLength(1);
-    const rendered = /alertname="([^"]*)"/.exec(series[0] ?? "")?.[1] ?? "";
+    const rendered = /tag_alertname="([^"]*)"/.exec(series[0] ?? "")?.[1] ?? "";
     expect(rendered).toHaveLength(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH);
     expect(rendered).toBe(long.slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH));
   });
@@ -146,7 +191,7 @@ describe("recordPluginMetric — promoted label values", () => {
     });
 
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
-    const rendered = /alertname="([^"]*)"/.exec(series[0] ?? "")?.[1] ?? "";
+    const rendered = /tag_alertname="([^"]*)"/.exec(series[0] ?? "")?.[1] ?? "";
     expect(rendered).not.toContain("�");
     expect(rendered.endsWith(emoji)).toBe(true);
     expect(Array.from(rendered)).toHaveLength(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH);
@@ -264,7 +309,7 @@ describe("recordPluginMetric — two-sided label gate", () => {
 
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
     expect(series).toHaveLength(1);
-    expect(series[0]).toContain('alertname="Declared"');
+    expect(series[0]).toContain('tag_alertname="Declared"');
     expect(series[0]).not.toContain("command_name");
     expect(series[0]).not.toContain("NotPromotable");
     expect(series[0]).not.toContain("NotDeclared");
@@ -402,7 +447,7 @@ describe("recordPluginMetric — cardinality budget", () => {
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
     const other = series.filter((line) => line.includes('plugin_key="other.plugin"'));
     expect(other).toHaveLength(1);
-    expect(other[0]).toContain('alertname="B-0"');
+    expect(other[0]).toContain('tag_alertname="B-0"');
     expect(other[0]).not.toContain(PLUGIN_METRIC_OVERFLOW_NAME);
   });
 
@@ -495,7 +540,7 @@ describe("recordPluginMetric — cardinality budget", () => {
     // If B collided it read as already-seen, skipped the budget check, and
     // published its own label map — a series bought for zero budget.
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
-    expect(series.filter((l) => l.includes("alertname="))).toHaveLength(1);
+    expect(series.filter((l) => l.includes("tag_alertname="))).toHaveLength(1);
 
     const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
     expect(dropped.filter((l) => l.includes('reason="label_budget"'))).toHaveLength(1);
@@ -520,7 +565,7 @@ describe("recordPluginMetric — cardinality budget", () => {
     expect(offending).toHaveLength(0);
     expect(await seriesFor(PLUGIN_METRIC_TOTAL_METRIC)).toHaveLength(1);
     expect((await seriesFor(PLUGIN_METRIC_TOTAL_METRIC))[0]).toContain(
-      'alertname="ABCDE"',
+      'tag_alertname="ABCDE"',
     );
   });
 

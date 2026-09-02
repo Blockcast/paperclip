@@ -635,6 +635,12 @@ export interface PaperclipPluginManifestV1 {
    *
    * Omitting it is safe and is the default: the plugin's metrics still publish,
    * just without per-tag breakdown. Max 5 keys, `snake_case`.
+   *
+   * Declare the key UNPREFIXED (`alertname`). It publishes as `tag_alertname`:
+   * promoted tags are namespaced so they cannot collide with a label Prometheus
+   * assigns itself — a bare `alertname` is overwritten by the firing rule's own
+   * name and hard-fails evaluation on duplicate label sets, and a bare
+   * `severity` is overwritten by the rule's `labels:` block silently.
    */
   metricLabels?: string[];
   /** Entrypoint paths relative to the package root. */
