@@ -1,0 +1,62 @@
+{{/*
+  Grafana dashboard for Paperclip runtime run-queue and retry health (BLO-23450).
+
+  WHY A SEPARATE TEMPLATE FILE RATHER THAN A SECOND BLOCK IN
+  templates/grafana-dashboard.yaml
+  ----------------------------------------------------------
+  Read templates/grafana-dashboard.yaml first -- it carries the full
+  explanation of the delivery mechanism, and this file deliberately does not
+  duplicate it. Two reasons this is its own file:
+
+    1. tests/grafana-dashboard.test.mjs renders with
+       `--show-only templates/grafana-dashboard.yaml` and parses the first
+       block scalar out of the result. Adding a second ConfigMap to that file
+       changes what that parser sees. A new file leaves those tests reading
+       exactly the document they were written against.
+
+    2. The live ConfigMap paperclip-grafana-dashboard-review-request-funnel is
+       a working artifact. Folding both dashboards into one globbed template
+       would rename it (the glob derives names from filenames), which deletes
+       and recreates a resource that is currently serving a dashboard. Not
+       worth it to save twelve lines.
+
+  ADDING ANOTHER DASHBOARD
+  ------------------------
+  Drop the JSON in dashboards/ and copy this file, changing the ConfigMap name
+  suffix and the .Files.Get path. No Grafana UI access is required at any
+  point; see runbooks/grafana-dashboard-as-code.md.
+
+  HOW IT REACHES GRAFANA (summary -- details in grafana-dashboard.yaml)
+  --------------------------------------------------------------------
+  orc8r-user-grafana in production-orc8r runs a kiwigrid/k8s-sidecar with
+  LABEL=grafana_dashboard LABEL_VALUE=1 RESOURCE=configmap NAMESPACE=ALL
+  METHOD=WATCH. NAMESPACE=ALL is why a ConfigMap rendered into the paperclip
+  release namespace is adopted with no change to the orc8r chart. Re-verified
+  against the live Deployment on 2026-09-02.
+
+  The JSON is loaded with .Files.Get rather than templated inline, because
+  Grafana legendFormat uses {{ label }} syntax that Helm would otherwise try to
+  evaluate. Only the datasource uid is substituted.
+*/}}
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "paperclip.fullname" . }}-grafana-dashboard-runtime-run-queue-health
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "paperclip.labels" . | nindent 4 }}
+    {{ .Values.grafanaDashboard.sidecarLabel }}: {{ .Values.grafanaDashboard.sidecarLabelValue | quote }}
+    {{- with .Values.grafanaDashboard.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.grafanaDashboard.folder }}
+  annotations:
+    grafana_folder: {{ . | quote }}
+  {{- end }}
+data:
+  runtime-run-queue-health.json: |
+    {{- .Files.Get "dashboards/runtime-run-queue-health.json"
+          | replace "__PAPERCLIP_DS_UID__" .Values.grafanaDashboard.datasourceUid
+          | nindent 4 }}
+{{- end }}
