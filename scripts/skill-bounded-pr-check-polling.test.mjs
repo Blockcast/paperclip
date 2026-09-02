@@ -342,6 +342,79 @@ test("prcheckloop: a failed status context exits 1", () => {
   assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
 });
 
+test("prcheckloop: an unknown check-run conclusion is NOT green", () => {
+  // Fail closed. Counting only the KNOWN failures leaves an unrecognized
+  // conclusion in neither `pending` nor `failed`, and "not pending and not
+  // failed" is the green path — so a conclusion GitHub adds after this was
+  // written would be reported as SUCCESS by a script whose entire job is to
+  // not do that.
+  const stubs = makeStubs({
+    checkRunsJson:
+      '{"check_runs":[{"name":"ci","status":"completed","conclusion":"exploded"}]}',
+    statusJson: NO_STATUSES,
+  });
+  const r = runBlock(PRCHECKLOOP_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "900" } });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  // The operator has to be able to tell "this script is out of date" from
+  // "CI is red", so the message names the value.
+  assert.match(r.stderr, /exploded/);
+});
+
+test("prcheckloop: an unknown status-context state is NOT green", () => {
+  const stubs = makeStubs({
+    checkRunsJson: '{"check_runs":[]}',
+    statusJson: '{"statuses":[{"state":"weird","context":"ci/legacy"}]}',
+  });
+  const r = runBlock(PRCHECKLOOP_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "900" } });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /weird/);
+});
+
+test("prcheckloop: an unknown non-completed check-run status is NOT green", () => {
+  // The pending side needs the same treatment: `status` is enumerated too, so
+  // an unrecognized non-terminal value must not silently count as pending
+  // either — polling on it would just burn the deadline and report a timeout.
+  const stubs = makeStubs({
+    checkRunsJson: '{"check_runs":[{"name":"ci","status":"hibernating"}]}',
+    statusJson: NO_STATUSES,
+  });
+  const r = runBlock(PRCHECKLOOP_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "900" } });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /hibernating/);
+});
+
+test("prcheckloop: every documented success state still reaches exit 0", () => {
+  // Discriminator for the three above: fail-closed is only correct if the
+  // DOCUMENTED terminal-success states still pass. neutral and skipped are
+  // easy to drop when enumerating.
+  const stubs = makeStubs({
+    checkRunsJson: JSON.stringify({
+      check_runs: [
+        { name: "a", status: "completed", conclusion: "success" },
+        { name: "b", status: "completed", conclusion: "neutral" },
+        { name: "c", status: "completed", conclusion: "skipped" },
+      ],
+    }),
+    statusJson: '{"statuses":[{"state":"success","context":"ci/legacy"}]}',
+  });
+  const r = runBlock(PRCHECKLOOP_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "900" } });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+});
+
+test("prcheckloop: every documented pending state keeps polling", () => {
+  // Same discriminator on the pending side: queued/in_progress/waiting/
+  // requested must still be pending, or the loop exits 1 on a healthy PR
+  // whose checks simply have not started.
+  for (const status of ["queued", "in_progress", "waiting", "requested"]) {
+    const stubs = makeStubs({
+      checkRunsJson: JSON.stringify({ check_runs: [{ name: "ci", status }] }),
+      statusJson: NO_STATUSES,
+    });
+    const r = runBlock(PRCHECKLOOP_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "0" } });
+    assert.equal(r.status, 124, `${status}: ${r.stdout}${r.stderr}`);
+  }
+});
+
 test("prcheckloop: pending work times out with 124", () => {
   const stubs = makeStubs({ checkRunsJson: PENDING_RUNS, statusJson: NO_STATUSES });
   const r = runBlock(PRCHECKLOOP_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "0" } });
