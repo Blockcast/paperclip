@@ -113,6 +113,45 @@ describe("recordPluginMetric — promoted label values", () => {
     expect(rendered).toBe(long.slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH));
   });
 
+  it("does not report a truncation for a value sitting exactly on the bound", async () => {
+    // Guards the counter against over-reporting: `value_truncated` must mean
+    // "this value was actually cut", not "this value was long". A rule author
+    // alerting on the drop series would otherwise page on healthy traffic.
+    recordPluginMetric({
+      ...PLUGIN,
+      name: "alertmanager.alert.error",
+      value: 1,
+      tags: { alertname: "C".repeat(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) },
+      declaredLabels: ["alertname"],
+    });
+
+    expect(await seriesFor(PLUGIN_METRIC_TOTAL_METRIC)).toHaveLength(1);
+    expect(await seriesFor(PLUGIN_METRIC_DROPPED_METRIC)).toHaveLength(0);
+  });
+
+  it("truncates on code points, so a surrogate pair is never split", async () => {
+    // A UTF-16 `.slice()` at the bound would cut this emoji in half and leave a
+    // lone surrogate, which the exposition serialises as U+FFFD -- a label
+    // value that differs from what the plugin sent. `alertname` is
+    // attacker-influenced, so the astral case is reachable, and the ASCII
+    // fixtures above cannot witness it.
+    const emoji = "\u{1F600}";
+    const boundary = `${"A".repeat(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH - 1)}${emoji}tail`;
+    recordPluginMetric({
+      ...PLUGIN,
+      name: "alertmanager.alert.error",
+      value: 1,
+      tags: { alertname: boundary },
+      declaredLabels: ["alertname"],
+    });
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    const rendered = /alertname="([^"]*)"/.exec(series[0] ?? "")?.[1] ?? "";
+    expect(rendered).not.toContain("�");
+    expect(rendered.endsWith(emoji)).toBe(true);
+    expect(Array.from(rendered)).toHaveLength(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH);
+  });
+
   it("charges two values sharing a truncated prefix ONE combination", async () => {
     // The ledger must key on what is actually published. If it keyed on the
     // untruncated value, two values rendering to one series would each consume
@@ -132,7 +171,16 @@ describe("recordPluginMetric — promoted label values", () => {
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
     expect(series).toHaveLength(1);
     expect(series[0]?.trimEnd().endsWith(" 2")).toBe(true);
-    expect(await seriesFor(PLUGIN_METRIC_DROPPED_METRIC)).toHaveLength(0);
+
+    // The collapse is a real breakdown loss, so it must not be silent: the
+    // drop series is documented as the complete answer to "why is my
+    // breakdown wrong", and an assertion of *no* drop would pin exactly the
+    // silence that made the PEN-2581 fault class invisible.
+    const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('reason="value_truncated"');
+    expect(dropped[0]).toContain('metric="alertmanager.alert.error"');
+    expect(dropped[0]?.trimEnd().endsWith(" 2")).toBe(true);
   });
 
   it("treats a non-primitive tag as absent, not as \"[object Object]\"", async () => {

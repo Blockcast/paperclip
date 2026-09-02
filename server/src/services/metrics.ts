@@ -2173,12 +2173,17 @@ function ensureRegistry(): {
         + "still landed on the metric's own series -- totals stay correct, only "
         + "the per-tag breakdown is lost), 'name_budget' (the plugin exceeded "
         + "its metric-NAME budget, so this write folded into the overflow "
-        + "series). A drop is never silent: this is the series that answers "
-        + "'why is my plugin metric missing', which otherwise required reading "
-        + "host source. The 'metric' label is populated ONLY for the two budget "
-        + "reasons, where its cardinality is already bounded: 'label_budget' "
-        + "carries the real name (it cleared the name budget, so it is one of "
-        + "at most " + String(PLUGIN_METRIC_NAME_BUDGET) + "), and 'name_budget' "
+        + "series), and 'value_truncated' (a promoted label value exceeded "
+        + String(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) + " code points and was "
+        + "cut to fit; the increment landed with the shortened value, and "
+        + "because the combination ledger keys on what is actually published, "
+        + "two values sharing that prefix collapse into one series). A drop is "
+        + "never silent: this is the series that answers 'why is my plugin "
+        + "metric missing or wrong', which otherwise required reading host "
+        + "source. The 'metric' label is populated ONLY where its cardinality "
+        + "is already bounded: 'label_budget' and 'value_truncated' carry the "
+        + "real name (it cleared the name budget, so it is one of at most "
+        + String(PLUGIN_METRIC_NAME_BUDGET) + "), and 'name_budget' "
         + "carries \"" + PLUGIN_METRIC_OVERFLOW_NAME + "\" -- NOT the rejected "
         + "name, which is by definition the unbounded thing that tier is "
         + "refusing. 'bad_name' and 'bad_value' leave it empty for the same "
@@ -3153,6 +3158,7 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
     );
     const labels: Record<string, string> = { ...identity, metric: name };
     const comboParts: string[] = [name];
+    let truncatedValue = false;
     for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
       const raw = declared.has(key) ? input.tags?.[key] : undefined;
       // Only primitives promote. `String(raw)` on an object yields the constant
@@ -3161,10 +3167,23 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       // because a rule author reading the series cannot tell it from a real
       // value. An array would flatten to a comma-joined string of unbounded
       // arity. Both are treated as "not supplied".
-      const promoted =
+      let promoted = "";
+      if (
         typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean"
-          ? String(raw).slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH)
-          : "";
+      ) {
+        const full = String(raw);
+        // Measure in code POINTS, not UTF-16 code units. A bare `.slice(128)`
+        // can cut a surrogate pair in half and leave a lone surrogate, which
+        // the exposition serialises as U+FFFD -- a label value that differs
+        // from the one the plugin sent, for no gain.
+        const points = Array.from(full);
+        if (points.length > PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) {
+          promoted = points.slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH).join("");
+          truncatedValue = true;
+        } else {
+          promoted = full;
+        }
+      }
       if (promoted.length > 0) labels[key] = promoted;
       comboParts.push(promoted);
     }
@@ -3200,6 +3219,22 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
         return;
       }
       seen.add(combo);
+    }
+
+    // A truncated value is a real breakdown loss, not a cosmetic one: the
+    // combination ledger keys on the TRUNCATED value (deliberately -- see
+    // pluginMetricCombinations), so two values sharing a 128-code-point prefix
+    // collapse into one series. Counting it here is what keeps this counter's
+    // contract universal: every rejection AND every degradation is recorded,
+    // so "why is my breakdown wrong" is answerable from the drop series alone
+    // and never requires reading host source. Cardinality-safe: `name` already
+    // cleared tier 1, so it is one of at most PLUGIN_METRIC_NAME_BUDGET values.
+    if (truncatedValue) {
+      metrics.pluginMetricDroppedCounter.inc({
+        ...identity,
+        reason: "value_truncated",
+        metric: name,
+      });
     }
 
     metrics.pluginMetricCounter.inc(labels, value);
