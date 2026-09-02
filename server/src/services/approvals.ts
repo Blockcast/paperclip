@@ -601,7 +601,16 @@ export function approvalService(db: Db) {
         }
 
         const now = new Date();
-        return txDb
+        // Status-guarded for the same reason `requestRevision` and `withdraw` are,
+        // and this one closes the loss class above rather than merely avoiding a
+        // resurrection. The status check is a separate statement over an unlocked
+        // read, and `resolveApproval` accepts `revision_requested`, so a board
+        // approve/reject committing in between would otherwise be reverted to
+        // `pending` with its *fresh* decision note nulled -- while the comment
+        // archived just above records the older revision note, leaving the card
+        // reading as though its reasoning had been preserved. Losing the race must
+        // be a no-op, not a silent overwrite of the newer decision (BLO-27036).
+        const updated = await txDb
           .update(approvals)
           .set({
             status: "pending",
@@ -611,9 +620,21 @@ export function approvalService(db: Db) {
             decidedAt: null,
             updatedAt: now,
           })
-          .where(eq(approvals.id, id))
+          .where(and(eq(approvals.id, id), eq(approvals.status, "revision_requested")))
           .returning()
-          .then((rows) => rows[0]);
+          .then((rows) => rows[0] ?? null);
+
+        // Throwing rolls the transaction back, so the archive comment written above
+        // goes with it -- a lost race leaves no trace of a resubmit that never was.
+        if (!updated) {
+          const latest = await getExistingApproval(id, txDb);
+          throw unprocessable("Only revision requested approvals can be resubmitted", {
+            approvalId: id,
+            status: latest.status,
+          });
+        }
+
+        return updated;
       });
     },
 
