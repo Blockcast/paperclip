@@ -74,14 +74,44 @@ HEAD_SHA=$(git rev-parse HEAD)
 Before reviewing, check whether you already reviewed this exact SHA:
 
 ```bash
-LAST_REVIEW_SHA=$(gh api "repos/$REPO/pulls/$PR/reviews" --jq '[.[] | select(.user.login == "ally-paperclip[bot]" or .user.login == "kkroo") | .commit_id] | last // ""')
-if [ "$LAST_REVIEW_SHA" = "$HEAD_SHA" ]; then
-  echo "Already reviewed at $HEAD_SHA, skipping."
+# Match the login that actually posts reviews. `allyblockcast[bot]` is the App
+# lane, `allyblockcast` the User seat — both are canonical per
+# scripts/check-ally-review-consistency.mjs (ALLY_APP_REVIEWER_LOGIN /
+# ALLY_USER_REVIEWER_LOGIN). Filtering on any other login silently matches
+# nothing, leaving LAST_REVIEW_SHA empty so the skip below never fires and
+# every wake re-reviews.
+#
+# Count reviews AT this head rather than taking the last review's commit_id:
+# `| last` answers "what did I review most recently", which is a different
+# question and returns the wrong answer whenever a head is revisited.
+# DISMISSED reviews are excluded because the consistency guard does not count
+# them as operative.
+ALREADY=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq \
+  "[.[] | select((.user.login == \"allyblockcast[bot]\" or .user.login == \"allyblockcast\")
+                 and (.state | ascii_downcase) != \"dismissed\"
+                 and .commit_id == \"$HEAD_SHA\")] | length")
+if [ "${ALREADY:-0}" -gt 0 ]; then
+  echo "Already reviewed at $HEAD_SHA ($ALREADY operative review(s)), skipping."
+  gh pr comment "$PR" --repo "$REPO" \
+    --body "Re-review requested but PR has not changed since last review at \`$HEAD_SHA\`."
   exit 0
 fi
 ```
 
-If already reviewed at this SHA, leave a single trailing comment "Re-review requested but PR has not changed since last review at \<sha\>" and exit. Wake on `github_pr_review` always re-reviews regardless of SHA.
+**This check is unconditional — there is no wake reason that exempts it.** An
+earlier revision said "wake on `github_pr_review` always re-reviews regardless
+of SHA", which is precisely how a second operative review lands on a head that
+already has one. `check-ally-review-consistency.mjs` invariant I1 permits **at
+most one** operative App review per head, so a same-head re-review is a
+violation by construction no matter what triggered it — and because a
+`COMMENTED` review cannot be dismissed through the API, the violation is
+permanent until that head moves or the PR closes. If a re-review is genuinely
+wanted, the PR needs a new commit.
+
+Note the skip path uses `gh pr comment`, **not** `gh pr review --comment`. The
+latter files a `PullRequestReview` object, which the guard counts as a second
+operative review — so "just leaving a note" through the review API recreates
+the exact violation this check exists to prevent.
 
 ### Step 3 — Dual review
 
