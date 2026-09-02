@@ -500,20 +500,36 @@ describe("startServer feedback export wiring", () => {
       await startServer();
       heartbeatServiceMock.publishGithubReviewDeadLetterGauge.mockClear();
       heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge.mockClear();
+      heartbeatServiceMock.reconcileFailedWakeDispatches.mockClear();
       // The pass the two gauges used to be the last act of. Rejecting it is
       // the chain-fragility half of the defect: pre-fix this erased both.
-      heartbeatServiceMock.reconcileFailedWakeDispatches.mockRejectedValueOnce(
+      heartbeatServiceMock.reconcileFailedWakeDispatches.mockRejectedValue(
         new Error("wake-dispatch reconciliation failed"),
       );
 
-      intervalCallback?.();
-      // `vi.waitFor` rather than counted microtask hops, for the reason given
-      // on the stale-lock sweep test above.
+      // Drive ticks until one actually reaches the reconcile pass.`startServer`
+      // registers startup recovery without awaiting it, and the tick
+      // early-returns while that is still pending, so firing the callback once
+      // is a race — the sibling unsuppressed-tick tests in this file share that
+      // fragility and lose it on a slow host.
       await vi.waitFor(() => {
-        expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
-        expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
+        intervalCallback?.();
+        expect(heartbeatServiceMock.reconcileFailedWakeDispatches).toHaveBeenCalled();
       });
+
+      // Ordering carries the assertion: both gauges are registered above the
+      // suppression gate and ahead of the chain, so once the rejecting pass at
+      // the tail of that chain has run at all, they must already have emitted.
+      // Pre-fix they were that pass's final two awaits, and this rejection
+      // erased both.
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalled();
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalled();
     } finally {
+      // `beforeEach` uses `clearAllMocks`, which keeps implementations — so the
+      // rejection above would leak into every later test unless restored here.
+      heartbeatServiceMock.reconcileFailedWakeDispatches.mockImplementation(
+        async () => ({ recovered: 0, exhausted: 0 }),
+      );
       setIntervalSpy.mockRestore();
     }
   });
