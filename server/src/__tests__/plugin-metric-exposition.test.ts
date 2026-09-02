@@ -455,6 +455,75 @@ describe("recordPluginMetric — cardinality budget", () => {
     ).toHaveLength(1);
   });
 
+  it("keys the ledger injectively when a value contains the separator itself", async () => {
+    // The companion to the test above, and the case it cannot reach. That one
+    // proves NUL beats a PRINTABLE separator by feeding values containing a
+    // space; it never feeds a value containing the separator, which is the
+    // only input that can break a join-based key. NUL is reachable here:
+    // `alertname`/`severity` are verbatim Alertmanager webhook labels, and
+    // JSON.parse of a body containing \u0000 yields that code point intact.
+    //
+    // `alertname` and `severity` sit at promotable indices 1 and 7, so the
+    // join places a fixed run of 6 NULs between them (the five empty
+    // unpromoted slots between). Six NULs inside one value therefore straddle
+    // that boundary and make the two writes below render to one key.
+    const NUL6 = "\u0000".repeat(6);
+
+    for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET - 1; i += 1) {
+      recordPluginMetric({
+        ...PLUGIN,
+        name: "m",
+        value: 1,
+        tags: { action: `fill-${i}` },
+        declaredLabels: ["action", "alertname", "severity"],
+      });
+    }
+
+    // A takes the budget's last slot.
+    recordPluginMetric({
+      ...PLUGIN, name: "m", value: 1,
+      tags: { alertname: `A${NUL6}B`, severity: "C" },
+      declaredLabels: ["action", "alertname", "severity"],
+    });
+    // B is a DISTINCT label map that naively joins to the same ledger key.
+    recordPluginMetric({
+      ...PLUGIN, name: "m", value: 1,
+      tags: { alertname: "A", severity: `B${NUL6}C` },
+      declaredLabels: ["action", "alertname", "severity"],
+    });
+
+    // If B collided it read as already-seen, skipped the budget check, and
+    // published its own label map — a series bought for zero budget.
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series.filter((l) => l.includes("alertname="))).toHaveLength(1);
+
+    const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
+    expect(dropped.filter((l) => l.includes('reason="label_budget"'))).toHaveLength(1);
+  });
+
+  it("never emits a raw control character into the exposition", async () => {
+    // prom-client escapes only backslash, newline and quote (registry.js
+    // escapeLabelValue), so any other control character reaches /metrics as a
+    // raw byte and is the scraper's problem. Values are stripped instead.
+    recordPluginMetric({
+      ...PLUGIN, name: "m", value: 1,
+      tags: { alertname: "A\u0000B\u0007C\u001bD\u007fE" },
+      declaredLabels: ["alertname"],
+    });
+
+    const { body } = await renderMetrics();
+    // Per line: the body is newline-separated, so a class spanning all of C0
+    // would match its own separators and assert nothing.
+    const offending = body
+      .split("\n")
+      .filter((l) => /[\u0000-\u0009\u000b-\u001f\u007f]/.test(l));
+    expect(offending).toHaveLength(0);
+    expect(await seriesFor(PLUGIN_METRIC_TOTAL_METRIC)).toHaveLength(1);
+    expect((await seriesFor(PLUGIN_METRIC_TOTAL_METRIC))[0]).toContain(
+      'alertname="ABCDE"',
+    );
+  });
+
   it("does not consume a new slot when the same combination repeats", async () => {
     for (let i = 0; i < 5; i += 1) {
       recordPluginMetric({

@@ -1663,7 +1663,7 @@ Keys outside the gate are **not** dropped from the metric — only from its labe
 
 `company_id` is never a label (unbounded per tenant). It stays on the `plugin_logs` row.
 
-**Cardinality is bounded in two tiers, and the tiers degrade on different axes on purpose.** Per worker process a plugin may occupy at most **50 distinct metric names** and **100 distinct `(metric, promoted-label-values)` combinations**. Independently of both, a single promoted label **value** is cut to **128 code points**.
+**Cardinality is bounded in two tiers, and the tiers degrade on different axes on purpose.** Per worker process a plugin may occupy at most **50 distinct metric names** and **100 distinct `(metric, promoted-label-values)` combinations**. Independently of both, a single promoted label **value** is cut to **128 code points**, and has **control characters stripped** — the exposition format cannot carry them, so a value containing them would otherwise emit raw bytes into `/metrics`.
 
 - Exceed the **combination** budget and a write **keeps its `metric` label and drops its promoted labels**. The increment still lands on that metric's own series, so an alert rule matching `metric="your.metric.name"` keeps working and `sum by (metric)` stays *exactly* correct — only the per-tag breakdown is lost.
 - Exceed the far tighter **name** budget and the write collapses to `metric="_overflow"`. This is the only case where `metric` collapses, and it means the plugin is minting names faster than any rule author could enumerate them.
@@ -1677,8 +1677,9 @@ That asymmetry is load-bearing. `metric` is the label rule authors filter on, wh
 | `label_budget` | tag-value budget exhausted; promoted labels dropped, increment still on the metric's series |
 | `name_budget` | metric-name budget exhausted; folded into the `_overflow` series |
 | `value_truncated` | a promoted label value exceeded 128 code points and was cut to fit; the increment landed with the shortened value, and two values sharing that prefix collapse into one series |
+| `value_sanitized` | a promoted label value carried control characters, which were stripped before publishing; the increment landed with the stripped value |
 
-The `metric` label is populated only where its cardinality is already bounded: `label_budget` and `value_truncated` carry the real metric name, `name_budget` carries `_overflow` (never the rejected name, which is the unbounded input that tier exists to refuse), and `bad_name`/`bad_value` leave it empty for that same reason. So `sum by (metric) (paperclip_plugin_metric_dropped_total)` buckets the two shape rejections under `metric=""` by design.
+The `metric` label is populated only where its cardinality is already bounded: `label_budget`, `value_truncated` and `value_sanitized` carry the real metric name, `name_budget` carries `_overflow` (never the rejected name, which is the unbounded input that tier exists to refuse), and `bad_name`/`bad_value` leave it empty for that same reason. So `sum by (metric) (paperclip_plugin_metric_dropped_total)` buckets the two shape rejections under `metric=""` by design.
 
 If a metric you expect is missing, or its per-tag breakdown looks wrong, query that series first — it is the answer, and it exists so the answer never requires reading host source.
 
