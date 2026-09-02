@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   PLUGIN_METRIC_CARDINALITY_BUDGET,
   PLUGIN_METRIC_DROPPED_METRIC,
+  PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH,
   PLUGIN_METRIC_NAME_BUDGET,
   PLUGIN_METRIC_OVERFLOW_NAME,
   PLUGIN_METRIC_TOTAL_METRIC,
@@ -87,6 +88,66 @@ describe("recordPluginMetric — exposition", () => {
     expect(series).toHaveLength(1);
     expect(series[0]).not.toContain("company_id");
     expect(series[0]).not.toContain("aaced805");
+  });
+});
+
+describe("recordPluginMetric — promoted label values", () => {
+  it("truncates an over-long promoted value rather than dropping the label", async () => {
+    // `alertname` is taken verbatim from the inbound Alertmanager webhook, so
+    // its length is attacker-influenced in a way the metric name is not.
+    // Truncate rather than drop: a truncated alertname still identifies the
+    // alert, where a dropped label loses the breakdown entirely.
+    const long = `Alert${"A".repeat(400)}`;
+    recordPluginMetric({
+      ...PLUGIN,
+      name: "alertmanager.alert.error",
+      value: 1,
+      tags: { alertname: long },
+      declaredLabels: ["alertname"],
+    });
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series).toHaveLength(1);
+    const rendered = /alertname="([^"]*)"/.exec(series[0] ?? "")?.[1] ?? "";
+    expect(rendered).toHaveLength(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH);
+    expect(rendered).toBe(long.slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH));
+  });
+
+  it("charges two values sharing a truncated prefix ONE combination", async () => {
+    // The ledger must key on what is actually published. If it keyed on the
+    // untruncated value, two values rendering to one series would each consume
+    // a budget slot -- letting a plugin exhaust its own budget with values that
+    // are indistinguishable in the exposition.
+    const prefix = "B".repeat(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH);
+    for (const suffix of ["-one", "-two"]) {
+      recordPluginMetric({
+        ...PLUGIN,
+        name: "alertmanager.alert.error",
+        value: 1,
+        tags: { alertname: `${prefix}${suffix}` },
+        declaredLabels: ["alertname"],
+      });
+    }
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series).toHaveLength(1);
+    expect(series[0]?.trimEnd().endsWith(" 2")).toBe(true);
+    expect(await seriesFor(PLUGIN_METRIC_DROPPED_METRIC)).toHaveLength(0);
+  });
+
+  it("treats a non-primitive tag as absent, not as \"[object Object]\"", async () => {
+    recordPluginMetric({
+      ...PLUGIN,
+      name: "alertmanager.alert.error",
+      value: 1,
+      tags: { alertname: { nested: "object" } as unknown as string },
+      declaredLabels: ["alertname"],
+    });
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series).toHaveLength(1);
+    expect(series[0]).not.toContain("object Object");
+    expect(series[0]).not.toContain("alertname=");
   });
 });
 

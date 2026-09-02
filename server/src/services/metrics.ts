@@ -769,6 +769,29 @@ export const PLUGIN_METRIC_NAME_REGEX = /^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$/;
 export const PLUGIN_METRIC_NAME_MAX_LENGTH = 64;
 
 /**
+ * Ceiling on the length of a *promoted tag value*, applying the same reasoning
+ * as {@link PLUGIN_METRIC_NAME_MAX_LENGTH} to the other axis — and the one that
+ * actually crosses a trust boundary. The metric name is plugin source; a
+ * promoted value is not. `alertname` is `alert.labels.alertname` taken verbatim
+ * from the inbound Alertmanager webhook, so its length is chosen by whoever
+ * authored the firing rule, not by us.
+ *
+ * The *count* of retained values is already bounded by
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET}, so an unbounded length is bloat
+ * rather than a breach: prom-client never retires a label combination, so each
+ * one is re-serialised on every scrape for the process lifetime. Truncating is
+ * strictly better than dropping — a truncated `alertname` still identifies the
+ * alert to a human reading the series, where a dropped label loses the
+ * breakdown entirely.
+ *
+ * 128 is comfortably above the longest alertname firing fleet-wide when this
+ * was written (59 chars, `PhysicalInfra...NearConfiguredMax`) while keeping the
+ * worst case bounded at roughly
+ * `CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin.
+ */
+export const PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH = 128;
+
+/**
  * Ceiling on distinct metric *names* a single plugin may occupy, per process
  * lifetime. Past it, further new names collapse into one `metric="_overflow"`
  * series.
@@ -1522,7 +1545,7 @@ let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let pluginMetric: Counter<
   "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
 > | null = null;
-let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason"> | null = null;
+let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric"> | null = null;
 
 /**
  * Per-plugin ledger of `(metric, promoted-label-values)` combinations already
@@ -1591,7 +1614,7 @@ function ensureRegistry(): {
   pluginMetricCounter: Counter<
     "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
   >;
-  pluginMetricDroppedCounter: Counter<"plugin_id" | "plugin_key" | "reason">;
+  pluginMetricDroppedCounter: Counter<"plugin_id" | "plugin_key" | "reason" | "metric">;
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
@@ -2152,8 +2175,15 @@ function ensureRegistry(): {
         + "its metric-NAME budget, so this write folded into the overflow "
         + "series). A drop is never silent: this is the series that answers "
         + "'why is my plugin metric missing', which otherwise required reading "
-        + "host source.",
-      labelNames: ["plugin_id", "plugin_key", "reason"],
+        + "host source. The 'metric' label is populated ONLY for the two budget "
+        + "reasons, where its cardinality is already bounded: 'label_budget' "
+        + "carries the real name (it cleared the name budget, so it is one of "
+        + "at most " + String(PLUGIN_METRIC_NAME_BUDGET) + "), and 'name_budget' "
+        + "carries \"" + PLUGIN_METRIC_OVERFLOW_NAME + "\" -- NOT the rejected "
+        + "name, which is by definition the unbounded thing that tier is "
+        + "refusing. 'bad_name' and 'bad_value' leave it empty for the same "
+        + "reason: a rejected name must never become a label value.",
+      labelNames: ["plugin_id", "plugin_key", "reason", "metric"],
       registers: [registry],
     });
     pluginStatusCollectorLastSuccess = new Gauge({
@@ -3097,7 +3127,17 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
         // Only here does `metric` collapse: the plugin is minting names
         // faster than any rule author could enumerate them, so there is no
         // per-name series worth preserving.
-        metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "name_budget" });
+        //
+        // The drop is labelled `_overflow`, matching the series the increment
+        // lands on -- deliberately NOT the rejected name. That name is the
+        // 51st-or-later distinct one, i.e. exactly the unbounded input this
+        // tier exists to refuse; carrying it here would leak the bound onto
+        // the drop series instead.
+        metrics.pluginMetricDroppedCounter.inc({
+          ...identity,
+          reason: "name_budget",
+          metric: PLUGIN_METRIC_OVERFLOW_NAME,
+        });
         metrics.pluginMetricCounter.inc(
           { ...identity, metric: PLUGIN_METRIC_OVERFLOW_NAME },
           value,
@@ -3115,8 +3155,16 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
     const comboParts: string[] = [name];
     for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
       const raw = declared.has(key) ? input.tags?.[key] : undefined;
+      // Only primitives promote. `String(raw)` on an object yields the constant
+      // "[object Object]", which is not a breach (it is low-cardinality) but is
+      // a label value that identifies nothing -- worse than an absent label,
+      // because a rule author reading the series cannot tell it from a real
+      // value. An array would flatten to a comma-joined string of unbounded
+      // arity. Both are treated as "not supplied".
       const promoted =
-        raw === undefined || raw === null ? "" : String(raw);
+        typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean"
+          ? String(raw).slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH)
+          : "";
       if (promoted.length > 0) labels[key] = promoted;
       comboParts.push(promoted);
     }
@@ -3140,8 +3188,14 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
         // lands on the plugin's real per-name series, so `sum by (metric)`
         // stays exactly correct across overflow; only the per-tag breakdown is
         // lost, and the drop counter says so rather than leaving it to be
-        // inferred from a flat graph.
-        metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "label_budget" });
+        // inferred from a flat graph. Safe to label with the real name: it
+        // already cleared tier 1, so it is one of at most
+        // PLUGIN_METRIC_NAME_BUDGET values.
+        metrics.pluginMetricDroppedCounter.inc({
+          ...identity,
+          reason: "label_budget",
+          metric: name,
+        });
         metrics.pluginMetricCounter.inc({ ...identity, metric: name }, value);
         return;
       }
