@@ -3248,6 +3248,9 @@ describe("realizeExecutionWorkspace", () => {
     await fs.mkdir(path.dirname(managedCwd), { recursive: true });
     const managedFixture = await createTempRepoWithSubmodule();
     await fs.rename(managedFixture.repoRoot, managedCwd);
+    // The rebind only accepts an origin-verified managed checkout, so the
+    // fixture needs the expected remote or findVerified...Checkout returns null.
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
 
     const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
     try {
@@ -3312,6 +3315,9 @@ describe("realizeExecutionWorkspace", () => {
     await fs.mkdir(path.dirname(managedCwd), { recursive: true });
     const managedFixture = await createTempRepoWithSubmodule();
     await fs.rename(managedFixture.repoRoot, managedCwd);
+    // The rebind only accepts an origin-verified managed checkout, so the
+    // fixture needs the expected remote or findVerified...Checkout returns null.
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
 
     const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
     try {

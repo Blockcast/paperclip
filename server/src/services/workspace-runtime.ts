@@ -3771,6 +3771,51 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+// Kept out of realizeExecutionWorkspace's non-worktree branch on purpose: that
+// branch is the identity seam for the default strategy, and
+// git-checkout-identity.test.ts asserts the stampCheckoutIdentity call stays
+// within a fixed window of the branch head. Inlining this logic pushes it out.
+async function rebindProjectPrimaryToManagedCheckout(input: {
+  base: ExecutionWorkspaceInput;
+  agent: ExecutionWorkspaceAgentRef;
+  recorder: WorkspaceOperationRecorder | null;
+}): Promise<RealizedExecutionWorkspace | null> {
+  const expectedRepoUrl = asString(input.base.repoUrl, "").trim();
+  const projectId = asString(input.base.projectId, "").trim();
+  const companyId = asString(input.agent.companyId, "").trim();
+  const managedCwd = expectedRepoUrl && projectId && companyId
+    ? await findVerifiedManagedProjectPrimaryCheckout({
+        companyId,
+        projectId,
+        expectedRepoUrl,
+        currentCwd: input.base.baseCwd,
+      })
+    : null;
+  if (!managedCwd) {
+    await validateProjectPrimaryRepoOrigin({ cwd: input.base.baseCwd, expectedRepoUrl });
+    return null;
+  }
+  const submoduleWarnings = await ensureGitSubmodulesReady({
+    cwd: managedCwd,
+    recorder: input.recorder,
+  });
+  return {
+    ...input.base,
+    baseCwd: managedCwd,
+    cwd: managedCwd,
+    strategy: "project_primary",
+    branchName: null,
+    worktreePath: null,
+    warnings: [
+      `Rebound stale project_primary cwd "${input.base.baseCwd}" to managed checkout "${managedCwd}".`,
+      ...submoduleWarnings,
+      ...(await stampCheckoutIdentity(managedCwd, input.agent)),
+    ],
+    created: false,
+    baseRefSha: null,
+  };
+}
+
 export async function realizeExecutionWorkspace(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -3789,36 +3834,12 @@ export async function realizeExecutionWorkspace(input: {
     const baseIsGitCheckout = await isGitCheckout(input.base.baseCwd);
     let warnings: string[] = [];
     if (input.base.source === "project_primary" && baseIsGitCheckout) {
-      const expectedRepoUrl = asString(input.base.repoUrl, "").trim();
-      const projectId = asString(input.base.projectId, "").trim();
-      const companyId = asString(input.agent.companyId, "").trim();
-      const managedCwd = expectedRepoUrl && projectId && companyId
-        ? await findVerifiedManagedProjectPrimaryCheckout({
-            companyId,
-            projectId,
-            expectedRepoUrl,
-            currentCwd: input.base.baseCwd,
-          })
-        : null;
-      if (managedCwd) {
-        warnings.push(`Rebound stale project_primary cwd "${input.base.baseCwd}" to managed checkout "${managedCwd}".`);
-        const submoduleWarnings = await ensureGitSubmodulesReady({
-          cwd: managedCwd,
-          recorder: input.recorder ?? null,
-        });
-        return {
-          ...input.base,
-          baseCwd: managedCwd,
-          cwd: managedCwd,
-          strategy: "project_primary",
-          branchName: null,
-          worktreePath: null,
-          warnings: [...warnings, ...submoduleWarnings, ...(await stampCheckoutIdentity(managedCwd, input.agent))],
-          created: false,
-          baseRefSha: null,
-        };
-      }
-      await validateProjectPrimaryRepoOrigin({ cwd: input.base.baseCwd, expectedRepoUrl });
+      const rebound = await rebindProjectPrimaryToManagedCheckout({
+        base: input.base,
+        agent: input.agent,
+        recorder: input.recorder ?? null,
+      });
+      if (rebound) return rebound;
     }
     if (baseIsGitCheckout) {
       warnings = await ensureGitSubmodulesReady({
