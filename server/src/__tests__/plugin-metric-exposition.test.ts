@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   PLUGIN_METRIC_CARDINALITY_BUDGET,
   PLUGIN_METRIC_DROPPED_METRIC,
+  PLUGIN_METRIC_NAME_BUDGET,
   PLUGIN_METRIC_OVERFLOW_NAME,
   PLUGIN_METRIC_TOTAL_METRIC,
   __resetMetricsForTest,
@@ -179,7 +180,14 @@ describe("recordPluginMetric — two-sided label gate", () => {
 });
 
 describe("recordPluginMetric — cardinality budget", () => {
-  it("collapses a hostile high-cardinality tag set into one overflow series", async () => {
+  it("keeps the metric label when a hostile tag set exhausts the label budget", async () => {
+    // THE regression guard for this feature's whole purpose. The first cut of
+    // this change collapsed `metric` into "_overflow" here, which silently
+    // broke any rule matching metric="alertmanager.alert.error" — a narrower
+    // re-run of the PEN-2579 failure mode (a rule watching a series that is
+    // not reliably there). Measured at the time: 155 distinct alertnames fired
+    // fleet-wide in 7 days against a 100 budget, so this path is the expected
+    // steady state, not a tail case.
     const OVER = PLUGIN_METRIC_CARDINALITY_BUDGET + 50;
     for (let i = 0; i < OVER; i += 1) {
       recordPluginMetric({
@@ -192,21 +200,74 @@ describe("recordPluginMetric — cardinality budget", () => {
     }
 
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
-    // Exactly the budget, plus the single overflow series. An exact count is
-    // deliberate: an off-by-one in the budget check shows up here and nowhere
-    // else.
+    // The budget's worth of fully-labelled combinations, plus ONE label-dropped
+    // series carrying the same metric name. An exact count is deliberate: an
+    // off-by-one in the budget check shows up here and nowhere else.
     expect(series).toHaveLength(PLUGIN_METRIC_CARDINALITY_BUDGET + 1);
+
+    // Nothing collapsed onto the name axis — the name budget was never touched.
+    expect(
+      series.filter((line) => line.includes(`metric="${PLUGIN_METRIC_OVERFLOW_NAME}"`)),
+    ).toHaveLength(0);
+
+    // The degraded write kept its metric label and lost only its alertname, so
+    // an alert rule filtering on the metric name still matches it.
+    const degraded = series.filter(
+      (line) =>
+        line.includes('metric="alertmanager.alert.error"') && !line.includes("alertname="),
+    );
+    expect(degraded).toHaveLength(1);
+    // Degraded, not discarded: all 50 over-budget writes are still counted.
+    expect(degraded[0]?.trimEnd().endsWith(" 50")).toBe(true);
+
+    const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('reason="label_budget"');
+    expect(dropped[0]?.trimEnd().endsWith(" 50")).toBe(true);
+  });
+
+  it("keeps sum-by-metric exact across label-budget overflow", async () => {
+    // The property that makes the label axis the right one to degrade: the
+    // per-tag breakdown is lost, but the metric's TOTAL is untouched, so a
+    // rate() alert on the metric name reads the true rate rather than a
+    // truncated one.
+    const OVER = PLUGIN_METRIC_CARDINALITY_BUDGET + 37;
+    for (let i = 0; i < OVER; i += 1) {
+      recordPluginMetric({
+        ...PLUGIN,
+        name: "alertmanager.alert.error",
+        value: 1,
+        tags: { alertname: `Alert-${i}` },
+        declaredLabels: ["alertname"],
+      });
+    }
+
+    const total = (await seriesFor(PLUGIN_METRIC_TOTAL_METRIC))
+      .filter((line) => line.includes('metric="alertmanager.alert.error"'))
+      .reduce((sum, line) => sum + Number(line.trimEnd().split(" ").pop()), 0);
+    expect(total).toBe(OVER);
+  });
+
+  it("collapses to the overflow series only when the metric NAME budget is exhausted", async () => {
+    // The one case where `metric` may collapse: a plugin minting names faster
+    // than any rule author could enumerate them. Distinct from the label budget
+    // above, and reported under its own reason so the two are never conflated.
+    const OVER = PLUGIN_METRIC_NAME_BUDGET + 10;
+    for (let i = 0; i < OVER; i += 1) {
+      recordPluginMetric({ ...PLUGIN, name: `churn.name_${i}`, value: 1 });
+    }
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series).toHaveLength(PLUGIN_METRIC_NAME_BUDGET + 1);
     const overflow = series.filter((line) =>
       line.includes(`metric="${PLUGIN_METRIC_OVERFLOW_NAME}"`),
     );
     expect(overflow).toHaveLength(1);
-    // Collapsed, not discarded: all 50 over-budget writes are still counted.
-    expect(overflow[0]?.trimEnd().endsWith(" 50")).toBe(true);
+    expect(overflow[0]?.trimEnd().endsWith(" 10")).toBe(true);
 
     const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
     expect(dropped).toHaveLength(1);
-    expect(dropped[0]).toContain('reason="budget"');
-    expect(dropped[0]?.trimEnd().endsWith(" 50")).toBe(true);
+    expect(dropped[0]).toContain('reason="name_budget"');
   });
 
   it("budgets each plugin independently", async () => {
@@ -272,12 +333,17 @@ describe("recordPluginMetric — cardinality budget", () => {
 
     const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
     expect(dropped).toHaveLength(1);
-    expect(dropped[0]).toContain('reason="budget"');
+    expect(dropped[0]).toContain('reason="label_budget"');
     expect(dropped[0]?.trimEnd().endsWith(" 1")).toBe(true);
 
+    // B degraded to the label-dropped series for "m" rather than collapsing the
+    // name — no _overflow, because the name budget was never in play here.
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
     expect(series.filter((l) => l.includes(`metric="${PLUGIN_METRIC_OVERFLOW_NAME}"`)))
-      .toHaveLength(1);
+      .toHaveLength(0);
+    expect(
+      series.filter((l) => l.includes('metric="m"') && !l.includes("action=")),
+    ).toHaveLength(1);
   });
 
   it("does not consume a new slot when the same combination repeats", async () => {

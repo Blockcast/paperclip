@@ -1663,13 +1663,19 @@ Keys outside the gate are **not** dropped from the metric — only from its labe
 
 `company_id` is never a label (unbounded per tenant). It stays on the `plugin_logs` row.
 
-**Cardinality is bounded, and exhaustion is visible rather than silent.** Each plugin may occupy at most 100 distinct `(metric, promoted-label-values)` combinations per worker process. Beyond that, further new combinations collapse into a single `metric="_overflow"` series — they are still counted, just not broken out. Every rejection or collapse increments `paperclip_plugin_metric_dropped_total{reason}`:
+**Cardinality is bounded in two tiers, and the tiers degrade on different axes on purpose.** Per worker process a plugin may occupy at most **50 distinct metric names** and **100 distinct `(metric, promoted-label-values)` combinations**.
+
+- Exceed the **combination** budget and a write **keeps its `metric` label and drops its promoted labels**. The increment still lands on that metric's own series, so an alert rule matching `metric="your.metric.name"` keeps working and `sum by (metric)` stays *exactly* correct — only the per-tag breakdown is lost.
+- Exceed the far tighter **name** budget and the write collapses to `metric="_overflow"`. This is the only case where `metric` collapses, and it means the plugin is minting names faster than any rule author could enumerate them.
+
+That asymmetry is load-bearing. `metric` is the label rule authors filter on, while promoted tag values (`alertname`, say) are the genuinely unbounded axis — so collapsing `metric` to protect against tag churn would silently break the rule the metric exists to feed, which is the failure mode this whole feature was built to end. Nothing is ever discarded; every rejection or degradation increments `paperclip_plugin_metric_dropped_total{reason}`:
 
 | `reason` | meaning |
 |---|---|
 | `bad_name` | name failed shape (`^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$`) or exceeded 64 chars |
 | `bad_value` | value was non-finite or negative |
-| `budget` | per-plugin cardinality budget exhausted; folded into the overflow series |
+| `label_budget` | tag-value budget exhausted; promoted labels dropped, increment still on the metric's series |
+| `name_budget` | metric-name budget exhausted; folded into the `_overflow` series |
 
 If a metric you expect is missing, query that series first — it is the answer, and it exists so the answer never requires reading host source.
 

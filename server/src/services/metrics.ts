@@ -712,22 +712,59 @@ export const PLUGIN_METRIC_NAME_REGEX = /^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$/;
 export const PLUGIN_METRIC_NAME_MAX_LENGTH = 64;
 
 /**
- * Hard ceiling on distinct `(metric, promoted-label-values)` combinations a
- * single plugin may occupy, **per process lifetime**. Past it, further new
- * combinations collapse into one `metric="_overflow"` series rather than being
- * discarded, so an over-cardinality plugin degrades to an aggregate instead of
- * going dark.
+ * Ceiling on distinct metric *names* a single plugin may occupy, per process
+ * lifetime. Past it, further new names collapse into one `metric="_overflow"`
+ * series.
  *
- * Bounded over combinations *ever observed*, not currently active, because
- * prom-client never retires a label combination — bounding "active" would
- * bound nothing. The budget resets on a worker restart, which is correct for a
+ * This tier exists because a metric name can be built by interpolation
+ * (`demo.${name}` in kitchen-sink, `slack.tool.${name}.error` in the Slack
+ * plugin), so the name axis is not inherently bounded by plugin source. It is
+ * nonetheless *enumerable* and small in practice — the alertmanager plugin
+ * uses 19 — which is why it gets a tight budget of its own rather than sharing
+ * one with the tag-value axis.
+ */
+export const PLUGIN_METRIC_NAME_BUDGET = 50;
+
+/**
+ * Ceiling on distinct `(metric, promoted-label-values)` combinations a single
+ * plugin may occupy, per process lifetime. Past it, a write **keeps its
+ * `metric` label and drops its promoted labels**, so it still lands on the
+ * plugin's real per-name series.
+ *
+ * The two tiers degrade on different axes, and that asymmetry is the whole
+ * point (PEN-2799 review of its own first cut):
+ *
+ * - The `metric` label is what an alert rule filters on. A rule reads
+ *   `paperclip_plugin_metric_total{metric="alertmanager.alert.error"}`, so
+ *   collapsing `metric` on overflow silently makes that rule stop matching —
+ *   a narrower re-run of the PEN-2579 failure mode (a rule watching a series
+ *   that is not reliably there), reintroduced by the bound meant to prevent
+ *   it.
+ * - Promoted tag values are the genuinely unbounded axis: `alertname` is
+ *   derived from alert labels, and 155 distinct alertnames fired fleet-wide in
+ *   the seven days before this was written, against 16 alertmanager metric
+ *   names that carry it. Exhaustion is the expected steady state within days
+ *   of a worker start, not a tail case.
+ *
+ * So the unbounded axis is the one that degrades, and the bounded, alertable
+ * one survives. Because a label-dropped write lands on the same series as a
+ * no-tag write of that metric, `sum by (metric)` stays **exactly** correct
+ * across overflow — only the per-tag breakdown is lost, and
+ * `paperclip_plugin_metric_dropped_total{reason="label_budget"}` says so.
+ *
+ * Both tiers are bounded over values *ever observed*, not currently active,
+ * because prom-client never retires a label combination — bounding "active"
+ * would bound nothing. They reset on a worker restart, which is correct for a
  * counter and does mean a plugin churning names gets a fresh allowance each
  * restart; the alternative is persisting the ledger, which is not worth a DB
  * write per metric.
+ *
+ * Worst case per plugin is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series
+ * + this many full combinations + one `_overflow`, i.e. 151.
  */
 export const PLUGIN_METRIC_CARDINALITY_BUDGET = 100;
 
-/** Label value that over-budget combinations collapse into. */
+/** Label value that over-name-budget writes collapse into. */
 export const PLUGIN_METRIC_OVERFLOW_NAME = "_overflow";
 
 /**
@@ -1424,6 +1461,14 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason"> | null =
  * appear in a Prometheus label value, so the key is injective.
  */
 const pluginMetricCombinations = new Map<string, Set<string>>();
+
+/**
+ * Per-plugin ledger of metric *names* already published, enforcing
+ * {@link PLUGIN_METRIC_NAME_BUDGET}. Kept separate from
+ * {@link pluginMetricCombinations} because the two tiers bound different axes
+ * and collapse to different targets — see PLUGIN_METRIC_CARDINALITY_BUDGET.
+ */
+const pluginMetricNames = new Map<string, Set<string>>();
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
@@ -1992,8 +2037,12 @@ function ensureRegistry(): {
         + "the plugin manifest's metricLabels and "
         + "PLUGIN_METRIC_PROMOTABLE_TAG_KEYS; unpromoted tags stay on the "
         + "plugin_logs row. company_id is deliberately not a label (unbounded "
-        + "per tenant). Combinations beyond the per-plugin budget collapse into "
-        + "metric=\"" + PLUGIN_METRIC_OVERFLOW_NAME + "\" rather than vanishing.",
+        + "per tenant). Two cardinality tiers degrade on DIFFERENT axes: past "
+        + "the per-plugin tag-value budget a write keeps its 'metric' label and "
+        + "drops its promoted labels, so a rule matching metric=\"<name>\" keeps "
+        + "working and sum by (metric) stays exact; only a plugin exceeding the "
+        + "much tighter metric-NAME budget collapses to metric=\""
+        + PLUGIN_METRIC_OVERFLOW_NAME + "\". Nothing is ever discarded.",
       labelNames: [
         "plugin_id",
         "plugin_key",
@@ -2008,10 +2057,14 @@ function ensureRegistry(): {
         "Plugin metric writes not published as-submitted, by reason "
         + "(PEN-2799): 'bad_name' (name failed shape/length validation), "
         + "'bad_value' (non-finite or negative -- ctx.metrics.write is a "
-        + "counter increment), 'budget' (per-plugin cardinality budget "
-        + "exhausted, so the write was folded into the overflow series). A drop "
-        + "is never silent: this is the series that answers 'why is my plugin "
-        + "metric missing', which otherwise required reading host source.",
+        + "counter increment), 'label_budget' (per-plugin tag-value budget "
+        + "exhausted, so the promoted labels were dropped but the increment "
+        + "still landed on the metric's own series -- totals stay correct, only "
+        + "the per-tag breakdown is lost), 'name_budget' (the plugin exceeded "
+        + "its metric-NAME budget, so this write folded into the overflow "
+        + "series). A drop is never silent: this is the series that answers "
+        + "'why is my plugin metric missing', which otherwise required reading "
+        + "host source.",
       labelNames: ["plugin_id", "plugin_key", "reason"],
       registers: [registry],
     });
@@ -2928,6 +2981,29 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       return;
     }
 
+    // Tier 1 — the name axis. Bounded on its own so that exhausting the
+    // (much larger) tag-value axis below can never cost a plugin its
+    // per-name series, which is what alert rules match on.
+    let seenNames = pluginMetricNames.get(pluginId);
+    if (!seenNames) {
+      seenNames = new Set<string>();
+      pluginMetricNames.set(pluginId, seenNames);
+    }
+    if (!seenNames.has(name)) {
+      if (seenNames.size >= PLUGIN_METRIC_NAME_BUDGET) {
+        // Only here does `metric` collapse: the plugin is minting names
+        // faster than any rule author could enumerate them, so there is no
+        // per-name series worth preserving.
+        metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "name_budget" });
+        metrics.pluginMetricCounter.inc(
+          { ...identity, metric: PLUGIN_METRIC_OVERFLOW_NAME },
+          value,
+        );
+        return;
+      }
+      seenNames.add(name);
+    }
+
     // Two-sided gate: manifest-declared AND platform-promotable.
     const declared = new Set(
       (input.declaredLabels ?? []).map((key) => String(key)),
@@ -2942,9 +3018,9 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       comboParts.push(promoted);
     }
 
-    // Budget is over combinations ever observed. `combo` is NUL-joined so two
-    // distinct combinations cannot render to one ledger key (see
-    // pluginMetricCombinations) — a collision there would hand out a free
+    // Tier 2 — the tag-value axis, over combinations ever observed. `combo` is
+    // NUL-joined so two distinct combinations cannot render to one ledger key
+    // (see pluginMetricCombinations) — a collision there would hand out a free
     // series and leak the bound.
     const combo = comboParts.join("\0");
     let seen = pluginMetricCombinations.get(pluginId);
@@ -2954,14 +3030,16 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
     }
     if (!seen.has(combo)) {
       if (seen.size >= PLUGIN_METRIC_CARDINALITY_BUDGET) {
-        // Collapse, don't discard: an over-cardinality plugin degrades to one
-        // aggregate series instead of going dark, and the drop is counted so
-        // the collapse is visible rather than inferred from a flat graph.
-        metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "budget" });
-        metrics.pluginMetricCounter.inc(
-          { ...identity, metric: PLUGIN_METRIC_OVERFLOW_NAME },
-          value,
-        );
+        // Drop the LABELS, keep the `metric`. The name already cleared tier 1,
+        // so its series is bounded and an alert rule matching on
+        // `metric="<name>"` keeps working — which is the entire reason this
+        // tier collapses on a different axis than the one above. The increment
+        // lands on the plugin's real per-name series, so `sum by (metric)`
+        // stays exactly correct across overflow; only the per-tag breakdown is
+        // lost, and the drop counter says so rather than leaving it to be
+        // inferred from a flat graph.
+        metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "label_budget" });
+        metrics.pluginMetricCounter.inc({ ...identity, metric: name }, value);
         return;
       }
       seen.add(combo);
@@ -3159,6 +3237,7 @@ export function __resetMetricsForTest(): void {
   pluginMetric = null;
   pluginMetricDropped = null;
   pluginMetricCombinations.clear();
+  pluginMetricNames.clear();
   pluginStatusCollectorLastSuccess = null;
   prReviewQueueWait = null;
   authRequest = null;
