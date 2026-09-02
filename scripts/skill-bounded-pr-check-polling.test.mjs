@@ -69,7 +69,7 @@ const EXECUTABLE_BLOCKS = () => [
 ];
 
 /**
- * A stub `gh` (and optionally `sleep`) on a private PATH.
+ * A stub `gh` / `glab` (and optionally `sleep`) on a private PATH.
  *
  * `checksRc` / `prViewRc` are consumed one entry per call and the last entry
  * repeats, so a test can say "pending, then green" without racing anything.
@@ -82,6 +82,12 @@ function makeStubs({
   statusJson = '{"statuses":[]}',
   apiRc = [0],
   stubSleep = false,
+  // GitLab side. `pipelineStatuses` is the newline-delimited output of
+  // `glab api .../pipelines --jq '.[].status'`; [] means "no pipelines exist".
+  mrState = "opened",
+  mrStateRc = [0],
+  pipelineStatuses = ["success"],
+  pipelinesRc = [0],
 } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "gh-stub-"));
   const bin = path.join(dir, "bin");
@@ -92,6 +98,13 @@ function makeStubs({
   writeFileSync(path.join(dir, "check-runs.json"), checkRunsJson);
   writeFileSync(path.join(dir, "status.json"), statusJson);
   writeFileSync(path.join(dir, "pr-state"), prState);
+  writeFileSync(path.join(dir, "mr-state-rc"), mrStateRc.join("\n") + "\n");
+  writeFileSync(path.join(dir, "pipelines-rc"), pipelinesRc.join("\n") + "\n");
+  writeFileSync(path.join(dir, "mr-state"), mrState);
+  writeFileSync(
+    path.join(dir, "pipeline-statuses"),
+    pipelineStatuses.length ? pipelineStatuses.join("\n") + "\n" : "",
+  );
 
   // pop <file> — read the next line, leaving the last one in place so it
   // repeats for every subsequent call.
@@ -134,6 +147,40 @@ exit 99
 `;
   writeFileSync(path.join(bin, "gh"), gh);
   chmodSync(path.join(bin, "gh"), 0o755);
+
+  // Same shape as the gh stub: log the call, pop a return code, print the
+  // fixture. The two glab endpoints the GitLab loop touches are distinguished
+  // by path suffix, so a test can assert the pipelines endpoint was never hit.
+  const glab = `#!/usr/bin/env bash
+d=${JSON.stringify(dir)}
+printf '%s\\n' "glab $*" >>"$d/calls.log"
+pop() {
+  local f=$1 line
+  line=$(head -n 1 "$f")
+  if [[ $(wc -l <"$f") -gt 1 ]]; then tail -n +2 "$f" >"$f.tmp" && mv "$f.tmp" "$f"; fi
+  printf '%s' "$line"
+}
+if [[ $1 == api ]]; then
+  case "$2" in
+    */pipelines)
+      rc=$(pop "$d/pipelines-rc")
+      [[ $rc != 0 ]] && { echo "glab: 500 Internal Server Error" >&2; exit "$rc"; }
+      cat "$d/pipeline-statuses"
+      exit 0
+      ;;
+    *)
+      rc=$(pop "$d/mr-state-rc")
+      [[ $rc != 0 ]] && { echo "glab: could not resolve MR" >&2; exit "$rc"; }
+      cat "$d/mr-state"; echo
+      exit 0
+      ;;
+  esac
+fi
+echo "glab stub: unhandled: $*" >&2
+exit 99
+`;
+  writeFileSync(path.join(bin, "glab"), glab);
+  chmodSync(path.join(bin, "glab"), 0o755);
 
   if (stubSleep) {
     // Records the requested duration and returns immediately, so the interval
@@ -511,4 +558,101 @@ test("jq is available for the prcheckloop classifier", () => {
   // The loop's success exit depends on jq; a host without it would fall
   // through to the deadline, which is the bug this test suite exists to stop.
   assert.doesNotThrow(() => execFileSync("jq", ["--version"], { stdio: "ignore" }));
+});
+
+// ---------------------------------------------------------------------------
+// GitLab loop. The finding these cover: the loop previously tested for
+// running/pending and then only for failed/canceled, so `manual`, `scheduled`,
+// and anything GitLab adds later landed in NEITHER bucket — and "not pending
+// and not failed" is the green path.
+// ---------------------------------------------------------------------------
+
+const GL_ENV = { MR_IID: "42", CHECK_DEADLINE_SEC: "900", CHECK_INTERVAL_SEC: "60" };
+
+function runGitLab(opts, env = {}) {
+  const stubs = makeStubs(opts);
+  return { stubs, r: runBlock(CHECK_PR_GITLAB(), { stubs, env: { ...GL_ENV, ...env } }) };
+}
+
+test("check-pr GitLab: a manual pipeline is NOT green", () => {
+  // The headline case. A pipeline parked on a manual gate is terminal until a
+  // human clicks play — it is neither success nor something a longer deadline
+  // fixes.
+  const { r } = runGitLab({ pipelineStatuses: ["manual"] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /manual/);
+});
+
+test("check-pr GitLab: a scheduled pipeline is NOT green", () => {
+  const { r } = runGitLab({ pipelineStatuses: ["scheduled"] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /scheduled/);
+});
+
+test("check-pr GitLab: an unknown pipeline status is NOT green", () => {
+  const { r } = runGitLab({ pipelineStatuses: ["teleported"] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  // Name the value, so "this script is out of date" stays distinguishable
+  // from "CI is red".
+  assert.match(r.stderr, /teleported/);
+});
+
+test("check-pr GitLab: a manual pipeline alongside successes is still NOT green", () => {
+  // The realistic shape: most jobs pass and one deploy stage waits on a human.
+  // A loop that only asks "is anything running?" reports this as green.
+  const { r } = runGitLab({ pipelineStatuses: ["success", "success", "manual"] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /manual/);
+});
+
+test("check-pr GitLab: an empty pipeline list is NOT green", () => {
+  // "Every pipeline is terminal and green" is vacuously true over zero
+  // pipelines, which is the one answer this loop must never invent.
+  const { r } = runGitLab({ pipelineStatuses: [] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: every documented success state reaches exit 0", () => {
+  // Discriminator. Fail-closed is only correct if the documented green states
+  // still pass; `skipped` is the easy one to drop when enumerating.
+  const { r } = runGitLab({ pipelineStatuses: ["success", "skipped"] });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: every documented pending state keeps polling", () => {
+  // Discriminator on the pending side: these must NOT be swept into the fatal
+  // arm, or the loop exits 1 on a healthy MR whose pipeline has not started.
+  for (const status of ["created", "waiting_for_resource", "preparing", "pending", "running"]) {
+    const { r } = runGitLab({ pipelineStatuses: [status] }, { CHECK_DEADLINE_SEC: "0" });
+    assert.equal(r.status, 124, `${status}: ${r.stdout}${r.stderr}`);
+  }
+});
+
+test("check-pr GitLab: a failed pipeline exits 1", () => {
+  const { r } = runGitLab({ pipelineStatuses: ["failed"] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: a merged MR returns 3 without querying pipelines", () => {
+  // Asserting the pipelines endpoint was never hit, not just the exit code —
+  // the point of the lifecycle guard is to not start polling at all.
+  const { stubs, r } = runGitLab({ mrState: "merged" });
+  assert.equal(r.status, 3, `${r.stdout}${r.stderr}`);
+  const calls = readFileSync(path.join(stubs.dir, "calls.log"), "utf8");
+  assert.ok(!calls.includes("/pipelines"), `queried pipelines anyway:\n${calls}`);
+});
+
+test("check-pr GitLab: a closed MR returns 4", () => {
+  const { r } = runGitLab({ mrState: "closed" });
+  assert.equal(r.status, 4, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: a failed pipelines query is not treated as green", () => {
+  const { r } = runGitLab({ pipelinesRc: [1] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: a failed MR-state query is not treated as open", () => {
+  const { r } = runGitLab({ mrStateRc: [1] });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
 });
