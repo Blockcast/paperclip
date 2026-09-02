@@ -55,4 +55,55 @@ describe.skipIf(!support.supported)("advisory xact lock savepoint semantics", ()
       await dbh.cleanup();
     }
   }, 180_000);
+
+  it("leaves the transaction WRITABLE after a failed statement inside the savepoint", async () => {
+    // The evidence the reviewer asked for on #1604: not just "the lock is
+    // released" but "issue creation remains usable". `lockPrReviewIssueScopes`
+    // catches a failed lock statement and returns so the create can proceed
+    // unserialized — but a failed statement aborts the whole transaction, so
+    // catching it is only half of failing open. The other half is the rollback,
+    // and this asserts the INSERT afterwards actually COMMITS.
+    //
+    // The transaction is driven by hand on a reserved connection rather than
+    // through `sql.begin()`: postgres-js remembers the first statement error
+    // and rethrows it at the transaction boundary even when the caller caught
+    // it, which would abort this test at `commit` instead of letting it assert.
+    const dbh = await startEmbeddedPostgresTestDatabase("advisory-lock-savepoint-write");
+    const holder = postgres(dbh.connectionString, { max: 1 });
+    const conn = await holder.reserve();
+    try {
+      await conn.unsafe("create table guard_probe(id int primary key)");
+      await conn.unsafe("begin");
+      await conn.unsafe("savepoint pr_review_scope_locks");
+      const [acquired] = await conn.unsafe(LOCK_SQL);
+      expect(acquired.acquired).toBe(true);
+
+      // Stand in for the real failure modes (reset connection,
+      // statement_timeout, lost EXECUTE on hashtextextended) with a
+      // deterministic statement error at the same point in the sequence.
+      await expect(conn.unsafe("select 1/0")).rejects.toThrow(/division by zero/);
+
+      // CONTROL. Without this the test could pass against a server where the
+      // failure never aborted anything, proving nothing about the rollback.
+      await expect(conn.unsafe("insert into guard_probe values (1)")).rejects.toThrow(
+        /current transaction is aborted/,
+      );
+
+      await conn.unsafe("rollback to savepoint pr_review_scope_locks");
+
+      // The property under test: the transaction is writable again.
+      await conn.unsafe("insert into guard_probe values (2)");
+      await conn.unsafe("commit");
+
+      // And it DURABLY committed — an insert that succeeds inside a
+      // transaction that then rolls back would satisfy the line above while
+      // still losing the issue.
+      const rows = await conn.unsafe("select id from guard_probe order by id");
+      expect(rows.map((r) => r.id)).toEqual([2]);
+    } finally {
+      await conn.release();
+      await holder.end();
+      await dbh.cleanup();
+    }
+  }, 180_000);
 });
