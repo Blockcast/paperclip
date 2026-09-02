@@ -1677,7 +1677,7 @@ That asymmetry is load-bearing. `metric` is the label rule authors filter on, wh
 | `label_budget` | tag-value budget exhausted; promoted labels dropped, increment still on the metric's series |
 | `name_budget` | metric-name budget exhausted; folded into the `_overflow` series |
 | `value_truncated` | a promoted label value exceeded 128 code points and was cut to fit; the increment landed with the shortened value, and two values sharing that prefix collapse into one series |
-| `value_sanitized` | a promoted label value carried control characters, which were stripped before publishing; the increment landed with the stripped value |
+| `value_sanitized` | a promoted label value carried control characters, which were stripped before publishing; the increment landed with the stripped value, and two values differing only in stripped characters collapse into one series |
 
 The `metric` label is populated only where its cardinality is already bounded: `label_budget`, `value_truncated` and `value_sanitized` carry the real metric name, `name_budget` carries `_overflow` (never the rejected name, which is the unbounded input that tier exists to refuse), and `bad_name`/`bad_value` leave it empty for that same reason. So `sum by (metric) (paperclip_plugin_metric_dropped_total)` buckets the two shape rejections under `metric=""` by design.
 
