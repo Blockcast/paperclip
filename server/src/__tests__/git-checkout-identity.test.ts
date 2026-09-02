@@ -419,6 +419,40 @@ describe("provisioning call-site invariants", () => {
     expect(wrapperBody).toContain("ensureCheckoutGitIdentity({");
   });
 
+  it("routes every managed-workspace return through the partial-clone guard (BLO-31351)", () => {
+    // Same invariant, same reason. Paperclip never *creates* a partial mirror --
+    // the managed clone passes no `--filter` -- it adopts whatever already sits
+    // at the managed path, and the `.git`-already-exists return is the one that
+    // matters. A guard placed after the clone would only ever inspect the one
+    // checkout that cannot be partial, which is how this reached production.
+    const source = readService("heartbeat.ts");
+    const wrapperStart = source.indexOf("async function ensureManagedProjectWorkspace(");
+    expect(wrapperStart).toBeGreaterThan(-1);
+    const wrapperBody = source.slice(wrapperStart, wrapperStart + 2400);
+
+    expect(wrapperBody).toContain("ensureManagedCheckoutCanServeClones({");
+    // A mirror that cannot serve must fail as a workspace validation failure,
+    // not as a bare Error: that specific cause is the one the recovery machinery
+    // treats as manual-repair and exempts from the wake-attempt budget. A plain
+    // throw here would burn attempts on a cause no retry can move.
+    expect(wrapperBody).toContain("partial_cannot_serve");
+    expect(wrapperBody).toContain("new WorkspaceValidationFailure(");
+    expect(wrapperBody).toContain("managed_checkout_partial_clone_unservable");
+  });
+
+  it("keeps the managed clone free of any object filter (BLO-31351)", () => {
+    // The guard above exists because this clone is a full clone. If a `--filter`
+    // or `--depth` is ever added here, Paperclip starts *manufacturing* the
+    // partial mirrors it currently only adopts, and every execution-workspace
+    // clone from one becomes a fake "repository corruption" failure.
+    const source = readService("heartbeat.ts");
+    const cloneIndex = source.indexOf('await execFile("git", ["clone"');
+    expect(cloneIndex).toBeGreaterThan(-1);
+    const cloneCall = source.slice(cloneIndex, cloneIndex + 200);
+    expect(cloneCall).not.toContain("--filter");
+    expect(cloneCall).not.toContain("--depth");
+  });
+
   it("provisions identity inside the worktree funnel, before the provision-command early return", () => {
     const source = readService("workspace-runtime.ts");
     const funnelStart = source.indexOf("async function provisionExecutionWorktree(");
