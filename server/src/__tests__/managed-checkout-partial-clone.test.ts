@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   countMissingObjects,
   ensureManagedCheckoutCanServeClones,
+  PARTIAL_CLONE_MISSING_SCAN_CAP,
   REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY,
   REMOTE_ORIGIN_PROMISOR_KEY,
 } from "../services/managed-checkout-partial-clone.js";
@@ -269,4 +270,33 @@ describe("ensureManagedCheckoutCanServeClones", () => {
     await git(["clone", "--quiet", `file://${upstreamNoFilter}`, full], root);
     await expect(countMissingObjects(full)).resolves.toMatchObject({ count: 0, truncated: false });
   }, 60_000);
+
+  it("still returns a verdict when the missing-object scan is truncated at the cap", async () => {
+    // The cap path kills `git rev-list` mid-walk, and that kill (plus the
+    // resulting write to a closed stdout) can surface as an `error` event racing
+    // `close`. If an error won that race, a repository with more missing objects
+    // than the cap would come back `indeterminate` -- warn-and-proceed on the
+    // single worst case, which then dies later reporting fake corruption. So
+    // truncation must beat any error, and a truncated count must still yield the
+    // fatal verdict rather than the repair one.
+    const unservable = path.join(root, "partial-missing-capped");
+    await git(
+      ["clone", "--quiet", "--filter=blob:none", "--no-checkout", `file://${upstreamAllowFilter}`, unservable],
+      root,
+    );
+
+    const result = await ensureManagedCheckoutCanServeClones({
+      cwd: unservable,
+      // Simulate the cap firing. The real cap is 10k objects, which is too large
+      // to build a fixture for; what matters is that a truncated count is still
+      // treated as a decided verdict.
+      countMissing: async () => ({ count: PARTIAL_CLONE_MISSING_SCAN_CAP, truncated: true }),
+    });
+
+    expect(result.state).toBe("partial_cannot_serve");
+    expect(result.missingObjectCountTruncated).toBe(true);
+    // Reported as a floor, not as an exact figure we did not measure.
+    expect(result.fatalMessage).toContain(`at least ${PARTIAL_CLONE_MISSING_SCAN_CAP}`);
+    expect(result.evidence).toMatchObject({ missingObjectCountTruncated: true });
+  }, 120_000);
 });
