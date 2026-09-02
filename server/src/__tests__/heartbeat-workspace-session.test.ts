@@ -3108,6 +3108,40 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
+  // BLO-31282 review follow-up: the tests above let the descriptor resolve its
+  // own identity, but production NEVER does -- `dispatchHeartbeatRun` always
+  // passes a precomputed `isolationIdentity`, built with the narrower
+  // `isWorkspaceIsolated: workspaceIsolationRequested` (mode only) rather than
+  // the broader in-function definition (mode OR task_session OR git_worktree).
+  // Pin the shipping path explicitly so a future change to either definition
+  // cannot silently stop covering it.
+  it("keeps the provisioned worktree when the isolation identity is precomputed by dispatch", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      // Exactly what dispatch hands in when it planned no workspace id.
+      isolationIdentity: { isolationMode: "run", isolationKey: "run:run-1" },
+    });
+
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      isolationKey: "run:run-1",
+      workspaceRoot: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+    });
+    expect(isolation?.storage.workspace).toBe("persistent");
+  });
+
   // BLO-31282: workspace *intent* is not evidence a worktree exists. A project
   // configured `isolated_workspace` whose strategy realizes to `project_primary`
   // has `cwd` pointing at the BASE checkout, so keying the workspace path off
@@ -3165,7 +3199,8 @@ describe("K8s session isolation metadata", () => {
     expect(isolation?.storage.workspace).toBe("ephemeral");
   });
 
-  it("removes user-controlled mutable paths before K8s adapter dispatch", () => {    expect(stripK8sIsolationOwnedEnv({
+  it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
+    expect(stripK8sIsolationOwnedEnv({
       env: {
         API_TOKEN: "preserved",
         HOME: "/paperclip/shared-home",
