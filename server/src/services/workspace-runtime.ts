@@ -9,6 +9,7 @@ import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
+  collectBranchTemplateProblems,
   listWorkspaceServiceCommandDefinitions,
   type ExecutionWorkspaceRunScope,
   type GitWorktreeBranchAncestryVerdict,
@@ -569,7 +570,16 @@ function sanitizeSlugPart(value: string | null | undefined, fallback: string): s
   return normalized.length > 0 ? normalized : fallback;
 }
 
-function renderWorkspaceTemplate(template: string, input: {
+/**
+ * The data a `workspaceStrategy.branchTemplate` renders against.
+ *
+ * Exported solely so a test can assert its leaf key set is exactly
+ * `EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS` — the list write-time validation
+ * accepts. Keeping the two in lockstep is what stops BLO-31281 recurring in the
+ * other direction: a key added here but not declared there would be rejected at
+ * write time despite rendering fine.
+ */
+export function buildWorkspaceTemplateData(input: {
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
   projectId: string | null;
@@ -577,7 +587,7 @@ function renderWorkspaceTemplate(template: string, input: {
 }) {
   const issueIdentifier = input.issue?.identifier ?? input.issue?.id ?? "issue";
   const slug = sanitizeSlugPart(input.issue?.title, sanitizeSlugPart(issueIdentifier, "issue"));
-  return renderTemplate(template, {
+  return {
     issue: {
       id: input.issue?.id ?? "",
       identifier: input.issue?.identifier ?? "",
@@ -594,7 +604,16 @@ function renderWorkspaceTemplate(template: string, input: {
       repoRef: input.repoRef ?? "",
     },
     slug,
-  });
+  };
+}
+
+function renderWorkspaceTemplate(template: string, input: {
+  issue: ExecutionWorkspaceIssueRef | null;
+  agent: ExecutionWorkspaceAgentRef;
+  projectId: string | null;
+  repoRef: string | null;
+}) {
+  return renderTemplate(template, buildWorkspaceTemplateData(input));
 }
 
 function sanitizeBranchName(value: string): string {
@@ -3870,6 +3889,20 @@ export async function realizeExecutionWorkspace(input: {
     projectId: input.base.projectId,
     repoRef: input.base.repoRef,
   });
+  // BLO-31281: write-time validation only guards NEW config. A template
+  // persisted before that validation existed still renders here, and the
+  // failure is invisible — `applyIssueIdentifierToBranchName` prefixes the
+  // issue identifier below, so the branch looks plausible while the template
+  // contributes nothing but a constant literal.
+  //
+  // Warn, do NOT repair. The worktree path is derived from the branch name, so
+  // silently re-rendering it would point this issue at a different directory
+  // and orphan the existing worktree along with any uncommitted work in it.
+  const branchTemplateWarnings = collectBranchTemplateProblems(branchTemplate).map(
+    (problem) =>
+      `Execution workspace ${problem} It rendered to "${renderedBranch}". Existing worktrees are `
+      + `left untouched; correct workspaceStrategy.branchTemplate to change future branch names.`,
+  );
   // Option (A) (BLO-9117): process-enforce the issue identifier into the branch
   // name so a merged PR reliably ref-links at merge time. See
   // applyIssueIdentifierToBranchName.
@@ -3977,6 +4010,7 @@ export async function realizeExecutionWorkspace(input: {
       worktreePath: reusablePath,
       warnings: [
         ...extraWarnings,
+        ...branchTemplateWarnings,
         ...baseRefreshWarnings,
         ...baseDrift.warnings,
         ...reuseOwnershipWarnings,
@@ -4131,7 +4165,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings, ...identityWarnings],
+    warnings: [...branchTemplateWarnings, ...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings, ...identityWarnings],
     created: true,
     baseRefSha: currentBaseRefSha,
   };

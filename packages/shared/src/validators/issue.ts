@@ -31,6 +31,7 @@ import {
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
+import { executionWorkspaceStrategySchema } from "./execution-workspace.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
@@ -106,20 +107,6 @@ export const ISSUE_EXECUTION_WORKSPACE_PREFERENCES = [
   "reuse_existing",
   "agent_default",
 ] as const;
-
-const executionWorkspaceStrategySchema = z
-  .object({
-    type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),
-    baseRef: z.string().optional().nullable(),
-    branchTemplate: z.string().optional().nullable(),
-    worktreeParentDir: z.string().optional().nullable(),
-    provisionCommand: z.string().optional().nullable(),
-    teardownCommand: z.string().optional().nullable(),
-    // BLO-19063: opt into a per-run working tree. Omitted => "per_issue", the
-    // historical behaviour.
-    runScope: z.enum(["per_issue", "per_run"]).optional().nullable(),
-  })
-  .strict();
 
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
