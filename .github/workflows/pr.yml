@@ -117,6 +117,17 @@ jobs:
         run: node --test ./scripts/check-pending-migration-preflight.test.js
         timeout-minutes: 1
 
+      # BLO-31254: executes the pre-flight's two-phase wait against a stub
+      # kubectl. The defect it guards was pure control flow — a single budget
+      # charged image transfer against the migration allowance, so a cold pull
+      # of the 1.7 GB image (measured 3m3s) failed a good build at 180s — and
+      # the render-level test above cannot tell a fix apart from a rewording.
+      # Slower than its neighbours because it must let real budgets expire.
+      - name: Test pending-migration pre-flight phase budgets (BLO-31254)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
+        timeout-minutes: 3
+
       # BLO-29008: executes the two-tier convergence gate's shell against
       # recorded cluster states. The gate fails OPEN if its string accumulation
       # breaks, so a render-level test cannot cover it — the negative cases here
