@@ -34,6 +34,20 @@
  * issue is a cost problem, whereas wrongly blocking issue creation is a
  * correctness problem.
  *
+ * On the SQL paths that posture costs more than a `catch`, and treating it as
+ * free is what produced a real defect here. The caller hands us its in-flight
+ * issue-create transaction, and a failed statement aborts *that* transaction:
+ * every later statement then raises 25P02 and the create 500s no matter what
+ * this module returns. So swallowing the error is only half of failing open.
+ * The other half is `rollback to savepoint`, the one statement that restores a
+ * usable transaction (measured; pinned against a real server in
+ * packages/db/src/advisory-xact-lock-savepoint.test.ts). Both SQL paths in this
+ * module therefore run inside a savepoint they can roll back, and both roll it
+ * back at the first failure rather than continuing to issue statements that are
+ * already guaranteed to fail. The one case this cannot cover is a transaction
+ * that was ALREADY aborted before the guard ran: `savepoint` itself fails then,
+ * and nothing this module can do from inside clears it.
+ *
  * Eligible creates take the normalized PR-scope advisory locks before the
  * issue-create title and idempotency locks. The webhook takes the same
  * normalized namespace as part of its compatibility lock set, so its wake
@@ -431,9 +445,16 @@ export async function lockPrReviewIssueScopes(
   try {
     await db.execute(sql`savepoint ${SAVEPOINT}`);
   } catch (error) {
+    // Realistically this only fails when the caller's transaction was ALREADY
+    // aborted before the guard ran (measured: `savepoint` raises 25P02 on an
+    // aborted transaction). We did not cause that and cannot clear it from in
+    // here — there is no savepoint to roll back to. So do NOT claim the create
+    // will proceed: it will fail on its next statement either way.
     logger.warn(
       { err: error },
-      "pr review duplicate guard could not open its lock savepoint; proceeding unserialized",
+      "pr review duplicate guard could not open its lock savepoint; skipping "
+        + "serialization. If this is 25P02 the caller's transaction was already "
+        + "aborted upstream and the create will fail regardless",
     );
     return;
   }
@@ -441,16 +462,42 @@ export async function lockPrReviewIssueScopes(
   const rollback = async () => {
     try {
       await db.execute(sql`rollback to savepoint ${SAVEPOINT}`);
+      return true;
     } catch (error) {
-      // The caller's transaction is already unusable if this fails; it will
-      // surface on their next statement. Nothing useful to do but say so.
+      // This is the ONE statement that can restore a transaction aborted
+      // inside the savepoint, so if it fails there is nothing left to try; it
+      // will surface on the caller's next statement.
       logger.warn({ err: error }, "pr review duplicate guard could not roll back its lock savepoint");
+      return false;
     }
   };
 
   const deadline = Date.now() + PR_REVIEW_ISSUE_LOCK_TIMEOUT_MS;
   for (const taskKey of taskKeys) {
-    while (!(await tryLockPrReviewScope(db, taskKey))) {
+    for (;;) {
+      const outcome = await tryLockPrReviewScope(db, taskKey);
+      if (outcome === "acquired") break;
+      if (outcome === "unusable" || outcome === "indeterminate") {
+        // Neither is retryable. "unusable" means the statement failed, so the
+        // transaction is aborted and every further statement raises 25P02
+        // until we roll back (measured) — retrying would issue ~100
+        // guaranteed-to-fail statements across the budget, logging a warning
+        // for each, and reach fail-open only incidentally via the give-up
+        // rollback. "indeterminate" means the result shape is unreadable, so
+        // the next call returns the same unreadable shape.
+        //
+        // Roll back either way: for "unusable" it is what restores the
+        // caller's transaction, and for "indeterminate" it releases whatever
+        // keys we already hold instead of stranding them.
+        await rollback();
+        logger.warn(
+          { taskKey, outcome, keysAttempted: taskKeys.length },
+          "pr review duplicate guard cannot evaluate a PR scope lock; rolled back "
+            + "to release what it held and restore the caller's transaction, and is "
+            + "proceeding unserialized",
+        );
+        return;
+      }
       if (Date.now() >= deadline) {
         await rollback();
         logger.warn(
@@ -469,18 +516,42 @@ export async function lockPrReviewIssueScopes(
   try {
     await db.execute(sql`release savepoint ${SAVEPOINT}`);
   } catch (error) {
+    // A failed RELEASE aborts the parent transaction (measured), so the locks
+    // do NOT "remain held" — the create is about to fail. The savepoint is
+    // still there, because the release that would have removed it is what
+    // failed, so rolling back to it restores a usable transaction. That
+    // abandons serialization, which is the correct direction here.
+    const restored = await rollback();
     logger.warn(
-      { err: error },
-      "pr review duplicate guard could not release its lock savepoint; "
-        + "locks remain held by the caller's transaction",
+      { err: error, restored },
+      "pr review duplicate guard could not release its lock savepoint; rolled back "
+        + "to restore the caller's transaction and is proceeding unserialized",
     );
   }
 }
 
+/**
+ * Three outcomes, not two.
+ *
+ * "contended" means someone else holds the key and retrying is meaningful.
+ *
+ * "unusable" means the STATEMENT failed, so the transaction is aborted and
+ * retrying is not just useless but actively harmful — every further statement
+ * raises 25P02 until the caller rolls back to its savepoint.
+ *
+ * "indeterminate" means the statement SUCCEEDED but its result shape is
+ * unreadable, so the transaction is fine and retrying is merely pointless: the
+ * next call returns the same unreadable shape.
+ *
+ * Collapsing all three into `false` is what made the retry loop spin ~100
+ * doomed statements before reaching fail-open by accident.
+ */
+type PrReviewScopeLockOutcome = "acquired" | "contended" | "unusable" | "indeterminate";
+
 async function tryLockPrReviewScope(
   db: Pick<DbTransaction, "execute">,
   taskKey: string,
-): Promise<boolean> {
+): Promise<PrReviewScopeLockOutcome> {
   let rows: unknown;
   try {
     rows = await db.execute(
@@ -492,17 +563,21 @@ async function tryLockPrReviewScope(
     // function but not of the statement: a reset connection, a
     // statement_timeout, or the role losing EXECUTE on hashtextextended all
     // throw here, and an uncaught throw aborts the caller's issue-create
-    // transaction and 500s the create. Report "not acquired" so the retry
-    // budget expires and the create proceeds unserialized.
+    // transaction and 500s the create.
+    //
+    // Report "unusable" rather than "contended": the transaction is now
+    // aborted, so the caller must roll back to its savepoint before issuing
+    // anything else. Only the caller knows the savepoint, so this is reported
+    // up rather than handled here.
     logger.warn(
       { err: error, taskKey },
-      "pr review duplicate guard could not evaluate the PR scope lock; proceeding unserialized",
+      "pr review duplicate guard could not evaluate the PR scope lock statement",
     );
-    return false;
+    return "unusable";
   }
   const row = Array.isArray(rows) ? rows[0] : null;
   if (row && typeof row === "object" && "acquired" in row) {
-    return (row as Record<string, unknown>).acquired === true;
+    return (row as Record<string, unknown>).acquired === true ? "acquired" : "contended";
   }
   // Not "someone else holds it" — the driver's result shape is unrecognized
   // (drizzle's postgres-js execute returns an array; node-postgres returns a
@@ -514,7 +589,7 @@ async function tryLockPrReviewScope(
     "pr review duplicate guard got an unrecognized advisory-lock result shape; "
       + "treating the PR scope as unserializable",
   );
-  return false;
+  return "indeterminate";
 }
 
 /**

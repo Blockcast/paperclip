@@ -138,6 +138,85 @@ describe("lockPrReviewIssueScopes", () => {
     expect(db.kinds.at(-1)).toBe("rollback");
   }, 15_000);
 
+  it("gives up at ONCE on a failed lock statement instead of retrying", async () => {
+    // The behavioural core of the fail-open fix. A failed statement aborts the
+    // transaction, so every retry raises 25P02 until a rollback (measured
+    // against a real server; see packages/db). The old code could not tell
+    // "someone holds it" from "the statement failed" and retried both, issuing
+    // roughly a hundred guaranteed-to-fail statements across the 1s budget —
+    // one warning each — and reaching fail-open only incidentally, via the
+    // give-up rollback at the end.
+    //
+    // A count assertion is the only thing that catches this: the exit code and
+    // the final rollback look identical either way.
+    let attempts = 0;
+    const db = fakeDb(() => {
+      attempts += 1;
+      return new Error("connection reset by peer");
+    });
+
+    const startedAt = Date.now();
+    await lockPrReviewIssueScopes(db as unknown as GuardTx, ONE_PR, OPTIONS);
+
+    expect(attempts).toBe(1);
+    expect(db.kinds).toEqual(["savepoint", "lock", "rollback"]);
+    // And it must not have burned the retry budget getting there.
+    expect(Date.now() - startedAt).toBeLessThan(500);
+  }, 15_000);
+
+  it("gives up at once on an unreadable lock result, without claiming the tx is broken", async () => {
+    // Distinct from the throwing case: the statement SUCCEEDED, so the
+    // transaction is fine — but the driver's result shape is unreadable, and
+    // the next call would return the same unreadable shape. Retrying is
+    // pointless rather than harmful. It still rolls back, to release any key
+    // already held rather than stranding it.
+    let attempts = 0;
+    const db = {
+      kinds: [] as Statement[],
+      execute: async (query: unknown) => {
+        const text = JSON.stringify((query as { queryChunks?: unknown }).queryChunks ?? query);
+        const kind = classify(text);
+        db.kinds.push(kind);
+        if (kind !== "lock") return [];
+        attempts += 1;
+        return { rowCount: 1 } as never; // node-postgres QueryResult shape, not an array
+      },
+    };
+
+    await lockPrReviewIssueScopes(db as unknown as GuardTx, ONE_PR, OPTIONS);
+
+    expect(attempts).toBe(1);
+    expect(db.kinds).toEqual(["savepoint", "lock", "rollback"]);
+  }, 15_000);
+
+  it("restores the caller's transaction when RELEASE SAVEPOINT fails", async () => {
+    // A failed RELEASE aborts the parent transaction (measured), so the old
+    // log line — "locks remain held by the caller's transaction" — was false
+    // and the create was about to fail. The savepoint still exists, because
+    // the release that would have removed it is what failed, so rolling back
+    // to it restores a usable transaction. Abandoning serialization is the
+    // correct direction; abandoning the create is not.
+    const kinds: Statement[] = [];
+    const db = {
+      kinds,
+      execute: async (query: unknown) => {
+        const text = JSON.stringify((query as { queryChunks?: unknown }).queryChunks ?? query);
+        const kind = classify(text);
+        kinds.push(kind);
+        if (kind === "release") throw new Error("savepoint does not exist");
+        if (kind !== "lock") return [];
+        return [{ acquired: true }];
+      },
+    };
+
+    await expect(
+      lockPrReviewIssueScopes(db as unknown as GuardTx, ONE_PR, OPTIONS),
+    ).resolves.toBeUndefined();
+
+    // The recovery rollback must actually be issued, after the failed release.
+    expect(kinds).toEqual(["savepoint", "lock", "release", "rollback"]);
+  }, 15_000);
+
   it("takes no lock at all when the assignee is not a configured PR reviewer", async () => {
     // Discriminator for the three tests above: they only prove something about
     // the lock protocol if the guard is reachable for some candidates and not
