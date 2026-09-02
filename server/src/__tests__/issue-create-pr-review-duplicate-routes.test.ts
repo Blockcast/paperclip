@@ -30,6 +30,7 @@ import {
   buildPrReviewTaskKey,
   parsePullRequestRefs,
   taskKeysMatch,
+  NOT_A_REVIEW_REQUEST_MARKER,
 } from "../services/pr-review-duplicate-issue-guard.js";
 
 // This suite exercises duplicate-review admission, not assignment wake
@@ -47,6 +48,28 @@ const NORMALIZED_PR_URL = `https://github.com/${NORMALIZED_REPO}/pull/${PR_NUMBE
 const TASK_KEY = `pr_review:${NORMALIZED_REPO}:${PR_NUMBER}`;
 
 describe("pr review duplicate issue guard (pure helpers)", () => {
+  it("does NOT case-fold task keys outside the pr_review scope", () => {
+    // taskKeysMatch must stay behaviourally identical to the SQL predicate,
+    // which only adds its lower() leg for pr_review keys. Without a negative,
+    // a regression dropping the isPrReviewTaskKey guard would widen equality
+    // for EVERY task scope in the system and still ship green.
+    expect(taskKeysMatch("issue:ABC-1", "issue:abc-1")).toBe(false);
+    expect(taskKeysMatch(`pr_review:${REPO}:${PR_NUMBER}`, TASK_KEY)).toBe(true);
+  });
+
+  it("bounds how many PR refs one issue body can force the guard to scan", () => {
+    // Each parsed ref becomes a lock namespace and a SQL predicate leg, so an
+    // unbounded scan lets one issue body (or a PR description echoed into one)
+    // decide how much work admission does. Assert the cap holds and that it
+    // keeps the FIRST refs, so the bound is deterministic rather than
+    // whichever refs a hash happened to order first.
+    const refs = Array.from({ length: 30 }, (_, i) => `https://github.com/${REPO}/pull/${1000 + i}`);
+    const parsed = parsePullRequestRefs(refs.join("\n"));
+    expect(parsed).toHaveLength(20);
+    expect(parsed[0]).toEqual({ repoFullName: NORMALIZED_REPO, prNumber: 1000 });
+    expect(parsed.at(-1)).toEqual({ repoFullName: NORMALIZED_REPO, prNumber: 1019 });
+  });
+
   it("resolves the same scope as the legacy key the webhook writes during phase one", () => {
     const webhookKey = __test_buildPrReviewerTaskKey({
       repoFullName: REPO,
@@ -521,6 +544,47 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
       .send({
         title: "Improve the reviewer's own verdict-formatting tooling",
         description: "No pull request reference here.",
+        assigneeAgentId: reviewer.id,
+      })
+      .expect(201);
+  });
+
+  it("admits an issue about the SAME PR only when it declares it is not a review request", async () => {
+    // The guard fires on any canonical PR permalink and cannot tell a review
+    // REQUEST from an issue that is merely ABOUT the review. Without an escape
+    // hatch a legitimate meta-issue like this one is hard-rejected, and the
+    // 409's remediation ("post a review-request marker comment on the PR") is
+    // actively wrong advice here: following it queues a SECOND review of a PR
+    // whose review is already broken. The only prior way past it was the
+    // global kill switch.
+    //
+    // Both halves share one fixture so the ONLY difference between the admitted
+    // and rejected creates is the marker itself.
+    const { companyId, reviewer, app } = await setup();
+    await seedReviewRun(companyId, reviewer.id);
+    const title = `Ally's review of ${PR_URL} exited with pr_review_output_missing`;
+    const body = "The adapter produced no verdict.";
+
+    // Rejected FIRST, deliberately. A 409 persists no issue, whereas a 201
+    // would then let the UNRELATED generic issue-deduplicator (a 30-day
+    // title-similarity window) answer the second create with
+    // `200 {deduplicated:true}` before this guard ever runs — which is what an
+    // earlier revision of this test actually hit.
+    const rejected = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title, description: body, assigneeAgentId: reviewer.id })
+      .expect(409);
+    expect(rejected.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    // The rejection must advertise the escape hatch or a blocked filer cannot
+    // discover it.
+    expect(rejected.body.remediation).toContain(NOT_A_REVIEW_REQUEST_MARKER);
+
+    // Same title, same fixture, same live review run — only the marker differs.
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title,
+        description: `${NOT_A_REVIEW_REQUEST_MARKER}\n${body}`,
         assigneeAgentId: reviewer.id,
       })
       .expect(201);

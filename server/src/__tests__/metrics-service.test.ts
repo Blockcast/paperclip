@@ -35,6 +35,10 @@ import {
   renderMetrics,
   setBackstopDeferredCandidates,
   EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+  GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
+  GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+  UNKNOWN_GITHUB_SUPPRESSION_CAUSE,
+  recordGithubReviewRequestSuppressed,
   GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
   KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
   KNOWN_WORKFLOW_RUN_CONCLUSIONS,
@@ -1290,5 +1294,49 @@ describe("backstop metrics (BLO-29763)", () => {
     setBackstopDeferredCandidates("issue_graph_liveness.backstop", 0);
     body = (await renderMetrics()).body;
     expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
+  });
+});
+
+describe("github review request suppression causes (BLO-20526 reviewer lock contention)", () => {
+  it("preserves reviewer_lock_contended rather than collapsing it to the unknown bucket", async () => {
+    // `normalizeGithubSuppressionCause` maps any cause absent from
+    // KNOWN_GITHUB_SUPPRESSION_CAUSES to UNKNOWN_GITHUB_SUPPRESSION_CAUSES's
+    // "other" — which the outage alert pages on as an UNTRIAGED cause. So
+    // emitting this cause without registering it would not merely mislabel the
+    // series, it would page on every occurrence of a known, expected drop.
+    __resetMetricsForTest();
+
+    const recorded = recordGithubReviewRequestSuppressed({
+      reason: "github_pr_review_requested",
+      cause: GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+    });
+
+    expect(recorded.cause).toBe("reviewer_lock_contended");
+    expect(recorded.cause).not.toBe(UNKNOWN_GITHUB_SUPPRESSION_CAUSE);
+
+    const body = (await renderMetrics()).body;
+    expect(body).toContain(
+      `${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC}{cause="reviewer_lock_contended",reason="github_pr_review_requested"} 1`,
+    );
+  });
+
+  it("still collapses an unregistered cause, so the check above is not vacuous", () => {
+    __resetMetricsForTest();
+
+    const recorded = recordGithubReviewRequestSuppressed({
+      reason: "github_pr_review_requested",
+      cause: "reviewer_lock_contended_typo",
+    });
+
+    expect(recorded.cause).toBe(UNKNOWN_GITHUB_SUPPRESSION_CAUSE);
+  });
+
+  it("zero-initializes the contended series so absent is distinguishable from zero", async () => {
+    // The series must exist before the first event or the outage alert cannot
+    // tell "nothing suppressed" from "the scrape is broken".
+    __resetMetricsForTest();
+
+    const body = (await renderMetrics()).body;
+    expect(body).toContain(`${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC}{cause="reviewer_lock_contended"`);
   });
 });
