@@ -33928,6 +33928,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * every agent). The scheduler invokes this independently once per tick so
    * suppression or an earlier recovery failure cannot erase the emission.
    *
+   * Startup emission was deliberately traded away for that independence
+   * (BLO-26727): this used to also run once inside startup recovery, so the
+   * first emission now lands on the first tick after
+   * `heartbeatStartupRecoveryPending` clears rather than mid-recovery. That
+   * flag is released in a `.finally()`, so a *failed* startup recovery still
+   * unblocks emission, and the previous periodic path sat behind the same
+   * early return — so the only regression is a bounded first-emission delay,
+   * in exchange for emission no longer riding on the recovery chain.
+   *
    * Fleet-wide (no companyId filter), matching every other gauge publisher in
    * this file: this control plane is one Prometheus scrape target for every
    * company it serves, and agent_id is a globally unique key.
