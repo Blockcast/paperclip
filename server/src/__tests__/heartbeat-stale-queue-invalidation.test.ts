@@ -2103,7 +2103,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         createdAt: new Date("2026-08-15T08:00:00.000Z"),
       });
 
-      const { run } = await resumeContinuationRetry({
+      const { runId, run } = await resumeContinuationRetry({
         companyId,
         agentId,
         issueId,
@@ -2114,7 +2114,10 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(run?.errorCode).toBe("issue_continuation_waiting_on_review");
       expect(run?.startedAt).toBeNull();
       expect(run?.resultJson).toMatchObject({ timeoutSource: "stale_queued_run_gate" });
-      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      // Scoped to this run, not the global mock: the sibling tests above resume
+      // runs that do execute, and an execution still settling past their end
+      // leaks a call into this one (see the note on resumeQueuedRuns above).
+      expect(countExecuteCallsForRun(runId)).toBe(0);
     });
 
     // The park cancellation posts a system comment (AC3). If system comments
@@ -2164,7 +2167,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
           sql`${issueComments.body} like '%Continuation retry%'`,
         ));
       expect(noticesAfter).toHaveLength(1);
-      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect(countExecuteCallsForRun(first.runId)).toBe(0);
+      expect(countExecuteCallsForRun(second.runId)).toBe(0);
     });
 
     // Preferring the live document over the wake snapshot must not bypass the
