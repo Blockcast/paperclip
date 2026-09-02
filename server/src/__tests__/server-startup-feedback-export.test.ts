@@ -77,6 +77,8 @@ const {
     reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     publishAgentLivenessGauges: vi.fn(async () => {}),
+    publishGithubReviewDeadLetterGauge: vi.fn(async () => {}),
+    publishAgentWakeupTerminalFailedGauge: vi.fn(async () => {}),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
@@ -424,6 +426,93 @@ describe("startServer feedback export wiring", () => {
       // suppressed tick still reports fleet health. Folding this call back
       // below the gate (or into the recovery chain) must fail here.
       expect(heartbeatServiceMock.publishAgentLivenessGauges).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-31335: the two wake-dispatch gauges used to publish from the tail of
+  // `reconcileFailedWakeDispatches`, whose periodic call site sits below the
+  // suppression gate — so a suppressed replica emitted neither, and any
+  // earlier rejection in the long `.then` chain skipped both silently. A
+  // stale gauge renders identically to a healthy-but-unchanged one, so
+  // neither failure was visible. These two cases pin the tick as the sole
+  // emission path, the same contract BLO-26727 gave the liveness gauges.
+  it("publishes both wake-dispatch gauges on a suppressed tick, without reaching the reconcile pass", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: true,
+      reason: "worktree_instance",
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      // Negative control. Without it this test would pass on a build that
+      // emitted from startup recovery too, which would prove only "the call
+      // happened somewhere" rather than "the tick is the emission path".
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).not.toHaveBeenCalled();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The point of the fix: both emit ahead of the suppression gate. Folding
+      // either call back below that gate must fail exactly here.
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
+      // ...and they got there without the pass they used to live inside being
+      // reached at all, which is the half a suppression-only assertion misses.
+      expect(heartbeatServiceMock.reconcileFailedWakeDispatches).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("publishes both wake-dispatch gauges on an unsuppressed tick whose reconcile pass rejects", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      heartbeatServiceMock.publishGithubReviewDeadLetterGauge.mockClear();
+      heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge.mockClear();
+      // The pass the two gauges used to be the last act of. Rejecting it is
+      // the chain-fragility half of the defect: pre-fix this erased both.
+      heartbeatServiceMock.reconcileFailedWakeDispatches.mockRejectedValueOnce(
+        new Error("wake-dispatch reconciliation failed"),
+      );
+
+      intervalCallback?.();
+      // `vi.waitFor` rather than counted microtask hops, for the reason given
+      // on the stale-lock sweep test above.
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
+        expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
+      });
     } finally {
       setIntervalSpy.mockRestore();
     }
