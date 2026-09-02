@@ -6320,7 +6320,34 @@ export function buildK8sRunIsolationDescriptor(input: {
       ? path.posix.join("/runtime-cache/paperclip-workspaces", input.persistedExecutionWorkspaceId!)
       : null;
   const sharedHomeRoot = resolveDefaultAgentWorkspaceDir(input.agentId);
-  const workspaceRoot = isolationMode === "run"
+  // BLO-31282: `isolationMode` answers "what is the isolation *key*", not "where
+  // does the repo live". An agent with effective concurrency > 1 and no persisted
+  // execution workspace id lands in `run:<runId>` isolation
+  // (`resolveK8sRunIsolationIdentity`, third branch) even when a git worktree was
+  // cut for it on persistent disk: the workspace *id* is missing, the workspace
+  // *path* is not. Overriding the path there discards a good checkout and drops
+  // the agent into an empty scratch dir, from which the only repo location its
+  // issue payload names is the project BASE checkout. That is how base checkouts
+  // accumulate uncommitted work under an `isolated_workspace` policy.
+  //
+  // Key this off the *realized* strategy, never off the configured workspace
+  // mode. `strategy === "git_worktree"` is set only when a worktree was actually
+  // created (the same condition that populates `worktreePath`), whereas a project
+  // configured `isolated_workspace` whose strategy realizes to `project_primary`
+  // has `cwd` pointing straight at the base checkout — so trusting workspace
+  // *intent* here would route every such run into the base deterministically,
+  // which is the opposite of the fix. Callers that omit `strategy` keep the
+  // pre-existing ephemeral behavior.
+  //
+  // Stateless PR reviews stay fully ephemeral by design: they take the first
+  // branch of `resolveK8sRunIsolationIdentity` ahead of any persisted workspace
+  // and must not be pinned to a durable checkout.
+  const hasProvisionedWorktree =
+    !input.statelessPrReview &&
+    input.executionWorkspace.strategy === "git_worktree" &&
+    Boolean(input.executionWorkspace.cwd);
+  const usesEphemeralWorkspace = isolationMode === "run" && !hasProvisionedWorktree;
+  const workspaceRoot = usesEphemeralWorkspace
     ? path.posix.join(ephemeralIsolationRoot!, "workspace")
     : input.executionWorkspace.cwd;
   const homeRoot = isolationMode === "run"
@@ -6351,7 +6378,10 @@ export function buildK8sRunIsolationDescriptor(input: {
     cacheRoot,
     tmpRoot,
     storage: {
-      workspace: isolationMode === "run" ? "ephemeral" : "persistent",
+      // BLO-31282: must track `workspaceRoot` exactly. A run pinned to a
+      // provisioned worktree needs the persistent volume mounted, or the volume
+      // wiring would back a persistent-disk path with ephemeral storage.
+      workspace: usesEphemeralWorkspace ? "ephemeral" : "persistent",
       home: persistent,
       session: persistent,
       cache: isolationMode === "shared" ? "persistent" : "ephemeral",

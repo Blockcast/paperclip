@@ -3065,8 +3065,107 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
-  it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
-    expect(stripK8sIsolationOwnedEnv({
+  // BLO-31282: the `run:<runId>` isolation *key* is correct for a concurrent
+  // agent with no persisted workspace id, but it must not also discard the
+  // worktree that was actually cut for the run. Dropping the agent into an empty
+  // ephemeral scratch dir is what pushed agents back into the project BASE
+  // checkout, which accumulated 32 uncommitted files across three days.
+  it("keeps the provisioned worktree as the workspace root under per-run isolation", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveMaxConcurrentRuns: 12,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    // The isolation key stays per-run so concurrent siblings keep independent
+    // writer reservations (BLO-16842) -- only the workspace path changes.
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      isolationKey: "run:run-1",
+      workspaceRoot: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+      homeRoot: "/runtime-cache/paperclip-runs/run-1/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run-1/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run-1/cache",
+    });
+    // storage.workspace must track workspaceRoot, or the volume wiring backs a
+    // persistent-disk path with ephemeral storage.
+    expect(isolation?.storage).toEqual({
+      workspace: "persistent",
+      home: "ephemeral",
+      session: "ephemeral",
+      cache: "ephemeral",
+    });
+  });
+
+  // BLO-31282: workspace *intent* is not evidence a worktree exists. A project
+  // configured `isolated_workspace` whose strategy realizes to `project_primary`
+  // has `cwd` pointing at the BASE checkout, so keying the workspace path off
+  // the mode would route every such run into the base deterministically.
+  it("stays ephemeral when isolated_workspace intent realized as the base checkout", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/projects/project-1/repo",
+        source: "task_session",
+        strategy: "project_primary",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveMaxConcurrentRuns: 12,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run-1/workspace",
+    });
+    expect(isolation?.storage.workspace).toBe("ephemeral");
+  });
+
+  // BLO-31282: a stateless PR review is forced to `run` isolation ahead of any
+  // persisted workspace and must stay fully ephemeral even though its realized
+  // strategy is `git_worktree`.
+  it("keeps a stateless PR review ephemeral despite a realized git worktree", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "pr-review-42",
+      statelessPrReview: true,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/pr-42",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: "execution-workspace-1",
+      effectiveMaxConcurrentRuns: 12,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run-1/workspace",
+    });
+    expect(isolation?.storage.workspace).toBe("ephemeral");
+  });
+
+  it("removes user-controlled mutable paths before K8s adapter dispatch", () => {    expect(stripK8sIsolationOwnedEnv({
       env: {
         API_TOKEN: "preserved",
         HOME: "/paperclip/shared-home",
