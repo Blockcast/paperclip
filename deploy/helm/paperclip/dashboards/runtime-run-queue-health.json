@@ -1,0 +1,201 @@
+{
+  "title": "Paperclip runtime — run queue & retry health",
+  "uid": "paperclip-runtime-queues",
+  "tags": [
+    "paperclip",
+    "runtime",
+    "queues",
+    "blo-21116",
+    "blo-22094",
+    "blo-23450"
+  ],
+  "schemaVersion": 39,
+  "editable": false,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Agents with an overdue parked retry",
+      "description": "Count of agents whose oldest `scheduled_retry` row is past its due time. Steady state is 0. Non-zero means the promotion path is not draining parked runs for that many agents — see BLO-22094.",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "count(max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds) > 0) or vector(0)",
+          "legendFormat": "agents overdue",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Worst queued-run age",
+      "description": "Oldest run sitting in `queued` across all agents. Excludes time parked in `scheduled_retry` by design (BLO-21116) — that window is the panel to the right.",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "max(max by (agent_id) (paperclip_queued_run_oldest_age_seconds))",
+          "legendFormat": "worst queued age",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1800 },
+              { "color": "red", "value": 3600 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Retry-age refresher healthy",
+      "description": "min() across control-plane replicas of paperclip_overdue_scheduled_retry_age_metrics_refresh_success. 0 means at least one replica failed to refresh, so the age gauges are FROZEN at their last value — a stale gauge renders identically to a healthy one, which is the failure this panel exists to make visible.",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "min(paperclip_overdue_scheduled_retry_age_metrics_refresh_success)",
+          "legendFormat": "refresh ok",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "STALE", "color": "red", "index": 0 },
+                "1": { "text": "OK", "color": "green", "index": 1 }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest queued-run age by agent",
+      "description": "paperclip_queued_run_oldest_age_seconds, max by agent_id. The gauge is emitted by every control-plane replica (service=paperclip x2, service=paperclip-workers x1) with identical values, so max by (agent_id) collapses the replicas — sum() would triple-count.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "max by (agent_id) (paperclip_queued_run_oldest_age_seconds)",
+          "legendFormat": "{{agent_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest overdue scheduled-retry age by agent",
+      "description": "paperclip_overdue_scheduled_retry_oldest_age_seconds, max by agent_id (BLO-22094). Age past DUE TIME of the oldest parked retry. A run merely backing off (scheduled_retry_at in the future) contributes nothing. Reads an explicit 0 — not an absent series — when an agent has none, so all-zero here is healthy, not missing data. Placed next to the queued-age panel so park-window and queue-window ages read side by side (BLO-23450).",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds)",
+          "legendFormat": "{{agent_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ]
+}
