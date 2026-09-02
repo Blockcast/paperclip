@@ -1596,6 +1596,16 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * can distinguish it — so the strip is the guard, and
  * `never emits a raw control character into the exposition` is what fails if
  * it is ever removed.
+ *
+ * Entries are keyed by `pluginId` and are never pruned in production — only
+ * {@link __resetMetricsForTest} clears them — so a plugin uninstalled or
+ * disabled mid-process keeps its ledger for the worker's lifetime. That is
+ * deliberate, not an oversight. The residue is bounded by the same two budgets
+ * this ledger exists to enforce (at most 50 names and 100 combinations per
+ * plugin, so ~150 short strings), and pruning on uninstall would hand a
+ * reinstall a fresh budget — turning install/uninstall into a way to mint
+ * unbounded series, which is exactly what the bound refuses. A worker restart
+ * is the reclaim path.
  */
 const pluginMetricCombinations = new Map<string, Set<string>>();
 
