@@ -264,7 +264,23 @@ and stop early when the MR itself settles (an MR closed with a stuck pipeline ha
 exactly the hazard the GitHub path guards against):
 
 ```bash
-# $CHECK_DEADLINE_SEC / $CHECK_INTERVAL_SEC validated as above.
+# Validation is repeated here, NOT cross-referenced. This block is run
+# standalone — it is the GitLab branch of the instructions, so an agent reaches
+# it without executing the GitHub block above. "Validated as above" left both
+# values unchecked on this path: a non-numeric CHECK_DEADLINE_SEC reaches `(( ))`,
+# which is arithmetic EVALUATION of caller-supplied text, and CHECK_INTERVAL_SEC=0
+# busy-loops against the GitLab API at whatever rate the network allows —
+# reinstating exactly the unbounded polling this skill exists to prevent.
+CHECK_DEADLINE_SEC=${CHECK_DEADLINE_SEC:-900}
+CHECK_INTERVAL_SEC=${CHECK_INTERVAL_SEC:-60}
+for var in CHECK_DEADLINE_SEC CHECK_INTERVAL_SEC; do
+  if [[ ! ${!var} =~ ^[0-9]+$ ]]; then
+    printf '%s must be a non-negative integer (got %q).\n' "$var" "${!var}" >&2
+    exit 2
+  fi
+done
+(( CHECK_INTERVAL_SEC < 60 )) && CHECK_INTERVAL_SEC=60
+
 poll_started=$(date +%s)
 while :; do
   mr_state=$(glab api "projects/:fullpath/merge_requests/$MR_IID" --jq .state) || {

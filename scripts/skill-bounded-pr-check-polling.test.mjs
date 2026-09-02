@@ -82,6 +82,7 @@ function makeStubs({
   statusJson = '{"statuses":[]}',
   apiRc = [0],
   stubSleep = false,
+  headShas = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
   // GitLab side. `pipelineStatuses` is the newline-delimited output of
   // `glab api .../pipelines --jq '.[].status'`; [] means "no pipelines exist".
   mrState = "opened",
@@ -97,7 +98,15 @@ function makeStubs({
   writeFileSync(path.join(dir, "api-rc"), apiRc.join("\n") + "\n");
   writeFileSync(path.join(dir, "check-runs.json"), checkRunsJson);
   writeFileSync(path.join(dir, "status.json"), statusJson);
-  writeFileSync(path.join(dir, "pr-state"), prState);
+  // Accepts a string (constant) or an array (one entry per call, last repeats)
+  // so a test can flip the state mid-poll without patching the stub's source.
+  writeFileSync(
+    path.join(dir, "pr-state"),
+    (Array.isArray(prState) ? prState : [prState]).join("\n") + "\n",
+  );
+  // Consumed one per `gh pr view --json headRefOid` call, last entry repeats —
+  // so a test can move the head mid-poll.
+  writeFileSync(path.join(dir, "head-shas"), headShas.join("\n") + "\n");
   writeFileSync(path.join(dir, "mr-state-rc"), mrStateRc.join("\n") + "\n");
   writeFileSync(path.join(dir, "pipelines-rc"), pipelinesRc.join("\n") + "\n");
   writeFileSync(path.join(dir, "mr-state"), mrState);
@@ -120,8 +129,15 @@ pop() {
 case "$1 $2" in
   "pr view")
     rc=$(pop "$d/pr-view-rc")
-    if [[ $rc == 0 ]]; then cat "$d/pr-state"; echo; else echo "gh: could not resolve PR" >&2; fi
-    exit "$rc"
+    if [[ $rc != 0 ]]; then echo "gh: could not resolve PR" >&2; exit "$rc"; fi
+    # The head-SHA query and the state query are the same subcommand; tell them
+    # apart by which --json fields were asked for.
+    if [[ "$*" == *headRefOid* && "$*" != *state* ]]; then
+      pop "$d/head-shas"; echo
+    else
+      pop "$d/pr-state"; echo
+    fi
+    exit 0
     ;;
   "pr checks")
     rc=$(pop "$d/checks-rc")
@@ -279,19 +295,20 @@ test("check-pr: a closed-unmerged PR exits 4, distinguishable from green", () =>
 });
 
 test("check-pr: a PR that merges mid-poll stops on the next iteration", () => {
-  // Open on the pre-flight read, merged on the in-loop re-read.
-  const stubs = makeStubs({ checksRc: [8], prState: "OPEN " });
-  writeFileSync(path.join(stubs.dir, "pr-state"), "OPEN ");
-  // Flip the state file after the first pr view call by making the stub's
-  // second read see MERGED: simplest is a sequence-aware state file.
-  const gh = readFileSync(path.join(stubs.bin, "gh"), "utf8").replace(
-    'if [[ $rc == 0 ]]; then cat "$d/pr-state"; echo;',
-    'if [[ $rc == 0 ]]; then n=$(cat "$d/n" 2>/dev/null || echo 0); echo $((n+1)) >"$d/n"; ' +
-      'if [[ $n -ge 1 ]]; then echo "MERGED 2026-09-01T00:00:00Z"; else cat "$d/pr-state"; echo; fi;',
-  );
-  writeFileSync(path.join(stubs.bin, "gh"), gh);
-  chmodSync(path.join(stubs.bin, "gh"), 0o755);
-  const r = runBlock(CHECK_PR_LOOP(), { stubs, env: { CHECK_DEADLINE_SEC: "900" } });
+  // Open on the pre-flight read, merged on the in-loop re-read. Driven by the
+  // stub's state SEQUENCE — an earlier version of this test rewrote the stub's
+  // source with a string replace, which silently stopped flipping the state
+  // when that line was refactored and left the test timing out at 60s instead
+  // of failing.
+  const stubs = makeStubs({
+    checksRc: [8],
+    prState: ["OPEN ", "MERGED 2026-09-01T00:00:00Z"],
+    stubSleep: true,
+  });
+  const r = runBlock(CHECK_PR_LOOP(), {
+    stubs,
+    env: { CHECK_DEADLINE_SEC: "900", CHECK_INTERVAL_SEC: "60" },
+  });
   assert.equal(r.status, 3, `${r.stdout}${r.stderr}`);
 });
 
@@ -655,4 +672,88 @@ test("check-pr GitLab: a failed pipelines query is not treated as green", () => 
 test("check-pr GitLab: a failed MR-state query is not treated as open", () => {
   const { r } = runGitLab({ mrStateRc: [1] });
   assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: rejects non-numeric config instead of evaluating it", () => {
+  // The block is reached standalone — it is the GitLab branch of the
+  // instructions — so "validated as above" left this path unguarded and fed
+  // caller-supplied text straight into `(( ))`, which is arithmetic
+  // EVALUATION, not a comparison.
+  for (const bad of ["abc", "9;echo pwned", "-1", "1.5", " 9"]) {
+    const { r } = runGitLab({}, { CHECK_DEADLINE_SEC: bad });
+    assert.equal(r.status, 2, `CHECK_DEADLINE_SEC=${JSON.stringify(bad)}: ${r.stdout}${r.stderr}`);
+    assert.doesNotMatch(r.stdout, /pwned/);
+  }
+  for (const bad of ["abc", "x"]) {
+    const { r } = runGitLab({}, { CHECK_INTERVAL_SEC: bad });
+    assert.equal(r.status, 2, `CHECK_INTERVAL_SEC=${JSON.stringify(bad)}: ${r.stdout}${r.stderr}`);
+  }
+});
+
+test("check-pr GitLab: an EMPTY config value means unset, and defaults", () => {
+  // Not a rejection case, and worth pinning so a future tightening of the
+  // regex above does not turn `CHECK_DEADLINE_SEC=` into a hard exit 2. An
+  // empty environment variable is indistinguishable from an absent one, so
+  // `${VAR:-default}` is the correct reading.
+  const { r } = runGitLab({ pipelineStatuses: ["success"] }, { CHECK_DEADLINE_SEC: "", CHECK_INTERVAL_SEC: "" });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+});
+
+test("check-pr GitLab: clamps a sub-minute interval to the 60s floor", () => {
+  // CHECK_INTERVAL_SEC=0 would busy-loop against the GitLab API at whatever
+  // rate the network allows — the unbounded polling this skill exists to
+  // remove, reintroduced through a missing clamp. Asserted via the recorded
+  // sleep argument rather than by waiting a minute.
+  const stubs = makeStubs({ pipelineStatuses: ["running"], stubSleep: true });
+  const r = runBlock(CHECK_PR_GITLAB(), {
+    stubs,
+    env: { ...GL_ENV, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "0" },
+  });
+  assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
+  const sleeps = readFileSync(path.join(stubs.dir, "sleeps.log"), "utf8").trim().split("\n");
+  assert.ok(sleeps.length > 0, "the loop never slept, so the clamp is untested");
+  for (const s of sleeps) assert.equal(s, "60", `slept ${s}s, below the documented floor`);
+});
+
+test("prcheckloop: re-reads the head each iteration and queries the NEW sha", () => {
+  // Ally's finding: HEAD_SHA was captured once in step 2 and never refreshed,
+  // so a concurrent push left the loop querying the OLD commit — whose checks
+  // are already terminal — and reporting it green while claiming to have
+  // inspected the latest head.
+  const OLD = "1111111111111111111111111111111111111111";
+  const NEW = "2222222222222222222222222222222222222222";
+  const stubs = makeStubs({
+    headShas: [OLD, NEW],
+    checkRunsJson: '{"check_runs":[{"name":"ci","status":"in_progress"}]}',
+    statusJson: NO_STATUSES,
+    stubSleep: true,
+  });
+  const r = runBlock(PRCHECKLOOP_LOOP(), {
+    stubs,
+    env: { HEAD_SHA: OLD, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "60" },
+  });
+  assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
+  const calls = readFileSync(path.join(stubs.dir, "calls.log"), "utf8");
+  // The whole point: it must have gone on to query the new commit.
+  assert.ok(calls.includes(`commits/${NEW}/check-runs`), `never queried the new sha:\n${calls}`);
+  assert.match(r.stdout, /Head moved/);
+});
+
+test("prcheckloop: a stable head is not reported as moving", () => {
+  // Discriminator: if the refresh were comparing against the wrong thing it
+  // would announce a move on every iteration, restart the clock forever, and
+  // never reach the deadline.
+  const SHA = "3333333333333333333333333333333333333333";
+  const stubs = makeStubs({
+    headShas: [SHA],
+    checkRunsJson: '{"check_runs":[{"name":"ci","status":"in_progress"}]}',
+    statusJson: NO_STATUSES,
+    stubSleep: true,
+  });
+  const r = runBlock(PRCHECKLOOP_LOOP(), {
+    stubs,
+    env: { HEAD_SHA: SHA, CHECK_DEADLINE_SEC: "0", CHECK_INTERVAL_SEC: "60" },
+  });
+  assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
+  assert.doesNotMatch(r.stdout, /Head moved/);
 });

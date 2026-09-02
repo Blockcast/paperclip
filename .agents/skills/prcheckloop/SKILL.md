@@ -139,6 +139,26 @@ while :; do
     CLOSED*) printf 'PR was closed without merging; nothing to wait for.\n'; exit 4 ;;
   esac
 
+  # Re-read the head EVERY iteration. A SHA captured once goes stale the moment
+  # anyone pushes, and then this loop keeps querying the OLD commit — whose
+  # checks are already terminal — and reports it green while claiming to have
+  # inspected the latest head. That is the same fail-open the rest of this
+  # block exists to remove, just sourced from the URL instead of the
+  # classifier. Restart the clock on a change: the new head's checks have not
+  # had the deadline yet, and inheriting the old one would time out a PR that
+  # was pushed to a minute ago.
+  CURRENT_SHA=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json headRefOid \
+    --jq .headRefOid) || {
+      printf 'Could not read the current head SHA.\n' >&2
+      exit 1
+    }
+  if [[ $CURRENT_SHA != "$HEAD_SHA" ]]; then
+    printf 'Head moved %s -> %s; restarting the wait on the new commit.\n' \
+      "${HEAD_SHA:0:9}" "${CURRENT_SHA:0:9}"
+    HEAD_SHA=$CURRENT_SHA
+    poll_started=$(date +%s)
+  fi
+
   # Inventory current-head checks and statuses; do not leave a watcher behind.
   # Check both exits: on a 403 secondary rate limit the redirect truncates the
   # file and gh writes the error to stderr, leaving an empty array. An empty
