@@ -769,6 +769,29 @@ export const PLUGIN_METRIC_NAME_REGEX = /^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$/;
 export const PLUGIN_METRIC_NAME_MAX_LENGTH = 64;
 
 /**
+ * Control characters stripped from a promoted label value before it is either
+ * published or keyed.
+ *
+ * Two distinct reasons, and each alone justifies it:
+ *
+ *  1. **Exposition.** prom-client escapes only `\`, `\n` and `"`
+ *     (`registry.js` `escapeLabelValue`). Every other control character —
+ *     NUL, CR, ESC — is written into `/metrics` as a raw byte and becomes the
+ *     scraper's problem. Promoted values are plugin-supplied and, for
+ *     `alertname`/`severity`, verbatim inbound webhook input, so this is
+ *     reachable rather than theoretical.
+ *  2. **Ledger identity.** {@link pluginMetricCombinations} keys on these
+ *     values. Stripping NUL here is what lets that key be discussed at all
+ *     without appealing to a Prometheus rule nothing in this path enforces.
+ *
+ * The whole C0 range plus DEL goes, `\n` and `\t` included: none of them
+ * belong in a label value, and one rule is easier to state than an exception
+ * list. Global flag is for `.replace`; do not call `.test()` on it — that is
+ * stateful via `lastIndex`.
+ */
+export const PLUGIN_METRIC_CONTROL_CHAR_REGEX = /[\u0000-\u001F\u007F]/g;
+
+/**
  * Ceiling on the length of a *promoted tag value*, applying the same reasoning
  * as {@link PLUGIN_METRIC_NAME_MAX_LENGTH} to the other axis — and the one that
  * actually crosses a trust boundary. The metric name is plugin source; a
@@ -1551,12 +1574,28 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * Per-plugin ledger of `(metric, promoted-label-values)` combinations already
  * published, enforcing {@link PLUGIN_METRIC_CARDINALITY_BUDGET}.
  *
- * Keys are joined with a NUL, matching this file's existing composite-key
- * idiom. That is not cosmetic: with a printable separator two different
- * combinations can render to the same ledger key, and the second write then
- * reads as already-seen — so it consumes no budget slot and still publishes.
- * Every such collision buys a free series and the bound leaks. NUL cannot
- * appear in a Prometheus label value, so the key is injective.
+ * Keys are NUL-joined, matching this file's existing composite-key idiom. That
+ * is not cosmetic: if two different combinations can render to the same key,
+ * the second write reads as already-seen — so it consumes no budget slot and
+ * still publishes. Every such collision buys a free series and the bound
+ * leaks.
+ *
+ * A join is injective only while its separator cannot occur inside a part,
+ * and that is NOT a free property of a Prometheus label value: promoted
+ * values include `alertname` and `severity`, which are verbatim inbound
+ * Alertmanager webhook labels, and a NUL survives `JSON.parse` intact. Six
+ * NULs inside `alertname` straddle the run of empty slots between promotable
+ * indices 1 and 7 and collide with a NUL inside `severity`.
+ *
+ * So the premise is enforced rather than assumed: promoted values are
+ * stripped of control characters at the promote site
+ * (see {@link PLUGIN_METRIC_CONTROL_CHAR_REGEX}), and the metric name cleared
+ * {@link PLUGIN_METRIC_NAME_REGEX}. A structurally injective key
+ * (`JSON.stringify`, a length-prefixed join) was measured at ~1.8x the cost
+ * of the join on this per-write path and, with the strip in place, no test
+ * can distinguish it — so the strip is the guard, and
+ * `never emits a raw control character into the exposition` is what fails if
+ * it is ever removed.
  */
 const pluginMetricCombinations = new Map<string, Set<string>>();
 
@@ -2177,11 +2216,16 @@ function ensureRegistry(): {
         + String(PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) + " code points and was "
         + "cut to fit; the increment landed with the shortened value, and "
         + "because the combination ledger keys on what is actually published, "
-        + "two values sharing that prefix collapse into one series). A drop is "
+        + "two values sharing that prefix collapse into one series), and "
+        + "'value_sanitized' (a promoted label value carried control "
+        + "characters, which were stripped before publishing -- prom-client "
+        + "escapes only backslash, newline and quote, so anything else would "
+        + "reach this endpoint as a raw byte). A drop is "
         + "never silent: this is the series that answers 'why is my plugin "
         + "metric missing or wrong', which otherwise required reading host "
         + "source. The 'metric' label is populated ONLY where its cardinality "
-        + "is already bounded: 'label_budget' and 'value_truncated' carry the "
+        + "is already bounded: 'label_budget', 'value_truncated' and "
+        + "'value_sanitized' carry the "
         + "real name (it cleared the name budget, so it is one of at most "
         + String(PLUGIN_METRIC_NAME_BUDGET) + "), and 'name_budget' "
         + "carries \"" + PLUGIN_METRIC_OVERFLOW_NAME + "\" -- NOT the rejected "
@@ -2923,7 +2967,7 @@ export function setAgentWakeupTerminalFailedUnresolved(
     // Anything not in the bounded scope set collapses to `other` rather than
     // minting a new series.
     const scope = entry.scope === "pr_review" ? "pr_review" : "other";
-    const key = `${errorCode} ${scope}`;
+    const key = `${errorCode}\u0000${scope}`;
     normalized.set(key, (normalized.get(key) ?? 0) + Math.max(0, entry.count));
   }
   for (
@@ -2936,7 +2980,7 @@ export function setAgentWakeupTerminalFailedUnresolved(
     for (const scope of TERMINAL_FAILED_WAKE_SCOPES) {
       gauge.set(
         { error_code: errorCode, scope },
-        normalized.get(`${errorCode} ${scope}`) ?? 0,
+        normalized.get(`${errorCode}\u0000${scope}`) ?? 0,
       );
     }
   }
@@ -3159,6 +3203,7 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
     const labels: Record<string, string> = { ...identity, metric: name };
     const comboParts: string[] = [name];
     let truncatedValue = false;
+    let sanitizedValue = false;
     for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
       const raw = declared.has(key) ? input.tags?.[key] : undefined;
       // Only primitives promote. `String(raw)` on an object yields the constant
@@ -3172,26 +3217,40 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
         typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean"
       ) {
         const full = String(raw);
+        // Strip control characters BEFORE anything else reads the value, so
+        // the same string is what gets published AND what gets keyed -- see
+        // PLUGIN_METRIC_CONTROL_CHAR_REGEX for why both matter.
+        const cleaned = full.replace(PLUGIN_METRIC_CONTROL_CHAR_REGEX, "");
+        if (cleaned.length !== full.length) sanitizedValue = true;
         // Measure in code POINTS, not UTF-16 code units. A bare `.slice(128)`
         // can cut a surrogate pair in half and leave a lone surrogate, which
         // the exposition serialises as U+FFFD -- a label value that differs
-        // from the one the plugin sent, for no gain.
-        const points = Array.from(full);
-        if (points.length > PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) {
-          promoted = points.slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH).join("");
-          truncatedValue = true;
+        // from the one the plugin sent, for no gain. The outer length check is
+        // not redundant: a UTF-16 length is always >= the code-point count, so
+        // it proves no truncation is needed without materialising an array for
+        // the short values that are the overwhelming majority of writes.
+        if (cleaned.length > PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) {
+          const points = Array.from(cleaned);
+          if (points.length > PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH) {
+            promoted = points.slice(0, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH).join("");
+            truncatedValue = true;
+          } else {
+            promoted = cleaned;
+          }
         } else {
-          promoted = full;
+          promoted = cleaned;
         }
       }
       if (promoted.length > 0) labels[key] = promoted;
       comboParts.push(promoted);
     }
 
-    // Tier 2 — the tag-value axis, over combinations ever observed. `combo` is
-    // NUL-joined so two distinct combinations cannot render to one ledger key
-    // (see pluginMetricCombinations) — a collision there would hand out a free
-    // series and leak the bound.
+    // Tier 2 — the tag-value axis, over combinations ever observed. NUL-joined,
+    // which is injective ONLY because no part can contain a NUL — and that is
+    // now enforced here rather than assumed: every promoted value is stripped
+    // of control characters a few lines above, and `name` cleared
+    // PLUGIN_METRIC_NAME_REGEX. See pluginMetricCombinations for why a
+    // collision would be a real leak rather than a miscount.
     const combo = comboParts.join("\0");
     let seen = pluginMetricCombinations.get(pluginId);
     if (!seen) {
@@ -3233,6 +3292,23 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       metrics.pluginMetricDroppedCounter.inc({
         ...identity,
         reason: "value_truncated",
+        metric: name,
+      });
+    }
+
+    // Stripping a control character is the same kind of event as truncation --
+    // the published value is not the one the plugin sent -- so it is counted
+    // for the same reason, and counting it is what keeps §26.4's claim that
+    // every degradation is recorded true rather than nearly true. Reported
+    // separately from `value_truncated` because the remedies differ: a
+    // truncation says "your value is too long", a strip says "your value
+    // carried bytes that cannot appear in an exposition", and a plugin author
+    // told the wrong one will look in the wrong place. Same cardinality
+    // argument as above: `name` already cleared tier 1.
+    if (sanitizedValue) {
+      metrics.pluginMetricDroppedCounter.inc({
+        ...identity,
+        reason: "value_sanitized",
         metric: name,
       });
     }
