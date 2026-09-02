@@ -383,10 +383,11 @@ describe("startServer feedback export wiring", () => {
     );
   });
 
-  it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {
+  it("keeps routine ticks, setup cleanup, and agent-health emission active when heartbeat scheduling is suppressed", async () => {
+    const schedulerIntervalMs = 30000;
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
-      heartbeatSchedulerIntervalMs: 30000,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
     }));
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: true,
@@ -396,7 +397,7 @@ describe("startServer feedback export wiring", () => {
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
       .mockImplementation(((callback: () => void, delay?: number) => {
-        if (delay === 30000) intervalCallback = callback;
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -406,6 +407,10 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
+      // The scheduler tick is the sole emission path (BLO-26727): startup
+      // recovery deliberately no longer publishes gauges, so nothing has
+      // emitted yet at this point.
+      expect(heartbeatServiceMock.publishAgentLivenessGauges).not.toHaveBeenCalled();
 
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
@@ -415,6 +420,10 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
+      // The point of the fix: emission runs ahead of the suppression gate, so a
+      // suppressed tick still reports fleet health. Folding this call back
+      // below the gate (or into the recovery chain) must fail here.
+      expect(heartbeatServiceMock.publishAgentLivenessGauges).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }
