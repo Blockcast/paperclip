@@ -265,6 +265,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: node ./scripts/designer-fast-uri-security.test.js
 
+      - name: Test bounded PR-check polling skills
+        # BLO-31075. .agents/skills/{check-pr,prcheckloop}/SKILL.md are executed
+        # by agents, so they are code. Their first version passed `bash -n` and
+        # still (a) polled a red PR for the full deadline before reporting a
+        # timeout and (b) had no success exit at all. This suite runs the fenced
+        # blocks against a stubbed `gh` and asserts the exit codes.
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
+        timeout-minutes: 1
+
       - name: Setup Helm
         if: ${{ !cancelled() }}
         uses: azure/setup-helm@v4
