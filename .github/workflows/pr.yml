@@ -92,6 +92,14 @@ jobs:
       - name: Test PR test-coverage gate
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
 
+      - name: Test bounded PR-check polling skills
+        # BLO-31075. .agents/skills/{check-pr,prcheckloop}/SKILL.md are executed
+        # by agents, so they are code. Their first version passed `bash -n` and
+        # still (a) polled a red PR for the full deadline before reporting a
+        # timeout and (b) had no success exit at all. This suite runs the fenced
+        # blocks against a stubbed `gh` and asserts the exit codes.
+        run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
+
       - name: Setup Helm
         uses: azure/setup-helm@v4
         with:

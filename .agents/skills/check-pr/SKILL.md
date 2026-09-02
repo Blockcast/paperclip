@@ -113,44 +113,125 @@ Key Perforce CL fields:
 ### 3. Wait for pending checks
 
 Never start an unbounded `gh pr checks --watch` process. Before polling a GitHub
-PR, read its lifecycle state and return immediately for merged or closed PRs;
-there is no useful check transition left to await, and legacy status contexts can
-remain pending forever after merge. For an open PR, use a bounded loop with a
-minimum interval of one minute and a deadline appropriate to the caller (the
-default below is 15 minutes):
+PR, read its lifecycle state and return immediately for merged or closed PRs:
+there is no useful check transition left to await, and a repo that parks a
+*legacy commit status* as a lease will never let the rollup settle. (Concretely:
+`Blockcast/onprem-k8s` posts `review/ally-worker-owner` only ever as `pending`,
+because `worker_ownership_is_current` treats any terminal state as "lease lost".
+`gh pr checks --watch` on a merged PR there polls forever —
+`timeout 30 gh pr checks 2831 -R Blockcast/onprem-k8s --watch` exits 124.)
+
+For an open PR, use a bounded loop with a minimum interval of one minute and a
+deadline appropriate to the caller (the default below is 15 minutes).
+
+**Run the block below as a single `bash` invocation** — `bash script.sh`, or one
+tool call containing the whole block. It bounds itself on wall-clock time read
+from `date`, but its `trap`s and its loop state exist only within one shell; a
+block split across several invocations re-enters the loop from the top each time
+and never reaches its own deadline.
+
+Exit codes are distinct so a caller can act on `$?` without re-parsing output:
+
+| Code | Meaning |
+|---|---|
+| 0 | every check reached a terminal state and all passed |
+| 1 | at least one check failed, or the repo reports no checks at all |
+| 2 | invalid configuration (non-numeric deadline/interval, `mktemp` failed) |
+| 3 | PR is already merged — nothing to wait for |
+| 4 | PR was closed without merging — nothing to wait for |
+| 124 | deadline exceeded with checks still pending |
 
 ```bash
 CHECK_DEADLINE_SEC=${CHECK_DEADLINE_SEC:-900}
 CHECK_INTERVAL_SEC=${CHECK_INTERVAL_SEC:-60}
-CHECK_INTERVAL_SEC=$((CHECK_INTERVAL_SEC < 60 ? 60 : CHECK_INTERVAL_SEC))
+# Validate before arithmetic: $(( )) evaluates array subscripts, so an
+# unvalidated value is a command-execution vector as well as a silent zero.
+for var in CHECK_DEADLINE_SEC CHECK_INTERVAL_SEC; do
+  if [[ ! ${!var} =~ ^[0-9]+$ ]]; then
+    printf '%s must be a non-negative integer (got %q).\n' "$var" "${!var}" >&2
+    exit 2
+  fi
+done
+(( CHECK_INTERVAL_SEC < 60 )) && CHECK_INTERVAL_SEC=60
 
-pr_state=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json state,mergedAt --jq '.state + " " + (.mergedAt // "")')
-case "$pr_state" in
-  MERGED*|CLOSED*)
-    printf 'PR is settled (%s); skipping check watch.\n' "$pr_state"
-    exit 0
-    ;;
-esac
+# Reads PR lifecycle state into $pr_state. Returns non-zero if gh itself
+# failed, so a 404 or an expired token is never mistaken for "still open".
+read_pr_state() {
+  pr_state=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" \
+    --json state,mergedAt --jq '.state + " " + (.mergedAt // "")') || return 1
+  [[ -n $pr_state ]]
+}
 
-watch_started=$SECONDS
-checks_output=$(mktemp)
-trap 'rm -f "$checks_output"' EXIT INT TERM
+# Maps a settled PR to its own exit code. Callers must be able to tell
+# "green, proceed" from "this PR was thrown away".
+exit_if_settled() {
+  case "$pr_state" in
+    MERGED*) printf 'PR is merged; nothing to wait for.\n'; exit 3 ;;
+    CLOSED*) printf 'PR was closed without merging; nothing to wait for.\n'; exit 4 ;;
+  esac
+}
+
+if ! read_pr_state; then
+  printf 'Could not read PR state for %s#%s.\n' "$OWNER_REPO" "$PR_NUMBER" >&2
+  exit 1
+fi
+exit_if_settled
+
+checks_output=$(mktemp) || { printf 'mktemp failed.\n' >&2; exit 2; }
+watch_pid=''
+# ONE EXIT trap. `trap` replaces rather than appends, so a second
+# `trap ... EXIT` anywhere below would silently drop this cleanup.
+cleanup() {
+  if [[ -n $watch_pid ]] && kill -0 "$watch_pid" 2>/dev/null; then
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+  fi
+  rm -f "$checks_output"
+}
+trap cleanup EXIT
+# These must *exit*, not just clean up: bash resumes execution after a
+# non-default signal handler returns, so a handler that only removes the
+# temp file leaves the loop running and recreates it on the next pass.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+watch_started=$(date +%s)
 while :; do
   # A fresh state read prevents a watch from surviving a merge/close race.
-  pr_state=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json state,mergedAt --jq '.state + " " + (.mergedAt // "")')
-  case "$pr_state" in
-    MERGED*|CLOSED*)
-      printf 'PR settled while polling (%s); stopping.\n' "$pr_state"
-      exit 0
+  if ! read_pr_state; then
+    printf 'Lost PR state for %s#%s while polling.\n' "$OWNER_REPO" "$PR_NUMBER" >&2
+    exit 1
+  fi
+  exit_if_settled
+
+  # Read the status directly, NOT through a pipe: in a pipeline $? is the
+  # last command's status. gh pr checks exits 0 only when every check
+  # PASSED, 8 while any are pending, and 1 both when a check failed and
+  # when the repo reports no checks at all. Collapsing non-zero into
+  # "still pending" makes a red PR poll to the deadline and report a
+  # timeout it already knew the answer to.
+  gh pr checks "$PR_NUMBER" --repo "$OWNER_REPO" >"$checks_output" 2>"$checks_output.err"
+  rc=$?
+  cat "$checks_output"
+  case $rc in
+    0)
+      break
+      ;;
+    8)
+      : # genuinely pending — fall through to the deadline check
+      ;;
+    *)
+      # `gh` prints "no checks reported on the '<branch>' branch" to stderr
+      # and leaves stdout empty, so surface stderr or the failure is silent.
+      cat "$checks_output.err" >&2
+      printf 'Checks are failing or unavailable (gh exit %s).\n' "$rc" >&2
+      rm -f "$checks_output.err"
+      exit 1
       ;;
   esac
+  rm -f "$checks_output.err"
 
-  if gh pr checks "$PR_NUMBER" --repo "$OWNER_REPO" >"$checks_output"; then
-    cat "$checks_output"
-    break
-  fi
-  cat "$checks_output"
-  if (( SECONDS - watch_started >= CHECK_DEADLINE_SEC )); then
+  if (( $(date +%s) - watch_started >= CHECK_DEADLINE_SEC )); then
     printf 'Timed out waiting for checks after %ss.\n' "$CHECK_DEADLINE_SEC" >&2
     exit 124
   fi
@@ -158,25 +239,17 @@ while :; do
 done
 ```
 
-If a child process is started for a longer-running equivalent, keep its PID and
-install a trap that terminates and waits for it on normal exit and signals:
+If you start a child process for a longer-running equivalent, capture its PID
+with `$!` **in the same shell** and reuse the `cleanup` trap above — a PID read
+from `$(...)` or from the end of a pipeline is not the process you need to reap:
 
 ```bash
-watch_pid=''
-cleanup_watch() {
-  if [[ -n "$watch_pid" ]] && kill -0 "$watch_pid" 2>/dev/null; then
-    kill "$watch_pid" 2>/dev/null || true
-    wait "$watch_pid" 2>/dev/null || true
-  fi
-}
-trap cleanup_watch EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+gh pr checks "$PR_NUMBER" --repo "$OWNER_REPO" --watch --interval 60 & watch_pid=$!
+wait "$watch_pid"
 ```
 
-The bounded loop applies to GitHub; for GitLab, use the same deadline and
-interval rules around the pipeline-status query. Do not wait forever for a
-remote status provider.
+`cleanup` already terminates `$watch_pid` on normal exit and on INT/TERM, so do
+not install a second `trap ... EXIT` for it.
 
 **GitHub:** poll `statusCheckRollup` from `gh pr view`.
 
@@ -184,7 +257,39 @@ remote status provider.
 ```bash
 glab api "projects/:fullpath/merge_requests/<MR_IID>/pipelines"
 ```
-Pipeline statuses: `running`, `pending`, `success`, `failed`, `canceled`, `skipped`. Poll until no pipeline has `running` or `pending` status.
+Pipeline statuses: `running`, `pending`, `success`, `failed`, `canceled`, `skipped`.
+
+The same bound applies here — do not wait forever for a remote status provider.
+Poll under the same deadline and one-minute interval floor as the GitHub loop,
+and stop early when the MR itself settles (an MR closed with a stuck pipeline has
+exactly the hazard the GitHub path guards against):
+
+```bash
+# $CHECK_DEADLINE_SEC / $CHECK_INTERVAL_SEC validated as above.
+poll_started=$(date +%s)
+while :; do
+  mr_state=$(glab api "projects/:fullpath/merge_requests/$MR_IID" --jq .state) || {
+    printf 'Could not read MR state.\n' >&2; exit 1; }
+  case "$mr_state" in
+    merged) printf 'MR is merged; nothing to wait for.\n'; exit 3 ;;
+    closed) printf 'MR was closed without merging; nothing to wait for.\n'; exit 4 ;;
+  esac
+
+  statuses=$(glab api "projects/:fullpath/merge_requests/$MR_IID/pipelines" --jq '.[].status') || {
+    printf 'Could not read pipeline statuses.\n' >&2; exit 1; }
+  if ! grep -qE '^(running|pending)$' <<<"$statuses"; then
+    grep -qE '^(failed|canceled)$' <<<"$statuses" && { printf '%s\n' "$statuses"; exit 1; }
+    printf '%s\n' "$statuses"
+    break
+  fi
+
+  if (( $(date +%s) - poll_started >= CHECK_DEADLINE_SEC )); then
+    printf 'Timed out waiting for pipelines after %ss.\n' "$CHECK_DEADLINE_SEC" >&2
+    exit 124
+  fi
+  sleep "$CHECK_INTERVAL_SEC"
+done
+```
 
 **Perforce:** Perforce doesn't have built-in CI checks natively. If the team uses a review tool (Swarm, etc.) or an external CI triggered by shelve events, check the relevant system. Otherwise, proceed to analysis immediately.
 
