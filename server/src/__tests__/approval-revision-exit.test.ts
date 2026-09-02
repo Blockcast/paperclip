@@ -229,12 +229,28 @@ describeEmbeddedPostgres("a requester-initiated exit never destroys the board's 
       type: "request_board_approval",
       status: "revision_requested",
       payload: { title: "Sign the DCO under a distinct identity" },
-      requestedByAgentId: null,
+      // The requesting agent, not null: withdraw and resubmit are requester-scoped,
+      // so a card nobody filed does not exercise the agent-reachable exit this
+      // change exists to provide.
+      requestedByAgentId: requesterAgentId,
       decisionNote: BOARD_NOTE,
       decidedByUserId: "board-user",
       decidedAt,
     });
     return { id, decidedAt };
+  }
+
+  async function seedPending() {
+    const id = randomUUID();
+    await db.insert(approvals).values({
+      id,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Persist the board decision note" },
+      requestedByAgentId: requesterAgentId,
+    });
+    return id;
   }
 
   it("withdraws straight out of revision_requested, leaving the note byte-identical", async () => {
@@ -285,6 +301,95 @@ describeEmbeddedPostgres("a requester-initiated exit never destroys the board's 
     expect(comments).toHaveLength(1);
     expect(comments[0].body).toContain(BOARD_NOTE);
     expect(comments[0].authorUserId).toBe("board-user");
+  });
+
+  for (const decision of ["approve", "reject"] as const) {
+    it(`persists a board decision note through ${decision}`, async () => {
+      const id = await seedPending();
+      const note = `Board ${decision} rationale survives the decision write.`;
+
+      const resolved = decision === "approve"
+        ? await approvalService(db).approve(id, "board-user", note)
+        : await approvalService(db).reject(id, "board-user", note);
+
+      expect(resolved.approval.decisionNote).toBe(note);
+      const [persisted] = await db.select().from(approvals).where(eq(approvals.id, id));
+      expect(persisted.status).toBe(decision === "approve" ? "approved" : "rejected");
+      expect(persisted.decisionNote).toBe(note);
+    });
+  }
+
+  it("does not revert a board decision that commits while a resubmit is in flight", async () => {
+    // The interleaving Ally reproduced on review of #1388: `resubmit` SELECTs
+    // `revision_requested` without FOR UPDATE, the board approves (writing a
+    // *fresh* note), and only then does the UPDATE run. Unguarded it reverted the
+    // card to `pending` and nulled the newer note, while the comment archived from
+    // the older revision note made the card read as though its reasoning had been
+    // preserved -- the exact loss class this issue exists to close, in the sibling
+    // function. Racing at the UPDATE rather than at the comment insert keeps this
+    // test coupled only to the statement under test.
+    const { id } = await seedRevisionRequested();
+    const boardApprovalNote = "Approved after all: the DCO question was settled on BLO-22323.";
+    let raced = false;
+
+    const racingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== "transaction") return Reflect.get(target, prop, receiver);
+        return (callback: (tx: unknown) => unknown) =>
+          target.transaction((tx: Record<string, any>) => callback(racingUpdates(tx)));
+      },
+    });
+
+    // Defers building the real update until `returning()`, so the board's decision
+    // commits on another pooled connection immediately before the guarded UPDATE
+    // executes. The resubmit transaction holds no row lock at that point -- its read
+    // was a plain SELECT -- so this commits rather than deadlocking.
+    function racingUpdates(tx: Record<string, any>) {
+      return new Proxy(tx, {
+        get(target, prop, receiver) {
+          if (prop !== "update") return Reflect.get(target, prop, receiver);
+          return (table: unknown) => ({
+            set: (values: unknown) => ({
+              where: (predicate: unknown) => ({
+                returning: async () => {
+                  if (!raced) {
+                    raced = true;
+                    await db
+                      .update(approvals)
+                      .set({
+                        status: "approved",
+                        decisionNote: boardApprovalNote,
+                        decidedByUserId: "board-user",
+                        decidedAt: new Date(),
+                      })
+                      .where(eq(approvals.id, id));
+                  }
+                  return target.update(table).set(values).where(predicate).returning();
+                },
+              }),
+            }),
+          });
+        },
+      });
+    }
+
+    await expect(approvalService(racingDb as typeof db).resubmit(id)).rejects.toMatchObject({
+      status: 422,
+    });
+    expect(raced).toBe(true);
+
+    // The board's decision stands, note byte-identical.
+    const [persisted] = await db.select().from(approvals).where(eq(approvals.id, id));
+    expect(persisted.status).toBe("approved");
+    expect(persisted.decisionNote).toBe(boardApprovalNote);
+
+    // And the archive comment rolled back with the transaction, so the card carries
+    // no record of a resubmit that never happened.
+    const comments = await db
+      .select()
+      .from(approvalComments)
+      .where(eq(approvalComments.approvalId, id));
+    expect(comments).toHaveLength(0);
   });
 
   it("still records the reason in the note when the board never wrote one", async () => {

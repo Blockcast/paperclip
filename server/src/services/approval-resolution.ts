@@ -156,8 +156,16 @@ export async function resolveApprovalWithSideEffects(
       entityId: approval.id,
       details: { type: approval.type, decidedByUserId },
     });
-    const revisionIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
-    await queueRequesterWake(approval, revisionIssues.map((issue) => issue.id));
+    // Unlike the approve/reject path below, nothing here consumes the linked
+    // issues except the wake, and the wake is a no-op without a requester. Skip
+    // the query for a card no agent filed.
+    if (approval.requestedByAgentId) {
+      const revisionIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+      await queueRequesterWake(
+        approval,
+        revisionIssues.map((issue) => issue.id),
+      );
+    }
     return { approval, applied: true };
   }
 
