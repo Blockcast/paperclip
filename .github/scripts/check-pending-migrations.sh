@@ -35,6 +35,10 @@ TIMEOUT_SECONDS="${PREFLIGHT_TIMEOUT_SECONDS:-180}"
 # the measured cold pull so registry throughput cannot fail a good build,
 # while still bounding an unschedulable pod or an undownloadable digest.
 STARTUP_TIMEOUT_SECONDS="${PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-600}"
+# How often phase 1 re-observes the pod. Injectable only so the behavioural
+# tests can drive real waits without spending real minutes; nothing in CI or the
+# deploy job sets it.
+POLL_SECONDS="${PREFLIGHT_POLL_SECONDS:-5}"
 
 [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "DIGEST is not a sha256 digest: ${DIGEST}" >&2; exit 1; }
 
@@ -116,7 +120,7 @@ while :; do
   if [ "$(date +%s)" -ge "${startup_deadline}" ]; then
     break
   fi
-  sleep 5
+  sleep "${POLL_SECONDS}"
 done
 startup_seconds=$(( $(date +%s) - startup_began ))
 

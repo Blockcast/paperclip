@@ -126,7 +126,7 @@ jobs:
       - name: Test pending-migration pre-flight phase budgets (BLO-31254)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
-        timeout-minutes: 3
+        timeout-minutes: 1
 
       # BLO-29008: executes the two-tier convergence gate's shell against
       # recorded cluster states. The gate fails OPEN if its string accumulation
