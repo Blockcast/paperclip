@@ -1348,6 +1348,10 @@ export {
 
 export { workspaceRuntimeControlTargetSchema } from "./validators/execution-workspace.js";
 export {
+  collectBranchTemplateProblems,
+  EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS,
+} from "./validators/execution-workspace.js";
+export {
   findWorkspaceCommandDefinition,
   listWorkspaceCommandDefinitions,
   listWorkspaceServiceCommandDefinitions,

@@ -25,6 +25,7 @@ import {
 import { eq } from "drizzle-orm";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
+  buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
@@ -57,6 +58,7 @@ import {
 } from "../services/local-service-supervisor.ts";
 import { resolvePaperclipConfigPath } from "../paths.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
+import { EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -7856,5 +7858,47 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       scopeId: "execution-workspace-1",
       executionWorkspaceId: "execution-workspace-1",
     });
+  });
+});
+
+/**
+ * BLO-31281: `branchTemplate` write-time validation rejects any key outside
+ * EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS, but that list lives in
+ * @paperclipai/shared while the data it describes is built here. Nothing but
+ * this test keeps the two honest, and drift is silent in both directions:
+ * a key present in the data but undeclared gets wrongly rejected at write
+ * time, and a key declared but absent from the data passes validation and
+ * then renders as empty text — which is exactly the failure this ticket is
+ * about.
+ */
+describe("branch template key contract", () => {
+  function leafKeys(value: unknown, prefix = ""): string[] {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return prefix ? [prefix] : [];
+    }
+    return Object.entries(value as Record<string, unknown>)
+      .flatMap(([key, child]) => leafKeys(child, prefix ? `${prefix}.${key}` : key));
+  }
+
+  const templateData = buildWorkspaceTemplateData({
+    issue: { id: "issue-uuid", identifier: "BLO-31281", title: "Some Title" },
+    agent: { id: "agent-uuid", name: "CTO" },
+    projectId: "project-uuid",
+    repoRef: "master",
+  });
+
+  it("exposes exactly the keys write-time validation accepts", () => {
+    expect(leafKeys(templateData).sort()).toEqual(
+      [...EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS].sort(),
+    );
+  });
+
+  it("resolves every declared key to a non-empty value", () => {
+    for (const key of EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS) {
+      const resolved = key
+        .split(".")
+        .reduce<unknown>((cursor, part) => (cursor as Record<string, unknown>)?.[part], templateData);
+      expect(resolved, `template key ${key} resolved empty`).toBeTruthy();
+    }
   });
 });
