@@ -1545,10 +1545,17 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * disabled mid-process keeps its ledger for the worker's lifetime. That is
  * deliberate, not an oversight. The residue is bounded by the same two budgets
  * this ledger exists to enforce (at most 50 names and 100 combinations per
- * plugin, so ~150 short strings), and pruning on uninstall would hand a
- * reinstall a fresh budget — turning install/uninstall into a way to mint
- * unbounded series, which is exactly what the bound refuses. A worker restart
- * is the reclaim path.
+ * plugin, so ~150 short strings), and on the *default* uninstall path pruning
+ * would hand a reinstall a fresh budget — turning install/uninstall into a way
+ * to mint unbounded series, which is exactly what the bound refuses.
+ *
+ * That default is a soft delete: the row survives as `uninstalled` and a
+ * reinstall reuses it, so `pluginId` — and with it the ledger key — is stable
+ * across the cycle. `uninstall(id, removeData = true)` instead hard-deletes the
+ * row, so the reinstall inserts under a fresh `defaultRandom()` id and gets a
+ * clean budget whether or not we prune; there the retained entry is an orphan
+ * rather than a hole this closes. The rule is kept unconditional because the
+ * exploitable path is the default one. A worker restart is the reclaim path.
  */
 const pluginMetricCombinations = new Map<string, Set<string>>();
 
