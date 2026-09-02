@@ -51,7 +51,12 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginPerformActionContext, WorkerToHostMethods } from "./protocol.js";
+import type {
+  PluginEventOwnershipCheck,
+  PluginFencingPrecondition,
+  PluginPerformActionContext,
+  WorkerToHostMethods,
+} from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -611,8 +616,38 @@ export interface PluginEventsClient {
    * @param name - Bare event name (e.g. `"sync-done"`)
    * @param companyId - UUID of the company this event belongs to
    * @param payload - JSON-serializable event payload
+   * @param options.ownershipCheck - Best-effort pre-dispatch ownership check.
+   *
+   * **This is not a fence, and the option is deliberately not called
+   * `fencing`.** The `issues.*` and `state.set` options of that name mutate a
+   * row, so the host takes the generation lock inside the mutation's own
+   * transaction and holds it to commit — no interleaving is possible, and a
+   * displaced caller's write cannot land. Event delivery is an in-memory
+   * fan-out to subscriber handlers with no transaction to join, so no lock can
+   * be held from the check through the dispatch.
+   *
+   * What you get: the host re-reads the generation immediately before fan-out
+   * and refuses to dispatch if it is already gone. A steal committing in the
+   * remaining window between that check and the fan-out still results in
+   * delivery. Holding the share lock across the handlers would close it and is
+   * rejected on purpose — handlers run arbitrary plugin code, so a slow or
+   * wedged handler would block the steal path, reintroducing the
+   * unstealable-fence failure this mechanism exists to prevent (BLO-31036).
+   *
+   * Consequently a subscriber must treat an event as a notification, not as an
+   * authorization to act: anything durable or side-effecting has to
+   * re-establish ownership itself. Making delivery authoritative requires a
+   * transactional outbox in the host event subsystem (BLO-31113) and cannot be
+   * fixed from the emitting side.
+   *
+   * @see PluginEventOwnershipCheck
    */
-  emit(name: string, companyId: string, payload: unknown): Promise<void>;
+  emit(
+    name: string,
+    companyId: string,
+    payload: unknown,
+    options?: { ownershipCheck?: PluginEventOwnershipCheck },
+  ): Promise<void>;
 }
 
 /**
@@ -896,8 +931,17 @@ export interface PluginStateClient {
    *
    * @param input - Scope key identifying the entry to write
    * @param value - JSON-serializable value to store
+   * @param options.fencing - Only apply the write while this fencing generation
+   *   is still held. The host takes a share lock on the named row inside the
+   *   upsert's own transaction and holds it to commit, so a concurrent steal
+   *   cannot land between the check and the write. Rejection throws with
+   *   `code: "fencing_generation_lost"`.
    */
-  set(input: ScopeKey, value: unknown): Promise<void>;
+  set(
+    input: ScopeKey,
+    value: unknown,
+    options?: { fencing?: PluginFencingPrecondition },
+  ): Promise<void>;
 
   /**
    * Delete a state value. No-ops silently if the entry does not exist
@@ -1603,6 +1647,12 @@ export interface PluginIssuesClient {
      * row points at the duplicate, not the original.
      */
     linkedLinearIssue?: { id: string; identifier: string };
+    /**
+     * Only create the issue while this fencing generation is still held. The
+     * host checks it under a share lock inside the create transaction, so a
+     * displaced caller cannot file an issue behind the current owner's back.
+     */
+    fencing?: PluginFencingPrecondition;
   }): Promise<Issue>;
   update(
     issueId: string,
@@ -1645,6 +1695,18 @@ export interface PluginIssuesClient {
     },
     companyId: string,
     actor?: PluginIssueMutationActor,
+    options?: {
+      /**
+       * Only apply the patch while this fencing generation is still held.
+       *
+       * Distinct from the `expectedCurrent*` preconditions above: those compare
+       * columns of *this* issue against a snapshot, while this locks a row in
+       * the calling plugin's own schema for the life of the update transaction.
+       * That is what makes it a fence rather than a barrier — a steal cannot
+       * commit between the check and the write.
+       */
+      fencing?: PluginFencingPrecondition;
+    },
   ): Promise<Issue>;
   assertCheckoutOwner(input: {
     issueId: string;
@@ -1684,7 +1746,14 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string },
+    options?: {
+      authorAgentId?: string;
+      /**
+       * Only write the comment while this fencing generation is still held.
+       * Checked under a share lock inside the insert's transaction.
+       */
+      fencing?: PluginFencingPrecondition;
+    },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,

@@ -166,6 +166,7 @@ import {
   issues,
   issueWorkProducts,
   projects,
+  routineTriggers,
   projectWorkspaces,
   routineRevisions,
   routineRuns,
@@ -433,6 +434,7 @@ import {
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
   resolveCapacityEscalation,
+  resolveRoutineScopedRetry,
   CAPACITY_ESCALATION_AFTER_MS,
   CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
@@ -18169,11 +18171,79 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : jitterTransientRetryFloor({ dueAt: effectiveRetryNotBefore, now, random: opts?.random })
               .dueAt
         : null;
-    const schedule = flooredDueAt
+    const preRoutineDueAt = flooredDueAt ?? baseSchedule.dueAt;
+
+    // Routine execution issues retain the routine run id as their origin. Read
+    // the schedule through that stable relation rather than inferring routine
+    // ownership from the heartbeat run itself. `nextRunAt` is the next window's
+    // boundary; its distance from this fire is the period for fixed-interval
+    // schedules and is the tightest known deadline for this execution.
+    const routineSchedule = issueId
+      ? await db
+          .select({
+            triggeredAt: routineRuns.triggeredAt,
+            triggerPayload: routineRuns.triggerPayload,
+          })
+          .from(issues)
+          .innerJoin(routineRuns, sql`${routineRuns.id}::text = ${issues.originRunId}`)
+          .innerJoin(routineTriggers, eq(routineTriggers.id, routineRuns.triggerId))
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, run.companyId),
+              eq(routineRuns.companyId, run.companyId),
+              eq(routineTriggers.kind, "schedule"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const routineWindowClosesAt = routineSchedule?.triggerPayload
+      ? readNonEmptyString(parseObject(routineSchedule.triggerPayload).__paperclipRoutineWindowClosesAt)
+      : null;
+    const routineWindowDeadline = routineWindowClosesAt ? new Date(routineWindowClosesAt) : null;
+    const routinePeriodMs = routineWindowDeadline && !Number.isNaN(routineWindowDeadline.getTime()) && routineSchedule?.triggeredAt
+      ? routineWindowDeadline.getTime() - routineSchedule.triggeredAt.getTime()
+      : null;
+    const routineRetryDecision =
+      routinePeriodMs !== null && routineWindowDeadline
+        ? resolveRoutineScopedRetry({
+            dueAt: preRoutineDueAt,
+            failedAt: run.finishedAt ?? run.updatedAt ?? now,
+            routinePeriodMs,
+            windowClosesAt: routineWindowDeadline,
+          })
+        : null;
+
+    if (routineRetryDecision?.decision === "abandon") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Scheduled retry abandoned because the owning routine window cannot accept a useful retry",
+        payload: {
+          retryReason,
+          scheduledRetryAttempt: nextAttempt,
+          routineRetryDecision: "abandon",
+          routineRetryReason: routineRetryDecision.reason,
+          routineRetryPreClampAt: preRoutineDueAt.toISOString(),
+          routineRetryRejectedDueAt: routineRetryDecision.rejectedDueAtIso,
+        },
+      });
+      return {
+        outcome: "not_scheduled" as const,
+        reason: routineRetryDecision.reason,
+        errorCode: "routine_retry_abandoned" as const,
+        issueId,
+      };
+    }
+
+    const routineDueAt = routineRetryDecision?.dueAt ?? preRoutineDueAt;
+    const schedule = routineDueAt.getTime() !== baseSchedule.dueAt.getTime()
       ? {
           ...baseSchedule,
-          dueAt: flooredDueAt,
-          delayMs: Math.max(0, flooredDueAt.getTime() - now.getTime()),
+          dueAt: routineDueAt,
+          delayMs: Math.max(0, routineDueAt.getTime() - now.getTime()),
         }
       : baseSchedule;
 
@@ -18250,6 +18320,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...(clampedTransientRetry?.clampedFromIso
         ? { transientRetryHorizonClampedFrom: clampedTransientRetry.clampedFromIso }
         : {}),
+      ...(routineRetryDecision
+        ? {
+            routineRetryPreClampAt: preRoutineDueAt.toISOString(),
+            routineRetryDecision: routineRetryDecision.decision,
+            ...(routineRetryDecision.decision === "clamp"
+              ? { routineRetryClampedFrom: routineRetryDecision.clampedFromIso }
+              : {}),
+          }
+        : {}),
       ...(transientRecovery?.errorFamily === "provider_quota" && transientRetryNotBefore
         ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
         : {}),
@@ -18282,7 +18361,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
-            | "issue_execution_lock_changed";
+            | "issue_execution_lock_changed"
+            | "routine_retry_abandoned";
           issueId: string | null;
           details: Record<string, unknown>;
         };

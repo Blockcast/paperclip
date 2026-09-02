@@ -156,6 +156,11 @@ jobs:
         run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
         timeout-minutes: 1
 
+      - name: Test @penstock publish-drift comparison
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
+        timeout-minutes: 1
+
       - name: Reject git push in adapter/runtime code
         if: ${{ !cancelled() }}
         run: node ./scripts/check-no-git-push.mjs
@@ -375,6 +380,10 @@ jobs:
       - name: Test ip-address security override
         if: ${{ !cancelled() }}
         run: pnpm run test:ip-address-security-override
+
+      - name: Test browserslist security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:browserslist-security-override
 
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}

@@ -2631,6 +2631,16 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs).toHaveLength(3);
     expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(1);
     expect(runs.filter((run) => run.status === "coalesced")).toHaveLength(2);
+    expect(runs.map((run) => run.triggerPayload?.__paperclipRoutineWindowClosesAt)).toEqual([
+      "2026-07-16T01:00:00.000Z",
+      "2026-07-16T02:00:00.000Z",
+      "2026-07-16T03:00:00.000Z",
+    ]);
+    expect(runs.map((run) => run.triggeredAt)).toEqual([
+      new Date("2026-07-16T00:00:00.000Z"),
+      new Date("2026-07-16T01:00:00.000Z"),
+      new Date("2026-07-16T02:00:00.000Z"),
+    ]);
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
     expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-16T03:00:00.000Z"));
   });

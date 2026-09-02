@@ -239,11 +239,12 @@ function sleep(ms: number): Promise<void> {
 //
 // The shared plugin install directory's package-lock.json and its physical
 // node_modules/ tree are written by several uncoordinated steps across a
-// server boot (an early one-time SDK-fork vendor copy, per-plugin `npm
-// install` invocations that each touch the same shared package.json/lockfile,
-// and a post-install re-patch that overwrites specific dist files but not
-// package.json — see the `copyWorkspaceSdkFiles`/`autoInstallBundledPlugins`
-// sequence in index.ts). None of those steps are transactional with each
+// server boot (per-plugin `npm install` invocations that each touch the same
+// shared package.json/lockfile, plus `autoInstallBundledPlugins` in index.ts).
+// Until 2026-09-01 a boot-time fork-vendor copy wrote there too and was the
+// dominant source of tears; the store now resolves the fork through an npm
+// alias so that copy is gone. The remaining writers are still not
+// transactional with each
 // other, so a restart, OOM-kill, or deploy rollout landing between two of
 // them can leave package-lock.json recording one version of a shared
 // dependency (e.g. `@paperclipai/plugin-sdk`) while node_modules physically

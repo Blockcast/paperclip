@@ -1775,6 +1775,7 @@ export function routineService(
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
     descriptionAppendix?: string | null;
+    triggeredAtOverride?: Date | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
   }) {
@@ -1810,12 +1811,27 @@ export function routineService(
       automaticVariables,
     });
     const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
+    const triggeredAt = input.triggeredAtOverride ?? new Date();
+    const nextRunAt = input.nextRunAtOverride !== undefined
+      ? input.nextRunAtOverride
+      : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
+        ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
+        : undefined;
     const title = interpolateRoutineTemplate(input.routine.title, allVariables) ?? input.routine.title;
     const baseDescription = interpolateRoutineTemplate(input.routine.description, allVariables);
     const description = [baseDescription, input.descriptionAppendix]
       .filter((part): part is string => Boolean(part && part.trim()))
       .join("\n\n");
     const triggerPayload = mergeRoutineRunPayload(input.payload, { ...automaticVariables, ...resolvedVariables });
+    // Keep the window boundary attached to this run. The scheduler advances the
+    // trigger before dispatching, so reading the trigger later can identify the
+    // next window rather than the one that owns this execution.
+    const persistedTriggerPayload = input.source === "schedule" && nextRunAt
+      ? {
+        ...(triggerPayload ?? {}),
+        __paperclipRoutineWindowClosesAt: nextRunAt.toISOString(),
+      }
+      : triggerPayload;
     const managedRoutineBinding = await getManagedRoutineBinding(input.routine);
     const managedIssueTemplate = readManagedRoutineIssueTemplate(managedRoutineBinding?.defaultsJson);
     const issueOriginKind = managedIssueTemplate?.surfaceVisibility === "plugin_operation" && managedRoutineBinding
@@ -1861,7 +1877,6 @@ export function routineService(
         if (existing) return existing;
       }
 
-      const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
       const latestRevisionResponsibleUserId = input.routine.latestRevisionId
         ? await txDb
@@ -1893,18 +1908,12 @@ export function routineService(
           status: "received",
           triggeredAt,
           idempotencyKey: input.idempotencyKey ?? null,
-          triggerPayload,
+          triggerPayload: persistedTriggerPayload,
           dispatchFingerprint,
           routineRevisionId: input.routine.latestRevisionId,
           responsibleUserId,
         })
         .returning();
-
-      const nextRunAt = input.nextRunAtOverride !== undefined
-        ? input.nextRunAtOverride
-        : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
-          ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
-          : undefined;
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
@@ -3141,6 +3150,8 @@ export function routineService(
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        let runTriggeredAtOverrides: Array<Date | null> = [row.trigger.nextRunAt];
+        let runNextRunAtOverrides: Array<Date | null> = [claimedNextRunAt];
 
         if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           if (isSubHourlyCronExpression(row.trigger.cronExpression, row.trigger.timezone, now)) {
@@ -3148,9 +3159,14 @@ export function routineService(
           } else {
             let cursor: Date | null = row.trigger.nextRunAt;
             runCount = 0;
+            runTriggeredAtOverrides = [];
+            runNextRunAtOverrides = [];
             while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
+              const missedAt = cursor;
               runCount += 1;
               claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
+              runTriggeredAtOverrides.push(missedAt);
+              runNextRunAtOverrides.push(claimedNextRunAt);
               cursor = claimedNextRunAt;
             }
           }
@@ -3210,7 +3226,8 @@ export function routineService(
             routine: row.routine,
             trigger: row.trigger,
             source: "schedule",
-            nextRunAtOverride: claimedNextRunAt,
+            triggeredAtOverride: runTriggeredAtOverrides[i] ?? row.trigger.nextRunAt,
+            nextRunAtOverride: runNextRunAtOverrides[i] ?? claimedNextRunAt,
           });
           triggered += 1;
         }
