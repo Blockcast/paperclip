@@ -358,6 +358,7 @@ import {
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
+import { truncateText } from "./truncate-text.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import {
   applyAgentGitIdentityToRuntimeConfig,
@@ -5737,10 +5738,7 @@ function summarizeRunFailureForIssueComment(
     .map((line) => line.trim())
     .find(Boolean) ?? null;
   const summarySource = apiMessageMatch?.[1] ?? firstLine;
-  const summary =
-    summarySource && summarySource.length > 240
-      ? `${summarySource.slice(0, 237)}...`
-      : summarySource;
+  const summary = summarySource ? truncateText(summarySource, 240) : null;
 
   if (errorCode && summary) return ` Latest retry failure: \`${errorCode}\` - ${summary}.`;
   if (errorCode) return ` Latest retry failure: \`${errorCode}\`.`;
