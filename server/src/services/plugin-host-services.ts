@@ -35,6 +35,7 @@ import type {
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
+import { recordPluginMetric } from "./metrics.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
@@ -1612,6 +1613,26 @@ export function buildHostServices(
       async write(params) {
         const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
         logger.debug({ pluginId, name: safeName, value: params.value, tags: params.tags }, "Plugin metric write");
+
+        // Publish to Prometheus FIRST (PEN-2799). Ordered before the
+        // plugin_logs buffer push deliberately: the buffer write can fail or be
+        // lost on a flush error, and the exposition path is the one an alert
+        // rule depends on. `recordPluginMetric` never throws, so this cannot
+        // turn a mis-shaped metric into a failed plugin call.
+        //
+        // Note this passes the *untruncated* name: recordPluginMetric applies
+        // its own length bound and counts an over-long name as an explicit
+        // `bad_name` drop. Handing it the pre-truncated string would let a
+        // too-long name silently masquerade as a valid shorter one and occupy a
+        // real series.
+        recordPluginMetric({
+          pluginId,
+          pluginKey,
+          name: String(params.name ?? ""),
+          value: typeof params.value === "number" ? params.value : Number(params.value),
+          tags: (params.tags ?? null) as Readonly<Record<string, unknown>> | null,
+          declaredLabels: options.manifest?.metricLabels ?? null,
+        });
 
         // Persist metrics to plugin_logs via the batch buffer (same path as
         // logger.log) so they benefit from batched writes and are flushed
