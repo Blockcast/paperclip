@@ -157,17 +157,35 @@ while :; do
 
   # Classification, per the tables below. Counted here rather than described,
   # so the loop has a success exit and not just a deadline.
-  read -r total pending failed < <(jq -rn \
+  #
+  # Every state is enumerated on ALL THREE sides and anything left over lands
+  # in `unknown`, which is fatal. Counting only known failures would leave an
+  # unrecognized value in neither `pending` nor `failed`, and "not pending and
+  # not failed" is the green path — so a conclusion GitHub adds after this was
+  # written would be reported as SUCCESS. Fail closed on what you do not
+  # recognize; the message names the values so "this script is out of date" is
+  # distinguishable from "CI is red".
+  read -r total pending failed unknown unknown_values < <(jq -rn \
     --slurpfile runs "$workdir/check-runs.json" \
     --slurpfile status "$workdir/commit-status.json" '
-      ($runs[0].check_runs // []) as $r
+      ["success","neutral","skipped"] as $run_ok
+      | ["failure","timed_out","cancelled","action_required","startup_failure","stale"] as $run_bad
+      | ($runs[0].check_runs // []) as $r
       | ($status[0].statuses // []) as $s
+      | [ $r[] | select(.status == "completed") | .conclusion // "" ] as $done
+      | [ $r[] | select(.status != "completed") | .status ] as $running
+      | [ $s[] | .state // "" ] as $ctx
+      | ( [ $running[] | select(. != "queued" and . != "in_progress" and . != "waiting"
+              and . != "requested" and . != "pending") ]
+          + [ $done[] | select(IN($run_ok[]) or IN($run_bad[]) | not) ]
+          + [ $ctx[] | select(. != "pending" and . != "success"
+              and . != "failure" and . != "error") ] ) as $weird
       | [ ($r | length) + ($s | length),
-          ([ $r[] | select(.status != "completed") ] | length)
-            + ([ $s[] | select(.state == "pending") ] | length),
-          ([ $r[] | select((.conclusion // "") as $c
-              | $c | IN("failure","timed_out","cancelled","action_required","startup_failure","stale")) ] | length)
-            + ([ $s[] | select(.state == "failure" or .state == "error") ] | length)
+          ($running | length) + ([ $ctx[] | select(. == "pending") ] | length),
+          ([ $done[] | select(IN($run_bad[])) ] | length)
+            + ([ $ctx[] | select(. == "failure" or . == "error") ] | length),
+          ($weird | length),
+          (($weird | unique | join(",")) // "")
         ] | @tsv') || { printf 'Could not classify check results.\n' >&2; exit 1; }
 
   elapsed=$(( $(date +%s) - poll_started ))
@@ -179,6 +197,12 @@ while :; do
     fi
   elif (( failed > 0 )); then
     printf '%s check(s) failed on %s.\n' "$failed" "$HEAD_SHA" >&2
+    exit 1
+  elif (( unknown > 0 )); then
+    # Never poll on an unrecognized state: it is terminal for all we know, so
+    # waiting would just burn the deadline and then report a timeout.
+    printf '%s check(s) on %s report state(s) this script does not recognize: %s\n' \
+      "$unknown" "$HEAD_SHA" "$unknown_values" >&2
     exit 1
   elif (( pending == 0 )); then
     printf 'All %s check(s) terminal and green on %s.\n' "$total" "$HEAD_SHA"
@@ -211,6 +235,15 @@ Treat these as failures:
 
 - check runs: `FAILURE`, `TIMED_OUT`, `CANCELLED`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, `STALE`
 - status contexts: `FAILURE`, `ERROR`
+
+These three lists are exhaustive as of writing, so **anything not on them is
+fatal** (exit 1, with the unrecognized value named). That is not pedantry: an
+unrecognized state left out of both the pending and the failure count is
+neither, and "not pending and not failed" is the green path — so a conclusion
+GitHub adds later would be reported as SUCCESS by the one script whose job is
+to not do that. Polling on it instead is no better; an unknown state may well
+be terminal, so waiting just burns the deadline to report a timeout. If you
+see this fire, add the new value to the list above AND to the `jq` filter.
 
 If no checks appear for the latest SHA (exit 5), inspect `.github/workflows/`,
 workflow path filters, and branch protection expectations. If the missing check
