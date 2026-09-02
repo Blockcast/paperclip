@@ -16,6 +16,15 @@
  * early. Both the old shape and the bounded statements that replaced it are
  * measured here, so the improvement is executable evidence rather than a claim
  * in a review comment.
+ *
+ * BLO-31354: every plan-shape assertion here is made against the projection the
+ * dispatcher actually issues — the keyset-only page from
+ * `readQueuedDispatchPage`, which both the main and critical lanes call. The
+ * superseded `SELECT *` shapes are still measured and recorded, but asserting
+ * on them pinned a plan choice that sits inside PostgreSQL's 1% cost fuzz
+ * against `heartbeat_runs_queued_age_idx` + Sort, so the winner was decided by
+ * ANALYZE's random sample and the test ejected unrelated PRs from the merge
+ * queue. See DISPATCH_QUERY_BEFORE for the measurements.
  */
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
@@ -180,7 +189,21 @@ async function seed(sql: postgres.Sql) {
   `);
 
   await sql.unsafe(`SET session_replication_role = origin`);
-  await sql.unsafe(`ANALYZE heartbeat_runs`);
+  // VACUUM, not just ANALYZE — for the same reason seedInterleavedQueue does it,
+  // and it is load-bearing here rather than tidiness. The dispatcher's head page
+  // is served by an INDEX ONLY scan, and index-only scans are costed against the
+  // visibility map: on a never-vacuumed table (relallvisible = 0) the planner
+  // must assume every tuple needs a heap visibility check, prices the ordered
+  // path as if it fetched heap, and the result lands within ~1% of
+  // heartbeat_runs_queued_age_idx + Sort. Inside PostgreSQL's 1% fuzz factor the
+  // winner is decided by ANALYZE's random sample, which is how BLO-31354 ejected
+  // an unrelated PR from the merge queue. Measured on this fixture: without
+  // VACUUM the two plans sit 0.01 cost units apart (-0.86%..+0.18%, flipping);
+  // with it the ordered path wins by +185%..+273% across 20 re-ANALYZEs.
+  // heartbeat_runs is continuously autovacuumed in production and the cost model
+  // reads the table-wide relallvisible/relpages fraction, so vacuuming here is
+  // what makes the fixture honest rather than what makes it pass.
+  await sql.unsafe(`VACUUM ANALYZE heartbeat_runs`);
   await sql.unsafe(`ANALYZE issues`);
 }
 
@@ -195,7 +218,27 @@ async function explain(sql: postgres.Sql, query: string) {
   };
 }
 
-const DISPATCH_QUERY = `
+/**
+ * The head page as the dispatcher issued it BEFORE BLO-20736, kept as recorded
+ * evidence and deliberately NOT asserted on — same policy as
+ * PRIORITY_LANE_BEFORE below and as the `SELECT *` record in the head-scan test.
+ *
+ * `readQueuedDispatchPage` replaced this with the two-phase read: phase 1
+ * projects only the keyset columns, phase 2 hydrates that page by primary key.
+ * Nothing in the dispatcher issues `SELECT *` ordered by (created_at, id) any
+ * more — the main lane and the critical lane both call that one function.
+ *
+ * Pinning this shape's plan is what made BLO-31354 flaky. Fetching whole ~2.8 kB
+ * rows in index order prices the ordered path against random heap I/O, which
+ * lands it within PostgreSQL's 1% fuzz factor of
+ * heartbeat_runs_queued_age_idx + Sort — 20.15 vs 20.14 cost units at the
+ * fixture's estimate. Inside the fuzz the winner is whichever way ANALYZE's
+ * random sample fell, so this assertion was a coin flip on a merge-queue gate.
+ * The property it was meant to protect is asserted below on the projection the
+ * dispatcher actually issues, where the same fixture prefers the ordered path by
+ * +185%..+273%.
+ */
+const DISPATCH_QUERY_BEFORE = `
   SELECT * FROM heartbeat_runs
    WHERE agent_id = '${AGENT}'::uuid
      AND status = 'queued'
@@ -203,7 +246,7 @@ const DISPATCH_QUERY = `
    LIMIT ${SCAN_LIMIT}
 `;
 
-const DISPATCH_CURSOR_QUERY = `
+const DISPATCH_CURSOR_QUERY_BEFORE = `
   SELECT * FROM heartbeat_runs
    WHERE agent_id = '${AGENT}'::uuid
      AND status = 'queued'
@@ -244,9 +287,15 @@ const PRIORITY_LANE_BEFORE = `
  * page of queued runs, then UUID-screens and resolves only that page's issues.
  * Filtering critical priority after the bounded read is what makes the
  * zero-match case independent of total queue depth.
+ *
+ * The projection is the dispatcher's, not `SELECT *`: production's critical
+ * lane calls the very same `readQueuedDispatchPage` as the main lane, so its
+ * step 1 IS the keyset-only index-only read. Measuring `SELECT *` here would
+ * measure a statement the dispatcher does not issue, and would reintroduce the
+ * BLO-31354 near-tie that this projection removes.
  */
 const PRIORITY_LANE_CRITICAL_CANDIDATES = `
-  SELECT * FROM heartbeat_runs
+  SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
    WHERE agent_id = '${AGENT}'::uuid
      AND heartbeat_runs.status = 'queued'
    ORDER BY created_at ASC, id ASC
@@ -326,6 +375,22 @@ const DISPATCH_HEAD_PROBE_CURSOR = `
    LIMIT ${SCAN_LIMIT}
 `;
 
+/**
+ * The same resumed probe, calibrated for `seed`'s fixture instead of the
+ * interleaved one. `seed` stamps the agent's backlog across the last
+ * AGENT_QUEUED_ROWS seconds, so the 90000-second bound above would sit before
+ * every row and resume nothing; 200 seconds lands mid-queue, which is the state
+ * the cursor exists to handle.
+ */
+const DISPATCH_HEAD_PROBE_CURSOR_MID_QUEUE = `
+  SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
+   WHERE agent_id = '${AGENT}'::uuid
+     AND status = 'queued'
+     AND (created_at, id) > (now() - interval '200 seconds', '00000000-0000-4000-8000-000000000000'::uuid)
+   ORDER BY created_at ASC, id ASC
+   LIMIT ${SCAN_LIMIT}
+`;
+
 function dispatchHeadProbeQuery(cursor: { createdAt: string; id: string } | null = null) {
   return `
     SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
@@ -396,12 +461,21 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     };
 
     // --- AC: the dispatch query uses the new index -------------------------
-    const head = await explain(sql, DISPATCH_QUERY);
+    // The superseded `SELECT *` shape is RECORDED, not asserted on — see
+    // DISPATCH_QUERY_BEFORE. Asserting its plan is what made this test eject
+    // unrelated PRs from the merge queue (BLO-31354).
+    record("dispatch head scan BEFORE (SELECT *)", await explain(sql, DISPATCH_QUERY_BEFORE));
+    record(
+      "dispatch keyset cursor scan BEFORE (SELECT *)",
+      await explain(sql, DISPATCH_CURSOR_QUERY_BEFORE),
+    );
+
+    const head = await explain(sql, DISPATCH_HEAD_PROBE);
     record("dispatch head scan", head);
     expect(indexesUsed(head.root)).toContain(DISPATCH_INDEX);
     expect(scanKinds(head.root)).not.toContain("Seq Scan");
 
-    const cursor = await explain(sql, DISPATCH_CURSOR_QUERY);
+    const cursor = await explain(sql, DISPATCH_HEAD_PROBE_CURSOR_MID_QUEUE);
     record("dispatch keyset cursor scan", cursor);
     expect(indexesUsed(cursor.root)).toContain(DISPATCH_INDEX);
 
@@ -420,6 +494,13 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
 
     // The index supplies (created_at, id) order, so no Sort over wide rows.
     expect(planNodes(head.root).map((n) => n["Node Type"])).not.toContain("Sort");
+    // What keeps the assertions above off the cost-model knife edge: with no
+    // heap fetches to pay for, the ordered path is not merely the planner's
+    // narrow preference over heartbeat_runs_queued_age_idx + Sort but its
+    // decisive one. This is the assertion that would fail first if a future
+    // change reverted the projection to `SELECT *`.
+    expect(scanKinds(head.root)).toContain("Index Only Scan");
+    expect(scanKinds(head.root)).not.toContain("Bitmap Heap Scan");
 
     // A LIMIT-bounded scan must not touch the whole backlog. `rowsInspected`
     // counts rows discarded by filters as well as emitted, so a plan that
@@ -460,6 +541,10 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // coverage.
     expect(indexesUsed(laneCriticalCandidates.root)).toContain(DISPATCH_INDEX);
     expect(scanKinds(laneCriticalCandidates.root)).not.toContain("Seq Scan");
+    // Same reason as the head scan above: the keyset-only projection is what
+    // keeps this off the BLO-31354 knife edge against
+    // heartbeat_runs_queued_age_idx + Sort.
+    expect(scanKinds(laneCriticalCandidates.root)).toContain("Index Only Scan");
     expect(rowsInspected(laneCriticalCandidates.root)).toBeLessThanOrEqual(SCAN_LIMIT * 3);
 
     // Lane A step 2 resolves at most SCAN_LIMIT UUID-screened ids by primary
@@ -641,7 +726,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       // The shape the dispatcher used to issue, MEASURED but not asserted on —
       // it is the before-evidence for why the projection changed, and pinning
       // it would lock in the bad plan as a requirement.
-      record(`depth ${depth}: head scan BEFORE (SELECT *)`, await explain(sql, DISPATCH_QUERY));
+      record(`depth ${depth}: head scan BEFORE (SELECT *)`, await explain(sql, DISPATCH_QUERY_BEFORE));
 
       const probe = await explain(sql, DISPATCH_HEAD_PROBE);
       record(`depth ${depth}: head probe (created_at, id only)`, probe);
