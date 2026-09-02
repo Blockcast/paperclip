@@ -363,6 +363,7 @@ import {
   applyAgentGitIdentityToRuntimeConfig,
   ensureCheckoutGitIdentity,
 } from "./git-checkout-identity.js";
+import { ensureManagedCheckoutCanServeClones } from "./managed-checkout-partial-clone.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -3243,6 +3244,15 @@ async function resolveManagedProjectWorkspaceCheckout(input: {
  * return, the "exists but isn't a checkout" return (which includes linked
  * worktrees), the repo-less return (a no-op, since there is no git metadata to
  * write into), and the post-clone return alike.
+ *
+ * BLO-31351 adds the partial-clone guard here for the same reason, and the
+ * "already cloned" case is again the one that matters: Paperclip never *creates*
+ * a partial mirror (the clone above passes no `--filter`), it only ever adopts
+ * one that something else left at the managed path. A guard placed after the
+ * clone would inspect the only checkout that cannot be partial. The repo-less
+ * return is deliberately covered too -- a project with no workspace rows still
+ * resolves to a managed `_default` dir, and that is precisely the path the
+ * mirror behind BLO-31338 was serving.
  */
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
@@ -3255,9 +3265,28 @@ async function ensureManagedProjectWorkspace(input: {
     cwd: realized.cwd,
     agent: input.agent ?? null,
   });
+  const partialClone = await ensureManagedCheckoutCanServeClones({ cwd: realized.cwd });
+  if (partialClone.state === "partial_cannot_serve") {
+    // Raised as a workspace validation failure rather than a bare Error so the
+    // recovery machinery treats it as the manual-repair, budget-exempt cause it
+    // is. A partial mirror missing objects cannot be fixed by retrying the same
+    // agent against the same path, and `workspace_validation_failed` is the one
+    // cause that neither wakes an owner nor spends a wake attempt.
+    throw new WorkspaceValidationFailure(partialClone.fatalMessage ?? "Managed checkout cannot serve clones.", {
+      workspaceValidation: {
+        reason: "managed_checkout_partial_clone_unservable",
+        companyId: input.companyId,
+        projectId: input.projectId,
+        repoUrl: input.repoUrl,
+        ...partialClone.evidence,
+      },
+    });
+  }
   return {
     cwd: realized.cwd,
-    warnings: [realized.warning, identity.warning].filter((value): value is string => Boolean(value)),
+    warnings: [realized.warning, identity.warning, partialClone.warning].filter(
+      (value): value is string => Boolean(value),
+    ),
   };
 }
 

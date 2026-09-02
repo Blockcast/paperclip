@@ -779,6 +779,48 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   return /(?:usage|rate|quota) limit|quota (?:exceeded|reset)|try again after/i.test(latestRun.error ?? "");
 }
 
+/**
+ * BLO-31351: git transport failures from the workspace bootstrap, before the
+ * agent has run anything.
+ *
+ * These phrases are emitted by git's pack negotiation, not by a repository the
+ * agent could have damaged: `upload-pack`/`fetch-pack`/`index-pack` failing,
+ * `early EOF`, or the notorious "possible repository corruption on the remote
+ * side" -- which is a lie. It names `pack-objects` exiting non-zero, and the
+ * commonest cause in this estate is a source that is a partial clone missing
+ * objects it is being asked to pack (BLO-31338). `git fsck` on such a source is
+ * clean.
+ *
+ * The point of classifying them is the attempt budget. Retrying the same agent
+ * against the same source cannot change a transport fault of this shape, so the
+ * default path spends attempts on guaranteed-identical failures -- two agents
+ * went down this way, each burning toward five. Routing them to
+ * `workspace_validation_failed` reuses the one recovery cause that neither wakes
+ * an owner nor spends a wake attempt, and whose operator guidance already says
+ * to repair the checkout.
+ *
+ * Deliberately anchored on transport-layer phrases rather than on any word
+ * containing "git": an agent's own failed `git` command is reported in its tool
+ * output, not as the run's terminal `error`, so widening this to ordinary git
+ * errors would buy false positives without buying coverage.
+ */
+const WORKSPACE_GIT_TRANSPORT_FAILURE_RE =
+  /(?:git upload-pack|upload-pack:|fetch-pack:|index-pack failed|invalid index-pack output|possible repository corruption|early EOF|the remote end hung up unexpectedly|could not read from remote repository)/i;
+
+/**
+ * True when this run died on a git transport fault before doing any model work.
+ * Shared by the audit predicate below and the recovery classifier so the two
+ * cannot drift into disagreeing about the same run.
+ */
+export function isWorkspaceGitTransportStrandedFailure(latestRun: LatestIssueRun): boolean {
+  if (!latestRun) return false;
+  if (latestRun.errorCode !== "adapter_failed") return false;
+  if (Object.keys(parseObject(latestRun.usageJson)).length > 0) return false;
+  return WORKSPACE_GIT_TRANSPORT_FAILURE_RE.test(
+    [latestRun.errorCode ?? "", latestRun.error ?? ""].join("\n"),
+  );
+}
+
 // BLO-20933: a run that dies because its POD vanished (eviction, preemption, node
 // drain, or the Job being deleted out from under it) is an infrastructure event, not
 // an agent/adapter failure — the run never got a chance to succeed or fail on its own
@@ -799,6 +841,19 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
 export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean {
   if (!latestRun) return false;
   if (latestRun.errorCode === "k8s_job_deleted_externally") return true;
+  // BLO-31351: a git transport fault during workspace setup, before the agent
+  // reached a model call, is an infrastructure event by the same argument as a
+  // vanished pod -- the run never got to succeed or fail on its own merits, and
+  // the cause is not something a retry can move.
+  //
+  // Note for anyone reading this expecting behaviour: `infraClassCause` is
+  // AUDIT-ONLY. It is written once, in `buildStrandedRecoveryActionEvidence`,
+  // and read by nothing in production. It does NOT gate the attempt budget --
+  // `classifyContinuationFailure` does, on error-code set membership alone. The
+  // budget exemption for this class comes from routing it to
+  // `workspace_validation_failed`, not from this predicate. Widening this alone
+  // would relabel the evidence and change nothing an operator could feel.
+  if (isWorkspaceGitTransportStrandedFailure(latestRun)) return true;
   if (latestRun.errorCode !== "claude_truncated") return false;
   return /pod is gone|pod was removed/i.test(latestRun.error ?? "");
 }
@@ -1459,6 +1514,7 @@ const ADAPTER_RESPONSE_PARSE_FAILURE_RE = /json parsing failed/i;
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
   | { kind: "configuration_incomplete" }
+  | { kind: "workspace_git_transport"; detail: string }
   | null;
 
 function parseProviderQuotaClockReset(error: string, now: Date) {
@@ -1530,7 +1586,11 @@ function parseProviderQuotaClockReset(error: string, now: Date) {
 }
 
 export function classifyAdapterFailureForRecovery(
-  latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson">,
+  // `usageJson` is optional so existing callers and fixtures keep compiling; the
+  // two production call sites pass a full run row, so the gate below is precise
+  // where it matters. An absent field reads as "no model call recorded".
+  latestRun: Pick<NonNullable<LatestIssueRun>, "error" | "errorCode" | "resultJson"> &
+    Partial<Pick<NonNullable<LatestIssueRun>, "usageJson">>,
   now = new Date(),
 ): AdapterFailureRecoveryClassification {
   if (
@@ -1552,6 +1612,28 @@ export function classifyAdapterFailureForRecovery(
     latestRun.errorCode === "adapter_failed" && ADAPTER_RESPONSE_PARSE_FAILURE_RE.test(rawError);
   const error = [latestRun.errorCode ?? "", rawError, isResponseParseFailure ? "" : JSON.stringify(resultJson)]
     .join("\n");
+  // BLO-31351: checked before the credential and quota arms because a transport
+  // fault carries no information about either, and the raw pack-protocol text is
+  // long enough to collide with them by accident.
+  //
+  // Gated on the run having no recorded usage, which is the closest thing to a
+  // "before first tool use" marker that exists -- there is no first-tool-use
+  // timestamp anywhere in the schema. No usage means no model call, hence no tool
+  // call, hence the failure came from the bootstrap rather than from work the
+  // agent did. A run that got as far as billing tokens is left to the existing
+  // paths, so this cannot hijack a mid-run failure that merely mentions git.
+  const reachedModelCall = Object.keys(parseObject(latestRun.usageJson ?? null)).length > 0;
+  if (
+    !isResponseParseFailure &&
+    !reachedModelCall &&
+    latestRun.errorCode === "adapter_failed" &&
+    WORKSPACE_GIT_TRANSPORT_FAILURE_RE.test(error)
+  ) {
+    return {
+      kind: "workspace_git_transport",
+      detail: WORKSPACE_GIT_TRANSPORT_FAILURE_RE.exec(error)?.[0] ?? "git transport failure",
+    };
+  }
   if (
     !isResponseParseFailure &&
     (latestRun.errorCode === "configuration_incomplete" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
@@ -7445,23 +7527,47 @@ export function recoveryService(
     classification: NonNullable<AdapterFailureRecoveryClassification>,
   ): NonNullable<LatestIssueRun> {
     const resultJson = parseObject(latestRun.resultJson);
-    const providerQuotaMetadata = classification.kind === "provider_quota"
+    // Enumerated per kind rather than as a binary ternary: the previous shape
+    // treated "not provider_quota" as "configuration_incomplete", so any kind
+    // added later silently inherited a credential error family and an errorCode
+    // equal to its own kind name -- a code no classification set recognizes.
+    const classified = classification.kind === "provider_quota"
       ? {
-          errorFamily: "provider_quota",
-          retryNotBefore: classification.retryAt.toISOString(),
-          transientRetryNotBefore: classification.retryAt.toISOString(),
-          providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+          errorCode: "provider_quota",
+          metadata: {
+            errorFamily: "provider_quota",
+            retryNotBefore: classification.retryAt.toISOString(),
+            transientRetryNotBefore: classification.retryAt.toISOString(),
+            providerQuotaRetryNotBefore: classification.retryAt.toISOString(),
+          },
         }
-      : { errorFamily: "configuration_incomplete" };
-    const errorCode = classification.kind;
+      : classification.kind === "workspace_git_transport"
+      // BLO-31351: stamped with the durable `workspace_validation_failed` code,
+      // not with the kind name. That code is what the recovery cause, the
+      // manual-repair wake policy and the budget exemption are all keyed on, so
+      // labelling the run anything else would leave a later sweep re-deriving a
+      // generic default-budget retry for a fault it already understood. The
+      // specific cause is preserved in `errorFamily` for diagnosis.
+      ? {
+          errorCode: "workspace_validation_failed",
+          metadata: {
+            errorFamily: "workspace_git_transport",
+            workspaceGitTransportDetail: classification.detail,
+          },
+        }
+      : {
+          errorCode: "configuration_incomplete",
+          metadata: { errorFamily: "configuration_incomplete" },
+        };
+    const errorCode = classified.errorCode;
 
     return {
       ...latestRun,
       errorCode,
       resultJson: {
         ...resultJson,
-        ...providerQuotaMetadata,
-        recoveryClassification: errorCode,
+        ...classified.metadata,
+        recoveryClassification: classification.kind,
       },
     };
   }
@@ -7885,15 +7991,28 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         } else {
+          const isGitTransport = adapterFailureClassification.kind === "workspace_git_transport";
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
             previousStatus: issue.status as StrandedPreviousStatus,
             latestRun,
-            recoveryCause: "configuration_incomplete",
-            comment:
-              "Paperclip classified the latest adapter failure as `configuration_incomplete`. " +
-              "Moving the issue to `blocked` with the configuration fix recorded instead of creating a recovery takeover.",
+            recoveryCause: isGitTransport ? "workspace_validation_failed" : "configuration_incomplete",
+            comment: isGitTransport
+              // BLO-31351: named as a transport fault, not as corruption. The
+              // "possible repository corruption on the remote side" wording git
+              // emits here is false, and taking it at face value sends the reader
+              // to re-clone a healthy repository while the real cause -- most often
+              // a partial-clone source missing objects it cannot pack -- survives.
+              ? "Paperclip classified the latest failure as a git transport fault during workspace setup " +
+                `(\`${adapterFailureClassification.detail}\`), before the agent ran anything. Moving the issue ` +
+                "to `blocked` for workspace repair rather than retrying: the same agent against the same " +
+                "source cannot produce a different result, so further attempts are guaranteed-identical " +
+                "failures. If git reported \"possible repository corruption on the remote side\", that is " +
+                "misleading -- check whether the clone source is a partial clone missing objects " +
+                "(`git config --get remote.origin.partialclonefilter`) before treating anything as damaged."
+              : "Paperclip classified the latest adapter failure as `configuration_incomplete`. " +
+                "Moving the issue to `blocked` with the configuration fix recorded instead of creating a recovery takeover.",
           });
           if (updated) {
             latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
