@@ -615,6 +615,11 @@ describe("startServer feedback export wiring", () => {
       // Positive: both emitted while recovery is still mid-flight.
       expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
+      // The hoist moved THREE publishers above this gate, not two. The liveness
+      // gauge is pinned above the *suppression* gate by the tests further up,
+      // but its position relative to the *recovery* gate is a behaviour change
+      // of this diff (it used to sit below) and is only covered here.
+      expect(heartbeatServiceMock.publishAgentLivenessGauges).toHaveBeenCalledTimes(1);
       // Control that the recovery guard really is still closed. Without this the
       // test could pass for the trivial reason that recovery had already
       // drained, proving nothing about where the registrations sit.

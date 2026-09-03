@@ -365,11 +365,23 @@ test("the terminal-failed runbook describes the post-BLO-31335 emission path", (
   // table's `reconcileFailedWakeDispatches` mentions describe which ROWS that
   // pass selects, which BLO-31335 did not change -- they must survive, so this
   // guard must never be satisfiable by a blanket find-and-replace.
-  const verifySection = runbook.slice(runbook.indexOf("## Verifying the signal is live"));
-  assert.ok(
-    verifySection,
-    "runbook must keep a 'Verifying the signal is live' section",
+  //
+  // The -1 check is load-bearing, not defensive boilerplate. `indexOf` returns
+  // -1 when the heading is renamed, and `slice(-1)` yields the file's LAST
+  // CHARACTER rather than "", which is truthy and matches no phrase -- so
+  // without this, `assert.ok` below would pass on a one-character string and
+  // the `doesNotMatch` regression guard would pass vacuously, while
+  // `slice(0, -1)` widened the row-selection assertion to the whole file. A
+  // guard that cannot fire is the same defect class this PR exists to remove.
+  const verifyIndex = runbook.indexOf("## Verifying the signal is live");
+  assert.notStrictEqual(
+    verifyIndex,
+    -1,
+    "runbook must keep a 'Verifying the signal is live' section -- the "
+      + "assertions below scope themselves to it by name and silently stop "
+      + "guarding if it is renamed",
   );
+  const verifySection = runbook.slice(verifyIndex);
 
   assert.doesNotMatch(
     verifySection,
@@ -390,7 +402,7 @@ test("the terminal-failed runbook describes the post-BLO-31335 emission path", (
   // load-bearing; assert they survive so a future sweep of the phrase above
   // cannot take them with it.
   assert.match(
-    runbook.slice(0, runbook.indexOf("## Verifying the signal is live")),
+    runbook.slice(0, verifyIndex),
     /`reconcileFailedWakeDispatches` only ever\nselects `dispatch_failed`/,
     "runbook must keep the row-selection statement -- BLO-31335 changed which "
       + "path EMITS the gauges, not which rows that pass selects",
