@@ -818,12 +818,63 @@ describe("buildJobManifest", () => {
       expect(command).toContain("if git -C '/paperclip/source-worktree' rev-parse --verify HEAD");
       expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("checkout --detach \"$source_head\"");
+      // BLO-31359: no recorded upstream, so the clone is left with no remote at
+      // all rather than one aimed back at the clone source.
+      expect(command).toContain("git -C '/runtime-cache/paperclip-runs/run-abc12345/workspace' remote remove origin");
+      expect(command).not.toContain("remote add origin");
       expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");
       expect(syntaxCheck.status).toBe(0);
       expect(command).not.toContain("/paperclip/config-workspace");
+    });
+
+    // BLO-31359: `git clone` aims the clone's `origin` at its source, so cloning
+    // the project base checkout makes that shared base a push target — git only
+    // refuses a push to the base's *currently checked out* branch, so any other
+    // refname lands inside it. Repointing `origin` at the real upstream is what
+    // keeps an ephemeral run's push traffic leaving the cluster.
+    it("repoints the ephemeral clone's origin at the real upstream, never the clone source", () => {
+      ctx.context = {
+        paperclipWorkspace: {
+          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+
+      // The clone still comes off local disk — that is what makes provisioning
+      // cheap — but the base must not survive as a remote.
+      expect(command).toContain(
+        `git clone --shared --no-checkout -- '/paperclip/instances/default/projects/co1/proj-1/paperclip' '${workspaceRoot}'`,
+      );
+      expect(command).toContain(`git -C '${workspaceRoot}' remote remove origin`);
+      expect(command).toContain(
+        `git -C '${workspaceRoot}' remote add origin 'https://github.com/Blockcast/paperclip.git'`,
+      );
+      // Remove must precede add, or the add fails and the base stays wired up.
+      expect(command.indexOf("remote remove origin")).toBeLessThan(command.indexOf("remote add origin"));
+      // Fail-closed: both remote commands sit in the `&&` chain, so a failure
+      // aborts the run rather than handing back a base-writable workspace.
+      expect(command).not.toMatch(/remote (remove|add) origin[^&|]*\|\|/);
+
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
     });
 
     it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {
