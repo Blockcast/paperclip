@@ -25,6 +25,11 @@
  * against `heartbeat_runs_queued_age_idx` + Sort, so the winner was decided by
  * ANALYZE's random sample and the test ejected unrelated PRs from the merge
  * queue. See DISPATCH_QUERY_BEFORE for the measurements.
+ *
+ * Scope: the assertions cover the dispatcher's PROJECTION, exercised as a
+ * custom plan. They do NOT cover the generic plan production actually executes
+ * for the prepared statement, which is separately known to pick the wrong
+ * index — see the scope limit on `explain` below, and BLO-31392.
  */
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
@@ -207,6 +212,23 @@ async function seed(sql: postgres.Sql) {
   await sql.unsafe(`ANALYZE issues`);
 }
 
+/**
+ * SCOPE LIMIT — this exercises the CUSTOM plan only.
+ *
+ * The statement is interpolated with literals, so the planner sees constant
+ * values and plans for them. Production instead binds `agent_id` through a
+ * prepared statement (postgres.js prepares by default) and under
+ * `plan_cache_mode = auto` switches to the GENERIC plan once the cost check
+ * favours it. Those plans differ here, and the generic one is currently WRONG:
+ * measured on production it picks `heartbeat_runs_queued_age_idx` plus a `Sort`
+ * rather than the ordered dispatch index, because that index's partial
+ * predicate is exactly `status = 'queued'` while its `Index Cond` bounds only
+ * `agent_id = $1`. So the assertions below can be green while production runs
+ * the plan they forbid. That live defect is BLO-31392, which owns the
+ * `EXPLAIN (GENERIC_PLAN)` assertion; nothing in this file covers it. Read
+ * every plan-shape claim here as "for the statement as written", not "for the
+ * plan production executes".
+ */
 async function explain(sql: postgres.Sql, query: string) {
   const rows = await sql.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query}`);
   const plan = (rows[0] as Record<string, unknown>)["QUERY PLAN"] as Array<Record<string, unknown>>;
@@ -376,20 +398,27 @@ const DISPATCH_HEAD_PROBE_CURSOR = `
 `;
 
 /**
- * The same resumed probe, calibrated for `seed`'s fixture instead of the
- * interleaved one. `seed` stamps the agent's backlog across the last
- * AGENT_QUEUED_ROWS seconds, so the 90000-second bound above would sit before
- * every row and resume nothing; 200 seconds lands mid-queue, which is the state
- * the cursor exists to handle.
+ * Where to resume from when probing `seed`'s fixture mid-queue, expressed as an
+ * OFFSET into the agent's own backlog rather than as a wall-clock interval.
+ *
+ * A `now() - interval` bound cannot express "mid-queue" against this fixture.
+ * `seed` stamps row `series` at `now() - (AGENT_QUEUED_ROWS - series)` seconds,
+ * so a bound of `now() - interval 'N seconds'` evaluated `d` seconds later
+ * qualifies `series > AGENT_QUEUED_ROWS - N + d` — i.e. `N - d` rows, one fewer
+ * per second of elapsed setup time. Here `d` spans a 200k-row INSERT, a
+ * VACUUM ANALYZE and several EXPLAIN ANALYZE calls, so the resumed page shrinks
+ * with runner load and at `d >= N` sits past the entire backlog and resumes
+ * nothing. That degrades SILENTLY: index name, `Index Cond`, `Filter` and
+ * `Index Only Scan` are all plan properties independent of row count, so the
+ * assertions below would still pass while covering an empty page. Resolving the
+ * cursor from a real row instead is mid-queue by construction at any `d` — the
+ * same approach the deferred passes already take.
+ *
+ * Offset so that exactly SCAN_LIMIT rows remain behind the cursor: the resumed
+ * page then saturates its LIMIT, which is what makes the bounded-work assertion
+ * meaningful rather than merely satisfied by a short page.
  */
-const DISPATCH_HEAD_PROBE_CURSOR_MID_QUEUE = `
-  SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
-   WHERE agent_id = '${AGENT}'::uuid
-     AND status = 'queued'
-     AND (created_at, id) > (now() - interval '200 seconds', '00000000-0000-4000-8000-000000000000'::uuid)
-   ORDER BY created_at ASC, id ASC
-   LIMIT ${SCAN_LIMIT}
-`;
+const MID_QUEUE_CURSOR_OFFSET = AGENT_QUEUED_ROWS - SCAN_LIMIT - 1;
 
 function dispatchHeadProbeQuery(cursor: { createdAt: string; id: string } | null = null) {
   return `
@@ -475,7 +504,29 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(indexesUsed(head.root)).toContain(DISPATCH_INDEX);
     expect(scanKinds(head.root)).not.toContain("Seq Scan");
 
-    const cursor = await explain(sql, DISPATCH_HEAD_PROBE_CURSOR_MID_QUEUE);
+    // Resume from a real row rather than a wall-clock interval, so the page is
+    // mid-queue regardless of how long the fixture took to build — see
+    // MID_QUEUE_CURSOR_OFFSET.
+    const midQueueCursorRow = (await sql.unsafe(
+      `SELECT created_at::text AS created_at_text, id::text AS id FROM heartbeat_runs
+        WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'
+        ORDER BY created_at ASC, id ASC
+        OFFSET ${MID_QUEUE_CURSOR_OFFSET} LIMIT 1`,
+    ) as Array<{ created_at_text: string; id: string }>)[0];
+    expect(midQueueCursorRow).toBeDefined();
+    const midQueueCursorQuery = dispatchHeadProbeQuery({
+      createdAt: midQueueCursorRow!.created_at_text,
+      id: midQueueCursorRow!.id,
+    });
+
+    // The coverage guard the wall-clock bound could not provide: assert the
+    // resumed page is actually a full page. Without this, a cursor that lands
+    // past the backlog resumes nothing and every plan-shape assertion below
+    // still passes, silently losing the mid-queue coverage they exist to give.
+    const midQueuePage = await sql.unsafe(midQueueCursorQuery) as Array<{ id: string }>;
+    expect(midQueuePage).toHaveLength(SCAN_LIMIT);
+
+    const cursor = await explain(sql, midQueueCursorQuery);
     record("dispatch keyset cursor scan", cursor);
     expect(indexesUsed(cursor.root)).toContain(DISPATCH_INDEX);
 
@@ -491,6 +542,15 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(cursorNode).not.toBeNull();
     expect(String(cursorNode?.["Index Cond"] ?? "")).toMatch(KEYSET_PREDICATE);
     expect(String(cursorNode?.["Filter"] ?? "")).not.toMatch(KEYSET_PREDICATE);
+
+    // The resumed page is held to the same plan shape as the head page, and to
+    // the same shape the deep-queue test asserts on its own cursor: a Sort
+    // would mean the whole remaining match set is consumed before the first row
+    // is emitted, and anything other than an index-only scan means the cursor
+    // page pays heap I/O the projection exists to avoid.
+    expect(planNodes(cursor.root).map((n) => n["Node Type"])).not.toContain("Sort");
+    expect(scanKinds(cursor.root)).toContain("Index Only Scan");
+    expect(scanKinds(cursor.root)).not.toContain("Bitmap Heap Scan");
 
     // The index supplies (created_at, id) order, so no Sort over wide rows.
     expect(planNodes(head.root).map((n) => n["Node Type"])).not.toContain("Sort");
