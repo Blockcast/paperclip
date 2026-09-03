@@ -230,7 +230,16 @@ function redactUriCredentialsInValue(value: string): string {
     .replace(URL_CREDENTIAL_PARAM_VALUE_RE, `$1${REDACTED_EVENT_VALUE}`);
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
+/**
+ * Exported because it is the admission gate for every sanitizer in this file:
+ * `sanitizeValue` and `redactAgentConfigPayload` both return their argument
+ * *by reference* when it fails this predicate. A caller that admits a payload
+ * on some weaker "is it an object" test therefore has a fail-open the sanitizer
+ * cannot see — it hands back the raw value and the caller spreads it. Callers
+ * that gate before redacting should gate on this, so the two tests cannot
+ * disagree.
+ */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;

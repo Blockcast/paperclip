@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -2200,16 +2200,32 @@ export function agentRoutes(
    * material, same file — these two should share a default, and now do.
    */
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
-    const record = asRecord(snapshot);
-    if (!record) return {};
-    const contained = redactAgentConfigPayload(record) ?? {};
+    // Gate on `isPlainObject`, NOT the local `asRecord`. `asRecord` admits any
+    // non-null non-array object, while `redactAgentConfigPayload` sanitizes only
+    // plain objects and otherwise returns its argument *by reference*
+    // (`redaction.ts`). Admitting on the wider test would let a foreign-prototype
+    // snapshot through uncontained: `contained` would BE `record`, the spread
+    // would emit it verbatim, and the three lines below would only be reshaping.
+    // Not reachable from today's callers — both snapshots come from `jsonb` via
+    // `JSON.parse`, which always yields `Object.prototype` objects — but a
+    // containment function resting on an unstated assumption about the shape it
+    // is handed is the exact defect class this function exists to close, so the
+    // admit gate and the sanitize gate share one predicate instead.
+    if (!isPlainObject(snapshot)) return {};
+    const contained = redactAgentConfigPayload(snapshot) ?? {};
     return {
       // Shape contract preserved exactly: absent or non-object config still
-      // normalizes to `{}`, and absent metadata still to `null`.
+      // normalizes to `{}`, and absent metadata still to `null`. These sub-field
+      // gates are `isPlainObject` for the same reason as above — `sanitizeValue`
+      // also passes a nested non-plain object through unchanged, so the mismatch
+      // recurs one level down.
       ...contained,
-      adapterConfig: asRecord(contained.adapterConfig) ?? {},
-      runtimeConfig: asRecord(contained.runtimeConfig) ?? {},
-      metadata: asRecord(contained.metadata) ?? contained.metadata ?? null,
+      adapterConfig: isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {},
+      runtimeConfig: isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {},
+      // Deliberately NOT gated to a record: an array-valued `metadata` must
+      // survive as the element-wise-sanitized array `sanitizeValue` produced,
+      // not be flattened to `null`. Coercing only absence is the whole contract.
+      metadata: contained.metadata ?? null,
     };
   }
 
