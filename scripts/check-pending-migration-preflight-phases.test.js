@@ -48,8 +48,12 @@ case "$args" in
     # pull cannot satisfy it, exactly as run 33601878894 did not.
     budget=$(printf '%s\\n' "$args" | grep -oE 'timeout=[0-9]+' | head -1 | cut -d= -f2)
     deadline=$(( now + \${budget:-0} ))
+    # STUB_JOB_RESULT=timeout models a job that starts and then never settles.
+    # It must ride out the whole --timeout rather than resolving early, or the
+    # run-budget test never spends the budget it is named for. "failed" still
+    # resolves as soon as the container starts, which is what kubectl does.
     while :; do
-      if [ $(( $(date +%s) - start )) -ge "\${STUB_READY_AFTER:-0}" ]; then
+      if [ "\${STUB_JOB_RESULT:-complete}" != timeout ] && [ $(( $(date +%s) - start )) -ge "\${STUB_READY_AFTER:-0}" ]; then
         [ "\${STUB_JOB_RESULT:-complete}" = complete ] && exit 0 || exit 1
       fi
       [ "$(date +%s)" -lt "$deadline" ] || exit 1
@@ -124,13 +128,22 @@ test("a container that never starts is reported as infrastructure, not a migrati
 });
 
 test("a started-but-unfinished check is reported as migrations in trouble", () => {
+  const began = Date.now();
   const { code, output } = runPreflight({ STUB_JOB_RESULT: "timeout" });
+  const elapsed = (Date.now() - began) / 1000;
 
   assert.equal(code, 1);
   assert.match(output, /INCONCLUSIVE/);
   assert.match(output, /run budget/, "the message must attribute the stall to the run phase");
   assert.match(output, /image pull is NOT implicated/, "it must rule the pull out explicitly");
   assert.doesNotMatch(output, /never started/, "this is the opposite cause and must not reuse that wording");
+  // Without this the test passes on a stub that resolves instantly, i.e. it
+  // would assert the message of a run-budget exhaustion that never happened.
+  // 2s is PREFLIGHT_TIMEOUT_SECONDS; allow slop for the whole-second compare.
+  assert.ok(
+    elapsed >= 1.5,
+    `the run budget must actually be spent, not short-circuited (took ${elapsed.toFixed(1)}s)`,
+  );
 });
 
 test("the two INCONCLUSIVE causes are distinguishable from the log alone", () => {
