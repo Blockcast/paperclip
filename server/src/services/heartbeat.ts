@@ -6354,14 +6354,25 @@ export function buildK8sRunIsolationDescriptor(input: {
   //
   // Same-issue concurrency is REACHABLE — do not assume the checkout lock
   // prevents it. `executionRunClaimCondition` is NOT skipped for an interaction
-  // wake: it is built unconditionally (`:19714`) and is always present in the
-  // claiming UPDATE's `.where(...)`. The claim condition is still applied, but
-  // an interaction wake tolerates it matching nothing and proceeds without
-  // holding the issue lock (`:19839` skips the cancel, control falls through to
-  // `return claimed` at `:19853`). The second run therefore never acquires
-  // `issues.executionRunId` at all — it is a deliberately lock-less run, not a
-  // competing lock holder, so there is no lock-ordering or retry fix available
-  // and no configuration in which the race closes.
+  // wake: it is built unconditionally and is always present in the claiming
+  // UPDATE's `.where(...)`. What `allowsIssueInteractionWake` gates is
+  // `issueLockRequired`, and what happens is that the claim's *failure to
+  // match* is TOLERATED: the UPDATE matches zero rows when another run already
+  // holds `executionRunId`, the lock-not-acquired cancel is skipped, and
+  // control falls through to `return claimed`. That is deliberate — an
+  // issue-interaction wake carrying a comment id is allowed to run while
+  // another run holds the issue, so a human can talk to the assignee
+  // mid-flight.
+  //
+  // The second run therefore never acquires `issues.executionRunId` at all. It
+  // is a deliberately lock-less run, not a competing lock holder, so there is
+  // no lock-ordering or retry fix available and no configuration in which the
+  // race closes.
+  //
+  // Grep the three symbols named above rather than trusting line numbers. An
+  // earlier draft of this very comment cited absolute lines and its own +3-line
+  // edit silently moved them onto a different cancel branch; each symbol
+  // resolves to exactly one definition site, so the numbers bought nothing.
   //
   // This is still strictly better than the behavior it replaces, which is why
   // it ships: the pre-fix run did not get an exclusive workspace either, it got
