@@ -800,16 +800,49 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     });
   });
 
-  // Precedence guard: a bare `notalready` is not a negation, and a sentence
-  // that merely contains "if" elsewhere still classifies once the clause itself
-  // is unhedged.
-  it("BLO-31374: a hedge in an earlier sentence does not veto a later unhedged clause", () => {
+  // Not vetoed: stating that no second review was posted is the defining
+  // property of this exit (second Ally pass on #1613 — a posted-negation veto
+  // sent all five of these to `missing`).
+  it.each([
+    "**Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — I did not post a second review.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; I didn't post again.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`. Did not post a duplicate verdict.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — could not post a duplicate; contract forbids it.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; unable to post a second verdict on the same head.",
+  ])("BLO-31374: a correct skip that says it did not post again still classifies (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // Precedence guard: a hedge or bare `if`/`whether` in an earlier clause does
+  // not veto a later unhedged clause — whatever joins the two clauses.
+  it.each([
+    "I checked whether a review exists. Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+    "Checked whether a prior review exists: already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Checked whether a prior review exists, already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Checked whether a prior review exists — already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Checked whether a prior review exists; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Skipping the post step if a review exists; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Determining if this is a duplicate: already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: an earlier clause's hedge or bare if/whether does not veto the clause (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // `notalready` is not a negation and not the clause: no word boundary before
+  // `already`, so the shape does not match at all and the run stays `missing`.
+  it("BLO-31374: a glued `notalready` is neither a negation nor the clause", () => {
     expect(
       evaluatePrReviewCompletionEvidence(reviewerContext, {
-        summary:
-          "I checked whether a review exists. Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+        summary: "This head was notalready reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
       }),
-    ).toEqual({ status: "already_reviewed" });
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  it("BLO-31374: rejects a plural negation", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "These heads weren't already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
   });
 
   it("accepts archived Network-Management-Portal skips", () => {

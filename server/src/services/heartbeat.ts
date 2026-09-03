@@ -9480,31 +9480,45 @@ function prReviewOutputHasSelfReviewSkip(
 // live head, which the wake context cannot know (the wake head is exactly what
 // went stale), so the clause is anchored to a 7–40 hex sha rather than to the
 // wake head — a sha-less "already reviewed" claim is NOT accepted. Three vetoes
-// keep the widened shape from masking a run that did NOT post (per Ally review
+// keep the widened shape from masking a run that did NOT post (per Ally reviews
 // of #1613): a negated clause ("was **not** already reviewed at …" — the
 // negation prefix tolerates the same markdown the clause does, so bold/italic
-// cannot slip past it), a hedge in the same sentence ("could not confirm
-// whether … already reviewed at …", "Unclear if already reviewed at …"), and
-// the shared posted-review negation cues ("… did not post …").
+// cannot slip past it), a hedge that governs the clause in the same sentence
+// ("could not confirm whether … already reviewed at …", "Unclear if already
+// reviewed at …"), and a prior/stale-head cue in the same sentence ("the prior
+// head was already reviewed at …, but the branch moved"). NOT vetoed: "did not
+// post" — not posting is the defining property of this exit, so the shared
+// prReviewOutputHasPostedReviewNegation cues would invert the branch (second
+// Ally pass: five plausible phrasings of a correct skip fell to `missing`).
+// Sentence scope for both cues ends at . : ; , — – or a newline, so a clause
+// joined by a colon or dash does not inherit a hedge from the previous clause.
 function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   // Markdown that may sit between tokens: whitespace, backticks, bold/italic.
   const md = "[\\s`*_]*";
   const pattern = new RegExp(
-    // `+`, not `*`: a bare `notalready` must not read as a negation.
-    "(?<negated>\\b(?:not|never|wasn['\u2019]?t|isn['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been)[\\s`*_]+){0,2})?" +
+    // `+`, not `*`: the negation must be its own word, separated from `already`
+    // by whitespace or markdown.
+    "(?<negated>\\b(?:not|never|wasn['\u2019]?t|weren['\u2019]?t|isn['\u2019]?t|aren['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been)[\\s`*_]+){0,2})?" +
       `\\balready\\s+reviewed\\s+at${md}` +
       // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
       `(?:[^\\s\`*_]{1,40}${md}for${md})?(?:(?:head|commit)${md})?` +
       "([0-9a-f]{7,40})(?![0-9a-f])",
     "gi",
   );
-  if (prReviewOutputHasPostedReviewNegation(text)) return false;
+  // Same-sentence scope: a clause boundary is any of . : ; , — – or a newline.
+  const clauseBefore = /[^.\n:;,\u2014\u2013]*$/;
+  const clauseAfter = /^[^.\n]*/;
+  // A hedge that governs the clause ("unclear whether …", "could not confirm
+  // whether …") — not a bare `if`/`whether` anywhere nearby.
+  const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|did\s+not|didn['\u2019]?t)\s+\w+\s+(?:if|whether))\b/i;
+  // The clause is about a superseded head, not the live one.
+  const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
-    // Hedge cue earlier in the same sentence: the clause is a question the run
-    // could not answer, not a finding.
-    const sentenceBefore = text.slice(Math.max(0, m.index - 80), m.index);
-    if (/\b(?:unclear|unsure|uncertain|not\s+sure|whether|if)\b[^.\n]{0,60}$/i.test(sentenceBefore)) continue;
+    const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
+    if (hedge.test(before) || priorHead.test(before)) continue;
+    const after = clauseAfter.exec(text.slice(m.index + m[0].length, m.index + m[0].length + 160))?.[0] ?? "";
+    if (priorHead.test(after)) continue;
     return true;
   }
   return false;
