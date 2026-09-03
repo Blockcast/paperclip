@@ -311,9 +311,19 @@ d=${JSON.stringify(dir)}
 # exactly 86400 for read 21 and every read after it, so any deadline above a
 # day would never be crossed and the ceiling would decay into the exact two
 # behaviours rejected above — spin to the spawn timeout, one stderr line per
-# pass. Measured on a reconstruction: at a 90000s deadline the non-cumulative
-# form spun to the kill with 389 stderr lines, the cumulative form exited
-# through the loop's own deadline path in 503ms with 2. No deadline in this
+# pass. Measured on a reconstruction at a 90000s deadline: the non-cumulative
+# form spun to the spawn timeout without ever reaching the loop's own deadline
+# path, while the cumulative form exited THROUGH that path in ~0.5s with
+# exactly 2 stderr lines — deterministically \`ceil(90000/86400)\`, not a
+# timing artefact. Note the exit code cannot tell these apart: \`timeout\` and
+# the loop's own deadline both exit 124, so the discriminator is reaching the
+# deadline path at all, not the status. The non-cumulative form's stderr line
+# count is deliberately NOT quoted here: it is just how many iterations fit
+# inside the 30s kill, so it is purely a function of machine speed — three
+# runs of the same reconstruction gave 389, 1104 and 1348. Do not re-measure
+# it, get a different number, and conclude this note is stale.
+#
+# No deadline in this
 # file exceeds 900 today, so this buys nothing at this head; it is here so the
 # ceiling stays a ceiling under a future edit rather than silently becoming
 # deadline-dependent. Legitimate tests are untouched — they never reach read 4.
