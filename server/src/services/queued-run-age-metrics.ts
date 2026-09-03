@@ -161,10 +161,16 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
  * before and the detector keeps its original sensitivity.
  *
  * Known limit: a writer that touches a still-parked row without re-deciding the
- * due time also bumps `updated_at` — `coalesceGithubReviewDelivery` is the one
- * such path today. That degrades the reading to the REMAINING horizon rather
- * than zeroing it, so an implausibly distant park stays far above threshold and
- * is still caught; it is a mild understatement, not a blind spot.
+ * due time also bumps `updated_at`. The paths known today are
+ * `coalesceGithubReviewDelivery` and the run-liveness backfill in
+ * `services/activity.ts`, whose update guards only on `id` +
+ * `isNull(liveness_state)` while its row selector admits parked rows
+ * (`status not in ('queued', 'running')`); that one is one-shot per run, since
+ * `classifyRunLiveness` always sets a non-null state. This is the set known
+ * today, not a proof that no other writer exists. Either way the reading
+ * degrades to the REMAINING horizon rather than zeroing it, so an implausibly
+ * distant park stays far above threshold and is still caught; it is a mild
+ * understatement, not a blind spot.
  *
  * `queued_at` represents a later promotion back to queued and must not be used.
  */
