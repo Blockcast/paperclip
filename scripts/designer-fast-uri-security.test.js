@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
+import { FAST_URI_ADVISORY, isVulnerableFastUri } from "./fast-uri-advisory.js";
+
+const designerRoot = new URL("../packages/services/designer/", import.meta.url);
+
 const lockfile = JSON.parse(
-  await readFile(
-    new URL("../packages/services/designer/package-lock.json", import.meta.url),
-    "utf8",
-  ),
+  await readFile(new URL("package-lock.json", designerRoot), "utf8"),
 );
 const fastUriResolutions = Object.entries(lockfile.packages).filter(
   ([path]) =>
@@ -17,13 +18,21 @@ assert.ok(
   "designer lockfile missing fast-uri resolution",
 );
 
-// Floor is 3.1.6: GHSA-5jgf-p345-68v8 / CVE-2026-75931 (host confusion via
-// skipped IDN canonicalization on scheme-relative references) covers
-// >= 3.1.3, < 3.1.6, so the previous 3.1.5 floor admitted a vulnerable pin.
 for (const [path, fastUri] of fastUriResolutions) {
-  const [major, minor, patch] = fastUri.version.split(".").map(Number);
   assert.ok(
-    major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 6))),
-    `designer lockfile ${path} resolved vulnerable fast-uri ${fastUri.version}`,
+    !isVulnerableFastUri(fastUri.version),
+    `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${FAST_URI_ADVISORY}`,
   );
 }
+
+// The lockfile above is a committed artifact; the manifest override is what
+// keeps the next `npm install` from drifting back into a vulnerable range.
+// Assert it too, otherwise the two can silently disagree.
+const manifest = JSON.parse(
+  await readFile(new URL("package.json", designerRoot), "utf8"),
+);
+assert.equal(
+  manifest.overrides?.["fast-uri"],
+  "^3.1.6",
+  "designer package.json must pin the fast-uri override that keeps npm off the vulnerable range",
+);
