@@ -910,6 +910,7 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
       const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+      const boundedGit = `git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
 
       expect(command).toContain(`fetch --no-tags --quiet origin`);
       // Fetch only after origin points at upstream — fetching earlier would pull
@@ -925,15 +926,23 @@ describe("buildJobManifest", () => {
       // refs/remotes/origin/HEAD, so `set-head` is paired with it — otherwise
       // `git symbolic-ref refs/remotes/origin/HEAD` stays broken in every
       // run-isolated workspace.
-      expect(command).toContain(`git -C '${workspaceRoot}' remote set-head origin -a`);
+      expect(command).toContain("remote set-head origin -a");
       expect(command.indexOf("fetch --no-tags")).toBeLessThan(command.indexOf("remote set-head"));
       // set-head carries its own nested guard, so a set-head failure after a
       // successful fetch cannot fall through to the "fetch failed" breadcrumb.
-      expect(command).toContain(`(git -C '${workspaceRoot}' remote set-head origin -a >/dev/null 2>&1 || true)`);
+      // It records its own breadcrumb instead of failing silently, so every
+      // failure path in this block explains itself on the workspace.
+      expect(command).toContain(
+        `(${boundedGit} remote set-head origin -a >/dev/null 2>&1 || git -C '${workspaceRoot}' config paperclip.originHeadUnset`,
+      );
 
-      // The fetch runs on every run-isolated pod start, so it is bounded: a
-      // transfer stalling below the floor aborts instead of holding startup open.
-      expect(command).toContain("-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15");
+      // Both calls in this block reach the network — `set-head -a` queries the
+      // remote for its default branch even when the tracking refs are already
+      // local — so the bound must be on both, not just the fetch.
+      expect(command).toContain(`${boundedGit} fetch --no-tags --quiet origin`);
+      expect(command).toContain(`${boundedGit} remote set-head origin -a`);
+      const bound = "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15";
+      expect(command.split(bound).length - 1).toBe(2);
 
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");

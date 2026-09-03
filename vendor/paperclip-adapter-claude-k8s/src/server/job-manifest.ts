@@ -1637,6 +1637,24 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // network blip or a read-only config cannot take down pod startup.
   const upstreamRepoUrl = asString(workspaceContext.repoUrl, "").trim();
   const runWorkspaceGit = `git -C ${quoteShellArg(isolation.workspaceRoot)}`;
+  // Both calls below reach the network, so both carry the same bound rather
+  // than only the fetch: `set-head -a` queries the remote for its default
+  // branch even when every remote-tracking ref is already present locally.
+  // Measured against an unreachable https remote with refs/remotes/origin/HEAD
+  // and origin/master intact and `symbolic-ref refs/remotes/origin/HEAD`
+  // already resolving: exit 128, `unable to access ...: Failed to connect`.
+  // Sharing one constant keeps the two from drifting apart.
+  //
+  // Two limits on what this bound actually buys, both deliberate:
+  //   - it aborts a *transfer* that stalls below 1 KiB/s for 15s. A connect
+  //     that never completes is still bounded only by the kernel's TCP retry,
+  //     which is finite but longer.
+  //   - both knobs are consumed by the curl-based HTTP transport, so an
+  //     `ssh://` or `git@host:` remote would ignore them silently and the
+  //     calls would be unbounded again. Every configured workspace `repoUrl`
+  //     is https today so nothing reaches that path, but a future SSH remote
+  //     needs its own bound rather than inheriting this one.
+  const boundedRunWorkspaceGit = `${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1666,19 +1684,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 // an offline pod degrades to "fetch first" rather than to a
                 // failed run or an unexplained `unknown revision`.
                 //
-                // This runs on every run-isolated pod start, so the fetch is
-                // bounded: `http.lowSpeedLimit`/`lowSpeedTime` abort a transfer
-                // that stalls below 1 KiB/s for 15s instead of letting a
-                // blackholed network hold pod startup open. That bounds a
-                // stalled *transfer*; a connect that never completes is still
-                // bounded only by the kernel's TCP retry, which is finite but
-                // longer.
+                // This runs on every run-isolated pod start, so both network
+                // calls are bounded — see `boundedRunWorkspaceGit` above for
+                // exactly what that bound does and does not cover.
                 //
                 // `set-head` is nested inside its own guard so that when the
                 // fetch succeeds but `set-head` fails, the chain does not fall
                 // through and write the misleading `originFetchFailed`
-                // breadcrumb about a fetch that actually worked.
-                `(${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 fetch --no-tags --quiet origin && (${runWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+                // breadcrumb about a fetch that actually worked. It records its
+                // own breadcrumb instead, so all three failure paths in this
+                // block explain themselves on the workspace rather than leaving
+                // a bare `symbolic-ref` failure for an agent to diagnose.
+                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved; run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
               ]
             : [
                 // No recorded upstream: leave the clone with no remote at all
