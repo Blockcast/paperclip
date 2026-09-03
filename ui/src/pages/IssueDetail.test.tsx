@@ -2202,12 +2202,17 @@ describe("IssueDetail", () => {
     const setTimeoutSpy = vi.spyOn(window, "setTimeout");
     const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
 
-    // Idempotent, so the failure path tears down as cleanly as the passing one. An
-    // assertion throwing before the unmount below would otherwise skip it and leave both
-    // a mounted IssueDetail and a live 2s handle behind — i.e. a real regression here
-    // would leak the very timer this test exists to catch into whichever test runs ~2s
-    // later, making it far harder to attribute than it needs to be.
+    // Two independent leaks to close on the failure path, because a red run that leaves a
+    // live 2s handle fires it into whichever test runs ~2s later.
+    //   1. An assertion throwing *before* the unmount below would skip teardown entirely,
+    //      leaving IssueDetail mounted. unmountLocalRoot is idempotent and also called
+    //      from the finally, so that path now tears down.
+    //   2. On an actual regression the unmount *does* run and the handle survives it —
+    //      that is what the final assertion is failing about — so the guard above cannot
+    //      help. The finally clears the retrieved handle directly. It runs after the
+    //      assertion has been recorded, so it cannot mask the failure.
     let unmounted = false;
+    let resetTimerId: unknown;
     const unmountLocalRoot = async () => {
       if (unmounted) {
         return;
@@ -2246,8 +2251,10 @@ describe("IssueDetail", () => {
       const resetTimers = setTimeoutSpy.mock.calls
         .map((call, index) => ({ delay: call[1], id: setTimeoutSpy.mock.results[index]?.value }))
         .filter((timer) => timer.delay === 2000);
+      // Captured before every assertion below, so the finally can always clear whatever
+      // we found even if one of them throws.
+      resetTimerId = resetTimers[0]?.id;
       expect(resetTimers).toHaveLength(1);
-      const resetTimerId = resetTimers[0]!.id;
       // jsdom-on-node hands back a Timeout object rather than a numeric id; either way
       // it has to be a handle we retained.
       expect(resetTimerId).toBeDefined();
@@ -2259,6 +2266,9 @@ describe("IssueDetail", () => {
       expect(clearTimeoutSpy.mock.calls.flat()).toContain(resetTimerId);
     } finally {
       await unmountLocalRoot();
+      if (resetTimerId !== undefined) {
+        window.clearTimeout(resetTimerId as number);
+      }
       localContainer.remove();
       if (originalClipboard) {
         Object.defineProperty(navigator, "clipboard", originalClipboard);
