@@ -1078,14 +1078,46 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const projectId = (issue as unknown as Record<string, unknown>)?.projectId as string | undefined;
         if (!projectId) return null;
         if (!isInCompany(projects.get(projectId), companyId)) return null;
+
+        // BLO-31349: mirror the host — prefer the issue's own bound execution
+        // workspace, so BOTH limbs of the contract are reachable from the
+        // double. Seed one via `seed({ executionWorkspaces: [...] })` and point
+        // the issue's `executionWorkspaceId` at it. Previously this hard-coded
+        // `isIssueScoped: false`, which meant a plugin author who correctly
+        // branched on the flag had the `true` limb permanently untested, while
+        // one who ignored it and wrote to `path` still saw green tests.
+        const executionWorkspaceId = (issue as unknown as Record<string, unknown>)
+          ?.executionWorkspaceId as string | undefined;
+        if (executionWorkspaceId) {
+          const executionWorkspace = executionWorkspaces.get(executionWorkspaceId);
+          if (isInCompany(executionWorkspace, companyId) && executionWorkspace?.cwd) {
+            const now = new Date().toISOString();
+            return {
+              id: executionWorkspace.id,
+              projectId: executionWorkspace.projectId,
+              name: executionWorkspace.branchName ?? executionWorkspace.id,
+              path: executionWorkspace.cwd,
+              repoUrl: executionWorkspace.repoUrl,
+              repoRef: executionWorkspace.branchName,
+              defaultRef: executionWorkspace.baseRef,
+              branchName: executionWorkspace.branchName,
+              isPrimary: false,
+              isIssueScoped: true,
+              mode: executionWorkspace.mode ?? null,
+              createdAt: now,
+              updatedAt: now,
+            };
+          }
+        }
+
         const workspaces = projectWorkspaces.get(projectId) ?? [];
         const primary = workspaces.find((workspace) => workspace.isPrimary);
         if (!primary) return null;
-        // BLO-31349: this double has no execution-workspace concept, so it can
-        // only ever serve the project-scoped fallback. Say so explicitly —
-        // leaving the field undefined would let a plugin test pass while the
-        // plugin treats a base checkout as an issue-scoped working copy.
-        return { ...primary, isIssueScoped: false };
+        // No live execution workspace bound: this is the project-scoped
+        // fallback. Say so explicitly — leaving the field undefined would let a
+        // plugin test pass while the plugin treats a base checkout as an
+        // issue-scoped working copy.
+        return { ...primary, isIssueScoped: false, mode: null };
       },
       // Lucitra extension
       async create(input) {
