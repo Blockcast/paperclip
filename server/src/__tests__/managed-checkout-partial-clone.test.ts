@@ -265,6 +265,130 @@ describe("ensureManagedCheckoutCanServeClones", () => {
     expect(result.warning).toContain("Permission denied");
   }, 120_000);
 
+  it("aborts the unset loop on the first failure rather than clearing the second key", async () => {
+    // Clearing `promisor` AFTER failing to clear the filter is the one ordering
+    // that makes things strictly worse: the filter goes on manufacturing missing
+    // objects on every fetch while the lazy-fetch remote is gone. Stopping at
+    // the first failure leaves both keys set -- the original latent trap, and
+    // nothing worse.
+    const partial = path.join(root, "partial-unset-abort");
+    await git(["clone", "--quiet", `file://${upstreamNoFilter}`, partial], root);
+    await git(["config", REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY, "blob:none"], partial);
+    await git(["config", REMOTE_ORIGIN_PROMISOR_KEY, "true"], partial);
+
+    const unsetAttempts: string[] = [];
+    const result = await ensureManagedCheckoutCanServeClones({
+      cwd: partial,
+      runGit: async (args, cwd) => {
+        if (args[0] === "config" && args[1] === "--unset") {
+          unsetAttempts.push(String(args[2]));
+          throw new Error("could not lock config file .git/config: File exists");
+        }
+        return (await git(args, cwd)).stdout;
+      },
+    });
+
+    expect(result.state).toBe("partial_repair_failed");
+    // The filter is attempted first and the promisor is never attempted...
+    expect(unsetAttempts).toEqual([REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY]);
+    // ...so both keys survive on disk, which is the safe state.
+    expect(await readConfig(partial, REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY)).toBe("blob:none");
+    expect(await readConfig(partial, REMOTE_ORIGIN_PROMISOR_KEY)).toBe("true");
+  }, 120_000);
+
+  it("treats an unset that reported failure but left the key gone as a repair", async () => {
+    // `git config --unset` exits 5 both for "the option does not exist" -- a
+    // benign race with a concurrent process -- and for "multiple lines match", a
+    // real failure. Now that the caller aborts on the first failure, reading the
+    // benign one as real would abandon a repair that had already happened.
+    const partial = path.join(root, "partial-unset-race");
+    await git(["clone", "--quiet", `file://${upstreamNoFilter}`, partial], root);
+    await git(["config", REMOTE_ORIGIN_PROMISOR_KEY, "true"], partial);
+
+    const result = await ensureManagedCheckoutCanServeClones({
+      cwd: partial,
+      runGit: async (args, cwd) => {
+        if (args[0] === "config" && args[1] === "--unset") {
+          // Perform the unset and then report it as failed: exactly what a
+          // concurrent clear looks like from in here.
+          await git(args, cwd);
+          const error = new Error("error: could not unset config") as Error & { code?: number };
+          error.code = 5;
+          throw error;
+        }
+        return (await git(args, cwd)).stdout;
+      },
+    });
+
+    expect(result.state).toBe("partial_repaired");
+    expect(await readConfig(partial, REMOTE_ORIGIN_PROMISOR_KEY)).toBeNull();
+  }, 120_000);
+
+  it("refuses to repair when only one of the two config keys could be read", async () => {
+    // The half-failed probe, and the dangerous direction of it: `promisor` reads
+    // as set while the FILTER read fails. Unsetting only the key we can see
+    // de-registers the lazy-fetch remote while an unread filter stays armed --
+    // the same unservable state the missing-objects branch refuses to create,
+    // reached through a read failure instead of a write failure.
+    const partial = path.join(root, "partial-read-half-failed");
+    await git(["clone", "--quiet", `file://${upstreamNoFilter}`, partial], root);
+    await git(["config", REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY, "blob:none"], partial);
+    await git(["config", REMOTE_ORIGIN_PROMISOR_KEY, "true"], partial);
+
+    const unsetAttempts: string[] = [];
+    const result = await ensureManagedCheckoutCanServeClones({
+      cwd: partial,
+      runGit: async (args, cwd) => {
+        if (
+          args[0] === "config" &&
+          args[1] === "--get" &&
+          args[2] === REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY
+        ) {
+          const error = new Error("fatal: unable to access '.git/config': Permission denied") as
+            Error & { code?: number };
+          error.code = 128;
+          throw error;
+        }
+        if (args[0] === "config" && args[1] === "--unset") {
+          unsetAttempts.push(String(args[2]));
+          throw new Error("the unset must not be attempted on a half-failed probe");
+        }
+        return (await git(args, cwd)).stdout;
+      },
+    });
+
+    // The load-bearing assertion: no write was even ATTEMPTED. Checking only the
+    // resulting state would not arm this test, because attempting the unset and
+    // having it refused also lands on `partial_repair_failed`.
+    expect(unsetAttempts).toEqual([]);
+    // Not `partial_repaired`: this verdict must never claim a repair it did not
+    // verify. And not fatal, because the checkout still serves today.
+    expect(result.state).toBe("partial_repair_failed");
+    expect(result.fatalMessage).toBeNull();
+    expect(result.warning).toContain("Permission denied");
+    expect(result.evidence).toMatchObject({
+      partialCloneConfigReadError: expect.stringContaining(REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY),
+    });
+    // Left exactly as found.
+    expect(await readConfig(partial, REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY)).toBe("blob:none");
+    expect(await readConfig(partial, REMOTE_ORIGIN_PROMISOR_KEY)).toBe("true");
+  }, 120_000);
+
+  it("names only the config keys it actually cleared", async () => {
+    // filter-set / promisor-unset is the ordinary trap. Naming both keys would
+    // claim one was cleared that was never set.
+    const partial = path.join(root, "partial-filter-only");
+    await git(["clone", "--quiet", `file://${upstreamNoFilter}`, partial], root);
+    await git(["config", REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY, "blob:none"], partial);
+
+    const result = await ensureManagedCheckoutCanServeClones({ cwd: partial });
+
+    expect(result.state).toBe("partial_repaired");
+    expect(result.warning).toContain(REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY);
+    expect(result.warning).not.toContain(REMOTE_ORIGIN_PROMISOR_KEY);
+    expect(result.evidence).toMatchObject({ unsetKeys: [REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY] });
+  }, 120_000);
+
   it("reports indeterminate rather than healthy when the config read itself fails", async () => {
     // The silently-fails-OPEN case. `git config --get` exits 1 for an unset key
     // and something else for a real problem; collapsing both to null would make

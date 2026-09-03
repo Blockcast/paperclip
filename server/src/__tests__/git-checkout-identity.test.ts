@@ -454,14 +454,27 @@ describe("provisioning call-site invariants", () => {
     const source = readService("heartbeat.ts");
     const loopStart = source.indexOf("for (const workspace of realizationCandidates) {");
     expect(loopStart).toBeGreaterThan(-1);
-    const loopBody = source.slice(loopStart, loopStart + 4000);
 
-    expect(loopBody).toContain("ensureManagedProjectWorkspace({");
+    // Anchored at the catch, with NO fixed-size window. The previous form sliced
+    // a 4000-character block and compared `indexOf` results inside it, which
+    // couples the assertion to comment length: once `continue;` slides past the
+    // end, `indexOf` returns -1 and `toBeLessThan(-1)` fails on correct code, on
+    // somebody else's unrelated commit. Measured headroom at the time was ~730
+    // characters.
+    const catchStart = source.indexOf("} catch (error) {", loopStart);
+    expect(catchStart).toBeGreaterThan(-1);
+    expect(source.slice(loopStart, catchStart)).toContain("ensureManagedProjectWorkspace({");
+
     // The rethrow must sit before the warning/continue, or the typed failure and
     // its whole workspaceValidation evidence payload are lost to the fall-through.
-    const rethrowIndex = loopBody.indexOf("if (error instanceof WorkspaceValidationFailure) throw error;");
+    const rethrowIndex = source.indexOf(
+      "if (error instanceof WorkspaceValidationFailure) throw error;",
+      catchStart,
+    );
+    const continueIndex = source.indexOf("continue;", catchStart);
     expect(rethrowIndex).toBeGreaterThan(-1);
-    expect(rethrowIndex).toBeLessThan(loopBody.indexOf("continue;"));
+    expect(continueIndex).toBeGreaterThan(-1);
+    expect(rethrowIndex).toBeLessThan(continueIndex);
   });
 
   it("keeps the managed clone free of any object filter (BLO-31351)", () => {
