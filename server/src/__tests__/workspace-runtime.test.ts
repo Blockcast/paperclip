@@ -4026,7 +4026,7 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
-  it("does not start a retry while the previous timed-out process group remains alive", async () => {
+  it("does not start a submodule inspection retry while the previous timed-out process group remains alive", async () => {
     // In the CephFS-stall case this change exists for, SIGKILL can be issued
     // while the task remains stuck in uninterruptible IO. Retrying immediately
     // would overlap the next Git tree with the old one against the same checkout,
