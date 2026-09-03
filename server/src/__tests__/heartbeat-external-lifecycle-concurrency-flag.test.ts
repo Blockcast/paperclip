@@ -3,6 +3,8 @@ import {
   resolveExternalLifecycleConcurrency,
   resolveHeartbeatPolicyForRuntimeConfig,
   resolveK8sRunIsolationIdentity,
+  scopeSessionParamsToIsolation,
+  sessionParamsMatchIsolation,
 } from "../services/heartbeat.ts";
 
 // Regression coverage for BLO-15959: bounded external-lifecycle concurrency
@@ -411,5 +413,60 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
       expect(withTree!.isolationMode).toBe(expectedMode);
       expect(withTree!.isolationMode).toBe(withoutTree!.isolationMode);
     }
+  });
+
+  // `isolationKey` is not read only by the reservation: it is also stamped onto
+  // persisted session params and gates saved-session resume
+  // (`sessionParamsMatchIsolation`, consumed at the `isolation_mismatch`
+  // requeue). Making the key stable across runs of one issue therefore FLIPS
+  // that guard from reject to accept, where a `run:<runId>` key could never
+  // match a previous run's stamp.
+  //
+  // That is intended, not incidental, and it is the pairing BLO-31282 already
+  // implies: such a run works in a DURABLE per-issue worktree, so the tree its
+  // session refers to really is the same one next run. Pinned here so the
+  // coupling stays a decision -- if a future change wants the reservation key
+  // to move without moving session scope, the two need separating and this
+  // assertion is where that shows up.
+  it("lets a same-issue run resume a session stamped by an earlier run", () => {
+    const descriptorFor = (runId: string, perIssueWorkspaceTreeKey: string | null) => {
+      const identity = resolveK8sRunIsolationIdentity({
+        ...base,
+        runId,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: null,
+        perIssueWorkspaceTreeKey,
+        effectiveMaxConcurrentRuns: 2,
+      })!;
+      return {
+        ...identity,
+        workspaceRoot: "/w",
+        homeRoot: "/h",
+        sessionRoot: "/s",
+        cacheRoot: "/c",
+        tmpRoot: "/t",
+        storage: {
+          workspace: "persistent" as const,
+          home: "ephemeral" as const,
+          session: "ephemeral" as const,
+          cache: "ephemeral" as const,
+        },
+        sessionScope: { taskKey: "issue-7", isolationKey: identity.isolationKey },
+      };
+    };
+    const stampOf = (runId: string, tree: string | null) =>
+      scopeSessionParamsToIsolation({ sessionId: `session-from-${runId}` }, descriptorFor(runId, tree));
+
+    // With a tree key, run B accepts the session run A stamped -- both runs of
+    // one issue resolve to one key.
+    expect(
+      sessionParamsMatchIsolation(stampOf("run-A", treeKey), descriptorFor("run-B", treeKey)),
+    ).toBe(true);
+
+    // Control -- the pre-BLO-31443 behavior this changes. Without a tree key
+    // each run stamps its own `run:<runId>`, so run B rejects run A's session.
+    expect(
+      sessionParamsMatchIsolation(stampOf("run-A", null), descriptorFor("run-B", null)),
+    ).toBe(false);
   });
 });
