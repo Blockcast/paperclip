@@ -74,6 +74,10 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const execFileAsync = promisify(execFile);
 
+// Captured before any test can prepend a `git` shim directory. See the PATH
+// backstop in the global `afterEach`.
+const BASELINE_PATH = process.env.PATH;
+
 function stableStringifyForTest(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringifyForTest(entry)).join(",")}]`;
@@ -393,6 +397,14 @@ afterEach(async () => {
   // cases. Clearing unconditionally is idempotent.
   setSubmoduleInspectSettingsForTests(null);
   setProcessGroupLivenessProbeForTests(null);
+  // Same backstop, for the `git` shim tests. They prepend a temp dir to PATH and
+  // restore it in their own `finally`, so this is normally a no-op -- but a test
+  // killed by the suite timeout runs that block late, and a leaked PATH whose
+  // shim dir still exists makes every later `git submodule status --recursive`
+  // in this file hang for the shim's full sleep. That would surface as an
+  // unrelated timeout in a downstream test rather than as a failure here.
+  if (BASELINE_PATH === undefined) delete process.env.PATH;
+  else if (process.env.PATH !== BASELINE_PATH) process.env.PATH = BASELINE_PATH;
   delete process.env.PAPERCLIP_CONFIG;
   delete process.env.PAPERCLIP_HOME;
   delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -3550,6 +3562,16 @@ describe("realizeExecutionWorkspace", () => {
     // 300ms matches the sibling shim tests: long enough that the budget is not
     // racing process startup, short enough to keep two attempts cheap.
     setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+    // Pin the last scheduler-dependent branch. Four assertions below require the
+    // *retry* path -- `attempts: 2`, "after 2 attempt(s)", and the exact probe
+    // count -- and that path is only taken when the timed-out group is already
+    // reaped. If a loaded host has not reaped `sleep` within
+    // PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS (750ms), inspectGitSubmoduleReadiness
+    // returns early at workspace-runtime.ts:2882 with `attempts: 1` and a
+    // different reason, and all four fail. 750ms is generous next to the 1ms
+    // timer that actually flaked, but leaving it unpinned would keep a race in
+    // the one test whose entire purpose is now determinism.
+    setProcessGroupLivenessProbeForTests(() => false);
 
     try {
       const realized = await realizeExecutionWorkspace({
@@ -4154,6 +4176,9 @@ describe("realizeExecutionWorkspace", () => {
     const previousPath = process.env.PATH;
     process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
     setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+    // This test asserts "2 attempt(s)" and `attempts: 2` on the post-repair
+    // probe, so it needs the retry branch for the same reason as above.
+    setProcessGroupLivenessProbeForTests(() => false);
 
     try {
       const realized = await realizeExecutionWorkspace({
