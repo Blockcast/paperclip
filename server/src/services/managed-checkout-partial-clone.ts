@@ -243,6 +243,37 @@ async function readConfigValue(
   }
 }
 
+/**
+ * Unset one config key, treating "the key is already gone" as success.
+ *
+ * `git config --unset` exits **5** both for "the option does not exist" and for
+ * "multiple lines match". The first is a benign race -- a concurrent process
+ * cleared the key between our read and our write -- and the second is a genuine
+ * failure. The exit code alone cannot tell them apart, so re-read the key: if it
+ * is gone, the state we wanted holds, whoever produced it.
+ *
+ * This matters more than it looks because the caller now aborts the whole repair
+ * on the first failure. Without this, a benign race on the first key would
+ * abandon a repair that had already happened and report `partial_repair_failed`
+ * about a key that is, in fact, absent.
+ */
+async function unsetConfigValue(
+  runGit: PartialCloneGitRunner,
+  cwd: string,
+  key: string,
+): Promise<string | null> {
+  const failure = await runGit(["config", "--unset", key], cwd).then(
+    () => null,
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  );
+  if (!failure) return null;
+  // Only a *readable* absence clears the failure. An unreadable re-read leaves
+  // the key's state unknown, which is the one case that must stay a failure.
+  const recheck = await readConfigValue(runGit, cwd, key);
+  if (!recheck.unreadable && recheck.value === null) return null;
+  return failure;
+}
+
 function describePartialCloneConfig(filter: string | null, promisor: string | null) {
   const parts: string[] = [];
   if (filter) parts.push(`${REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY}=${filter}`);
@@ -315,11 +346,21 @@ export async function ensureManagedCheckoutCanServeClones(input: {
   const filter = filterRead.value;
   const promisor = promisorRead.value;
 
+  // Attribute the failure to its key, and keep BOTH: a probe where one key read
+  // and the other did not is the dangerous shape, and collapsing the two with
+  // `??` would report only the first and hide which key is unknown.
+  const unreadable =
+    [
+      filterRead.unreadable && `${REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY}: ${filterRead.unreadable}`,
+      promisorRead.unreadable && `${REMOTE_ORIGIN_PROMISOR_KEY}: ${promisorRead.unreadable}`,
+    ]
+      .filter((entry): entry is string => typeof entry === "string")
+      .join("; ") || null;
+
   // An unreadable config is NOT a clean repository. Reporting `not_partial` here
   // would hide a locked config or a permission fault on shared storage behind a
   // healthy-looking verdict, which is the one direction this guard must never
   // fail in.
-  const unreadable = filterRead.unreadable ?? promisorRead.unreadable;
   if (unreadable && !filter && !promisor) {
     return {
       ...base,
@@ -342,6 +383,10 @@ export async function ensureManagedCheckoutCanServeClones(input: {
     partialCloneFilter: filter,
     partialClonePromisor: promisor,
   };
+  // Recorded unconditionally from here on. The gate above only fires when BOTH
+  // keys are unknown, so without this a half-failed probe would leave no trace
+  // that the verdict rests on an incomplete read.
+  if (unreadable) evidence.partialCloneConfigReadError = unreadable;
 
   const countMissing = input.countMissing ?? countMissingObjects;
   let missing: { count: number; truncated: boolean };
@@ -389,15 +434,52 @@ export async function ensureManagedCheckoutCanServeClones(input: {
 
   // Nothing missing, so the filter is a latent trap rather than a live fault:
   // clearing it now is safe and stops the next fetch from re-arming it.
+  //
+  // Unless the probe was incomplete. If one key read and the other did not, we
+  // know this checkout is partial but not what the unread key holds -- and
+  // unsetting only the key we could read is the exact asymmetry the `missing > 0`
+  // branch exists to refuse: clearing `promisor` while an unreadable
+  // `partialclonefilter` is still set leaves a repo that can neither serve its
+  // objects nor lazily fetch them. So leave it precisely as found. The fatal
+  // path above is deliberately reached first, because a known-set filter with
+  // missing objects is `partial_cannot_serve` whatever the other key did.
+  if (unreadable) {
+    return {
+      ...base,
+      state: "partial_repair_failed",
+      filter,
+      promisor,
+      missingObjectCount: 0,
+      evidence,
+      warning:
+        `Managed checkout "${cwd}" is a partial clone (${configDescription}) with no missing objects, so it ` +
+        `still serves clones today, but Paperclip could not read its full partial-clone config and so did ` +
+        `not clear it: ${unreadable}. Clearing only the readable key could leave the checkout able to ` +
+        `neither serve its objects nor fetch them lazily, so it was left untouched. Every later fetch can ` +
+        `reintroduce missing objects and break clones from this path.`,
+    };
+  }
+
   const unsetFailures: string[] = [];
+  const unsetKeys: string[] = [];
   for (const key of [REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY, REMOTE_ORIGIN_PROMISOR_KEY]) {
     const present = key === REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY ? filter : promisor;
     if (!present) continue;
-    const failure = await runGit(["config", "--unset", key], cwd).then(
-      () => null,
-      (error: unknown) => (error instanceof Error ? error.message : String(error)),
-    );
-    if (failure) unsetFailures.push(`${key}: ${failure}`);
+    const failure = await unsetConfigValue(runGit, cwd, key);
+    if (failure) {
+      unsetFailures.push(`${key}: ${failure}`);
+      // Abort rather than attempt the next key. The filter is cleared FIRST, so
+      // stopping here leaves both keys set -- the original latent trap, and
+      // nothing worse. Continuing is the dangerous branch: clearing `promisor`
+      // after failing to clear the filter de-registers the lazy-fetch remote
+      // while the filter goes on manufacturing missing objects on every fetch.
+      // The window is narrow (`.git/config.lock` contention between two
+      // back-to-back writes) but it is the same one this module already treats
+      // as real; a permission fault fails both keys and is harmless by
+      // comparison.
+      break;
+    }
+    unsetKeys.push(key);
   }
 
   if (unsetFailures.length > 0) {
@@ -422,10 +504,15 @@ export async function ensureManagedCheckoutCanServeClones(input: {
     filter,
     promisor,
     missingObjectCount: 0,
-    evidence,
+    evidence: { ...evidence, unsetKeys },
+    // Derived from the keys actually unset, not from both names. The loop skips
+    // keys that were not present, and the common trap is filter-set /
+    // promisor-unset -- naming both would claim a key was cleared that was never
+    // there. `unsetKeys` cannot be empty here: reaching this line requires at
+    // least one key set, no unreadable read, and no failure.
     warning:
       `Managed checkout "${cwd}" was a partial clone (${configDescription}) with no missing objects. Cleared ` +
-      `${REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY} and ${REMOTE_ORIGIN_PROMISOR_KEY} so later fetches cannot ` +
-      `reintroduce missing objects and break execution-workspace clones from this path.`,
+      `${unsetKeys.join(" and ")} so later fetches cannot reintroduce missing objects and break ` +
+      `execution-workspace clones from this path.`,
   };
 }
