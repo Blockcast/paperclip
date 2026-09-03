@@ -93,6 +93,39 @@
 -- stopped sorting, and re-measure production's `EXPLAIN (GENERIC_PLAN)` before
 -- closing that issue.
 --
+-- WHY THIS LANDS BEFORE THAT FIX, given it costs a permanent write. Raised in
+-- review and worth answering in place, because the honest reading of the
+-- numbers above is that this index does not decide the plan and the plan-cache
+-- lever does. The cost is real: a queued row now sits in THREE overlapping
+-- partial indexes (0208, 0217, this one), so every queued INSERT maintains one
+-- more entry and every transition out of 'queued' — the dispatcher's hottest
+-- write — incurs one more index delete. `status` is an indexed column here, so
+-- those updates cannot be HOT.
+--
+-- What bounds that cost is the predicate: only rows WHERE status = 'queued' are
+-- indexed, and a queued row is transient by construction. The index tracks the
+-- live queue (tens to low thousands of rows), not the ~1.8 GB table, so it is
+-- small, cheap to rebuild, and cheap to drop.
+--
+-- Against that, it is the only one of the three objects that is both as narrow
+-- as 0217's and ordered for this ORDER BY, so it improves the outcome of EVERY
+-- candidate lever rather than competing with any of them, and it is reversible
+-- in one statement if the lever lands and makes it redundant. That is the whole
+-- argument: cheap, bounded, reversible, and strictly additive to the planner's
+-- option set — not that it is sufficient, which the measurements above say it
+-- is not.
+--
+-- SO RE-EVALUATE IT once the plan-cache lever lands. If forcing a custom plan
+-- (or otherwise keeping this statement off the generic plan) makes production
+-- stably pick an ordered index-only path, then 0208's index already serves the
+-- custom plan — that is exactly what force_custom_plan restored in production —
+-- and this index has no remaining job. Drop it rather than leaving a third
+-- partial index on the queue's hot write path out of inertia. The concrete
+-- test: production's plan for the head scan is ordered and index-only with
+-- `heartbeat_runs_agent_dispatch_idx` under the lever, at which point
+-- `DROP INDEX CONCURRENTLY heartbeat_runs_agent_queued_dispatch_idx` should be
+-- a no-op for the dispatcher.
+--
 -- Deliberately NOT done here:
 --
 --   * Dropping or reshaping 0217's index. It exists for BLO-21116's queue-age
@@ -101,9 +134,16 @@
 --     index with INCLUDE (queued_at) is possible and is the tidier end state,
 --     but it changes an object another issue owns and is not needed to fix this.
 --   * Pinning plan_cache_mode or disabling prepared statements for this
---     statement. That treats the symptom, leaves the planner without a good
---     path, and would have to be re-reasoned for every future shape of this
---     query.
+--     statement. NOT because it is the lesser fix — by the measurements above it
+--     is the one that actually decides the plan, and this index is not — but
+--     because it is a change to a hot, start-lock-holding read path with three
+--     candidate implementations (force_custom_plan around the statement,
+--     `sql.unsafe(query, params)` which does not register a prepared statement,
+--     or inlining agent_id so the statement has no parameters to generalise and
+--     plan_cache_mode stops applying). They differ in blast radius and in
+--     whether they trade a generic plan for unbounded plan-cache churn — one
+--     SQL text per agent, in the inlining case — and that choice deserves its
+--     own measurement rather than riding along with an index migration.
 --
 -- 0209's recovery index is left in place and is still the narrower object for
 -- the recovery lane's predicate, so that lane keeps its absolute bound.

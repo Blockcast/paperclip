@@ -217,6 +217,28 @@ const KEYSET_PREDICATE = /\(\s*created_at\s*,\s*id\s*\)/;
  * then the generic plan if it costs less, so the literal-only assertions above
  * measure a plan production may stop using. `$1` here is what makes this the
  * generic case; the projection and ORDER BY are otherwise identical.
+ *
+ * LIMIT is a PLACEHOLDER, not a literal, because production binds it too:
+ * `readQueuedDispatchPage` ends in `.limit(input.limit)`, and drizzle's PG
+ * dialect emits that as ``sql` limit ${limit}` `` (pg-core/dialect.ts), where an
+ * interpolated number becomes a bind parameter — so the text production
+ * prepares ends in `LIMIT $n`, never `LIMIT 200`.
+ *
+ * This matters to the plan, but in the OPPOSITE direction to the obvious guess,
+ * so measure before changing it back. `preprocess_limit()` reads a constant
+ * LIMIT into an absolute tuple count and a non-constant one into `count_est =
+ * -1`, which falls back to assuming 10% of rows are fetched. Here `LIMIT 200`
+ * is 2-200x LARGER than the generic estimate (1-91 rows), so as a literal it
+ * normalises to "retrieve all rows" and a Sort's startup cost is fully
+ * amortised; the 10% fraction is what charges that startup in full. Measured on
+ * this fixture, depth 1000, head shape:
+ *
+ *   LIMIT 200 literal:  Limit cost=0.28..4.73 rows=20  (= the whole scan)
+ *   LIMIT $n bound:     Limit cost=0.28..0.70 rows=2   (scan alone is 4.75)
+ *
+ * So binding it makes this probe faithful to production AND makes the no-Sort
+ * assertion easier to satisfy, not harder. Do not read the placeholder as the
+ * strict choice — the negative control below is what carries this test.
  */
 function dispatchHeadProbeGenericQuery(shape: { cutoff: boolean; cursor: boolean }) {
   let next = 2;
@@ -230,7 +252,7 @@ function dispatchHeadProbeGenericQuery(shape: { cutoff: boolean; cursor: boolean
        ${cutoff}
        ${cursor}
      ORDER BY created_at ASC, id ASC
-     LIMIT ${SCAN_LIMIT}
+     LIMIT $${next++}
   `;
 }
 
@@ -1056,6 +1078,16 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
          * query. This fails deterministically with the fix reverted, on a
          * structural impossibility rather than a cost margin, which is also why
          * it cannot become the next knife-edge flake.
+         *
+         * Driving transaction state through raw BEGIN/ROLLBACK is only correct
+         * because this pool is `max: 1` (see the `postgres(...)` call above), so
+         * the DROP and both EXPLAINs are guaranteed the same connection. Widen
+         * the pool and this control breaks in two ways at once: the EXPLAINs may
+         * run on a connection that still has the index, silently voiding the
+         * control, or the non-concurrent DROP INDEX (ACCESS EXCLUSIVE) may block
+         * on a connection waiting for the ROLLBACK that would release it. If the
+         * pool ever needs to grow, convert this to `sql.begin(async (tx) => ...)`,
+         * which is pool-independent and rolls back on throw.
          */
         await sql.unsafe("BEGIN");
         try {
