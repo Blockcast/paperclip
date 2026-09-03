@@ -21,6 +21,18 @@ const DIGEST = `sha256:${"ab".repeat(32)}`;
 // would weaken the assertion while keeping it green.
 const RUN_BUDGET_SECONDS = 2;
 
+// Large enough that "rode out the budget" and "bailed early" are separable on a
+// real clock. Feeds the env, the early-bail ceiling and the messages below, so
+// that lowering it to save wall-clock -- which this file's budgets have already
+// been subjected to once, see the note at the poll override -- shrinks the
+// ceiling with it instead of leaving a fixed ceiling the budget can no longer
+// reach. A ceiling above its own budget is unfalsifiable and stays green.
+const STARTUP_BUDGET_SECONDS = 60;
+
+// The bar for "did not ride out the startup budget". Derived, not chosen, so it
+// tracks the budget it is a fraction of.
+const EARLY_BAIL_CEILING_SECONDS = STARTUP_BUDGET_SECONDS / 6;
+
 // Stands in for the cluster. Container start is a function of elapsed time so a
 // slow image pull can be simulated without one.
 const STUB = `#!/usr/bin/env bash
@@ -60,10 +72,12 @@ case "$args" in
     # resolves as soon as the container starts, which real kubectl does NOT do:
     # --for=condition=complete never sees Complete go true on a failed Job and
     # has no second condition to give up on, so it blocks the full --timeout
-    # (kubernetes/kubernetes#89273). The divergence is deliberate and buys ~2s
-    # per test; the script's verdict is identical either way. Its operational
-    # corollary is real though -- a genuine FAILED verdict in production spends
-    # the whole run budget before it prints, which the job timeout fold covers.
+    # (kubernetes/kubectl#1629; the underlying gap is kubernetes/kubernetes#100248,
+    # "wait on multiple conditions", closed rotten rather than fixed). The
+    # divergence is deliberate and buys ~2s per test; the script's verdict is
+    # identical either way. Its operational corollary is real though -- a
+    # genuine FAILED verdict in production spends the whole run budget before
+    # it prints, which the job timeout fold covers.
     while :; do
       if [ "\${STUB_JOB_RESULT:-complete}" != timeout ] && [ $(( $(date +%s) - start )) -ge "\${STUB_READY_AFTER:-0}" ]; then
         [ "\${STUB_JOB_RESULT:-complete}" = complete ] && exit 0 || exit 1
@@ -90,9 +104,8 @@ function runPreflight(env = {}) {
       STUB_STATE: dir,
       DIGEST,
       NS: "paperclip-test",
-      // Deliberately tiny so a budget being charged the wrong phase is loud.
       PREFLIGHT_TIMEOUT_SECONDS: String(RUN_BUDGET_SECONDS),
-      PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "60",
+      PREFLIGHT_STARTUP_TIMEOUT_SECONDS: String(STARTUP_BUDGET_SECONDS),
       // These tests wait on real clocks, so the production 5s poll would make
       // the file cost ~32s against the policy job's one-minute step bound. The
       // waits stay real; only their granularity shrinks.
@@ -197,7 +210,7 @@ test("a pod that dies before its container runs is not reported as a migration v
     STUB_NEVER_STARTS: "1",
     STUB_TERMINAL_PHASE: "Failed",
     STUB_JOB_RESULT: "failed",
-    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "60",
+    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: String(STARTUP_BUDGET_SECONDS),
   });
   const elapsed = (Date.now() - began) / 1000;
 
@@ -216,7 +229,10 @@ test("a pod that dies before its container runs is not reported as a migration v
   assert.match(output, /migration check itself never ran/, "it must disclaim any migration verdict");
   // backoffLimit is 0, so nothing will replace the pod; the rest of the budget
   // cannot change the answer.
-  assert.ok(elapsed < 10, `a terminal phase with no start stamp must not ride out the budget (took ${elapsed}s)`);
+  assert.ok(
+    elapsed < EARLY_BAIL_CEILING_SECONDS,
+    `a terminal phase with no start stamp must not ride out the budget (took ${elapsed}s)`,
+  );
 });
 
 test("a config error fails fast instead of riding out the startup budget", () => {
@@ -226,15 +242,18 @@ test("a config error fails fast instead of riding out the startup budget", () =>
   const { code, output } = runPreflight({
     STUB_READY_AFTER: "9999",
     STUB_WAITING_REASON: "CreateContainerConfigError",
-    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "60",
+    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: String(STARTUP_BUDGET_SECONDS),
   });
   const elapsed = (Date.now() - began) / 1000;
 
   assert.equal(code, 1);
   assert.match(output, /CreateContainerConfigError/);
-  assert.ok(elapsed < 10, `must not burn the whole 60s startup budget on a terminal error (took ${elapsed}s)`);
+  assert.ok(
+    elapsed < EARLY_BAIL_CEILING_SECONDS,
+    `must not burn the whole ${STARTUP_BUDGET_SECONDS}s startup budget on a terminal error (took ${elapsed}s)`,
+  );
   // Bailing early and exhausting the budget are different facts. Claiming the
-  // container "never started within its 60s startup budget" after 0s would
+  // container "never started within its Ns startup budget" after 0s would
   // point an operator at the budget when the budget was never the constraint.
   assert.match(output, /terminal container error/, "the message must name the early bail as such");
   assert.doesNotMatch(
