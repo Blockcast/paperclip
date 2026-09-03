@@ -419,6 +419,77 @@ describe("provisioning call-site invariants", () => {
     expect(wrapperBody).toContain("ensureCheckoutGitIdentity({");
   });
 
+  it("routes every managed-workspace return through the partial-clone guard (BLO-31351)", () => {
+    // Same invariant, same reason. Paperclip never *creates* a partial mirror --
+    // the managed clone passes no `--filter` -- it adopts whatever already sits
+    // at the managed path, and the `.git`-already-exists return is the one that
+    // matters. A guard placed after the clone would only ever inspect the one
+    // checkout that cannot be partial, which is how this reached production.
+    const source = readService("heartbeat.ts");
+    const wrapperStart = source.indexOf("async function ensureManagedProjectWorkspace(");
+    expect(wrapperStart).toBeGreaterThan(-1);
+    const wrapperBody = source.slice(wrapperStart, wrapperStart + 2400);
+
+    expect(wrapperBody).toContain("ensureManagedCheckoutCanServeClones({");
+    // A mirror that cannot serve must fail as a workspace validation failure,
+    // not as a bare Error: that specific cause is the one the recovery machinery
+    // treats as manual-repair and exempts from the wake-attempt budget. A plain
+    // throw here would burn attempts on a cause no retry can move.
+    expect(wrapperBody).toContain("partial_cannot_serve");
+    expect(wrapperBody).toContain("new WorkspaceValidationFailure(");
+    expect(wrapperBody).toContain("managed_checkout_partial_clone_unservable");
+  });
+
+  it("does not let the realization loop swallow a WorkspaceValidationFailure (BLO-31351)", () => {
+    // Ally's Critical finding on PR #1611, and the reason the assertion above is
+    // not sufficient on its own: it greps for the *throw*, which is satisfied by
+    // a throw nobody lets out. `ensureManagedProjectWorkspace` has two callers.
+    // The repo-less one propagates; the repo-backed one sits inside the
+    // `realizationCandidates` loop behind `catch { ...; continue; }`, and the
+    // fall-through below that loop ends at `resolveDefaultAgentWorkspaceDir` --
+    // an EMPTY per-agent directory. Swallowing an unservable-mirror failure
+    // there runs the agent to completion against the wrong tree and records no
+    // `workspace_validation_failed` cause at all, which is strictly worse than
+    // the pre-guard behaviour of failing loudly at clone time.
+    const source = readService("heartbeat.ts");
+    const loopStart = source.indexOf("for (const workspace of realizationCandidates) {");
+    expect(loopStart).toBeGreaterThan(-1);
+
+    // Anchored at the catch, with NO fixed-size window. The previous form sliced
+    // a 4000-character block and compared `indexOf` results inside it, which
+    // couples the assertion to comment length: once `continue;` slides past the
+    // end, `indexOf` returns -1 and `toBeLessThan(-1)` fails on correct code, on
+    // somebody else's unrelated commit. Measured headroom at the time was ~730
+    // characters.
+    const catchStart = source.indexOf("} catch (error) {", loopStart);
+    expect(catchStart).toBeGreaterThan(-1);
+    expect(source.slice(loopStart, catchStart)).toContain("ensureManagedProjectWorkspace({");
+
+    // The rethrow must sit before the warning/continue, or the typed failure and
+    // its whole workspaceValidation evidence payload are lost to the fall-through.
+    const rethrowIndex = source.indexOf(
+      "if (error instanceof WorkspaceValidationFailure) throw error;",
+      catchStart,
+    );
+    const continueIndex = source.indexOf("continue;", catchStart);
+    expect(rethrowIndex).toBeGreaterThan(-1);
+    expect(continueIndex).toBeGreaterThan(-1);
+    expect(rethrowIndex).toBeLessThan(continueIndex);
+  });
+
+  it("keeps the managed clone free of any object filter (BLO-31351)", () => {
+    // The guard above exists because this clone is a full clone. If a `--filter`
+    // or `--depth` is ever added here, Paperclip starts *manufacturing* the
+    // partial mirrors it currently only adopts, and every execution-workspace
+    // clone from one becomes a fake "repository corruption" failure.
+    const source = readService("heartbeat.ts");
+    const cloneIndex = source.indexOf('await execFile("git", ["clone"');
+    expect(cloneIndex).toBeGreaterThan(-1);
+    const cloneCall = source.slice(cloneIndex, cloneIndex + 200);
+    expect(cloneCall).not.toContain("--filter");
+    expect(cloneCall).not.toContain("--depth");
+  });
+
   it("provisions identity inside the worktree funnel, before the provision-command early return", () => {
     const source = readService("workspace-runtime.ts");
     const funnelStart = source.indexOf("async function provisionExecutionWorktree(");
