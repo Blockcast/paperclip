@@ -24291,9 +24291,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * BLO-20736: read one keyset page of an agent's queued runs in two phases.
    *
    * Phase 1 projects ONLY (created_at, id). Both live in
+   * heartbeat_runs_agent_queued_dispatch_idx (BLO-31392, migration 0237)
+   * alongside the leading agent_id, and in
    * heartbeat_runs_agent_dispatch_idx alongside the (agent_id, status) prefix,
    * so the whole page comes from the index with no heap access at all — an
    * `Index Only Scan`, ordered, that stops after `limit` entries.
+   *
+   * Which of the two serves it depends on whether PostgreSQL is costing a
+   * custom or a generic plan; both are ordered and index-only for this
+   * projection, which is the property that matters. See the `status` literal
+   * below for why the generic case needed its own index.
    *
    * That projection is the entire point, and it is a cost-model fix rather than
    * a cosmetic one. PostgreSQL estimates `agent_id = $1` and `status = 'queued'`
@@ -24360,8 +24367,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const queuedPagePredicate = and(
       eq(heartbeatRuns.agentId, input.agentId),
       // Keep the partial-index predicate a SQL literal. postgres.js uses
-      // prepared statements by default; a bound status parameter can receive a
-      // generic plan that cannot imply `status = 'queued'`.
+      // prepared statements by default, and a bound status parameter can
+      // receive a generic plan that cannot imply `status = 'queued'` — so
+      // neither partial index would be provably applicable and the scan falls
+      // back to a wider path.
+      //
+      // BLO-31392: the literal is necessary but NOT sufficient, and for a while
+      // this comment claimed more than it delivered. Being a literal lets the
+      // planner prove a partial index applicable — but it does not choose
+      // WHICH. Migration 0217 added heartbeat_runs_queued_age_idx with a
+      // predicate of exactly `status = 'queued'`, and in the generic pass
+      // (agent_id unknown, so the row estimate collapses to ~1 and a Sort looks
+      // free) that index won on size alone, producing `Index Scan` + `Sort` —
+      // the unbounded shape this function exists to avoid. Measured on
+      // production. Migration 0237 answers it where the planner actually
+      // decides: heartbeat_runs_agent_queued_dispatch_idx carries the same
+      // narrow predicate plus (created_at, id) as trailing keys, so it is no
+      // larger than 0217's and additionally supplies the ORDER BY. Do not drop
+      // it without re-measuring the GENERIC plan, not just the custom one.
+      //
+      // That index is still not the whole fix, and the gap is worth knowing
+      // before trusting this path. Measured generic cost, 0237 vs 0217, at the
+      // ~1-row estimate this statement gets: 48% cheaper when the heap is
+      // all-visible, but only 0.24% — inside the 1% STD_FUZZ_FACTOR — when it
+      // is not, and queued rows are freshly written so they never are. At a
+      // 1-row estimate a Sort costs ~0.02, so no index design can win this
+      // decisively; only taking the statement off the generic plan can (the
+      // custom plan picks the ordered scan every time, on production too).
+      // Until that lands, treat the ordered plan here as likely-but-unproven in
+      // production and re-measure `EXPLAIN (GENERIC_PLAN)` there rather than
+      // inferring it from a green CI run. BLO-31392.
       sql`${heartbeatRuns.status} = 'queued'`,
       input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
       // Keyset cursor. created_at alone is not unique (bulk wake fan-out stamps

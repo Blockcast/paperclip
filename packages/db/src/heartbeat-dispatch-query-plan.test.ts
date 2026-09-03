@@ -48,6 +48,24 @@ import {
 
 const DISPATCH_INDEX = "heartbeat_runs_agent_dispatch_idx";
 const RECOVERY_INDEX = "heartbeat_runs_recovery_dispatch_idx";
+/**
+ * BLO-31392. Migration 0237's index: same `status = 'queued'` predicate as
+ * 0217's queue-age index, but with (created_at, id) as trailing keys so it can
+ * satisfy the dispatcher's ORDER BY directly.
+ */
+const QUEUED_DISPATCH_INDEX = "heartbeat_runs_agent_queued_dispatch_idx";
+/** Migration 0217's queue-age index — applicable to the dispatch filter but NOT ordered for it. */
+const AGE_INDEX = "heartbeat_runs_queued_age_idx";
+/**
+ * Indexes that carry (created_at, id) in the ORDER BY's order, so the head page
+ * can be emitted without a Sort. The assertion below deliberately accepts
+ * EITHER rather than pinning one: measured generic costs for the cursor-bearing
+ * shapes are 5.08 vs 5.16 and 4.58 vs 4.61 — inside and beside PostgreSQL's 1%
+ * STD_FUZZ_FACTOR. Pinning the winner would recreate exactly the knife-edge
+ * flake BLO-31354 was filed for. The load-bearing property is "ordered,
+ * index-only, no Sort", not which of the two ordered indexes supplies it.
+ */
+const ORDERED_DISPATCH_INDEXES = [QUEUED_DISPATCH_INDEX, DISPATCH_INDEX];
 const SCAN_LIMIT = 200;
 const TOTAL_RUNS = 200_000;
 const TOTAL_ISSUES = Number(process.env.BLO20396_ISSUES ?? 20_000);
@@ -128,12 +146,56 @@ function rowsInspected(node: Record<string, unknown>): number {
   }, 0);
 }
 
-/** The plan node that scans a named index, so its conditions can be inspected. */
-function indexScanNode(
+/**
+ * BLO-31392: which ordering-capable dispatch index this plan used, if any.
+ *
+ * Every assertion in this file that used to name `heartbeat_runs_agent_dispatch_idx`
+ * goes through here instead. The reason is not tolerance for drift — it is that
+ * the identity of the winner was never the invariant. Migration 0237 added a
+ * SECOND index that satisfies `agent_id = ? AND status = 'queued'` in
+ * `(created_at, id)` order, and it is deliberately NARROWER than 0208's (whose
+ * predicate spans `status IN ('queued', 'scheduled_retry')`), so for the
+ * queued-only predicates below the planner now legitimately prefers it. Pinning
+ * either name turns a correct planner choice between two correct plans into a
+ * red build — and this test gates the merge queue, so that is not a cosmetic
+ * cost. BLO-31354 was filed because these plans sit inside PostgreSQL's 1%
+ * STD_FUZZ_FACTOR and the winner flips on ANALYZE's random sample.
+ *
+ * What still IS asserted, unchanged and at every site: no `Seq Scan`, no
+ * `Bitmap Heap Scan`, no `Sort`, the keyset predicate resolved in `Index Cond`
+ * rather than `Filter`, and an absolute bound on rows inspected. Those are the
+ * properties BLO-20396 and BLO-20736 were closed on. Whichever of the two
+ * ordered indexes supplies them is an implementation detail.
+ *
+ * `heartbeat_runs_queued_age_idx` is NOT in this set and must never be: its
+ * second key is `coalesce(queued_at, created_at)`, so it cannot supply this
+ * ORDER BY and its plans always carry the `Sort` this whole test exists to
+ * forbid.
+ */
+function orderedDispatchIndexScanNode(
   node: Record<string, unknown>,
-  indexName: string,
 ): Record<string, unknown> | null {
-  return planNodes(node).find((entry) => entry["Index Name"] === indexName) ?? null;
+  return (
+    planNodes(node).find(
+      (entry) =>
+        typeof entry["Index Name"] === "string"
+        && ORDERED_DISPATCH_INDEXES.includes(entry["Index Name"] as string),
+    ) ?? null
+  );
+}
+
+/** Assert the plan is served by one of the ordering-capable dispatch indexes. */
+function expectOrderedDispatchIndex(node: Record<string, unknown>) {
+  const used = indexesUsed(node);
+  expect(
+    used.some((name) => ORDERED_DISPATCH_INDEXES.includes(name)),
+    `expected one of ${ORDERED_DISPATCH_INDEXES.join(" | ")}, got [${used.join(", ")}]`,
+  ).toBe(true);
+  // The queue-age index cannot supply (created_at, id) ordering, so its
+  // presence here means a Sort was reintroduced. Called out separately from the
+  // generic `not.toContain("Sort")` checks because this is the specific
+  // regression BLO-31392 was filed for, and the failure message should say so.
+  expect(used).not.toContain(AGE_INDEX);
 }
 
 /**
@@ -144,6 +206,57 @@ function indexScanNode(
  * cursor at all.
  */
 const KEYSET_PREDICATE = /\(\s*created_at\s*,\s*id\s*\)/;
+
+/**
+ * BLO-31392: the head scan in BOUND-PARAMETER form, for EXPLAIN (GENERIC_PLAN).
+ *
+ * Everything else in this file interpolates literals, which is what the
+ * dispatcher's `status = 'queued'` really is — but `agent_id` is a BOUND
+ * parameter in production (Drizzle `eq`), and postgres.js prepares by default.
+ * A statement with a bound parameter gets custom plans for five executions and
+ * then the generic plan if it costs less, so the literal-only assertions above
+ * measure a plan production may stop using. `$1` here is what makes this the
+ * generic case; the projection and ORDER BY are otherwise identical.
+ */
+function dispatchHeadProbeGenericQuery(shape: { cutoff: boolean; cursor: boolean }) {
+  let next = 2;
+  const cutoff = shape.cutoff ? `AND created_at >= $${next++}::timestamptz` : "";
+  const cursor = shape.cursor
+    ? `AND (created_at, id) > ($${next++}::timestamptz, $${next++}::uuid)`
+    : "";
+  return `
+    SELECT created_at::text AS dispatch_created_at_cursor, id FROM heartbeat_runs
+     WHERE agent_id = $1 AND status = 'queued'
+       ${cutoff}
+       ${cursor}
+     ORDER BY created_at ASC, id ASC
+     LIMIT ${SCAN_LIMIT}
+  `;
+}
+
+/**
+ * All four predicate shapes `readQueuedDispatchPage` can emit. Each is a
+ * DISTINCT SQL text, so each gets its own plan-cache entry and makes its own
+ * custom-vs-generic decision — the head shape being safe says nothing about the
+ * paging shape, which is the one a deep queue actually spends its time in.
+ */
+const DISPATCH_PREDICATE_SHAPES = [
+  { label: "head (no cutoff, no cursor)", cutoff: false, cursor: false },
+  { label: "cutoff only", cutoff: true, cursor: false },
+  { label: "cursor only (paging)", cutoff: false, cursor: true },
+  { label: "cutoff and cursor", cutoff: true, cursor: true },
+] as const;
+
+async function explainGeneric(sql: postgres.Sql, query: string) {
+  const rows = await sql.unsafe(`EXPLAIN (GENERIC_PLAN, FORMAT JSON) ${query}`);
+  const plan = (rows[0] as Record<string, unknown>)["QUERY PLAN"] as Array<Record<string, unknown>>;
+  const root = plan[0].Plan as Record<string, unknown>;
+  const text = await sql.unsafe(`EXPLAIN (GENERIC_PLAN) ${query}`);
+  return {
+    root,
+    text: text.map((row) => String((row as Record<string, unknown>)["QUERY PLAN"])).join("\n"),
+  };
+}
 
 async function seed(sql: postgres.Sql) {
   // FK triggers off: this fixture only needs the two tables under test.
@@ -517,7 +630,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
 
     const head = await explain(sql, DISPATCH_HEAD_PROBE);
     record("dispatch head scan", head);
-    expect(indexesUsed(head.root)).toContain(DISPATCH_INDEX);
+    expectOrderedDispatchIndex(head.root);
     expect(scanKinds(head.root)).not.toContain("Seq Scan");
 
     // Resume from a real row rather than a wall-clock interval, so the page is
@@ -537,7 +650,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
 
     const cursor = await explain(sql, midQueueCursorQuery);
     record("dispatch keyset cursor scan", cursor);
-    expect(indexesUsed(cursor.root)).toContain(DISPATCH_INDEX);
+    expectOrderedDispatchIndex(cursor.root);
 
     // It is not enough that the index appears somewhere in the plan: the keyset
     // predicate has to be SATISFIED BY the index rather than re-checked after
@@ -547,7 +660,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // only by LIMIT on OUTPUT, which is the unbounded-work shape the resume
     // cursor exists to remove. That plan still contains the index name, so the
     // assertion above cannot distinguish it.
-    const cursorNode = indexScanNode(cursor.root, DISPATCH_INDEX);
+    const cursorNode = orderedDispatchIndexScanNode(cursor.root);
     expect(cursorNode).not.toBeNull();
     expect(String(cursorNode?.["Index Cond"] ?? "")).toMatch(KEYSET_PREDICATE);
     expect(String(cursorNode?.["Filter"] ?? "")).not.toMatch(KEYSET_PREDICATE);
@@ -635,7 +748,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // run targets a critical issue. The dispatcher keyset-pages this statement
     // across detached passes, so the bound does not sacrifice any-depth
     // coverage.
-    expect(indexesUsed(laneCriticalCandidates.root)).toContain(DISPATCH_INDEX);
+    expectOrderedDispatchIndex(laneCriticalCandidates.root);
     expect(scanKinds(laneCriticalCandidates.root)).not.toContain("Seq Scan");
     // Same reason as the head scan above: the keyset-only projection is what
     // keeps this off the BLO-31354 knife edge against
@@ -827,7 +940,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       const probe = await explain(sql, DISPATCH_HEAD_PROBE);
       record(`depth ${depth}: head probe (created_at, id only)`, probe);
 
-      expect(indexesUsed(probe.root)).toContain(DISPATCH_INDEX);
+      expectOrderedDispatchIndex(probe.root);
       expect(scanKinds(probe.root)).not.toContain("Seq Scan");
       expect(scanKinds(probe.root)).not.toContain("Bitmap Heap Scan");
       // Ordered straight off the index. A Sort here would mean the whole match
@@ -840,12 +953,126 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       // rechecked after it, or every resumed pass re-walks the discarded prefix.
       const probeCursor = await explain(sql, DISPATCH_HEAD_PROBE_CURSOR);
       record(`depth ${depth}: head probe, resumed`, probeCursor);
-      const probeCursorNode = indexScanNode(probeCursor.root, DISPATCH_INDEX);
+      const probeCursorNode = orderedDispatchIndexScanNode(probeCursor.root);
       expect(probeCursorNode).not.toBeNull();
       expect(String(probeCursorNode?.["Index Cond"] ?? "")).toMatch(KEYSET_PREDICATE);
       expect(String(probeCursorNode?.["Filter"] ?? "")).not.toMatch(KEYSET_PREDICATE);
       expect(planNodes(probeCursor.root).map((n) => n["Node Type"])).not.toContain("Sort");
       expect(rowsInspected(probeCursor.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
+
+      /**
+       * BLO-31392: the same guarantee under the GENERIC plan, for every one of
+       * the four predicate shapes.
+       *
+       * Everything above interpolates `agent_id` as a literal, so PostgreSQL
+       * plans it one-shot as a custom plan. Production BINDS it, prepares the
+       * statement, and after five executions may switch to the generic plan for
+       * the life of a pooled connection — so the assertions above can be green
+       * on a plan production has stopped using. That is the gap that let this
+       * defect through, and `EXPLAIN (GENERIC_PLAN)` is what closes it.
+       *
+       * READ THIS BEFORE TRUSTING GREEN. This assertion does NOT reproduce the
+       * production inversion, and it is important not to mistake it for a
+       * regression test that would. Measured 2026-09-03 on this fixture family:
+       *
+       *   fixture, VACUUMed:    dispatch_idx 4.30 (no Sort) vs age_idx 8.32 (Sort)
+       *   fixture, relallvisible=0: dispatch_idx 8.30      vs age_idx 8.32
+       *   PRODUCTION:           dispatch_idx 5.84          vs age_idx 2.50 (Sort WINS)
+       *
+       * The controlling variable is the visibility map, not the row estimate
+       * (swept agent cardinality from 200 to 20,000 — n_distinct 200..20054,
+       * estimates 1..10 rows — and the ordered index won every time). An
+       * index-only scan is only costed cheaply when relallvisible/relpages is
+       * high; every fixture here VACUUMs immediately before measuring and gets
+       * the full discount, while production churns continuously and does not —
+       * `Heap Fetches: 18` in the production plan is the fingerprint. Forcing
+       * relallvisible to 0 brings the two within 0.24%, i.e. inside
+       * STD_FUZZ_FACTOR, but still does not invert them.
+       *
+       * The same measurement run against the index THIS issue adds, 0237 vs
+       * 0217 head-to-head at the 1-row generic estimate, says the fix inherits
+       * the same ceiling:
+       *
+       *   relallvisible/relpages = 1.00:  4.30 vs 8.32  -> 48.3% cheaper
+       *   relallvisible/relpages = 0.00:  8.30 vs 8.32  ->  0.24% cheaper
+       *
+       * Production is the second row. So the index is necessary but probably
+       * not sufficient, and this assertion should not be read as proof that
+       * production stopped sorting — at a 1-row estimate a Sort costs ~0.02 and
+       * no index design beats a smaller unordered one by more than a rounding
+       * error. Only taking the statement off the generic plan makes it
+       * deterministic. Tracked on BLO-31392.
+       *
+       * So what this DOES catch: losing every ordering-capable index, a
+       * projection change that stops the scan being index-only, or a future
+       * narrower partial index that beats both. What it does NOT catch is
+       * production's specific cost inversion. That needs the production
+       * `EXPLAIN (GENERIC_PLAN)` recorded on BLO-31392.
+       */
+      for (const shape of DISPATCH_PREDICATE_SHAPES) {
+        const genericQuery = dispatchHeadProbeGenericQuery(shape);
+        const generic = await explainGeneric(sql, genericQuery);
+        record(`depth ${depth}: GENERIC plan, ${shape.label}`, {
+          text: generic.text,
+          root: generic.root,
+        });
+
+        // A Sort cannot emit its first row until it has consumed its whole
+        // input, so a Sort here means LIMIT stops bounding the work and the
+        // dispatcher reads the agent's entire backlog under the start lock.
+        expect(planNodes(generic.root).map((node) => node["Node Type"])).not.toContain("Sort");
+        expect(scanKinds(generic.root)).not.toContain("Seq Scan");
+        expect(scanKinds(generic.root)).not.toContain("Bitmap Heap Scan");
+        expect(scanKinds(generic.root)).toContain("Index Only Scan");
+        // Either ordered index is acceptable (see ORDERED_DISPATCH_INDEXES);
+        // the queue-age index is not, because it cannot supply this ORDER BY.
+        expect(indexesUsed(generic.root)).not.toContain(AGE_INDEX);
+        expect(
+          indexesUsed(generic.root).some((name) => ORDERED_DISPATCH_INDEXES.includes(name)),
+        ).toBe(true);
+
+        /**
+         * NEGATIVE CONTROL — the assertion above is green on UNFIXED code, so
+         * on its own it does not test this fix at all.
+         *
+         * Measured on this fixture: without 0237, the generic plan still picks
+         * 0208's dispatch index (4.30) over the queue-age index (8.32), so
+         * every assertion above passes with the fix reverted. That is the exact
+         * "green forever" shape BLO-31354 was filed for, one level up — an
+         * assertion that looks like a regression test and is not one.
+         *
+         * The reproduction condition for production's inversion is a low
+         * visibility fraction (production reported `Heap Fetches: 18`; this
+         * fixture VACUUMs immediately before measuring and gets a full
+         * index-only discount it does not), and it could not be reproduced here
+         * — forcing relallvisible to 0 brought the two within 0.24% but never
+         * inverted them. So rather than chase a cost inversion this fixture
+         * cannot produce, isolate the CAPABILITY the fix adds.
+         *
+         * Drop 0208's index inside a transaction that is always rolled back.
+         * The queue-age index is then the only OTHER candidate, and it cannot
+         * supply `(created_at, id)` ordering at any cost — so the absence of a
+         * Sort here is possible if and only if 0237 exists and serves this
+         * query. This fails deterministically with the fix reverted, on a
+         * structural impossibility rather than a cost margin, which is also why
+         * it cannot become the next knife-edge flake.
+         */
+        await sql.unsafe("BEGIN");
+        try {
+          await sql.unsafe(`DROP INDEX ${DISPATCH_INDEX}`);
+          const isolated = await explainGeneric(sql, genericQuery);
+          record(
+            `depth ${depth}: GENERIC plan, ${shape.label}, ${DISPATCH_INDEX} dropped`,
+            { text: isolated.text, root: isolated.root },
+          );
+          expect(indexesUsed(isolated.root)).toContain(QUEUED_DISPATCH_INDEX);
+          expect(planNodes(isolated.root).map((node) => node["Node Type"])).not.toContain("Sort");
+          expect(scanKinds(isolated.root)).toContain("Index Only Scan");
+        } finally {
+          // Restores the index for every later assertion in this test.
+          await sql.unsafe("ROLLBACK");
+        }
+      }
 
       // Deferred emergency-admission refusals are filtered *after* the raw
       // cursor-bearing probe in production. If they were pushed into SQL as
