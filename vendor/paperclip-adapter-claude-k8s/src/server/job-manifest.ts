@@ -1601,6 +1601,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
+  // BLO-31359: `git clone` points the new clone's `origin` at whatever it was
+  // cloned from, so cloning the project base checkout hands every ephemeral run
+  // a remote that writes back into shared, long-lived state on the PVC. Git only
+  // refuses a push to the base's *currently checked out* branch; any other
+  // refname lands, which is how base checkouts accumulate agent-authored
+  // `blo-*` branches. Keep the clone — cloning from local disk with `--shared`
+  // is what makes provisioning cheap — but repoint `origin` at the real
+  // upstream so a push leaves the cluster instead of mutating the base.
+  //
+  // Remove-then-add rather than `set-url`: `git remote remove` drops the whole
+  // `remote.origin` section, so the re-added remote cannot inherit a stale
+  // `pushurl` still aimed at the base. Both commands stay in the `&&` chain
+  // unguarded — this fails the run closed rather than handing back a workspace
+  // that can write to the base.
+  const upstreamRepoUrl = asString(workspaceContext.repoUrl, "").trim();
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1611,6 +1626,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           // the clone still owns its refs, index, worktree, and lock files.
           `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
           `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
+          `git -C ${quoteShellArg(isolation.workspaceRoot)} remote remove origin`,
+          // No recorded upstream (a cwd that happens to be a repo, e.g. a stray
+          // `.git` under the per-agent fallback home): leave the clone with no
+          // remote at all rather than one aimed at the base.
+          ...(upstreamRepoUrl
+            ? [`git -C ${quoteShellArg(isolation.workspaceRoot)} remote add origin ${quoteShellArg(upstreamRepoUrl)}`]
+            : []),
         ].join(" && ")};`,
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a
