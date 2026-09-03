@@ -726,6 +726,62 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     ).toEqual({ status: "already_reviewed" });
   });
 
+  // BLO-31374: the same idempotent exit as the reviewer actually writes it —
+  // markdown-formatted, and with the sha either after `for` or directly after
+  // `at`. Both texts are verbatim openings of real Ally runs on 2026-09-02 that
+  // exited cleanly and were still classified `pr_review_output_missing`,
+  // flipping Ally to `error`.
+  it.each([
+    {
+      label: "run b7a984bf — sha directly after `at`, bold + backticks",
+      summary:
+        "**Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — no action taken.\n\n" +
+        "The wake was a `transient_failure_retry` carrying a stale head (`0936fba6…`). Against the live PR state:\n\n" +
+        "- **Live head:** `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` (the wake-time SHA is superseded).\n" +
+        "- **Existing review:** `5096237327` — `allyblockcast[bot]` (Bot), state `COMMENTED`, submitted 2026-09-02T23:28:20Z, " +
+        "body starting `## Ally — Consolidated PR Review` with exactly one `Reviewed head:` line attesting `8b237675…`.\n\n" +
+        "Posting again would be a duplicate verdict on the same head, which the one-review-per-(PR, head) contract prohibits. Exiting cleanly.",
+    },
+    {
+      label: "run 3ace1eef — timestamp + `for` + backticked sha",
+      summary:
+        "Exiting without posting — the idempotency check proves this head was already reviewed.\n\n" +
+        "## Wake disposition: already reviewed\n\n" +
+        "**`Blockcast/penstock-vault-node#554`** — the wake carried head `8d47ae36`, which has been superseded. " +
+        "Live head is **`90193c30abb9a75ac17e167b9aea8ca83cebc2cb`**, and the PR is **merged**.\n\n" +
+        "**Already reviewed at 2026-09-02T20:41:53Z for `90193c30abb9a75ac17e167b9aea8ca83cebc2cb`** (review `5094874877`).\n\n" +
+        "No review posted, no PR state touched.",
+    },
+    {
+      label: "sha after a `head` noun",
+      summary: "Already reviewed at head 90193c30abb9a75ac17e167b9aea8ca83cebc2cb; skipping.",
+    },
+  ])("BLO-31374: accepts a markdown-formatted already-reviewed exit ($label)", ({ summary }) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // Masking guard: an "already reviewed" claim that cites no sha is not an
+  // idempotency exit — nothing ties it to a head — and stays `missing`.
+  it("BLO-31374: rejects an already-reviewed claim that cites no sha", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "Already reviewed at 2026-09-02T20:41:53Z; nothing further to do.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Masking guard: a negated clause describes the opposite situation.
+  it("BLO-31374: rejects a negated already-reviewed clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary:
+          "This head was not already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the draft review was never posted.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
   it("accepts archived Network-Management-Portal skips", () => {
     expect(
       evaluatePrReviewCompletionEvidence(
