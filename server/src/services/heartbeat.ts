@@ -9495,11 +9495,16 @@ function prReviewOutputHasSelfReviewSkip(
 // explains the wake (third Ally pass), so both cues look only at the text
 // BEFORE the clause, and that scope ends at . : ; , — – or a newline, so a
 // clause joined by a colon or dash does not inherit a hedge from the previous
-// clause. The same before-scope also carries a negation cue for the
+// clause. The same before-scope also carries an EPISTEMIC negation cue for the
 // non-adjacent form ("no evidence this head was already reviewed at …",
 // "I cannot see that this head was already reviewed at …" — fourth Ally pass:
 // the adjacent form alone let these through as `already_reviewed`, the masking
-// direction). The scope is capped at 120 characters before the clause; a
+// direction). It is anchored to an epistemic head (evidence / indication /
+// believe / see / confirm …) exactly as `hedge` is anchored, because a bare
+// negation word list vetoes the house phrasing of a CORRECT skip — "Exiting
+// without posting since this head was already reviewed at …", "No action
+// taken because …" (fifth Ally pass: 10 of 10 such phrasings fell to
+// `missing`). The scope is capped at 120 characters before the clause; a
 // comma-free run-on longer than that escapes the vetoes, which no real
 // reviewer sentence has approached (commas are themselves boundaries), and an
 // uncapped `[^…]*$` scan is quadratic on long outputs.
@@ -9524,14 +9529,17 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   const clauseBefore = /[^.\n:;,\u2014\u2013]*$/;
   // A hedge that governs the clause ("unclear whether …", "could not fully
   // confirm whether …") — not a bare `if`/`whether` anywhere nearby.
-  const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|not\s+able\s+to|did\s+not|didn['\u2019]?t)\s+(?:\w+\s+){1,3}(?:if|whether))\b/i;
+  const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|not\s+able\s+to|failed\s+to|did\s+not|didn['\u2019]?t)\s+(?:\w+\s+){1,3}(?:if|whether))\b/i;
   // The clause's subject is a superseded head, not the live one.
   const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
-  // A negation governing the clause from further back in the same clause
-  // ("no evidence … was already reviewed at", "cannot see that … was already
-  // reviewed at"). `cannot`/`can't` are listed because `\bnot\b` does not
-  // match inside `cannot`.
-  const negation = /\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|without)\b/i;
+  // An epistemic negation governing the clause from further back in the same
+  // clause ("no evidence … was already reviewed at", "cannot see that … was
+  // already reviewed at"): a negation word followed within three words by an
+  // epistemic head. NOT a bare negation — "Exiting without posting since …",
+  // "No action taken because …" are how a correct skip explains itself.
+  // `cannot`/`can't` are listed because `\bnot\b` does not match inside
+  // `cannot`.
+  const negation = /\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t)\s+(?:\w+\s+){0,3}(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|see|seen|appears?|suggests?|confirms?|confirmed|aware)\b/i;
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";

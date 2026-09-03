@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildPaperclipTaskMarkdown,
   derivePaperclipPrReview,
-  evaluatePrReviewCompletionEvidence, prReviewOutputHasAlreadyReviewedSkip,
+  evaluatePrReviewCompletionEvidence,
   mergeCoalescedContextSnapshot,
+  prReviewOutputHasAlreadyReviewedSkip,
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
@@ -900,6 +901,32 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     });
   });
 
+  // A correct skip explains WHY it did not post, often with a negation word in
+  // the same clause and before the review clause (fifth Ally pass). Only an
+  // epistemic negation vetoes; these all classify.
+  it.each([
+    "Exiting without posting since this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I did not post a duplicate because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "There is no need to post again because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "No action taken because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Nothing to do here because the head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I don't need to post since the head was already reviewed at 2026-09-02T20:41:53Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f.",
+    "The contract does not permit a second verdict and this head was already reviewed at 2026-09-02T20:41:53Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f.",
+    "I cannot post a second verdict because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "No second verdict is needed as this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Skipping — no duplicate verdict is permitted and this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: a non-epistemic negation explaining the skip does not veto (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  it("BLO-31374: 'failed to confirm whether' is a governing hedge", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "I failed to confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; aborting.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
   // A negation in the PREVIOUS clause does not reach the review clause.
   it("BLO-31374: a negation in an earlier clause does not veto the clause", () => {
     expect(
@@ -925,6 +952,9 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`This head was **not** already reviewed at \`${sha}\`.`, false],
       [`There is no evidence this head was already reviewed at \`${sha}\`.`, false],
       [`I cannot see that this head was already reviewed at \`${sha}\`.`, false],
+      [`Exiting without posting since this head was already reviewed at \`${sha}\`.`, true],
+      [`No action taken because this head was already reviewed at \`${sha}\`.`, true],
+      [`I failed to confirm whether this head was already reviewed at \`${sha}\`.`, false],
       [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
       [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
       [`The prior head was already reviewed at \`${sha}\`, but the branch moved.`, false],
