@@ -5,8 +5,8 @@
 # advisory land twice by hand: GHSA-7p8r-x3mc-p8w7 (alert #114, BLO-21608) and
 # GHSA-5jgf-p345-68v8 (alerts #148/#149, BLO-31415/BLO-31416). BLO-31437.
 #
-#   pnpm-lock.yaml                                    -> covered, `directory: "/"`
-#   packages/services/designer/package-lock.json      -> covered, entry below
+#   pnpm-lock.yaml                                        -> covered, `directory: "/"`
+#   packages/services/designer/package-lock.json          -> covered, entry below
 #   vendor/paperclip-adapter-claude-k8s/package-lock.json -> DELIBERATELY EXCLUDED
 #
 # The vendored adapter is excluded because an automated bump there cannot pass
