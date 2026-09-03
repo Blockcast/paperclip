@@ -315,6 +315,35 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?runbook_url: "[^"]*runbooks\/agent-wakeup-terminal-failed\.md"/,
     "terminal-failed alert must link the runbook from its annotation",
   );
+
+  // BLO-31335: the description hands the responder a query, and since this
+  // gauge moved onto the scheduler tick EVERY replica publishes it with the
+  // same value (full rewrite of global DB-derived state). So the aggregation
+  // has to be spelled out and it has to be replica-invariant -- a bare
+  // `sum by (error_code)` reads 3x on a 3-replica deploy. The rule's own
+  // `expr` is unaffected (it is the replica-invariant max() over the age
+  // gauge, asserted above), which is exactly why this can rot unnoticed: no
+  // rendered expression breaks, only the human following the instructions.
+  const [, terminalFailedDescription] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+description: "([\s\S]*?)"\n/,
+  ) ?? [];
+  assert.ok(
+    terminalFailedDescription,
+    "terminal-failed alert must render a description annotation",
+  );
+  assert.match(
+    terminalFailedDescription,
+    /max by \(error_code, scope\)/,
+    "terminal-failed description must name the replica-invariant aggregation "
+      + "(max by (error_code, scope)), matching the metric's own help string",
+  );
+  assert.doesNotMatch(
+    terminalFailedDescription,
+    /Break down by the `error_code` label on the count series/,
+    "terminal-failed description must not tell the responder to break the "
+      + "count series down without naming an aggregation -- the natural "
+      + "reading is `sum by (error_code)`, which multiplies by replica count",
+  );
 });
 
 test("PaperclipQueuedRunStranded is agent-keyed, freshness-gated, and fires before 30m (BLO-21116)", () => {
