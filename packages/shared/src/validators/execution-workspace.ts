@@ -95,6 +95,22 @@ export function collectBranchTemplateProblems(template: string | null | undefine
   return problems;
 }
 
+/**
+ * Deliberately NOT scoped to `type === "git_worktree"`, even though
+ * `branchTemplate` is only ever rendered on that path.
+ *
+ * `type` is optional here, so a scoped rule would skip a template written with
+ * `type` absent or set to `project_primary` — and a *later* write flipping
+ * `type` to `git_worktree` does not revalidate the template it inherits. That
+ * would activate never-validated config, which is the same "a rule reaches only
+ * one of the write paths" failure this schema was de-duplicated to remove.
+ *
+ * The cost of the unscoped choice is stated rather than hidden: a project or
+ * issue carrying an inert bad template is blocked from unrelated
+ * workspace-policy edits until the template is corrected. That is a visible,
+ * actionable 422 naming the fix, which is the trade this whole ticket argues
+ * for over a silent no-op.
+ */
 const branchTemplateSchema = z
   .string()
   .optional()
