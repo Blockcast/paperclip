@@ -205,9 +205,9 @@ export const heartbeatRuns = pgTable(
     // trailing keys, so it indexes the same ROWS as queuedAgeIdx AND supplies
     // the ORDER BY directly: the page comes back ordered with no Sort, the LIMIT
     // truncates the scan, and the projection stays Index Only. Same rows is not
-    // the same size — three keys to queuedAgeIdx's two, so ~1.4x the pages per
-    // entry (see migration 0237 for the arithmetic). That width does not show up
-    // in the comparison below, which is decided at a 1-row estimate.
+    // the same size — three keys to queuedAgeIdx's two, so ~1.4x the page space
+    // per entry (see migration 0237 for the arithmetic). That width does not
+    // show up in the comparison below, which is decided at a 1-row estimate.
     //
     // How decisively it beats queuedAgeIdx depends on the visibility map, and
     // that qualifier matters — measured generic cost, this index vs
