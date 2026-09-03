@@ -2170,6 +2170,96 @@ describe("IssueDetail", () => {
     }
   });
 
+  it("clears the pending 2s copy-reset timer on unmount instead of leaking it past teardown", async () => {
+    // Negative control for BLO-31438. The copy success path schedules setCopied(false)
+    // 2s out. If that handle is not owned and cleared on unmount, the timer outlives the
+    // component: it fires after vitest tears down jsdom, React reaches for `window`, and
+    // the whole workspaces-a lane goes red with every test passing. Remove the cleanup in
+    // IssueDetail.tsx and the final assertion here fails.
+    const clipboardWrite = vi.fn(async () => {});
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const originalSecureContext = Object.getOwnPropertyDescriptor(window, "isSecureContext");
+    // copyTextToClipboard gates the Clipboard API on isSecureContext; jsdom leaves it
+    // falsy, which would divert this through the execCommand fallback instead.
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      identifier: "PAP-1",
+      title: "Copy me",
+      description: "Task body",
+    }));
+
+    // A dedicated root, so the unmount under test is ours and afterEach stays untouched.
+    const localContainer = document.createElement("div");
+    document.body.appendChild(localContainer);
+    const localRoot = createRoot(localContainer);
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+    const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
+
+    try {
+      await act(async () => {
+        localRoot.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+      await flushReact();
+
+      const copyButton = Array.from(localContainer.querySelectorAll("button"))
+        .find((button) => button.getAttribute("title") === "Copy task as markdown");
+      expect(copyButton).toBeTruthy();
+
+      setTimeoutSpy.mockClear();
+      await act(async () => {
+        copyButton!.click();
+        await Promise.resolve();
+      });
+      await flushReact();
+
+      // Behaviour preserved: the copied affordance is showing while mounted.
+      expect(copyButton!.querySelector(".text-green-500")).not.toBeNull();
+
+      // The reset must be scheduled through a handle we can retrieve.
+      const resetTimers = setTimeoutSpy.mock.calls
+        .map((call, index) => ({ delay: call[1], id: setTimeoutSpy.mock.results[index]?.value }))
+        .filter((timer) => timer.delay === 2000);
+      expect(resetTimers).toHaveLength(1);
+      const resetTimerId = resetTimers[0]!.id;
+      // jsdom-on-node hands back a Timeout object rather than a numeric id; either way
+      // it has to be a handle we retained.
+      expect(resetTimerId).toBeDefined();
+
+      // Unmount inside the 2s window — the race the CI failure hits.
+      clearTimeoutSpy.mockClear();
+      await act(async () => {
+        localRoot.unmount();
+      });
+
+      expect(clearTimeoutSpy.mock.calls.flat()).toContain(resetTimerId);
+    } finally {
+      localContainer.remove();
+      if (originalClipboard) {
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      } else {
+        // @ts-expect-error test cleanup for optional browser API
+        delete navigator.clipboard;
+      }
+      if (originalSecureContext) {
+        Object.defineProperty(window, "isSecureContext", originalSecureContext);
+      } else {
+        // @ts-expect-error test cleanup for optional browser API
+        delete window.isSecureContext;
+      }
+    }
+  });
+
   it("renders the graduated task thread without the chat flag", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
 
