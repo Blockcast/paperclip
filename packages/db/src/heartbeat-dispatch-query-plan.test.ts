@@ -543,6 +543,19 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     expect(String(cursorNode?.["Index Cond"] ?? "")).toMatch(KEYSET_PREDICATE);
     expect(String(cursorNode?.["Filter"] ?? "")).not.toMatch(KEYSET_PREDICATE);
 
+    // The resumed page must actually RESUME A FULL PAGE. Every other assertion
+    // on `cursor` is a plan property that holds trivially — and in
+    // `rowsInspected`'s case MORE easily — on a short or empty page, so without
+    // this the mid-queue coverage can vanish while the test stays green. That
+    // is exactly how the previous wall-clock cursor degraded: measured on one
+    // runner it resumed 166 rows instead of 200, losing 17% of its coverage
+    // silently. The offset is derived to leave SCAN_LIMIT rows after the cursor
+    // row, so a full page is the only correct answer; the guard states that
+    // arithmetic so a future fixture change fails with its reason rather than
+    // as an opaque count mismatch.
+    expect(AGENT_QUEUED_ROWS - MID_QUEUE_CURSOR_OFFSET - 1).toBeGreaterThanOrEqual(SCAN_LIMIT);
+    expect(Number(cursor.root["Actual Rows"] ?? 0)).toBe(SCAN_LIMIT);
+
     // The resumed page is held to the same plan shape as the head page, and to
     // the same shape the deep-queue test asserts on its own cursor: a Sort
     // would mean the whole remaining match set is consumed before the first row
