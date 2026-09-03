@@ -114,10 +114,19 @@
 -- (agent_id, coalesce(queued_at, created_at)) — two keys, 16 B + 8 B = 24 B —
 -- against this index's three, 16 B + 8 B + 16 B = 40 B. With the 8 B index-tuple
 -- header and the 4 B line pointer that is ~52 B against ~36 B of page space per
--- entry, so ~1.4x the pages for the same row count. The trailing `id` is the
--- primary key, so every key here is unique and btree deduplication can never
--- apply to it, while 0217's key CAN repeat — bulk wake fan-out stamps identical
--- created_at — and can therefore compress. So 1.4x is a FLOOR, not an estimate.
+-- entry, so ~1.4x the pages for the same row count.
+--
+-- 1.4x is the MEASURED RATIO, not a proven floor. An earlier wording here called
+-- it a floor on the grounds that 0217's key can repeat under bulk wake fan-out
+-- and could therefore btree-deduplicate. Half of that holds: the trailing `id`
+-- is the primary key, so every key in THIS index is unique and dedup can never
+-- apply to it. The other half does not. 0217's key is the PAIR
+-- (agent_id, coalesce(queued_at, created_at)), so a fan-out stamping one
+-- timestamp across many agents yields DISTINCT keys and dedup finds nothing to
+-- merge. Compressing 0217 needs two or more runs queued for the SAME agent at
+-- the same timestamp — plausible, but a different claim, and not measured here.
+-- Where that does not happen, 1.4x is the gap rather than a lower bound on it.
+-- The retirement decision below rests on the 1.4x, which is exact either way.
 --
 -- That width does NOT explain the 0.24% above, and the visibility-map
 -- attribution there stands: the churning-regime figures are 8.30 against 8.32, a

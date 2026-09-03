@@ -172,16 +172,18 @@ function formatRowsInspected(node: Record<string, unknown>): string {
  * diagnostic you most want when an assertion FAILS, and a single write placed
  * after the assertions produces no report in exactly that case.
  *
- * Hoisted out of the two tests that build reports: the closure was duplicated
- * character-for-character, so a change to the report format — such as the
- * `formatRowsInspected` split above — had to be made twice or silently applied
- * to only one of the two artifacts.
+ * Hoisted out of the three tests that emit plans: the closure was duplicated
+ * character-for-character in two of them, so a change to the report format —
+ * such as the `formatRowsInspected` split above — had to be made twice or
+ * silently applied to only one of the two artifacts. The recovery-lane site
+ * inlined the same format string a third time and had the same exposure.
  *
- * `destination` is per-test on purpose. Both call sites previously wrote to
+ * `destination` is per-test on purpose. Two call sites previously wrote to
  * PLAN_REPORT itself, so whichever test ran last overwrote the other's plans
  * and the report silently contained one test's output while appearing complete.
- * Each writer now gets its own file, matching the `.recovery` suffix the
- * recovery-lane site already used.
+ * Each writer now gets its own suffixed file — `.keyset`, `.recovery`, `.head`,
+ * one per test — so the emitted set names which test produced what and nothing
+ * writes to the bare PLAN_REPORT path.
  */
 function makePlanRecorder(report: string[], destination: string | null) {
   return (title: string, plan: { text: string; root: Record<string, unknown> }) => {
@@ -687,7 +689,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     await seed(sql);
 
     const report: string[] = [];
-    const record = makePlanRecorder(report, PLAN_REPORT);
+    const record = makePlanRecorder(report, PLAN_REPORT && `${PLAN_REPORT}.keyset`);
 
     // --- AC: the dispatch query uses the new index -------------------------
     // The superseded `SELECT *` shape is RECORDED, not asserted on — see
@@ -950,13 +952,10 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     await sql.unsafe(`ANALYZE heartbeat_runs`);
 
     const laneRecovery = await explain(sql, PRIORITY_LANE_RECOVERY);
-    if (PLAN_REPORT) {
-      fs.writeFileSync(
-        `${PLAN_REPORT}.recovery`,
-        `\n===== recovery lane, ${DEEP_BACKLOG_ROWS}-row non-recovery backlog =====\n`
-          + `${laneRecovery.text}\n-- rows inspected: ${formatRowsInspected(laneRecovery.root)}`,
-      );
-    }
+    makePlanRecorder([], PLAN_REPORT && `${PLAN_REPORT}.recovery`)(
+      `recovery lane, ${DEEP_BACKLOG_ROWS}-row non-recovery backlog`,
+      laneRecovery,
+    );
 
     // The fixture has to be deep enough that a filtered walk and a bounded scan
     // are actually distinguishable; asserting a ceiling against a shallow
