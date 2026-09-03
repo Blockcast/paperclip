@@ -669,15 +669,106 @@ describe("handleWebhook — firing first time", () => {
   it("fails closed when the fallback agent configuration is missing", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    // The fail-closed guarantee (BLO-26613) is unchanged and still asserted
+    // below: no ownerless issue, no state row. PEN-2581 changed only how the
+    // drop is *reported* — an unresolvable owner is a config/roster fact no
+    // retry can fix, so the delivery acknowledges it instead of failing.
     await expect(
       handleWebhook(ctx, config, true, baseInput()),
-    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    ).resolves.toBeUndefined();
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.owner.fallback_failed",
       1,
       { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh" },
+    );
+  });
+
+  it("does not let one ownerless alert dark-tier the rest of its batch", async () => {
+    // The PEN-2581 outage in one test: a single alert with no resolvable owner
+    // threw, the throw was accumulated into AlertDeliveryIncompleteError, and
+    // the whole delivery 502'd — so every *other* alert in the batch was lost
+    // too, and Alertmanager retried the doomed batch 15-17× before dropping it.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ fallbackAgentName: undefined });
+    // team=platform resolves through ownerMap; team=storage is unmapped, and
+    // with no fallbackAgentName it is permanently ownerless.
+    mocks.users.findByEmail.mockResolvedValue({
+      id: "user-42",
+      email: "alice@example.com",
+      name: "Alice",
+    });
+    const owned = baseAlert({
+      labels: {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        team: "platform",
+        node: "pve-3",
+      },
+      fingerprint: "aaaa1111",
+    });
+    const ownerless = baseAlert({
+      labels: {
+        alertname: "CephOsdNearFull",
+        severity: "critical",
+        team: "storage",
+        node: "pve-4",
+      },
+      fingerprint: "bbbb2222",
+    });
+
+    await expect(
+      handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({ alerts: [ownerless, owned] }),
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    // The healthy alert still became tracked work despite sharing a batch with
+    // the ownerless one — and it is ordered FIRST in the payload, so this also
+    // pins that the drop does not abort the remainder of the loop.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].title).toBe(
+      "[critical] CiliumPolicyDropsHigh · platform",
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CephOsdNearFull" },
+    );
+  });
+
+  it("still fails the delivery for a transient per-alert fault", async () => {
+    // Control for the two tests above: the permanent carve-out must not have
+    // widened into "swallow every per-alert failure". A transient fault still
+    // owes Alertmanager a retry, so it still fails the delivery and still
+    // reports through the transient metric (BLO-20467's silent-loss guard).
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    mocks.issues.create.mockRejectedValueOnce(new Error("issue RPC timed out"));
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
     );
   });
 
