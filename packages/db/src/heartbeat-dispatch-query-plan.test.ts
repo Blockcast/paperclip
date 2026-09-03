@@ -147,6 +147,24 @@ function rowsInspected(node: Record<string, unknown>): number {
 }
 
 /**
+ * `rowsInspected` for the PLAN REPORT, which mixes executed and non-executed
+ * plans in one file.
+ *
+ * `EXPLAIN (GENERIC_PLAN)` never runs the query, so no node carries
+ * `Actual Rows` and every counter `rowsInspected` sums defaults to 0. Printing
+ * that as `rows inspected: 0` renders the LEAST informative case ("not
+ * executed, nothing measured") as the MOST reassuring one ("examined no rows
+ * at all") — and it does so directly beneath entries where the same number is
+ * a real measurement. This report is what a human reads when comparing the
+ * fixture against production's `EXPLAIN (GENERIC_PLAN)` for BLO-31392, so the
+ * two kinds of zero have to stay distinguishable.
+ */
+function formatRowsInspected(node: Record<string, unknown>): string {
+  const executed = planNodes(node).some((entry) => entry["Actual Rows"] !== undefined);
+  return executed ? String(rowsInspected(node)) : "n/a (not executed — EXPLAIN without ANALYZE)";
+}
+
+/**
  * BLO-31392: which ordering-capable dispatch index this plan used, if any.
  *
  * Every assertion in this file that used to name `heartbeat_runs_agent_dispatch_idx`
@@ -239,10 +257,21 @@ const KEYSET_PREDICATE = /\(\s*created_at\s*,\s*id\s*\)/;
  * So binding it makes this probe faithful to production AND makes the no-Sort
  * assertion easier to satisfy, not harder. Do not read the placeholder as the
  * strict choice — the negative control below is what carries this test.
+ *
+ * The cutoff arm's `$n` is deliberately UNCAST, matching production's
+ * `gte(heartbeatRuns.createdAt, input.cutoff)`, which binds through the column
+ * mapper with no explicit cast. Measured both ways on a 2000-row fixture: the
+ * plans are identical — same index, same `0.28..9.88` cost, and PostgreSQL
+ * renders the same `Index Cond: (created_at >= $2)` either way, because
+ * operator resolution against a `timestamptz` column types the parameter
+ * regardless. So the cast was pure divergence with no planner effect, and
+ * dropping it costs nothing. The CURSOR arm below keeps its casts: it is a
+ * row-wise comparison, where the unknowns are not resolvable from a single
+ * column, and production casts there explicitly too.
  */
 function dispatchHeadProbeGenericQuery(shape: { cutoff: boolean; cursor: boolean }) {
   let next = 2;
-  const cutoff = shape.cutoff ? `AND created_at >= $${next++}::timestamptz` : "";
+  const cutoff = shape.cutoff ? `AND created_at >= $${next++}` : "";
   const cursor = shape.cursor
     ? `AND (created_at, id) > ($${next++}::timestamptz, $${next++}::uuid)`
     : "";
@@ -636,7 +665,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // diagnostic you most want when an assertion below FAILS, and a single
     // write placed after the assertions produces no report in exactly that case.
     const record = (title: string, plan: { text: string; root: Record<string, unknown> }) => {
-      report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${rowsInspected(plan.root)}`);
+      report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${formatRowsInspected(plan.root)}`);
       if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
     };
 
@@ -791,6 +820,33 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // index-restricted rather than filtered over the agent's queued rows. The
     // absolute bound this buys is asserted in its own test below, on a backlog
     // deep enough for the difference to be visible.
+    //
+    // THIS PIN IS DELIBERATE, unlike the dispatch-lane ones above (which
+    // BLO-31392 relaxed to `expectOrderedDispatchIndex`). Read this before
+    // adding another `status = 'queued'` index.
+    //
+    // 0237 made this lane a two-horse race for the first time: it has the
+    // IDENTICAL key columns to 0209 — `(agent_id, created_at, id)` — and a
+    // strictly WIDER predicate (`status = 'queued'` alone), which this query's
+    // `status = 'queued' AND source = ... AND recoveryActionId IS NOT NULL`
+    // implies. So 0237 is now a legitimate candidate here, which is exactly the
+    // shape that made the dispatch pins flake (BLO-31354).
+    //
+    // It is pinned anyway because the margin is wide rather than knife-edge,
+    // and for a structural reason rather than a cost one: 0209 absorbs BOTH
+    // JSON qualifiers into its predicate, so it holds only recovery rows and
+    // applies no `Filter`; 0237 holds the agent's ENTIRE queued backlog and
+    // would have to re-check both qualifiers as a `Filter`. The dispatch lane
+    // sat on a 0.24% margin because the two indexes there differed only in
+    // predicate width over near-identical row sets. Here the row sets differ by
+    // orders of magnitude, in 0209's favour.
+    //
+    // And the pin is not the only guard: `rowsInspected` below is bounded by
+    // RECOVERY_LANE_ABSOLUTE_BOUND, so picking 0237 fails on WORK VOLUME too,
+    // not merely on a name. If this ever does flake, that is the signal to
+    // check — a name-only failure with the bound still satisfied means the
+    // planner found an equally cheap path and the pin should be relaxed; the
+    // bound failing too means a real regression.
     expect(indexesUsed(laneRecovery.root)).toContain(RECOVERY_INDEX);
     expect(scanKinds(laneRecovery.root)).not.toContain("Seq Scan");
 
@@ -875,7 +931,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       fs.writeFileSync(
         `${PLAN_REPORT}.recovery`,
         `\n===== recovery lane, ${DEEP_BACKLOG_ROWS}-row non-recovery backlog =====\n`
-          + `${laneRecovery.text}\n-- rows inspected: ${rowsInspected(laneRecovery.root)}`,
+          + `${laneRecovery.text}\n-- rows inspected: ${formatRowsInspected(laneRecovery.root)}`,
       );
     }
 
@@ -883,6 +939,11 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // are actually distinguishable; asserting a ceiling against a shallow
     // backlog proves nothing.
     expect(DEEP_BACKLOG_ROWS).toBeGreaterThan(SCAN_LIMIT * 4);
+    // Deliberate name pin — see the long note at the other RECOVERY_INDEX
+    // assertion for why 0237 is a candidate here and why the margin is safe.
+    // This site is the stronger of the two: the fixture's backlog is
+    // deliberately deep and non-recovery, so 0237 would hold DEEP_BACKLOG_ROWS
+    // rows to 0209's handful.
     expect(indexesUsed(laneRecovery.root)).toContain(RECOVERY_INDEX);
     expect(scanKinds(laneRecovery.root)).not.toContain("Seq Scan");
 
@@ -950,7 +1011,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       expect(queued).toBe(depth);
 
       const record = (title: string, plan: { text: string; root: Record<string, unknown> }) => {
-        report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${rowsInspected(plan.root)}`);
+        report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${formatRowsInspected(plan.root)}`);
         if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
       };
 
