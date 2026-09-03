@@ -2202,6 +2202,22 @@ describe("IssueDetail", () => {
     const setTimeoutSpy = vi.spyOn(window, "setTimeout");
     const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
 
+    // Idempotent, so the failure path tears down as cleanly as the passing one. An
+    // assertion throwing before the unmount below would otherwise skip it and leave both
+    // a mounted IssueDetail and a live 2s handle behind — i.e. a real regression here
+    // would leak the very timer this test exists to catch into whichever test runs ~2s
+    // later, making it far harder to attribute than it needs to be.
+    let unmounted = false;
+    const unmountLocalRoot = async () => {
+      if (unmounted) {
+        return;
+      }
+      unmounted = true;
+      await act(async () => {
+        localRoot.unmount();
+      });
+    };
+
     try {
       await act(async () => {
         localRoot.render(
@@ -2238,12 +2254,11 @@ describe("IssueDetail", () => {
 
       // Unmount inside the 2s window — the race the CI failure hits.
       clearTimeoutSpy.mockClear();
-      await act(async () => {
-        localRoot.unmount();
-      });
+      await unmountLocalRoot();
 
       expect(clearTimeoutSpy.mock.calls.flat()).toContain(resetTimerId);
     } finally {
+      await unmountLocalRoot();
       localContainer.remove();
       if (originalClipboard) {
         Object.defineProperty(navigator, "clipboard", originalClipboard);
