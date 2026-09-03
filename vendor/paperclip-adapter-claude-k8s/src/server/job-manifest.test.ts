@@ -949,28 +949,45 @@ describe("buildJobManifest", () => {
       // silently — exactly the regression worth catching — while a correctly
       // bounded one pushes it to 3 and fails, training the next reader to bump
       // the literal instead of reading the block.
-      const bound = "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15";
+      const boundFlags = ["-c http.lowSpeedLimit=1000", "-c http.lowSpeedTime=15"];
       const gitPrefix = `git -C '${workspaceRoot}'`;
-      // Verbs that contact the remote. `remote set-head <remote> -a` does — it
-      // asks the remote for its default branch. `remote add`/`remote remove`,
-      // `checkout`, and `config` stay local.
-      const reachesNetwork = (args: string) =>
-        /^\s*(fetch|pull|push|clone|ls-remote)\b/.test(args) ||
-        /^\s*remote\s+(update\b|set-head\s+\S+\s+(-a\b|--auto\b))/.test(args);
+      // Deny-list, deliberately, because the two sets are not symmetric: the
+      // verbs this block uses that stay local are enumerable, the ones that can
+      // reach a remote are not. An allowlist of network verbs fails OPEN — an
+      // unnamed verb is classified local, so an unbounded call using it passes
+      // every assertion below. `remote prune` and `remote show` are two that
+      // exist today: both block on an unreachable remote exactly as
+      // `set-head -a` does. Treating anything unrecognised as network-reaching
+      // fails CLOSED instead, so a new verb reddens this suite until a human
+      // classifies it — which is the whole point of a drift guard.
+      const staysLocal = (args: string) =>
+        /^\s*(config|checkout|rev-parse|symbolic-ref)\b/.test(args) ||
+        /^\s*remote\s+(add|remove|rename|set-url)\b/.test(args);
+      const reachesNetwork = (args: string) => !staysLocal(args);
 
       const invocations = command
         .split(gitPrefix)
         .slice(1)
         .map((tail) => {
           // One invocation ends at the next shell separator.
-          const args = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
-          const bounded = args.trimStart().startsWith(bound);
-          return { args: bounded ? args.trimStart().slice(bound.length) : args, bounded };
+          const raw = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
+          // Peel every leading `-c <key>=<value>` so boundedness is a question
+          // of which flags are present, not of them being adjacent and in this
+          // exact order — and so the verb match sees the subcommand either way.
+          let rest = raw.trimStart();
+          const flags: string[] = [];
+          for (let m = rest.match(/^-c\s+(\S+)\s+/); m; m = rest.match(/^-c\s+(\S+)\s+/)) {
+            flags.push(`-c ${m[1]}`);
+            rest = rest.slice(m[0].length);
+          }
+          return { args: rest, bounded: boundFlags.every((flag) => flags.includes(flag)) };
         });
 
       const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
       // The real guard: no unbounded network call, however this block grows.
-      // Needs no edit when a third bounded call is legitimately added.
+      // Needs no edit when a third bounded call is legitimately added. Scope is
+      // every `git -C '<workspaceRoot>'`-prefixed call — a call written against
+      // a different `-C`, or as `cd "$root" && git ...`, is not seen here.
       expect(networkCalls.filter((i) => !i.bounded).map((i) => i.args.trim())).toEqual([]);
       // ...and nothing that stays local pays the bound, so the bound tracks the
       // set of network calls in both directions.
