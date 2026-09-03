@@ -843,6 +843,48 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
   });
 
+  // Stale/prior-head narration AFTER the clause is how a correct skip explains
+  // the wake (third Ally pass); only a prior-head subject BEFORE the clause
+  // vetoes.
+  it.each([
+    "**Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — the wake carried a stale head, superseded by this one.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, the wake head has moved since the original wake.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — the branch moved after the wake, so the wake SHA is not the live one.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the prior head in the payload is superseded.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` (the earlier head `0936fba6` is stale) — no action taken.",
+  ])("BLO-31374: stale-head narration after the clause does not veto (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // Markdown closing before the sha: the clause interior tolerates the same
+  // markdown class as its tail.
+  it.each([
+    "**Already reviewed** at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+    "*Already reviewed* at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "`Already reviewed` at 8b237675b19fa5ae061821fd3b1d87cd8cd1836f.",
+  ])("BLO-31374: markdown that closes before the sha still matches (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  it("BLO-31374: a glued `alreadyreviewed` is not the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "alreadyreviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Multi-word hedges still govern the clause.
+  it.each([
+    "I could not fully confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; aborting.",
+    "I was not able to confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: a multi-word governing hedge still vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
   // `notalready` is not a negation and not the clause: no word boundary before
   // `already`, so the shape does not match at all and the run stays `missing`.
   it("BLO-31374: a glued `notalready` is neither a negation nor the clause", () => {

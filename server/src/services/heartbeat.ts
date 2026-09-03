@@ -9382,21 +9382,27 @@ function prReviewOutputHasSelfReviewSkip(
 // negation prefix tolerates the same markdown the clause does, so bold/italic
 // cannot slip past it), a hedge that governs the clause in the same sentence
 // ("could not confirm whether … already reviewed at …", "Unclear if already
-// reviewed at …"), and a prior/stale-head cue in the same sentence ("the prior
-// head was already reviewed at …, but the branch moved"). NOT vetoed: "did not
-// post" — not posting is the defining property of this exit, so the shared
+// reviewed at …"), and a prior/stale-head cue governing the clause ("the prior
+// head was already reviewed at …"). NOT vetoed: "did not post" — not posting is
+// the defining property of this exit, so the shared
 // prReviewOutputHasPostedReviewNegation cues would invert the branch (second
 // Ally pass: five plausible phrasings of a correct skip fell to `missing`).
-// Sentence scope for both cues ends at . : ; , — – or a newline, so a clause
-// joined by a colon or dash does not inherit a hedge from the previous clause.
+// Also NOT vetoed: stale/prior-head narration AFTER the clause ("… — the wake
+// carried a stale head, superseded by this one") — that is how a correct skip
+// explains the wake (third Ally pass), so both cues look only at the text
+// BEFORE the clause, and that scope ends at . : ; , — – or a newline, so a
+// clause joined by a colon or dash does not inherit a hedge from the previous
+// clause.
 function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   // Markdown that may sit between tokens: whitespace, backticks, bold/italic.
   const md = "[\\s`*_]*";
   const pattern = new RegExp(
     // `+`, not `*`: the negation must be its own word, separated from `already`
-    // by whitespace or markdown.
+    // by whitespace or markdown. The same `+` class joins already/reviewed/at,
+    // so "**Already reviewed** at `<sha>`" (markdown closing before the sha)
+    // matches while `alreadyreviewed` cannot.
     "(?<negated>\\b(?:not|never|wasn['\u2019]?t|weren['\u2019]?t|isn['\u2019]?t|aren['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been)[\\s`*_]+){0,2})?" +
-      `\\balready\\s+reviewed\\s+at${md}` +
+      `\\balready[\\s\`*_]+reviewed[\\s\`*_]+at${md}` +
       // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
       `(?:[^\\s\`*_]{1,40}${md}for${md})?(?:(?:head|commit)${md})?` +
       "([0-9a-f]{7,40})(?![0-9a-f])",
@@ -9404,18 +9410,15 @@ function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   );
   // Same-sentence scope: a clause boundary is any of . : ; , — – or a newline.
   const clauseBefore = /[^.\n:;,\u2014\u2013]*$/;
-  const clauseAfter = /^[^.\n]*/;
-  // A hedge that governs the clause ("unclear whether …", "could not confirm
-  // whether …") — not a bare `if`/`whether` anywhere nearby.
-  const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|did\s+not|didn['\u2019]?t)\s+\w+\s+(?:if|whether))\b/i;
-  // The clause is about a superseded head, not the live one.
+  // A hedge that governs the clause ("unclear whether …", "could not fully
+  // confirm whether …") — not a bare `if`/`whether` anywhere nearby.
+  const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|not\s+able\s+to|did\s+not|didn['\u2019]?t)\s+(?:\w+\s+){1,3}(?:if|whether))\b/i;
+  // The clause's subject is a superseded head, not the live one.
   const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
     if (hedge.test(before) || priorHead.test(before)) continue;
-    const after = clauseAfter.exec(text.slice(m.index + m[0].length, m.index + m[0].length + 160))?.[0] ?? "";
-    if (priorHead.test(after)) continue;
     return true;
   }
   return false;
