@@ -552,6 +552,18 @@ describe("agent secret redaction on mutating responses", () => {
     return {
       name: "Builder",
       role: "engineer",
+      // `title` and `icon` are the two other string-valued fields
+      // `buildConfigSnapshot` emits. They are pinned as READABLE below because
+      // passing the whole record to `sanitizeRecord` subjects the snapshot's top
+      // level to every gate in it — not just `classifyKeyTier` but the
+      // `env`/`headers` special cases, `^args$`, and the dotted-value rule — so
+      // an over-redaction here would blank the revision diff in the UI.
+      // (Boundary, stated so it is not mistaken for a guarantee: a *dotted*
+      // three-segment value in one of these fields would be blanked by the
+      // dotted-value rule. No caller produces one; this pins the realistic
+      // shape, not every possible string.)
+      title: "Staff Engineer",
+      icon: "wrench",
       adapterType: "claude_local",
       adapterConfig: { env: { FOO: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
       runtimeConfig: {},
@@ -601,6 +613,8 @@ describe("agent secret redaction on mutating responses", () => {
     // the revision diff into an unreadable wall of sentinels.
     expect(res.body.afterConfig.name).toBe("Builder");
     expect(res.body.afterConfig.role).toBe("engineer");
+    expect(res.body.afterConfig.title).toBe("Staff Engineer");
+    expect(res.body.afterConfig.icon).toBe("wrench");
     expect(res.body.afterConfig.adapterType).toBe("claude_local");
     // The response-shape contract the three overrides used to guarantee.
     expect(res.body.afterConfig.runtimeConfig).toEqual({});
@@ -625,8 +639,78 @@ describe("agent secret redaction on mutating responses", () => {
     expectNoPlaintextSecrets(res.body);
   });
 
-  // secret_ref bindings are pointers, never plaintext. They must not gain a
-  // resolved `value` on any response regardless of projectionClass.
+  // The old `metadata` branch gated on `typeof x === "object" && x !== null`,
+  // which is TRUE for an array, and the redactor returns a non-plain-object
+  // argument unchanged — so an array-valued `metadata` went out verbatim. This
+  // is the third instance of that `isPlainObject` hole on PEN-2370.
+  //
+  // Pinned rather than argued: the containment change closes it because
+  // `sanitizeValue` maps arrays element-wise, but nothing in this file exercised
+  // an array-shaped `metadata`, so the fix rested on the PR description alone.
+  it("masks a plain binding carried in an ARRAY-valued metadata field", async () => {
+    const snapshot = {
+      ...snapshotWithUnnamedConfigField(),
+      metadata: [{ type: "plain", value: SNAPSHOT_DRIFT_SECRET }],
+    };
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: snapshot,
+      afterConfig: snapshot,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    // The array SHAPE must survive — coercing it to `null` would hide the leak
+    // by destroying the field, which is not the same fix and would break the
+    // diff view. It must arrive as an array whose elements are masked.
+    expect(Array.isArray(res.body.afterConfig.metadata)).toBe(true);
+    expect(res.body.afterConfig.metadata).toEqual([
+      { type: "plain", value: "***REDACTED***" },
+    ]);
+    expect(res.body.beforeConfig.metadata).toEqual([
+      { type: "plain", value: "***REDACTED***" },
+    ]);
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // The admit gate and the sanitize gate must be the same predicate. The
+  // redactor sanitizes only `isPlainObject` values and otherwise returns its
+  // argument BY REFERENCE, so admitting on a wider "is it an object" test made
+  // the containment a no-op for a foreign-prototype snapshot: the spread would
+  // emit the raw record and the sub-field lines would only reshape it.
+  //
+  // Not reachable from today's callers — `jsonb` columns arrive via `JSON.parse`
+  // and always carry `Object.prototype`. Pinned because an unstated assumption
+  // about the shape a containment function is handed is the defect class this
+  // whole projection exists to close, and because failing OPEN is the wrong
+  // direction for the one mask standing over at-rest plaintext.
+  it("contains a snapshot whose prototype is not Object.prototype", async () => {
+    const foreignPrototype = Object.assign(
+      Object.create({ inherited: true }),
+      snapshotWithUnnamedConfigField(),
+    );
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: foreignPrototype,
+      afterConfig: foreignPrototype,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    // Fails closed: an un-sanitizable shape is withheld entirely rather than
+    // spread out uncontained.
+    expect(res.body.afterConfig).toEqual({});
+    expect(res.body.beforeConfig).toEqual({});
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+
   it("never serializes a resolved value for a secret_ref env binding", async () => {
     const refAgent = {
       ...baseAgent,
