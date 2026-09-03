@@ -33,7 +33,7 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { isClosedIsolatedExecutionWorkspace, pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { isClosedExecutionWorkspace, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -730,6 +730,7 @@ export function buildHostServices(
     baseRef: workspace.baseRef,
     branchName: workspace.branchName,
     providerType: workspace.providerType,
+    mode: workspace.mode,
     providerMetadata: readProviderMetadata(workspace.metadata),
   });
 
@@ -1812,15 +1813,32 @@ export function buildHostServices(
           .executionWorkspaceId as string | null | undefined;
         if (executionWorkspaceId) {
           const workspace = await executionWorkspaces.getById(executionWorkspaceId);
-          // A closed/archived isolated workspace may already have had its
-          // directory torn down, so treat it as absent rather than handing
-          // back a path that no longer exists.
-          if (inCompany(workspace, companyId) && !isClosedIsolatedExecutionWorkspace(workspace)) {
-            const path = sanitizeWorkspacePath(workspace.agentCwd ?? workspace.cwd);
+          // A closed/archived workspace may already have had its directory torn
+          // down, so treat it as absent rather than handing back a path that no
+          // longer exists. Deliberately the mode-INDEPENDENT guard: the reason
+          // ("the directory may be gone") is true of an archived cloud_sandbox
+          // or shared_workspace exactly as much as of an isolated worktree, and
+          // the isolated-only variant reports false for four of the five modes.
+          if (inCompany(workspace, companyId) && !isClosedExecutionWorkspace(workspace)) {
+            // `cwd`, NOT `agentCwd`: agentCwd is documented as the path to
+            // prefer for filesystem ops *inside the adapter session*, and for
+            // an ssh-transport realization it is a path on the REMOTE host. The
+            // plugin host runs in the server process, so that path may not
+            // exist here — and PLUGIN_SPEC tells plugins to hand `path`
+            // straight to Node and git. `cwd` is the canonical local
+            // realization and equals `agentCwd` whenever the realization is
+            // local, so nothing is lost in the common case; a null `cwd`
+            // correctly drops to the honest project-scoped fallback below.
+            const path = sanitizeWorkspacePath(workspace.cwd);
             // An unrealized workspace (no cwd yet) has no directory to offer.
             // Returning `path: ""` with `isIssueScoped: true` would be worse
             // than the honest project-scoped fallback below.
             if (path) {
+              // Deliberate: `name` becomes the execution workspace's own label
+              // (e.g. the branch slug) rather than the project name, so a
+              // caller rendering it sees which working copy it actually got.
+              // A project-name label on a per-issue worktree would be the same
+              // conflation this method is being fixed for.
               const name = sanitizeWorkspaceName(workspace.name, path);
               return {
                 id: workspace.id,
@@ -1836,6 +1854,11 @@ export function buildHostServices(
                 // An execution workspace is never the project primary.
                 isPrimary: false,
                 isIssueScoped: true,
+                // Provenance alone does not tell a caller whether the path is
+                // private to this issue — `shared_workspace` and
+                // `operator_branch` are issue-bound but NOT isolated. Surface
+                // the mode so the isolation question is answerable.
+                mode: workspace.mode,
                 createdAt: workspace.createdAt.toISOString(),
                 updatedAt: workspace.updatedAt.toISOString(),
               };
@@ -1863,6 +1886,8 @@ export function buildHostServices(
           // choice for a fallback guess.
           isPrimary: project.primaryWorkspaceSource === "explicit",
           isIssueScoped: false,
+          // Project-scoped: no execution workspace, so no mode to report.
+          mode: null,
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };

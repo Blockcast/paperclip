@@ -398,6 +398,20 @@ export interface PluginEntityQuery {
 // ---------------------------------------------------------------------------
 
 /**
+ * Mode of an execution workspace, as surfaced on {@link PluginWorkspace.mode}.
+ *
+ * Only `isolated_workspace` and `cloud_sandbox` guarantee the path is private
+ * to one issue. `shared_workspace` and `operator_branch` are issue-*bound* but
+ * point at a shared checkout.
+ */
+export type PluginWorkspaceMode =
+  | "shared_workspace"
+  | "isolated_workspace"
+  | "operator_branch"
+  | "adapter_managed"
+  | "cloud_sandbox";
+
+/**
  * Workspace metadata provided by the host. Plugins use this to resolve local
  * filesystem paths for file browsing, git, terminal, and process operations.
  *
@@ -405,13 +419,23 @@ export interface PluginEntityQuery {
  * @see PLUGIN_SPEC.md §20 — Local Tooling
  */
 export interface PluginWorkspace {
-  /** UUID primary key. */
+  /**
+   * Primary key. Note this carries three namespaces depending on how the
+   * workspace was resolved, and only `isIssueScoped` distinguishes them:
+   * an `execution_workspaces.id` when `isIssueScoped` is `true`, a
+   * `project_workspaces.id` when a project workspace row exists, and the
+   * synthetic non-UUID `${projectId}:managed` for a managed checkout with no
+   * row. Do not round-trip it into a lookup without checking which you hold.
+   */
   id: string;
   /** UUID of the parent project. */
   projectId: string;
   /** Display name for this workspace. */
   name: string;
-  /** Absolute filesystem path to the workspace directory. */
+  /**
+   * Absolute filesystem path to the workspace directory, on the machine the
+   * plugin host runs on.
+   */
   path: string;
   /**
    * Repository URL, when known. Optional for SDK back-compat — external
@@ -421,7 +445,17 @@ export interface PluginWorkspace {
   repoUrl?: string | null;
   /** Checkout/ref requested for the workspace, when known. Optional for SDK back-compat. */
   repoRef?: string | null;
-  /** Default comparison ref for workspace tooling, when known. Optional for SDK back-compat. */
+  /**
+   * Default comparison ref for workspace tooling, when known. Optional for SDK
+   * back-compat.
+   *
+   * Note the ref *namespace* differs by provenance: when `isIssueScoped` is
+   * `true` this is the execution workspace's base ref, which is typically a
+   * remote-tracking form (`origin/master`); otherwise it is the project's bare
+   * configured ref (`master`). `git merge-base` accepts both, but
+   * `rev-parse --verify` against an unfetched remote does not — fetch first, or
+   * normalize, rather than assuming a namespace.
+   */
   defaultRef?: string | null;
   /**
    * Branch checked out in this workspace, when it is an execution workspace
@@ -432,19 +466,28 @@ export interface PluginWorkspace {
   /** Whether this is the project's primary workspace. */
   isPrimary: boolean;
   /**
-   * BLO-31349: whether `path` was resolved from the *issue's* bound execution
-   * workspace (`true`) or is a project-scoped fallback (`false`).
+   * BLO-31349: **provenance**, not isolation. `true` means `path` was resolved
+   * from the issue's own bound execution workspace; `false` means no live
+   * workspace was bound and this is a project-scoped fallback.
+   *
+   * This does NOT tell you the path is private to the issue — `shared_workspace`
+   * and `operator_branch` are issue-bound modes that resolve to a shared
+   * checkout and still report `true`. To answer the isolation question, read
+   * {@link PluginWorkspace.mode}.
    *
    * Only meaningful on `getWorkspaceForIssue`, which always sets it. The
    * project-scoped readers (`listWorkspaces`, `getPrimaryWorkspace`) leave it
-   * undefined because the question does not apply to them.
-   *
-   * Treat `false` as "this is the shared project checkout, not a per-issue
-   * working copy" — writing to it under an `isolated_workspace` policy is
-   * exactly the leak the policy exists to prevent. Optional for SDK
+   * undefined because the question does not apply to them. Optional for SDK
    * back-compat.
    */
   isIssueScoped?: boolean;
+  /**
+   * Mode of the bound execution workspace, when `isIssueScoped` is `true`.
+   * `null` for project-scoped results. This is the field that answers "is this
+   * path private to my issue" — see {@link PluginWorkspaceMode}. Optional for
+   * SDK back-compat.
+   */
+  mode?: PluginWorkspaceMode | null;
   /** ISO 8601 creation timestamp. */
   createdAt: string;
   /** ISO 8601 last-updated timestamp. */
@@ -481,6 +524,11 @@ export interface PluginExecutionWorkspaceMetadata {
   branchName: string | null;
   /** Host provider type for the realized workspace. */
   providerType: string | null;
+  /**
+   * Mode of this execution workspace — the field that answers whether its
+   * path is private to one issue. Optional for SDK back-compat.
+   */
+  mode?: PluginWorkspaceMode | null;
   /** Provider metadata already safe for plugin consumption. */
   providerMetadata: Record<string, unknown> | null;
 }
@@ -1049,17 +1097,29 @@ export interface PluginProjectsClient {
    * or sandbox an agent actually works in — and only falls back to the
    * project-scoped primary workspace when the issue has none.
    *
-   * Read {@link PluginWorkspace.isIssueScoped} to tell the two apart:
+   * Read {@link PluginWorkspace.isIssueScoped} for **provenance** — where the
+   * path came from:
    *
-   * - `true` — `path` is the issue's execution workspace `cwd`, and
-   *   `branchName` is the branch checked out there. Safe to write to.
+   * - `true` — `path` is the bound execution workspace's local `cwd`, and
+   *   `branchName` is the branch checked out there.
    * - `false` — the issue has no live execution workspace, so `path` is the
    *   shared project checkout. Under an `isolated_workspace` policy this is
    *   the directory the policy exists to keep work *out* of; prefer
    *   read-only use, or provision a workspace first.
    *
-   * A closed or archived isolated workspace is treated as absent, because its
-   * directory may already have been torn down.
+   * Read {@link PluginWorkspace.mode} for **isolation** — whether the path is
+   * private to this issue. `isIssueScoped: true` alone does not establish that:
+   * `shared_workspace` and `operator_branch` are issue-bound modes that resolve
+   * to a shared checkout. Check `mode` before assuming a write is confined to
+   * this issue.
+   *
+   * `path` is the local `cwd`, never `agentCwd` — the latter is the
+   * adapter-session path and points at the remote host for ssh-transport
+   * realizations, which is not where the plugin host runs.
+   *
+   * A closed or archived workspace is treated as absent — in any mode, not just
+   * `isolated_workspace` — because its directory may already have been torn
+   * down.
    *
    * @param issueId - UUID of the issue
    * @param companyId - UUID of the company that owns the issue

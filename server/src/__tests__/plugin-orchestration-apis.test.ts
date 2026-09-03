@@ -214,7 +214,13 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       companyId: string,
       projectId: string,
       slug: string,
-      overrides: { status?: string; closedAt?: Date; cwd?: string | null } = {},
+      overrides: {
+        status?: string;
+        closedAt?: Date;
+        cwd?: string | null;
+        mode?: string;
+        metadata?: Record<string, unknown> | null;
+      } = {},
     ) {
       const issueId = randomUUID();
       const executionWorkspaceId = randomUUID();
@@ -234,7 +240,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         companyId,
         projectId,
         sourceIssueId: issueId,
-        mode: "isolated_workspace",
+        mode: (overrides.mode ?? "isolated_workspace") as "isolated_workspace",
         strategyType: "git_worktree",
         name: slug,
         status: overrides.status ?? "active",
@@ -245,6 +251,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         branchName: slug,
         providerType: "git_worktree",
         providerRef: `${BASE_CHECKOUT}/.paperclip/worktrees/${slug}`,
+        metadata: overrides.metadata ?? null,
       });
       await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, issueId));
       return { issueId, executionWorkspaceId };
@@ -321,6 +328,76 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         path: BASE_CHECKOUT,
         isIssueScoped: false,
       });
+    });
+
+    // Ally review of #1617: the guard borrowed `isClosedIsolatedExecutionWorkspace`,
+    // which short-circuits to false when `mode !== "isolated_workspace"`. Four of
+    // the five persisted modes therefore treated a torn-down workspace as live.
+    // An archived `cloud_sandbox` is the strongest case — the sandbox is
+    // destroyed, so the directory is definitively gone.
+    it("treats a closed NON-isolated workspace as absent too (mode-independent guard)", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const { issueId } = await seedIssueWithWorktree(companyId, projectId, "dead-sandbox", {
+        mode: "cloud_sandbox",
+        status: "archived",
+        closedAt: new Date(),
+      });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      await expect(services.projects.getWorkspaceForIssue({ issueId, companyId })).resolves.toMatchObject({
+        path: BASE_CHECKOUT,
+        isIssueScoped: false,
+      });
+    });
+
+    // Ally review of #1617: `agentCwd` is documented as the path to prefer for
+    // filesystem ops *inside the adapter session*; for an ssh-transport
+    // realization it is a path on the REMOTE host. The plugin host runs in the
+    // server process, and PLUGIN_SPEC §20 tells plugins to hand `path` straight
+    // to Node and git — so returning the remote path is at best ENOENT and at
+    // worst a write to a coincidentally-valid local directory.
+    it("returns the LOCAL cwd, never the remote agentCwd, for an ssh-transport realization", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const localCwd = `${BASE_CHECKOUT}/.paperclip/worktrees/ssh-slug`;
+      const { issueId } = await seedIssueWithWorktree(companyId, projectId, "ssh-slug", {
+        cwd: localCwd,
+        metadata: {
+          workspaceRealization: { transport: "ssh", remote: { path: "/remote/home/agent/ssh-slug" } },
+        },
+      });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+      const workspace = await services.projects.getWorkspaceForIssue({ issueId, companyId });
+
+      expect(workspace?.path).toBe(localCwd);
+      expect(workspace?.path).not.toContain("/remote/");
+      expect(workspace?.isIssueScoped).toBe(true);
+    });
+
+    // Ally review of #1617: `isIssueScoped` is provenance, not isolation.
+    // `shared_workspace` is issue-BOUND but points at a shared checkout, so a
+    // plugin must read `mode` to answer "is this path private to my issue".
+    it("reports mode so callers can distinguish issue-bound from isolated", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const isolated = await seedIssueWithWorktree(companyId, projectId, "iso-mode");
+      const shared = await seedIssueWithWorktree(companyId, projectId, "shared-mode", {
+        mode: "shared_workspace",
+      });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      // Both are issue-scoped by provenance...
+      await expect(
+        services.projects.getWorkspaceForIssue({ issueId: isolated.issueId, companyId }),
+      ).resolves.toMatchObject({ isIssueScoped: true, mode: "isolated_workspace" });
+      // ...but only `mode` reveals that this one is not a private directory.
+      await expect(
+        services.projects.getWorkspaceForIssue({ issueId: shared.issueId, companyId }),
+      ).resolves.toMatchObject({ isIssueScoped: true, mode: "shared_workspace" });
     });
 
     it("falls back when the bound workspace has no realized directory yet", async () => {
