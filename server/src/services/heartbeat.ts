@@ -13755,6 +13755,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : managedWorkspace.cwd;
             managedWorkspaceWarnings = managedWorkspace.warnings;
           } catch (error) {
+            // BLO-31351: a typed workspace-validation failure must NOT be
+            // absorbed into "try the next candidate". This catch exists to skip
+            // a workspace that merely could not be realized, but the fall-through
+            // below ends at `resolveDefaultAgentWorkspaceDir` — an EMPTY per-agent
+            // directory — because `buildRealizationFailedResult` returns non-null
+            // only for an explicitly-targeted non-primary workspace. Swallowing
+            // an unservable-mirror failure here would therefore run the agent to
+            // completion against the wrong tree, record no
+            // `workspace_validation_failed` cause, and reach none of that cause's
+            // budget exemptions. That is strictly worse than the pre-guard
+            // behaviour, where the mirror at least failed loudly at clone time.
+            //
+            // Tradeoff, stated because it is a real one: where candidates resolve
+            // to DIFFERENT managed dirs (distinct `repoUrl`s), this aborts rather
+            // than trying a sibling that might be healthy. That is deliberate. An
+            // unservable partial mirror is an infrastructure fault that will keep
+            // breaking every run routed through it, so surfacing it once with the
+            // real reason is worth more than quietly succeeding on a different
+            // tree and leaving it to strand someone else later.
+            if (error instanceof WorkspaceValidationFailure) throw error;
             if (preferredWorkspace?.id === workspace.id) {
               preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
             }
