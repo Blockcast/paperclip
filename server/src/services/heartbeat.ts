@@ -9431,12 +9431,14 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
   // An epistemic negation governing the clause from further back in the same
   // clause ("no evidence … was already reviewed at", "cannot see that … was
-  // already reviewed at"): a negation word followed within three words by an
-  // epistemic head. NOT a bare negation — "Exiting without posting since …",
+  // already reviewed at", "could not verify that … was already reviewed at"): a
+  // negation word followed within three words by an epistemic head — including
+  // the establishing verbs (verify / establish / determine / find / check …),
+  // whose `that`-complement form the `hedge` cue cannot see (sixth Ally pass). NOT a bare negation — "Exiting without posting since …",
   // "No action taken because …" are how a correct skip explains itself.
   // `cannot`/`can't` are listed because `\bnot\b` does not match inside
   // `cannot`.
-  const negation = /\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t)\s+(?:\w+\s+){0,3}(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|see|seen|appears?|suggests?|confirms?|confirmed|aware)\b/i;
+  const negation = /\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|couldn['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|unable\s+to|failed\s+to)\s+(?:\w+\s+){0,3}(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|see|seen|appears?|suggests?|confirms?|confirmed|aware|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tell)\b/i;
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";

@@ -927,6 +927,25 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
   });
 
+  // Masking guard (sixth Ally pass): a `that`-complement of an establishing
+  // verb that the run could NOT complete. The hedge only sees `if|whether`.
+  it.each([
+    "I could not verify that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not establish that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not determine that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not find that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I have not verified that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Unable to establish that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not check that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the API failed.",
+    "I couldn't verify that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I failed to establish that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: rejects a failed establishing verb with a that-complement (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
   // A negation in the PREVIOUS clause does not reach the review clause.
   it("BLO-31374: a negation in an earlier clause does not veto the clause", () => {
     expect(
@@ -955,6 +974,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`Exiting without posting since this head was already reviewed at \`${sha}\`.`, true],
       [`No action taken because this head was already reviewed at \`${sha}\`.`, true],
       [`I failed to confirm whether this head was already reviewed at \`${sha}\`.`, false],
+      [`I could not verify that this head was already reviewed at \`${sha}\`.`, false],
+      [`Unable to establish that this head was already reviewed at \`${sha}\`.`, false],
       [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
       [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
       [`The prior head was already reviewed at \`${sha}\`, but the branch moved.`, false],
