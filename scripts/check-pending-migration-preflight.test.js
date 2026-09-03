@@ -74,9 +74,17 @@ test("startup and run budgets are separate, and startup clears a cold pull", () 
   // build at 180s. The startup budget must stay comfortably above that
   // measurement; the behavioural suite overrides both, so only a render-level
   // check can hold the shipped defaults.
-  const runBudget = Number(script.match(/TIMEOUT_SECONDS="\$\{PREFLIGHT_TIMEOUT_SECONDS:-(\d+)\}"/)?.[1]);
+  //
+  // Anchor on the assignment at start-of-line, matching
+  // check-docker-deploy-timeout.test.js: a comment naming a budget in
+  // `${...}` form ahead of the real assignment would otherwise feed the wrong
+  // number in. No such comment exists today -- this keeps that a property of
+  // the regex rather than of the script's current prose.
+  const runBudget = Number(
+    script.match(/^TIMEOUT_SECONDS="\$\{PREFLIGHT_TIMEOUT_SECONDS:-(\d+)\}"/m)?.[1],
+  );
   const startupBudget = Number(
-    script.match(/STARTUP_TIMEOUT_SECONDS="\$\{PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-(\d+)\}"/)?.[1],
+    script.match(/^STARTUP_TIMEOUT_SECONDS="\$\{PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-(\d+)\}"/m)?.[1],
   );
 
   assert.ok(Number.isFinite(runBudget), "the run budget must have a numeric default");

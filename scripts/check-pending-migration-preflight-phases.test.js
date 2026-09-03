@@ -33,6 +33,18 @@ const STARTUP_BUDGET_SECONDS = 60;
 // tracks the budget it is a fraction of.
 const EARLY_BAIL_CEILING_SECONDS = STARTUP_BUDGET_SECONDS / 6;
 
+// A third startup budget, kept short because the recoverable-pull-error test
+// rides it out in full. Declared here with the others so it cannot drift from
+// the floor derived below.
+const PULL_ERROR_BUDGET_SECONDS = 5;
+
+// The bar for "kept polling through a recoverable pull error". Derived so the
+// two move together: lowering the budget alone would otherwise put the floor
+// above it and fail a correct script, and raising it alone would silently
+// weaken the assertion. The margin absorbs the script's whole-second deadline
+// compare, which can round down ~1s early against this wall clock.
+const PULL_ERROR_FLOOR_SECONDS = PULL_ERROR_BUDGET_SECONDS * 0.7;
+
 // Stands in for the cluster. Container start is a function of elapsed time so a
 // slow image pull can be simulated without one.
 const STUB = `#!/usr/bin/env bash
@@ -270,15 +282,16 @@ test("a transient pull error rides out the startup budget rather than failing fa
   const { output } = runPreflight({
     STUB_READY_AFTER: "9999",
     STUB_WAITING_REASON: "ImagePullBackOff",
-    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "5",
+    PREFLIGHT_STARTUP_TIMEOUT_SECONDS: String(PULL_ERROR_BUDGET_SECONDS),
   });
   const elapsed = (Date.now() - began) / 1000;
 
-  // The budget is 5s, but the script's deadline is compared in whole seconds,
-  // so it can round down to ~1s early against this wall clock. The claim under
-  // test is "kept polling" rather than "bailed on sight" -- the terminal-error
-  // path returns in ~0.2s, so anything in seconds settles it without making the
-  // assertion a hostage to second-granularity slop.
-  assert.ok(elapsed >= 3.5, `must keep waiting through a recoverable pull error (took ${elapsed}s)`);
+  // The claim under test is "kept polling" rather than "bailed on sight" -- the
+  // terminal-error path returns in ~0.2s, so any floor in seconds settles it
+  // without making the assertion a hostage to second-granularity slop.
+  assert.ok(
+    elapsed >= PULL_ERROR_FLOOR_SECONDS,
+    `must keep waiting through a recoverable pull error (took ${elapsed}s)`,
+  );
   assert.match(output, /ImagePullBackOff/);
 });
