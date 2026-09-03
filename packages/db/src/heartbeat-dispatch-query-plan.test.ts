@@ -30,6 +30,13 @@
  * custom plan. They do NOT cover the generic plan production actually executes
  * for the prepared statement, which is separately known to pick the wrong
  * index — see the scope limit on `explain` below, and BLO-31392.
+ *
+ * Second scope limit, on the word "actually" above: the projection is mirrored
+ * BY HAND in DISPATCH_HEAD_PROBE. Nothing here reads `readQueuedDispatchPage`'s
+ * SQL, so if production reverts to `SELECT *` these assertions stay green while
+ * pinning a plan production no longer issues. Verified by reading
+ * `server/src/services/heartbeat.ts` when this file changes; unenforced between
+ * those reads.
  */
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
@@ -441,6 +448,15 @@ function dispatchHeadProbeQuery(cursor: { createdAt: string; id: string } | null
  * heap page (`Heap Blocks: exact=<depth>`), which is what a queue accumulated
  * over time actually looks like.
  *
+ * That "asserting the wrong thing" argument is about a projection that FETCHES
+ * THE HEAP, which is what this file used to assert on. It does not apply to the
+ * keyset-only projection: with no heap access to price, clustering stops
+ * deciding the plan, which is why the head-scan test above does assert the
+ * ordered index-only plan on `seed`'s fixture and measures a +185%..+273%
+ * margin there rather than the old 1% tie. Do not read the paragraph above as
+ * grounds for deleting those assertions — if one of them goes red, the
+ * projection or the index is the thing that changed, not the fixture.
+ *
  * VACUUM, not just ANALYZE: index-only scans are costed against the visibility
  * map, and a never-vacuumed table reports relallvisible = 0 and gets bitmap+sort
  * regardless of projection. Production is continuously autovacuumed, so
@@ -519,13 +535,6 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       id: midQueueCursorRow!.id,
     });
 
-    // The coverage guard the wall-clock bound could not provide: assert the
-    // resumed page is actually a full page. Without this, a cursor that lands
-    // past the backlog resumes nothing and every plan-shape assertion below
-    // still passes, silently losing the mid-queue coverage they exist to give.
-    const midQueuePage = await sql.unsafe(midQueueCursorQuery) as Array<{ id: string }>;
-    expect(midQueuePage).toHaveLength(SCAN_LIMIT);
-
     const cursor = await explain(sql, midQueueCursorQuery);
     record("dispatch keyset cursor scan", cursor);
     expect(indexesUsed(cursor.root)).toContain(DISPATCH_INDEX);
@@ -549,11 +558,25 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // this the mid-queue coverage can vanish while the test stays green. That
     // is exactly how the previous wall-clock cursor degraded: measured on one
     // runner it resumed 166 rows instead of 200, losing 17% of its coverage
-    // silently. The offset is derived to leave SCAN_LIMIT rows after the cursor
-    // row, so a full page is the only correct answer; the guard states that
-    // arithmetic so a future fixture change fails with its reason rather than
-    // as an opaque count mismatch.
-    expect(AGENT_QUEUED_ROWS - MID_QUEUE_CURSOR_OFFSET - 1).toBeGreaterThanOrEqual(SCAN_LIMIT);
+    // silently.
+    //
+    // MID_QUEUE_CURSOR_OFFSET is derived to leave SCAN_LIMIT rows after the
+    // cursor row, so a full page is the only correct answer — but that
+    // derivation is only sound while the fixture really seeds
+    // AGENT_QUEUED_ROWS queued rows for AGENT. Assert the seeded count itself,
+    // because that is the invariant a fixture change actually breaks (an edit
+    // to `generate_series` in `seed`, or any second writer of queued rows for
+    // this agent). Restating the offset arithmetic here instead would reduce to
+    // `SCAN_LIMIT >= SCAN_LIMIT` and could never fail.
+    const seededQueued = Number(
+      (
+        (await sql.unsafe(
+          `SELECT count(*)::int AS n FROM heartbeat_runs
+            WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'`,
+        )) as Array<{ n: number }>
+      )[0]!.n,
+    );
+    expect(seededQueued).toBe(AGENT_QUEUED_ROWS);
     expect(Number(cursor.root["Actual Rows"] ?? 0)).toBe(SCAN_LIMIT);
 
     // The resumed page is held to the same plan shape as the head page, and to
