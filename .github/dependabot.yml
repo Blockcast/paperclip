@@ -1,3 +1,24 @@
+# This repo has THREE npm lockfiles. Dependabot only opens version-update PRs
+# for directories named below, so a lockfile that is missing here gets security
+# ALERTS (those come from the dependency graph, not this file) but never an
+# automated bump — remediation is manual every time. That gap let the same
+# advisory land twice by hand: GHSA-7p8r-x3mc-p8w7 (alert #114, BLO-21608) and
+# GHSA-5jgf-p345-68v8 (alerts #148/#149, BLO-31415/BLO-31416). BLO-31437.
+#
+#   pnpm-lock.yaml                                    -> covered, `directory: "/"`
+#   packages/services/designer/package-lock.json      -> covered, entry below
+#   vendor/paperclip-adapter-claude-k8s/package-lock.json -> DELIBERATELY EXCLUDED
+#
+# The vendored adapter is excluded because an automated bump there cannot pass
+# CI. `vendor_claude_k8s` in .github/workflows/pr.yml recomputes a sha256
+# manifest over `git ls-files` for that directory (excluding only LICENSE and
+# PROVENANCE.md) and fails unless it matches the hash recorded in
+# PROVENANCE.md. package-lock.json is a tracked file inside that manifest, so
+# any bump changes the hash, Dependabot cannot update PROVENANCE.md in the same
+# PR, and `vendor_claude_k8s` is on the required `verify` path — every such PR
+# would be born red and unmergeable. That directory also carries a manual
+# `-blockcast.N` version-bump convention (see its PROVENANCE.md). Bump it by
+# hand, as an ordinary in-tree PR, per vendor/README.md.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -11,6 +32,34 @@ updates:
       - "dependencies"
     ignore:
       # Ignore major version bumps — review those manually
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # packages/services/designer is deliberately outside the pnpm workspace
+  # (pnpm-workspace.yaml excludes packages/services/**), so it carries its own
+  # package-lock.json and the root `pnpm.overrides` cannot reach it — the
+  # `directory: "/"` entry above does not cover it. Unlike the vendored adapter,
+  # this lockfile is safe to bump automatically: UPSTREAM.md excludes
+  # package-lock.json from the vendoring rsync and regenerates it locally/in CI,
+  # and "lockfile insulation" is one of the three stated reasons for vendoring
+  # the service at all. There is no integrity manifest over this directory. The
+  # one CI check that reads this lockfile,
+  # scripts/designer-fast-uri-security.test.js, asserts a version FLOOR
+  # (fast-uri >= 3.1.5), which an upward bump satisfies by construction.
+  - package-ecosystem: npm
+    directory: "/packages/services/designer"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    # Deliberately 5 rather than the root's 10: this is a single service with a
+    # much smaller dependency surface than the monorepo root, and a lower cap
+    # bounds the weekly PR volume this entry can add.
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    ignore:
+      # Mirrors the root entry — review major bumps manually.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
