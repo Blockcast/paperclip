@@ -2170,25 +2170,46 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * Contain the WHOLE snapshot, not three named fields.
+   *
+   * This used to spread the stored row and override `adapterConfig`,
+   * `runtimeConfig` and `metadata`. That list is complete for the shape
+   * `buildConfigSnapshot` emits today, so it did not leak — but it fails open
+   * the moment a config-bearing field is added to the snapshot and this line is
+   * not revisited in the same commit. It is the same drift that produced doors
+   * #12 and #13 on PEN-2370, where a projection's withholding list was correct
+   * when written and silently stopped covering what it projected.
+   *
+   * The stakes here are higher than for a live-agent read, because the row this
+   * projects is stored *pre-redaction* by `buildConfigSnapshot`, which uses the
+   * name-based `sanitizeRecord` rather than the structural one — so an
+   * ordinary-keyed value like `env.FOO` is genuinely at rest in the clear and
+   * this projection is the only thing masking it on the way out.
+   *
+   * `redactAgentConfigPayload` recurses, so an `env`/`headers` map or a
+   * `{type:"plain",value}` binding is masked at any depth under any parent key,
+   * including one added after this comment was written. That also closes an
+   * array-shaped hole in the old `metadata` branch: `typeof x === "object"` is
+   * true for an array, and `redactAgentConfigPayload` returns a non-plain-object
+   * argument unchanged, so an array-valued `metadata` was passed through
+   * verbatim. `sanitizeValue` maps arrays element-wise.
+   *
+   * Note the polarity of `redactAgentConfiguration` directly above: it
+   * enumerates its output, so a new agent column cannot ship by accident. Same
+   * material, same file — these two should share a default, and now do.
+   */
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
-    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {};
-    const record = snapshot as Record<string, unknown>;
+    const record = asRecord(snapshot);
+    if (!record) return {};
+    const contained = redactAgentConfigPayload(record) ?? {};
     return {
-      ...record,
-      adapterConfig: redactAgentConfigPayload(
-        typeof record.adapterConfig === "object" && record.adapterConfig !== null
-          ? (record.adapterConfig as Record<string, unknown>)
-          : {},
-      ),
-      runtimeConfig: redactAgentConfigPayload(
-        typeof record.runtimeConfig === "object" && record.runtimeConfig !== null
-          ? (record.runtimeConfig as Record<string, unknown>)
-          : {},
-      ),
-      metadata:
-        typeof record.metadata === "object" && record.metadata !== null
-          ? redactAgentConfigPayload(record.metadata as Record<string, unknown>)
-          : record.metadata ?? null,
+      // Shape contract preserved exactly: absent or non-object config still
+      // normalizes to `{}`, and absent metadata still to `null`.
+      ...contained,
+      adapterConfig: asRecord(contained.adapterConfig) ?? {},
+      runtimeConfig: asRecord(contained.runtimeConfig) ?? {},
+      metadata: asRecord(contained.metadata) ?? contained.metadata ?? null,
     };
   }
 

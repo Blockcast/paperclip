@@ -534,6 +534,97 @@ describe("agent secret redaction on mutating responses", () => {
     expectNoPlaintextSecrets(res.body);
   });
 
+  // `redactRevisionSnapshot` spread the stored snapshot and then overrode three
+  // named fields — `adapterConfig`, `runtimeConfig`, `metadata`. That list is
+  // complete for `buildConfigSnapshot`'s current shape, so the surface does not
+  // leak today; it leaks the moment a config-bearing field is added to the
+  // snapshot and this list is not extended in the same commit. Doors #12 and
+  // #13 on PEN-2370 were both exactly that drift (`workspaceRuntime` added to a
+  // projection whose withholding list nobody revisited), so the class is pinned
+  // here rather than the three spellings.
+  //
+  // The revisions are also the one config surface stored *pre-redaction* by a
+  // name-based sanitizer, which is why an ordinary-keyed value reaches the row.
+  const SNAPSHOT_DRIFT_SECRET = "revision-snapshot-secret-under-an-ordinary-key";
+  const revisionId = "33333333-3333-4333-8333-333333333333";
+
+  function snapshotWithUnnamedConfigField() {
+    return {
+      name: "Builder",
+      role: "engineer",
+      adapterType: "claude_local",
+      adapterConfig: { env: { FOO: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
+      runtimeConfig: {},
+      metadata: null,
+      // Stands in for any field a future `buildConfigSnapshot` adds. It is not
+      // in the override list, so the spread used to carry it out verbatim.
+      sidecarConfig: { env: { BAR: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
+    };
+  }
+
+  function revisionRow() {
+    return {
+      id: revisionId,
+      agentId,
+      companyId,
+      source: "patch",
+      changedKeys: ["adapterConfig"],
+      beforeConfig: snapshotWithUnnamedConfigField(),
+      afterConfig: snapshotWithUnnamedConfigField(),
+    };
+  }
+
+  it("GET /agents/:id/config-revisions/:revisionId contains a snapshot field the override list does not name", async () => {
+    mockAgentService.getConfigRevision.mockResolvedValue(revisionRow());
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    // Assert the success path explicitly — a 403/404 would pass every negative
+    // assertion below vacuously.
+    expect(res.status).toBe(200);
+    // The named field still works, so a regression here is not what fails.
+    expect(res.body.afterConfig.adapterConfig.env.FOO).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    // The unnamed one is the point.
+    expect(res.body.afterConfig.sidecarConfig.env.BAR).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(res.body.beforeConfig.sidecarConfig.env.BAR).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    // Non-credential snapshot fields stay readable — containment must not turn
+    // the revision diff into an unreadable wall of sentinels.
+    expect(res.body.afterConfig.name).toBe("Builder");
+    expect(res.body.afterConfig.role).toBe("engineer");
+    expect(res.body.afterConfig.adapterType).toBe("claude_local");
+    // The response-shape contract the three overrides used to guarantee.
+    expect(res.body.afterConfig.runtimeConfig).toEqual({});
+    expect(res.body.afterConfig.metadata).toBeNull();
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  it("GET /agents/:id/config-revisions contains the same field on the list route", async () => {
+    mockAgentService.listConfigRevisions.mockResolvedValue([revisionRow()]);
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].afterConfig.sidecarConfig.env.BAR).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
   // secret_ref bindings are pointers, never plaintext. They must not gain a
   // resolved `value` on any response regardless of projectionClass.
   it("never serializes a resolved value for a secret_ref env binding", async () => {
