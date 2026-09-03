@@ -265,6 +265,71 @@ describe("ensureManagedCheckoutCanServeClones", () => {
     expect(result.warning).toContain("Permission denied");
   }, 120_000);
 
+  it("reports indeterminate rather than healthy when the config read itself fails", async () => {
+    // The silently-fails-OPEN case. `git config --get` exits 1 for an unset key
+    // and something else for a real problem; collapsing both to null would make
+    // a locked config or a permission fault on shared storage report as
+    // `not_partial` with no warning -- a healthy verdict on an unchecked repo,
+    // which is the one direction this guard must never fail in.
+    const repo = path.join(root, "config-unreadable");
+    await git(["clone", "--quiet", `file://${upstreamNoFilter}`, repo], root);
+
+    const result = await ensureManagedCheckoutCanServeClones({
+      cwd: repo,
+      runGit: async () => {
+        const error = new Error("fatal: unable to access '.git/config': Permission denied") as
+          Error & { code?: number };
+        error.code = 128;
+        throw error;
+      },
+    });
+
+    expect(result.state).toBe("indeterminate");
+    expect(result.warning).toContain("Permission denied");
+    expect(result.fatalMessage).toBeNull();
+    expect(result.evidence).toMatchObject({ partialCloneConfigReadError: expect.stringContaining("Permission denied") });
+  }, 60_000);
+
+  it("treats a genuine exit-1 unset key as not-partial, not as unreadable", async () => {
+    // The control for the test above: exit 1 IS the normal "key is not set"
+    // outcome and must stay silent, or every healthy repo warns.
+    const repo = path.join(root, "config-unset");
+    await git(["clone", "--quiet", `file://${upstreamNoFilter}`, repo], root);
+
+    const result = await ensureManagedCheckoutCanServeClones({
+      cwd: repo,
+      runGit: async () => {
+        const error = new Error("exit 1") as Error & { code?: number };
+        error.code = 1;
+        throw error;
+      },
+    });
+
+    expect(result.state).toBe("not_partial");
+    expect(result.warning).toBeNull();
+  }, 60_000);
+
+  it("inspects a bare/mirror checkout, which has no .git entry", async () => {
+    // The module's premise is that it adopts whatever some other process left at
+    // the managed path, and a `--mirror`/bare clone is a plausible thing to
+    // find. `git rev-parse --git-dir` would be the obvious probe and is unsafe
+    // (git walks UP, so a plain dir under an ancestor repo reports that
+    // ancestor), so bare repos are detected structurally and probed through an
+    // explicit `--git-dir`.
+    const bare = path.join(root, "bare-mirror.git");
+    await git(["clone", "--quiet", "--mirror", `file://${upstreamNoFilter}`, bare], root);
+    await git(["--git-dir", bare, "config", REMOTE_ORIGIN_PROMISOR_KEY, "true"], root);
+
+    const result = await ensureManagedCheckoutCanServeClones({ cwd: bare });
+
+    expect(result.state).toBe("partial_repaired");
+    expect(
+      await git(["--git-dir", bare, "config", "--get", REMOTE_ORIGIN_PROMISOR_KEY], root)
+        .then((r) => r.stdout.trim() || null)
+        .catch(() => null),
+    ).toBeNull();
+  }, 120_000);
+
   it("counts missing objects as zero on a healthy full clone", async () => {
     const full = path.join(root, "full-for-count");
     await git(["clone", "--quiet", `file://${upstreamNoFilter}`, full], root);

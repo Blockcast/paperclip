@@ -48,8 +48,7 @@
  * estate is rare (measured 2026-09-02: 0 of 26 default mirrors).
  */
 
-import { spawn } from "node:child_process";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -160,6 +159,10 @@ export async function countMissingObjects(cwd: string): Promise<{ count: number;
     };
 
     const consume = (line: string) => {
+      // Past the cap the verdict is settled and the kill has already been sent;
+      // returning early keeps the intent explicit and avoids re-signalling once
+      // per remaining `?` line in the buffered chunk.
+      if (truncated) return;
       // `--missing=print` marks a missing object by prefixing its OID with "?".
       if (!line.startsWith("?")) return;
       count += 1;
@@ -211,17 +214,33 @@ export async function countMissingObjects(cwd: string): Promise<{ count: number;
   });
 }
 
+/**
+ * Read one config key, distinguishing "not set" from "could not read".
+ *
+ * `git config --get` exits **1** for an unset key -- a normal read outcome --
+ * and something else (commonly 128: `fatal: unable to access '.git/config':
+ * Permission denied`, a locked config, a spawn failure) for a genuine problem.
+ * Collapsing both to `null` would make an unreadable config indistinguishable
+ * from a clean repository, so the guard would report `not_partial` with no
+ * warning at all on exactly the shared-storage paths it exists to cover --
+ * failing silently OPEN, and contradicting this module's own contract that every
+ * non-fatal failure mode surfaces as a warning.
+ */
 async function readConfigValue(
   runGit: PartialCloneGitRunner,
   cwd: string,
   key: string,
-): Promise<string | null> {
-  // Exit 1 with no output is git's "key is not set" -- a normal read outcome,
-  // hence catch-to-null rather than rethrow.
-  const raw = await runGit(["config", "--get", key], cwd).catch(() => null);
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  return trimmed.length > 0 ? trimmed : null;
+): Promise<{ value: string | null; unreadable: string | null }> {
+  try {
+    const raw = await runGit(["config", "--get", key], cwd);
+    const trimmed = typeof raw === "string" ? raw.trim() : "";
+    return { value: trimmed.length > 0 ? trimmed : null, unreadable: null };
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code === 1) return { value: null, unreadable: null };
+    const reason = error instanceof Error ? error.message : String(error);
+    return { value: null, unreadable: reason };
+  }
 }
 
 function describePartialCloneConfig(filter: string | null, promisor: string | null) {
@@ -270,11 +289,49 @@ export async function ensureManagedCheckoutCanServeClones(input: {
     .lstat(path.resolve(cwd, ".git"))
     .then((entry) => entry.isDirectory() || entry.isFile())
     .catch(() => false);
-  if (!hasGitMetadata) return { ...base, state: "not_a_checkout" };
 
-  const runGit = input.runGit ?? defaultRunGit;
-  const filter = await readConfigValue(runGit, cwd, REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY);
-  const promisor = await readConfigValue(runGit, cwd, REMOTE_ORIGIN_PROMISOR_KEY);
+  // A bare/mirror checkout has no `.git` entry at all, so the probe above skips
+  // it. That is deliberate rather than an oversight, and the reasoning is worth
+  // stating because the module's own premise is that it adopts whatever some
+  // other process left here: `git rev-parse --git-dir` would be the obvious
+  // fallback and it is NOT safe, because git walks *up* from its cwd and a plain
+  // directory nested under an ancestor repository would report that ancestor.
+  // So bare repositories are detected structurally instead, with no git
+  // invocation, and probed through an explicit `--git-dir` that cannot walk up.
+  const bareMarkers = await Promise.all(
+    ["HEAD", "objects", "refs"].map((entry) =>
+      fs.lstat(path.resolve(cwd, entry)).then(() => true).catch(() => false),
+    ),
+  );
+  const isBareCheckout = bareMarkers.every(Boolean);
+  if (!hasGitMetadata && !isBareCheckout) return { ...base, state: "not_a_checkout" };
+
+  const baseRunGit = input.runGit ?? defaultRunGit;
+  const runGit: PartialCloneGitRunner = hasGitMetadata
+    ? baseRunGit
+    : (args, dir) => baseRunGit(["--git-dir", dir, ...args], dir);
+  const filterRead = await readConfigValue(runGit, cwd, REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY);
+  const promisorRead = await readConfigValue(runGit, cwd, REMOTE_ORIGIN_PROMISOR_KEY);
+  const filter = filterRead.value;
+  const promisor = promisorRead.value;
+
+  // An unreadable config is NOT a clean repository. Reporting `not_partial` here
+  // would hide a locked config or a permission fault on shared storage behind a
+  // healthy-looking verdict, which is the one direction this guard must never
+  // fail in.
+  const unreadable = filterRead.unreadable ?? promisorRead.unreadable;
+  if (unreadable && !filter && !promisor) {
+    return {
+      ...base,
+      state: "indeterminate",
+      warning:
+        `Managed checkout "${cwd}" could not be checked for partial-clone config: ${unreadable}. ` +
+        `Treating the partial-clone state as unknown rather than healthy. If a later clone from this ` +
+        `path fails with "possible repository corruption on the remote side", check ` +
+        `${REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY} and ${REMOTE_ORIGIN_PROMISOR_KEY} by hand.`,
+      evidence: { cwd, partialCloneConfigReadError: unreadable },
+    };
+  }
   // Either key alone is enough to make this a partial clone whose later fetches
   // manufacture missing objects, so this is a union rather than a conjunction.
   if (!filter && !promisor) return { ...base, state: "not_partial" };

@@ -803,9 +803,23 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
  * containing "git": an agent's own failed `git` command is reported in its tool
  * output, not as the run's terminal `error`, so widening this to ordinary git
  * errors would buy false positives without buying coverage.
+ *
+ * It is also deliberately anchored on the STRUCTURAL phrases only. `early EOF`,
+ * `the remote end hung up unexpectedly` and `could not read from remote
+ * repository` are the canonical symptoms of a network blip, a server-side pack
+ * timeout or a large-repo stall — faults that usually succeed on the next
+ * attempt. Matching them here would rewrite `adapter_failed` (a member of
+ * `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so bounded re-dispatches today)
+ * into a cause with `maxAttempts: null` and no scheduled wake, so a DNS hiccup
+ * during bootstrap would need a human. The justification above — that the same
+ * agent against the same source cannot produce a different result — is true of
+ * an unservable source and false of a transient one, so only the phrases that
+ * can ONLY come from a structurally broken pack negotiation belong here. The
+ * real incident text carries three of them, so nothing is lost by excluding the
+ * network-shaped ones.
  */
 const WORKSPACE_GIT_TRANSPORT_FAILURE_RE =
-  /(?:git upload-pack|upload-pack:|fetch-pack:|index-pack failed|invalid index-pack output|possible repository corruption|early EOF|the remote end hung up unexpectedly|could not read from remote repository)/i;
+  /(?:git upload-pack|upload-pack:|fetch-pack:|index-pack failed|invalid index-pack output|possible repository corruption)/i;
 
 /**
  * True when this run died on a git transport fault before doing any model work.

@@ -440,6 +440,30 @@ describe("provisioning call-site invariants", () => {
     expect(wrapperBody).toContain("managed_checkout_partial_clone_unservable");
   });
 
+  it("does not let the realization loop swallow a WorkspaceValidationFailure (BLO-31351)", () => {
+    // Ally's Critical finding on PR #1611, and the reason the assertion above is
+    // not sufficient on its own: it greps for the *throw*, which is satisfied by
+    // a throw nobody lets out. `ensureManagedProjectWorkspace` has two callers.
+    // The repo-less one propagates; the repo-backed one sits inside the
+    // `realizationCandidates` loop behind `catch { ...; continue; }`, and the
+    // fall-through below that loop ends at `resolveDefaultAgentWorkspaceDir` --
+    // an EMPTY per-agent directory. Swallowing an unservable-mirror failure
+    // there runs the agent to completion against the wrong tree and records no
+    // `workspace_validation_failed` cause at all, which is strictly worse than
+    // the pre-guard behaviour of failing loudly at clone time.
+    const source = readService("heartbeat.ts");
+    const loopStart = source.indexOf("for (const workspace of realizationCandidates) {");
+    expect(loopStart).toBeGreaterThan(-1);
+    const loopBody = source.slice(loopStart, loopStart + 4000);
+
+    expect(loopBody).toContain("ensureManagedProjectWorkspace({");
+    // The rethrow must sit before the warning/continue, or the typed failure and
+    // its whole workspaceValidation evidence payload are lost to the fall-through.
+    const rethrowIndex = loopBody.indexOf("if (error instanceof WorkspaceValidationFailure) throw error;");
+    expect(rethrowIndex).toBeGreaterThan(-1);
+    expect(rethrowIndex).toBeLessThan(loopBody.indexOf("continue;"));
+  });
+
   it("keeps the managed clone free of any object filter (BLO-31351)", () => {
     // The guard above exists because this clone is a full clone. If a `--filter`
     // or `--depth` is ever added here, Paperclip starts *manufacturing* the

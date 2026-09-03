@@ -188,14 +188,45 @@ describe("classifyAdapterFailureForRecovery -- workspace git transport", () => {
   it.each([
     ["upload-pack death", "error: git upload-pack: git-pack-objects died with error."],
     ["fake corruption", "fatal: aborting due to possible repository corruption on the remote side."],
-    ["early EOF", "fatal: early EOF"],
     ["index-pack output", "fatal: fetch-pack: invalid index-pack output"],
-    ["hung up remote", "fatal: the remote end hung up unexpectedly"],
-    ["unreadable remote", "fatal: could not read from remote repository"],
   ])("classifies %s", (_label, error) => {
     expect(classifyAdapterFailureForRecovery({
       errorCode: "adapter_failed",
       error,
+      resultJson: null,
+      usageJson: null,
+    })).toMatchObject({ kind: "workspace_git_transport" });
+  });
+
+  it.each([
+    ["early EOF", "fatal: early EOF"],
+    ["hung up remote", "fatal: the remote end hung up unexpectedly"],
+    ["unreadable remote", "fatal: could not read from remote repository"],
+  ])("leaves the transient network fault %s on the retrying path", (_label, error) => {
+    // These are the canonical symptoms of a network blip, a server-side pack
+    // timeout or a large-repo stall -- faults that usually succeed on attempt
+    // two. `adapter_failed` is in `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so
+    // they get bounded re-dispatches today. Claiming them here would rewrite
+    // them to a cause with `maxAttempts: null` and no scheduled wake, so a DNS
+    // hiccup during bootstrap would need a human. Returning null keeps them
+    // retrying, and the real incident text carries three structural phrases, so
+    // excluding these loses no coverage.
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error,
+      resultJson: null,
+      usageJson: null,
+    })).toBeNull();
+  });
+
+  it("still classifies the real incident text, which mixes structural and transient phrases", () => {
+    // `early EOF` appears in the incident log too -- but alongside three
+    // structural phrases, so narrowing the regex does not lose the case it
+    // exists for. This is the test that pins that.
+    expect(POD_GIT_TRANSPORT_FAILURE).toContain("early EOF");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: POD_GIT_TRANSPORT_FAILURE,
       resultJson: null,
       usageJson: null,
     })).toMatchObject({ kind: "workspace_git_transport" });
