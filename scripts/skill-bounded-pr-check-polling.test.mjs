@@ -315,18 +315,26 @@ d=${JSON.stringify(dir)}
 # form spun to the spawn timeout without ever reaching the loop's own deadline
 # path, while the cumulative form exited THROUGH that path in ~0.5s with
 # exactly 2 stderr lines — deterministically \`ceil(90000/86400)\`, not a
-# timing artefact. Note the exit code cannot tell these apart: \`timeout\` and
-# the loop's own deadline both exit 124, so the discriminator is reaching the
-# deadline path at all, not the status. The non-cumulative form's stderr line
-# count is deliberately NOT quoted here: it is just how many iterations fit
-# inside the 30s kill, so it is purely a function of machine speed — three
-# runs of the same reconstruction gave 389, 1104 and 1348. Do not re-measure
-# it, get a different number, and conclude this note is stale.
+# timing artefact. The exit status is what tells those two apart, and it is
+# the cheapest discriminator available: this harness runs no \`timeout\`(1) —
+# \`runBlock\` is a bare \`spawnSync\` with \`timeout: 30_000\` — so a spawn-timeout
+# kill reports \`status: null\` with \`SIGTERM\`/\`ETIMEDOUT\`, while reaching the
+# loop's own deadline path exits \`124\`. That \`null\`-vs-\`124\` split is exactly
+# what every \`assert.equal(r.status, 124)\` in this file rests on; see the same
+# point made above about a loop that stops sleeping. The non-cumulative form's
+# stderr line count is deliberately NOT quoted here: it is just how many
+# iterations fit inside the 30s kill, so it is timing-dependent — machine
+# speed AND load — and three runs of the same reconstruction gave 389, 1104
+# and 1348, a 3.5x spread with the hardware held fixed. Do not re-measure it,
+# get a different number, and conclude this note is stale. Past roughly 11k
+# lines the 1 MiB default \`maxBuffer\` binds before the 30s kill does and the
+# child dies \`ENOBUFS\` instead — also \`status: null\`, so the discriminator
+# above holds in that regime too.
 #
-# No deadline in this
-# file exceeds 900 today, so this buys nothing at this head; it is here so the
-# ceiling stays a ceiling under a future edit rather than silently becoming
-# deadline-dependent. Legitimate tests are untouched — they never reach read 4.
+# No deadline in this file exceeds 900 today, so this buys nothing at this
+# head; it is here so the ceiling stays a ceiling under a future edit rather
+# than silently becoming deadline-dependent. Legitimate tests are untouched —
+# they never reach read 4.
 if [[ $1 == +%s ]]; then
   reads=$(( $(cat "$d/reads" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$reads" >"$d/reads"
