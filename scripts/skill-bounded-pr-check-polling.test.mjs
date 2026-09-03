@@ -21,6 +21,13 @@
 //   Deadlines are driven to 0 rather than waited out: the loops measure elapsed
 //   wall-clock with `date +%s`, so a 0-second deadline fires on the first pass
 //   and the timeout paths run in milliseconds.
+//
+//   Where a test needs the loop to survive one pass and time out on a LATER
+//   one, a 0-second deadline cannot express that and a small non-zero one is a
+//   race — `date +%s` is integer-second, so "1" fires whenever the first pass
+//   straddles a second boundary. Those tests pass `virtualClock: true`, which
+//   fakes `date +%s` off a counter that only advances when the loop sleeps.
+//   See the stub for the full rationale (BLO-31386).
 import { strict as assert } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
@@ -73,6 +80,9 @@ const EXECUTABLE_BLOCKS = () => [
  *
  * `checksRc` / `prViewRc` are consumed one entry per call and the last entry
  * repeats, so a test can say "pending, then green" without racing anything.
+ *
+ * `virtualClock` additionally stubs `date +%s` — see the comment on the stub
+ * itself for why any test with a single-digit deadline needs it.
  */
 function makeStubs({
   prState = "OPEN ",
@@ -82,6 +92,7 @@ function makeStubs({
   statusJson = '{"statuses":[]}',
   apiRc = [0],
   stubSleep = false,
+  virtualClock = false,
   headShas = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
   // GitLab side. `pipelineStatuses` is the newline-delimited output of
   // `glab api .../pipelines --jq '.[].status'`; [] means "no pipelines exist".
@@ -198,12 +209,67 @@ exit 99
   writeFileSync(path.join(bin, "glab"), glab);
   chmodSync(path.join(bin, "glab"), 0o755);
 
-  if (stubSleep) {
+  if (stubSleep || virtualClock) {
     // Records the requested duration and returns immediately, so the interval
     // floor is assertable without a test that actually sleeps a minute.
-    const sleep = `#!/usr/bin/env bash\nprintf '%s\\n' "$1" >>${JSON.stringify(dir)}/sleeps.log\nexit 0\n`;
+    //
+    // Under `virtualClock` it ALSO advances the fake clock by the duration it
+    // was asked to sleep. That is the whole seam: elapsed time becomes a pure
+    // function of what the loop slept, not of how long the poll body happened
+    // to take.
+    //
+    // The advance has a floor of one tick so that the clock moves even on
+    // `sleep 0`. Without it, a loop whose clamp had been removed and whose
+    // interval was 0 would advance time by 0 forever and hang until the
+    // 30-second spawn timeout — the negative control would still fail, but as
+    // an opaque timeout rather than "slept 0s, below the documented floor".
+    // A real `sleep 0` also consumes a nonzero interval, so this is the more
+    // faithful model as well as the more legible one.
+    const sleep = virtualClock
+      ? `#!/usr/bin/env bash
+d=${JSON.stringify(dir)}
+printf '%s\\n' "$1" >>"$d/sleeps.log"
+advance=$1; (( advance < 1 )) && advance=1
+printf '%s' "$(( $(cat "$d/clock") + advance ))" >"$d/clock"
+exit 0
+`
+      : `#!/usr/bin/env bash\nprintf '%s\\n' "$1" >>${JSON.stringify(dir)}/sleeps.log\nexit 0\n`;
     writeFileSync(path.join(bin, "sleep"), sleep);
     chmodSync(path.join(bin, "sleep"), 0o755);
+  }
+
+  if (virtualClock) {
+    // WHY (BLO-31386): the loops measure elapsed time as
+    // `$(date +%s) - poll_started`, which is INTEGER-second arithmetic. Under
+    // the real clock a 1-second deadline therefore fires whenever the first
+    // poll pass happens to straddle a wall-clock second boundary — an event
+    // whose probability is just the pass duration, ~30-45% here. That made
+    // "deadline long enough for one sleep, then time out" a coin flip: the
+    // loop exited 124 on the FIRST pass having slept zero times, and the
+    // suite failed on `expected at least one sleep` for ~4 runs in 9 on
+    // completely unchanged code. Because the `policy` job is a hard merge
+    // gate, each occurrence ejected an unrelated PR from the merge queue.
+    //
+    // Raising the deadline would only have made the coin flip rarer, not
+    // removed it. Stubbing `date` removes it outright: this clock ONLY moves
+    // when the loop sleeps, so wall-clock duration of the poll body — the
+    // sole source of the nondeterminism — no longer enters the arithmetic.
+    // "One sleep, then the next pass times out" becomes an arithmetic
+    // certainty at any deadline below the clamped interval.
+    //
+    // The clamp assertion stays load-bearing: the recorded sleep argument is
+    // still whatever the loop actually asked for, so dropping the 60s floor
+    // still turns the test red.
+    writeFileSync(path.join(dir, "clock"), "1000000000");
+    const date = `#!/usr/bin/env bash
+d=${JSON.stringify(dir)}
+# Only +%s is faked; anything else falls through to the real date so an
+# unrelated future use inside a skill block cannot silently read this clock.
+if [[ $1 == +%s ]]; then cat "$d/clock"; echo; exit 0; fi
+exec /usr/bin/env -i PATH=/usr/bin:/bin date "$@"
+`;
+    writeFileSync(path.join(bin, "date"), date);
+    chmodSync(path.join(bin, "date"), 0o755);
   }
   return { dir, bin };
 }
@@ -514,10 +580,13 @@ test("prcheckloop: a merged PR exits 3 without querying checks", () => {
 });
 
 test("prcheckloop: a sub-minute interval is clamped to 60s", () => {
-  const stubs = makeStubs({ checkRunsJson: PENDING_RUNS, statusJson: NO_STATUSES, stubSleep: true });
+  const stubs = makeStubs({ checkRunsJson: PENDING_RUNS, statusJson: NO_STATUSES, virtualClock: true });
   const r = runBlock(PRCHECKLOOP_LOOP(), {
     stubs,
-    // Deadline long enough for one sleep, then the second pass times out.
+    // Deadline shorter than the clamped interval, on a clock that only moves
+    // when the loop sleeps: pass 1 sees elapsed 0 and sleeps, that sleep
+    // advances the clock past the deadline, pass 2 times out. Deterministic
+    // rather than a race against wall-clock second boundaries (BLO-31386).
     env: { CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "5" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
@@ -704,9 +773,14 @@ test("check-pr GitLab: clamps a sub-minute interval to the 60s floor", () => {
   // rate the network allows — the unbounded polling this skill exists to
   // remove, reintroduced through a missing clamp. Asserted via the recorded
   // sleep argument rather than by waiting a minute.
-  const stubs = makeStubs({ pipelineStatuses: ["running"], stubSleep: true });
+  const stubs = makeStubs({ pipelineStatuses: ["running"], virtualClock: true });
   const r = runBlock(CHECK_PR_GITLAB(), {
     stubs,
+    // Same virtual-clock reasoning as the prcheckloop clamp test above. This
+    // site failed differently — the loop exited before the sleep stub had
+    // created sleeps.log at all, so it died in readFileSync with ENOENT
+    // rather than on the assertion, which is why grepping CI for the
+    // assertion text did not find it (BLO-31386).
     env: { ...GL_ENV, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "0" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
@@ -726,10 +800,14 @@ test("prcheckloop: re-reads the head each iteration and queries the NEW sha", ()
     headShas: [OLD, NEW],
     checkRunsJson: '{"check_runs":[{"name":"ci","status":"in_progress"}]}',
     statusJson: NO_STATUSES,
-    stubSleep: true,
+    virtualClock: true,
   });
   const r = runBlock(PRCHECKLOOP_LOOP(), {
     stubs,
+    // Virtual clock (BLO-31386): reaching the NEW sha requires a second pass,
+    // so under the real clock this shared the 1-second-deadline race and could
+    // exit 124 on pass 1 having never queried it — a third symptom of the same
+    // root cause ("never queried the new sha"), distinct from the other two.
     env: { HEAD_SHA: OLD, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "60" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
