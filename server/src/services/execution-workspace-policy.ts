@@ -407,3 +407,41 @@ export function executionWorkspaceUsesPerRunScope(input: {
   });
   return asString(parseObject(strategy.value).runScope, "") === "per_run";
 }
+
+/**
+ * BLO-31443: will this run work in a durable git worktree, resolved the same
+ * way realization resolves it?
+ *
+ * Deliberately mode-INDEPENDENT, because "a worktree exists" and "workspace
+ * isolation was requested" are different questions and the divergence is
+ * reachable three ways: `buildExecutionWorkspaceAdapterConfig` only strips
+ * `workspaceStrategy` for non-isolated modes when `hasWorkspaceControl` holds,
+ * the issue `adapterConfig` overlay can re-introduce it after that strip, and
+ * `realizeExecutionWorkspace` itself branches solely on
+ * `workspaceStrategy.type !== "git_worktree"` and never consults the mode. So
+ * an agent-level or issue-level strategy yields a real worktree while
+ * `workspaceIsolationRequested` (mode-derived) reads false.
+ *
+ * `buildK8sRunIsolationDescriptor` already follows that same principle for
+ * `workspaceRoot` — it keys `hasProvisionedWorktree` off the realized strategy
+ * and warns against trusting workspace *intent*. This predicate is the
+ * pre-realization half of it, needed because the writer reservation is bound
+ * long before a strategy is realized.
+ *
+ * The `=== "git_worktree"` comparison matches `realizeExecutionWorkspace`,
+ * which treats every other value as `project_primary`.
+ */
+export function executionWorkspaceUsesGitWorktree(input: {
+  agentConfig: Record<string, unknown>;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+  mode: ParsedExecutionWorkspaceMode;
+  legacyUseProjectWorkspace: boolean | null;
+  issueAdapterConfig?: Record<string, unknown> | null;
+}): boolean {
+  const strategy = resolveOverlaidWorkspaceStrategy({
+    baseConfig: buildExecutionWorkspaceAdapterConfig(input),
+    issueAdapterConfig: input.issueAdapterConfig,
+  });
+  return asString(parseObject(strategy.value).type, "") === "git_worktree";
+}

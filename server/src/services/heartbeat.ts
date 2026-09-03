@@ -376,6 +376,7 @@ import {
 import {
   buildExecutionWorkspaceAdapterConfig,
   executionWorkspaceUsesPerRunScope,
+  executionWorkspaceUsesGitWorktree,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
@@ -6372,14 +6373,19 @@ export function buildK8sRunIsolationDescriptor(input: {
   // branch of `resolveK8sRunIsolationIdentity` ahead of any persisted workspace
   // and must not be pinned to a durable checkout.
   //
-  // KNOWN, DELIBERATE NARROWING OF EXCLUSIVITY — read before widening this.
-  // The `run:<runId>` workspace path was unique *by construction*, so it also
-  // acted as a de-facto exclusion on the workspace. `cwd` under the default
+  // EXCLUSIVITY: closed by BLO-31443, do not re-derive this as a live defect.
+  // The `run:<runId>` workspace path used to be unique *by construction*, so it
+  // also acted as a de-facto exclusion on the workspace. `cwd` under the default
   // `per_issue` runScope is keyed by issue, not run, so that incidental
-  // exclusivity is gone: two runs of one issue hold distinct `run:` keys, both
-  // satisfy the single-writer guard on
-  // `external_runtime_reservations_active_isolation_writer_idx`, and both now
-  // resolve to the same worktree.
+  // exclusivity was lost here: two runs of one issue held distinct writer keys
+  // and both satisfied
+  // `external_runtime_reservations_active_isolation_writer_idx`.
+  //
+  // `resolveK8sRunIsolationIdentity` now takes `perIssueWorkspaceTreeKey` and
+  // keys the reservation off the tree instead, so same-issue runs collide on
+  // that index and the second is deferred. Nothing about the PATHS below
+  // changed -- `isolationMode` is untouched, so every root still derives from
+  // `runId`/`persistedExecutionWorkspaceId` exactly as it did.
   //
   // Same-issue concurrency is REACHABLE — do not assume the checkout lock
   // prevents it. `claimQueuedRun` normally requires
@@ -6396,11 +6402,13 @@ export function buildK8sRunIsolationDescriptor(input: {
   // of the same issue share that issue's own worktree" is the sharing model
   // `per_issue` runScope already describes.
   //
-  // The principled repair is to key the isolation reservation off the resolved
-  // workspace PATH rather than the run id, so different issues still get
-  // distinct keys (preserving BLO-16842 sibling concurrency) while same-issue
-  // runs serialize. That changes BLO-16842's invariant and is tracked
-  // separately rather than smuggled in here.
+  // The narrowing above was accepted here rather than fixed here because the
+  // repair changes BLO-16842's invariant: key the reservation off the resolved
+  // workspace tree rather than the run id, so different issues still get
+  // distinct keys (preserving sibling concurrency) while same-issue runs
+  // serialize. That shipped as BLO-31443 in
+  // `resolveK8sRunIsolationIdentity`/`withPerIssueWorkspaceTreeKey`, not in this
+  // function -- this one still only decides where the repo lives.
   const hasProvisionedWorktree =
     !input.statelessPrReview &&
     input.executionWorkspace.strategy === "git_worktree" &&
@@ -6482,6 +6490,14 @@ export function resolveK8sRunIsolationIdentity(input: {
   persistedExecutionWorkspaceId?: string | null;
   persistedWorkspaceExplicitlySelected?: boolean;
   effectiveMaxConcurrentRuns: number;
+  /**
+   * BLO-31443: stable identity of the durable per-issue tree this run will
+   * work in, or null when the run gets a tree nothing else can reach.
+   * Non-null makes the writer reservation follow the TREE instead of the RUN.
+   * Callers must pass null for `per_run` runScope and for stateless PR review,
+   * both of which are run-unique by construction.
+   */
+  perIssueWorkspaceTreeKey?: string | null;
 }): { isolationMode: "shared" | "run" | "workspace"; isolationKey: string } | null {
   if (!isK8sAdapter(input.adapterType)) return null;
   if (input.statelessPrReview) {
@@ -6500,10 +6516,22 @@ export function resolveK8sRunIsolationIdentity(input: {
       (input.persistedWorkspaceExplicitlySelected && input.effectiveMaxConcurrentRuns > 1)
     )
   ) {
-    return {
-      isolationMode: "workspace",
+    const persistedIdentity = {
+      isolationMode: "workspace" as const,
       isolationKey: `workspace:${input.persistedExecutionWorkspaceId}`,
     };
+    // BLO-31443: an EXPLICITLY reused persisted workspace already names the tree
+    // itself, and several issues can point at one such workspace (that is what
+    // `executionWorkspacePreference: "reuse_existing"` and `shared_workspace`
+    // mode are for). Substituting a per-issue key here would LOOSEN exclusivity
+    // rather than tighten it: two different issues sharing one workspace would
+    // get two distinct keys and both write the same tree -- the same defect
+    // class this row exists to close, in the opposite direction. Only the
+    // run-unique key below (a per-run `randomUUID()` minted because the issue
+    // has no persisted workspace yet) is safe to replace.
+    return input.persistedWorkspaceExplicitlySelected
+      ? persistedIdentity
+      : withPerIssueWorkspaceTreeKey(persistedIdentity, input.perIssueWorkspaceTreeKey);
   }
   // Workspace intent without a persisted workspace id has no stable workspace
   // key yet. That pre-existing gap used to fall through to shared isolation;
@@ -6520,9 +6548,62 @@ export function resolveK8sRunIsolationIdentity(input: {
   // Runs targeting an explicitly reused persisted workspace (handled above)
   // never reach this branch, so anonymous siblings still get distinct keys.
   if (input.effectiveMaxConcurrentRuns > 1) {
-    return { isolationMode: "run", isolationKey: `run:${input.runId}` };
+    return withPerIssueWorkspaceTreeKey(
+      { isolationMode: "run", isolationKey: `run:${input.runId}` },
+      input.perIssueWorkspaceTreeKey,
+    );
   }
   return { isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` };
+}
+
+/**
+ * BLO-31443: make the single-writer reservation follow the TREE, not the RUN.
+ *
+ * BLO-31282 (#1610) stopped overriding `workspaceRoot` for a run that already
+ * had a git worktree cut for it, which fixed base-checkout contamination but
+ * gave up an incidental exclusivity property. `run:<runId>` and
+ * `workspace:<freshUuid>` are both unique per RUN, whereas the worktree they
+ * resolve to is keyed by ISSUE under the default `per_issue` runScope. Two
+ * concurrent runs of one issue therefore held two distinct keys, both satisfied
+ * `external_runtime_reservations_active_isolation_writer_idx`, and both wrote
+ * the same tree. Substituting a per-issue key makes them collide on that index,
+ * so the second serializes instead.
+ *
+ * Two same-issue runs are reachable and this is NOT closable by config: the
+ * `executionRunClaimCondition` UPDATE matches zero rows for an interaction wake
+ * and that failure is deliberately tolerated (`allowsIssueInteractionWake`), so
+ * the second run never contends for `issues.executionRunId` at all.
+ *
+ * THE INVARIANT: only ever replace a key that is RUN-UNIQUE. A key that already
+ * names a shared tree is at least as strict as the per-issue key, so
+ * substituting it would loosen exclusivity instead of tightening it. Three keys
+ * are therefore left alone, each for its own reason:
+ *
+ * - `shared` (`agent-shared:<agentId>`) is already STRICTER than per-tree — one
+ *   writer per agent. Substituting a per-tree key there would *loosen* it and
+ *   let an effective-concurrency-1 agent hold two reservations for different
+ *   issues, inverting BLO-16842's containment.
+ * - `workspace:<id>` for an EXPLICITLY reused persisted workspace already names
+ *   the tree, and several issues may share one such workspace, so a per-issue
+ *   key would let those issues write it concurrently. Gated at the call site in
+ *   `resolveK8sRunIsolationIdentity`, and guarded by
+ *   `heartbeat-external-runtime-retry.test.ts`, which binds an owner on
+ *   `workspace:<sharedId>` and requires a contender on a DIFFERENT issue to
+ *   collide with it.
+ * - stateless PR review never reaches this helper; it returns run-scoped
+ *   isolation ahead of every other branch and must stay fully ephemeral.
+ *
+ * `isolationMode` is untouched, so every filesystem root keeps deriving from
+ * `runId`/`persistedExecutionWorkspaceId` exactly as before — only the
+ * reservation key, the `tmpRoot` hash and `sessionScope.isolationKey` move.
+ */
+function withPerIssueWorkspaceTreeKey(
+  identity: { isolationMode: "shared" | "run" | "workspace"; isolationKey: string },
+  perIssueWorkspaceTreeKey: string | null | undefined,
+): { isolationMode: "shared" | "run" | "workspace"; isolationKey: string } {
+  const treeKey = readNonEmptyString(perIssueWorkspaceTreeKey ?? null);
+  if (!treeKey || identity.isolationMode === "shared") return identity;
+  return { isolationMode: identity.isolationMode, isolationKey: `workspace-tree:${treeKey}` };
 }
 
 const K8S_ISOLATION_OWNED_ENV_KEYS = new Set([
@@ -26503,6 +26584,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? randomUUID()
             : null
         );
+    // BLO-31443: the writer reservation must exclude on the TREE this run will
+    // work in, not on the run. The literal `cwd` is unavailable here -- it needs
+    // `repoRoot` from a `git rev-parse` against `resolvedWorkspace.cwd`, which is
+    // not resolved until ~700 lines below, and the reservation has to be bound
+    // before the workspace is realized. Under `per_issue` runScope the resolved
+    // path is a pure function of the issue (identifier + title -> branch name ->
+    // directory, with no run input), so the issue IS the equivalence class of
+    // that path: keying on it collides exactly when two runs would share a tree.
+    //
+    // Scoped by `projectWorkspaceId` because one issue can hold trees in several
+    // repos of a multi-repo project, and those are genuinely independent.
+    //
+    // Two deliberate exclusions:
+    // - `per_run` runScope appends a run token to the branch, hence to the
+    //   directory, so those runs are already tree-unique and must NOT collide.
+    // - a stateless PR review is run-unique by construction and is filtered in
+    //   the resolver ahead of every other branch.
+    //
+    // Conservative in the one case where issue and path disagree: an issue
+    // retitled between runs resolves to a NEW directory while keeping its id, so
+    // this over-serializes rather than under-serializes. Serializing two runs
+    // that could have been parallel costs latency; letting two runs share one
+    // tree corrupts a checkout.
+    const perIssueWorkspaceTreeKey =
+      issueRef?.id &&
+      paperclipPrReview === null &&
+      !executionWorkspaceUsesPerRunScopeForIssue &&
+      (
+        workspaceIsolationRequested ||
+        workspaceReuseRequest.existingExecutionWorkspaceAvailable ||
+        executionWorkspaceUsesGitWorktree({
+          agentConfig: config,
+          projectPolicy: projectExecutionWorkspacePolicy,
+          issueSettings: issueExecutionWorkspaceSettings,
+          mode: requestedExecutionWorkspaceMode,
+          legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+          issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
+        })
+      )
+        ? `${issueRef.projectWorkspaceId ?? "no-project-workspace"}:${issueRef.id}`
+        : null;
     const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
       adapterType: agent.adapterType,
       runId: run.id,
@@ -26511,6 +26633,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       isWorkspaceIsolated: workspaceIsolationRequested,
       persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
       persistedWorkspaceExplicitlySelected: workspaceReuseRequest.existingExecutionWorkspaceAvailable,
+      perIssueWorkspaceTreeKey,
       effectiveMaxConcurrentRuns:
         resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
     });
