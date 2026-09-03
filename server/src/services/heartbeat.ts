@@ -6353,12 +6353,15 @@ export function buildK8sRunIsolationDescriptor(input: {
   // resolve to the same worktree.
   //
   // Same-issue concurrency is REACHABLE — do not assume the checkout lock
-  // prevents it. `claimQueuedRun` normally requires
-  // `executionRunId IS NULL OR = <claiming run>` (see the
-  // `executionRunClaimCondition` guard), but that lock is skipped entirely when
-  // `allowsIssueInteractionWake` holds — an issue-interaction wake carrying a
-  // comment id is deliberately allowed to run while another run holds the
-  // issue, so a human can talk to the assignee mid-flight.
+  // prevents it. `executionRunClaimCondition` is NOT skipped for an interaction
+  // wake: it is built unconditionally (`:19714`) and is always present in the
+  // claiming UPDATE's `.where(...)`. The claim condition is still applied, but
+  // an interaction wake tolerates it matching nothing and proceeds without
+  // holding the issue lock (`:19839` skips the cancel, control falls through to
+  // `return claimed` at `:19853`). The second run therefore never acquires
+  // `issues.executionRunId` at all — it is a deliberately lock-less run, not a
+  // competing lock holder, so there is no lock-ordering or retry fix available
+  // and no configuration in which the race closes.
   //
   // This is still strictly better than the behavior it replaces, which is why
   // it ships: the pre-fix run did not get an exclusive workspace either, it got
@@ -6370,8 +6373,8 @@ export function buildK8sRunIsolationDescriptor(input: {
   // The principled repair is to key the isolation reservation off the resolved
   // workspace PATH rather than the run id, so different issues still get
   // distinct keys (preserving BLO-16842 sibling concurrency) while same-issue
-  // runs serialize. That changes BLO-16842's invariant and is tracked
-  // separately rather than smuggled in here.
+  // runs serialize. That changes BLO-16842's invariant and is tracked in
+  // BLO-31443 rather than smuggled in here.
   const hasProvisionedWorktree =
     !input.statelessPrReview &&
     input.executionWorkspace.strategy === "git_worktree" &&
