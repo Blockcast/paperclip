@@ -3115,8 +3115,8 @@ describe("K8s session isolation metadata", () => {
   // the broader in-function definition (mode OR task_session OR git_worktree).
   // Pin the shipping path explicitly so a future change to either definition
   // cannot silently stop covering it.
-  it("keeps the provisioned worktree when the isolation identity is precomputed by dispatch", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+  const buildPrecomputedIdentityDescriptor = () =>
+    buildK8sRunIsolationDescriptor({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3134,19 +3134,29 @@ describe("K8s session isolation metadata", () => {
       isolationIdentity: { isolationMode: "run", isolationKey: "run:run-1" },
     });
 
+  it("keeps the provisioned worktree when the isolation identity is precomputed by dispatch", () => {
+    const isolation = buildPrecomputedIdentityDescriptor();
     expect(isolation).toMatchObject({
       isolationMode: "run",
       isolationKey: "run:run-1",
       workspaceRoot: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
     });
     expect(isolation?.storage.workspace).toBe("persistent");
-    // BLO-31443: pin that keeping the *workspace* persistent did not leak into
-    // the sibling roots. Home/session/cache must stay ephemeral and stay under
-    // the per-run isolation root -- that leak is the plausible regression if
-    // someone later widens `usesEphemeralWorkspace` to cover them too.
+    // BLO-31443: keeping the *workspace* persistent must not leak into the
+    // sibling storage classes. These three are the ones that would move if
+    // someone later widened `usesEphemeralWorkspace` to cover them too.
     expect(isolation?.storage.home).toBe("ephemeral");
     expect(isolation?.storage.session).toBe("ephemeral");
     expect(isolation?.storage.cache).toBe("ephemeral");
+  });
+
+  // BLO-31443: a DIFFERENT invariant from the storage classes above, split out
+  // so a failure here is not misread as the widening regression. `homeRoot` and
+  // `sessionRoot` never consult `usesEphemeralWorkspace` -- they key purely off
+  // `isolationMode` -- so that widening cannot move them. What these pin is the
+  // ephemeral root LAYOUT, which is worth catching if it ever changes silently.
+  it("keeps the sibling roots under the per-run ephemeral root when the worktree is pinned", () => {
+    const isolation = buildPrecomputedIdentityDescriptor();
     expect(isolation?.homeRoot).toBe("/runtime-cache/paperclip-runs/run-1/home");
     expect(isolation?.sessionRoot).toBe("/runtime-cache/paperclip-runs/run-1/session");
   });
