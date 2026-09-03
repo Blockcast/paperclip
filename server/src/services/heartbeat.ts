@@ -9392,8 +9392,16 @@ function prReviewOutputHasSelfReviewSkip(
 // explains the wake (third Ally pass), so both cues look only at the text
 // BEFORE the clause, and that scope ends at . : ; , — – or a newline, so a
 // clause joined by a colon or dash does not inherit a hedge from the previous
-// clause.
-function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
+// clause. The same before-scope also carries a negation cue for the
+// non-adjacent form ("no evidence this head was already reviewed at …",
+// "I cannot see that this head was already reviewed at …" — fourth Ally pass:
+// the adjacent form alone let these through as `already_reviewed`, the masking
+// direction). The scope is capped at 120 characters before the clause; a
+// comma-free run-on longer than that escapes the vetoes, which no real
+// reviewer sentence has approached (commas are themselves boundaries), and an
+// uncapped `[^…]*$` scan is quadratic on long outputs.
+// Exported for direct table tests of the veto boundaries.
+export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   // Markdown that may sit between tokens: whitespace, backticks, bold/italic.
   const md = "[\\s`*_]*";
   const pattern = new RegExp(
@@ -9402,7 +9410,8 @@ function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
     // so "**Already reviewed** at `<sha>`" (markdown closing before the sha)
     // matches while `alreadyreviewed` cannot.
     "(?<negated>\\b(?:not|never|wasn['\u2019]?t|weren['\u2019]?t|isn['\u2019]?t|aren['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been)[\\s`*_]+){0,2})?" +
-      `\\balready[\\s\`*_]+reviewed[\\s\`*_]+at${md}` +
+      // `+` after `at` too: `at8b237675…` with no separator is not the clause.
+      "\\balready[\\s`*_]+reviewed[\\s`*_]+at[\\s`*_]+" +
       // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
       `(?:[^\\s\`*_]{1,40}${md}for${md})?(?:(?:head|commit)${md})?` +
       "([0-9a-f]{7,40})(?![0-9a-f])",
@@ -9415,10 +9424,15 @@ function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|not\s+able\s+to|did\s+not|didn['\u2019]?t)\s+(?:\w+\s+){1,3}(?:if|whether))\b/i;
   // The clause's subject is a superseded head, not the live one.
   const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
+  // A negation governing the clause from further back in the same clause
+  // ("no evidence … was already reviewed at", "cannot see that … was already
+  // reviewed at"). `cannot`/`can't` are listed because `\bnot\b` does not
+  // match inside `cannot`.
+  const negation = /\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|without)\b/i;
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
-    if (hedge.test(before) || priorHead.test(before)) continue;
+    if (hedge.test(before) || priorHead.test(before) || negation.test(before)) continue;
     return true;
   }
   return false;
