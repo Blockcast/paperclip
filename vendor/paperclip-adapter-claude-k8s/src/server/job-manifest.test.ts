@@ -816,12 +816,16 @@ describe("buildJobManifest", () => {
       expect(env.get("TEMP")).toBe("/runtime-cache/paperclip-runs/run-abc12345/tmp");
       expect(env.get("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
       expect(command).toContain("if git -C '/paperclip/source-worktree' rev-parse --verify HEAD");
-      expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      expect(command).toContain("git clone --shared --no-checkout --origin origin -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("checkout --detach \"$source_head\"");
       // BLO-31359: no recorded upstream, so the clone is left with no remote at
-      // all rather than one aimed back at the clone source.
+      // all rather than one aimed back at the clone source — plus a breadcrumb,
+      // so the resulting "'origin' does not appear to be a git repository" is
+      // self-explaining.
       expect(command).toContain("git -C '/runtime-cache/paperclip-runs/run-abc12345/workspace' remote remove origin");
       expect(command).not.toContain("remote add origin");
+      expect(command).not.toContain("fetch --no-tags");
+      expect(command).toContain("config paperclip.originRemoved");
       expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
@@ -860,17 +864,60 @@ describe("buildJobManifest", () => {
       // The clone still comes off local disk — that is what makes provisioning
       // cheap — but the base must not survive as a remote.
       expect(command).toContain(
-        `git clone --shared --no-checkout -- '/paperclip/instances/default/projects/co1/proj-1/paperclip' '${workspaceRoot}'`,
+        `git clone --shared --no-checkout --origin origin -- '/paperclip/instances/default/projects/co1/proj-1/paperclip' '${workspaceRoot}'`,
       );
       expect(command).toContain(`git -C '${workspaceRoot}' remote remove origin`);
       expect(command).toContain(
-        `git -C '${workspaceRoot}' remote add origin 'https://github.com/Blockcast/paperclip.git'`,
+        `git -C '${workspaceRoot}' remote add origin -- 'https://github.com/Blockcast/paperclip.git'`,
       );
       // Remove must precede add, or the add fails and the base stays wired up.
       expect(command.indexOf("remote remove origin")).toBeLessThan(command.indexOf("remote add origin"));
-      // Fail-closed: both remote commands sit in the `&&` chain, so a failure
-      // aborts the run rather than handing back a base-writable workspace.
+      // Fail-closed: the two commands that establish the security property sit
+      // in the `&&` chain unguarded, so a failure aborts the run rather than
+      // handing back a base-writable workspace.
       expect(command).not.toMatch(/remote (remove|add) origin[^&|]*\|\|/);
+
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
+    });
+
+    // `git remote remove` also deletes every refs/remotes/origin/*, so without
+    // this the workspace has no remote-tracking refs and `git rebase
+    // origin/master` fails with `unknown revision`. The refetch is ergonomics,
+    // not security, so unlike the remove/add pair it is guarded — an offline pod
+    // must degrade to "fetch first", never to a failed run.
+    it("refetches remote-tracking refs after repointing origin, without letting a fetch failure fail the run", () => {
+      ctx.context = {
+        paperclipWorkspace: {
+          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+
+      expect(command).toContain(`git -C '${workspaceRoot}' fetch --no-tags --quiet origin`);
+      // Fetch only after origin points at upstream — fetching earlier would pull
+      // the base's refs back in under the name `origin`.
+      expect(command.indexOf("remote add origin")).toBeLessThan(command.indexOf("fetch --no-tags"));
+      // Guarded, and in a subshell: `a && b || true` would parse as
+      // `(a && b) || true` and swallow failures of the unguarded security
+      // commands earlier in the chain.
+      expect(command).toContain(`(git -C '${workspaceRoot}' fetch --no-tags --quiet origin ||`);
+      expect(command).toContain("config paperclip.originFetchFailed");
 
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");

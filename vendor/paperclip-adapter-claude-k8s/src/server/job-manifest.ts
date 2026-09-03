@@ -1612,10 +1612,23 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   //
   // Remove-then-add rather than `set-url`: `git remote remove` drops the whole
   // `remote.origin` section, so the re-added remote cannot inherit a stale
-  // `pushurl` still aimed at the base. Both commands stay in the `&&` chain
-  // unguarded — this fails the run closed rather than handing back a workspace
-  // that can write to the base.
+  // `pushurl` still aimed at the base.
+  //
+  // `remote remove` also deletes every `refs/remotes/origin/*`, so the clone is
+  // briefly left with no remote-tracking refs and `origin/<branch>` is an
+  // unknown revision. That is deliberate, not collateral: those refs described
+  // the *base's* local branches while being named as though they described
+  // upstream, and a lying ref is worse than a missing one. The best-effort
+  // fetch below repopulates them from the real upstream, which is the first
+  // time `origin/master` in a run workspace has actually meant upstream.
+  //
+  // Guarding rule for this chain: commands that establish the security property
+  // (the base must not be reachable as a remote) stay UNGUARDED so a failure
+  // fails the run closed rather than handing back a base-writable workspace.
+  // Commands that only provide ergonomics or diagnostics are guarded, so a
+  // network blip or a read-only config cannot take down pod startup.
   const upstreamRepoUrl = asString(workspaceContext.repoUrl, "").trim();
+  const runWorkspaceGit = `git -C ${quoteShellArg(isolation.workspaceRoot)}`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1624,15 +1637,35 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
           // Git objects are immutable/content-addressed and may be shared read-only;
           // the clone still owns its refs, index, worktree, and lock files.
-          `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
-          `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
-          `git -C ${quoteShellArg(isolation.workspaceRoot)} remote remove origin`,
-          // No recorded upstream (a cwd that happens to be a repo, e.g. a stray
-          // `.git` under the per-agent fallback home): leave the clone with no
-          // remote at all rather than one aimed at the base.
+          //
+          // `--origin origin` pins the remote name: `git clone` otherwise honors
+          // `clone.defaultRemoteName`, and because the removal below is unguarded,
+          // an image that ever set that config would hard-fail every run-isolated
+          // pod with `error: No such remote: 'origin'`.
+          `git clone --shared --no-checkout --origin origin -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
+          `${runWorkspaceGit} checkout --detach "$source_head"`,
+          `${runWorkspaceGit} remote remove origin`,
           ...(upstreamRepoUrl
-            ? [`git -C ${quoteShellArg(isolation.workspaceRoot)} remote add origin ${quoteShellArg(upstreamRepoUrl)}`]
-            : []),
+            ? [
+                // `--` because `quoteShellArg` stops shell injection but not git's
+                // own option parsing, and a repoUrl starting with `-` would
+                // otherwise be read as a flag.
+                `${runWorkspaceGit} remote add origin -- ${quoteShellArg(upstreamRepoUrl)}`,
+                // Ergonomics, not security: restore `origin/<branch>` so the
+                // common `git rebase origin/master` / `git log origin/master..HEAD`
+                // phrasings resolve. Guarded, and leaves a breadcrumb when it
+                // cannot run, so an offline pod degrades to "fetch first" rather
+                // than to a failed run or an unexplained `unknown revision`.
+                `(${runWorkspaceGit} fetch --no-tags --quiet origin || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+              ]
+            : [
+                // No recorded upstream (a cwd that happens to be a repo, e.g. a
+                // stray `.git` under the per-agent fallback home): leave the clone
+                // with no remote at all rather than one aimed at the base, and say
+                // so on the workspace so the resulting `fatal: 'origin' does not
+                // appear to be a git repository` is self-explaining.
+                `(${runWorkspaceGit} config paperclip.originRemoved 'no upstream recorded for this run; origin removed so the clone source (a shared base checkout) is not a push target (BLO-31359)' || true)`,
+              ]),
         ].join(" && ")};`,
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a
