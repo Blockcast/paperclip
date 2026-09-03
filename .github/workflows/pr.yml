@@ -123,6 +123,16 @@ jobs:
       # of the 1.7 GB image (measured 3m3s) failed a good build at 180s — and
       # the render-level test above cannot tell a fix apart from a rewording.
       # Slower than its neighbours because it must let real budgets expire.
+      #
+      # The 1-minute bound is measured, not guessed: 21.5s locally and 23s on a
+      # runner (run 33714085042, policy job), a 7% spread, so ~2.5x margin. It
+      # does not need the 3x that BLO-31405 asks of the Helm render suite,
+      # because the two have different variance profiles: this file's cost is
+      # almost entirely fixed `sleep`, which does not dilate under runner
+      # contention, whereas that suite forks `helm template` 18 times and ranges
+      # 21.8s local to 32-73s on CI. Keep this bound honest by re-measuring
+      # rather than by analogy -- but if you add a test here that waits on a new
+      # budget, it lands on the bound directly, so check the total.
       - name: Test pending-migration pre-flight phase budgets (BLO-31254)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
