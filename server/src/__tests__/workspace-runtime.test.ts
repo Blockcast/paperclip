@@ -3696,9 +3696,9 @@ describe("realizeExecutionWorkspace", () => {
       // to: an inconclusive *initial* probe found no fault to act on, so it must
       // not have run a repair, nor claimed one. (Pairing a repair claim with an
       // inconclusive *post-repair* verification is a different, specified case
-      // -- see "reports both the repair and the degradation when the post-repair
-      // re-check stalls" -- so this assertion is only sound once the stage above
-      // is pinned.)
+      // -- see "reports both the submodule repair and the degradation when the
+      // post-repair re-check stalls" -- so this assertion is only sound once the
+      // stage above is pinned.)
       expect(
         operations.some(
           (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
@@ -3920,7 +3920,7 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
-  it("still degrades when a stalled probe produced no fault record", async () => {
+  it("still degrades when a stalled submodule probe produced no fault record", async () => {
     // The converse of the test above, and the property that keeps this from
     // becoming a fail-*closed* regression: an empty or fault-free partial output
     // is NOT evidence of health (an early kill or stdio buffering can yield zero
@@ -4183,7 +4183,7 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
-  it("reports both the repair and the degradation when the post-repair re-check stalls", async () => {
+  it("reports both the submodule repair and the degradation when the post-repair re-check stalls", async () => {
     // The other timeout tests all stall the *initial* probe. This covers the
     // second inspection site, which has a different obligation: the repair
     // commands really did succeed, so the run must report that alongside the
@@ -4281,7 +4281,7 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
-  it("reports both the repair and the degradation when a salvaged initial stall is followed by a stalled re-check", async () => {
+  it("reports both the submodule repair and the degradation when a salvaged initial stall is followed by a stalled re-check", async () => {
     // BLO-30301: this is the exact path CI drifted into when the sibling
     // "degrades to a warning ..." test ran on a 1ms budget with no shim, and it
     // is a distinct path from the test above -- there the initial probe *exits*
