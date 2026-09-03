@@ -38,12 +38,28 @@ const EARLY_BAIL_CEILING_SECONDS = STARTUP_BUDGET_SECONDS / 6;
 // the floor derived below.
 const PULL_ERROR_BUDGET_SECONDS = 5;
 
-// The bar for "kept polling through a recoverable pull error". Derived so the
-// two move together: lowering the budget alone would otherwise put the floor
-// above it and fail a correct script, and raising it alone would silently
-// weaken the assertion. The margin absorbs the script's whole-second deadline
-// compare, which can round down ~1s early against this wall clock.
-const PULL_ERROR_FLOOR_SECONDS = PULL_ERROR_BUDGET_SECONDS * 0.7;
+// Both the script and the stub compare a whole-second `date +%s` against a
+// deadline built from a whole-second start stamp, so a budget of N can be
+// satisfied after as little as N-1 seconds of wall clock -- the truncated start
+// instant is up to 1s in the past. Any "the budget was really spent" floor at
+// or above N-1 therefore fails on a correct script whenever the invocation
+// lands late in a second. Measured: a 1.5s floor against the 2s run budget
+// failed at 1.2s in roughly 1 run of 6 under load.
+//
+// So subtract the granularity first and only then take a margin, rather than
+// taking a fraction of the budget and hoping it clears. The remaining floor is
+// still several times the ~0.2s short-circuit path it exists to exclude, so it
+// stays load-bearing.
+const CLOCK_GRANULARITY_SECONDS = 1;
+const spentFloor = (budgetSeconds) => (budgetSeconds - CLOCK_GRANULARITY_SECONDS) * 0.75;
+
+// A pull slower than the run budget by more than the truncation above can
+// erase. One second is not enough: the stub's clock origin is its first call,
+// which is the `apply` the script makes *before* stamping startup_began, so the
+// two origins can land in different seconds and the script's reported
+// startup_seconds reads 1s short of this. At RUN_BUDGET_SECONDS + 1 that
+// under-report lands exactly on the budget and the strict comparison fails.
+const SLOW_PULL_SECONDS = RUN_BUDGET_SECONDS + CLOCK_GRANULARITY_SECONDS + 1;
 
 // Stands in for the cluster. Container start is a function of elapsed time so a
 // slow image pull can be simulated without one.
@@ -137,14 +153,14 @@ test("a pull slower than the run budget still passes", () => {
   // The BLO-31254 regression: the container becomes Running only after the
   // 2s run budget would already have expired. A single budget fails here; a
   // startup phase that gates the run clock does not.
-  const { code, output } = runPreflight({ STUB_READY_AFTER: "3" });
+  const { code, output } = runPreflight({ STUB_READY_AFTER: String(SLOW_PULL_SECONDS) });
 
   assert.equal(code, 0, `slow pull must not fail the gate:\n${output}`);
   assert.match(output, /PASSED/);
   const started = Number(output.match(/container started within (\d+)s/)?.[1]);
   assert.ok(
-    started > 2,
-    `startup must have outlasted the 2s run budget, proving the pull was not charged to it (got ${started}s)`,
+    started > RUN_BUDGET_SECONDS,
+    `startup must have outlasted the ${RUN_BUDGET_SECONDS}s run budget, proving the pull was not charged to it (got ${started}s)`,
   );
 });
 
@@ -176,9 +192,9 @@ test("a started-but-unfinished check is reported as migrations in trouble", () =
   assert.doesNotMatch(output, /never started/, "this is the opposite cause and must not reuse that wording");
   // Without this the test passes on a stub that resolves instantly, i.e. it
   // would assert the message of a run-budget exhaustion that never happened.
-  // Derived from the budget rather than restated, with slop for the
-  // whole-second compare inside the stub.
-  const floor = RUN_BUDGET_SECONDS * 0.75;
+  // Derived from the budget rather than restated, net of the whole-second
+  // granularity noted at the constant.
+  const floor = spentFloor(RUN_BUDGET_SECONDS);
   assert.ok(
     elapsed >= floor,
     `the run budget must actually be spent, not short-circuited (took ${elapsed.toFixed(1)}s)`,
@@ -290,7 +306,7 @@ test("a transient pull error rides out the startup budget rather than failing fa
   // terminal-error path returns in ~0.2s, so any floor in seconds settles it
   // without making the assertion a hostage to second-granularity slop.
   assert.ok(
-    elapsed >= PULL_ERROR_FLOOR_SECONDS,
+    elapsed >= spentFloor(PULL_ERROR_BUDGET_SECONDS),
     `must keep waiting through a recoverable pull error (took ${elapsed}s)`,
   );
   assert.match(output, /ImagePullBackOff/);
