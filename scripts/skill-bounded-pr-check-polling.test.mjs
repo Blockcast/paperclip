@@ -242,13 +242,18 @@ exit 0
     // WHY (BLO-31386): the loops measure elapsed time as
     // `$(date +%s) - poll_started`, which is INTEGER-second arithmetic. Under
     // the real clock a 1-second deadline therefore fires whenever the first
-    // poll pass happens to straddle a wall-clock second boundary — an event
-    // whose probability is just the pass duration, ~30-45% here. That made
-    // "deadline long enough for one sleep, then time out" a coin flip: the
-    // loop exited 124 on the FIRST pass having slept zero times, and the
-    // suite failed on `expected at least one sleep` for ~4 runs in 9 on
-    // completely unchanged code. Because the `policy` job is a hard merge
-    // gate, each occurrence ejected an unrelated PR from the merge queue.
+    // poll pass happens to straddle a wall-clock second boundary. Its
+    // probability is just the fraction of a second that pass occupies, so the
+    // rate is load-DEPENDENT rather than a fixed property of the test: ~5%
+    // (1/20) on a quiet sandbox, but 4-in-6 under induced CPU load. CI runners
+    // are the loaded case, and CI is where this was first seen. Do not measure
+    // this locally, get 5%, and conclude the note is stale.
+    //
+    // That made "deadline long enough for one sleep, then time out" a coin
+    // flip: the loop exited 124 on the FIRST pass having slept zero times, and
+    // the suite failed on `expected at least one sleep` on completely
+    // unchanged code. Because the `policy` job is a hard merge gate, each
+    // occurrence ejected an unrelated PR from the merge queue.
     //
     // Raising the deadline would only have made the coin flip rarer, not
     // removed it. Stubbing `date` removes it outright: this clock ONLY moves
@@ -263,10 +268,32 @@ exit 0
     writeFileSync(path.join(dir, "clock"), "1000000000");
     const date = `#!/usr/bin/env bash
 d=${JSON.stringify(dir)}
-# Only +%s is faked; anything else falls through to the real date so an
+# Only +%s is faked; a non-epoch use falls through to the real date so an
 # unrelated future use inside a skill block cannot silently read this clock.
+#
+# The fall-through is deliberately CLOSED to epoch reads, because matching
+# only an exact \`+%s\` is asymmetric: it stops the fake clock leaking into
+# unrelated \`date\` uses, but does nothing to stop an epoch read escaping the
+# fake clock. A future \`date -u +%s\`, or any epoch read carrying a leading
+# flag, would reach the REAL clock and silently reinstate the very race this
+# stub exists to remove — no failure, just an intermittent merge-gating flake
+# again. So an unhandled argument mentioning %s is a hard error: loud at the
+# one site where silence was expensive (BLO-31386).
 if [[ $1 == +%s ]]; then cat "$d/clock"; echo; exit 0; fi
-exec /usr/bin/env -i PATH=/usr/bin:/bin date "$@"
+for a in "$@"; do
+  case $a in
+    *%s*)
+      printf 'virtual clock stub: unhandled epoch format: %s\\n' "$*" >&2
+      exit 64
+      ;;
+  esac
+done
+# PATH is overridden so this stub cannot recurse into itself. The rest of the
+# environment is inherited on purpose: \`env -i\` would also drop TZ and the
+# locale, so a future non-epoch \`date\` would format in UTC/C under test and
+# in the runner's zone in production — a divergence that would surface only as
+# a mismatched formatted string.
+exec /usr/bin/env PATH=/usr/bin:/bin date "$@"
 `;
     writeFileSync(path.join(bin, "date"), date);
     chmodSync(path.join(bin, "date"), 0o755);
@@ -780,13 +807,16 @@ test("check-pr GitLab: clamps a sub-minute interval to the 60s floor", () => {
     // site failed differently — the loop exited before the sleep stub had
     // created sleeps.log at all, so it died in readFileSync with ENOENT
     // rather than on the assertion, which is why grepping CI for the
-    // assertion text did not find it (BLO-31386).
+    // assertion text did not find it (BLO-31386). The read below now goes
+    // through the guarded `sleeps()` helper, so if this ever regresses again
+    // it fails on the assertion that says what went wrong instead of
+    // reproducing that same opaque ENOENT.
     env: { ...GL_ENV, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "0" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
-  const sleeps = readFileSync(path.join(stubs.dir, "sleeps.log"), "utf8").trim().split("\n");
-  assert.ok(sleeps.length > 0, "the loop never slept, so the clamp is untested");
-  for (const s of sleeps) assert.equal(s, "60", `slept ${s}s, below the documented floor`);
+  const slept = sleeps(stubs);
+  assert.ok(slept.length > 0, "the loop never slept, so the clamp is untested");
+  for (const s of slept) assert.equal(s, "60", `slept ${s}s, below the documented floor`);
 });
 
 test("prcheckloop: re-reads the head each iteration and queries the NEW sha", () => {
