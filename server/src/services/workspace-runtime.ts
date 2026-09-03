@@ -3903,6 +3903,15 @@ export async function realizeExecutionWorkspace(input: {
       `Execution workspace ${problem} It rendered to "${renderedBranch}". Existing worktrees are `
       + `left untouched; correct workspaceStrategy.branchTemplate to change future branch names.`,
   );
+  // Both git_worktree return shapes below (reuse and create) must surface these.
+  // Composing every warning list through one helper keeps that guarantee in a
+  // single place: this ticket is about a silent no-op, so the mitigation for it
+  // must not itself be droppable by a later refactor that edits one of the two
+  // arrays and not the other.
+  const composeWarnings = (...groups: Array<readonly string[]>): string[] => [
+    ...branchTemplateWarnings,
+    ...groups.flat(),
+  ];
   // Option (A) (BLO-9117): process-enforce the issue identifier into the branch
   // name so a merged PR reliably ref-links at merge time. See
   // applyIssueIdentifierToBranchName.
@@ -4008,15 +4017,14 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [
-        ...extraWarnings,
-        ...branchTemplateWarnings,
-        ...baseRefreshWarnings,
-        ...baseDrift.warnings,
-        ...reuseOwnershipWarnings,
-        ...submoduleWarnings,
-        ...identityWarnings,
-      ],
+      warnings: composeWarnings(
+        extraWarnings,
+        baseRefreshWarnings,
+        baseDrift.warnings,
+        reuseOwnershipWarnings,
+        submoduleWarnings,
+        identityWarnings,
+      ),
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -4165,7 +4173,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...branchTemplateWarnings, ...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings, ...identityWarnings],
+    warnings: composeWarnings(baseRefreshWarnings, ownershipWarnings, submoduleWarnings, identityWarnings),
     created: true,
     baseRefSha: currentBaseRefSha,
   };

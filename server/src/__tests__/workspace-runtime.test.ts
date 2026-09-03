@@ -723,6 +723,73 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
+  // BLO-31281: write-time validation only guards NEW config, so the render-time
+  // warning is the only thing that surfaces a template persisted BEFORE that
+  // validation existed — i.e. the 36-worktree case this ticket was filed for.
+  // Both return shapes are asserted separately: they compose their warning
+  // lists at different call sites, so one test could pass while the other path
+  // silently dropped the warning, which is the exact failure mode of the bug.
+  it("warns on both the create and reuse paths when branchTemplate cannot render", async () => {
+    const repoRoot = await createTempRepo();
+    // The production value from the ticket: single braces are never substituted
+    // AND `issueNumber` is not a known key, so this trips both problems.
+    const realizeWithBadTemplate = () => realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "blo-{issueNumber}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    const created = await realizeWithBadTemplate();
+    expect(created.created).toBe(true);
+    expect(created.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("never substituted"),
+    ]));
+
+    // Warn, do NOT repair: the identifier prefix still lands, and the literal
+    // token survives into the branch name exactly as observed in production.
+    expect(created.branchName).toBe("PAP-447-blo-issueNumber");
+
+    const reused = await realizeWithBadTemplate();
+    expect(reused.created).toBe(false);
+    expect(reused.cwd).toBe(created.cwd);
+    expect(reused.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("never substituted"),
+    ]));
+  });
+
+  it("adds no branchTemplate warning when the template renders cleanly", async () => {
+    // Control for the test above: proves the warning is driven by the template
+    // being unrenderable, not merely by having reached the worktree path.
+    const repoRoot = await createTempRepo();
+    const realized = await realizeWorktreeForTest(repoRoot, "HEAD");
+
+    expect(realized.branchName).toBe("PAP-447-add-worktree-support");
+    expect(
+      realized.warnings.filter((warning) => warning.includes("branchTemplate")),
+    ).toEqual([]);
+  });
+
   it("stamps the agent git identity on the default project_primary strategy, which has no worktree funnel", async () => {
     // BLO-23894 gap found while finishing the change: `project_primary` is the
     // DEFAULT strategy (asString(rawStrategy.type, "project_primary")) and it
