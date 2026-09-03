@@ -20,6 +20,7 @@ import {
   pluginEventOutbox,
   pluginManagedResources,
   plugins,
+  projectWorkspaces,
   projects,
 } from "@paperclipai/db";
 import {
@@ -169,6 +170,208 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       providerMetadata: { sandboxId: "sandbox-1" },
     });
     await expect(services.executionWorkspaces.get({ workspaceId, companyId: otherCompanyId })).resolves.toBeNull();
+  });
+
+  // BLO-31349: getWorkspaceForIssue took an issueId but used it only to find
+  // the project, then returned the project BASE checkout. Every issue in a
+  // project got the same path, and under an `isolated_workspace` policy that
+  // path is the one directory the policy exists to keep agents out of.
+  describe("projects.getWorkspaceForIssue", () => {
+    const BASE_CHECKOUT = "/tmp/paperclip-base-checkout";
+
+    async function seedIsolatedProject(companyId: string) {
+      const projectId = randomUUID();
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Isolated",
+        status: "in_progress",
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          allowIssueOverride: true,
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/master" },
+        },
+      });
+      // The project primary workspace IS the base checkout: projects.ts derives
+      // `effectiveLocalFolder` as `primaryWorkspace.cwd ?? managedFolder`.
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(),
+        companyId,
+        projectId,
+        name: "paperclip",
+        sourceType: "git_repo",
+        cwd: BASE_CHECKOUT,
+        repoUrl: "https://example.com/paperclip.git",
+        repoRef: "master",
+        defaultRef: "master",
+        isPrimary: true,
+      });
+      return projectId;
+    }
+
+    async function seedIssueWithWorktree(
+      companyId: string,
+      projectId: string,
+      slug: string,
+      overrides: { status?: string; closedAt?: Date; cwd?: string | null } = {},
+    ) {
+      const issueId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      // issues.execution_workspace_id and execution_workspaces.source_issue_id
+      // reference each other, so seed the issue first and bind it afterwards.
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        projectId,
+        title: `Issue ${slug}`,
+        status: "in_progress",
+        priority: "medium",
+        identifier: `${issuePrefix(companyId)}-${slug}`,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        sourceIssueId: issueId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: slug,
+        status: overrides.status ?? "active",
+        closedAt: overrides.closedAt ?? null,
+        cwd: overrides.cwd === undefined ? `${BASE_CHECKOUT}/.paperclip/worktrees/${slug}` : overrides.cwd,
+        repoUrl: "https://example.com/paperclip.git",
+        baseRef: "origin/master",
+        branchName: slug,
+        providerType: "git_worktree",
+        providerRef: `${BASE_CHECKOUT}/.paperclip/worktrees/${slug}`,
+      });
+      await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, issueId));
+      return { issueId, executionWorkspaceId };
+    }
+
+    it("resolves each issue's own execution workspace, never the project base checkout", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const alpha = await seedIssueWithWorktree(companyId, projectId, "alpha");
+      const beta = await seedIssueWithWorktree(companyId, projectId, "beta");
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      const alphaWorkspace = await services.projects.getWorkspaceForIssue({ issueId: alpha.issueId, companyId });
+      const betaWorkspace = await services.projects.getWorkspaceForIssue({ issueId: beta.issueId, companyId });
+
+      expect(alphaWorkspace).toMatchObject({
+        id: alpha.executionWorkspaceId,
+        projectId,
+        path: `${BASE_CHECKOUT}/.paperclip/worktrees/alpha`,
+        branchName: "alpha",
+        repoRef: "alpha",
+        defaultRef: "origin/master",
+        isPrimary: false,
+        isIssueScoped: true,
+      });
+
+      // (a) two issues in one project resolve to DIFFERENT paths...
+      expect(alphaWorkspace!.path).not.toEqual(betaWorkspace!.path);
+      expect(betaWorkspace!.path).toEqual(`${BASE_CHECKOUT}/.paperclip/worktrees/beta`);
+      // ...and (b) neither is the base checkout. Both assertions fail before the fix.
+      expect(alphaWorkspace!.path).not.toEqual(BASE_CHECKOUT);
+      expect(betaWorkspace!.path).not.toEqual(BASE_CHECKOUT);
+    });
+
+    it("falls back to the project primary, flagged as not issue-scoped, when no workspace is bound", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        projectId,
+        title: "Unprovisioned",
+        status: "todo",
+        priority: "medium",
+        identifier: `${issuePrefix(companyId)}-unprovisioned`,
+      });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      // Deliberately NOT null: a null would push every caller into inventing its
+      // own fallback, which is how this defect family started. Callers branch on
+      // isIssueScoped instead.
+      await expect(services.projects.getWorkspaceForIssue({ issueId, companyId })).resolves.toMatchObject({
+        projectId,
+        path: BASE_CHECKOUT,
+        branchName: null,
+        isIssueScoped: false,
+      });
+    });
+
+    it("treats a closed isolated workspace as absent rather than returning a torn-down path", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const { issueId } = await seedIssueWithWorktree(companyId, projectId, "archived-slug", {
+        status: "archived",
+        closedAt: new Date(),
+      });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      await expect(services.projects.getWorkspaceForIssue({ issueId, companyId })).resolves.toMatchObject({
+        path: BASE_CHECKOUT,
+        isIssueScoped: false,
+      });
+    });
+
+    it("falls back when the bound workspace has no realized directory yet", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const { issueId } = await seedIssueWithWorktree(companyId, projectId, "unrealized", { cwd: null });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      // An empty path flagged as issue-scoped would be worse than the honest
+      // project-scoped fallback.
+      await expect(services.projects.getWorkspaceForIssue({ issueId, companyId })).resolves.toMatchObject({
+        path: BASE_CHECKOUT,
+        isIssueScoped: false,
+      });
+    });
+
+    it("does not leak another company's issue workspace", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      const { issueId } = await seedIssueWithWorktree(companyId, projectId, "scoped");
+      const otherCompanyId = randomUUID();
+      await db.insert(companies).values({
+        id: otherCompanyId,
+        name: "Other",
+        issuePrefix: issuePrefix(otherCompanyId),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      await expect(
+        services.projects.getWorkspaceForIssue({ issueId, companyId: otherCompanyId }),
+      ).resolves.toBeNull();
+    });
+
+    // Regression guard: the fix must not over-reach into the project-scoped
+    // sibling, where effectiveLocalFolder is the CORRECT answer.
+    it("leaves getPrimaryWorkspace pointing at the project base checkout", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const projectId = await seedIsolatedProject(companyId);
+      await seedIssueWithWorktree(companyId, projectId, "unrelated");
+
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+      const primary = await services.projects.getPrimaryWorkspace({ projectId, companyId });
+      expect(primary).toMatchObject({ path: BASE_CHECKOUT, isPrimary: true });
+      // The project-scoped reader has no opinion on issue scope.
+      expect(primary!.isIssueScoped).toBeUndefined();
+    });
   });
 
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {

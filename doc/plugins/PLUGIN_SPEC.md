@@ -1243,6 +1243,13 @@ Plugins that need filesystem, git, terminal, or process operations implement tho
 
 The host provides workspace metadata through `ctx.projects` (list workspaces, get primary workspace, resolve workspace from issue or agent/run). Plugins use this metadata to resolve local paths and then operate on the filesystem, spawn processes, shell out to `git`, or open PTY sessions using standard Node APIs or any libraries they choose.
 
+`getWorkspaceForIssue` prefers the issue's own execution workspace — the per-issue worktree or sandbox an agent actually works in — and falls back to the project's primary workspace when the issue has none. Branch on `isIssueScoped` before writing:
+
+- `true` — `path` is the issue's own working copy. Safe to write to.
+- `false` — `path` is the shared project checkout. Under an `isolated_workspace` policy this is the directory the policy exists to keep work *out* of; prefer read-only use, or provision a workspace first.
+
+Do not re-derive a workspace path from the project's local folder yourself. That is the same shortcut the host itself used to take (BLO-31349), and it silently routes every issue in a project to one shared directory.
+
 This keeps the host lean — it does not need to maintain a parallel API surface for every OS-level operation a plugin might need. Plugins own their own logic for file browsing, git workflows, terminal sessions, and process management.
 
 ## 21. Persistence And Postgres
