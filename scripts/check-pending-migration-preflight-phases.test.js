@@ -15,6 +15,12 @@ import { test } from "node:test";
 const SCRIPT = new URL("../.github/scripts/check-pending-migrations.sh", import.meta.url).pathname;
 const DIGEST = `sha256:${"ab".repeat(32)}`;
 
+// Deliberately tiny so a budget being charged the wrong phase is loud. Shared
+// with the run-budget floor below so the two cannot drift apart -- lowering
+// this alone would otherwise fail that test spuriously, and raising it alone
+// would weaken the assertion while keeping it green.
+const RUN_BUDGET_SECONDS = 2;
+
 // Stands in for the cluster. Container start is a function of elapsed time so a
 // slow image pull can be simulated without one.
 const STUB = `#!/usr/bin/env bash
@@ -50,8 +56,14 @@ case "$args" in
     deadline=$(( now + \${budget:-0} ))
     # STUB_JOB_RESULT=timeout models a job that starts and then never settles.
     # It must ride out the whole --timeout rather than resolving early, or the
-    # run-budget test never spends the budget it is named for. "failed" still
-    # resolves as soon as the container starts, which is what kubectl does.
+    # run-budget test never spends the budget it is named for. "failed" instead
+    # resolves as soon as the container starts, which real kubectl does NOT do:
+    # --for=condition=complete never sees Complete go true on a failed Job and
+    # has no second condition to give up on, so it blocks the full --timeout
+    # (kubernetes/kubernetes#89273). The divergence is deliberate and buys ~2s
+    # per test; the script's verdict is identical either way. Its operational
+    # corollary is real though -- a genuine FAILED verdict in production spends
+    # the whole run budget before it prints, which the job timeout fold covers.
     while :; do
       if [ "\${STUB_JOB_RESULT:-complete}" != timeout ] && [ $(( $(date +%s) - start )) -ge "\${STUB_READY_AFTER:-0}" ]; then
         [ "\${STUB_JOB_RESULT:-complete}" = complete ] && exit 0 || exit 1
@@ -79,7 +91,7 @@ function runPreflight(env = {}) {
       DIGEST,
       NS: "paperclip-test",
       // Deliberately tiny so a budget being charged the wrong phase is loud.
-      PREFLIGHT_TIMEOUT_SECONDS: "2",
+      PREFLIGHT_TIMEOUT_SECONDS: String(RUN_BUDGET_SECONDS),
       PREFLIGHT_STARTUP_TIMEOUT_SECONDS: "60",
       // These tests wait on real clocks, so the production 5s poll would make
       // the file cost ~32s against the policy job's one-minute step bound. The
@@ -139,9 +151,11 @@ test("a started-but-unfinished check is reported as migrations in trouble", () =
   assert.doesNotMatch(output, /never started/, "this is the opposite cause and must not reuse that wording");
   // Without this the test passes on a stub that resolves instantly, i.e. it
   // would assert the message of a run-budget exhaustion that never happened.
-  // 2s is PREFLIGHT_TIMEOUT_SECONDS; allow slop for the whole-second compare.
+  // Derived from the budget rather than restated, with slop for the
+  // whole-second compare inside the stub.
+  const floor = RUN_BUDGET_SECONDS * 0.75;
   assert.ok(
-    elapsed >= 1.5,
+    elapsed >= floor,
     `the run budget must actually be spent, not short-circuited (took ${elapsed.toFixed(1)}s)`,
   );
 });
