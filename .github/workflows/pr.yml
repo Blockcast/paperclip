@@ -483,7 +483,14 @@ jobs:
           node-version: 24
 
       - name: Install helm
+        # Pinned: BLO-31405 removed the `policy` copy of the chart render and
+        # with it the only pinned setup-helm in this file, leaving the render
+        # that gates `verify` floating on whatever `@v4` resolved to that day.
+        # A helm release that changes template output would fail every PR with
+        # no version to point at.
         uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
 
       - name: Test Helm chart renders
         run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
