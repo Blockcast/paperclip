@@ -459,9 +459,15 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
 
-      // Negative control. Without it this test would pass on a build that
-      // emitted from startup recovery too, which would prove only "the call
-      // happened somewhere" rather than "the tick is the emission path".
+      // Pre-tick control. Be precise about what this does and does NOT prove.
+      // With suppression active `startServer` skips the entire
+      // startup-recovery block, so nothing has had the opportunity to emit
+      // yet. It therefore establishes exactly one thing: any call observed
+      // after the tick below came FROM that tick. It cannot detect a build
+      // that also published from startup recovery, because on this path
+      // startup recovery never runs at all — the unsuppressed sibling test
+      // below carries that stronger control, where recovery has fully drained
+      // before the assertion is made.
       expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).not.toHaveBeenCalled();
 
@@ -475,7 +481,10 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
       // ...and they got there without the pass they used to live inside being
-      // reached at all, which is the half a suppression-only assertion misses.
+      // reached. This holds for two independent reasons here — suppression
+      // skips startup recovery, and the tick's own gate keeps the chain
+      // unreached — so it still fails if the reconcile call is hoisted above
+      // the suppression gate.
       expect(heartbeatServiceMock.reconcileFailedWakeDispatches).not.toHaveBeenCalled();
     } finally {
       setIntervalSpy.mockRestore();
@@ -498,8 +507,31 @@ describe("startServer feedback export wiring", () => {
 
     try {
       await startServer();
-      heartbeatServiceMock.publishGithubReviewDeadLetterGauge.mockClear();
-      heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge.mockClear();
+
+      // Drain startup recovery BEFORE touching the mocks or driving a tick.
+      // `startServer` registers recovery without awaiting it, and the tick
+      // early-returns while it is pending, so the old shape — firing the
+      // callback inside a `vi.waitFor` that waited on
+      // `reconcileFailedWakeDispatches` having been called — could go green off
+      // recovery's OWN call to that pass at index.ts while every tick it drove
+      // had early-returned and published nothing. The gauge assertions then
+      // failed. Recovery's last step is that same pass, so waiting for it here
+      // (before any mockClear) is what makes the single tick below deterministic.
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.reconcileFailedWakeDispatches).toHaveBeenCalled();
+      });
+      // Let the `.finally()` that clears `heartbeatStartupRecoveryPending` run.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The strong negative control the suppressed sibling test cannot give:
+      // startup recovery has now actually RUN, including the reconcile pass
+      // these two gauges used to be the last act of, and neither has emitted.
+      // On a build that still published from inside that pass, both would
+      // already be non-zero here.
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).not.toHaveBeenCalled();
+
       heartbeatServiceMock.reconcileFailedWakeDispatches.mockClear();
       // The pass the two gauges used to be the last act of. Rejecting it is
       // the chain-fragility half of the defect: pre-fix this erased both.
@@ -507,28 +539,93 @@ describe("startServer feedback export wiring", () => {
         new Error("wake-dispatch reconciliation failed"),
       );
 
-      // Drive ticks until one actually reaches the reconcile pass.`startServer`
-      // registers startup recovery without awaiting it, and the tick
-      // early-returns while that is still pending, so firing the callback once
-      // is a race — the sibling unsuppressed-tick tests in this file share that
-      // fragility and lose it on a slow host.
+      // Exactly one tick, driven OUTSIDE the predicate so the call counts below
+      // are exact rather than "however many times waitFor happened to retry".
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
       await vi.waitFor(() => {
-        intervalCallback?.();
         expect(heartbeatServiceMock.reconcileFailedWakeDispatches).toHaveBeenCalled();
       });
 
-      // Ordering carries the assertion: both gauges are registered above the
-      // suppression gate and ahead of the chain, so once the rejecting pass at
-      // the tail of that chain has run at all, they must already have emitted.
-      // Pre-fix they were that pass's final two awaits, and this rejection
-      // erased both.
-      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalled();
-      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalled();
+      // Both gauges emitted exactly once from that single tick, even though the
+      // pass at the tail of its chain rejected. Pre-fix they were that pass's
+      // final two awaits and the rejection erased both.
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
+      // Ordering, asserted rather than argued: both gauges are registered at
+      // the top of the tick, so they must be invoked ahead of the chain link
+      // that reaches the reconcile pass.
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge.mock.invocationCallOrder[0])
+        .toBeLessThan(heartbeatServiceMock.reconcileFailedWakeDispatches.mock.invocationCallOrder[0]);
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge.mock.invocationCallOrder[0])
+        .toBeLessThan(heartbeatServiceMock.reconcileFailedWakeDispatches.mock.invocationCallOrder[0]);
     } finally {
       // `beforeEach` uses `clearAllMocks`, which keeps implementations — so the
       // rejection above would leak into every later test unless restored here.
       heartbeatServiceMock.reconcileFailedWakeDispatches.mockImplementation(
         async () => ({ recovered: 0, exhausted: 0 }),
+      );
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // Pins the OTHER half of the hoist (BLO-31335, Ally round 2): the gauge
+  // registrations sit above the `heartbeatStartupRecoveryPending` early-return,
+  // not merely above the suppression gate. Both gauges are zero-initialized, so
+  // a replica that skipped them while recovery ran would not render "No data" —
+  // it would export a confident `0`, which is the fabricated-health mode this
+  // issue exists to remove, time-boxed to a boot that can last minutes rather
+  // than the one tick a naive reading suggests. Neither sibling test above can
+  // catch a regression here: the suppressed one never starts recovery at all,
+  // and the unsuppressed one deliberately drains it first.
+  it("publishes both wake-dispatch gauges on a tick while startup recovery is still pending", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    // Hold the FIRST startup-recovery step open so the pass cannot complete and
+    // `heartbeatStartupRecoveryPending` stays true for the whole test. A gate
+    // we release in `finally` rather than a never-resolving promise, so the
+    // registered scheduler work still drains for later tests in this file.
+    let releaseRecovery: () => void = () => {};
+    const recoveryGate = new Promise<void>((resolve) => {
+      releaseRecovery = resolve;
+    });
+    heartbeatServiceMock.reconcileWorkerCrashedRuns.mockImplementation(async () => {
+      await recoveryGate;
+      return { reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] };
+    });
+
+    try {
+      await startServer();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Positive: both emitted while recovery is still mid-flight.
+      expect(heartbeatServiceMock.publishGithubReviewDeadLetterGauge).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.publishAgentWakeupTerminalFailedGauge).toHaveBeenCalledTimes(1);
+      // Control that the recovery guard really is still closed. Without this the
+      // test could pass for the trivial reason that recovery had already
+      // drained, proving nothing about where the registrations sit.
+      // `sweepExpiredRuntimeStatuses` is the first statement after that guard.
+      expect(heartbeatServiceMock.sweepExpiredRuntimeStatuses).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reconcileFailedWakeDispatches).not.toHaveBeenCalled();
+    } finally {
+      releaseRecovery();
+      // `beforeEach` uses `clearAllMocks`, which keeps implementations.
+      heartbeatServiceMock.reconcileWorkerCrashedRuns.mockImplementation(
+        async () => ({ reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] }),
       );
       setIntervalSpy.mockRestore();
     }
