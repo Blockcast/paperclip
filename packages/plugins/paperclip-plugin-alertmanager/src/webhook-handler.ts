@@ -65,6 +65,36 @@ export class AlertDeliveryIncompleteError extends Error {
   }
 }
 
+/**
+ * Raised by a per-alert path whose failure no retry can fix — a configuration
+ * or roster fact rather than process state.
+ *
+ * The per-alert catch treats these as *handled*: the alert is dropped, the
+ * failure is recorded (log + metric), and the fingerprint is deliberately NOT
+ * added to `failedFingerprints`, so the delivery still answers 200.
+ *
+ * This is the same "log + 200" treatment the malformed-payload and
+ * permanent-policy drops already get. It exists because the taxonomy the
+ * per-alert catch was written against — "these failures are issue-RPC,
+ * state-store, event, and metric errors, which are transient" — stopped being
+ * true once `handleFiring` began throwing on unresolvable fallback ownership
+ * (PEN-2581). Reporting a permanent fault through the transient channel makes
+ * Alertmanager retry it 15-17× and drop the delivery anyway, and the resulting
+ * `alertmanager_notifications_failed_total` storm masks concurrent *transient*
+ * failures that retrying would genuinely have fixed.
+ *
+ * Only reachable from the firing path (owner resolution is never run on
+ * resolve), so a dropped alert that is still firing returns on Alertmanager's
+ * next `repeat_interval` — this trades a doomed retry burst for a later
+ * re-delivery, not for silent permanent loss.
+ */
+export class PermanentAlertError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentAlertError";
+  }
+}
+
 const AGGREGATE_CREATION_CLAIMS_TABLE = "alertmanager_aggregate_creation_claims";
 const AGGREGATE_MEMBERS_TABLE = "alertmanager_aggregate_members";
 const AGGREGATE_LIFECYCLE_FENCES_TABLE = "alertmanager_aggregate_lifecycle_fences";
@@ -1540,7 +1570,7 @@ export async function handleFiring(
       alertname,
       severity,
     });
-    throw new Error(
+    throw new PermanentAlertError(
       `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
     );
   }
@@ -2227,17 +2257,37 @@ export async function handleWebhook(
       // so Alertmanager stopped retrying and the alert was destroyed with no
       // durable issue or state row — the same silent-loss class as the outage
       // this plugin already suffered (BLO-20467).
+      //
+      // `PermanentAlertError` is the one documented exception to that taxonomy:
+      // a config/roster fault no retry can fix, so it takes the same "log + 200"
+      // route as the malformed payload above instead of the transient-retry
+      // route. Retrying it burns Alertmanager's 15-17 attempts, drops the
+      // delivery anyway, and storms the failure metric that transient faults
+      // need to stay legible. See the class doc (PEN-2581).
+      const permanent = err instanceof PermanentAlertError;
       ctx.logger.error(
-        `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
+        permanent
+          ? `paperclip-plugin-alertmanager: permanently dropping alert ${alert.fingerprint}: ${String(err)} — no retry can resolve this, so the delivery is not failed`
+          : `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
       );
-      failedFingerprints.push(alert.fingerprint);
+      if (!permanent) {
+        failedFingerprints.push(alert.fingerprint);
+      }
       try {
-        await ctx.metrics.write("alertmanager.alert.error", 1, {
-          alertname: alert.labels.alertname ?? "unknown",
-        });
+        await ctx.metrics.write(
+          permanent
+            ? "alertmanager.alert.permanent_error"
+            : "alertmanager.alert.error",
+          1,
+          {
+            alertname: alert.labels.alertname ?? "unknown",
+          },
+        );
       } catch (metricErr) {
         // Telemetry is best-effort; a metrics outage must not be the thing that
-        // aborts the remaining alerts. The delivery already counts as failed.
+        // aborts the remaining alerts. The delivery's outcome is already
+        // decided either way — failed for a transient fault, 200 for a
+        // permanent one.
         ctx.logger.error(
           `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
         );
