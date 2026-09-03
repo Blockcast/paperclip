@@ -827,6 +827,22 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
   });
 
+  // Pins the two halves of the hedge veto independently. (1) A bare
+  // `whether`/`if` in the SAME clause that does not govern the review clause
+  // must not veto — only a governing hedge ("unclear whether", "could not
+  // confirm whether") does. (2) A governing hedge about something else in the
+  // PREVIOUS clause, joined by ; : , or —, is out of scope for the review
+  // clause.
+  it.each([
+    "Whether the wake was stale is moot because the head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Regardless of if the wake head moved, this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Unclear whether CI is green; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+    "I could not confirm whether CI passed: already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Not sure if the lockstep check ran, already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: only a hedge governing the review clause in its own clause vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
   // `notalready` is not a negation and not the clause: no word boundary before
   // `already`, so the shape does not match at all and the run stays `missing`.
   it("BLO-31374: a glued `notalready` is neither a negation nor the clause", () => {
