@@ -3140,6 +3140,12 @@ describe("K8s session isolation metadata", () => {
       workspaceRoot: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
     });
     expect(isolation?.storage.workspace).toBe("persistent");
+    // Only the workspace becomes persistent. Home/session/cache must stay
+    // ephemeral under `run` isolation -- pinning that the worktree change did
+    // not widen into the other three storage classes.
+    expect(isolation?.storage.home).toBe("ephemeral");
+    expect(isolation?.storage.session).toBe("ephemeral");
+    expect(isolation?.storage.cache).toBe("ephemeral");
   });
 
   // BLO-31282: workspace *intent* is not evidence a worktree exists. A project
