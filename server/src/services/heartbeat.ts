@@ -6752,6 +6752,44 @@ export function deriveTaskKeyWithHeartbeatFallback(
   return null;
 }
 
+/**
+ * Persisted-snapshot sibling of the `genericTimerWake` predicate in
+ * `enqueueWakeup` (BLO-31344). Answers "was the wake that produced this parked
+ * run an unscoped heartbeat tick?" from a stored `contextSnapshot` alone.
+ *
+ * Needed because a `scheduled_retry` promotion never re-enters `wakeup()` —
+ * `promoteDueScheduledRetries` reads those rows straight from the DB — so by
+ * the time a park comes due the live predicate's inputs are gone and the
+ * promoter has only the run row to reason from.
+ *
+ * ⚠ This deliberately does NOT test `deriveTaskKey(snapshot) === null`, and the
+ * distinction is the whole reason the helper exists. `enqueueWakeup` evaluates
+ * `!taskKey` against the value *returned* by `enrichWakeContextSnapshot`, which
+ * is plain {@link deriveTaskKey} — `null` for a generic tick. The snapshot that
+ * gets *persisted* has by then had {@link deriveTaskKeyWithHeartbeatFallback}
+ * stamp `taskKey: HEARTBEAT_TASK_KEY` into it (see the fallback assignment in
+ * `enrichWakeContextSnapshot`, which writes the sentinel to the snapshot but
+ * never to the returned value). So on a stored row the synthetic sentinel is
+ * the *evidence that the wake was generic*, not evidence that it was scoped —
+ * and a naive non-null check would be false for every row this predicate exists
+ * to match, i.e. it would silently never fire.
+ *
+ * Errs toward "not generic": `commentId` is checked alongside `wakeCommentId`
+ * because suppressing a genuinely scoped retry would drop the wake its scope
+ * was for, which is far worse than promoting one redundant no-op.
+ */
+export function isGenericTimerWakeSnapshot(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): boolean {
+  if (readNonEmptyString(contextSnapshot?.wakeSource) !== "timer") return false;
+  if (readNonEmptyString(contextSnapshot?.issueId)) return false;
+  if (readNonEmptyString(contextSnapshot?.taskId)) return false;
+  if (readNonEmptyString(contextSnapshot?.wakeCommentId)) return false;
+  if (readNonEmptyString(contextSnapshot?.commentId)) return false;
+  const taskKey = readNonEmptyString(contextSnapshot?.taskKey);
+  return taskKey === null || taskKey === HEARTBEAT_TASK_KEY;
+}
+
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -17062,7 +17100,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
           | "issue_paused"
-          | "issue_dependencies_blocked";
+          | "issue_dependencies_blocked"
+          | "timer_no_actionable_work";
         issueId: string | null;
         details: Record<string, unknown>;
       };
@@ -17400,6 +17439,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           : { outcome: "not_promoted", run: null };
       }
+    }
+
+    // BLO-31344: a promoted retry has never passed through the wake-time
+    // suppression gate, because `promoteDueScheduledRetries` reads
+    // `scheduled_retry` rows straight from the DB and never enters `wakeup()`.
+    // So `skipTimerWhenNoActionableWork` — whose entire job is to stop an
+    // unscoped heartbeat tick from paying for an adapter invocation that has
+    // nothing to do — is defeated by ANY park, from any path, that promotes into
+    // a lane whose queue has since drained.
+    //
+    // Ordering the dispatch-side gate ahead of the penstock gate (see
+    // `enqueueWakeup`) stops new generic ticks from parking, but it is not
+    // sufficient on its own and this block is not redundant with it. It cannot
+    // help a row that is ALREADY parked, and it cannot help a
+    // `dependency_blocked` / `transient_failure` park whose original wake was
+    // generic — those are written by paths that never consult the wake gate at
+    // all. Both halves are required; neither alone closes the bypass.
+    //
+    // Guard: only a wake that was generic-timer-shaped when it was ENQUEUED is
+    // eligible, reconstructed via `isGenericTimerWakeSnapshot` (read its doc for
+    // why a plain `deriveTaskKey` null-check would never fire here). A scoped
+    // retry must promote regardless of what else the lane has queued —
+    // suppressing one would drop the wake its scope was for. Evaluated before
+    // the capacity re-probe below so a tick with nothing to do is not re-parked
+    // for capacity it will never use.
+    if (
+      parseHeartbeatPolicy(agent).skipTimerWhenNoActionableWork &&
+      isGenericTimerWakeSnapshot(contextSnapshot) &&
+      !(await hasActionableTimerWork(agent))
+    ) {
+      const suppressionGate = {
+        allowed: false as const,
+        reason:
+          "Scheduled retry suppressed because the original wake was an unscoped timer tick and no assigned todo or in_progress issue requires this agent",
+        errorCode: "timer_no_actionable_work" as const,
+        issueId: null,
+        details: {
+          scheduledRetryReason: dueRun.scheduledRetryReason,
+          scheduledRetryAttempt: dueRun.scheduledRetryAttempt,
+        },
+      };
+      const cancelled = await cancelScheduledRetryForGate(dueRun, suppressionGate, now);
+      return cancelled
+        ? {
+            outcome: "gate_suppressed",
+            run: cancelled,
+            reason: suppressionGate.reason,
+            errorCode: suppressionGate.errorCode,
+          }
+        : { outcome: "not_promoted", run: null };
     }
 
     // A ccrotate capacity defer must re-check the gate at promotion time: if the
@@ -31636,6 +31725,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Original check (`timer` only, plus the narrow
     // `provider_quota_exhausted_recovered` reason) only caught the
     // smallest slice.
+    const genericTimerWake =
+      source === "timer" &&
+      !issueId &&
+      !wakeCommentId &&
+      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
+      !taskKey;
+    // BLO-31344: this gate MUST be evaluated before the penstock capacity gate
+    // below, and the ordering is the fix, not a stylistic preference.
+    //
+    // The capacity gate does not decline a wake, it *postpones* it: it commits a
+    // `scheduled_retry` run and returns null. Promotion of that row never
+    // re-enters `wakeup()`, so anything ordered after the capacity gate is
+    // simply never evaluated for a wake that got parked. With this block second,
+    // `skipTimerWhenNoActionableWork` was therefore defeated precisely during a
+    // capacity crunch — when every tick parks and later promotes, and when
+    // burning a paid attempt on a guaranteed no-op costs the most. The knob
+    // worked on an idle fleet and stopped working under load.
+    //
+    // Evaluating suppression first collapses the common case with no run row, no
+    // park, no promotion and no adapter invocation. Declining a wake we would
+    // have thrown away regardless cannot lose work, whereas parking it demonstrably
+    // did: the park outlives the reason it was created.
+    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
+      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
+        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+      });
+      await markTimerHeartbeatChecked(agentId, source);
+      return null;
+    }
+
     const gateAppliesToWake =
       source === "timer" ||
       source === "automation" ||
@@ -31662,20 +31781,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (suppression) suppression.providerCapacityDeferred = true;
         return null;
       }
-    }
-
-    const genericTimerWake =
-      source === "timer" &&
-      !issueId &&
-      !wakeCommentId &&
-      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
-      !taskKey;
-    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
-      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
-      });
-      await markTimerHeartbeatChecked(agentId, source);
-      return null;
     }
 
     let manualCapacityActivityPublishes: ActivityPublish[] = [];
