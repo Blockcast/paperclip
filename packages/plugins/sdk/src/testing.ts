@@ -1079,7 +1079,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         if (!projectId) return null;
         if (!isInCompany(projects.get(projectId), companyId)) return null;
         const workspaces = projectWorkspaces.get(projectId) ?? [];
-        return workspaces.find((workspace) => workspace.isPrimary) ?? null;
+        const primary = workspaces.find((workspace) => workspace.isPrimary);
+        if (!primary) return null;
+        // BLO-31349: this double has no execution-workspace concept, so it can
+        // only ever serve the project-scoped fallback. Say so explicitly —
+        // leaving the field undefined would let a plugin test pass while the
+        // plugin treats a base checkout as an issue-scoped working copy.
+        return { ...primary, isIssueScoped: false };
       },
       // Lucitra extension
       async create(input) {

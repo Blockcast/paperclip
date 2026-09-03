@@ -423,8 +423,28 @@ export interface PluginWorkspace {
   repoRef?: string | null;
   /** Default comparison ref for workspace tooling, when known. Optional for SDK back-compat. */
   defaultRef?: string | null;
+  /**
+   * Branch checked out in this workspace, when it is an execution workspace
+   * backed by a real branch. `null` for project-scoped workspaces, which are
+   * not pinned to one branch. Optional for SDK back-compat.
+   */
+  branchName?: string | null;
   /** Whether this is the project's primary workspace. */
   isPrimary: boolean;
+  /**
+   * BLO-31349: whether `path` was resolved from the *issue's* bound execution
+   * workspace (`true`) or is a project-scoped fallback (`false`).
+   *
+   * Only meaningful on `getWorkspaceForIssue`, which always sets it. The
+   * project-scoped readers (`listWorkspaces`, `getPrimaryWorkspace`) leave it
+   * undefined because the question does not apply to them.
+   *
+   * Treat `false` as "this is the shared project checkout, not a per-issue
+   * working copy" — writing to it under an `isolated_workspace` policy is
+   * exactly the leak the policy exists to prevent. Optional for SDK
+   * back-compat.
+   */
+  isIssueScoped?: boolean;
   /** ISO 8601 creation timestamp. */
   createdAt: string;
   /** ISO 8601 last-updated timestamp. */
@@ -1023,16 +1043,29 @@ export interface PluginProjectsClient {
   getPrimaryWorkspace(projectId: string, companyId: string): Promise<PluginWorkspace | null>;
 
   /**
-   * Resolve the primary workspace for an issue by looking up the issue's
-   * project and returning its primary workspace.
+   * Resolve the working directory for an issue.
    *
-   * This is a convenience method that combines `issues.get()` and
-   * `getPrimaryWorkspace()` in a single RPC call.
+   * Prefers the issue's own bound execution workspace — the per-issue worktree
+   * or sandbox an agent actually works in — and only falls back to the
+   * project-scoped primary workspace when the issue has none.
+   *
+   * Read {@link PluginWorkspace.isIssueScoped} to tell the two apart:
+   *
+   * - `true` — `path` is the issue's execution workspace `cwd`, and
+   *   `branchName` is the branch checked out there. Safe to write to.
+   * - `false` — the issue has no live execution workspace, so `path` is the
+   *   shared project checkout. Under an `isolated_workspace` policy this is
+   *   the directory the policy exists to keep work *out* of; prefer
+   *   read-only use, or provision a workspace first.
+   *
+   * A closed or archived isolated workspace is treated as absent, because its
+   * directory may already have been torn down.
    *
    * @param issueId - UUID of the issue
    * @param companyId - UUID of the company that owns the issue
-   * @returns The primary workspace for the issue's project, or `null` if
-   *   the issue has no project or the project has no workspace
+   * @returns The issue's execution workspace when one is bound and live,
+   *   otherwise the project's primary workspace with `isIssueScoped: false`;
+   *   `null` if the issue has no project, or the project has no workspace
    *
    * @see PLUGIN_SPEC.md §20 — Local Tooling
    */

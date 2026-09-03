@@ -33,7 +33,7 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { isClosedIsolatedExecutionWorkspace, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -1801,6 +1801,52 @@ export function buildHostServices(
         if (!projectId) return null;
         const project = await projects.getById(projectId);
         if (!inCompany(project, companyId)) return null;
+
+        // BLO-31349: prefer the issue's OWN execution workspace. This method
+        // takes an issueId and promises issue scope; previously it used the
+        // issueId only to find the project and then returned the project base
+        // checkout, so every issue in a project got the same path — and under
+        // an `isolated_workspace` policy that path is the one directory the
+        // policy exists to keep agents out of.
+        const executionWorkspaceId = (issue as Record<string, unknown>)
+          .executionWorkspaceId as string | null | undefined;
+        if (executionWorkspaceId) {
+          const workspace = await executionWorkspaces.getById(executionWorkspaceId);
+          // A closed/archived isolated workspace may already have had its
+          // directory torn down, so treat it as absent rather than handing
+          // back a path that no longer exists.
+          if (inCompany(workspace, companyId) && !isClosedIsolatedExecutionWorkspace(workspace)) {
+            const path = sanitizeWorkspacePath(workspace.agentCwd ?? workspace.cwd);
+            // An unrealized workspace (no cwd yet) has no directory to offer.
+            // Returning `path: ""` with `isIssueScoped: true` would be worse
+            // than the honest project-scoped fallback below.
+            if (path) {
+              const name = sanitizeWorkspaceName(workspace.name, path);
+              return {
+                id: workspace.id,
+                projectId: workspace.projectId,
+                name,
+                path,
+                repoUrl: workspace.repoUrl ?? project.codebase.repoUrl,
+                // For a worktree the checked-out ref *is* the branch, and the
+                // base ref is what tooling should diff against.
+                repoRef: workspace.branchName ?? project.codebase.repoRef,
+                defaultRef: workspace.baseRef ?? project.codebase.defaultRef,
+                branchName: workspace.branchName ?? null,
+                // An execution workspace is never the project primary.
+                isPrimary: false,
+                isIssueScoped: true,
+                createdAt: workspace.createdAt.toISOString(),
+                updatedAt: workspace.updatedAt.toISOString(),
+              };
+            }
+          }
+        }
+
+        // Fallback: no live execution workspace bound to this issue. Return the
+        // project primary rather than null, so callers do not each invent their
+        // own fallback and re-derive `effectiveLocalFolder` — the very defect
+        // this method had. `isIssueScoped: false` tells them what they got.
         const row = project.primaryWorkspace;
         const path = sanitizeWorkspacePath(project.codebase.effectiveLocalFolder);
         const name = sanitizeWorkspaceName(row?.name ?? project.name, path);
@@ -1812,9 +1858,11 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
+          branchName: null,
           // BLO-26184: see getPrimaryWorkspace above — do not claim explicit
           // choice for a fallback guess.
           isPrimary: project.primaryWorkspaceSource === "explicit",
+          isIssueScoped: false,
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };
