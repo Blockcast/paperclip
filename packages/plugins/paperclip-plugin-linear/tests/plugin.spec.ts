@@ -3414,6 +3414,118 @@ describe("paperclip-plugin-linear", () => {
       // (Per-test mock-reset cleanup removed — beforeEach now restores
       // syncModule defaults systematically via restoreSyncModuleDefaults.)
     });
+
+    // BLO-3267: the test above awaits delivery 1 before firing delivery 2, so it
+    // only covers sequential retries. The duplicate pair actually observed on
+    // BLO-3267 landed 3ms apart — i.e. concurrent delivery, where the
+    // read-then-write `listComments` check cannot see a sibling that has not
+    // written yet. This is the case that regressed.
+    it("does not double-post when the same Linear comment is delivered concurrently", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-99",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      // Both deliveries in flight at once — neither awaited before the other
+      // starts, so the sentinel check alone cannot separate them.
+      await Promise.all([
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: commentPayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-a",
+        }),
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: commentPayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-b",
+        }),
+      ]);
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-99 -->");
+    });
+
+    // The in-flight claim must be released even when the create throws, or one
+    // failed delivery would suppress every later retry of that comment.
+    it("releases the in-flight claim when the bridged create fails", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-77",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      const createComment = harness.ctx.issues.createComment;
+      const failOnce = vi
+        .spyOn(harness.ctx.issues, "createComment")
+        .mockRejectedValueOnce(new Error("transient host failure"));
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+        requestId: "fails",
+      });
+
+      failOnce.mockRestore();
+      expect(harness.ctx.issues.createComment).toBe(createComment);
+
+      // The retry must still be able to bridge the comment.
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+        requestId: "retry-after-failure",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+    });
   });
 
   // -----------------------------------------------------------------------
