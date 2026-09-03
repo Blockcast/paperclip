@@ -25,21 +25,14 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    # 15, not 5, because this is the tightest-budgeted job that sets up pnpm and
+    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
     # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
     # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
     # into a job timeout, which ejects a merge-queue candidate just the same but
     # burns a runner for the full budget first. Worst case here is roughly
     # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
     # headroom above it.
-    #
-    # BLO-31405 raised this from 10. Measured over the 25 most recent runs the
-    # job's p100 is 459s against the old 600s cap — and that run spent only 46s
-    # in the Helm render step, which is now allowed 240s. Worst case was
-    # therefore 413s + 240s = 653s, i.e. the job cap would have expired before
-    # the step bound it encloses ever could, making that bound unreachable.
-    # 900s keeps ~250s of headroom over the same worst case.
-    timeout-minutes: 15
+    timeout-minutes: 10
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -282,29 +275,9 @@ jobs:
         run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
         timeout-minutes: 1
 
-      - name: Setup Helm
-        if: ${{ !cancelled() }}
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.16.3
-
-      - name: Test Helm chart render suite (deploy/helm/paperclip)
-        if: ${{ !cancelled() }}
-        # These render tests (topology-spread, probes, role-rbac, prometheus-rule,
-        # service-monitor, blockcast-auth, runtime-cache) previously ran nowhere in
-        # CI — a chart edit could silently break or regress any of them and every
-        # required check would stay green. BLO-20901's whole premise is that
-        # paperclip-api node spread is "enforced by scheduler policy, not left to
-        # chance"; that claim only holds if the test asserting it actually runs.
-        run: node --test deploy/helm/paperclip/tests/*.test.mjs
-        # BLO-31405: 4 min, not the policy default of 1. This is the only step
-        # here that forks `helm template` once per test file (18 of them), so it
-        # is 30-70s where every other node --test step is under 10s. At the old
-        # 60s bound its p100 of 73s crossed the line on 3 of the 25 most recent
-        # runs, failing `policy` — and skipping every lane that `needs:` it — on
-        # PRs that never touched the chart. scripts/__tests__/policy-node-test-
-        # timeouts.test.mjs allowlists this one step and holds every other at 1.
-        timeout-minutes: 4
+      # BLO-31405: the chart render suite deliberately does NOT run here. It has
+      # its own `helm_chart` job below; see the comment there before adding it
+      # back.
 
       - name: Test Ally review-consistency guard
         if: ${{ !cancelled() }}
@@ -469,6 +442,15 @@ jobs:
   # Deliberately its own job rather than a step in `policy`: it needs helm and
   # the runner image's pinned yq, and a tooling regression in provisioning those
   # should not take down the gate that every unrelated PR depends on.
+  #
+  # BLO-31405: a second copy of this suite had landed in parallel as a `policy`
+  # step (#965 and #995 crossed, each believing the tests ran nowhere), which is
+  # exactly the coupling the paragraph above rejects. It shelled out to `helm
+  # template` once per test file, so under `policy`'s 60s step bound its p100 of
+  # 73s failed 3 of 25 sampled runs on duration alone — each one skipping every
+  # lane that `needs: policy`, on PRs that never touched the chart. Removed. Do
+  # not re-add it here: this job is a `verify` lane (see its `needs:`), so a red
+  # chart already fails the required check without any `policy` coupling.
   helm_chart:
     name: Helm chart
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
