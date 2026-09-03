@@ -9479,21 +9479,32 @@ function prReviewOutputHasSelfReviewSkip(
 // `pr_review_output_missing` and flipped Ally to `error`. The cited sha is the
 // live head, which the wake context cannot know (the wake head is exactly what
 // went stale), so the clause is anchored to a 7–40 hex sha rather than to the
-// wake head — a sha-less "already reviewed" claim is NOT accepted — and a
-// negated clause ("not already reviewed at …") is rejected.
+// wake head — a sha-less "already reviewed" claim is NOT accepted. Three vetoes
+// keep the widened shape from masking a run that did NOT post (per Ally review
+// of #1613): a negated clause ("was **not** already reviewed at …" — the
+// negation prefix tolerates the same markdown the clause does, so bold/italic
+// cannot slip past it), a hedge in the same sentence ("could not confirm
+// whether … already reviewed at …", "Unclear if already reviewed at …"), and
+// the shared posted-review negation cues ("… did not post …").
 function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   // Markdown that may sit between tokens: whitespace, backticks, bold/italic.
   const md = "[\\s`*_]*";
   const pattern = new RegExp(
-    "(\\b(?:not|never|wasn['\u2019]?t|isn['\u2019]?t|hasn['\u2019]?t)\\s+(?:been\\s+)?)?" +
+    // `+`, not `*`: a bare `notalready` must not read as a negation.
+    "(?<negated>\\b(?:not|never|wasn['\u2019]?t|isn['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been)[\\s`*_]+){0,2})?" +
       `\\balready\\s+reviewed\\s+at${md}` +
       // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
       `(?:[^\\s\`*_]{1,40}${md}for${md})?(?:(?:head|commit)${md})?` +
       "([0-9a-f]{7,40})(?![0-9a-f])",
     "gi",
   );
+  if (prReviewOutputHasPostedReviewNegation(text)) return false;
   for (const m of text.matchAll(pattern)) {
-    if (m[1]) continue;
+    if (m.groups?.negated) continue;
+    // Hedge cue earlier in the same sentence: the clause is a question the run
+    // could not answer, not a finding.
+    const sentenceBefore = text.slice(Math.max(0, m.index - 80), m.index);
+    if (/\b(?:unclear|unsure|uncertain|not\s+sure|whether|if)\b[^.\n]{0,60}$/i.test(sentenceBefore)) continue;
     return true;
   }
   return false;

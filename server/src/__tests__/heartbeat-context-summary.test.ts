@@ -772,14 +772,44 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
   });
 
-  // Masking guard: a negated clause describes the opposite situation.
-  it("BLO-31374: rejects a negated already-reviewed clause", () => {
+  // Masking guard: a negated clause describes the opposite situation — and the
+  // negation must survive the same markdown the clause tolerates (Ally review
+  // of #1613: a bare `\s+` prefix let `**not**` through).
+  it.each([
+    { label: "plain not", summary: "This head was not already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the draft review was never posted." },
+    { label: "bold not", summary: "This head was **not** already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the draft review was never posted." },
+    { label: "italic not", summary: "It was *not* already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`." },
+    { label: "not yet been", summary: "Has not yet been already reviewed at 8b237675b19fa5ae061821fd3b1d87cd8cd1836f." },
+  ])("BLO-31374: rejects a negated already-reviewed clause ($label)", ({ summary }) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Masking guard: hedged or prior-head narration from a run that did NOT post
+  // (Ally review of #1613). The old `for`-anchored regex rejected all three.
+  it.each([
+    { label: "could not confirm whether", summary: "I could not confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the API call failed." },
+    { label: "unclear if", summary: "Unclear if already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`. Aborting before the post step." },
+    { label: "prior head, did not post", summary: "The prior head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, but the branch moved and I did not post a review for the new head." },
+  ])("BLO-31374: rejects hedged or prior-head already-reviewed narration ($label)", ({ summary }) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Precedence guard: a bare `notalready` is not a negation, and a sentence
+  // that merely contains "if" elsewhere still classifies once the clause itself
+  // is unhedged.
+  it("BLO-31374: a hedge in an earlier sentence does not veto a later unhedged clause", () => {
     expect(
       evaluatePrReviewCompletionEvidence(reviewerContext, {
         summary:
-          "This head was not already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the draft review was never posted.",
+          "I checked whether a review exists. Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
       }),
-    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+    ).toEqual({ status: "already_reviewed" });
   });
 
   it("accepts archived Network-Management-Portal skips", () => {
