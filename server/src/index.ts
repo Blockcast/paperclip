@@ -1327,6 +1327,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        // Keep the outcome-side health signal independent from scheduling
+        // suppression and the long recovery chain below.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentLivenessGauges(new Date())
+          .catch((err) => {
+            logger.error({ err }, "periodic agent-liveness gauge publication failed");
+          }));
+
         const timerSuppression = await heartbeat.resolveSchedulingSuppression();
         // Re-check AFTER the await, not just before it (BLO-20822). This
         // callback is handed to `setInterval` and is not itself registered with
