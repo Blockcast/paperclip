@@ -180,20 +180,39 @@ of the gauge's 24h recency window by themselves.
 ## Verifying the signal is live
 
 ```
-paperclip_agent_wakeup_terminal_failed_oldest_age_seconds{scope="pr_review"}
-sum(paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"})
+max(paperclip_agent_wakeup_terminal_failed_oldest_age_seconds{scope="pr_review"})
+sum(max by (error_code, scope) (paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"}))
 ```
+
+Both are aggregated the replica-invariant way on purpose. Since BLO-31335 every
+replica publishes both gauges from its own heartbeat scheduler tick, as a full
+rewrite of global DB-derived state, so all replicas carry the **same** number —
+a bare `sum` multiplies by the replica count. The first query is the alert's own
+`expr` without the threshold comparison, so what you read here is what the rule
+evaluates; the second is the breakdown the alert description tells you to run
+(`max by (scope)` and `max by (error_code, scope)` respectively in the metric
+help strings — with `scope` pinned by the selector, `max(...)` is the same
+thing). For the "0 vs No data" decision below the multiplier would have been
+harmless, but a runbook that prints a bare `sum` one screen from an alert
+description warning against one is how the guidance rots.
 
 Both series are zero-initialized at process start — the count across the full
 `(error_code, scope)` grid, the age across both scopes — so a healthy fleet
 renders **0**, not "No data". If you see "No data", the scrape is broken or the
-reconcile pass is not running — that is a different and worse problem than the
-alert firing.
+**heartbeat scheduler tick** is not running — that is a different and worse
+problem than the alert firing.
+
+Check the tick, not `reconcileFailedWakeDispatches`. Since BLO-31335 both gauges
+publish from the scheduler tick above the suppression and startup-recovery gates,
+so a stalled or never-reached `reconcileFailedWakeDispatches` no longer suppresses
+either series. (Before BLO-31335 it did, and a suppressed replica emitted
+neither.) That pass still decides which *rows* exist — see the status table above
+— it just no longer decides whether the gauges are emitted.
 
 The age series is also explicitly rewritten to 0 for a scope with no unresolved
-rows on every reconcile pass. That is what lets the alert resolve: a gauge left
-untouched when the last failure clears would freeze above the threshold and page
-forever.
+rows on every heartbeat scheduler tick. That is what lets the alert resolve: a
+gauge left untouched when the last failure clears would freeze above the
+threshold and page forever.
 
 ### Where the rule actually runs
 

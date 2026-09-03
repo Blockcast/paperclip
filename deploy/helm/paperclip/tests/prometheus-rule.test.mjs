@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -343,6 +344,65 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     "terminal-failed description must not tell the responder to break the "
       + "count series down without naming an aggregation -- the natural "
       + "reading is `sum by (error_code)`, which multiplies by replica count",
+  );
+});
+
+test("the terminal-failed runbook describes the post-BLO-31335 emission path", () => {
+  // The sibling of the description guard above, on the other side of
+  // `runbook_url`. BLO-31335 moved both wake-dispatch gauges off
+  // `reconcileFailedWakeDispatches` and onto the heartbeat scheduler tick,
+  // which silently falsified the runbook's "No data" triage step -- it sent an
+  // on-call responder mid-incident to check a pass that can no longer suppress
+  // these series. Nothing rendered breaks when this rots (the chart does not
+  // read the runbook at all), so only an assertion catches it, and this is the
+  // page an operator lands on from the alert.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/agent-wakeup-terminal-failed.md"),
+    "utf8",
+  );
+
+  // Split at the status table so the two halves can be asserted apart. The
+  // table's `reconcileFailedWakeDispatches` mentions describe which ROWS that
+  // pass selects, which BLO-31335 did not change -- they must survive, so this
+  // guard must never be satisfiable by a blanket find-and-replace.
+  const verifySection = runbook.slice(runbook.indexOf("## Verifying the signal is live"));
+  assert.ok(
+    verifySection,
+    "runbook must keep a 'Verifying the signal is live' section",
+  );
+
+  assert.doesNotMatch(
+    verifySection,
+    /reconcile pass/,
+    "runbook liveness section must not attribute gauge emission to the "
+      + "reconcile pass -- since BLO-31335 both gauges publish from the "
+      + "heartbeat scheduler tick, so a stalled reconcile no longer explains "
+      + "'No data' and sends the responder to the wrong subsystem",
+  );
+  assert.match(
+    verifySection,
+    /heartbeat scheduler tick/,
+    "runbook liveness section must name the heartbeat scheduler tick as the "
+      + "emission path to check",
+  );
+
+  // The row-selection statements outside the liveness section are correct and
+  // load-bearing; assert they survive so a future sweep of the phrase above
+  // cannot take them with it.
+  assert.match(
+    runbook.slice(0, runbook.indexOf("## Verifying the signal is live")),
+    /`reconcileFailedWakeDispatches` only ever\nselects `dispatch_failed`/,
+    "runbook must keep the row-selection statement -- BLO-31335 changed which "
+      + "path EMITS the gauges, not which rows that pass selects",
+  );
+
+  // Same replica-invariance rule as the alert description: every replica
+  // publishes the same value, so a bare `sum` reads 3x on a 3-replica deploy.
+  assert.match(
+    verifySection,
+    /sum\(max by \(error_code, scope\) \(paperclip_agent_wakeup_terminal_failed_unresolved/,
+    "runbook copy-paste query must use the replica-invariant aggregation, "
+      + "matching the alert description it sits one hop from",
   );
 });
 
