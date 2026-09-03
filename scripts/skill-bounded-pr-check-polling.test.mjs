@@ -225,10 +225,15 @@ exit 99
     // an opaque timeout rather than "slept 0s, below the documented floor".
     // A real `sleep 0` also consumes a nonzero interval, so this is the more
     // faithful model as well as the more legible one.
+    //
+    // It also clears the `date` stub's consecutive-read counter, which is what
+    // makes that counter mean "reads with no intervening sleep" rather than
+    // "reads in total" — see the ceiling on the date stub below.
     const sleep = virtualClock
       ? `#!/usr/bin/env bash
 d=${JSON.stringify(dir)}
 printf '%s\\n' "$1" >>"$d/sleeps.log"
+printf '0' >"$d/reads"
 advance=$1; (( advance < 1 )) && advance=1
 printf '%s' "$(( $(cat "$d/clock") + advance ))" >"$d/clock"
 exit 0
@@ -279,7 +284,37 @@ d=${JSON.stringify(dir)}
 # stub exists to remove — no failure, just an intermittent merge-gating flake
 # again. So an unhandled argument mentioning %s is a hard error: loud at the
 # one site where silence was expensive (BLO-31386).
-if [[ $1 == +%s ]]; then cat "$d/clock"; echo; exit 0; fi
+#
+# The read counter is the same principle applied to the opposite escape. A
+# clock that moves ONLY when the loop sleeps cannot time out a loop that never
+# sleeps: \`elapsed\` stays 0, the deadline never fires, and the block spins
+# until the 30s spawn timeout — so a regression that stopped the loop sleeping
+# would surface as \`null !== 124\` instead of as the assertion that names it,
+# which is precisely the diagnosability this file exists to restore. Past a
+# ceiling of consecutive reads with no intervening sleep, jump the clock so the
+# loop times out through its OWN deadline path and the suite fails fast on
+# "expected at least one sleep" (3.3s rather than 30s).
+#
+# 20 is ~7x headroom: the counter resets on every sleep, and the highest any
+# test here legitimately reaches is 3. It is deliberately not larger — the
+# ceiling is also the number of wasted poll passes the failure costs, and 100
+# took 16s to trip.
+#
+# Jumping the clock, rather than exiting nonzero, is what makes this work at
+# all: the loops run WITHOUT \`set -e\`, so a failed \`date\` inside
+# \`elapsed=\$(( \$(date +%s) - poll_started ))\` is swallowed and the spin
+# continues — measured, it still timed out at 30s and merely added one stderr
+# line per iteration.
+if [[ $1 == +%s ]]; then
+  reads=$(( $(cat "$d/reads" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$reads" >"$d/reads"
+  if (( reads > 20 )); then
+    printf 'virtual clock stub: %s clock reads with no intervening sleep — the loop is not sleeping\\n' "$reads" >&2
+    printf '%s\\n' "$(( $(cat "$d/clock") + 86400 ))"
+    exit 0
+  fi
+  cat "$d/clock"; echo; exit 0
+fi
 for a in "$@"; do
   case $a in
     *%s*)
