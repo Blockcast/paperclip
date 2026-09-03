@@ -47,7 +47,7 @@
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
           "editorMode": "code",
-          "expr": "sum(paperclip_github_review_request_dead_letter_unresolved)",
+          "expr": "sum(max by (reason) (paperclip_github_review_request_dead_letter_unresolved))",
           "legendFormat": "unresolved",
           "range": false,
           "instant": true

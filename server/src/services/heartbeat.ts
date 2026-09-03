@@ -34511,10 +34511,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * it was built to detect. Raising the cap only moves the burst rate that
        * defeats it; the cap has to be off the age path entirely.
        *
-       * It is an aggregate, so "uncapped" costs one row per scope, not a scan
-       * proportional to the failure count. The count series keeps its bounded
+       * It is an aggregate, so "uncapped" RETURNS one row per scope. That is a
+       * statement about result cardinality, not about scan cost, and the two
+       * must not be conflated (BLO-31335, Ally round 2): the `where` — both
+       * `not exists` subqueries included — is evaluated per candidate row
+       * before `min()` collapses anything. The count series keeps its bounded
        * scan: a count is a magnitude and a truncated magnitude still pages,
        * whereas a truncated MIN is simply the wrong number.
+       *
+       * So the scan is held down by predicates rather than by a row cap. The
+       * outer query is bounded by `cutoff`; each subquery additionally carries
+       * a CONSTANT bound (`> ${cutoff}`) alongside its correlated one. The
+       * constant bound is logically redundant — any successor must postdate a
+       * candidate whose `finishedAt >= cutoff`, so it cannot change the result
+       * set — but a purely correlated predicate gives the planner nothing
+       * sargable and it probes all history. This matters more now that the
+       * publisher runs on every replica's scheduler tick rather than on one
+       * replica's reconcile pass. Same treatment the sibling JS-side successor
+       * lookups below already get from `oldestFinishedAt`.
        *
        * The successor predicates are built from the SAME
        * TERMINAL_FAILED_WAKE_SUCCESSOR_* constants the JS path uses. That is
@@ -34547,6 +34561,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 where successor_wake.payload ->> 'taskKey' = ${wakeTaskKey}
                   and successor_wake.id <> ${agentWakeupRequests.id}
                   and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
+                  and successor_wake.requested_at > ${cutoff.toISOString()}::timestamptz
                   and successor_wake.status in (${successorStatusList(
                     TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
                   )})
@@ -34556,6 +34571,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 from heartbeat_runs successor_run
                 where successor_run.context_task_key = ${wakeTaskKey}
                   and successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                  and successor_run.created_at > ${cutoff.toISOString()}::timestamptz
                   and successor_run.status in (${successorStatusList(
                     TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
                   )})

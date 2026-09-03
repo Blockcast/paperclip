@@ -1666,8 +1666,11 @@ function ensureRegistry(): {
       help:
         "Current count of GitHub review-request wakes sitting in the durable terminal "
         + "dispatch_failed_exhausted state within the recency window, re-derived from "
-        + "agent_wakeup_requests on every wake-dispatch reconcile pass (BLO-18859 review "
-        + "follow-up). This is the restart-safe companion to "
+        + "agent_wakeup_requests on every heartbeat scheduler tick (BLO-18859 review "
+        + "follow-up; moved off the wake-dispatch reconcile pass in BLO-31335). Published "
+        + "by EVERY replica and identical on each, because it is a full rewrite of global "
+        + "DB-derived state -- aggregate across pods with max by (reason), never a bare "
+        + "sum, which multiplies by the replica count. This is the restart-safe companion to "
         + "paperclip_github_review_request_delivery_total{state=\"dead_lettered\"}: that "
         + "counter is process-local, so a dead letter recorded before the first scrape has "
         + "no baseline to increase() against, and a pod replacement retires the series "
@@ -1742,8 +1745,12 @@ function ensureRegistry(): {
       help:
         "Current count of agent_wakeup_requests rows sitting in the terminal "
         + "status='failed' state within the recency window, with no successor wake for "
-        + "the same taskKey, re-derived from committed rows on every wake-dispatch "
-        + "reconcile pass (BLO-20255). Distinct from the dispatch dead-letter gauge "
+        + "the same taskKey, re-derived from committed rows on every heartbeat scheduler "
+        + "tick (BLO-20255; moved off the wake-dispatch reconcile pass in BLO-31335). "
+        + "Published by EVERY replica and identical on each, because it is a full rewrite "
+        + "of global DB-derived state -- aggregate across pods with "
+        + "max by (error_code, scope), never a bare sum. Distinct from the dispatch "
+        + "dead-letter gauge "
         + GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC
         + ": 'failed' means the wake dispatched and the RUN died "
         + "(Job force-terminated, Job failed, adapter threw), whereas "
@@ -1780,7 +1787,9 @@ function ensureRegistry(): {
       help:
         "Age in seconds of the OLDEST agent_wakeup_requests row still sitting in the "
         + "terminal status='failed' state for this scope, with no successor wake for the "
-        + "same taskKey, re-derived on every wake-dispatch reconcile pass (BLO-20255). 0 "
+        + "same taskKey, re-derived on every heartbeat scheduler tick (BLO-20255; moved "
+        + "off the wake-dispatch reconcile pass in BLO-31335). Published by EVERY replica "
+        + "and identical on each; aggregate across pods with max by (scope). 0 "
         + "means the scope has no unresolved terminal-failed wake. Alert on THIS rather "
         + "than on a `for:` clause over "
         + AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC
@@ -2538,10 +2547,10 @@ export function recordGithubReviewCompletion(status: string | null | undefined):
 
 /**
  * Publish the current unresolved GitHub review-request dead-letter counts
- * (BLO-18859 review follow-up). Called once per wake-dispatch reconcile pass
- * with the full bounded map, so the gauge is a rewrite of durable state rather
- * than a delta — a restarted process republishes the same value on its first
- * pass instead of starting from a zero it can never climb back from.
+ * (BLO-18859 review follow-up). Called once per heartbeat scheduler tick
+ * (BLO-31335) with the full bounded map, so the gauge is a rewrite of durable
+ * state rather than a delta — a restarted process republishes the same value on
+ * its first tick instead of starting from a zero it can never climb back from.
  *
  * Every known reason absent from `byReason` is explicitly reset to 0, so a
  * dead letter that ages out of the recency window drops the gauge instead of
@@ -2561,10 +2570,10 @@ export function setGithubReviewRequestDeadLetterUnresolved(byReason: Record<stri
 
 /**
  * Publish the current unresolved terminal-`failed` wake counts (BLO-20255).
- * Called once per wake-dispatch reconcile pass with the full bounded set, so
- * the gauge is a rewrite of durable state rather than a delta — a restarted
- * process republishes the same value on its first pass instead of starting
- * from a zero it can never climb back from.
+ * Called once per heartbeat scheduler tick (BLO-31335) with the full bounded
+ * set, so the gauge is a rewrite of durable state rather than a delta — a
+ * restarted process republishes the same value on its first tick instead of
+ * starting from a zero it can never climb back from.
  *
  * Every `(error_code, scope)` pair absent from `entries` is explicitly reset to
  * 0, so a row that ages out of the recency window — or that a successor wake
@@ -2607,9 +2616,9 @@ export function setAgentWakeupTerminalFailedUnresolved(
 /**
  * Publish the oldest unresolved terminal-`failed` wake age per scope
  * (BLO-20255). Same rewrite-of-durable-state contract as
- * {@link setAgentWakeupTerminalFailedUnresolved}: called once per reconcile
- * pass with the full set, and every scope absent from `entries` is explicitly
- * reset to 0.
+ * {@link setAgentWakeupTerminalFailedUnresolved}: called once per heartbeat
+ * scheduler tick (BLO-31335) with the full set, and every scope absent from
+ * `entries` is explicitly reset to 0.
  *
  * That reset is the part with teeth. If a scope's series were merely left
  * alone once its last failure cleared, the age would freeze at whatever it
