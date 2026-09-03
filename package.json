@@ -43,6 +43,7 @@
     "check:token-gates": "node scripts/check-token-gates.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
+    "test:agent-health-preflight": "node --test scripts/agent-health-preflight.test.mjs",
     "test:security-audit-overrides": "node scripts/security-audit-overrides.test.js",
     "test:ip-address-security-override": "node --test scripts/ip-address-security-override.test.js",
     "test:browserslist-security-override": "node --test scripts/browserslist-security-override.test.js",

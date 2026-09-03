@@ -395,6 +395,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:browserslist-security-override
 
+      - name: Test agent-health preflight fixtures
+        if: ${{ !cancelled() }}
+        run: pnpm run test:agent-health-preflight
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
