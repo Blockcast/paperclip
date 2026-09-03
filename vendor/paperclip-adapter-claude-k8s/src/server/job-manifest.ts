@@ -1619,8 +1619,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // unknown revision. That is deliberate, not collateral: those refs described
   // the *base's* local branches while being named as though they described
   // upstream, and a lying ref is worse than a missing one. The best-effort
-  // fetch below repopulates them from the real upstream, which is the first
-  // time `origin/master` in a run workspace has actually meant upstream.
+  // fetch below repopulates `refs/remotes/origin/<branch>` from the real
+  // upstream, which is the first time `origin/master` in a run workspace has
+  // actually meant upstream.
+  //
+  // `fetch` restores branches but NOT `refs/remotes/origin/HEAD` (a symbolic
+  // ref that a plain clone does carry, and that tooling reads via
+  // `git symbolic-ref refs/remotes/origin/HEAD` to find the default branch),
+  // so the fetch is paired with `remote set-head -a`. Same reasoning as the
+  // branches: the old `origin/HEAD` pointed at the *base's* current branch, so
+  // it too was a lying ref, and this repoints it at upstream's default.
   //
   // Guarding rule for this chain: commands that establish the security property
   // (the base must not be reachable as a remote) stay UNGUARDED so a failure
@@ -1653,17 +1661,37 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 `${runWorkspaceGit} remote add origin -- ${quoteShellArg(upstreamRepoUrl)}`,
                 // Ergonomics, not security: restore `origin/<branch>` so the
                 // common `git rebase origin/master` / `git log origin/master..HEAD`
-                // phrasings resolve. Guarded, and leaves a breadcrumb when it
-                // cannot run, so an offline pod degrades to "fetch first" rather
-                // than to a failed run or an unexplained `unknown revision`.
-                `(${runWorkspaceGit} fetch --no-tags --quiet origin || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+                // phrasings resolve, then `set-head` so `origin/HEAD` resolves
+                // too. Guarded, and leaves a breadcrumb when it cannot run, so
+                // an offline pod degrades to "fetch first" rather than to a
+                // failed run or an unexplained `unknown revision`.
+                //
+                // This runs on every run-isolated pod start, so the fetch is
+                // bounded: `http.lowSpeedLimit`/`lowSpeedTime` abort a transfer
+                // that stalls below 1 KiB/s for 15s instead of letting a
+                // blackholed network hold pod startup open. That bounds a
+                // stalled *transfer*; a connect that never completes is still
+                // bounded only by the kernel's TCP retry, which is finite but
+                // longer.
+                //
+                // `set-head` is nested inside its own guard so that when the
+                // fetch succeeds but `set-head` fails, the chain does not fall
+                // through and write the misleading `originFetchFailed`
+                // breadcrumb about a fetch that actually worked.
+                `(${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 fetch --no-tags --quiet origin && (${runWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
               ]
             : [
-                // No recorded upstream (a cwd that happens to be a repo, e.g. a
-                // stray `.git` under the per-agent fallback home): leave the clone
-                // with no remote at all rather than one aimed at the base, and say
-                // so on the workspace so the resulting `fatal: 'origin' does not
-                // appear to be a git repository` is self-explaining.
+                // No recorded upstream: leave the clone with no remote at all
+                // rather than one aimed at the base, and say so on the
+                // workspace so the resulting `fatal: 'origin' does not appear
+                // to be a git repository` is self-explaining.
+                //
+                // The reachable case is a `local_path` project workspace.
+                // `validateProjectWorkspace` requires only *one* of `cwd` or
+                // `repoUrl`, so a workspace configured by path satisfies it via
+                // `cwd` and carries `repoUrl: null` by construction. A project
+                // with no git workspace at all never reaches here — it fails the
+                // `rev-parse --verify HEAD` guard above.
                 `(${runWorkspaceGit} config paperclip.originRemoved 'no upstream recorded for this run; origin removed so the clone source (a shared base checkout) is not a push target (BLO-31359)' || true)`,
               ]),
         ].join(" && ")};`,

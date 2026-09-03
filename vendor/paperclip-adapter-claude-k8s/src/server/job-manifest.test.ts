@@ -825,6 +825,8 @@ describe("buildJobManifest", () => {
       expect(command).toContain("git -C '/runtime-cache/paperclip-runs/run-abc12345/workspace' remote remove origin");
       expect(command).not.toContain("remote add origin");
       expect(command).not.toContain("fetch --no-tags");
+      // Nothing that presumes a remote may leak onto the no-upstream path.
+      expect(command).not.toContain("remote set-head");
       expect(command).toContain("config paperclip.originRemoved");
       expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
@@ -887,7 +889,7 @@ describe("buildJobManifest", () => {
     // origin/master` fails with `unknown revision`. The refetch is ergonomics,
     // not security, so unlike the remove/add pair it is guarded — an offline pod
     // must degrade to "fetch first", never to a failed run.
-    it("refetches remote-tracking refs after repointing origin, without letting a fetch failure fail the run", () => {
+    it("refetches remote-tracking refs and origin/HEAD after repointing origin, without letting a fetch failure fail the run", () => {
       ctx.context = {
         paperclipWorkspace: {
           cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
@@ -909,15 +911,29 @@ describe("buildJobManifest", () => {
       const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
       const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
 
-      expect(command).toContain(`git -C '${workspaceRoot}' fetch --no-tags --quiet origin`);
+      expect(command).toContain(`fetch --no-tags --quiet origin`);
       // Fetch only after origin points at upstream — fetching earlier would pull
       // the base's refs back in under the name `origin`.
       expect(command.indexOf("remote add origin")).toBeLessThan(command.indexOf("fetch --no-tags"));
       // Guarded, and in a subshell: `a && b || true` would parse as
       // `(a && b) || true` and swallow failures of the unguarded security
       // commands earlier in the chain.
-      expect(command).toContain(`(git -C '${workspaceRoot}' fetch --no-tags --quiet origin ||`);
+      expect(command).toContain(`(git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000`);
       expect(command).toContain("config paperclip.originFetchFailed");
+
+      // `fetch` restores refs/remotes/origin/<branch> but not the symbolic
+      // refs/remotes/origin/HEAD, so `set-head` is paired with it — otherwise
+      // `git symbolic-ref refs/remotes/origin/HEAD` stays broken in every
+      // run-isolated workspace.
+      expect(command).toContain(`git -C '${workspaceRoot}' remote set-head origin -a`);
+      expect(command.indexOf("fetch --no-tags")).toBeLessThan(command.indexOf("remote set-head"));
+      // set-head carries its own nested guard, so a set-head failure after a
+      // successful fetch cannot fall through to the "fetch failed" breadcrumb.
+      expect(command).toContain(`(git -C '${workspaceRoot}' remote set-head origin -a >/dev/null 2>&1 || true)`);
+
+      // The fetch runs on every run-isolated pod start, so it is bounded: a
+      // transfer stalling below the floor aborts instead of holding startup open.
+      expect(command).toContain("-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15");
 
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");
