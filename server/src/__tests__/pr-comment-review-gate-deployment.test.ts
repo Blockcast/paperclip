@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * BLO-29711 AC#1. The gate's status context moved out of the `review/`
@@ -14,10 +15,20 @@ import { join } from "node:path";
  * "green while nothing is happening" shape this issue exists to remove, so the
  * name is pinned on both sides of the wire.
  */
-const repoRoot = process.cwd();
+// Resolved from this file, not from `process.cwd()`. Vitest is invoked from the
+// repo root by `pnpm test` and from `server/` by a filtered run, so a cwd-based
+// root makes these assertions pass or throw ENOENT depending on how the suite
+// was started — the reads must be anchored to the source tree instead.
+const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 
 function read(relativePath: string): string {
-  return readFileSync(join(repoRoot, relativePath), "utf8");
+  const contents = readFileSync(join(repoRoot, relativePath), "utf8");
+  // An empty read would satisfy every `not.toContain` assertion below, so a
+  // future path regression must fail loudly rather than vacuously pass.
+  if (contents.trim().length === 0) {
+    throw new Error(`${relativePath} resolved to an empty file under ${repoRoot}`);
+  }
+  return contents;
 }
 
 const CONTEXT_ENV = "PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT";

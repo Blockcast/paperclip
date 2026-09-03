@@ -702,14 +702,14 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     const retryReleased = new Promise<void>((resolve) => {
       releaseRetry = resolve;
     });
-    const postedBodies: Array<{ state?: string; description?: string }> = [];
+    const postedBodies: Array<{ state?: string; context?: string; description?: string }> = [];
     const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) {
         statusReads += 1;
         if (statusReads === 2) {
-          retryReadStarted();
+          releaseRetryRead();
           await retryReleased;
           return jsonResponse([]);
         }
@@ -723,7 +723,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         ]);
       }
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
-        if (init?.body) postedBodies.push(JSON.parse(String(init.body)) as { state?: string; description?: string });
+        if (init?.body) postedBodies.push(JSON.parse(String(init.body)) as { state?: string; context?: string; description?: string });
         return jsonResponse({ id: postedBodies.length }, true, 201);
       }
       if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
@@ -735,8 +735,10 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     const retry = pollGitHubCommitStatusDeliveriesOnce(db);
     await retryReadStarted;
 
-    // The newer evaluation shares the same lock and publishes while the
-    // worker is between its first freshness read and lock acquisition.
+    // The newer evaluation shares the same lock and publishes while the worker
+    // is paused inside its pre-lock freshness re-check, i.e. after it has
+    // claimed the row but before it holds the advisory lock. Asserted as the
+    // exact body so a post to the wrong context cannot pass.
     await withGithubStatusDeliveryLock(
       db,
       "Blockcast/hang#" + HEAD_SHA,
@@ -749,10 +751,12 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         targetUrl: null,
       }),
     );
-    releaseRetryRead();
+    releaseRetry();
     await retry;
 
-    expect(postedBodies).toEqual([{ state: "success", description: "new clean evaluation" }]);
+    expect(postedBodies).toEqual([
+      { state: "success", context: "review/ally-comment", description: "new clean evaluation" },
+    ]);
     expect(await readDelivery(delivery.id)).toMatchObject({
       status: "skipped",
       lastResult: { reason: "fresh_success_status_exists" },
