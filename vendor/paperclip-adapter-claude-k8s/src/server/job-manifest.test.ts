@@ -14,6 +14,7 @@ import {
   ENV_NAME_CLASSIFICATION,
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
+  findLiteralOperatorEnvVarsInPodSpec,
   findServerOnlyEnvVarsInPodSpec,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
@@ -1040,6 +1041,47 @@ describe("buildJobManifest", () => {
       expect(env.get("GOCACHE")).toBe("/custom-go-cache");
     });
 
+    // PEN-2370. adapterConfig.env is the one env channel whose names are data
+    // rather than code: an operator picks them, so neither SENSITIVE_ENV_NAME_RE
+    // nor ENV_NAME_CLASSIFICATION can enumerate them ahead of time. Routing it
+    // by name therefore fails open on exactly the case that matters — a
+    // credential under a name nobody predicted — and `GET Pod` returns it.
+    // BLO-21858 (ANTHROPIC_CUSTOM_HEADERS) is the proof it happens; the remedy
+    // there was to pin one more name, which does not bound the next one.
+    it("routes an operator-supplied env value through a Secret even when its name matches no sensitive pattern", () => {
+      // Control: if this ever starts matching, the assertions below would be
+      // carried by the pre-existing denylist rather than by the layer-4 rule,
+      // and would attest nothing.
+      expect(isSensitiveEnvName("SENTRY_DSN")).toBe(false);
+      expect(classifyEnvName("SENTRY_DSN")).toBeNull();
+
+      const dsn = "https://0123456789abcdef@o0.ingest.example.invalid/42";
+      ctx.config = { env: { SENTRY_DSN: dsn } };
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
+      const env = job.spec?.template?.spec?.containers[0]?.env ?? [];
+      const entry = env.find((e) => e.name === "SENTRY_DSN");
+
+      // The name survives — knowing *which* variables are set is the
+      // diagnostic value the read-only grant exists for.
+      expect(entry).toBeDefined();
+      // The value does not. This is the half `GET Pod` must not return.
+      expect(entry?.value).toBeUndefined();
+      expect(entry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.SENTRY_DSN).toBe(dsn);
+    });
+
+    it("keeps an operator override of a declared SAFE_LITERAL name a readable literal", () => {
+      // The counterweight to the rule above: BLO-29804 declined a blanket
+      // inversion because ~40 operability fields would go opaque and stop
+      // `GET Pod` being a triage tool. Declared-safe names stay literal, so
+      // that argument keeps holding.
+      expect(classifyEnvName("XDG_CACHE_HOME")).toBe("SAFE_LITERAL");
+      ctx.config = { env: { XDG_CACHE_HOME: "/custom-cache" } };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const env = job.spec?.template?.spec?.containers[0]?.env ?? [];
+      expect(env.find((e) => e.name === "XDG_CACHE_HOME")?.value).toBe("/custom-cache");
+    });
+
     it("inherits env vars from selfPod, routing the credential-shaped one through a Secret", () => {
       selfPod.inheritedEnv = { ANTHROPIC_API_KEY: "sk-abc", AWS_REGION: "us-east-1" };
       const { job, envSecret } = buildJobManifest({ ctx, selfPod });
@@ -1066,11 +1108,18 @@ describe("buildJobManifest", () => {
 
 
     it("user env config overrides inherited env", () => {
+      // The invariant under test is layer-4 *precedence* over layer 3, not the
+      // shape the winning value takes on the pod. Since PEN-2370 an
+      // operator-supplied name that is not declared SAFE_LITERAL is
+      // Secret-backed, so precedence is now asserted through the Secret. The
+      // inherited value losing is still the thing being proven.
       selfPod.inheritedEnv = { AWS_REGION: "us-east-1" };
       ctx.config = { env: { AWS_REGION: "us-west-2" } };
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const awsRegion = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "AWS_REGION");
-      expect(awsRegion?.value).toBe("us-west-2");
+      expect(awsRegion?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.AWS_REGION).toBe("us-west-2");
+      expect(awsRegion?.value).toBeUndefined();
     });
 
     it("sets PAPERCLIP_RUN_ID", () => {
@@ -2217,6 +2266,39 @@ describe("fail-closed sensitive-env guard covers every container on the pod", ()
     // ...and is inside the guard's field of view (it returns clean today).
     expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
   });
+
+  // PEN-2370. Positive controls for the layer-4 backstop. A guard that reports
+  // zero can mean "no violations" or "matches nothing", and those are different
+  // claims — so prove it fires before trusting a clean result from it.
+  it("flags an operator-supplied literal that no sensitive-name pattern matches", () => {
+    const podSpec = {
+      containers: [
+        {
+          name: "claude",
+          env: [
+            { name: "SENTRY_DSN", value: "https://0123456789abcdef@o0.ingest.example.invalid/42" },
+            { name: "XDG_CACHE_HOME", value: "/custom-cache" },
+          ],
+        },
+      ],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+
+    // The pre-existing sensitive-name guard is blind to it — this is the gap.
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
+    // The layer-4 guard fires, and names the container.
+    expect(findLiteralOperatorEnvVarsInPodSpec(podSpec, ["SENTRY_DSN", "XDG_CACHE_HOME"]))
+      .toEqual(["claude/SENTRY_DSN"]);
+    // A declared SAFE_LITERAL name stays permitted even though the operator set it.
+    expect(findLiteralOperatorEnvVarsInPodSpec(podSpec, ["XDG_CACHE_HOME"])).toEqual([]);
+    // A name the operator did not supply is out of scope for this rule.
+    expect(findLiteralOperatorEnvVarsInPodSpec(podSpec, [])).toEqual([]);
+  });
+
+  it("returns clean for the manifest buildJobManifest actually assembles from operator env", () => {
+    const ctx = makeCtx({ config: { env: { SENTRY_DSN: "https://abc@o0.ingest.example.invalid/1" } } });
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(findLiteralOperatorEnvVarsInPodSpec(job.spec!.template.spec!, ["SENTRY_DSN"])).toEqual([]);
+  });
 });
 
 /**
@@ -2606,15 +2688,28 @@ describe("env name classification gate (BLO-29804)", () => {
     expect(ENV_NAME_CLASSIFICATION.filter((e) => e.reason.trim().length === 0).map((e) => e.name)).toEqual([]);
   });
 
-  it("keeps the Secret-backed name set identical to the pre-change set (no behaviour change)", () => {
-    // The no-behaviour-change proof required by BLO-29804. This is the set as
-    // it stood before the classification table existed: regex matches plus the
-    // one name BLO-21858 pinned. If introducing the table ever moves a var
-    // between literal and secretKeyRef, this reddens.
+  it("pins the Secret-backed name set (BLO-29804 baseline + the PEN-2370 layer-4 rule)", () => {
+    // Originally BLO-29804's no-behaviour-change proof: the set as it stood
+    // before the classification table existed (regex matches plus the one name
+    // BLO-21858 pinned). That property held until PEN-2370, which deliberately
+    // changed it: an operator-supplied name that is not declared SAFE_LITERAL
+    // is now Secret-backed rather than a pod literal, because
+    // `adapterConfig.env` is unbounded by construction and a name denylist over
+    // it is fail-open.
+    //
+    // OPERATOR_TUNABLE is the visible cost of that decision and is kept in the
+    // fixture on purpose: it is *not* a credential, and it still goes to the
+    // Secret, because nothing at this layer can tell it from one. An operator
+    // var that genuinely needs to stay readable via `GET Pod` gets a declared
+    // SAFE_LITERAL entry — one deliberate edit, which is the review checkpoint.
+    //
+    // The test keeps its original function: pin the exact set, so any *further*
+    // movement between literal and secretKeyRef reddens and has to be argued.
     const EXPECTED_SECRET_BACKED = [
       "ANTHROPIC_CUSTOM_HEADERS",
       "GH_TOKEN",
       "OPERATOR_API_TOKEN",
+      "OPERATOR_TUNABLE",
       "PAPERCLIP_API_KEY",
       "PAPERCLIP_K8S_ISOLATION_KEY",
     ];
