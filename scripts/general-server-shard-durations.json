@@ -310,6 +310,7 @@
     "server/src/__tests__/live-events-ws.test.ts": 45,
     "server/src/__tests__/log-redaction.test.ts": 14,
     "server/src/__tests__/logger-tz.test.ts": 58,
+    "server/src/__tests__/managed-checkout-partial-clone.test.ts": 1583,
     "server/src/__tests__/mcp-http.test.ts": 18,
     "server/src/__tests__/mcp-seed-scrub-coverage.test.ts": 6,
     "server/src/__tests__/metrics-ccrotate-capacity-deferred.test.ts": 17,
