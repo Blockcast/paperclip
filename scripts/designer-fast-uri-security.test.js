@@ -17,10 +17,13 @@ assert.ok(
   "designer lockfile missing fast-uri resolution",
 );
 
+// Floor is 3.1.6: GHSA-5jgf-p345-68v8 / CVE-2026-75931 (host confusion via
+// skipped IDN canonicalization on scheme-relative references) covers
+// >= 3.1.3, < 3.1.6, so the previous 3.1.5 floor admitted a vulnerable pin.
 for (const [path, fastUri] of fastUriResolutions) {
   const [major, minor, patch] = fastUri.version.split(".").map(Number);
   assert.ok(
-    major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
+    major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 6))),
     `designer lockfile ${path} resolved vulnerable fast-uri ${fastUri.version}`,
   );
 }

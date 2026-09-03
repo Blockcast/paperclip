@@ -47,7 +47,7 @@ async function main() {
     const packageJson = JSON.parse(
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
-    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.5");
+    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
     const fastUriResolution = lockfile.match(
@@ -56,7 +56,7 @@ async function main() {
     assert.ok(fastUriResolution, "lockfile missing fast-uri resolution");
     const [, major, minor, patch] = fastUriResolution.map(Number);
     assert.ok(
-      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
+      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 6))),
       `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
     );
     const designerLockfile = JSON.parse(
@@ -73,7 +73,7 @@ async function main() {
     assert.ok(
       designerMajor > 3 ||
         (designerMajor === 3 &&
-          (designerMinor > 1 || (designerMinor === 1 && designerPatch >= 5))),
+          (designerMinor > 1 || (designerMinor === 1 && designerPatch >= 6))),
       "designer lockfile resolved vulnerable fast-uri",
     );
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
