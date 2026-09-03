@@ -1279,7 +1279,14 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
        * on reliably at the process boundaries: `increase()` needs a
        * pre-increment sample, and a replaced pod retires its series. So these
        * assert the property that fixes that — the value is *re-derived from
-       * committed rows* on each reconcile pass, not accumulated in memory.
+       * committed rows* every time it is published, not accumulated in memory.
+       *
+       * Since BLO-31335 that publish happens on the heartbeat scheduler tick
+       * rather than at the tail of `reconcileFailedWakeDispatches`, which is
+       * why the cases below call `publishGithubReviewDeadLetterGauge`
+       * explicitly after the reconcile instead of relying on it as the
+       * emission vehicle. The reconcile is still called where a case needs the
+       * row transitions it performs.
        */
       async function deadLetterGauge(): Promise<number> {
         const metric = getMetricsRegistry().getSingleMetric(
