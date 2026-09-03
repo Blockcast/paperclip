@@ -488,6 +488,10 @@ jobs:
         # that gates `verify` floating on whatever `@v4` resolved to that day.
         # A helm release that changes template output would fail every PR with
         # no version to point at.
+        #
+        # Bumped by hand: dependabot's github-actions ecosystem updates `uses:`
+        # refs, not `with:` inputs, so nothing moves this line automatically.
+        # BLO-31516.
         uses: azure/setup-helm@v4
         with:
           version: v3.16.3

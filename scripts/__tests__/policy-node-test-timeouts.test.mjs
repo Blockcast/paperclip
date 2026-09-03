@@ -4,6 +4,14 @@ import { test } from "node:test";
 
 const workflowSource = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
 
+// Scope: pr.yml only, of 31 workflow files. The invariant the chart-suite
+// assertions below encode ("the suite runs in exactly one job") is really
+// repo-wide, so a re-add in e2e.yml or master-health.yml is invisible here.
+// Deliberate rather than overlooked: pr.yml is where both historical duplicates
+// landed (#965, #995), and today no other workflow references the suite at all
+// -- docker.yml renders the chart four times but never runs its tests. Widen
+// this to a glob over .github/workflows/ if that stops being true.
+
 // Every assertion here matches pr.yml as text, so all of them have to ignore
 // comments. pr.yml documents these invariants in prose inside itself -- the
 // `helm_chart` preamble names the suite's directory and says "do not re-add it
@@ -69,10 +77,18 @@ test("policy continues after a bounded test failure unless cancelled", () => {
 // invoked with today. The glob is one spelling of many: re-adding the step as
 // `node --test ./deploy/helm/paperclip/tests/probes.test.mjs` restores the
 // duplicate coverage while leaving a glob-only search at exactly one hit, so
-// the gate passes and the thing it exists to catch goes through. The directory
-// catches every spelling -- individual files, a bare directory, a leading `./`
-// -- and catches a re-add inside a `run: |` block, which filtering to `run:`
-// lines would miss (pr.yml has 17 such blocks).
+// the gate passes and the thing it exists to catch goes through.
+//
+// What the directory buys, precisely: any re-add that names the path from the
+// repo root -- individual files, a bare directory, a leading `./` -- including
+// one inside a `run: |` block, which filtering to `run:` lines would miss
+// (pr.yml has 17 such blocks). What it does NOT catch is a re-add that chdirs
+// first, because then the path never appears in full. Both of these pass the
+// assertion below; the one after it is what closes them.
+//
+//     run: |                              working-directory: deploy/helm/paperclip
+//       cd deploy/helm/paperclip          run: node --test ./tests/*.test.mjs
+//       node --test ./tests/*.test.mjs
 const CHART_SUITE = "deploy/helm/paperclip/tests/";
 
 // `[a-z_]+` missed every job key containing a digit -- 3 of the 12 defined
@@ -111,6 +127,32 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
   assert.equal(jobOwning(offsets[0]), "helm_chart", `${CHART_SUITE} must run in the helm_chart job`);
 });
 
+// The chdir escapes named above. Scoped to steps that ALSO run `node --test`:
+// `helm lint`/`helm template` against the chart are legitimate anywhere (and
+// docker.yml does exactly that, four times), so a bare chdir is not the thing
+// being caught -- running the suite from inside the chart is.
+//
+// Still not exhaustive, and deliberately not claimed to be: a chdir built from
+// a shell variable, a matrix value, or a `pushd` escapes both assertions. This
+// closes the two spellings a re-add would plausibly be written in, which is the
+// axis the assertion above leaves open -- not the whole space.
+const CHART_DIR = "deploy/helm/paperclip";
+
+test("only helm_chart runs the chart suite from inside the chart directory (BLO-31516)", () => {
+  const marker = "\n      - name: ";
+  const offenders = [];
+  for (let at = workflow.indexOf(marker); at !== -1; at = workflow.indexOf(marker, at + 1)) {
+    const next = workflow.indexOf(marker, at + 1);
+    const step = workflow.slice(at, next === -1 ? undefined : next);
+    if (!step.includes("node --test")) continue;
+    const chdirs = new RegExp(`\\n\\s+(?:working-directory:|cd) +\\.?/?${CHART_DIR}/?\\s*$`, "m").test(step);
+    if (chdirs && jobOwning(at) !== "helm_chart") {
+      offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `only helm_chart may run node --test from inside ${CHART_DIR}`);
+});
+
 // BLO-29182 observed this exact invocation hang, and its fix bounded the copy
 // that used to live in `policy`. Removing that copy has to carry the bound with
 // it, or the one `node --test` step known to hang is unbounded again — a hung
@@ -138,6 +180,17 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
 // template output would turn `verify` red repo-wide with no version to point
 // at. `helm_chart`'s own preamble already leans on pinning ("the runner
 // image's pinned yq"), so pin the chart renderer the same way and gate it.
+//
+// Read the `version:` key on its own rather than matching the shape of the
+// whole `with:` block. The invariant is "a version is named and it isn't
+// `latest`" -- the action's default -- and nothing more. Requiring `version` to
+// be the first key under `with:` false-reds on a correctly pinned install the
+// moment a sibling lands above it (`token` and `downloadBaseURL` are both real
+// setup-helm inputs, and alphabetical ordering puts `downloadBaseURL` first);
+// requiring a leading `v` and three components rejects `3.16.3` and `v3.17`,
+// which the action documents as valid. All three of those failed with "must
+// pin an explicit version" against installs that were pinned, which sends the
+// next reader hunting for a pin that is right there.
 test("the chart render job pins the helm it renders with (BLO-31516)", () => {
   const region = jobRegion("helm_chart");
   const step = region
@@ -145,9 +198,14 @@ test("the chart render job pins the helm it renders with (BLO-31516)", () => {
     .slice(1)
     .find((candidate) => candidate.includes("azure/setup-helm"));
   assert.ok(step, "helm_chart must install helm");
+  const version = step.match(/\n {10}version: *(\S+)\n/)?.[1];
+  assert.ok(
+    version && version !== "latest",
+    "the helm install must pin an explicit version, not float on the action's default (`latest`)",
+  );
   assert.match(
-    step,
-    /\n        with:\n          version: v\d+\.\d+\.\d+\n/,
-    "the helm install must pin an explicit version, not float on the action's default",
+    version,
+    /^v?\d+\.\d+(\.\d+)?(-[0-9A-Za-z.-]+)?$/,
+    `the helm version must name a release, got ${version}`,
   );
 });
