@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildPaperclipTaskMarkdown,
   derivePaperclipPrReview,
-  evaluatePrReviewCompletionEvidence,
+  evaluatePrReviewCompletionEvidence, prReviewOutputHasAlreadyReviewedSkip,
   mergeCoalescedContextSnapshot,
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
@@ -882,6 +882,56 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
       status: "missing",
       errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Masking guard (fourth Ally pass): a negation governing the clause from the
+  // subject position, not adjacent to `already`. All four were `false` on
+  // master and must stay `missing`.
+  it.each([
+    "There is no evidence this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, so I posted a fresh verdict.",
+    "I do not believe this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I cannot see that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Found no review; nothing indicates this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: rejects a non-adjacent negation governing the clause (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // A negation in the PREVIOUS clause does not reach the review clause.
+  it("BLO-31374: a negation in an earlier clause does not veto the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "No changes were requested on the prior head; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+      }),
+    ).toEqual({ status: "already_reviewed" });
+  });
+
+  // Direct table over the predicate: pins each veto boundary in one line.
+  describe("BLO-31374: prReviewOutputHasAlreadyReviewedSkip boundaries", () => {
+    const sha = "8b237675b19fa5ae061821fd3b1d87cd8cd1836f";
+    it.each([
+      [`Already reviewed at \`${sha}\` — no action taken.`, true],
+      [`already reviewed at 2026-05-26T04:38:27Z for ${sha}`, true],
+      [`**Already reviewed** at \`${sha}\`.`, true],
+      [`Already reviewed at head ${sha}; skipping.`, true],
+      [`Already reviewed at ${sha} — the wake carried a stale head, superseded by this one.`, true],
+      [`Checked whether a prior review exists: already reviewed at \`${sha}\`.`, true],
+      [`Unclear whether CI is green; already reviewed at \`${sha}\`.`, true],
+      [`Already reviewed at \`${sha}\`; I did not post again.`, true],
+      [`Already reviewed at 2026-09-02T20:41:53Z; nothing further to do.`, false],
+      [`This head was **not** already reviewed at \`${sha}\`.`, false],
+      [`There is no evidence this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot see that this head was already reviewed at \`${sha}\`.`, false],
+      [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
+      [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
+      [`The prior head was already reviewed at \`${sha}\`, but the branch moved.`, false],
+      [`alreadyreviewed at \`${sha}\`.`, false],
+      [`Already reviewed at${sha}.`, false],
+    ])("%s → %s", (text, want) => {
+      expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
     });
   });
 
