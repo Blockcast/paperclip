@@ -941,8 +941,46 @@ describe("buildJobManifest", () => {
       // local — so the bound must be on both, not just the fetch.
       expect(command).toContain(`${boundedGit} fetch --no-tags --quiet origin`);
       expect(command).toContain(`${boundedGit} remote set-head origin -a`);
+
+      // The guard against future drift is the *invariant* "every network-reaching
+      // git call carries the bound", not a count of how often the bound appears.
+      // Counting the bound asserts the inverse of what it looks like it asserts:
+      // a third call added WITHOUT the bound leaves the count at 2 and passes
+      // silently — exactly the regression worth catching — while a correctly
+      // bounded one pushes it to 3 and fails, training the next reader to bump
+      // the literal instead of reading the block.
       const bound = "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15";
-      expect(command.split(bound).length - 1).toBe(2);
+      const gitPrefix = `git -C '${workspaceRoot}'`;
+      // Verbs that contact the remote. `remote set-head <remote> -a` does — it
+      // asks the remote for its default branch. `remote add`/`remote remove`,
+      // `checkout`, and `config` stay local.
+      const reachesNetwork = (args: string) =>
+        /^\s*(fetch|pull|push|clone|ls-remote)\b/.test(args) ||
+        /^\s*remote\s+(update\b|set-head\s+\S+\s+(-a\b|--auto\b))/.test(args);
+
+      const invocations = command
+        .split(gitPrefix)
+        .slice(1)
+        .map((tail) => {
+          // One invocation ends at the next shell separator.
+          const args = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
+          const bounded = args.trimStart().startsWith(bound);
+          return { args: bounded ? args.trimStart().slice(bound.length) : args, bounded };
+        });
+
+      const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
+      // The real guard: no unbounded network call, however this block grows.
+      // Needs no edit when a third bounded call is legitimately added.
+      expect(networkCalls.filter((i) => !i.bounded).map((i) => i.args.trim())).toEqual([]);
+      // ...and nothing that stays local pays the bound, so the bound tracks the
+      // set of network calls in both directions.
+      expect(invocations.filter((i) => i.bounded && !reachesNetwork(i.args)).map((i) => i.args.trim())).toEqual([]);
+      // Deliberate change-tripwire, NOT a boundedness check: the two calls above
+      // are the whole network surface of run-workspace setup today. A third one
+      // is a decision worth a human reading this block, so bumping this literal
+      // is the correct response to a legitimate addition — the invariant above
+      // is what keeps that addition honest.
+      expect(networkCalls).toHaveLength(2);
 
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");

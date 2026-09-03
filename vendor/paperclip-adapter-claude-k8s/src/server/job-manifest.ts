@@ -1692,10 +1692,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 // fetch succeeds but `set-head` fails, the chain does not fall
                 // through and write the misleading `originFetchFailed`
                 // breadcrumb about a fetch that actually worked. It records its
-                // own breadcrumb instead, so all three failure paths in this
-                // block explain themselves on the workspace rather than leaving
-                // a bare `symbolic-ref` failure for an agent to diagnose.
-                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved; run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+                // own breadcrumb instead, so both failure paths in this chain
+                // explain themselves on the workspace rather than leaving a
+                // bare `symbolic-ref` failure for an agent to diagnose. (The
+                // sibling `originRemoved` breadcrumb below is not a failure —
+                // it is the no-upstream branch.)
+                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved, possibly a stalled transfer hit by the low-speed bound; run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
               ]
             : [
                 // No recorded upstream: leave the clone with no remote at all
