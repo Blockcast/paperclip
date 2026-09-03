@@ -9513,25 +9513,51 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   );
   // Same-sentence scope: a clause boundary is any of . : ; , — – or a newline.
   const clauseBefore = /[^.\n:;,\u2014\u2013]*$/;
-  // A hedge that governs the clause ("unclear whether …", "could not fully
-  // confirm whether …") — not a bare `if`/`whether` anywhere nearby.
-  const hedge = /\b(?:(?:unclear|unsure|uncertain|not\s+sure)\s+(?:if|whether)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|not\s+able\s+to|failed\s+to|did\s+not|didn['\u2019]?t)\s+(?:\w+\s+){1,3}(?:if|whether))\b/i;
+  // A hedge that governs the clause ("unclear whether …", "not clear that …",
+  // "could not fully confirm whether …") — not a bare `if`/`whether` anywhere
+  // nearby. Hedge stems take `that` as well as `if`/`whether`; the negated-verb
+  // arm keeps `if`/`whether` only, since its `that` form belongs to `negation`.
+  const hedge =
+    /\b(?:(?:unclear|unsure|uncertain|unknown|unverified|unconfirmed|ambiguous|not\s+sure|not\s+clear|no\s+idea)\s+(?:if|whether|that)|(?:could\s+not|couldn['\u2019]?t|cannot|can['\u2019]?t|unable\s+to|not\s+able\s+to|failed\s+to|did\s+not|didn['\u2019]?t)\s+(?:\w+\s+){1,3}(?:if|whether))\b/i;
+  // An assumption governing the clause with neither a negation nor a
+  // complementizer to hang on ("Possibly already reviewed at …", "Assuming this
+  // head was already reviewed at …", "I doubt this head was …"). Seventh Ally
+  // pass: nine hedges outside the four original stems reached `already_reviewed`
+  // in the backtick shapes this function added.
+  const assumption = /\b(?:possibly|probably|presumably|assuming|apparently|doubt(?:s|ed|ful)?|may\s+have\s+been|might\s+have\s+been)\b/i;
   // The clause's subject is a superseded head, not the live one.
   const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
   // An epistemic negation governing the clause from further back in the same
   // clause ("no evidence … was already reviewed at", "cannot see that … was
-  // already reviewed at", "could not verify that … was already reviewed at"): a
-  // negation word followed within three words by an epistemic head — including
-  // the establishing verbs (verify / establish / determine / find / check …),
-  // whose `that`-complement form the `hedge` cue cannot see (sixth Ally pass). NOT a bare negation — "Exiting without posting since …",
-  // "No action taken because …" are how a correct skip explains itself.
-  // `cannot`/`can't` are listed because `\bnot\b` does not match inside
-  // `cannot`.
-  const negation = /\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|couldn['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|unable\s+to|failed\s+to)\s+(?:\w+\s+){0,3}(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|see|seen|appears?|suggests?|confirms?|confirmed|aware|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tell)\b/i;
+  // already reviewed at", "could not verify that … was already reviewed at"):
+  // a negation word followed within three words by an epistemic head. Two
+  // kinds of head, discriminated by what ties them to THIS clause:
+  //   (a) evidence nouns and mental-state predicates are inherently about the
+  //       claim, so no complement marker is required ("no evidence …");
+  //   (b) the establishing verbs (see / confirm / verify / establish /
+  //       determine / find / check / locate …) are transitive over ARBITRARY
+  //       objects, so they veto only with the complementizer (that / whether /
+  //       if) that binds them to the already-reviewed clause. Without it,
+  //       "I did not find a newer head so already reviewed at <ts> for <sha>"
+  //       is a correct skip whose negated object is the newer head, not the
+  //       review — the seventh Ally pass measured six such phrasings that the
+  //       verb-only list (sixth pass) turned into false `missing`.
+  // Known limit: an elided complementizer ("I cannot say this head was
+  // already reviewed at …") is indistinguishable from an unrelated object and
+  // is not vetoed.
+  // NOT a bare negation — "Exiting without posting since …", "No action taken
+  // because …" are how a correct skip explains itself. `cannot`/`can't` are
+  // listed because `\bnot\b` does not match inside `cannot`.
+  const negationPrefix =
+    "\\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|couldn['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|unable\\s+to|failed\\s+to)\\s+(?:\\w+\\s+){0,3}";
+  const epistemicNoun = "(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|appears?|suggests?|aware)";
+  const establishingVerb =
+    "(?:see|seen|confirms?|confirmed|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tell)\\s+(?:\\w+\\s+){0,3}(?:that|whether|if)";
+  const negation = new RegExp(`${negationPrefix}(?:${epistemicNoun}|${establishingVerb})\\b`, "i");
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
-    if (hedge.test(before) || priorHead.test(before) || negation.test(before)) continue;
+    if (hedge.test(before) || assumption.test(before) || priorHead.test(before) || negation.test(before)) continue;
     return true;
   }
   return false;

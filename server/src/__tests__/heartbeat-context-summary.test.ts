@@ -946,6 +946,61 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     });
   });
 
+  // Seventh Ally pass, over-veto direction: the establishing verbs are
+  // transitive over arbitrary objects, so a correct skip that negates finding
+  // or checking a DIFFERENT thing must still classify as a skip. Master
+  // accepted every one of these in the plain shape.
+  it.each([
+    "I did not find a newer head so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "No newer review was found so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I could not find any reason to re-review so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I did not check the comments API but already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I could not see a newer head so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "Cannot tell you more; nothing else found so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I did not find a newer head so **already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — no action taken.",
+  ])("BLO-31374: a negated establishing verb with an unrelated object is still a skip (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // …while the same verb bound to the clause by a complementizer still vetoes.
+  it("BLO-31374: the complementizer is what binds a negated establishing verb to the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "I did not find that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Seventh Ally pass, masking direction: hedges outside the original four
+  // stems, `that` after a hedge stem, and assumptions with no negation and no
+  // complementizer at all.
+  it.each([
+    "Unknown whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "It remains unverified whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I have no idea whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "It is ambiguous whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "It is not clear that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I doubt this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Possibly already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, but I could not check.",
+    "Assuming this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` (not confirmed).",
+  ])("BLO-31374: rejects a hedge or assumption governing the clause (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // An assumption in the PREVIOUS clause does not reach the review clause.
+  it("BLO-31374: an assumption in an earlier clause does not veto the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "Presumably the earlier run posted; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+      }),
+    ).toEqual({ status: "already_reviewed" });
+  });
+
   // A negation in the PREVIOUS clause does not reach the review clause.
   it("BLO-31374: a negation in an earlier clause does not veto the clause", () => {
     expect(
@@ -975,6 +1030,9 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No action taken because this head was already reviewed at \`${sha}\`.`, true],
       [`I failed to confirm whether this head was already reviewed at \`${sha}\`.`, false],
       [`I could not verify that this head was already reviewed at \`${sha}\`.`, false],
+      [`I did not find a newer head so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I did not find that this head was already reviewed at \`${sha}\`.`, false],
+      [`Possibly already reviewed at \`${sha}\`, but I could not check.`, false],
       [`Unable to establish that this head was already reviewed at \`${sha}\`.`, false],
       [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
       [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
