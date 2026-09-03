@@ -48,8 +48,8 @@
 -- This index restores the guarantee BLO-20736 was closed on.
 --
 -- The fix is to stop competing on index size and give the planner an object that
--- is BOTH as narrow as 0217's and ordered. This index has the same predicate as
--- 0217's (`status = 'queued'`) and the same columns as 0209's
+-- indexes the same ROWS as 0217's and is also ordered. This index has the same
+-- predicate as 0217's (`status = 'queued'`) and the same columns as 0209's
 -- (agent_id, created_at, id), so:
 --
 --   * the partial predicate implies the query's status qualifier, so it drops
@@ -81,8 +81,8 @@
 -- once the index-only discount is gone the comparison is decided by a rounding
 -- error. This index is therefore NECESSARY BUT PROBABLY NOT SUFFICIENT. It
 -- strictly improves the object the planner has available — it is smaller than
--- 0208's for this predicate and it is the only one of the three that is both
--- as narrow as 0217's and ordered — but it cannot by itself guarantee the
+-- 0208's for this predicate and it is the only one of the three that indexes
+-- 0217's row set AND is ordered — but it cannot by itself guarantee the
 -- planner picks it in production's regime.
 --
 -- Making that deterministic requires removing the dependence on the cost
@@ -107,8 +107,27 @@
 -- live queue (tens to low thousands of rows), not the ~1.8 GB table, so it is
 -- small, cheap to rebuild, and cheap to drop.
 --
--- Against that, it is the only one of the three objects that is both as narrow
--- as 0217's and ordered for this ORDER BY, so it improves the outcome of EVERY
+-- SAME ROWS IS NOT SAME SIZE, and this is the one place the distinction bites,
+-- because a retirement decision compares these two objects on storage and write
+-- cost. Raised in review; "no larger than 0217's" was the earlier wording here
+-- and it understates this index by ~40%. 0217 is
+-- (agent_id, coalesce(queued_at, created_at)) — two keys, 16 B + 8 B = 24 B —
+-- against this index's three, 16 B + 8 B + 16 B = 40 B. With the 8 B index-tuple
+-- header and the 4 B line pointer that is ~52 B against ~36 B of page space per
+-- entry, so ~1.4x the pages for the same row count. The trailing `id` is the
+-- primary key, so every key here is unique and btree deduplication can never
+-- apply to it, while 0217's key CAN repeat — bulk wake fan-out stamps identical
+-- created_at — and can therefore compress. So 1.4x is a FLOOR, not an estimate.
+--
+-- That width does NOT explain the 0.24% above, and the visibility-map
+-- attribution there stands: the churning-regime figures are 8.30 against 8.32, a
+-- gap of exactly the ~0.02 a Sort costs at a 1-row estimate, and the two scan
+-- costs are otherwise identical. At that estimate the extra width does not
+-- register in the cost model at all. It matters for the drop decision, not for
+-- the plan choice.
+--
+-- Against that, it is the only one of the three objects that indexes 0217's row
+-- set AND is ordered for this ORDER BY, so it improves the outcome of EVERY
 -- candidate lever rather than competing with any of them, and it is reversible
 -- in one statement if the lever lands and makes it redundant. That is the whole
 -- argument: cheap, bounded, reversible, and strictly additive to the planner's

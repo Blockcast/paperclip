@@ -24396,9 +24396,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the unbounded shape this function exists to avoid. Measured on
       // production. Migration 0237 answers it where the planner actually
       // decides: heartbeat_runs_agent_queued_dispatch_idx carries the same
-      // narrow predicate plus (created_at, id) as trailing keys, so it is no
-      // larger than 0217's and additionally supplies the ORDER BY. Do not drop
-      // it without re-measuring the GENERIC plan, not just the custom one.
+      // narrow predicate plus (created_at, id) as trailing keys, so it indexes
+      // the same ROWS as 0217's (wider per entry — three keys to two) and
+      // additionally supplies the ORDER BY. Do not drop it without
+      // re-measuring the GENERIC plan, not just the custom one.
       //
       // That index is still not the whole fix, and the gap is worth knowing
       // before trusting this path. Measured generic cost, 0237 vs 0217, at the

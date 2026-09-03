@@ -6,7 +6,8 @@
  * The structural check matters more here than for a normal index. This index
  * exists to win a planner comparison against `heartbeat_runs_queued_age_idx`,
  * and it only wins because of three specific properties: the predicate is
- * exactly `status = 'queued'` (so it is no larger than its competitor), the keys
+ * exactly `status = 'queued'` (so it indexes the same rows as its competitor,
+ * though it is wider per entry), the keys
  * are `(created_at, id)` after `agent_id` (so the ORDER BY needs no Sort), and
  * there is nothing else in the tuple (so the scan stays Index Only). An index
  * precreated with, say, `(agent_id, created_at)` would be accepted by a
@@ -116,9 +117,10 @@ describeEmbeddedPostgres("heartbeat-run queued dispatch index migration", () => 
   it("rejects a same-name index whose predicate is wider than the dispatch filter", async () => {
     // `status IN ('queued', 'scheduled_retry')` is 0208's predicate, and an
     // index built that way would be a second copy of 0208 rather than the
-    // narrow object this migration exists to add. Being exactly as narrow as
-    // heartbeat_runs_queued_age_idx is the whole reason the planner picks this
-    // one over it in the generic plan, so a wider predicate is a silent revert.
+    // narrow object this migration exists to add. Indexing exactly the same
+    // ROWS as heartbeat_runs_queued_age_idx is the whole reason the planner
+    // picks this one over it in the generic plan, so a wider predicate is a
+    // silent revert.
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-queued-dispatch-wide-");
     cleanups.push(database.cleanup);
     const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });

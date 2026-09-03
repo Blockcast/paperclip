@@ -165,6 +165,32 @@ function formatRowsInspected(node: Record<string, unknown>): string {
 }
 
 /**
+ * Appends plans to `report` and flushes the whole accumulated report to
+ * `destination` on EVERY call.
+ *
+ * Flushed per-record rather than once at the end because these plans are the
+ * diagnostic you most want when an assertion FAILS, and a single write placed
+ * after the assertions produces no report in exactly that case.
+ *
+ * Hoisted out of the two tests that build reports: the closure was duplicated
+ * character-for-character, so a change to the report format — such as the
+ * `formatRowsInspected` split above — had to be made twice or silently applied
+ * to only one of the two artifacts.
+ *
+ * `destination` is per-test on purpose. Both call sites previously wrote to
+ * PLAN_REPORT itself, so whichever test ran last overwrote the other's plans
+ * and the report silently contained one test's output while appearing complete.
+ * Each writer now gets its own file, matching the `.recovery` suffix the
+ * recovery-lane site already used.
+ */
+function makePlanRecorder(report: string[], destination: string | null) {
+  return (title: string, plan: { text: string; root: Record<string, unknown> }) => {
+    report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${formatRowsInspected(plan.root)}`);
+    if (destination) fs.writeFileSync(destination, report.join("\n"));
+  };
+}
+
+/**
  * BLO-31392: which ordering-capable dispatch index this plan used, if any.
  *
  * Every assertion in this file that used to name `heartbeat_runs_agent_dispatch_idx`
@@ -661,13 +687,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     await seed(sql);
 
     const report: string[] = [];
-    // Flushed on every record rather than once at the end: these plans are the
-    // diagnostic you most want when an assertion below FAILS, and a single
-    // write placed after the assertions produces no report in exactly that case.
-    const record = (title: string, plan: { text: string; root: Record<string, unknown> }) => {
-      report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${formatRowsInspected(plan.root)}`);
-      if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
-    };
+    const record = makePlanRecorder(report, PLAN_REPORT);
 
     // --- AC: the dispatch query uses the new index -------------------------
     // The superseded `SELECT *` shape is RECORDED, not asserted on — see
@@ -841,12 +861,15 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
     // predicate width over near-identical row sets. Here the row sets differ by
     // orders of magnitude, in 0209's favour.
     //
-    // And the pin is not the only guard: `rowsInspected` below is bounded by
-    // RECOVERY_LANE_ABSOLUTE_BOUND, so picking 0237 fails on WORK VOLUME too,
-    // not merely on a name. If this ever does flake, that is the signal to
-    // check — a name-only failure with the bound still satisfied means the
-    // planner found an equally cheap path and the pin should be relaxed; the
-    // bound failing too means a real regression.
+    // The pin is the ONLY guard at this site: this test asserts no
+    // `rowsInspected` ceiling on `laneRecovery`, so here a 0237 win fails on
+    // the name alone. The independent work-volume guard —
+    // `rowsInspected(laneRecovery.root) <= RECOVERY_LANE_ABSOLUTE_BOUND` —
+    // lives in the separate "bounds the recovery lane absolutely" test below,
+    // which is where the two failure modes can be read apart: a name-only
+    // failure with the bound still satisfied means the planner found an equally
+    // cheap path and the pin should be relaxed; the bound failing too means a
+    // real regression. If THIS assertion flakes on its own, check it there.
     expect(indexesUsed(laneRecovery.root)).toContain(RECOVERY_INDEX);
     expect(scanKinds(laneRecovery.root)).not.toContain("Seq Scan");
 
@@ -1010,10 +1033,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       ) as Array<{ queued: number }>;
       expect(queued).toBe(depth);
 
-      const record = (title: string, plan: { text: string; root: Record<string, unknown> }) => {
-        report.push(`\n===== ${title} =====\n${plan.text}\n-- rows inspected: ${formatRowsInspected(plan.root)}`);
-        if (PLAN_REPORT) fs.writeFileSync(PLAN_REPORT, report.join("\n"));
-      };
+      const record = makePlanRecorder(report, PLAN_REPORT && `${PLAN_REPORT}.head`);
 
       // The shape the dispatcher used to issue, MEASURED but not asserted on —
       // it is the before-evidence for why the projection changed, and pinning
