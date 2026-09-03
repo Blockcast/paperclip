@@ -17,7 +17,7 @@
       "id": 1,
       "type": "stat",
       "title": "Unresolved dead-letters",
-      "description": "Restart-safe gauge, recomputed from committed agent_wakeup_requests rows on every wake-dispatch reconcile pass. Non-zero means at least one @ally review request is sitting in the terminal dispatch_failed_exhausted state and will NEVER be retried — the PR has a posted trigger and no review. Steady state is 0. This is the gauge arm of PaperclipGithubReviewRequestDeadLettered.",
+      "description": "Restart-safe gauge, recomputed from committed agent_wakeup_requests rows on every heartbeat scheduler tick, on every replica (BLO-31335 moved it off the wake-dispatch reconcile pass, which only ran on an unsuppressed replica). Replica-invariant, so aggregate with max by (reason) before summing, never a bare sum. Non-zero means at least one @ally review request is sitting in the terminal dispatch_failed_exhausted state and will NEVER be retried — the PR has a posted trigger and no review. Steady state is 0. This is the gauge arm of PaperclipGithubReviewRequestDeadLettered.",
       "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
       "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
       "fieldConfig": {

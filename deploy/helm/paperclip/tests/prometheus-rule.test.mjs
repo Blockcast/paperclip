@@ -142,11 +142,22 @@ test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delive
   // recorded before the first scrape (no baseline for increase()) or one whose
   // pod is replaced before `for` elapses (series retires out of the range) is
   // silently un-alertable — a terminal loss that pages nobody. The gauge is
-  // re-derived from committed rows every reconcile pass, so it survives both.
+  // re-derived from committed rows on every heartbeat scheduler tick, so it
+  // survives both. (BLO-31335 moved that emission off the wake-dispatch
+  // reconcile pass, which only ran on an unsuppressed replica.)
+  //
+  // BLO-31335: the aggregation is pinned, not just the metric name. This gauge
+  // is a full rewrite of global, DB-derived state, so it is replica-invariant —
+  // every publishing pod exports the same value. A bare `sum()` therefore
+  // multiplies by the replica count (3× today) and silently rescales on any
+  // replica-count change. `max by (reason)` collapses the pod dimension first;
+  // the outer `sum` then adds the 8 reason buckets, which a bare `max()` would
+  // have undercounted to the single largest bucket. Both halves are load-bearing
+  // and neither is recoverable from `promtool check rules` or a render test.
   assert.match(
     rendered,
-    /or \(sum\(paperclip_github_review_request_dead_letter_unresolved\) > 0\)/,
-    "dead-letter alert must also key on the restart-safe durable gauge",
+    /or \(sum\(max by \(reason\) \(paperclip_github_review_request_dead_letter_unresolved\)\) > 0\)/,
+    "dead-letter alert must key on the restart-safe durable gauge, aggregated replica-safely",
   );
 });
 
