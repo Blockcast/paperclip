@@ -470,6 +470,16 @@ jobs:
 
       - name: Test Helm chart renders
         run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
+        # BLO-29182 observed THIS invocation hang: `node --test` has no default
+        # per-test timeout and these tests shell out to `helm`, which does
+        # network I/O, so a stalled fetch has no upper bound below the job cap.
+        # That was fixed by bounding the `policy` copy, and BLO-31405 has now
+        # removed that copy as a duplicate — so the bound has to live here, or
+        # deleting the duplicate would leave the one invocation known to hang
+        # unbounded again. 4 min is 3.3x the suite's measured p100 of 73s (25
+        # sampled pr.yml runs) and well inside the 10-minute job cap, so a hang
+        # fails this step attributably instead of burning the whole budget.
+        timeout-minutes: 4
 
   typecheck_release_registry:
     name: Typecheck + Release Registry

@@ -65,6 +65,14 @@ function jobOwning(offset) {
   return owner;
 }
 
+function jobRegion(name) {
+  const start = workflow.indexOf(`\n  ${name}:\n`);
+  assert.notEqual(start, -1, `pr.yml must define ${name}`);
+  const after = workflow.slice(start + 1);
+  const nextJob = after.search(/\n {2}[a-z_]+:\n/);
+  return nextJob === -1 ? after : after.slice(0, nextJob + 1);
+}
+
 test("the chart render suite runs in exactly one job, and that job is helm_chart", () => {
   const offsets = [];
   for (let at = workflow.indexOf(CHART_SUITE); at !== -1; at = workflow.indexOf(CHART_SUITE, at + 1)) {
@@ -76,4 +84,24 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
     `pr.yml must invoke ${CHART_SUITE} exactly once, found ${offsets.length}`,
   );
   assert.equal(jobOwning(offsets[0]), "helm_chart", `${CHART_SUITE} must run in the helm_chart job`);
+});
+
+// BLO-29182 observed this exact invocation hang, and its fix bounded the copy
+// that used to live in `policy`. Removing that copy has to carry the bound with
+// it, or the one `node --test` step known to hang is unbounded again — a hung
+// step would burn the whole job budget instead of failing attributably. The
+// margin (4 min against a 73s p100) lives in the workflow comment; the
+// invariant worth gating is only that a step bound exists and is under the cap.
+test("the chart render step is bounded, and inside its job's budget (BLO-29182)", () => {
+  const region = jobRegion("helm_chart");
+  const jobCap = Number(region.match(/\n    timeout-minutes: (\d+)\n/)?.[1]);
+  assert.ok(jobCap > 0, "helm_chart must declare a job-level timeout-minutes");
+  const step = region
+    .split("\n      - name: ")
+    .slice(1)
+    .find((candidate) => candidate.includes(CHART_SUITE));
+  assert.ok(step, `helm_chart must contain the ${CHART_SUITE} step`);
+  const stepBound = Number(step.match(/\n        timeout-minutes: (\d+)\n/)?.[1]);
+  assert.ok(stepBound > 0, "the chart render step must declare a step-level timeout-minutes");
+  assert.ok(stepBound < jobCap, `step bound ${stepBound}m must sit below the ${jobCap}m job cap`);
 });
