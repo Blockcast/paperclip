@@ -25,14 +25,21 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
+    # 15, not 5, because this is the tightest-budgeted job that sets up pnpm and
     # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
     # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
     # into a job timeout, which ejects a merge-queue candidate just the same but
     # burns a runner for the full budget first. Worst case here is roughly
     # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
     # headroom above it.
-    timeout-minutes: 10
+    #
+    # BLO-31405 raised this from 10. Measured over the 25 most recent runs the
+    # job's p100 is 459s against the old 600s cap — and that run spent only 46s
+    # in the Helm render step, which is now allowed 240s. Worst case was
+    # therefore 413s + 240s = 653s, i.e. the job cap would have expired before
+    # the step bound it encloses ever could, making that bound unreachable.
+    # 900s keeps ~250s of headroom over the same worst case.
+    timeout-minutes: 15
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -302,7 +309,14 @@ jobs:
         # paperclip-api node spread is "enforced by scheduler policy, not left to
         # chance"; that claim only holds if the test asserting it actually runs.
         run: node --test deploy/helm/paperclip/tests/*.test.mjs
-        timeout-minutes: 1
+        # BLO-31405: 4 min, not the policy default of 1. This is the only step
+        # here that forks `helm template` once per test file (18 of them), so it
+        # is 30-70s where every other node --test step is under 10s. At the old
+        # 60s bound its p100 of 73s crossed the line on 3 of the 25 most recent
+        # runs, failing `policy` — and skipping every lane that `needs:` it — on
+        # PRs that never touched the chart. scripts/__tests__/policy-node-test-
+        # timeouts.test.mjs allowlists this one step and holds every other at 1.
+        timeout-minutes: 4
 
       - name: Test Ally review-consistency guard
         if: ${{ !cancelled() }}
