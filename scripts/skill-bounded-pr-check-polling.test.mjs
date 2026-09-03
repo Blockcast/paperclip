@@ -305,12 +305,26 @@ d=${JSON.stringify(dir)}
 # \`elapsed=\$(( \$(date +%s) - poll_started ))\` is swallowed and the spin
 # continues — measured, it still timed out at 30s and merely added one stderr
 # line per iteration.
+#
+# The jump is written BACK to the clock so it accumulates. A jump that only
+# returned \`clock + 86400\` without persisting it would pin \`elapsed\` at
+# exactly 86400 for read 21 and every read after it, so any deadline above a
+# day would never be crossed and the ceiling would decay into the exact two
+# behaviours rejected above — spin to the spawn timeout, one stderr line per
+# pass. Measured on a reconstruction: at a 90000s deadline the non-cumulative
+# form spun to the kill with 389 stderr lines, the cumulative form exited
+# through the loop's own deadline path in 503ms with 2. No deadline in this
+# file exceeds 900 today, so this buys nothing at this head; it is here so the
+# ceiling stays a ceiling under a future edit rather than silently becoming
+# deadline-dependent. Legitimate tests are untouched — they never reach read 4.
 if [[ $1 == +%s ]]; then
   reads=$(( $(cat "$d/reads" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$reads" >"$d/reads"
   if (( reads > 20 )); then
     printf 'virtual clock stub: %s clock reads with no intervening sleep — the loop is not sleeping\\n' "$reads" >&2
-    printf '%s\\n' "$(( $(cat "$d/clock") + 86400 ))"
+    jumped=$(( $(cat "$d/clock") + 86400 ))
+    printf '%s' "$jumped" >"$d/clock"
+    printf '%s\\n' "$jumped"
     exit 0
   fi
   cat "$d/clock"; echo; exit 0
