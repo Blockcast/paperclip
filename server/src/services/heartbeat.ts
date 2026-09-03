@@ -9363,6 +9363,39 @@ function prReviewOutputHasSelfReviewSkip(
   return handlePattern.test(text);
 }
 
+// BLO-31374: the idempotent "already reviewed" exit. The reviewer found an Ally
+// review whose body attests the LIVE head and exited without posting, per the
+// one-review-per-(PR, head) contract. Routine on `transient_failure_retry` wakes,
+// which carry the head captured at the original wake and are often stale by the
+// time the retry runs. Real shapes, all of which must classify `already_reviewed`:
+//   "already reviewed at 2026-05-26T04:38:27Z for 86fd374dc3b4…"               (plain)
+//   "**Already reviewed at 2026-09-02T20:41:53Z for `90193c30abb9…`**"          (run 3ace1eef)
+//   "**Already reviewed at `8b237675b19f…`** — no action taken."                (run b7a984bf)
+// The previous inline regex accepted only the plain shape: a backtick between
+// `for` and the sha, or the sha following `at` directly, fell through to
+// `pr_review_output_missing` and flipped Ally to `error`. The cited sha is the
+// live head, which the wake context cannot know (the wake head is exactly what
+// went stale), so the clause is anchored to a 7–40 hex sha rather than to the
+// wake head — a sha-less "already reviewed" claim is NOT accepted — and a
+// negated clause ("not already reviewed at …") is rejected.
+function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
+  // Markdown that may sit between tokens: whitespace, backticks, bold/italic.
+  const md = "[\\s`*_]*";
+  const pattern = new RegExp(
+    "(\\b(?:not|never|wasn['\u2019]?t|isn['\u2019]?t|hasn['\u2019]?t)\\s+(?:been\\s+)?)?" +
+      `\\balready\\s+reviewed\\s+at${md}` +
+      // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
+      `(?:[^\\s\`*_]{1,40}${md}for${md})?(?:(?:head|commit)${md})?` +
+      "([0-9a-f]{7,40})(?![0-9a-f])",
+    "gi",
+  );
+  for (const m of text.matchAll(pattern)) {
+    if (m[1]) continue;
+    return true;
+  }
+  return false;
+}
+
 export function evaluatePrReviewCompletionEvidence(
   contextSnapshot: Record<string, unknown> | null | undefined,
   output: {
@@ -9384,7 +9417,7 @@ export function evaluatePrReviewCompletionEvidence(
   if (/\bgh\s+pr\s+review\b[\s\S]{0,400}\bexit["']?\s*:\s*0\b/i.test(text)) {
     return { status: "posted_review" as const };
   }
-  if (/\balready\s+reviewed\s+at\b[\s\S]{0,160}\bfor\b\s+[0-9a-f]{7,40}\b/i.test(text)) {
+  if (prReviewOutputHasAlreadyReviewedSkip(text)) {
     return { status: "already_reviewed" as const };
   }
   if (
