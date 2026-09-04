@@ -343,4 +343,64 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 518000`);
     expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
   });
+
+  // BLO-31174 in-range control. The detector shipped with a population baseline
+  // but nothing asserting that a HEALTHY re-parking row stays below threshold
+  // over time, which is exactly how the created_at formulation reached
+  // production: it reads correctly on the single-shot parks the other tests
+  // cover, and only diverges once a row is re-decided in place.
+  it("reports the booked interval, not cumulative age, for a re-parked row", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    // A dependency_blocked row on its 10th re-park: first parked ~10h ago, and
+    // re-decided in place every hour since. `heartbeat.ts` UPDATEs the same row
+    // with scheduledRetryAt = now + backoff and updatedAt = now, leaving
+    // created_at pinned at the original park.
+    const now = new Date("2026-09-03T05:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 10 * 3_600_000);
+    const backoffMs = 3_600_000; // DEP_BLOCKED_MAX_DELAY_MS ceiling
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt,
+      updatedAt: now,
+      scheduledRetryAt: new Date(now.getTime() + backoffMs),
+      scheduledRetryAttempt: 10,
+      scheduledRetryReason: "dependency_blocked",
+    });
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    // Each booking chose one hour, so the gauge must read one hour regardless of
+    // how long the row has been re-parking. Against created_at this read 39600
+    // and breached the 5400s alert threshold ~7x over on a healthy row.
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 3600`);
+  });
+
+  it("does not report a negative horizon for a re-touched past-due park", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-03T05:00:00.000Z");
+    const createdAt = new Date(now.getTime() - 7_200_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt,
+      // Touched after the due time already passed, as the GitHub review
+      // coalescing path can do to a still-parked row.
+      updatedAt: now,
+      scheduledRetryAt: new Date(now.getTime() - 1_800_000),
+      scheduledRetryAttempt: 3,
+    });
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 0`);
+  });
 });

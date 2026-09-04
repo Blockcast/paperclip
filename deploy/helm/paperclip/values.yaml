@@ -559,7 +559,7 @@ prometheusRule:
   overdueScheduledRetryAgeMetricsRefreshFailureFor: 5m
   # -- Runbook for the overdue-scheduled-retry alert, linked from its annotation.
   overdueScheduledRetryRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#overdue-scheduled-retry-blo-22094"
-  # -- Maximum booked interval from heartbeat_runs.created_at to scheduled_retry_at before a future-due park is considered implausible (BLO-25036). Derived from the observed seven-day population: n=5253, p50=21.5s, p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s.
+  # -- Maximum booked interval from heartbeat_runs.updated_at (the moment the due time is chosen) to scheduled_retry_at before a future-due park is considered implausible (BLO-25036; subtrahend corrected from created_at in BLO-31174, which made the reading accumulate across re-parks instead of measuring one booking). Derived as a conservative bound from the observed seven-day park-to-promotion lag population: n=5253, p50=21.5s, p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s -- that lag is a different quantity from a booked horizon, so treat these percentiles as a proxy for scale rather than as park-horizon percentiles.
   scheduledRetryParkHorizonSeconds: 5400
   # -- Scrape-flap tolerance only (BLO-25036); the horizon age lives in scheduledRetryParkHorizonSeconds.
   scheduledRetryParkHorizonFor: 5m
