@@ -89,7 +89,17 @@ test("policy continues after a bounded test failure unless cancelled", () => {
 //     run: |                              working-directory: deploy/helm/paperclip
 //       cd deploy/helm/paperclip          run: node --test ./tests/*.test.mjs
 //       node --test ./tests/*.test.mjs
-const CHART_SUITE = "deploy/helm/paperclip/tests/";
+// One path, spelled once. These two constants encode the same thing -- the
+// chart root a chdir lands in, and the suite directory underneath it -- and
+// while they were independent literals, which assertion fired depended on which
+// literal a spelling happened to match. That is not hypothetical: `cd
+// <chart>/tests/` matched CHART_SUITE and tripped the exactly-once assertion,
+// while `cd <chart>/tests` -- one character shorter, and the more natural way to
+// write it -- matched neither, so the two spellings of one chdir got opposite
+// verdicts and the safer-looking one was the one that passed. Deriving one from
+// the other makes the two assertions visibly cover one path.
+const CHART_DIR = "deploy/helm/paperclip";
+const CHART_SUITE = `${CHART_DIR}/tests/`;
 
 // `[a-z_]+` missed every job key containing a digit -- 3 of the 12 defined
 // here (`opencode_k8s_seed_cold_start`, `vendor_claude_k8s`, `e2e`). Latent so
@@ -145,18 +155,30 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
 // it as an escape and covering it cost the same, and only one of those two
 // stays true as the file changes.
 //
-// Still not exhaustive, and deliberately not claimed to be: a chdir built from
-// a shell variable or a matrix value escapes both assertions, because then the
-// path never appears literally at all. This closes the spellings a re-add would
-// plausibly be written in, which is the axis the assertion above leaves open --
-// not the whole space.
+// Still not exhaustive, and deliberately not claimed to be -- but the escapes
+// worth naming are the ones a reader would otherwise assume are closed, not the
+// ones that are obviously out of reach. Two escape:
+//
+//   * A chdir whose path is built from a shell variable or a matrix value:
+//     `cd $GITHUB_WORKSPACE/deploy/helm/paperclip`. Note the path IS there
+//     literally -- the reason this escapes is narrower than "the path never
+//     appears": the prefix admits only `.` or `/` in front of the directory, not
+//     an arbitrary leading segment.
+//   * A job-level `defaults: run: working-directory: <chart>` paired with a
+//     plain `run: node --test ./tests/*.test.mjs`. Job defaults sit outside
+//     every `- name:` chunk this loop inspects, so no step text contains the
+//     chdir at all. Closing this needs the loop to read job-level keys, not a
+//     wider regex.
+//
+// The directory itself is matched one segment deep rather than bounded at the
+// chart root, because bounding it there let a chdir DEEPER than the chart walk
+// through both assertions -- `cd <chart>/tests` being the obvious one.
 //
 // Both this and `policySteps` split steps on `- name: `, so a step written
 // without a `name:` folds into the preceding step's chunk and is attributed to
 // that step's offset. It fails safe the same way `jobOwning` does, and for the
 // same reason: the text is still inside some chunk, and attribution can only
 // drift backwards, never forwards into a job that has not started yet.
-const CHART_DIR = "deploy/helm/paperclip";
 
 test("only helm_chart runs the chart suite from inside the chart directory (BLO-31516)", () => {
   const marker = "\n      - name: ";
@@ -166,7 +188,7 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
     const step = workflow.slice(at, next === -1 ? undefined : next);
     if (!step.includes("node --test")) continue;
     const chdirs = new RegExp(
-      `(?:[\\n;&|]|run:)\\s*(?:working-directory:|cd|pushd) +\\.?/?${CHART_DIR}/?(?=[\\s&;|]|$)`,
+      `(?:[\\n;&|]|run:)\\s*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"']*)?(?=[\\s&;|"']|$)`,
     ).test(step);
     if (chdirs && jobOwning(at) !== "helm_chart") {
       offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
@@ -226,10 +248,15 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
 //
 // The quote is captured rather than discarded for one narrow case in the other
 // direction. YAML resolves an unquoted `\d+\.\d+` as a float, so `version: 3.10`
-// reaches the action as `3.1` -- the `python-version: 3.10` trap. Only a
-// trailing zero survives that round trip wrong (`3.16` renders back as `3.16`),
-// so a trailing zero is all this rejects, and either quoting the value or
-// naming the patch component clears it.
+// reaches the action as `3.1` -- the `python-version: 3.10` trap. What survives
+// that round trip wrong is a value whose fractional part ENDS in zero, and the
+// zero-only case is the one to keep in mind: `3.0` and `4.0` reach the action as
+// `3` and `4`, an unpinned major line, which is the same floating-render hazard
+// this pin exists to close. `4.0` is the live one -- helm v4 shipped
+// 2026-08-13, so a bump to the 4.x line is a plausible edit and `version: 4.0`
+// is a natural way to write it. `3.16` is unaffected (it renders back as
+// `3.16`), and either quoting the value or naming the patch component clears
+// any of these.
 test("the chart render job pins the helm it renders with (BLO-31516)", () => {
   const region = jobRegion("helm_chart");
   const step = region
@@ -249,7 +276,7 @@ test("the chart render job pins the helm it renders with (BLO-31516)", () => {
     `the helm version must name a release, got ${version}`,
   );
   assert.ok(
-    pin[1] || !/^\d+\.\d+0+$/.test(version),
+    pin[1] || !/^\d+\.\d*0+$/.test(version),
     `unquoted ${version} is a YAML float and reaches the action as ${Number(version)}; quote it or name the patch component`,
   );
 });
