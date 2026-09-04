@@ -589,9 +589,17 @@ export function classifyAgentHealth(agent) {
 }
 
 /**
- * The production-facing drop the `superseded_fingerprint` fixture exists to pin:
- * a superseded approval row, and any row carrying no alert `category`,
- * contributes nothing to the canonical fingerprint input.
+ * The drop the `superseded_fingerprint` fixture exists to pin: a superseded
+ * approval row, and any row carrying no alert `category`, contributes nothing
+ * to the canonical fingerprint input.
+ *
+ * Scope, deliberately stated: this rule is defined HERE and has no counterpart
+ * elsewhere in the repo. The alert-row shapes it operates on (`category`,
+ * `subjectId`, `requestedCapCents`) appear in no file outside this script and
+ * its test — the receipt is composed by the agent from the runbook, not by
+ * shared code — so this is the only executable statement of the rule, not a
+ * mirror of one. If a renderer ever grows its own superseded-drop, import it
+ * rather than restating it: a divergence between the two would not fail here.
  *
  * Exported so the fixture's claim is reachable from a test. The fixture used to
  * assert `fingerprintOf(canonical) === fingerprintOf(canonical)` — the
