@@ -1346,6 +1346,15 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No other branches suggest yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No clear evidence yet this head was already reviewed at \`${sha}\`.`, false],
       [`No strong indication still this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot fully confirm yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not fully aware yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot definitively say yet this head was already reviewed at \`${sha}\`.`, false],
+      [`We do not currently believe yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I have not conclusively verified yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No longer aware yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No anomaly indicates yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No reply suggests yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No supply shows yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
@@ -1368,6 +1377,7 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       ["I cannot say this head was ", "negation"],
       ["I am unaware that this head was ", "fusedNegation"],
       ["No evidence yet this head was ", "negatedHeadConnective"],
+      ["I cannot fully confirm yet this head was ", "negatedHeadConnective"],
       ["No evidence that this head was ", "negation"],
       ["I am not aware that this head was ", "negation"],
       // Correct skips: no cue governs the clause, so nothing vetoes.
