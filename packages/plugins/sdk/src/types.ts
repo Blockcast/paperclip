@@ -1753,8 +1753,32 @@ export interface PluginIssuesClient {
        * Checked under a share lock inside the insert's transaction.
        */
       fencing?: PluginFencingPrecondition;
+      /**
+       * Dedup key, scoped to this plugin *installation*: the host namespaces it
+       * as `plugin:<pluginId>:<key>`, so a natural key (a delivery id,
+       * `comment:<id>`) cannot collide with another plugin's or with a
+       * server-internal one. `pluginId` is the install row's id, not the
+       * manifest `pluginKey`, but that row and its id are retained by the
+       * default (soft) uninstall and reused on reinstall, so keys keep matching
+       * across an uninstall/reinstall cycle. They are orphaned only by a purge
+       * (`DELETE /api/plugins/:pluginId?purge=true`) or a table reseed, and that
+       * boundary fails in the safe direction (an extra comment, never a wrong
+       * body handed back). A second create
+       * carrying a key already written to this issue returns the existing
+       * comment — `deduplicated: true` — instead
+       * of inserting, atomically in the database, so it holds across replicas
+       * and across concurrent deliveries. Empty and whitespace-only strings are
+       * treated as omitted. Omit for today's behaviour: no key means no dedup.
+       *
+       * Caveat when combined with `fencing`: the generation is asserted *before*
+       * the dedup lookup, so a duplicate delivery arriving after the generation
+       * has advanced throws a fencing error rather than returning the existing
+       * comment. Treat that error as "may already be applied", not as "not
+       * written".
+       */
+      idempotencyKey?: string | null;
     },
-  ): Promise<IssueComment>;
+  ): Promise<IssueComment & { deduplicated?: boolean }>;
   createInteraction(
     issueId: string,
     interaction: CreateIssueThreadInteraction,
