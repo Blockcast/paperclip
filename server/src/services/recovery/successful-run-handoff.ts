@@ -396,6 +396,17 @@ export function buildSuccessfulRunHandoffInstruction(input: {
   ].join("\n");
 }
 
+/**
+ * `input.run` must be a row re-read AFTER the source run body executed, not the
+ * claim-time snapshot. `statusOnlyDocumentWriteRefusedAt` is stamped mid-run by
+ * `assertDeliverableMutationAllowedByRunContext`, so a claim-time row would
+ * carry `null` and the BLO-23197 escalation below would never fire. Both
+ * dispatch paths satisfy this today — `classifyAndPersistRunLiveness` returns
+ * the row from an `UPDATE ... RETURNING()`, and the finalize path re-reads via
+ * `getRun` — but that is an invariant of `heartbeat.ts` rather than of this
+ * function, and no test here can observe it: pass a stale row and every case
+ * below still passes while the escalation silently stops firing.
+ */
 export function decideSuccessfulRunHandoff(input: {
   run: HeartbeatRunRow;
   issue: IssueRow | null;
@@ -479,6 +490,14 @@ export function decideSuccessfulRunHandoff(input: {
   // deliberately not escalated — that needs a full normal-model run, a wider
   // grant than this detector should make on its own — which is why the stamp is
   // scoped to documents at the point of refusal.
+  //
+  // `Boolean(...)` guards a narrowed column projection, not `undefined`: the row
+  // type is `Date | null` and never `undefined`, so the only way this field goes
+  // absent is a `select()` that omits it. `getRun` is projected, but both
+  // `heartbeatRunSafeColumns` and `heartbeatRunSqlAsciiSafeColumns` spread
+  // `...getTableColumns(heartbeatRuns)` — that spread is what keeps this field
+  // present, and a future hand-enumerated projection there would disable the
+  // escalation in production while every test in this file still passed.
   const workClass: SuccessfulRunHandoffWorkClass =
     issue.workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)
       ? "planning_only"
