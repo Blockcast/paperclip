@@ -2483,7 +2483,7 @@ export function buildHostServices(
                 params.issueId,
                 params.body,
                 { agentId: params.authorAgentId },
-                { fencingPrecondition },
+                { fencingPrecondition, idempotencyKey: params.idempotencyKey },
                 tx,
               ),
             )
@@ -2491,19 +2491,26 @@ export function buildHostServices(
               params.issueId,
               params.body,
               { agentId: params.authorAgentId },
-            )) as IssueComment;
-        await logPluginActivity({
-          companyId,
-          action: "issue.comment.created",
-          entityType: "issue",
-          entityId: issue.id,
-          actor: { actorAgentId: params.authorAgentId ?? null },
-          details: {
-            identifier: issue.identifier,
-            commentId: comment.id,
-            bodySnippet: comment.body.slice(0, 120),
-          },
-        });
+              { idempotencyKey: params.idempotencyKey },
+            )) as IssueComment & { deduplicated?: true };
+        // On the dedup path no row was written, so logging `issue.comment.created`
+        // would report a creation that did not happen — once per duplicate
+        // delivery, which is exactly the noise an idempotency key is bought to
+        // remove.
+        if (!comment.deduplicated) {
+          await logPluginActivity({
+            companyId,
+            action: "issue.comment.created",
+            entityType: "issue",
+            entityId: issue.id,
+            actor: { actorAgentId: params.authorAgentId ?? null },
+            details: {
+              identifier: issue.identifier,
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+            },
+          });
+        }
         return comment;
       },
       async createInteraction(params) {
