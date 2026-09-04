@@ -9532,12 +9532,17 @@ function prReviewOutputHasSelfReviewSkip(
 // governing a DIFFERENT noun phrase reach the clause across the connective —
 // "No newer commits were found so this head was already reviewed at …"
 // (eleventh pass: 5 of 5 regressed against master).
-const CONNECTIVES =
-  "so|but|and|because|since|therefore|thus|hence" +
-  // Adversative and consecutive (fourteenth pass): a negation crossed all of
-  // these and vetoed a clause it does not govern. Unlike the hedge vocabulary,
-  // the connective set is CLOSED, so completing it converges.
-  "|yet|however|though|although|still|nonetheless|nevertheless|whereas|while|then|consequently|accordingly";
+// Two kinds of connective, which the copula filler treats alike but the
+// elided-complement cue must NOT: a CONSEQUENCE connective introduces a new
+// clause whose subject is what follows ("nothing else found SO this head was"),
+// so a negated head before it governs the PREVIOUS clause and never this one;
+// an ADVERSATIVE can sit inside a single clause with the complementizer
+// dropped ("no clear evidence YET this head was"). Measured (pass 17): treating
+// them alike vetoed 6 correct skips of the form "no evidence so this head was".
+const CONSEQUENCE_CONNECTIVES = "so|because|since|therefore|thus|hence|and|but";
+const ADVERSATIVE_CONNECTIVES =
+  "yet|however|though|although|still|nonetheless|nevertheless|whereas|while|then|consequently|accordingly";
+const CONNECTIVES = `${CONSEQUENCE_CONNECTIVES}|${ADVERSATIVE_CONNECTIVES}`;
 // The connectives are DUAL-ROLE words, so the exclusion is conditioned on the
 // role rather than applied to the word. In the CONNECTIVE role the word is
 // followed by the subject ("...were found yet this head was already reviewed"),
@@ -9715,13 +9720,17 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // as connective-role and the negation never reaches the clause (Ally pass
   // 16: 35/35 such phrasings accepted, at every head since the connectives
   // were excluded). The discriminator is the GAP between the negation and its
-  // head: zero intervening words is the filler role ("no evidence yet"), one
-  // or more is the connective role ("no newer commits were found yet") — the
+  // head. An ADJECTIVE does not widen that gap — "no CLEAR evidence yet this
+  // head was …" is the filler role written the ordinary way (Ally pass 17:
+  // adjacency-only accepted 6/6 such phrasings; the same shape pass 11 settled
+  // for `doubt`). So the stem allows up to two intervening words, EXCLUDING
+  // auxiliaries: "no newer commits WERE found yet …" keeps its verb between
+  // negation and head, and that verb is what marks the connective role.
   // head noun alone cannot tell them apart, since `found` is itself a head.
   // Dropping the exclusion instead trades back 20/20 connective-sense skips.
   {
     name: "negatedHeadConnective",
-    stem: `${NEGATION_PREFIX_WORD}\\s+${EPISTEMIC_HEAD}\\s+(?:${CONNECTIVES})\\b`,
+    stem: `${NEGATION_PREFIX_WORD}\\s+(?:(?!(?:was|were|is|are|has|have|had|been|be|did|does|do)\\b)\\w+\\s+){0,2}${EPISTEMIC_HEAD}\\s+(?:${ADVERSATIVE_CONNECTIVES})\\b`,
   },
   // An epistemic negation governing the clause from further back: a negation
   // word, then within three words a head that could establish the claim. One
