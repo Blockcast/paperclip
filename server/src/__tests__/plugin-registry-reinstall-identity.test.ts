@@ -67,6 +67,10 @@ describeEmbeddedPostgres("plugin registry: dedup namespace identity across reins
     // the route's `purge = req.query.purge === "true"` (`routes/plugins.ts:2368`,
     // passed at `:2377`). Flipping either would falsify the docstring with this
     // suite still green — check them too if this test ever has to be revisited.
+    // `unload` reaches `registry.uninstall` from a second site, `:568`, which
+    // hardcodes `true`; it is a purge either way and cannot silently flip, so it
+    // does not participate in the defaults above — but an audit that walks only
+    // `:590` will see one hard-delete entry point where there are two.
     const softUninstalled = await registry.uninstall(originalId, false);
     expect(softUninstalled?.status).toBe("uninstalled");
     // Soft delete retains the row — the id is still resolvable.
@@ -88,11 +92,12 @@ describeEmbeddedPostgres("plugin registry: dedup namespace identity across reins
     expect(await registry.getByKey(MANIFEST.id)).toBeNull();
 
     const reinstalled = await registry.install({ packageName: "pkg-a" }, MANIFEST);
-    // Guard before the negative assertion: `reinstalled?.id` is `undefined` if
-    // `install` ever returns nullish, and `undefined !== originalId` would
-    // satisfy `.not.toBe` without observing a new id at all. Mirrors the
-    // `expect(installed).not.toBeNull()` guard in the soft-uninstall case.
-    expect(reinstalled).not.toBeNull();
-    expect(reinstalled?.id).not.toBe(originalId);
+    // Assert through `!`, not behind an `expect(...).not.toBeNull()` guard: this
+    // branch reaches the fresh-insert return (`plugin-registry.ts:204`), one of
+    // only two un-coalesced `return rows[0]` in the registry, so a nullish result
+    // here is `undefined`, not `null`. `toBeNull` is `Object.is(actual, null)` and
+    // so admits `undefined` — after which `undefined?.id !== originalId` satisfies
+    // the negative assertion without ever observing a new id. `!` throws on both.
+    expect(reinstalled!.id).not.toBe(originalId);
   });
 });
