@@ -31,10 +31,32 @@ const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const PRECREATE_RAISE_MARKER = "requires online index precreation";
 
 /**
- * The same guard identified structurally rather than by wording: a
- * `RAISE EXCEPTION` whose `HINT` tells the operator to build the index online
- * because it is absent. `PRECREATE_RAISE_MARKER` is how we spell that
- * contract; this is the contract itself.
+ * A remediation that builds the index online *because it is absent*. This is
+ * what separates the precreation family from 0226/0227, whose raises fire for
+ * a *mismatched* index and remediate with `DROP ... IF EXISTS` first. An
+ * absent index there is a documented no-op, so they are correctly unregistered.
+ */
+const ONLINE_PRECREATE_REMEDIATION = /CREATE (?:UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS/i;
+
+/** One slice per `RAISE EXCEPTION`, each ending where the next one begins. */
+function raiseBlocks(sql: string): string[] {
+  const starts: number[] = [];
+  const pattern = /RAISE\s+EXCEPTION\b/gi;
+  for (let match = pattern.exec(sql); match; match = pattern.exec(sql)) starts.push(match.index);
+  return starts.map((start, index) => sql.slice(start, starts[index + 1] ?? sql.length));
+}
+
+/** That raise's own `HINT`, with SQL's doubled-quote escaping undone. */
+function hintOf(block: string): string | null {
+  const match = /HINT\s*=\s*'((?:[^']|'')*)'/i.exec(block);
+  return match ? match[1].replace(/''/g, "'") : null;
+}
+
+/**
+ * The guard identified structurally rather than by wording: a `RAISE EXCEPTION`
+ * whose own `HINT` tells the operator to build the index online because it is
+ * absent. `PRECREATE_RAISE_MARKER` is how we spell that contract; this is the
+ * contract itself.
  *
  * Both detectors are needed. The drift test below compares a hand-maintained
  * registry against a scan of the same files, so a migration that phrases its
@@ -45,12 +67,20 @@ const PRECREATE_RAISE_MARKER = "requires online index precreation";
  * miss removes an item from the expected *and* the actual set can never fail,
  * so the check has to key on something the wording cannot silence.
  *
- * Deliberately does not match 0226: its only `RAISE EXCEPTION` fires for a
- * *mismatched* index and remediates with `DROP ... IF EXISTS`. An absent index
- * there is a documented no-op, so it is correctly absent from the registry.
+ * Attribution is per-raise on purpose. Scanning the whole file for a
+ * `RAISE ... HINT` pair inside a fixed character window makes the verdict
+ * depend on how far apart two unrelated branches happen to sit: 0217's
+ * mismatch raise and the *next* branch's `HINT` are ~600 characters apart, so
+ * such a window decides the right answer for the wrong reason and flips if
+ * anyone reflows the SQL. Slicing at each raise pairs every raise with its own
+ * `HINT` and needs no magic number.
  */
-const PRECREATE_GUARD_SHAPE =
-  /RAISE\s+EXCEPTION\b[\s\S]{0,600}?HINT\s*=\s*'[^']*(?:''[^']*)*CREATE (?:UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS/i;
+function raisesForPrecreation(sql: string): boolean {
+  return raiseBlocks(sql).some((block) => {
+    const hint = hintOf(block);
+    return hint !== null && ONLINE_PRECREATE_REMEDIATION.test(hint);
+  });
+}
 
 async function readMigrationSqlFiles(): Promise<readonly { readonly file: string; readonly contents: string }[]> {
   const entries = await readdir(migrationsDir);
@@ -76,7 +106,7 @@ describe("PRECREATE_REQUIRED_INDEXES registry", () => {
 
   it("catches a guarded migration whose raise wording escapes the marker", async () => {
     const files = await readMigrationSqlFiles();
-    const guardShaped = files.filter(({ contents }) => PRECREATE_GUARD_SHAPE.test(contents)).map(({ file }) => file);
+    const guardShaped = files.filter(({ contents }) => raisesForPrecreation(contents)).map(({ file }) => file);
     const markerMatched = await migrationFilesRequiringPrecreation();
 
     // Non-vacuity: a shape detector that matches nothing would make this test
@@ -86,6 +116,23 @@ describe("PRECREATE_REQUIRED_INDEXES registry", () => {
     // in the first set but not the second is invisible to the drift test on
     // *both* sides, so it never reaches the pre-flight.
     expect(guardShaped.filter((file) => !markerMatched.includes(file))).toEqual([]);
+  });
+
+  it("does not mistake a drop-and-rebuild remediation for precreation", async () => {
+    // The discriminator that keeps the shape detector narrow. 0226/0227 raise
+    // for a *mismatched* index and remediate by dropping it first; an absent
+    // index there is a documented no-op, so they must stay out of the registry.
+    // Widening the shape to match them would fail unrelated PRs, so pin it.
+    const files = await readMigrationSqlFiles();
+    const dropRemediated = files.filter(
+      ({ file }) => file.startsWith("0226_") || file.startsWith("0227_"),
+    );
+    expect(dropRemediated.length).toBe(2);
+    for (const { file, contents } of dropRemediated) {
+      expect(raiseBlocks(contents).length).toBeGreaterThan(0);
+      expect({ file, guarded: raisesForPrecreation(contents) }).toEqual({ file, guarded: false });
+      expect(PRECREATE_REQUIRED_INDEXES.map((spec) => spec.migration)).not.toContain(file);
+    }
   });
 
   it("registers no migration that does not actually exist on disk", async () => {
