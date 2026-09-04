@@ -725,8 +725,9 @@ describe("isClaudeImmutableThinkingBlockError", () => {
 // `!parsed` branch returns before classifyClaudeUpstreamFailure is ever
 // called, so AC3 was inert on exactly the startup-time fault BLO-7991
 // describes. `stdout` is the only surface left there, and scanning it is safe
-// only because a model cannot have discussed anything without producing
-// output tokens first.
+// only because the guard reads that same raw surface: the parsed
+// `assistantContentSeen` flag does NOT imply the model stayed silent, so it
+// cannot bound what the raw scan sees.
 describe("isClaudeSkillNotFoundStartupFailure", () => {
   const startupLog = [
     '{"type":"system","subtype":"init"}',
@@ -750,6 +751,49 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     expect(transcript).toContain("Skill 'verification-before-completion' not found");
     expect(
       isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: true }),
+    ).toBe(false);
+  });
+
+  // Shape (a): an OOMKill mid-first-assistant-message. The truncated line
+  // fails parseJson, so it never sets `assistantContentSeen` — yet it sits
+  // verbatim in `stdout`. Misclassifying this as `skill_not_found` would
+  // permanently suppress retries for a transient pod kill, so the raw-surface
+  // guard has to catch it even though the parsed flag is false.
+  it("refuses to scan when a truncated, unparseable assistant line is present", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      // Truncated mid-write: no closing braces, so parseJson rejects it.
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Skill \'verification-before-completion\' not found is the err',
+    ].join("\n");
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    const parsed = parseClaudeStreamJson(transcript);
+    // Precondition: the parser really does leave the flag false here.
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
+  // Shape (b): a complete, parseable assistant event carrying text but no
+  // usage data at all. `outputTokens` defaults to -1, so `outputTokens > 0` is
+  // false and the flag stays clear even though the model demonstrably spoke.
+  it("refuses to scan when an assistant event carries text but no usage data", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Root cause: Skill \'verification-before-completion\' not found."}]}}',
+    ].join("\n");
+    const parsed = parseClaudeStreamJson(transcript);
+    // Preconditions: the model's text was captured, yet the flag is false.
+    expect(parsed.summary).toContain("Skill 'verification-before-completion' not found");
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
     ).toBe(false);
   });
 
