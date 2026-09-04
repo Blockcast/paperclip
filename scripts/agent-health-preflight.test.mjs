@@ -169,6 +169,17 @@ describe("agent-health v4 preflight", () => {
     assert.equal(census.slots[0].state, "classification-producing");
   });
 
+  // --- Regression: Ally finding on PR #1571, head fa550edd -------------------
+  it("routes a non-boundary key that Date.parse accepts to malformed, not out-of-range", () => {
+    // `"2026"` parses to 2026-01-01T00:00:00Z, which IS on the six-hour grid, so
+    // it reached the non-failing out-of-range bucket — a bucketing bug wearing a
+    // valid boundary, in the bucket documented as NOT for bucketing bugs.
+    const census = classifyRoutineRuns([{ windowKey: "2026", runId: "bare-year", status: "completed", commentId: "c" }]);
+    assert.deepEqual(census.malformedRows, [{ runId: "bare-year", windowKey: "2026" }]);
+    assert.deepEqual(census.outOfWindowKeys, []);
+    assert.equal(census.complete, false);
+  });
+
   it("reports malformed rows instead of dropping them", () => {
     const rows = sevenDayWindowKeys().map((windowKey, index) => ({
       windowKey,
@@ -387,6 +398,48 @@ describe("census completeness is derived from observed coverage, not from the ke
     assert.equal(census.counts.silent, 27);
   });
 
+  // --- Regression: Ally finding on PR #1571, head fa550edd -------------------
+  // The two receipt predicates disagreed on a blank id: `hasAnyReceipt` tested
+  // `!= null` while the `completed-without-comment` branch tested `!commentId`.
+  // A row with `commentId: ""` was therefore receiptless for display and a
+  // receipt for the `silent` term — and `silent` is the only coverage input to
+  // `complete`, so the total outage below reported green.
+  it("treats a blank receipt id as no receipt, not as a receipt", () => {
+    for (const blank of ["", "   "]) {
+      const ranButSilent = sevenDayWindowKeys().map((windowKey, index) => ({
+        windowKey,
+        runId: `run-${index}`,
+        status: "completed",
+        commentId: blank,
+        classification: null,
+        fingerprint: `fp-${index}`,
+      }));
+      const census = classifyRoutineRuns(ranButSilent);
+      // Before the fix: silent === 0, observedWindows === 28, complete === true.
+      assert.equal(census.counts.silent, 28, `commentId ${JSON.stringify(blank)} must not count as a receipt`);
+      assert.equal(census.counts["completed-without-comment"], 28);
+      assert.equal(census.observedWindows, 0);
+      assert.equal(census.complete, false);
+    }
+  });
+
+  // Two-sided, per the tolerance test above: the unified predicate must not
+  // over-fire and start reading real receipt ids as absent.
+  it("still counts a non-blank receipt id as a receipt", () => {
+    const covered = sevenDayWindowKeys().map((windowKey, index) => ({
+      windowKey,
+      runId: `run-${index}`,
+      status: "completed",
+      commentId: index === 0 ? "0" : `c-${index}`,
+      classification: "x",
+      fingerprint: `fp-${index}`,
+    }));
+    const census = classifyRoutineRuns(covered);
+    assert.equal(census.counts.silent, 0, "an id of \"0\" is an id, not an absent receipt");
+    assert.equal(census.counts["completed-without-comment"], 0);
+    assert.equal(census.complete, true);
+  });
+
   it("reports a slot with neither a run row nor a receipt as both runless and silent", () => {
     const [windowKey] = sevenDayWindowKeys();
     const census = classifyRoutineRuns([
@@ -497,6 +550,16 @@ describe("fixture derivations are load-bearing, not restated literals", () => {
     assert.ok(maxStepPercent([1.3, 1.3, 1.3]) > 25, "a 30% step must not read as under the threshold");
     // ...and the bound tracks the largest step, not the first or the last.
     assert.equal(Math.round(maxStepPercent([1.02, 1.3, 1.05])), 30);
+  });
+
+  // --- Regression: Ally finding on PR #1571, head fa550edd -------------------
+  it("refuses to bound the per-step threshold over an empty step array", () => {
+    // `Math.max()` is -Infinity, and `-Infinity < 25` is true — so an empty
+    // array would pass the per-step half vacuously, which is the same shape as
+    // the literal `8 < 25` this derivation replaced.
+    assert.throws(() => maxStepPercent([]), /vacuously/);
+    // Two-sided: the guard must not fire on the shape the fixture actually uses.
+    assert.equal(Math.round(maxStepPercent([1.08])), 8);
   });
 
   it("reports the derived max step in the fixture detail, not a hardcoded 8", () => {
