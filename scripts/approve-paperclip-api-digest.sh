@@ -166,6 +166,13 @@ clear_in_flight_lock() {
 # scripts/test-apply-platform-sre-backup-rbac.sh asserts this equals the CEL bound.
 readonly MAX_APPROVED_DIGESTS=3
 
+# Retry bound shared by BOTH retirement paths: retire-only mode below, and
+# release_in_flight_lock on the abort path. Declared here rather than inside
+# retire-only mode because that block exits before the approval path ever runs,
+# so a declaration there leaves this unset -- and under `set -u` that aborts
+# cleanup_on_exit mid-retirement, turning a parity fix into a fresh wedge.
+readonly RETIRE_ATTEMPTS=3
+
 if [[ -n "${PAPERCLIP_MAX_APPROVED_DIGESTS:-}" \
       && "$PAPERCLIP_MAX_APPROVED_DIGESTS" != "$MAX_APPROVED_DIGESTS" ]]; then
   echo "refusing to approve: PAPERCLIP_MAX_APPROVED_DIGESTS=${PAPERCLIP_MAX_APPROVED_DIGESTS} disagrees with the" >&2
@@ -283,9 +290,6 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
   fi
   trap 'rm -f "$retire_err"' EXIT
 
-  # Bound named rather than spelled `1 2 3`, so the trailing-sleep guard below
-  # cannot drift out of step with the loop it is guarding.
-  readonly RETIRE_ATTEMPTS=3
   for attempt in $(seq 1 "$RETIRE_ATTEMPTS"); do
     # `get` is the approver's only read verb and it is scoped to this one name.
     # A failure is fail-closed and must be surfaced: a caller that cannot read
@@ -293,7 +297,15 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
     # would leave the wedge in place while claiming it was cleared.
     if ! retire_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>"$retire_err")"; then
       echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock:" >&2
-      sed 's/^/    /' "$retire_err" >&2
+      if [[ -s "$retire_err" ]]; then
+        sed 's/^/    /' "$retire_err" >&2
+      else
+        # kubectl killed by a signal, or dead before it wrote anything, would
+        # otherwise print a dangling colon and -- now that the bootstrap hint is
+        # gated on NotFound -- no guidance at all. The gate stays honest without
+        # restoring the red herring it was added to remove.
+        echo "    (kubectl produced no error output)" >&2
+      fi
       # Gated on the cause: the bootstrap is only the answer for a ConfigMap
       # that is not there. Printed blind, it sends an operator whose approver
       # Role is missing `get` to re-run a bootstrap that is already in place --
@@ -658,8 +670,23 @@ observe_rollout_nonce() {
 # entries here could evict a rollback target.
 release_in_flight_lock() {
   local attempt json
-  for attempt in 1 2 3; do
-    json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>/dev/null)" || return 1
+  for attempt in $(seq 1 "$RETIRE_ATTEMPTS"); do
+    # Same argument as the retire-only read above, and it applies harder here:
+    # this path has LESS operator visibility, not more. Its failure surfaces as
+    # cleanup_on_exit's bare "could not retire the in-flight lock" with no cause,
+    # and unlike retire-only mode nobody is sitting at a terminal to re-run it
+    # with more logging. Written to a file rather than folded in with `2>&1`
+    # because kubectl warns on the SUCCESS path too, and those lines would be
+    # spliced into the JSON parsed just below.
+    if ! json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>"${release_err:-/dev/null}")"; then
+      echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock:" >&2
+      if [[ -n "${release_err:-}" && -s "$release_err" ]]; then
+        sed 's/^/    /' "$release_err" >&2
+      else
+        echo "    (kubectl produced no error output)" >&2
+      fi
+      return 1
+    fi
     if ! jq -e \
         --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
         --arg digest "$DIGEST" \
@@ -679,7 +706,13 @@ release_in_flight_lock() {
     if clear_in_flight_lock "$json"; then
       return 0
     fi
-    sleep 1
+    # Guarded rather than unconditional: the last attempt has nothing left to
+    # wait for. Spelled as an `if` and not `(( ... )) && sleep` because it is the
+    # final command in the loop body, where a false `(( ... ))` under `set -e`
+    # would abort the retirement it is meant to pace.
+    if (( attempt < RETIRE_ATTEMPTS )); then
+      sleep 1
+    fi
   done
   return 1
 }
@@ -848,6 +881,7 @@ replace_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-err.XXXXXX")"
 nonce_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-nonce.XXXXXX")"
 server_plan_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-server-plan.XXXXXX")"
 probe_attempts_log="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-probe-log.XXXXXX")"
+release_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-release-err.XXXXXX")"
 lock_cleanup_armed=""
 lock_preserve_on_failure=""
 lock_owner_is_ours=""
@@ -866,11 +900,13 @@ cleanup_on_exit() {
     else
       echo "WARNING: could not retire the in-flight lock on ${DIGEST}." >&2
       echo "The next approval will refuse until it is retired with" >&2
-      echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=${DIGEST} and the current" >&2
-      echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER value." >&2
+      echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=${DIGEST} and the owner read from" >&2
+      echo "the cluster -- the annotation is the one place it provably still exists:" >&2
+      echo "  kubectl -n ${NAMESPACE} get configmap ${CONFIGMAP} \\" >&2
+      echo "    -o jsonpath='{.metadata.annotations.${LOCK_OWNER_ANNOTATION//./\\.}}'" >&2
     fi
   fi
-  rm -f "$replace_err" "$nonce_err" "$server_plan_err" "$probe_attempts_log"
+  rm -f "$replace_err" "$nonce_err" "$server_plan_err" "$probe_attempts_log" "$release_err"
   exit "$status"
 }
 trap cleanup_on_exit EXIT

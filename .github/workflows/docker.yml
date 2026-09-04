@@ -1266,10 +1266,21 @@ jobs:
             # armed through the admissibility probe, then traps INT and TERM into
             # a non-zero exit that runs `release_in_flight_lock`. So an operator
             # cancelling the deploy has its lock retired inside that script,
-            # before this step ever runs. Only a SIGKILL runs no trap at all, and
-            # there the approval log still carries the digest and owner for
-            # PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY. Pinned by the two
-            # cancellation tests in approve-paperclip-api-digest.test.js.
+            # before this step ever runs. Only a SIGKILL runs no trap at all.
+            # Recover THAT one from the cluster, not from this run's log. The
+            # log carries the digest but never the owner: LOCK_OWNER_ID reaches
+            # stdout at exactly one site, the script's success epilogue, which is
+            # past this entire window -- and the `holding in-flight approval
+            # lock ... (owner ...)` notice below reads a file the script only
+            # writes on return, so it is unreachable here too. The annotation is
+            # the one place the owner provably still exists at that moment:
+            #   kubectl -n paperclip-release-approvals get configmap \
+            #     paperclip-api-approved-images -o jsonpath=\
+            #     '{.metadata.annotations.paperclip\.blockcast\.net/approval-in-flight-owner}'
+            # Both halves are required: PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY
+            # validates the pair and matches on digest AND owner, so the digest
+            # alone cannot retire anything. Pinned by the two cancellation tests
+            # in approve-paperclip-api-digest.test.js.
             echo "this job's approval published no in-flight lock for this step to retire (none minted, adopted, or already retired by the approval's own cleanup)"
             exit 0
           fi
