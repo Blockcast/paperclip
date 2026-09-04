@@ -1337,6 +1337,15 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`Nothing new seen therefore this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No confirmation hence this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No indication thus this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing else found consequently this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No confirmation accordingly this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing else found therefore this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence then this head was already reviewed at \`${sha}\`.`, false],
+      [`No newer commits appear yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer revisions indicate yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No other branches suggest yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No clear evidence yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No strong indication still this head was already reviewed at \`${sha}\`.`, false],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
