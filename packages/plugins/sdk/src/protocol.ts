@@ -1668,10 +1668,14 @@ export interface WorkerToHostMethods {
       authorAgentId?: string;
       fencing?: PluginFencingPrecondition;
       /**
-       * Dedup key, scoped to the calling plugin: the host namespaces it as
-       * `plugin:<pluginId>:<key>`, so a natural key cannot collide with another
-       * plugin's or with a server-internal one. A second create carrying a key
-       * already written to this issue returns the existing comment —
+       * Dedup key, scoped to this plugin *installation*: the host namespaces it
+       * as `plugin:<pluginId>:<key>`, so a natural key cannot collide with
+       * another plugin's or with a server-internal one. `pluginId` is the
+       * install row's id, not the manifest `pluginKey`, so keys written before
+       * an uninstall/reinstall stop matching after it — the boundary fails in
+       * the safe direction (an extra comment, never a wrong body handed back).
+       * A second create carrying a key already written to this issue returns
+       * the existing comment —
        * `deduplicated: true` — instead of inserting, atomically in the database,
        * so it holds across replicas and across concurrent deliveries. Empty and
        * whitespace-only strings are treated as omitted. Omit for today's
