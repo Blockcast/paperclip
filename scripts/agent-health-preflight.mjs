@@ -620,8 +620,17 @@ export function canonicalRows(rows) {
  * while the cumulative does — was asserted against a constant: replacing the
  * three 1.08 steps with 1.30 left the fixture green and still printed
  * "(max step 8%)" (Ally review, PR #1571).
+ *
+ * Throws on an empty array rather than returning `Math.max()`'s `-Infinity`,
+ * which is `< 25` and so would pass the per-step bound vacuously — the same
+ * shape as the literal this function replaced. Unreachable from the current
+ * fixture, whose step array is a three-element literal; this is a guard against
+ * the next caller (Ally review, PR #1571).
  */
 export function maxStepPercent(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    throw new Error("maxStepPercent: no steps — a per-step bound over nothing passes vacuously");
+  }
   return Math.max(...steps.map((step) => (step - 1) * 100));
 }
 
@@ -707,9 +716,25 @@ function hasClassificationReceipt(row) {
  * decided and still never post the comment — the recorded `2026-09-03T12` slot
  * classified `issue_created` with `commentId: null`. A decision is not an
  * emission, so this keys on `commentId` alone.
+ *
+ * "Absent" is null, undefined, OR blank, and this is the SINGLE definition —
+ * `classifyWindowRows` calls this rather than restating it. The two used to
+ * disagree: this tested `!= null` while the `completed-without-comment` branch
+ * tested `!row.commentId`, so a `commentId: ""` row was receiptless for display
+ * and a receipt for the `silent` term. A 28/28 census of terminal runs carrying
+ * `commentId: ""` therefore reported `counts.silent === 0`, `complete: true`,
+ * `pass: true` — the identical total emission-contract outage the same input
+ * with `null` correctly fails, reported green (Ally review, PR #1571).
+ *
+ * Blank, not just empty: these rows are parsed from a caller-supplied JSON file
+ * whose null-vs-empty convention this script explicitly cannot assume (see the
+ * `canonicalRows` scope note), and a whitespace-only id is as absent as `""`.
+ * The asymmetry decides the tie — reading a blank id as PRESENT is a silent
+ * false green during an outage, reading it as ABSENT is a loud false red on a
+ * healthy fleet.
  */
 function hasAnyReceipt(row) {
-  return row?.commentId != null;
+  return row?.commentId != null && String(row.commentId).trim() !== "";
 }
 
 /**
@@ -753,6 +778,12 @@ function hasAnyReceipt(row) {
  * construction — a classification receipt has a `commentId`, so a window
  * carrying one can never be silent — which is what keeps published coverage
  * ratios for historical windows unmoved by this change.
+ *
+ * Both the `completed-without-comment` and `silent` branches below route their
+ * "is there a receipt?" question through `hasAnyReceipt`, deliberately: when
+ * they tested it independently they disagreed on a blank id, and a slot that is
+ * receiptless for one term and receipted for the other is exactly the false
+ * green this precedence exists to prevent.
  */
 function classifyWindowRows(candidates) {
   const fingerprints = candidates
@@ -760,7 +791,7 @@ function classifyWindowRows(candidates) {
     .filter((value) => typeof value === "string" && value.length > 0);
 
   const states = [];
-  if (candidates.some((row) => ["completed", "succeeded"].includes(row.status) && !row.commentId)) {
+  if (candidates.some((row) => ["completed", "succeeded"].includes(row.status) && !hasAnyReceipt(row))) {
     states.push("completed-without-comment");
   }
   if (!candidates.some(hasAnyReceipt)) states.push("silent");
@@ -772,6 +803,9 @@ function classifyWindowRows(candidates) {
   }
   return { state: states[0], states };
 }
+
+/** The exact shape `windowKey()` emits, plus the `.000Z` variant pinned by test. */
+const BOUNDARY_KEY_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:00:00(\.000)?Z$/;
 
 /**
  * Places a row's `windowKey` on the six-hour grid.
@@ -785,9 +819,22 @@ function classifyWindowRows(candidates) {
  * A grid-aligned instant in non-canonical string form (`...T06:00:00.000Z`) is
  * normalized rather than rejected: it names the right window, and `expectedSet`
  * compares strings.
+ *
+ * The shape check is what makes that split hold. `Date.parse` alone accepts far
+ * more than a boundary string: `"2026"` parses to `2026-01-01T00:00:00Z`, lands
+ * on the six-hour grid, and was routed to the non-failing out-of-range bucket —
+ * a bucketing bug wearing a valid boundary, in the bucket documented above as
+ * NOT for bucketing bugs. It failed safe (out-of-window rows leave their
+ * windows silent, so the gate still went red) but by the wrong term, naming the
+ * wrong defect to whoever reads the output (Ally review, PR #1571).
+ *
+ * The accepted shape is exactly what `windowKey()` emits, plus the `.000Z`
+ * variant pinned by test. Anything else is a producer bug, and stating the
+ * contract this narrowly is what lets `malformed` mean what its name says.
  */
 function placeWindowKey(rawKey) {
   if (typeof rawKey !== "string") return { kind: "malformed" };
+  if (!BOUNDARY_KEY_SHAPE.test(rawKey)) return { kind: "malformed" };
   const ms = Date.parse(rawKey);
   if (!Number.isFinite(ms)) return { kind: "malformed" };
   if (ms % SIX_HOURS_MS !== 0) return { kind: "malformed" };
