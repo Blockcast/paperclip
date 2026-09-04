@@ -64,17 +64,6 @@ let currentCtx: PluginContext | null = null;
 
 const inFlightCreates = new Set<string>();
 
-// Same idea for bridged comments, keyed by Linear comment UUID (BLO-3267).
-// The `listComments` sentinel check below is a read-then-write and cannot see a
-// sibling delivery that has not written yet, so simultaneous deliveries of one
-// comment both pass it. Duplicate pairs observed in the wild were ~3ms apart —
-// far inside a `listComments` round-trip — so the sentinel alone only covers
-// sequential retries. Plugin workers run on the singleton worker StatefulSet
-// (the multi-replica API tier 503s plugin operations), so a process-local set
-// covers the deployed topology; the sentinel check remains as the second layer
-// that survives a restart, and would be the only layer if that tier ever scales.
-const inFlightComments = new Set<string>();
-
 // Tracks Paperclip issue IDs that were just created from Linear webhooks.
 // The issue.created event handler checks this to avoid a feedback loop
 // (webhook creates Paperclip issue → issue.created fires → would push back to Linear).
@@ -3602,95 +3591,93 @@ async function handleWebhookEvent(
     const commentBody = data.body as string;
     if (!commentBody || commentBody.includes("[synced from Paperclip]")) return;
 
-    // BLO-2973: idempotency-check by Linear comment UUID before creating.
-    // Linear retries webhook deliveries on transient failures (and our own
-    // retry layer can fire the handler twice for the same payload). Without
-    // this check, every retry creates a duplicate paperclip comment.
+    // BLO-31657: dedup by Linear comment UUID, in the database.
     //
-    // We embed a sentinel HTML comment in the bridged body — invisible in
-    // rendered markdown, but a stable, content-addressable marker we can
-    // grep when listing existing comments. Falls back to skipping the
-    // create if listing fails (better an occasional missed sync than a
-    // duplicate sync).
+    // Linear retries webhook deliveries on transient failures (and our own
+    // retry layer can fire the handler twice for the same payload), so without
+    // dedup every retry creates a duplicate paperclip comment (BLO-2973).
+    //
+    // This used to be two cooperating layers: a `listComments` scan for a
+    // sentinel HTML comment, plus a process-local `inFlightComments` claim
+    // (BLO-3267) to cover the concurrent case the scan structurally could not —
+    // a read-then-write cannot see a sibling that has not written yet, and the
+    // duplicate pair actually observed landed 3ms apart. Both are gone: the
+    // host now offers `idempotencyKey`, which dedups in the insert itself
+    // against a partial unique index, so it is atomic, holds across concurrent
+    // deliveries, and — unlike a process-local Set — keeps holding if the
+    // plugin tier ever runs more than one replica.
+    //
+    // Dropping the scan also drops one RPC round-trip per bridged comment.
+    //
+    // The sentinel is still *written*: it is load-bearing for edit propagation
+    // (BLO-31634), which matches on it. It is simply no longer *read* here.
+    //
+    // Migration window: comments bridged before this shipped carry the sentinel
+    // but no idempotency key, so a redelivery of one of those does not dedup.
+    // Linear only retries within a bounded window, so this is confined to
+    // comments bridged minutes either side of the deploy, and it fails in the
+    // safe direction (one duplicate comment, never a wrong body).
     const linearCommentId = data.id as string | undefined;
     if (!linearCommentId) {
-      ctx.logger.warn("Comment webhook missing data.id; skipping idempotency check (may double-post)");
-    } else {
-      // Claim the comment id synchronously — before the first `await` below —
-      // so a simultaneous delivery of the same comment sees the claim instead
-      // of racing us through the `listComments` check (BLO-3267).
-      if (inFlightComments.has(linearCommentId)) {
-        ctx.logger.info(`Skipping duplicate webhook comment ${linearCommentId} — already in flight`);
-        return;
-      }
-      inFlightComments.add(linearCommentId);
+      ctx.logger.warn("Comment webhook missing data.id; creating without an idempotency key (may double-post)");
     }
 
+    const userName = (data.user as Record<string, unknown>)?.name as string ?? "Linear user";
+
+    // Bare `BLO-1234`-style refs in Linear text would otherwise be linkified
+    // by the UI to Paperclip's own `/issues/BLO-1234` — same identifier
+    // scheme, different issues. Wrap them as proper Linear links here so the
+    // UI rewrite skips them.
+    const workspaceSlug = await resolveLinearWorkspaceSlug(ctx, link.linearUrl);
+    const safeBody = linkifyBareLinearIssueRefs(commentBody, workspaceSlug);
+
+    // Prepend the sentinel so edit propagation can match this comment back to
+    // its Linear source. The HTML comment renders invisibly.
+    const sentinelPrefix = linearCommentId
+      ? `<!-- linear-comment-id: ${linearCommentId} -->\n`
+      : "";
+
     try {
-      if (linearCommentId) {
-        try {
-          const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
-          const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
-          if (existing.some((c) => typeof c.body === "string" && c.body.includes(sentinel))) {
-            ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
-            return;
-          }
-        } catch (err) {
-          ctx.logger.warn(`Idempotency check failed for comment ${linearCommentId}: ${err}; proceeding (may double-post)`);
-        }
-      }
+      const created = await ctx.issues.createComment(
+        link.paperclipIssueId,
+        `${sentinelPrefix}**${userName}** (from Linear):\n\n${safeBody}`,
+        link.paperclipCompanyId,
+        linearCommentId ? { idempotencyKey: `linear-comment:${linearCommentId}` } : undefined,
+      );
 
-      const userName = (data.user as Record<string, unknown>)?.name as string ?? "Linear user";
-
-      // Bare `BLO-1234`-style refs in Linear text would otherwise be linkified
-      // by the UI to Paperclip's own `/issues/BLO-1234` — same identifier
-      // scheme, different issues. Wrap them as proper Linear links here so the
-      // UI rewrite skips them.
-      const workspaceSlug = await resolveLinearWorkspaceSlug(ctx, link.linearUrl);
-      const safeBody = linkifyBareLinearIssueRefs(commentBody, workspaceSlug);
-
-      // Prepend the sentinel so future webhook deliveries can detect this
-      // comment was already mirrored. The HTML comment renders invisibly.
-      const sentinelPrefix = linearCommentId
-        ? `<!-- linear-comment-id: ${linearCommentId} -->\n`
-        : "";
-
-      try {
-        await ctx.issues.createComment(
-          link.paperclipIssueId,
-          `${sentinelPrefix}**${userName}** (from Linear):\n\n${safeBody}`,
-          link.paperclipCompanyId,
-        );
-
-        await ctx.activity.log({
-          companyId: link.paperclipCompanyId,
-          message: `issue.comment.synced_from_linear`,
-          entityType: "issue",
-          entityId: link.paperclipIssueId,
-          metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.synced", linearCommentId: linearCommentId ?? null },
-        });
-
-        ctx.logger.info(`Webhook bridged comment to ${link.linearIdentifier}`);
-      } catch (err) {
-        ctx.logger.warn(`Webhook failed to bridge comment: ${err}`);
-      }
-    } finally {
-      // Release after the create *attempt* resolves — not before it, and not
-      // only on success. Releasing earlier would reopen a window where the
-      // claim is gone and no sentinel is written yet, i.e. neither layer
-      // covers the comment.
+      // A duplicate delivery gets the first delivery's comment handed back
+      // rather than an error. Return before logging activity: the row already
+      // existed, so recording `comment.synced` again would report a sync that
+      // did not happen, once per duplicate delivery — exactly the noise the
+      // key is bought to remove.
       //
-      // On the success path the sentinel is already visible to the next
-      // delivery by the time the claim drops, so the handoff is clean. On the
-      // failure paths (`createComment` threw, `resolveLinearWorkspaceSlug`
-      // threw) there is deliberately no sentinel to hand off to, and the claim
-      // must still drop: holding it would make one failed delivery permanently
-      // suppress that comment's own retry — a worse bug than the double-post
-      // this guards. Do not "tighten" this by moving the delete into the
-      // success branch; see the `releases the in-flight claim when the bridged
-      // create fails` and `... when workspace-slug resolution throws` tests,
-      // which pin exactly that.
-      if (linearCommentId) inFlightComments.delete(linearCommentId);
+      // This branch is also where an `action: "update"` delivery lands. A
+      // Linear edit keeps the comment's UUID, so the key is unchanged and the
+      // edit dedups against the original mirror instead of propagating — the
+      // same outcome the sentinel scan used to produce, reached a different
+      // way. That is BLO-31634, and it is deliberately *unchanged* here rather
+      // than fixed in passing: propagating an edit needs an update call keyed
+      // on the existing comment, not a create. The comment id handed back on
+      // this path is what such a fix would target.
+      if (created.deduplicated) {
+        ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
+        return;
+      }
+
+      await ctx.activity.log({
+        companyId: link.paperclipCompanyId,
+        message: `issue.comment.synced_from_linear`,
+        entityType: "issue",
+        entityId: link.paperclipIssueId,
+        metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.synced", linearCommentId: linearCommentId ?? null },
+      });
+
+      ctx.logger.info(`Webhook bridged comment to ${link.linearIdentifier}`);
+    } catch (err) {
+      // No claim to release and no sentinel to hand off: a failed delivery
+      // leaves no trace, so the next retry of this comment is free to try
+      // again and will dedup against the key if a sibling won the race.
+      ctx.logger.warn(`Webhook failed to bridge comment: ${err}`);
     }
   }
 
