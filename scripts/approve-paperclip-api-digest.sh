@@ -195,10 +195,10 @@ require_bounded_positive_int PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS \
 # The lock-owner handoff path is validated here for a sharper reason than the
 # knobs above: it is the one operator-facing value whose failure would otherwise
 # land AFTER the ring write. emit_lock_owner runs immediately after the rotation
-# succeeds, so under `set -e` an unwritable path aborts with the ring rotated and
-# the in-flight lock held -- reproducing the exact "approved, then died before
-# helm touched the cluster" window this handoff exists to close. Proving
-# writability now costs nothing; discovering it later costs a deploy.
+# succeeds, so under `set -e` an unwritable path aborts there. That abort is
+# safe -- cleanup_on_exit retires the lock it just minted -- but it costs a
+# deploy, and it fails at a point in the run that reads like success. Proving
+# writability now costs nothing; discovering it later costs a release cycle.
 #
 # The target file is deliberately NOT created. Absent means "this invocation has
 # no lock it is entitled to abandon", so pre-creating an empty file here would
@@ -224,7 +224,7 @@ if [[ -n "$LOCK_OWNER_OUT" ]]; then
   if ! lock_owner_probe="$(
         mktemp "${lock_owner_out_dir}/.paperclip-lock-owner-probe.XXXXXX" 2>/dev/null)"; then
     echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}': ${lock_owner_out_dir} is not writable" >&2
-    echo "the approval would succeed and then abort with the lock held; fix the path first" >&2
+    echo "the approval would rotate the ring and then abort, costing a deploy; fix the path first" >&2
     exit 2
   fi
   rm -f "$lock_owner_probe"
@@ -708,14 +708,20 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
     rotated=yes
     # Only after the write landed: before it, no lock with this owner exists.
     #
-    # Non-fatal on purpose. The path was proven writable during env validation,
-    # so a failure here means something changed mid-run (revoked mount, full
-    # disk). Aborting at this point would leave the ring rotated and the lock
-    # held, which is precisely the window this handoff exists to close, so warn
-    # and carry on: cleanup_on_exit still retires the lock if this script fails,
-    # and otherwise the next release retires it after observing the rollout.
-    emit_lock_owner \
-      || echo "WARNING: could not write the lock owner to ${LOCK_OWNER_OUT}; no cleanup step can name this lock." >&2
+    # Deliberately fatal under `set -e`, matching this file's fail-fast
+    # convention. The minted branch just armed lock_cleanup_armed and cleared
+    # lock_preserve_on_failure, so aborting here reaches cleanup_on_exit's
+    # release_in_flight_lock: the lock is retired, the ring still lists DIGEST,
+    # and the run fails visibly. That is self-healing, and it is what the next
+    # approval needs.
+    #
+    # Warning and carrying on would instead exit 0 with the ring rotated and a
+    # live lock nothing can name -- an absent owner file means "no lock this run
+    # is entitled to abandon", so a cleanup step correctly declines to touch it.
+    # That is the BLO-31598 wedge reintroduced, and silently. The path was proven
+    # writable during env validation, so reaching here at all means something
+    # changed mid-run (revoked mount, full disk).
+    emit_lock_owner
     break
   fi
 
