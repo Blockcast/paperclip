@@ -388,9 +388,7 @@ const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s
 //
 // Membership criterion, so a future entry is a judgement and not a guess: the
 // event's payload must be entirely harness-authored scalars.
-//   - `system`           — init metadata (session_id, model, tool names). Also
-//                          covers `subtype:"status"`, which v2.1.210 emits
-//                          before the first turn (`status`/`uuid`/`session_id`).
+//   - `system`           — but only on the subtypes below, NOT wholesale.
 //   - `rate_limit_event` — `rate_limit_info` counters + `uuid`/`session_id`.
 // `result` is deliberately absent: its `result` field is the model's own final
 // message. A parseable `result` event cannot reach this scan (its presence is
@@ -403,6 +401,44 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
   "rate_limit_event",
 ]);
 
+// `system` is a multiplexer, so admitting the type wholesale would reproduce
+// this guard's own defect one level down: a new subtype would be admitted by
+// default, exactly as a new top-level type was admitted by the old blocklist.
+// The criterion above is stated per *payload*, so it has to be applied per
+// (type, subtype) wherever a type demultiplexes.
+//
+// Measured against the v2.1.210 binary this adapter runs, `system` carries at
+// least five subtypes — `init`, `status`, `compact_boundary`, `hook_response`,
+// `mcp_status`. Only the first two are admitted:
+//   - `init`   — session_id, model, tool names; the startup line itself.
+//   - `status` — `status`/`uuid`/`session_id`. Emitted before the first turn;
+//                observed only under `--include-partial-messages`, which is
+//                also the mode in which `init -> status -> death` is a real
+//                startup shape, so the entry is load-bearing there.
+// `hook_response` is the concrete reason this gate exists rather than being
+// future-proofing: the binary constructs it as
+// `{type:"system",subtype:"hook_response",…,output,stdout,stderr}` — i.e. it
+// embeds a hook process's raw stdout, which is operator-configured and not
+// harness-authored at all. Hooks are reachable through `--settings`, which
+// `job-manifest.ts` appends verbatim from `config.extraArgs`; that is the same
+// one-config-edit-away channel that motivated inverting this guard in the first
+// place, so leaving `system` wholesale would leave the identical argument
+// standing against the fix. (`hook_error` appears in no v2.1.210 string table —
+// it is not a subtype at this version.)
+//
+// `status` is admitted despite its own `compact_result`/`compact_error` fields,
+// which carry compaction summaries derived from model output: compaction cannot
+// occur before the first turn, so any transcript reaching it also contains an
+// `assistant` line, which this guard rejects independently.
+//
+// A `system` line with no readable subtype fails closed, like any unrecognised
+// type. Truncation drops the tail, not the head, so a genuine `init` line is
+// either whole or too short to carry the trigger phrase.
+const CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set([
+  "init",
+  "status",
+]);
+
 // The first `"type":"…"` on a line. Whitespace-tolerant because this matches
 // text rather than JSON structure, and a truncated event still carries its
 // leading `"type":"<role>"` prefix — truncation drops the tail, not the head.
@@ -410,6 +446,10 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // position of an over-long type and let the scan advance to a *nested* type
 // instead, which is the one direction that could wrongly allowlist a line.
 const CLAUDE_EVENT_TYPE_RE = /"type"\s*:\s*"([^"\r\n]*)"/;
+
+// The first `"subtype":"…"` on a line, read with the same tolerances and for
+// the same reason as the type above.
+const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
 
 /**
  * True when every event line in the RAW transcript is one the harness authored.
@@ -434,8 +474,10 @@ const CLAUDE_EVENT_TYPE_RE = /"type"\s*:\s*"([^"\r\n]*)"/;
  * reading would fail closed on.
  *
  * Claude emits the discriminator first, so a line's first type is its top-level
- * type. Where that ever fails to hold the error is one-directional: every
- * nested type the CLI emits (`text`, `tool_result`, `tool_use`, `thinking`,
+ * type, and the same holds for the `system` subtype (the binary constructs it
+ * immediately after the type). Where that ever fails to hold the error is
+ * one-directional: every nested type the CLI emits (`text`, `tool_result`,
+ * `tool_use`, `thinking`,
  * `image`) is absent from the allowlist, so a re-ordered *dangerous* line still
  * fails closed, and a re-ordered `system` line costs only a missed detection —
  * which degrades to the untyped `buildPartialRunError`, i.e. pre-BLO-7991
@@ -453,6 +495,11 @@ function claudeTranscriptIsHarnessAuthoredOnly(stdout: string): boolean {
     const match = CLAUDE_EVENT_TYPE_RE.exec(line);
     if (!match) continue;
     if (!CLAUDE_HARNESS_AUTHORED_EVENT_TYPES.has(match[1])) return false;
+    // `system` demultiplexes, so the allowlist has to reach its subtype too.
+    if (match[1] === "system") {
+      const subtype = CLAUDE_EVENT_SUBTYPE_RE.exec(line);
+      if (!subtype || !CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES.has(subtype[1])) return false;
+    }
   }
   return true;
 }
@@ -545,8 +592,14 @@ export function isClaudeSkillNotFoundStartupFailure(input: {
 }): boolean {
   if (input.assistantContentSeen) return false;
   if (typeof input.stdout !== "string") return false;
-  if (!claudeTranscriptIsHarnessAuthoredOnly(input.stdout)) return false;
-  return CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout);
+  // Phrase test before the transcript walk: both predicates are pure and
+  // neither regex is `/g`, so the order is semantically identical, but
+  // `claudeTranscriptIsHarnessAuthoredOnly` splits the ENTIRE pod log eagerly
+  // and its own early `return false` therefore saves nothing. The phrase is
+  // absent on the overwhelming majority of failed runs, so testing it first
+  // skips the split outright.
+  if (!CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout)) return false;
+  return claudeTranscriptIsHarnessAuthoredOnly(input.stdout);
 }
 
 /**
