@@ -724,6 +724,7 @@ export function buildHostServices(
     companyId: workspace.companyId,
     projectId: workspace.projectId,
     projectWorkspaceId: workspace.projectWorkspaceId,
+    name: workspace.name,
     path: workspace.cwd ?? workspace.providerRef,
     cwd: workspace.cwd,
     repoUrl: workspace.repoUrl,
@@ -731,6 +732,11 @@ export function buildHostServices(
     branchName: workspace.branchName,
     providerType: workspace.providerType,
     mode: workspace.mode,
+    // BLO-31349: expose the host's own closed-ness verdict rather than the raw
+    // `status`/`closedAt` columns, so plugins (and the SDK test double) branch
+    // on the same predicate `getWorkspaceForIssue` uses to reject a torn-down
+    // workspace, instead of each re-deriving it and missing `cleanup_failed`.
+    closed: isClosedExecutionWorkspace(workspace),
     providerMetadata: readProviderMetadata(workspace.metadata),
   });
 

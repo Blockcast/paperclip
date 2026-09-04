@@ -1090,12 +1090,26 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           ?.executionWorkspaceId as string | undefined;
         if (executionWorkspaceId) {
           const executionWorkspace = executionWorkspaces.get(executionWorkspaceId);
-          if (isInCompany(executionWorkspace, companyId) && executionWorkspace?.cwd) {
+          // Mirror ALL THREE of the host's rejection conditions
+          // (`plugin-host-services.ts` `getWorkspaceForIssue`): wrong company,
+          // closed/archived, and no realized `cwd`. Dropping any one of them
+          // makes the double model a workspace the host would refuse, so a
+          // plugin author who tested the fallback here would see `true` in the
+          // harness and `false` in production. Seed `closed: true` to exercise
+          // the torn-down-workspace fallback.
+          if (
+            isInCompany(executionWorkspace, companyId) &&
+            !executionWorkspace?.closed &&
+            executionWorkspace?.cwd
+          ) {
             const now = new Date().toISOString();
             return {
               id: executionWorkspace.id,
               projectId: executionWorkspace.projectId,
-              name: executionWorkspace.branchName ?? executionWorkspace.id,
+              // `name` first, to match the host, which labels the result with
+              // the execution workspace's own name column; `branchName`/`id`
+              // remain as fallbacks for a double seeded without a name.
+              name: executionWorkspace.name ?? executionWorkspace.branchName ?? executionWorkspace.id,
               path: executionWorkspace.cwd,
               repoUrl: executionWorkspace.repoUrl,
               repoRef: executionWorkspace.branchName,
