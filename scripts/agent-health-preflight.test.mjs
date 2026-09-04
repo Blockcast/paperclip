@@ -508,7 +508,8 @@ describe("fixture derivations are load-bearing, not restated literals", () => {
   });
 });
 
-describe("synthetic renderer fixture is a real derivation, not a restated literal", () => {  it("matches the persisted canonical-input and transformed-output hashes", () => {
+describe("synthetic renderer fixture is a real derivation, not a restated literal", () => {
+  it("matches the persisted canonical-input and transformed-output hashes", () => {
     assert.equal(sha256(CANONICAL_INPUT_BYTES), CANONICAL_INPUT_SHA256);
     const result = runSyntheticRendererFixture();
     assert.equal(result.status, "pass");
