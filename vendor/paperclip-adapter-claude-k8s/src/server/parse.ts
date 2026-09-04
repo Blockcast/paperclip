@@ -408,8 +408,8 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // (type, subtype) wherever a type demultiplexes.
 //
 // Measured against the v2.1.210 binary this adapter runs, `system` carries at
-// least five subtypes — `init`, `status`, `compact_boundary`, `hook_response`,
-// `mcp_status`. Only the first two are admitted:
+// least six subtypes — `init`, `status`, `compact_boundary`, `hook_started`,
+// `hook_response`, `mcp_status`. Only the first two are admitted:
 //   - `init`   — session_id, model, tool names; the startup line itself.
 //   - `status` — `status`/`uuid`/`session_id`. Emitted before the first turn;
 //                observed only under `--include-partial-messages`, which is
@@ -419,12 +419,16 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // future-proofing: the binary constructs it as
 // `{type:"system",subtype:"hook_response",…,output,stdout,stderr}` — i.e. it
 // embeds a hook process's raw stdout, which is operator-configured and not
-// harness-authored at all. Hooks are reachable through `--settings`, which
-// `job-manifest.ts` appends verbatim from `config.extraArgs`; that is the same
-// one-config-edit-away channel that motivated inverting this guard in the first
-// place, so leaving `system` wholesale would leave the identical argument
-// standing against the fix. (`hook_error` appears in no v2.1.210 string table —
-// it is not a subtype at this version.)
+// harness-authored at all. That is not merely reachable through `--settings`:
+// Paperclip provisions hooks itself, so it is live today. A real pod log on
+// this instance opens with a `SessionStart:startup` `hook_response` whose
+// `output` is a 344-byte operator message, and another carries an nginx 503
+// HTML error page — arbitrary external text inside a `system` event, in
+// production. `hook_started` is admitted nowhere for the same reason its
+// sibling is not: its `hook_name` is operator-derived.
+// (`hook_error` appears in no v2.1.210 string table — not a subtype at this
+// version. Corroborated behaviourally: a hook exiting 3 with stderr output
+// still emits `subtype:"hook_response"` with `exit_code:3`.)
 //
 // `status` is admitted despite its own `compact_result`/`compact_error` fields,
 // which carry compaction summaries derived from model output: compaction cannot
@@ -433,7 +437,10 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 //
 // A `system` line with no readable subtype fails closed, like any unrecognised
 // type. Truncation drops the tail, not the head, so a genuine `init` line is
-// either whole or too short to carry the trigger phrase.
+// either whole or too short to carry the trigger phrase — and a truncated
+// `hook_response`, the more interesting case since truncation is the class that
+// produced the original bug, still carries its leading subtype and so fails
+// closed on that read regardless of what its severed tail contained.
 const CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set([
   "init",
   "status",
@@ -452,7 +459,7 @@ const CLAUDE_EVENT_TYPE_RE = /"type"\s*:\s*"([^"\r\n]*)"/;
 const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
 
 /**
- * True when every event line in the RAW transcript is one the harness authored.
+ * True when this single line is one the harness authored end to end.
  *
  * Read on the same surface as the skill scan below, which is the whole point: a
  * parsed signal cannot bound what a raw regex sees. Deliberately does NOT
@@ -460,18 +467,12 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  * guard exists to catch, and parsing would skip it (`firstContentLine` in
  * execute.ts can parse because a *missed* protocol line there is cosmetic).
  *
- * Scoped per line, and reads only the FIRST type on each, so that a nested
- * `"type"` cannot veto the line that contains it. Measured rather than assumed:
- * against the CLI this adapter actually runs (v2.1.210), a real `system:init`
- * line is 1717 bytes with `mcp_servers` populated and carries exactly ONE
- * `"type"` — its own. Its `mcp_servers` entries are `{name, status}` with no
- * `type`, and `output_style` is a bare string. So a whole-transcript "every
- * type must be `system`" assertion would pass today too; per-line scoping is
- * defence-in-depth, NOT a fix for a present-day break. What it buys is the
- * removal of a dependency on the init payload never growing a nested `type` —
- * a fact about one CLI version rather than a property of the protocol — and it
- * keeps the `rate_limit_event` detection below, which a whole-transcript
- * reading would fail closed on.
+ * Reads only the FIRST type on the line, so that a nested `"type"` cannot veto
+ * the line that contains it. Measured rather than assumed: against the CLI this
+ * adapter actually runs (v2.1.210), a real `system:init` line is 1717 bytes
+ * with `mcp_servers` populated and carries exactly ONE `"type"` — its own. Its
+ * `mcp_servers` entries are `{name, status}` with no `type`, and `output_style`
+ * is a bare string.
  *
  * Claude emits the discriminator first, so a line's first type is its top-level
  * type, and the same holds for the `system` subtype (the binary constructs it
@@ -486,22 +487,68 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *
  * Lines with no `"type"` at all are content, not events — the CLI's own
  * `Error: Skill "<name>" not found` output is one, so they cannot be rejected
- * without rejecting the very thing being detected.
+ * without rejecting the very thing being detected. In stream-json mode every
+ * model token and tool result is wrapped in a JSON event, so a line carrying no
+ * type is the CLI speaking outside the protocol rather than a payload that can
+ * relay model or tool text.
  */
-function claudeTranscriptIsHarnessAuthoredOnly(stdout: string): boolean {
+function claudeLineIsHarnessAuthored(line: string): boolean {
+  const match = CLAUDE_EVENT_TYPE_RE.exec(line);
+  if (!match) return true;
+  if (!CLAUDE_HARNESS_AUTHORED_EVENT_TYPES.has(match[1])) return false;
+  // `system` demultiplexes, so the allowlist has to reach its subtype too.
+  if (match[1] === "system") {
+    const subtype = CLAUDE_EVENT_SUBTYPE_RE.exec(line);
+    if (!subtype || !CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES.has(subtype[1])) return false;
+  }
+  return true;
+}
+
+/**
+ * True when the trigger phrase appears on a line the harness authored.
+ *
+ * This ATTRIBUTES the phrase to its line rather than demanding the whole
+ * transcript be clean, and that distinction is the correction to BLO-31794's
+ * first cut. A whole-transcript veto is unsatisfiable in production: hooks are
+ * Paperclip-provisioned, so `system:hook_started` / `hook_response` open the
+ * transcript BEFORE `init` on the large majority of real runs — measured at
+ * 6510 of 8036 `init`-carrying pod logs on this instance (81%), and in a 399-log
+ * sample where both appear the hook line preceded `init` 399/399 times. Under a
+ * whole-transcript veto every one of those runs loses detection outright, which
+ * is precisely the "fix the false positive by disabling detection entirely"
+ * failure mode this issue's own acceptance criteria warn about — and it would
+ * have shipped green, because the suite's only positive fixture is the synthetic
+ * two-line shape that no production run has.
+ *
+ * Attribution is also the more faithful invariant. Every false positive in this
+ * family — a truncated `assistant` line, a complete `assistant` event with no
+ * usage, a pre-assistant `user`/`tool_result`, a `stream_event` delta, a
+ * `hook_response` payload — is the phrase sitting INSIDE an event that can
+ * carry text the harness did not author. The genuine signal is the phrase on a
+ * line that cannot. So the question worth asking is not "is this transcript
+ * clean?" but "did the harness write THIS line?", and unrelated untrusted text
+ * elsewhere no longer vetoes a real death.
+ *
+ * Unknown types still fail closed, so the allowlist keeps the property this
+ * issue was filed for: a newly-appearing event shape is excluded by default
+ * rather than admitted by default.
+ *
+ * One deliberate narrowing versus the whole-string test: `CLAUDE_SKILL_NOT_FOUND_RE`
+ * has `\s+` between its tokens, which matches a newline, so the phrase could in
+ * principle straddle two lines and match the transcript while matching no single
+ * line. The CLI emits the error on one line, so this costs nothing observed; and
+ * the direction is the safe one — a missed classification degrades to the
+ * retryable `buildPartialRunError`, whereas the alternative is a permanent
+ * retry suppression.
+ */
+function claudeTranscriptHasHarnessAuthoredSkillPhrase(stdout: string): boolean {
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    const match = CLAUDE_EVENT_TYPE_RE.exec(line);
-    if (!match) continue;
-    if (!CLAUDE_HARNESS_AUTHORED_EVENT_TYPES.has(match[1])) return false;
-    // `system` demultiplexes, so the allowlist has to reach its subtype too.
-    if (match[1] === "system") {
-      const subtype = CLAUDE_EVENT_SUBTYPE_RE.exec(line);
-      if (!subtype || !CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES.has(subtype[1])) return false;
-    }
+    if (!CLAUDE_SKILL_NOT_FOUND_RE.test(line)) continue;
+    if (claudeLineIsHarnessAuthored(line)) return true;
   }
-  return true;
+  return false;
 }
 
 /**
@@ -592,14 +639,13 @@ export function isClaudeSkillNotFoundStartupFailure(input: {
 }): boolean {
   if (input.assistantContentSeen) return false;
   if (typeof input.stdout !== "string") return false;
-  // Phrase test before the transcript walk: both predicates are pure and
-  // neither regex is `/g`, so the order is semantically identical, but
-  // `claudeTranscriptIsHarnessAuthoredOnly` splits the ENTIRE pod log eagerly
-  // and its own early `return false` therefore saves nothing. The phrase is
-  // absent on the overwhelming majority of failed runs, so testing it first
-  // skips the split outright.
+  // Cheap whole-transcript phrase test before the per-line walk. Both are pure
+  // and neither regex is `/g`, so this is semantically a pre-filter only: the
+  // walk below re-tests each line and is what actually decides. The phrase is
+  // absent on the overwhelming majority of failed runs, and `stdout` is the
+  // entire pod log, so this skips the eager `split` outright on that common path.
   if (!CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout)) return false;
-  return claudeTranscriptIsHarnessAuthoredOnly(input.stdout);
+  return claudeTranscriptHasHarnessAuthoredSkillPhrase(input.stdout);
 }
 
 /**
