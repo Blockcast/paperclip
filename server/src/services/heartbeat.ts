@@ -9538,7 +9538,17 @@ const CONNECTIVES =
   // these and vetoed a clause it does not govern. Unlike the hedge vocabulary,
   // the connective set is CLOSED, so completing it converges.
   "|yet|however|though|although|still|nonetheless|nevertheless|whereas|while|then|consequently|accordingly";
-const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b)\\w+\\s+){0,4}`;
+// The connectives are DUAL-ROLE words, so the exclusion is conditioned on the
+// role rather than applied to the word. In the CONNECTIVE role the word is
+// followed by the subject ("...were found yet this head was already reviewed"),
+// and the filler must not cross it. In the FILLER role it is followed by a
+// complementizer ("no confirmation yet THAT this head was already reviewed"),
+// where it is ordinary English for "I could not establish this" and the
+// negation must still reach the clause. Excluding them unconditionally traded
+// 12 filler-sense vetoes for 12 connective-sense acceptances 1:1 and lost the
+// side a reviewer actually writes (fifteenth pass); the nested lookahead is
+// strictly better than either.
+const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b(?!\\s+(?:that|whether)\\b))\\w+\\s+){0,4}`;
 const COPULA_EDGE = `${COPULA_FILLER}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s\`*_]*$`;
 const CLAUSE_REACH = `(?:[\\s\`*_]*$|\\s+${COPULA_EDGE})`;
 
