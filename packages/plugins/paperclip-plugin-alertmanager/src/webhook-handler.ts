@@ -1580,9 +1580,17 @@ export async function handleFiring(
       })`,
     );
     try {
+      // `refusal` splits the two outcomes this metric otherwise conflates: a
+      // permanent refusal is dropped at 200 and will not be retried, a
+      // transient one keeps Alertmanager's retry window. Without the label an
+      // operator has to join this series against
+      // `alertmanager.alert.permanent_error` to tell "gone until someone edits
+      // config" from "retrying, may still land". Two values, so no meaningful
+      // cardinality cost.
       await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
         alertname,
         severity,
+        refusal: isPermanent ? "permanent" : "transient",
       });
     } catch (metricErr) {
       // Best-effort, matching the severity-floor and opt-out drops above. On the
