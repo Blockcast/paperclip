@@ -10,7 +10,7 @@
 // script and sourcing it, so a rename or a rewrite fails this test rather than
 // silently leaving it asserting against a copy.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -725,16 +725,20 @@ function emitOwner({ ours, outPathSet = true, ownerId = "a".repeat(64) }) {
     outPathSet ? `PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=${JSON.stringify(outPath)}` : "",
     emitOwnerSource,
     OWNER_FN,
-    // Report mode via stat so the umask is asserted, not assumed.
     `if [ -e ${JSON.stringify(outPath)} ]; then`,
-    `  printf 'WROTE %s %s' "$(cat ${JSON.stringify(outPath)})" "$(stat -c %a ${JSON.stringify(outPath)})"`,
+    `  printf 'WROTE %s' "$(cat ${JSON.stringify(outPath)})"`,
     "else",
     "  printf 'NOFILE'",
     "fi",
   ].filter(Boolean).join("\n");
   const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
   assert.equal(result.status, 0, `emit_lock_owner harness failed: ${result.stderr}`);
-  return result.stdout.trim();
+  const observed = result.stdout.trim();
+  // Mode is read here rather than via `stat -c %a`, which is GNU-only syntax and
+  // fails the harness outright on BSD/macOS — asserting the umask, not the
+  // platform's stat flags.
+  if (observed === "NOFILE") return observed;
+  return `${observed} ${(statSync(outPath).mode & 0o777).toString(8)}`;
 }
 
 test("a lock this invocation minted hands its owner to the workflow", () => {
@@ -773,9 +777,9 @@ test("ownership is cleared on exactly the branches that inherit or lose the lock
 // Emitting before the write would name a lock that does not exist if the replace
 // then fails, sending a cleanup step to abandon another process's transaction.
 //
-// Located by indentation rather than by the exact call text: the call is now
-// `||`-guarded (see the next test), and pinning the bare statement would make
-// adding that guard fail this test for the wrong reason.
+// Located by indentation rather than by the exact call text, so this ordering
+// assertion survives a change to the call's FORM (a guard, a redirect) and fails
+// only when the call actually MOVES, which is the property it exists to pin.
 const emitCallLineIndex = script
   .split("\n")
   .findIndex((line) => new RegExp(`^ {4}${OWNER_FN}\\b`).test(line));
@@ -791,18 +795,96 @@ test("the owner is emitted only after the ring write actually lands", () => {
   );
 });
 
-// The call sits five lines after the ring rotation, so under `set -e` a bare
-// invocation turns any write failure into an abort with the ring rotated and the
-// lock held — reproducing the exact window this handoff closes. Up-front
-// validation removes the foreseeable causes; this guard covers the rest.
-test("a failed handoff cannot abort the run after the ring has rotated", () => {
-  assert.notEqual(emitCallLineIndex, -1, `${OWNER_FN} is never called from the rotate loop`);
-  const statement = script.split("\n").slice(emitCallLineIndex, emitCallLineIndex + 2).join("\n");
-  assert.match(
-    statement,
-    /\|\|/,
-    `${OWNER_FN} must be \`||\`-guarded at the call site, or set -e aborts with the lock held`,
+// The emit call is deliberately BARE, so under `set -e` a write failure five
+// lines after the rotation aborts the run. That is only correct because the
+// abort is self-healing: the minted branch armed lock_cleanup_armed, so
+// cleanup_on_exit retires the lock rather than stranding it.
+//
+// Ally flagged the earlier `||` guard on #1638 because the comment justifying it
+// asserted the opposite — that aborting there holds the lock — which is false and
+// which its own next sentence contradicted. So this executes the real
+// cleanup_on_exit against the real flag values instead of reading the source:
+// a rationale that claims self-healing is worth nothing if the cleanup it names
+// stops firing, and only running it catches that.
+const cleanupSource = extractShellFunction("cleanup_on_exit");
+
+function runCleanup({ armed, preserve, status }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-cleanup-"));
+  const harness = [
+    "set -uo pipefail",
+    `lock_cleanup_armed=${armed ? "yes" : '""'}`,
+    `lock_preserve_on_failure=${preserve ? "yes" : '""'}`,
+    "DIGEST=sha256:feedface",
+    // cleanup_on_exit rm -f's these; point them at unused paths in a scratch dir.
+    ...["replace_err", "nonce_err", "server_plan_err", "probe_attempts_log"].map(
+      (name) => `${name}=${JSON.stringify(path.join(dir, name))}`,
+    ),
+    // Stubbed so the test observes the DECISION to retire, with no cluster.
+    'release_in_flight_lock() { echo "RELEASED" >&2; return 0; }',
+    cleanupSource,
+    // cleanup_on_exit reads $?, so set it exactly as the trap would.
+    `( exit ${status} )`,
+    "cleanup_on_exit",
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  return { status: result.status, released: /RELEASED/.test(result.stderr), stderr: result.stderr };
+}
+
+test("aborting after the ring rotated retires the lock this run minted", () => {
+  const result = runCleanup({ armed: true, preserve: false, status: 1 });
+  assert.equal(result.released, true, "a minted lock must be retired on failure, not stranded");
+  assert.equal(result.status, 1, "cleanup must preserve the failing exit status");
+  assert.match(result.stderr, /Retired this approval's in-flight lock/);
+});
+
+// The other half of the safety split: an adopted lock belongs to a rollout that
+// may still be live, so failure must leave it alone.
+test("aborting after adopting an earlier attempt's lock leaves it alone", () => {
+  const result = runCleanup({ armed: false, preserve: true, status: 1 });
+  assert.equal(result.released, false, "an inherited lock must survive this run's failure");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Preserved the adopted in-flight lock/);
+});
+
+// Success deliberately leaves the lock live for the next release to retire after
+// observing this plan marker roll out.
+test("a successful run leaves its lock live for the next release", () => {
+  const result = runCleanup({ armed: true, preserve: false, status: 0 });
+  assert.equal(result.released, false, "success must not retire the lock it is handing forward");
+  assert.equal(result.status, 0);
+});
+
+// The cleanup above only runs if the emit failure actually propagates. Reading
+// the call site for an absent `||` would be the same presence-assertion Ally
+// showed passing on mutated code, so run the REAL call statement under real
+// `set -e` with a failing emit and observe whether the shell stops.
+const emitStatement = (() => {
+  const lines = script.split("\n");
+  const collected = [lines[emitCallLineIndex]];
+  for (let i = emitCallLineIndex + 1; i < lines.length; i += 1) {
+    const joined = collected[collected.length - 1].trimEnd();
+    const next = lines[i].trim();
+    if (!joined.endsWith("\\") && !next.startsWith("||") && !next.startsWith("&&")) break;
+    collected.push(lines[i]);
+  }
+  return collected.map((line) => line.replace(/^ {4}/, "")).join("\n");
+})();
+
+test("a failed handoff aborts the run instead of exiting 0 with an unnamed lock", () => {
+  const harness = [
+    "set -euo pipefail",
+    "LOCK_OWNER_OUT=/dev/null",
+    `${OWNER_FN}() { return 1; }`,
+    emitStatement,
+    'echo "CONTINUED"',
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.doesNotMatch(
+    result.stdout,
+    /CONTINUED/,
+    `a failed ${OWNER_FN} must abort so cleanup_on_exit retires the lock; the call ran on past it:\n${emitStatement}`,
   );
+  assert.notEqual(result.status, 0, "the run must fail visibly rather than report success");
 });
 
 // --- handoff path validation ------------------------------------------------
@@ -850,6 +932,35 @@ test("validating the handoff path does not create the target file", () => {
     [],
     "the writability probe must clean up after itself",
   );
+});
+
+// The probe's FAILURE branch is the realistic production case — a read-only
+// mount — and the only one of the four with non-trivial logic, so it is worth
+// exercising rather than trusting. Root defeats the mode bits and would write
+// happily, so these skip rather than assert a falsehood when running as root.
+const runsAsRoot = typeof process.geteuid === "function" && process.geteuid() === 0;
+
+test("an unwritable parent directory is rejected before the approval ring is touched", { skip: runsAsRoot && "mode bits do not constrain root" }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-ro-"));
+  chmodSync(dir, 0o500);
+  try {
+    const result = runWithOwnerOut(path.join(dir, "lock-owner.txt"));
+    assert.equal(result.status, 2, `got: ${result.stderr}`);
+    assert.match(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=/);
+    assert.match(result.stderr, /is not writable/, `got: ${result.stderr}`);
+  } finally {
+    chmodSync(dir, 0o700);
+  }
+});
+
+test("an existing but unwritable target is rejected", { skip: runsAsRoot && "mode bits do not constrain root" }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-ro-target-"));
+  const outPath = path.join(dir, "lock-owner.txt");
+  writeFileSync(outPath, "");
+  chmodSync(outPath, 0o400);
+  const result = runWithOwnerOut(outPath);
+  assert.equal(result.status, 2, `got: ${result.stderr}`);
+  assert.match(result.stderr, /exists and is not writable/, `got: ${result.stderr}`);
 });
 
 test("an unset handoff path skips validation entirely", () => {
