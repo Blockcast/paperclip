@@ -797,6 +797,37 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     ).toBe(false);
   });
 
+  // Shape (c): a `user`-typed event before any `assistant` event. `user` events
+  // carry tool_result content, i.e. arbitrary text the harness did not author —
+  // and this very issue's text contains the trigger phrase verbatim, so a run
+  // reading BLO-7991 is the natural first false positive. The parser ignores
+  // `user` events entirely (no branch in parseClaudeStreamJson), so the flag
+  // stays false. `buildPartialRunError`'s own "skips user events alongside
+  // system events" test (execute.test.ts) models exactly this init -> user ->
+  // error ordering on this same `!parsed` path, so the shape is one the adapter
+  // already expects rather than one hypothesised here.
+  it("refuses to scan when a user event precedes any assistant event", () => {
+    const toolResult =
+      'Skill \'verification-before-completion\' not found — quoted from the issue body';
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":${JSON.stringify(toolResult)}}]}}`,
+      "Error: pod terminated",
+    ].join("\n");
+    // Preconditions: the phrase is present verbatim, no assistant event exists,
+    // and the parser leaves the flag false — so only the guard can save this.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(transcript).not.toContain('"type":"assistant"');
+    const parsed = parseClaudeStreamJson(transcript);
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
   it("returns false for an unrelated startup failure", () => {
     expect(
       isClaudeSkillNotFoundStartupFailure({

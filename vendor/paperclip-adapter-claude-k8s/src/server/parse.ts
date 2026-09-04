@@ -377,12 +377,19 @@ export interface ClaudeUpstreamClassification {
 
 const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s+found\b/i;
 
-// Presence of an assistant event in the RAW transcript. Read on the same
+// Presence of a conversation-turn event in the RAW transcript. Read on the same
 // surface as the skill scan below, which is the whole point: a parsed signal
 // cannot bound what a raw regex sees. Whitespace-tolerant because this matches
-// text rather than JSON structure, and a truncated event still carries this
-// prefix — truncation drops the tail, not the leading `"type":"assistant"`.
-const CLAUDE_ASSISTANT_EVENT_RE = /"type"\s*:\s*"assistant"/;
+// text rather than JSON structure, and a truncated event still carries its
+// leading `"type":"<role>"` prefix — truncation drops the tail, not the head.
+//
+// `user` is included alongside `assistant` because `user` events carry
+// tool_result payloads — arbitrary text the harness did not author, which can
+// quote the trigger phrase (this issue's own text does). The parser has no
+// `user` branch at all, so such an event never touches `assistantContentSeen`;
+// only this raw check sees it. A genuine startup skill death emits neither
+// (just `system:init` + the error), so widening costs nothing in detection.
+const CLAUDE_CONVERSATION_EVENT_RE = /"type"\s*:\s*"(assistant|user)"/;
 
 /**
  * Detect Claude's "Skill "<name>" not found" death (BLO-7991 AC3).
@@ -432,8 +439,8 @@ function isClaudeSkillNotFoundError(input: {
  * code, so it is guarded twice, and the second guard is the load-bearing one.
  *
  * `assistantContentSeen` is a *parsed* signal and is NOT equivalent to "the
- * model has not spoken", so it cannot bound what a raw scan sees. Two shapes
- * slip between them, both of which the parser produces deliberately:
+ * model has not spoken", so it cannot bound what a raw scan sees. Three shapes
+ * slip between them, all of which the parser produces deliberately:
  *
  *   (a) A line that fails `parseJson` is skipped (`:33`) and never touches the
  *       flag, yet it remains verbatim in the `stdout` being tested. This is the
@@ -442,9 +449,15 @@ function isClaudeSkillNotFoundError(input: {
  *       `message.output_tokens` nor `message.usage.output_tokens` is present,
  *       so a fully-written assistant event carrying text still leaves the flag
  *       false — `assistantTexts` is populated (`:74`) while the flag is not.
+ *   (c) A `user`-typed event before any `assistant` event. These carry
+ *       tool_result content — text the harness did not author, which can quote
+ *       the trigger phrase (BLO-7991's own body does) — and the parser has no
+ *       `user` branch at all, so the flag is never touched.
+ *       `buildPartialRunError` already models this `init` -> `user` -> error
+ *       ordering on this same `!parsed` path.
  *
- * Either shape reaches this scan with model prose in `stdout` and the flag
- * false. Because `skill_not_found` is in NON_RETRYABLE_CONTINUATION_ERROR_CODES
+ * Each shape reaches this scan with the phrase in `stdout` and the flag false.
+ * Because `skill_not_found` is in NON_RETRYABLE_CONTINUATION_ERROR_CODES
  * and is excluded from the zero-token session reset, that false positive
  * suppresses retries *permanently* — so a transient OOM whose truncated message
  * happened to discuss a missing skill would never be retried. Single quotes and
@@ -452,10 +465,11 @@ function isClaudeSkillNotFoundError(input: {
  * the match (this file's own fixtures rely on that).
  *
  * The fix is to guard on the same surface the scan reads: positive evidence of
- * an assistant event anywhere in the raw transcript. That is strictly stronger
- * than the token flag and immune to both shapes. A genuine startup skill death
- * has only the `system:init` line and the error, so detection is unaffected.
- * The parsed flag is retained as a cheap first check, not as the guarantee.
+ * a conversation-turn event anywhere in the raw transcript. That is strictly
+ * stronger than the token flag and immune to all three shapes. A genuine skill
+ * death at startup has only the `system:init` line and the error, so detection
+ * is unaffected. The parsed flag is retained as a cheap first check, not as the
+ * guarantee.
  */
 export function isClaudeSkillNotFoundStartupFailure(input: {
   stdout?: string | null;
@@ -463,7 +477,7 @@ export function isClaudeSkillNotFoundStartupFailure(input: {
 }): boolean {
   if (input.assistantContentSeen) return false;
   if (typeof input.stdout !== "string") return false;
-  if (CLAUDE_ASSISTANT_EVENT_RE.test(input.stdout)) return false;
+  if (CLAUDE_CONVERSATION_EVENT_RE.test(input.stdout)) return false;
   return CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout);
 }
 
