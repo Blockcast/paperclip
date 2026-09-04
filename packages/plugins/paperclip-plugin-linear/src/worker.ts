@@ -3675,8 +3675,21 @@ async function handleWebhookEvent(
         ctx.logger.warn(`Webhook failed to bridge comment: ${err}`);
       }
     } finally {
-      // Release only after the create has durably landed, so the sentinel is
-      // visible to the next delivery by the time the claim drops.
+      // Release after the create *attempt* resolves — not before it, and not
+      // only on success. Releasing earlier would reopen a window where the
+      // claim is gone and no sentinel is written yet, i.e. neither layer
+      // covers the comment.
+      //
+      // On the success path the sentinel is already visible to the next
+      // delivery by the time the claim drops, so the handoff is clean. On the
+      // failure paths (`createComment` threw, `resolveLinearWorkspaceSlug`
+      // threw) there is deliberately no sentinel to hand off to, and the claim
+      // must still drop: holding it would make one failed delivery permanently
+      // suppress that comment's own retry — a worse bug than the double-post
+      // this guards. Do not "tighten" this by moving the delete into the
+      // success branch; see the `releases the in-flight claim when the bridged
+      // create fails` and `... when workspace-slug resolution throws` tests,
+      // which pin exactly that.
       if (linearCommentId) inFlightComments.delete(linearCommentId);
     }
   }
