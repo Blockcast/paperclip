@@ -191,6 +191,45 @@ if (( knob_status != 0 )); then
 fi
 require_bounded_positive_int PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS \
   "$PROBE_MAX_SLEEP_SECONDS" "$PROBE_MAX_SLEEP_SECONDS_LIMIT" || exit 2
+
+# The lock-owner handoff path is validated here for a sharper reason than the
+# knobs above: it is the one operator-facing value whose failure would otherwise
+# land AFTER the ring write. emit_lock_owner runs immediately after the rotation
+# succeeds, so under `set -e` an unwritable path aborts with the ring rotated and
+# the in-flight lock held -- reproducing the exact "approved, then died before
+# helm touched the cluster" window this handoff exists to close. Proving
+# writability now costs nothing; discovering it later costs a deploy.
+#
+# The target file is deliberately NOT created. Absent means "this invocation has
+# no lock it is entitled to abandon", so pre-creating an empty file here would
+# hand a consumer a path that exists with no owner in it. Probe a sibling temp
+# file instead: same directory, same mount, same permissions, no target.
+LOCK_OWNER_OUT="${PAPERCLIP_APPROVAL_LOCK_OWNER_OUT:-}"
+if [[ -n "$LOCK_OWNER_OUT" ]]; then
+  if [[ -d "$LOCK_OWNER_OUT" ]]; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}' is a directory, not a file" >&2
+    echo "name the file to write the in-flight lock owner to, or unset it" >&2
+    exit 2
+  fi
+  lock_owner_out_dir="$(dirname -- "$LOCK_OWNER_OUT")"
+  if [[ ! -d "$lock_owner_out_dir" ]]; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}': ${lock_owner_out_dir} is not a directory" >&2
+    echo "create it before this step, or unset the variable to skip the handoff" >&2
+    exit 2
+  fi
+  if [[ -e "$LOCK_OWNER_OUT" && ! -w "$LOCK_OWNER_OUT" ]]; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}' exists and is not writable" >&2
+    exit 2
+  fi
+  if ! lock_owner_probe="$(
+        mktemp "${lock_owner_out_dir}/.paperclip-lock-owner-probe.XXXXXX" 2>/dev/null)"; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}': ${lock_owner_out_dir} is not writable" >&2
+    echo "the approval would succeed and then abort with the lock held; fix the path first" >&2
+    exit 2
+  fi
+  rm -f "$lock_owner_probe"
+fi
+
 if [[ -z "${PAPERCLIP_DEPLOY_KUBECONFIG:-}" \
       || ! -f "$PAPERCLIP_DEPLOY_KUBECONFIG" ]]; then
   echo "PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential used for the admission probe" >&2
@@ -668,7 +707,15 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
       | kubectl replace -f - >/dev/null 2>"$replace_err"; then
     rotated=yes
     # Only after the write landed: before it, no lock with this owner exists.
-    emit_lock_owner
+    #
+    # Non-fatal on purpose. The path was proven writable during env validation,
+    # so a failure here means something changed mid-run (revoked mount, full
+    # disk). Aborting at this point would leave the ring rotated and the lock
+    # held, which is precisely the window this handoff exists to close, so warn
+    # and carry on: cleanup_on_exit still retires the lock if this script fails,
+    # and otherwise the next release retires it after observing the rollout.
+    emit_lock_owner \
+      || echo "WARNING: could not write the lock owner to ${LOCK_OWNER_OUT}; no cleanup step can name this lock." >&2
     break
   fi
 

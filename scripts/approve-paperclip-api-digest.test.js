@@ -10,7 +10,7 @@
 // script and sourcing it, so a rename or a rewrite fails this test rather than
 // silently leaving it asserting against a copy.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -337,12 +337,89 @@ test("ownership is cleared on exactly the branches that inherit or lose the lock
 
 // Emitting before the write would name a lock that does not exist if the replace
 // then fails, sending a cleanup step to abandon another process's transaction.
+//
+// Located by indentation rather than by the exact call text: the call is now
+// `||`-guarded (see the next test), and pinning the bare statement would make
+// adding that guard fail this test for the wrong reason.
+const emitCallLineIndex = script
+  .split("\n")
+  .findIndex((line) => new RegExp(`^ {4}${OWNER_FN}\\b`).test(line));
+
 test("the owner is emitted only after the ring write actually lands", () => {
-  const rotated = script.indexOf("rotated=yes");
-  const emitCall = script.indexOf(`\n    ${OWNER_FN}\n`);
-  assert.notEqual(emitCall, -1, `${OWNER_FN} is never called from the rotate loop`);
+  assert.notEqual(emitCallLineIndex, -1, `${OWNER_FN} is never called from the rotate loop`);
+  const lines = script.split("\n");
+  const rotatedLineIndex = lines.findIndex((line) => line.includes("rotated=yes"));
+  assert.notEqual(rotatedLineIndex, -1, "rotated=yes not found in the rotate loop");
   assert.ok(
-    emitCall > rotated,
+    emitCallLineIndex > rotatedLineIndex,
     `${OWNER_FN} must be called after the successful kubectl replace, not before it`,
   );
+});
+
+// The call sits five lines after the ring rotation, so under `set -e` a bare
+// invocation turns any write failure into an abort with the ring rotated and the
+// lock held — reproducing the exact window this handoff closes. Up-front
+// validation removes the foreseeable causes; this guard covers the rest.
+test("a failed handoff cannot abort the run after the ring has rotated", () => {
+  assert.notEqual(emitCallLineIndex, -1, `${OWNER_FN} is never called from the rotate loop`);
+  const statement = script.split("\n").slice(emitCallLineIndex, emitCallLineIndex + 2).join("\n");
+  assert.match(
+    statement,
+    /\|\|/,
+    `${OWNER_FN} must be \`||\`-guarded at the call site, or set -e aborts with the lock held`,
+  );
+});
+
+// --- handoff path validation ------------------------------------------------
+//
+// Ally flagged this on #1638: the handoff path was the only operator-facing
+// value in the script with no up-front validation, in a file that states the
+// opposite convention outright ("Validated here, with the other operator-facing
+// env, so a typo fails before the ring is touched"). The failure it produced was
+// not a wedge — cleanup_on_exit still retires the lock — but it cost a deploy and
+// aborted at a point in the script that reads like success.
+function runWithOwnerOut(outPath) {
+  return runWithKnobs({ PAPERCLIP_APPROVAL_LOCK_OWNER_OUT: outPath });
+}
+
+test("an unwritable handoff path is rejected before the approval ring is touched", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-out-"));
+  const cases = [
+    // The realistic one: a workflow that has not created the directory yet.
+    [path.join(dir, "missing-dir", "lock-owner.txt"), /is not a directory/],
+    // A path that names the directory itself.
+    [dir, /is a directory, not a file/],
+  ];
+  for (const [outPath, expected] of cases) {
+    const result = runWithOwnerOut(outPath);
+    assert.equal(result.status, 2, `${outPath} should exit 2, got ${result.status}`);
+    assert.match(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=/);
+    assert.match(result.stderr, expected, `got: ${result.stderr}`);
+  }
+});
+
+// The whole safety property of the handoff is that an ABSENT file means "this
+// invocation has no lock it is entitled to abandon". Validating by creating the
+// target would hand a consumer a path that exists with no owner in it, so the
+// probe must not leave the target behind.
+test("validating the handoff path does not create the target file", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-out-"));
+  const outPath = path.join(dir, "lock-owner.txt");
+  const result = runWithOwnerOut(outPath);
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
+  assert.doesNotMatch(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT/);
+  assert.equal(existsSync(outPath), false, "validation must not pre-create the handoff target");
+  assert.deepEqual(
+    readdirSync(dir).filter((name) => name.includes("probe")),
+    [],
+    "the writability probe must clean up after itself",
+  );
+});
+
+test("an unset handoff path skips validation entirely", () => {
+  const result = runWithKnobs({});
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
+  assert.doesNotMatch(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT/);
 });
