@@ -1004,18 +1004,125 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     ).toBe(false);
   });
 
-  // An unreadable subtype fails closed like an unrecognised type. Truncation
-  // drops the tail, not the head, so a real `init` line is either whole or too
-  // short to carry the trigger phrase — the lost detection costs one
-  // classification, which is the safe direction.
-  it("refuses to scan when a system event has no readable subtype", () => {
+  // The counterweight to the test above, and the reason this guard attributes
+  // the phrase to its line instead of demanding a globally clean transcript.
+  //
+  // Hooks are Paperclip-provisioned, not merely reachable via `extraArgs`, so
+  // `hook_started`/`hook_response` open the transcript BEFORE `init` on the
+  // large majority of real runs. Measured on this instance's pod logs: 6510 of
+  // 8036 `init`-carrying logs contain `hook_started` (81%), and in a 399-log
+  // sample carrying both, the hook line preceded `init` 399/399 times. The
+  // three lines below are the verbatim shape of that preamble.
+  //
+  // A whole-transcript "every line must be harness-authored" veto returns false
+  // here — i.e. it silently disables detection on ~81% of production runs while
+  // every other fixture in this file keeps passing, because they all use the
+  // synthetic two-line shape that no production run has. That is exactly the
+  // "fix the false positive by disabling detection entirely" failure mode this
+  // issue's acceptance criteria warn about, so it gets a dedicated test.
+  it("still classifies behind the production hook preamble that precedes init", () => {
+    const hookStarted = JSON.stringify({
+      type: "system",
+      subtype: "hook_started",
+      hook_id: "f7ecab0f-3f81-439f-b193-4efd3d7f1b48",
+      hook_name: "SessionStart:startup",
+      hook_event: "SessionStart",
+      uuid: "6350f706-ab90-4e8f-89d9-32df2493eae4",
+      session_id: "439039b2-7606-4593-99f6-476e33a06535",
+    });
+    // Operator-authored text, verbatim in shape from a real pod log: this
+    // `output` is a ccrotate status message. Its presence must NOT veto the
+    // genuine death on the bare line below — but it must also never itself be
+    // scanned, which the preceding test pins.
+    const hookResponse = JSON.stringify({
+      type: "system",
+      subtype: "hook_response",
+      hook_id: "f7ecab0f-3f81-439f-b193-4efd3d7f1b48",
+      hook_name: "SessionStart:startup",
+      hook_event: "SessionStart",
+      output: '{"systemMessage":"Currently on extra usage (7d resets at 9:00 PM, 3275m)."}',
+      stdout: '{"systemMessage":"Currently on extra usage (7d resets at 9:00 PM, 3275m)."}',
+      stderr: "",
+      exit_code: 0,
+      outcome: "success",
+    });
+    const transcript = [
+      hookStarted,
+      hookResponse,
+      '{"type":"system","subtype":"init"}',
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    // Preconditions: the preamble really does carry non-allowlisted subtypes,
+    // and really does precede init — so only per-line attribution can pass this.
+    expect(transcript).toContain('"subtype":"hook_started"');
+    expect(transcript).toContain('"subtype":"hook_response"');
+    expect(transcript.indexOf("hook_started")).toBeLessThan(transcript.indexOf('"subtype":"init"'));
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Either hook line alone is sufficient to trip a whole-transcript veto, so
+  // both are pinned independently rather than only in combination.
+  it("still classifies when either hook line alone precedes init", () => {
+    const errorLine = 'Error: Skill "verification-before-completion" not found';
+    for (const hookLine of [
+      '{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}',
+      '{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","stdout":"ok"}',
+    ]) {
+      const transcript = [hookLine, '{"type":"system","subtype":"init"}', errorLine].join("\n");
+      expect(
+        isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+      ).toBe(true);
+    }
+  });
+
+  // Attribution must survive an untrusted line appearing AFTER the genuine
+  // death as well as before it — the veto this replaces was order-insensitive,
+  // and so is this. A `stream_event` here carries model prose, is not
+  // allowlisted, and still must not veto the bare error line above it.
+  it("still classifies when an untrusted event follows the genuine death", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      'Error: Skill "verification-before-completion" not found',
+      '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"unrelated prose"}}}',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // An unreadable subtype fails closed like an unrecognised type. The property
+  // that matters is about the line CARRYING the phrase: a `system` line whose
+  // subtype cannot be read might be a truncated `hook_response`, so the phrase
+  // on it must never be attributed to the harness.
+  it("refuses to scan a system event with no readable subtype that carries the phrase", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"system","session_id":"e45846ad","stdout":"Skill \'verification-before-completion\' not found',
+    ].join("\n");
+    // Precondition: the phrase is present, in a matchable form, on the
+    // unreadable line — so a pass here would be permanent retry suppression.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
+  });
+
+  // The converse, and a deliberate behaviour change from the whole-transcript
+  // veto this replaces: an unreadable line that does NOT carry the phrase is
+  // simply not where the evidence is, so it no longer vetoes a genuine death
+  // elsewhere in the transcript. Under the veto this returned false — which is
+  // the same over-suppression that silently disabled detection behind the
+  // production hook preamble.
+  it("still classifies when an unreadable system event does not carry the phrase", () => {
     const transcript = [
       '{"type":"system","session_id":"e45846ad"}',
       'Error: Skill "verification-before-completion" not found',
     ].join("\n");
     expect(
       isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   // Reading only the first type per line rests on Claude emitting the
