@@ -80,15 +80,29 @@ test("policy continues after a bounded test failure unless cancelled", () => {
 // the gate passes and the thing it exists to catch goes through.
 //
 // What the directory buys, precisely: any re-add that names the path from the
-// repo root -- individual files, a bare directory, a leading `./` -- including
-// one inside a `run: |` block, which filtering to `run:` lines would miss
-// (pr.yml has 17 such blocks). What it does NOT catch is a re-add that chdirs
-// first, because then the path never appears in full. Both of these pass the
-// assertion below; the one after it is what closes them.
+// repo root -- individual files, a bare directory WITH its trailing slash, a
+// leading `./` -- including one inside a `run: |` block, which filtering to
+// `run:` lines would miss (pr.yml has 17 such blocks). Drop that slash and the
+// text match does escape, so `node --test ./deploy/helm/paperclip/tests` looks
+// like a hole; it is not one, because Node resolves a positional argument as a
+// module path and never searches it as a directory. Measured on the pinned
+// `node-version: 24` (pr.yml:483): both spellings die with
+// `code: 'MODULE_NOT_FOUND'` and exit 1, reported as one failing test. So the
+// gap is real in the matcher and inert in practice -- and inert in the loud
+// direction, which is why it is left alone: that spelling cannot reintroduce
+// coverage silently, it can only break the step that tries.
+//
+// What it does NOT catch is a re-add where the
+// path never appears in full, and that has two independent causes, not one:
+// chdir'ing first, and a glob wide enough that the directory is never spelled.
+// Both pass the assertion below. The next two assertions close one each -- the
+// chdir one, then the house-style one that keeps globs narrow.
 //
 //     run: |                              working-directory: deploy/helm/paperclip
 //       cd deploy/helm/paperclip          run: node --test ./tests/*.test.mjs
 //       node --test ./tests/*.test.mjs
+//
+//     run: node --test ./deploy/helm/*/tests/*.test.mjs
 // One path, spelled once. These two constants encode the same thing -- the
 // chart root a chdir lands in, and the suite directory underneath it -- and
 // while they were independent literals, which assertion fired depended on which
@@ -107,10 +121,21 @@ const CHART_SUITE = `${CHART_DIR}/tests/`;
 // (`canary_dry_run`) and still fails the owner assertion below, so it failed
 // safe. It could only false-pass if a digit-named job were defined immediately
 // after `helm_chart` (today `typecheck_release_registry`).
+//
+// Anchored past `jobs:` so that count stays checkable. Two-space keys also
+// occur under `on:` -- `pull_request:` and `merge_group:` -- so an unanchored
+// scan matches 14 keys while the comment says 12, and the next person to
+// re-derive the number gets 14 and concludes the comment has drifted. Both sit
+// above every job, so this was inert in the safe direction; the anchor buys
+// honesty about the count rather than a behaviour change.
+const JOBS_AT = workflow.indexOf("\njobs:\n");
+assert.notEqual(JOBS_AT, -1, "pr.yml must declare a jobs: block");
+
 function jobOwning(offset) {
   let owner = null;
   for (const match of workflow.matchAll(/\n {2}([a-z0-9_-]+):\n/g)) {
     if (match.index >= offset) break;
+    if (match.index < JOBS_AT) continue;
     owner = match[1];
   }
   return owner;
@@ -146,11 +171,19 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
 // end-of-line anchor only catches a chdir that is the whole line, so
 // `cd <dir> && node --test ...` -- the most idiomatic single-line spelling --
 // walked straight through it, as did `;`, `||` and a trailing comment. The left
-// side needs the same treatment for two separate reasons: a chdir can be the
-// second half of a compound command (`mkdir -p x && cd <dir>`), and on a
+// side needs the same treatment for three separate reasons: a chdir can be the
+// second half of a compound command (`mkdir -p x && cd <dir>`); on a
 // single-line `run:` there is no newline in front of `cd` at all, so anchoring
 // on one silently exempted the inline spelling while catching the identical
-// `run: |` block form. `pushd` is in the alternation because it is `cd` with a
+// `run: |` block form; and it can open a subshell or sit inside a quoted
+// command -- `(cd <dir> && ...)`, `bash -c "cd <dir> && ..."`, `if cd <dir>;
+// then ...` -- which is the idiomatic way to chdir without leaking the
+// directory into everything after it. Widening the left side to whitespace is
+// safe here specifically because the alternation still requires the literal
+// token `cd`/`pushd`/`working-directory:` immediately before the path, so it
+// cannot fire on a word that merely ends in `cd`. `)` joins the right-hand
+// class for `(cd <dir>)` with no trailing command inside the subshell.
+// `pushd` is in the alternation because it is `cd` with a
 // stack: nothing here pushd's into the chart for any other purpose, so naming
 // it as an escape and covering it cost the same, and only one of those two
 // stays true as the file changes.
@@ -188,13 +221,64 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
     const step = workflow.slice(at, next === -1 ? undefined : next);
     if (!step.includes("node --test")) continue;
     const chdirs = new RegExp(
-      `(?:[\\n;&|]|run:)\\s*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"']*)?(?=[\\s&;|"']|$)`,
+      `(?:[\\s;&|("']|run:)\\s*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
     ).test(step);
     if (chdirs && jobOwning(at) !== "helm_chart") {
       offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
     }
   }
   assert.deepEqual(offenders, [], `only helm_chart may run node --test from inside ${CHART_DIR}`);
+});
+
+// The exactly-once assertion matches the suite's path as TEXT, so it is only as
+// strong as the guarantee that every invocation names its paths literally. All
+// 42 `node --test` calls in pr.yml do -- there is not a single `**` in the file
+// -- so that assertion can be trusted today, and nothing was holding it in
+// place. A glob wide enough to reach the suite without ever spelling its
+// directory escapes the exactly-once assertion AND the chdir one above, while
+// still running the tests. No chdir is involved, so neither escape named above
+// covers it:
+//
+//     node --test ./deploy/helm/*/tests/*.test.mjs   <- one char from a caught spelling
+//     node --test "./deploy/**/*.test.mjs"
+//     node --test                                    <- default discovery, repo root
+//
+// The first is the one to weigh: a second chart under `deploy/helm/` makes it
+// the natural way to write "all chart suites". Argless is the other: pr.yml has
+// 42 near-identical single-file steps, so consolidating them is a plausible
+// refactor, and default discovery from the repo root picks the suite up
+// silently -- reintroducing exactly the duplicate this gate exists to catch.
+//
+// Gate the house style rather than chase spellings: every invocation names at
+// least one path, and no path wildcards a DIRECTORY. That is a narrower claim
+// than "the suite runs once" and it is what makes the text match above sound.
+// A wildcard in the FILENAME is fine and stays fine -- `helm_chart`'s own
+// `./deploy/helm/paperclip/tests/*.test.mjs` has one, and its `*` is followed
+// by no `/`, which is precisely the distinction being drawn.
+test("every node --test names explicit paths, so the text match above is sound (BLO-31516)", () => {
+  const marker = "\n      - name: ";
+  const offenders = [];
+  for (let at = workflow.indexOf(marker); at !== -1; at = workflow.indexOf(marker, at + 1)) {
+    const next = workflow.indexOf(marker, at + 1);
+    const step = workflow.slice(at, next === -1 ? undefined : next);
+    // `(?:[^\n\\]|\\\n)*` rather than `[^\n]*(?:\\\n[^\n]*)*`: a greedy
+    // `[^\n]*` swallows the `\` that continues pr.yml's one multi-line
+    // invocation, so the continuation branch never gets to match and that
+    // step's two paths read as no paths at all -- a false red on the real file.
+    for (const invocation of step.matchAll(/node --test((?:[^\n\\]|\\\n)*)/g)) {
+      const args = invocation[1]
+        .split(/[\s\\]+/)
+        .filter(Boolean)
+        .filter((arg) => !arg.startsWith("--"));
+      if (args.length === 0) {
+        offenders.push(`${jobOwning(at)}: node --test with no path argument`);
+      }
+      for (const arg of args.filter((path) => path.includes("**") || /\*[^\s]*\//.test(path))) {
+        offenders.push(`${jobOwning(at)}: wildcard directory in ${arg}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], "every node --test must name explicit paths, without wildcarding a directory");
 });
 
 // BLO-29182 observed this exact invocation hang, and its fix bounded the copy
