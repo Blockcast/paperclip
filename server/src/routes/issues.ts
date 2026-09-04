@@ -6916,6 +6916,16 @@ export function issueRoutes(
     // replaces, the drop is uncorrelated with denial volume — re-refusals
     // re-stamp the same row by primary key — so it degrades on genuine database
     // failure only, and says so in the log.
+    //
+    // On the co-written `updatedAt`: deliberately NOT justified by enumerating
+    // today's readers, because such a list is wrong the moment one is added.
+    // The stamp fires mid-run, and the run's own terminal finalize
+    // (`setRunStatus`) always writes a strictly later `updatedAt` — so the stamp
+    // cannot move this row across any time threshold its own completion does not
+    // already move it across, which holds for every reader present and future.
+    // The column carries no `$onUpdate`; ~50 sites in `heartbeat.ts` bump it
+    // explicitly across a run's life, so one more mid-run bump is not a new
+    // class of event on this row.
     if (statusOnly && mutationKind === "document") {
       try {
         await db
