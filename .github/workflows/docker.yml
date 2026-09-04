@@ -1319,6 +1319,7 @@ jobs:
           # `set -e` cannot abort the step before the summary and the annotation
           # below are written; `pipefail` keeps the pipeline status the script's
           # own rather than tee's.
+          # BEGIN RETIRE_IN_FLIGHT_LOCK_HANDBACK
           retire_status=0
           if ! KUBECONFIG="${approver_kubeconfig}" \
               PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
@@ -1350,3 +1351,4 @@ jobs:
             echo "::error::could not retire the in-flight approval lock on ${LOCK_DIGEST} (owner ${LOCK_OWNER}). Every production deploy is refused at admission until it is retired — see this step's log for the recovery command."
             exit 1
           fi
+          # END RETIRE_IN_FLIGHT_LOCK_HANDBACK
