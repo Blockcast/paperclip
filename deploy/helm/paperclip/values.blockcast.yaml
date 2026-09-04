@@ -353,26 +353,43 @@ resources:
     # the same name prefix but is an unrelated BLO-22032 monitoring exporter with
     # its own 32Mi request, not part of this chart.)
     #
-    # AFFORDABILITY — read the invariant, not the number. Per-node headroom here
-    # moves fast: the same phase-filtered query below returned 78.7, then 62.7,
-    # then 91.2 GiB for k8s-paperclip-10 over the course of 2026-09-04, so any
-    # single figure pinned in this comment is stale within hours and the next
-    # engineer will fail to reproduce it. The durable claim is the binding
-    # constraint: +5Gi has to fit in the SMALLEST headroom in the paperclip pool,
-    # and across all of those reads the pool floor stayed at roughly 18-24 GiB
-    # (k8s-paperclip-3 was ~23.5 GiB at the last read). +5Gi per pod clears that
-    # floor by ~4x, so this is affordable anywhere in the observed range — which
-    # is the thing worth knowing, and it does not decay. Re-derive with:
+    # AFFORDABILITY — this is a threshold test, not a number to memorise.
+    # Do not trust any headroom figure written in this comment, including the
+    # ones below. Both the pool floor's VALUE and WHICH NODE holds it move
+    # within the hour: on 2026-09-04 alone the phase-filtered floor read
+    # ~15.5 GiB (k8s-paperclip-3), then ~23.5 GiB, then 25.6 GiB — by which
+    # point the floor node was k8s-paperclip-8 and k8s-paperclip-3 had risen to
+    # 37.5 GiB. Two successive revisions of this comment pinned a figure and
+    # then a band, and BOTH fell outside their own stated range within hours.
+    #
+    # The durable part is the decision rule. What binds is not the +5Gi delta
+    # but a FULL 7Gi request fitting on whatever node the pod lands on — the
+    # scheduler re-evaluates the entire request on every reschedule, not the
+    # increment. So the test is:
+    #
+    #   smallest phase-filtered headroom in the workload=paperclip pool  >=  7Gi
+    #
+    # Every floor observed on 2026-09-04 (15.5 / 23.5 / 25.6 GiB) clears that by
+    # more than 2x, which is why this change is free today. If a future
+    # re-derivation returns a floor below ~14 GiB the margin is gone and this
+    # needs re-deciding; below 7 GiB the pod cannot be placed there at all.
+    # That threshold is a property of THIS change and does not decay with the
+    # cluster. Re-derive the floor with:
     #   sum by (node) (kube_node_status_allocatable{resource="memory"})
     #   - sum by (node) (
     #       kube_pod_container_resource_requests{resource="memory"}
     #       * on (namespace,pod) group_left()
     #       (max by (namespace,pod) (kube_pod_status_phase{phase=~"Running|Pending"} == 1))
     #     )
-    # The phase join is mandatory, not tidiness: unfiltered it also counts
-    # Succeeded pods' requests and reads ~44 GiB too pessimistic on
-    # k8s-paperclip-6 (that node reads -3.6 GiB over-committed unfiltered vs
-    # +40.6 GiB free filtered) — see PEN-2957 item B.
+    # The phase join is mandatory, not tidiness. Unfiltered, the query also
+    # counts the requests of pods that have already finished (Succeeded AND
+    # Failed), which on k8s-paperclip-6 reads ~44 GiB too pessimistic. Keep the
+    # DELTA, not the endpoints: measured hours apart the two endpoints moved
+    # from -21.5/+22.6 GiB to +2.5/+46.6 GiB, while the gap between them held at
+    # 44.09 GiB both times — because it is a phantom, it is stable even as real
+    # headroom swings. Of that 44.09 GiB, 40.09 GiB is Succeeded pods (239 in
+    # the namespace) and exactly 4.00 GiB is Failed. This is the same retention
+    # that PEN-2957 item B caps: reaper history is what inflates the phantom.
     #
     # The API tier is over-provisioned by this at its ~0.85 GiB steady state.
     # That is the accepted cost of a shared block; splitting `api.resources` out
