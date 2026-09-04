@@ -9465,9 +9465,10 @@ function prReviewOutputHasSelfReviewSkip(
 // `pr_review_output_missing` and flipped Ally to `error`. The cited sha is the
 // live head, which the wake context cannot know (the wake head is exactly what
 // went stale), so the clause is anchored to a 7–40 hex sha rather than to the
-// wake head — a sha-less "already reviewed" claim is NOT accepted. Three vetoes
+// wake head — a sha-less "already reviewed" claim is NOT accepted. Five cues
 // keep the widened shape from masking a run that did NOT post (per Ally reviews
-// of #1613): a negated clause ("was **not** already reviewed at …" — the
+// of #1613) — an adjacent negation, plus four tested against the clause scope
+// (hedge, assumption, priorHead, negation/elided-complement): a negated clause ("was **not** already reviewed at …" — the
 // negation prefix tolerates the same markdown the clause does, so bold/italic
 // cannot slip past it), a hedge that governs the clause in the same sentence
 // ("could not confirm whether … already reviewed at …", "Unclear if already
@@ -9524,7 +9525,19 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   // head was already reviewed at …", "I doubt this head was …"). Seventh Ally
   // pass: nine hedges outside the four original stems reached `already_reviewed`
   // in the backtick shapes this function added.
-  const assumption = /\b(?:possibly|probably|presumably|assuming|apparently|doubt(?:s|ed|ful)?|may\s+have\s+been|might\s+have\s+been)\b/i;
+  //
+  // END-ANCHORED, like `negation`'s establishing verbs are marker-bound: the
+  // stem governs the clause only when it sits immediately before it or reaches
+  // it through a copula. Hedging about the WAKE — "The wake was probably a
+  // duplicate dispatch so already reviewed at …" — is the most natural thing
+  // this exit says, and a bare word list vetoed six such correct skips that
+  // master accepted (eighth Ally pass).
+  const assumeStem =
+    "\\b(?:possibly|probably|presumably|assuming|apparently|doubt(?:s|ed|ful)?|may\\s+have\\s+been|might\\s+have\\s+been)";
+  // A copula at the clause edge is what binds a governing verb to the clause;
+  // a correct skip has `so`/`but`/`and`/`because` there instead.
+  const copulaEdge = "(?:\\w+\\s+){0,4}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s`*_]*$";
+  const assumption = new RegExp(`${assumeStem}(?:[\\s\`*_]*$|\\s+${copulaEdge})`, "i");
   // The clause's subject is a superseded head, not the live one.
   const priorHead = /\b(?:prior|previous|earlier|stale|old|superseded)\s+head\b|\bbranch\s+(?:has\s+)?moved\b|\bhead\s+(?:has\s+)?moved\b/i;
   // An epistemic negation governing the clause from further back in the same
@@ -9542,9 +9555,9 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   //       is a correct skip whose negated object is the newer head, not the
   //       review — the seventh Ally pass measured six such phrasings that the
   //       verb-only list (sixth pass) turned into false `missing`.
-  // Known limit: an elided complementizer ("I cannot say this head was
-  // already reviewed at …") is indistinguishable from an unrelated object and
-  // is not vetoed.
+  // An elided complementizer ("I cannot say this head was already reviewed
+  // at …") is handled by `elidedComplement` below, on the same copula-edge
+  // discriminator `assumption` uses.
   // NOT a bare negation — "Exiting without posting since …", "No action taken
   // because …" are how a correct skip explains itself. `cannot`/`can't` are
   // listed because `\bnot\b` does not match inside `cannot`.
@@ -9554,10 +9567,26 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
   const establishingVerb =
     "(?:see|seen|confirms?|confirmed|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tell)\\s+(?:\\w+\\s+){0,3}(?:that|whether|if)";
   const negation = new RegExp(`${negationPrefix}(?:${epistemicNoun}|${establishingVerb})\\b`, "i");
+  // The complementizer elided: "cannot say this head WAS already reviewed at
+  // …". The verb is bound to the clause by the copula immediately preceding
+  // it, not by `that`/`whether`. A correct skip never has a copula in that
+  // position — it has so / but / and / because — so this closes the residual
+  // the seventh pass documented as a limit (eighth Ally pass).
+  const sayVerb =
+    "(?:say|says|said|state|states|assert|asserts|claim|claims|tell|tells|confirm|verify|establish|determine|see|find|prove)";
+  const elidedComplement = new RegExp(`${negationPrefix}${sayVerb}\\s+${copulaEdge}`, "i");
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
-    if (hedge.test(before) || assumption.test(before) || priorHead.test(before) || negation.test(before)) continue;
+    if (
+      hedge.test(before) ||
+      assumption.test(before) ||
+      priorHead.test(before) ||
+      negation.test(before) ||
+      elidedComplement.test(before)
+    ) {
+      continue;
+    }
     return true;
   }
   return false;

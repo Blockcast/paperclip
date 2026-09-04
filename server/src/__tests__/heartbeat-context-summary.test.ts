@@ -992,6 +992,36 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     });
   });
 
+  // Eighth Ally pass, over-veto direction: hedging about the WAKE is the most
+  // natural thing this exit says, and the assumption stem must not veto it.
+  // Master accepted all six.
+  it.each([
+    "The wake was probably a duplicate dispatch so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "This is presumably a retry wake so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "The retry was apparently spurious so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "The PR may have been updated since but already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "Possibly a duplicate wake and already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "The wake payload was probably stale so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+  ])("BLO-31374: an assumption about the wake is still a skip (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // Eighth Ally pass, masking direction: the complementizer elided, the verb
+  // bound to the clause by the copula at the clause edge.
+  it.each([
+    "I cannot say this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I cannot state this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not confirm this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not establish this head had been already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: rejects an elided complementizer bound by a copula (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
   // An assumption in the PREVIOUS clause does not reach the review clause.
   it("BLO-31374: an assumption in an earlier clause does not veto the clause", () => {
     expect(
@@ -1033,6 +1063,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`I did not find a newer head so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`I did not find that this head was already reviewed at \`${sha}\`.`, false],
       [`Possibly already reviewed at \`${sha}\`, but I could not check.`, false],
+      [`The wake was probably a duplicate dispatch so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I cannot say this head was already reviewed at \`${sha}\`.`, false],
       [`Unable to establish that this head was already reviewed at \`${sha}\`.`, false],
       [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
       [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
