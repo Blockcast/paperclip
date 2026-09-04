@@ -1264,10 +1264,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Resource defaults — UI stores dotted keys (e.g. "resources.requests.cpu")
   // as flat config entries, so read them directly from config with the dotted key.
+  // The memory request is sized from the measured distribution of per-run peak
+  // working set (7d, n=10510 agent runs): mean 439 Mi, p95 1.06 GiB, p99 2.95
+  // GiB, max 7.64 GiB. 1536Mi (= 1.5 GiB) sits just above p95, so ~96% of runs
+  // stay within their request. It is deliberately NOT the mean — the request is
+  // admission control, and the long tail is what the (unchanged) 8Gi limit
+  // absorbs. Written as "1536Mi" rather than "1.5Gi" because Kubernetes
+  // canonicalizes BinarySI quantities on read-back: the two are byte-identical,
+  // but a live pod renders "1536Mi", so the literal here matches what anyone
+  // greps for post-deploy.
   const containerResources: k8s.V1ResourceRequirements = {
     requests: {
       cpu: asString(config["resources.requests.cpu"], "1000m"),
-      memory: asString(config["resources.requests.memory"], "2Gi"),
+      memory: asString(config["resources.requests.memory"], "1536Mi"),
     },
     limits: {
       cpu: asString(config["resources.limits.cpu"], "4000m"),
