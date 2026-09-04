@@ -7,6 +7,21 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { pluginStateStore } from "../services/plugin-state-store.js";
 import { GBRAIN_RECALL_METRIC, __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
+// Imported from the gbrain plugin's real producer on purpose (BLO-25892). The
+// server-side extractor in plugin-state-store.ts duck-types `value.status` out
+// of a payload owned by packCacheEntry, and nothing in server/ imports
+// StoredRecall, so there is no type-level link between the two packages. If
+// this fixture were hand-built and the producer ever moved `status` under an
+// envelope key, normalizeGbrainRecallStatus would send every real prefetch to
+// "other", status="error" would stay flat at 0, and the alert would never fire
+// — indistinguishable from a healthy fleet, with both tests still green.
+// Building the fixture from the producer makes a producer-side rename break
+// this test instead of silently zeroing the detector. Same relative
+// cross-package import pattern as linear-webhook-fixture-replay.test.ts.
+import {
+  buildCacheEntry,
+  packCacheEntry,
+} from "../../../packages/plugins/paperclip-plugin-gbrain/src/recall.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -84,26 +99,47 @@ describeEmbeddedPostgres("plugin state store", () => {
     __resetMetricsForTest();
     const store = pluginStateStore(db);
 
+    // Built by the real producer, not hand-written: this is the cross-package
+    // shape contract the metric depends on. ok:false + a non-null
+    // issuePageSlug + no "no-oauth-client" reasonKind is the branch that
+    // yields status "error" — the 2026-08-08 outage's classification.
+    const erroredRecall = packCacheEntry(
+      buildCacheEntry({
+        result: {
+          ok: false,
+          issuePageSlug: "issues/blo-25892",
+          graph: null,
+          reason: "traverse_graph failed: fetch failed",
+        },
+        depth: 2,
+        nowIso: "2026-08-08T11:00:00.000Z",
+      }),
+    );
+    // Guard the guard: if the producer stops emitting a top-level "error"
+    // status, fail here with a clear message rather than further down as a
+    // confusing zero counter.
+    expect(erroredRecall.status).toBe("error");
+
     await store.set(pluginId, {
       scopeKind: "run",
       scopeId: randomUUID(),
       stateKey: "gbrain-context",
-      value: { status: "error", note: "traverse_graph failed: fetch failed" },
+      value: erroredRecall,
     });
     await store.set(pluginId, {
       scopeKind: "instance",
       stateKey: "gbrain-context",
-      value: { status: "ok" },
+      value: erroredRecall,
     });
     await store.set(pluginId, {
       scopeKind: "run",
       scopeId: randomUUID(),
       stateKey: "some-other-state-key",
-      value: { status: "ok" },
+      value: erroredRecall,
     });
 
     const { body } = await renderMetrics();
     expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="error"} 1`);
-    expect(body).not.toMatch(new RegExp(`${GBRAIN_RECALL_METRIC}\\{status="ok"\\} [1-9]`));
+    expect(body).not.toMatch(new RegExp(`${GBRAIN_RECALL_METRIC}\\{status="other"\\} [1-9]`));
   });
 });
