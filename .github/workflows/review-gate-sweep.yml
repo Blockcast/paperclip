@@ -81,11 +81,17 @@ permissions:
 # `arc-light`/`arc-paperclip-general` PR runs started instantly):
 #
 #   33877561971  13:20Z  success  -- last sweep that actually ran
-#   33883204083  14:20Z  queued 4h+, zero jobs  -- holds the slot, never evicted
+#   33883204083  14:20Z  queued 5h22m, zero jobs AT MEASUREMENT -- held the slot,
+#                        never evicted; a runner finally took it 19:43Z and it
+#                        ran (and failed) at 19:45Z, so re-querying it today
+#                        shows `jobs: 1`. The queue time and the non-eviction
+#                        are the load-bearing halves and both still hold.
 #   33888968885  15:21Z  cancelled, zero jobs   -- evicted at 16:22:56 by its successor
 #   33894806243  16:22Z  cancelled, zero jobs   -- evicted at 17:17:57
 #   33899818405  17:17Z  cancelled, zero jobs   -- evicted at 18:23:58
 #
+# The three CANCELLED rows are the evidence for eviction and they are stable --
+# re-querying them still returns `cancelled` with `jobs: 0`.
 # Each cancelled run's `updated_at` is exactly its successor's `created_at`, and
 # each reports `jobs: []` -- evicted while pending, never a timeout and never a
 # runner failure. This is worse than a late reconciler: the AC4 alarm (below)
@@ -114,9 +120,31 @@ permissions:
 # exhaust it. That degrades LOUDLY -- the script detects rate-limit exhaustion
 # explicitly and reports it, and writes stay capped by MAX_REFIRES_PER_RUN -- so
 # it turns the tab red rather than going quiet, which is the failure direction
-# this reconciler must never have. Overlapping sweeps do not double-post: the
-# re-fire cooldown is derived per-PR from the marker comments already on the PR
-# (`existing_marker_epochs`), i.e. from GitHub state, not from run-local state.
+# this reconciler must never have.
+#
+# SECOND RESIDUAL, likewise stated rather than implied: two sweeps that execute
+# CONCURRENTLY can both re-fire the same PR. The per-PR cooldown is derived from
+# the marker comments already on the PR (`existing_marker_epochs`), i.e. from
+# GitHub state rather than run-local state -- but that check is not atomic. The
+# comments are read during the scan and the write happens later with no re-read
+# (sweep-stalled-ally-reviews.py: cooldown at `should_refire`, write at
+# `request_review`), so two runs interleaved inside that window both observe
+# `since_last >= REFIRE_COOLDOWN_SECONDS` and both fire. It is worse than a
+# duplicate comment: `request_review` deliberately DELETEs before it POSTs, to
+# force a fresh `review_requested` event that a bare POST would no-op, so the
+# interleaving also leaves a window with no pending request at all.
+#
+# Dropping the group is what newly exposes this -- it was the one thing the
+# group did deliver correctly (mutual exclusion of RUNNING jobs), even though
+# it could not serialise a queued backlog. Accepted here, not dismissed, on
+# scope and on reachability. Scope: the fix belongs in the script's write path
+# (re-read the markers immediately before the write), and this change
+# deliberately does not touch the decision logic. Reachability: cadence is
+# hourly, a healthy run takes ~2min, and REFIRE_COOLDOWN_SECONDS is 2h, so
+# runs never overlap in normal operation -- it needs a starvation backlog
+# released together, which is the scenario this change creates by preserving
+# the backlog instead of discarding it. Tracked separately; do not read the
+# absent group as making overlapping writes safe.
 
 jobs:
   sweep:
@@ -132,7 +160,10 @@ jobs:
     # runner is ever assigned. `timeout-minutes` is a JOB-level bound and only
     # engages once the job starts, so a run with `jobs: []` is not bounded by it
     # at any value. Measured 2026-09-04 (BLO-31818): run 33883204083 sat queued
-    # over 4 hours, 16x this 15-minute ceiling, having never started a step.
+    # 5h22m -- 21x this 15-minute ceiling -- with `jobs: []` and this bound
+    # never engaged. (It was eventually given a runner at 19:43Z and ran for
+    # 2m16s, so a re-query now reports `jobs: 1`; the 5h22m of unbounded queue
+    # time is the part that matters here.)
     # There is no workflow-level equivalent -- GitHub exposes no queue-time
     # bound -- so do not try to raise or lower this number to address a starved
     # queue. That failure mode is a runner-capacity problem, and the thing this
