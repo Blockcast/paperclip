@@ -874,8 +874,10 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
   // `{name, status}` with no `type` of their own, and `output_style` is a bare
   // string, so the whole line carries exactly ONE `"type"`. That measurement is
   // the point of the assertion below — it is the fact that makes per-line
-  // scoping defence-in-depth rather than a fix for a live break, and if a
-  // future CLI adds a nested `type` here this test is where that shows up.
+  // scoping defence-in-depth rather than a fix for a live break. Note the
+  // assertion pins the FIXTURE's shape, not the CLI's: `initLine` is a
+  // hardcoded literal, so no CLI change can redden it. It documents the
+  // measured invariant; it does not detect drift away from it.
   it("still classifies on a full production-shaped init line", () => {
     const initLine = JSON.stringify({
       type: "system",
@@ -926,9 +928,12 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     ).toBe(true);
   });
 
-  // v2.1.210 emits `subtype:"status"` before the first turn, so allowlisting
-  // `system` wholesale has to cover it — a transcript that died after it is
-  // still a genuine startup death with no model output.
+  // v2.1.210 emits `subtype:"status"` before the first turn under
+  // `--include-partial-messages` (across 3 runs it appeared in no plain
+  // `--print --output-format stream-json --verbose` invocation). That is also
+  // the mode in which `init -> status -> death` is a real startup shape —
+  // before any `stream_event` exists to reject the transcript — so the
+  // allowlist entry is load-bearing rather than incidental.
   it("still classifies when a system:status event follows init", () => {
     const transcript = [
       '{"type":"system","subtype":"init"}',
@@ -961,6 +966,56 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     expect(
       isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
     ).toBe(true);
+  });
+
+  // `system` is a multiplexer, so admitting the type wholesale would reproduce
+  // the very defect this file's guard fixes, one level down: a new subtype
+  // admitted by default, exactly as a new top-level type was admitted by the
+  // old blocklist. This is not future-proofing — the v2.1.210 binary builds
+  // `{type:"system",subtype:"hook_response",…,output,stdout,stderr}`, embedding
+  // a hook process's raw stdout. Hooks are operator-configured via `--settings`,
+  // which `job-manifest.ts` appends verbatim from `config.extraArgs` — the same
+  // one-config-edit-away channel that motivated inverting this guard at all.
+  it("refuses to scan when a system event carries operator-configured hook output", () => {
+    // Single-quoted on purpose: `JSON.stringify` escapes `"` to `\"`, and the
+    // phrase regex does not match across the backslash, so a double-quoted
+    // fixture here would pass vacuously — proving nothing about the subtype
+    // gate. Single quotes survive JSON encoding unescaped and do match.
+    const phrase = "Error: Skill 'verification-before-completion' not found";
+    const hookResponse = JSON.stringify({
+      type: "system",
+      subtype: "hook_response",
+      hook_id: "b0d1f2a3",
+      hook_name: "SessionStart",
+      hook_event: "SessionStart",
+      output: phrase,
+      stdout: phrase,
+      stderr: "",
+      exit_code: 0,
+      outcome: "success",
+    });
+    const transcript = ['{"type":"system","subtype":"init"}', hookResponse].join("\n");
+    // Precondition: the phrase really is present *and* in a form the scan
+    // matches, so a pass here would be a false positive and therefore
+    // *permanent* retry suppression.
+    expect(hookResponse).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
+  });
+
+  // An unreadable subtype fails closed like an unrecognised type. Truncation
+  // drops the tail, not the head, so a real `init` line is either whole or too
+  // short to carry the trigger phrase — the lost detection costs one
+  // classification, which is the safe direction.
+  it("refuses to scan when a system event has no readable subtype", () => {
+    const transcript = [
+      '{"type":"system","session_id":"e45846ad"}',
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
   });
 
   // Reading only the first type per line rests on Claude emitting the
