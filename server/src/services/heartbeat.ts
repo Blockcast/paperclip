@@ -9544,11 +9544,30 @@ const CONNECTIVES =
 // and the filler must not cross it. In the FILLER role it is followed by a
 // complementizer ("no confirmation yet THAT this head was already reviewed"),
 // where it is ordinary English for "I could not establish this" and the
-// negation must still reach the clause. Excluding them unconditionally traded
+// negation must still reach the clause. The complementizer need not be
+// adjacent — "no evidence while CHECKING that this head was …" puts a
+// participle in between — so the role test allows it up to two words out. Excluding them unconditionally traded
 // 12 filler-sense vetoes for 12 connective-sense acceptances 1:1 and lost the
 // side a reviewer actually writes (fifteenth pass); the nested lookahead is
 // strictly better than either.
-const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b(?!\\s+(?:that|whether)\\b))\\w+\\s+){0,4}`;
+// The filler bound is DERIVED from the clause cap, and is deliberately
+// NON-BINDING. There is exactly one operative limit on how far a cue reaches —
+// CLAUSE_SCOPE_CHARS — and this bound exists only to keep the quantifier
+// bounded for ReDoS. Sizing it at CLAUSE_SCOPE_CHARS / 5 (a conservative 5
+// characters per word including its space) makes it wider than the character
+// window can ever fill: a filler of that many words consumes the whole window
+// and crowds out the cue word itself, so the character cap always binds first.
+// Measured: "No evidence" + 23 filler words + "was" does NOT veto, because the
+// negation falls outside the 120-character slice.
+//
+// The previous literal 4 was a SECOND, tighter cap with no derivation, and it
+// silently truncated reach before the connective logic ran: "no evidence while
+// checking that this head was already reviewed at …" is five filler words, so
+// the negation never reached the clause and the claim was accepted (fifteenth
+// pass, pre-existing at every prior head).
+const CLAUSE_SCOPE_CHARS = 120;
+const COPULA_FILLER_WORDS = Math.floor(CLAUSE_SCOPE_CHARS / 5);
+const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b(?!\\s+(?:\\w+\\s+){0,2}(?:that|whether)\\b))\\w+\\s+){0,${COPULA_FILLER_WORDS}}`;
 const COPULA_EDGE = `${COPULA_FILLER}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s\`*_]*$`;
 const CLAUSE_REACH = `(?:[\\s\`*_]*$|\\s+${COPULA_EDGE})`;
 
@@ -9605,8 +9624,14 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
     name: "assumption",
     stem:
       "\\b(?:possibly|probably|presumably|assuming|assumption|apparently|guess(?:es|ing|ed)?" +
-      "|perhaps|maybe|likely|plausible|seem(?:s|ed)?|appears?|believ(?:e|es|ed)" +
-      "|think(?:s)?|thought|suspect(?:s|ed)?|looks?\\s+like" +
+      "|perhaps|maybe|likely|plausible|seem(?:s|ed)?|appear(?:s|ed)?|believ(?:e|es|ed)" +
+      "|think(?:s|ing)?|thought|suspect(?:s|ed)?|look(?:s|ed)?\\s+like" +
+      // Thirteenth pass: predicative adjectives whose ADVERB was already
+      // listed, and the epistemic NOUNS beside the listed `assumption`. Same
+      // stance, different part of speech; the adverb/noun asymmetry was an
+      // accident of how the list grew, not a distinction worth keeping.
+      "|probable|possible|conceivable|presumable|apparent" +
+      "|presumption|belief|impression|understanding" +
       "|(?<!\\b(?:no|not|without|beyond|never|in)\\s(?:\\w+\\s){0,2})doubt(?:s|ed|ful)?" +
       "|may\\s+have\\s+been|might\\s+have\\s+been)",
   },
@@ -9695,9 +9720,26 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
     // `Already`, not for the sha, and the attestation contract mandates
     // lowercase hex.
     const sha = m.groups?.sha ?? "";
-    if (!/^[0-9a-f]+$/.test(sha)) continue;
-    if (!/[a-f]/.test(sha) && !m.groups?.forMarker && !m.groups?.nounMarker) continue;
-    const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
+    const shaIsLowerHex = /^[0-9a-f]+$/.test(sha);
+    const shaHasHexLetter = /[a-f]/.test(sha);
+    const shaMarked = Boolean(m.groups?.forMarker || m.groups?.nounMarker);
+    if (!shaIsLowerHex || (!shaHasHexLetter && !shaMarked)) {
+      // A rejected token must not consume the clause. `matchAll` yields
+      // non-overlapping matches, so `continue` here would swallow the only
+      // `already reviewed at` prefix and never reach a real sha later in the
+      // SAME clause — "already reviewed at 1234567 (sha `<40-hex>`)" (fifteenth
+      // pass). Re-scan the remainder of this clause, but require the later
+      // token to be marker-qualified (`sha`/`commit`/`head`), mirroring the
+      // rule the rejected token just failed: without that, any incidental hex
+      // word in the tail ("…and the deadbeef branch") would be read as the
+      // cited commit, which is the masking direction.
+      const tail = text.slice(m.index + m[0].length);
+      const sameClause = /^[^.\n:;,—–]*/.exec(tail)?.[0] ?? "";
+      const rescued = /\b(?:sha|commit|head)[\s`*_:=]+([0-9a-f]{7,40})(?![0-9a-f])/i.exec(sameClause);
+      const rescuedSha = rescued?.[1] ?? "";
+      if (!/^[0-9a-f]+$/.test(rescuedSha) || !/[a-f]/.test(rescuedSha)) continue;
+    }
+    const before = clauseBefore.exec(text.slice(Math.max(0, m.index - CLAUSE_SCOPE_CHARS), m.index))?.[0] ?? "";
     if (GOVERNING_CUES.some(({ re }) => re.test(before))) continue;
     return true;
   }
