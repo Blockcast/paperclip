@@ -51,6 +51,11 @@ const wrapperRef = "./.github/actions/setup-pnpm";
 // the structural fix is baking the pinned pnpm into the ARC runner image so
 // the bootstrap stops being a registry round-trip at all (see the wrapper's
 // own header), and the residual is recorded at pr.yml's `policy` cap.
+//
+// The NAME is historical: it dates from the 10 derived above and still says
+// "for retry", but what the number now encodes is the measured slow-success
+// setup floor. Read it as that, not as a retry budget -- the two differ by
+// ~4m and the paragraph above is the reason.
 const MIN_TIMEOUT_MINUTES_FOR_RETRY = 15;
 
 // Direct calls are allowed at exactly these grandfathered sites. Keyed by
@@ -141,7 +146,7 @@ test("no workflow reaches for pnpm/action-setup outside the grandfathered v4 sit
   }
 });
 
-test("every job that sets up pnpm has headroom for a second attempt", async () => {
+test("every job that sets up pnpm clears the measured setup floor", async () => {
   for (const { name, body } of await readWorkflows()) {
     const file = name.slice(name.lastIndexOf("/") + 1);
     for (const job of splitJobs(stripComments(body))) {
@@ -167,8 +172,10 @@ test("every job that sets up pnpm has headroom for a second attempt", async () =
       assert.ok(
         Number(declared[1]) >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
         `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${declared[1]}, ` +
-          `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m needed for the retry budget — a stalled ` +
-          `registry would time the job out instead of retrying (BLO-28813)`,
+          `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. A slow-but-successful setup ` +
+          `alone measured 8.1m (checkout + pnpm p100), and the job's own work adds up to ` +
+          `3.9m on top, so a budget under the floor is spent before the work starts — the ` +
+          `job dies at its cap as an unattributable \`cancelled\` (BLO-31690)`,
       );
     }
   }

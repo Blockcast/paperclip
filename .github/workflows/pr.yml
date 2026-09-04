@@ -29,11 +29,11 @@ jobs:
     # at 10 the cap was the binding constraint rather than a backstop: over the
     # last 75 completed runs of this job (2026-09-04, BLO-31690) 2 were
     # cancelled AT the cap and 5 more landed between 9.5m and 9.9m, i.e. 7 of
-    # 75 survived on under 30s of luck. Note 6 of those runs read `cancelled`
-    # but only the 2 at 10.2m are cap deaths -- the other 4 stopped at 2.9-5.1m
-    # and are superseded pushes. The status alone does not distinguish them,
-    # which is why this class hid for so long. Sized against that sample, worst
-    # observed:
+    # 75 finished within 30s of the cap, 2 of them fatally. Note 6 of those
+    # runs read `cancelled` but only the 2 at 10.2m are cap deaths -- the
+    # other 4 stopped at 2.9-5.1m and are superseded pushes. The status alone
+    # does not distinguish them, which is why this class hid for so long.
+    # Sized against that sample, worst observed:
     #
     #   `Checkout repository` + `Setup pnpm`   8.1m   (the two are
     #                                                 independently bimodal --
@@ -54,6 +54,14 @@ jobs:
     #                                                 the job cap -- BLO-29182)
     #                                         -------
     #                                         13.0m   -> 15m = 2.0m (13%)
+    #
+    # That is the worst OBSERVED case. With the 6m checkout bound below the
+    # worst case is also bounded from above rather than merely unobserved:
+    # 6.0m checkout + 4.3m pnpm p100 + 3.9m gate work = 14.2m, still inside
+    # 15m -- and a checkout slower than that now fails as the checkout step
+    # instead of as the cap. `Setup pnpm` is the one leg still unbounded (see
+    # the residuals below), so it is the only remaining way to reach the cap
+    # without an attributable step failure.
     #
     # This supersedes an earlier 5 -> 10 raise whose arithmetic was "2 x
     # (bootstrap + 120s fetch) + backoff ~= 5m", covering a second
@@ -97,14 +105,22 @@ jobs:
         # makes this the larger and more variable half of the setup cost the
         # job budget above is sized against (0.5m-4.4m observed over 75 runs).
         # It previously carried no bound at all, so a wedged fetch could only
-        # ever surface as an unattributable job-cap cancellation. 8m is ~1.8x
-        # the 4.4m p100: loose enough not to flake on a slow-but-working
-        # fetch, tight enough to name the culprit when one hangs. Adding this
-        # raises no existing bound; it bounds a step that had none (BLO-31690).
+        # ever surface as an unattributable job-cap cancellation.
+        #
+        # 6m, not 8m: a bound only helps if it is the thing that fires first.
+        # With pnpm at its 4.3m p100 and gate work at its 3.9m p100, the 15m
+        # cap leaves checkout 6.8m -- so an 8m bound left a 6.8-8.0m band in
+        # which a checkout passes its own bound and then dies at the cap
+        # anyway, unattributed, which is precisely the mode this bound exists
+        # to remove. 6m is ~1.4x the 4.4m p100: loose enough not to flake on a
+        # slow-but-working fetch, tight enough to stay attributable across the
+        # whole budget rather than most of it. Adding this raises no existing
+        # bound; it bounds a step that had none, and both facts are gated by
+        # scripts/__tests__/policy-node-test-timeouts.test.mjs (BLO-31690).
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-        timeout-minutes: 8
+        timeout-minutes: 6
 
       - name: Block manual lockfile edits
         # Exemptions: (1) the dedicated chore/refresh-lockfile branch that CI
