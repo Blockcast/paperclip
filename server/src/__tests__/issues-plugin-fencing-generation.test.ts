@@ -240,6 +240,59 @@ describeEmbeddedPostgres("plugin fencing generation enforced by the issues servi
     expect(rows).toHaveLength(0);
   });
 
+  // BLO-31657: `fencing` and `idempotencyKey` interact, and the order is not the
+  // one a plugin author would assume from the dedup docs alone.
+  // `assertPluginFencingGeneration` runs *before* the insert and before the
+  // return-existing lookup, so once the generation has advanced a duplicate
+  // delivery does NOT resolve to the comment its first delivery wrote — it
+  // throws. The retry is therefore not idempotent under fencing, and a plugin
+  // must read `fencing_generation_lost` as "may already be applied" rather than
+  // "not written". Pinned here so the docstring on `issues.createComment` cannot
+  // drift back to claiming an unconditional return-existing.
+  it("throws rather than returning the existing comment when a fenced retry has lost the generation", async () => {
+    const company = await seedCompany();
+    const token = randomUUID();
+    await claimFence(company.id, token);
+    const issue = await svc.create(company.id, { title: "held" });
+    const idempotencyKey = `plugin:test:delivery-${randomUUID()}`;
+
+    // Delivery 1 lands while the caller still holds the fence.
+    const first = await db.transaction((tx) =>
+      svc.addComment(
+        issue.id,
+        "delivery 1",
+        {},
+        { fencingPrecondition: precondition(company.id, token), idempotencyKey },
+        tx,
+      ),
+    );
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+
+    // The fence moves to a replacement worker...
+    await stealFence(company.id, randomUUID());
+
+    // ...and the redelivery of that same comment now throws, even though the key
+    // it carries is already on the issue and dedup alone would have returned it.
+    await expect(
+      db.transaction((tx) =>
+        svc.addComment(
+          issue.id,
+          "delivery 1 redelivered",
+          {},
+          { fencingPrecondition: precondition(company.id, token), idempotencyKey },
+          tx,
+        ),
+      ),
+    ).rejects.toMatchObject({ details: { code: "fencing_generation_lost" } });
+
+    // Still exactly one row, and it is delivery 1's — the throw wrote nothing,
+    // so the error means "already applied", not "lost".
+    const rows = await db.select().from(issueComments);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).toBe(first.id);
+    expect(rows[0]!.body).toBe("delivery 1");
+  });
+
   it("rejects a table or column that is not a bare identifier, and cannot reach another schema", () => {
     for (const table of ['fences"; DROP TABLE issues; --', 'issues" ; --', "public.issues", ""]) {
       expect(() =>
