@@ -51,8 +51,11 @@ const mockIssuesApi = vi.hoisted(() => ({
   uploadAttachment: vi.fn(),
 }));
 
+// `list` is deliberately absent. The real `executionWorkspacesApi` has it, but
+// NewIssueDialog must only ever reach for the cheaper `listSummaries`; leaving
+// it off the double turns a regression into a TypeError here rather than a
+// silent extra fetch.
 const mockExecutionWorkspacesApi = vi.hoisted(() => ({
-  list: vi.fn(),
   listSummaries: vi.fn(),
 }));
 
@@ -313,6 +316,24 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
   throw lastError;
 }
 
+// Asserts the submit button is clickable. Deliberately NOT a wait.
+//
+// `disabled` is `!titleHasText || createIssue.isPending`, and `titleHasText` is
+// set synchronously by every entry path into this dialog — typed input, dialog
+// defaults, draft restore — never by a query. Eleven call sites used to spell
+// this `await vi.waitFor(() => expect(...hasAttribute("disabled")).toBe(false))`,
+// which returned on attempt 0 having flushed nothing: it read as the settle
+// before the click and was not one, which is the trap described above. Keeping
+// it a bare `expect` makes that visible at every call site — no `await`, so
+// nothing can be mistaken for synchronisation.
+//
+// If the click below depends on query-resolved state — the experimental flags,
+// the project list, the reusable-workspace summaries — settle on THAT state
+// with `waitForAssertion` first. This function will not do it for you.
+function expectSubmitEnabled(submitButton: HTMLButtonElement | undefined) {
+  expect(submitButton?.hasAttribute("disabled")).toBe(false);
+}
+
 function renderDialog(container: HTMLDivElement) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -354,7 +375,6 @@ describe("NewIssueDialog", () => {
     mockIssuesApi.create.mockReset();
     mockIssuesApi.upsertDocument.mockReset();
     mockIssuesApi.uploadAttachment.mockReset();
-    mockExecutionWorkspacesApi.list.mockReset();
     mockExecutionWorkspacesApi.listSummaries.mockReset();
     mockExecutionWorkspacesApi.listSummaries.mockResolvedValue([]);
     mockProjectsApi.list.mockResolvedValue([
@@ -409,7 +429,7 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    await vi.waitFor(() => expect(submitButton?.hasAttribute("disabled")).toBe(false));
+    expectSubmitEnabled(submitButton);
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -436,7 +456,7 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    await vi.waitFor(() => expect(submitButton?.hasAttribute("disabled")).toBe(false));
+    expectSubmitEnabled(submitButton);
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -529,6 +549,12 @@ describe("NewIssueDialog", () => {
     const { root } = renderDialog(container);
     await flush();
 
+    // Asserts the endpoint choice, not just that some fetch happened: the
+    // dialog must ask for reuse-eligible summaries rather than the full
+    // workspace list. The `not.toHaveBeenCalled()` check on `list` that used to
+    // sit here could never fail — the dialog has no `list` call site, so it was
+    // vacuous by construction. Omitting `list` from the module double enforces
+    // the same invariant for real: a regression to it throws here instead.
     await waitForAssertion(() => {
       expect(mockExecutionWorkspacesApi.listSummaries).toHaveBeenCalledWith("company-1", {
         projectId: "project-1",
@@ -536,14 +562,11 @@ describe("NewIssueDialog", () => {
         reuseEligible: true,
       });
     });
-    expect(mockExecutionWorkspacesApi.list).not.toHaveBeenCalled();
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Sub-Task"));
     expect(submitButton).not.toBeUndefined();
-    await waitForAssertion(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -678,9 +701,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -713,9 +734,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -905,9 +924,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -948,9 +965,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -987,9 +1002,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1025,9 +1038,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1172,9 +1183,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Sub-Task"));
     expect(submitButton).not.toBeUndefined();
-    await waitForAssertion(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1313,9 +1322,15 @@ describe("NewIssueDialog", () => {
 
     const { root } = renderDialog(container);
 
-    // The workspace mode select is gated on `getExperimental` resolving
-    // `enableIsolatedWorkspaces: true`. Two flushes are still a fixed number of
-    // ticks, so under load this read could miss the select entirely.
+    // The workspace mode select sits behind TWO independent async gates, and
+    // the settle below covers both because it waits on the select itself:
+    //   1. `getExperimental` resolving `enableIsolatedWorkspaces: true`, and
+    //   2. the projects query, via `currentProject && currentProjectSupports-
+    //      ExecutionWorkspace` — `currentProject` is looked up in
+    //      `orderedProjects`, and the policy is only read once the flag is on.
+    // Naming only the flag would understate it: two flushes are still a fixed
+    // number of ticks, so under load this read could miss the select entirely
+    // because either query is still pending.
     let modeSelect: HTMLSelectElement | undefined;
     await waitForAssertion(() => {
       modeSelect = (container.querySelector("select") as HTMLSelectElement | null) ?? undefined;
@@ -1397,9 +1412,12 @@ describe("NewIssueDialog", () => {
     const { root } = renderDialog(container);
 
     // The watchdog block renders only once `getExperimental` resolves
-    // `enableTaskWatchdogs: true`. Settling on the button's disabled attribute
-    // below does not cover this: that is driven by the draft restore, which
-    // lands on mount and is independent of the experimental query.
+    // `enableTaskWatchdogs: true`, and the same flag gates the `watchdog` key
+    // in the submitted payload (`taskWatchdogsEnabled` in `handleSubmit`). So
+    // this settle is what makes the assertion below reachable at all — without
+    // it the click submits a payload with no `watchdog` key. `expectSubmitEnabled`
+    // does not cover it: that tracks the draft restore, which lands on mount
+    // and is independent of the experimental query.
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Keep it moving");
     });
@@ -1407,9 +1425,7 @@ describe("NewIssueDialog", () => {
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     expect(submitButton).not.toBeUndefined();
-    await vi.waitFor(() => {
-      expect(submitButton?.hasAttribute("disabled")).toBe(false);
-    });
+    expectSubmitEnabled(submitButton);
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
