@@ -16,6 +16,7 @@
 // which is what these tests exist to prevent.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -151,10 +152,105 @@ test("idempotency attests the head from the body, never from commit_id", () => {
   // attested an older head can start reporting the current one — the skip then
   // fires for a head that was never reviewed. The immutable attestation is the
   // `Reviewed head: <40-hex>` line in the review body.
-  assert.match(code, /Reviewed head: /,
+  assert.match(code, /Reviewed head:/,
     "the query must parse the immutable `Reviewed head:` attestation");
   assert.doesNotMatch(code, /\.commit_id/,
     "commit_id is mutable across Update branch and must not decide idempotency");
+});
+
+// ---------------------------------------------------------------------------
+// Executable contract. Everything above pins TEXT, which is not enough: an
+// earlier revision of this file passed every string assertion while the query
+// it pinned matched nothing at all. `gh api --jq` is gojq (Go RE2), where jq's
+// `"m"` flag means DOTALL rather than multiline anchoring, so
+// `test("^Reviewed head: …$"; "m")` never matched a body with a heading above
+// the attestation. The tests were green; the guard was inert.
+//
+// So: extract the jq program the document prescribes and RUN it against
+// synthetic review payloads. The pattern is deliberately flag-free — `(^|\n)`
+// behaves identically in RE2 and Oniguruma — which is what lets the local jq
+// binary stand in for gh's embedded gojq here.
+// ---------------------------------------------------------------------------
+
+const HEAD = "a".repeat(40);
+const OTHER = "b".repeat(40);
+
+function jqProgram() {
+  const m = /--jq '([\s\S]*?)'/.exec(idempotencyBlock());
+  assert.ok(m, "Step 2 must pass its filter to gh via --jq '...'");
+  return m[1];
+}
+
+function review({ login = "allyblockcast[bot]", type = "Bot", state = "COMMENTED", body }) {
+  return { id: Math.floor(Math.random() * 1e6), user: { login, type }, state, body };
+}
+
+// Runs the document's own jq program over `reviews`, returning the match count
+// the shell would compute (the program emits one line per match; Step 2 counts
+// lines with `wc -l`).
+function runQuery(reviews, headSha = HEAD) {
+  let out;
+  try {
+    out = execFileSync("jq", ["-r", jqProgram()], {
+      input: JSON.stringify(reviews),
+      env: { ...process.env, HEAD_SHA: headSha },
+      encoding: "utf8",
+    });
+  } catch (err) {
+    // A jq that cannot parse the program is a failing contract, not a skip.
+    throw new Error(`the prescribed jq program failed to run: ${err.stderr || err.message}`);
+  }
+  return out.split("\n").filter((l) => l.trim()).length;
+}
+
+test("the prescribed query actually matches an attesting review", () => {
+  const attesting = review({ body: `## 🔍 Automated Review — PR #1 @ ${HEAD.slice(0, 7)}\n\nReviewed head: ${HEAD}\n\n### 🚨 Critical\n` });
+
+  // Positive control FIRST: if this cannot find a review that plainly attests
+  // the head, every "0" below is meaningless.
+  assert.equal(runQuery([attesting]), 1,
+    "a review whose body attests HEAD_SHA must be counted — a query that matches"
+    + " nothing makes ALREADY always 0, so the skip never fires and every wake"
+    + " re-reviews the same head");
+});
+
+test("the prescribed query rejects what must not satisfy the skip", () => {
+  const cases = [
+    ["a different head", review({ body: `Reviewed head: ${OTHER}\n` })],
+    ["no attestation at all", review({ body: "## Review\nlooks thorough, attests nothing\n" })],
+    ["the User seat, not the App", review({ login: "allyblockcast", type: "User", body: `Reviewed head: ${HEAD}\n` })],
+    ["a dismissed review", review({ state: "DISMISSED", body: `Reviewed head: ${HEAD}\n` })],
+    ["a foreign bot", review({ login: "other-bot[bot]", body: `Reviewed head: ${HEAD}\n` })],
+    ["a mid-line mention", review({ body: `see Reviewed head: ${HEAD} in the log\n` })],
+  ];
+  for (const [label, r] of cases) {
+    assert.equal(runQuery([r]), 0, `${label} must not satisfy the skip`);
+  }
+});
+
+test("the prescribed query tolerates attestation forms in circulation", () => {
+  // The live bundle's own parser accepts quoted and emphasised forms. A pattern
+  // stricter than the attestations actually posted would skip real reviews.
+  for (const body of [
+    `> _Reviewed head:_ \`${HEAD}\`\n`,
+    `**Reviewed head:** ${HEAD}\n`,
+    `Reviewed head: ${HEAD}`,
+  ]) {
+    assert.equal(runQuery([review({ body })]), 1,
+      `must recognise the attestation form: ${JSON.stringify(body)}`);
+  }
+});
+
+test("Step 4 emits the attestation Step 2 consumes", () => {
+  // Two halves of one guard. A consumer with no producer counts zero forever,
+  // which is a second, independent way for this to go inert — fixing the regex
+  // alone would not restore it.
+  const start = agentsDoc.indexOf("### Step 4");
+  assert.notEqual(start, -1, "Step 4 must exist");
+  const step4 = agentsDoc.slice(start, agentsDoc.indexOf("### Step 5", start));
+  assert.match(step4, /Reviewed head: /,
+    "the Step 4 review template must emit a `Reviewed head:` line; the heading's"
+    + " short SHA is not a substitute for the 40-hex attestation");
 });
 
 test("the skip path posts a comment, not a review", () => {

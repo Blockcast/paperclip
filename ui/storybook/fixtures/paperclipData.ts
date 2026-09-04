@@ -613,7 +613,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
       workspaceStrategy: {
         type: "git_worktree",
         baseRef: "master",
-        branchTemplate: "{issueIdentifier}-{slug}",
+        branchTemplate: "{{issue.identifier}}-{{slug}}",
         worktreeParentDir: storybookWorktreeRoot,
         provisionCommand: null,
         teardownCommand: null,

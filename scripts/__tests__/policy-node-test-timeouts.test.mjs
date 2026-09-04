@@ -40,3 +40,68 @@ test("policy continues after a bounded test failure unless cancelled", () => {
     assert.match(step, /\n        if: \$\{\{ !cancelled\(\)/, "later policy steps must continue after a test failure");
   }
 });
+
+// BLO-31405. The chart render suite forks `helm template` once per test file, so
+// under the one-minute default asserted above its p100 of 73s (25 sampled runs)
+// failed `policy` on duration alone — skipping every lane that `needs:` it, on
+// PRs that never touched the chart. It belongs to the dedicated `helm_chart`
+// job, which has a 10-minute budget and is itself a `verify` lane.
+//
+// It had already landed in both places at once: #965 added the policy step and
+// #995 added the job, each comment claiming the tests "ran nowhere in CI". A
+// note saying "do not re-add" would not have stopped that, because neither
+// author read the other's file. So gate it, in both directions — exactly one
+// invocation, owned by exactly that job. Deleting the coverage outright fails
+// this too, which is the mistake that motivated the duplicate in the first
+// place.
+const CHART_SUITE = "deploy/helm/paperclip/tests/*.test.mjs";
+
+function jobOwning(offset) {
+  let owner = null;
+  for (const match of workflow.matchAll(/\n {2}([a-z_]+):\n/g)) {
+    if (match.index >= offset) break;
+    owner = match[1];
+  }
+  return owner;
+}
+
+function jobRegion(name) {
+  const start = workflow.indexOf(`\n  ${name}:\n`);
+  assert.notEqual(start, -1, `pr.yml must define ${name}`);
+  const after = workflow.slice(start + 1);
+  const nextJob = after.search(/\n {2}[a-z_]+:\n/);
+  return nextJob === -1 ? after : after.slice(0, nextJob + 1);
+}
+
+test("the chart render suite runs in exactly one job, and that job is helm_chart", () => {
+  const offsets = [];
+  for (let at = workflow.indexOf(CHART_SUITE); at !== -1; at = workflow.indexOf(CHART_SUITE, at + 1)) {
+    offsets.push(at);
+  }
+  assert.equal(
+    offsets.length,
+    1,
+    `pr.yml must invoke ${CHART_SUITE} exactly once, found ${offsets.length}`,
+  );
+  assert.equal(jobOwning(offsets[0]), "helm_chart", `${CHART_SUITE} must run in the helm_chart job`);
+});
+
+// BLO-29182 observed this exact invocation hang, and its fix bounded the copy
+// that used to live in `policy`. Removing that copy has to carry the bound with
+// it, or the one `node --test` step known to hang is unbounded again — a hung
+// step would burn the whole job budget instead of failing attributably. The
+// margin (4 min against a 73s p100) lives in the workflow comment; the
+// invariant worth gating is only that a step bound exists and is under the cap.
+test("the chart render step is bounded, and inside its job's budget (BLO-29182)", () => {
+  const region = jobRegion("helm_chart");
+  const jobCap = Number(region.match(/\n    timeout-minutes: (\d+)\n/)?.[1]);
+  assert.ok(jobCap > 0, "helm_chart must declare a job-level timeout-minutes");
+  const step = region
+    .split("\n      - name: ")
+    .slice(1)
+    .find((candidate) => candidate.includes(CHART_SUITE));
+  assert.ok(step, `helm_chart must contain the ${CHART_SUITE} step`);
+  const stepBound = Number(step.match(/\n        timeout-minutes: (\d+)\n/)?.[1]);
+  assert.ok(stepBound > 0, "the chart render step must declare a step-level timeout-minutes");
+  assert.ok(stepBound < jobCap, `step bound ${stepBound}m must sit below the ${jobCap}m job cap`);
+});

@@ -6382,12 +6382,26 @@ export function buildK8sRunIsolationDescriptor(input: {
   // resolve to the same worktree.
   //
   // Same-issue concurrency is REACHABLE — do not assume the checkout lock
-  // prevents it. `claimQueuedRun` normally requires
-  // `executionRunId IS NULL OR = <claiming run>` (see the
-  // `executionRunClaimCondition` guard), but that lock is skipped entirely when
-  // `allowsIssueInteractionWake` holds — an issue-interaction wake carrying a
-  // comment id is deliberately allowed to run while another run holds the
-  // issue, so a human can talk to the assignee mid-flight.
+  // prevents it. `executionRunClaimCondition` is NOT skipped for an interaction
+  // wake: it is built unconditionally and is always present in the claiming
+  // UPDATE's `.where(...)`. What `allowsIssueInteractionWake` gates is
+  // `issueLockRequired`, and what happens is that the claim's *failure to
+  // match* is TOLERATED: the UPDATE matches zero rows when another run already
+  // holds `executionRunId`, the lock-not-acquired cancel is skipped, and
+  // control falls through to `return claimed`. That is deliberate — an
+  // issue-interaction wake carrying a comment id is allowed to run while
+  // another run holds the issue, so a human can talk to the assignee
+  // mid-flight.
+  //
+  // The second run therefore never acquires `issues.executionRunId` at all. It
+  // is a deliberately lock-less run, not a competing lock holder, so there is
+  // no lock-ordering or retry fix available and no configuration in which the
+  // race closes.
+  //
+  // Grep the three symbols named above rather than trusting line numbers. An
+  // earlier draft of this very comment cited absolute lines and its own +3-line
+  // edit silently moved them onto a different cancel branch; each symbol
+  // resolves to exactly one definition site, so the numbers bought nothing.
   //
   // This is still strictly better than the behavior it replaces, which is why
   // it ships: the pre-fix run did not get an exclusive workspace either, it got
@@ -6399,8 +6413,8 @@ export function buildK8sRunIsolationDescriptor(input: {
   // The principled repair is to key the isolation reservation off the resolved
   // workspace PATH rather than the run id, so different issues still get
   // distinct keys (preserving BLO-16842 sibling concurrency) while same-issue
-  // runs serialize. That changes BLO-16842's invariant and is tracked
-  // separately rather than smuggled in here.
+  // runs serialize. That changes BLO-16842's invariant and is tracked in
+  // BLO-31443 rather than smuggled in here.
   const hasProvisionedWorktree =
     !input.statelessPrReview &&
     input.executionWorkspace.strategy === "git_worktree" &&

@@ -402,11 +402,16 @@ jobs:
     environment:
       name: paperclip-production
     # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
-    # rollout wait (BLO-29008), plus checkout, approval, final verification, and
-    # cleanup margin. scripts/check-docker-deploy-timeout.test.js sums EVERY
-    # `rollout status --timeout=` in this job, so adding a third tier wait
-    # without raising this fails CI rather than silently overrunning the job.
-    timeout-minutes: 85
+    # rollout wait (BLO-29008), plus the pending-migration pre-flight's 600s
+    # startup + 180s run budgets (BLO-31254), plus checkout, approval, final
+    # verification, and cleanup margin. scripts/check-docker-deploy-timeout.test.js
+    # sums EVERY `rollout status --timeout=` in this job AND reads both
+    # PREFLIGHT_*_SECONDS defaults out of .github/scripts/check-pending-migrations.sh,
+    # so raising any of them without raising this fails CI rather than silently
+    # overrunning the job. Overrunning is not a clean failure: GitHub cancels the
+    # job mid-`helm upgrade --atomic`, killing the process whose job is to roll
+    # back, which is the half-applied release BLO-21492 added --atomic to prevent.
+    timeout-minutes: 98
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -998,7 +1003,7 @@ jobs:
           # `timeout 45s` plugin-seed calls (~9m45s) and the startup probe budget
           # is failureThreshold 30 x periodSeconds 10 (5m). Raise this only
           # alongside that arithmetic, and keep the deploy job's timeout-minutes
-          # covering helm + api + worker + 10m (pinned by
+          # covering helm + api + worker + pre-flight + 10m (pinned by
           # scripts/check-docker-deploy-timeout.test.js).
           kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=15m
 

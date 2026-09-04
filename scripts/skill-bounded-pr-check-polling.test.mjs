@@ -21,6 +21,13 @@
 //   Deadlines are driven to 0 rather than waited out: the loops measure elapsed
 //   wall-clock with `date +%s`, so a 0-second deadline fires on the first pass
 //   and the timeout paths run in milliseconds.
+//
+//   Where a test needs the loop to survive one pass and time out on a LATER
+//   one, a 0-second deadline cannot express that and a small non-zero one is a
+//   race — `date +%s` is integer-second, so "1" fires whenever the first pass
+//   straddles a second boundary. Those tests pass `virtualClock: true`, which
+//   fakes `date +%s` off a counter that only advances when the loop sleeps.
+//   See the stub for the full rationale (BLO-31386).
 import { strict as assert } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
@@ -73,6 +80,9 @@ const EXECUTABLE_BLOCKS = () => [
  *
  * `checksRc` / `prViewRc` are consumed one entry per call and the last entry
  * repeats, so a test can say "pending, then green" without racing anything.
+ *
+ * `virtualClock` additionally stubs `date +%s` — see the comment on the stub
+ * itself for why any test with a single-digit deadline needs it.
  */
 function makeStubs({
   prState = "OPEN ",
@@ -82,6 +92,7 @@ function makeStubs({
   statusJson = '{"statuses":[]}',
   apiRc = [0],
   stubSleep = false,
+  virtualClock = false,
   headShas = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
   // GitLab side. `pipelineStatuses` is the newline-delimited output of
   // `glab api .../pipelines --jq '.[].status'`; [] means "no pipelines exist".
@@ -198,12 +209,161 @@ exit 99
   writeFileSync(path.join(bin, "glab"), glab);
   chmodSync(path.join(bin, "glab"), 0o755);
 
-  if (stubSleep) {
+  if (stubSleep || virtualClock) {
     // Records the requested duration and returns immediately, so the interval
     // floor is assertable without a test that actually sleeps a minute.
-    const sleep = `#!/usr/bin/env bash\nprintf '%s\\n' "$1" >>${JSON.stringify(dir)}/sleeps.log\nexit 0\n`;
+    //
+    // Under `virtualClock` it ALSO advances the fake clock by the duration it
+    // was asked to sleep. That is the whole seam: elapsed time becomes a pure
+    // function of what the loop slept, not of how long the poll body happened
+    // to take.
+    //
+    // The advance has a floor of one tick so that the clock moves even on
+    // `sleep 0`. Without it, a loop whose clamp had been removed and whose
+    // interval was 0 would advance time by 0 forever and hang until the
+    // 30-second spawn timeout — the negative control would still fail, but as
+    // an opaque timeout rather than "slept 0s, below the documented floor".
+    // A real `sleep 0` also consumes a nonzero interval, so this is the more
+    // faithful model as well as the more legible one.
+    //
+    // It also clears the `date` stub's consecutive-read counter, which is what
+    // makes that counter mean "reads with no intervening sleep" rather than
+    // "reads in total" — see the ceiling on the date stub below.
+    const sleep = virtualClock
+      ? `#!/usr/bin/env bash
+d=${JSON.stringify(dir)}
+printf '%s\\n' "$1" >>"$d/sleeps.log"
+printf '0' >"$d/reads"
+advance=$1; (( advance < 1 )) && advance=1
+printf '%s' "$(( $(cat "$d/clock") + advance ))" >"$d/clock"
+exit 0
+`
+      : `#!/usr/bin/env bash\nprintf '%s\\n' "$1" >>${JSON.stringify(dir)}/sleeps.log\nexit 0\n`;
     writeFileSync(path.join(bin, "sleep"), sleep);
     chmodSync(path.join(bin, "sleep"), 0o755);
+  }
+
+  if (virtualClock) {
+    // WHY (BLO-31386): the loops measure elapsed time as
+    // `$(date +%s) - poll_started`, which is INTEGER-second arithmetic. Under
+    // the real clock a 1-second deadline therefore fires whenever the first
+    // poll pass happens to straddle a wall-clock second boundary. Its
+    // probability is just the fraction of a second that pass occupies, so the
+    // rate is load-DEPENDENT rather than a fixed property of the test: ~5%
+    // (1/20) on a quiet sandbox, but 4-in-6 under induced CPU load. CI runners
+    // are the loaded case, and CI is where this was first seen. Do not measure
+    // this locally, get 5%, and conclude the note is stale.
+    //
+    // That made "deadline long enough for one sleep, then time out" a coin
+    // flip: the loop exited 124 on the FIRST pass having slept zero times, and
+    // the suite failed on `expected at least one sleep` on completely
+    // unchanged code. Because the `policy` job is a hard merge gate, each
+    // occurrence ejected an unrelated PR from the merge queue.
+    //
+    // Raising the deadline would only have made the coin flip rarer, not
+    // removed it. Stubbing `date` removes it outright: this clock ONLY moves
+    // when the loop sleeps, so wall-clock duration of the poll body — the
+    // sole source of the nondeterminism — no longer enters the arithmetic.
+    // "One sleep, then the next pass times out" becomes an arithmetic
+    // certainty at any deadline below the clamped interval.
+    //
+    // The clamp assertion stays load-bearing: the recorded sleep argument is
+    // still whatever the loop actually asked for, so dropping the 60s floor
+    // still turns the test red.
+    writeFileSync(path.join(dir, "clock"), "1000000000");
+    const date = `#!/usr/bin/env bash
+d=${JSON.stringify(dir)}
+# Only +%s is faked; a non-epoch use falls through to the real date so an
+# unrelated future use inside a skill block cannot silently read this clock.
+#
+# The fall-through is deliberately CLOSED to epoch reads, because matching
+# only an exact \`+%s\` is asymmetric: it stops the fake clock leaking into
+# unrelated \`date\` uses, but does nothing to stop an epoch read escaping the
+# fake clock. A future \`date -u +%s\`, or any epoch read carrying a leading
+# flag, would reach the REAL clock and silently reinstate the very race this
+# stub exists to remove — no failure, just an intermittent merge-gating flake
+# again. So an unhandled argument mentioning %s is a hard error: loud at the
+# one site where silence was expensive (BLO-31386).
+#
+# The read counter is the same principle applied to the opposite escape. A
+# clock that moves ONLY when the loop sleeps cannot time out a loop that never
+# sleeps: \`elapsed\` stays 0, the deadline never fires, and the block spins
+# until the 30s spawn timeout — so a regression that stopped the loop sleeping
+# would surface as \`null !== 124\` instead of as the assertion that names it,
+# which is precisely the diagnosability this file exists to restore. Past a
+# ceiling of consecutive reads with no intervening sleep, jump the clock so the
+# loop times out through its OWN deadline path and the suite fails fast on
+# "expected at least one sleep" (3.3s rather than 30s).
+#
+# 20 is ~7x headroom: the counter resets on every sleep, and the highest any
+# test here legitimately reaches is 3. It is deliberately not larger — the
+# ceiling is also the number of wasted poll passes the failure costs, and 100
+# took 16s to trip.
+#
+# Jumping the clock, rather than exiting nonzero, is what makes this work at
+# all: the loops run WITHOUT \`set -e\`, so a failed \`date\` inside
+# \`elapsed=\$(( \$(date +%s) - poll_started ))\` is swallowed and the spin
+# continues — measured, it still timed out at 30s and merely added one stderr
+# line per iteration.
+#
+# The jump is written BACK to the clock so it accumulates. A jump that only
+# returned \`clock + 86400\` without persisting it would pin \`elapsed\` at
+# exactly 86400 for read 21 and every read after it, so any deadline above a
+# day would never be crossed and the ceiling would decay into the exact two
+# behaviours rejected above — spin to the spawn timeout, one stderr line per
+# pass. Measured on a reconstruction at a 90000s deadline: the non-cumulative
+# form spun to the spawn timeout without ever reaching the loop's own deadline
+# path, while the cumulative form exited THROUGH that path in ~0.5s with
+# exactly 2 stderr lines — deterministically \`ceil(90000/86400)\`, not a
+# timing artefact. The exit status is what tells those two apart, and it is
+# the cheapest discriminator available: this harness runs no \`timeout\`(1) —
+# \`runBlock\` is a bare \`spawnSync\` with \`timeout: 30_000\` — so a spawn-timeout
+# kill reports \`status: null\` with \`SIGTERM\`/\`ETIMEDOUT\`, while reaching the
+# loop's own deadline path exits \`124\`. That \`null\`-vs-\`124\` split is exactly
+# what every \`assert.equal(r.status, 124)\` in this file rests on; see the same
+# point made above about a loop that stops sleeping. The non-cumulative form's
+# stderr line count is deliberately NOT quoted here: it is just how many
+# iterations fit inside the 30s kill, so it is timing-dependent — machine
+# speed AND load — and three runs of the same reconstruction gave 389, 1104
+# and 1348, a 3.5x spread with the hardware held fixed. Do not re-measure it,
+# get a different number, and conclude this note is stale. Past roughly 11k
+# lines the 1 MiB default \`maxBuffer\` binds before the 30s kill does and the
+# child dies \`ENOBUFS\` instead — also \`status: null\`, so the discriminator
+# above holds in that regime too.
+#
+# No deadline in this file exceeds 900 today, so this buys nothing at this
+# head; it is here so the ceiling stays a ceiling under a future edit rather
+# than silently becoming deadline-dependent. Legitimate tests are untouched —
+# they never reach read 4.
+if [[ $1 == +%s ]]; then
+  reads=$(( $(cat "$d/reads" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$reads" >"$d/reads"
+  if (( reads > 20 )); then
+    printf 'virtual clock stub: %s clock reads with no intervening sleep — the loop is not sleeping\\n' "$reads" >&2
+    jumped=$(( $(cat "$d/clock") + 86400 ))
+    printf '%s' "$jumped" >"$d/clock"
+    printf '%s\\n' "$jumped"
+    exit 0
+  fi
+  cat "$d/clock"; echo; exit 0
+fi
+for a in "$@"; do
+  case $a in
+    *%s*)
+      printf 'virtual clock stub: unhandled epoch format: %s\\n' "$*" >&2
+      exit 64
+      ;;
+  esac
+done
+# PATH is overridden so this stub cannot recurse into itself. The rest of the
+# environment is inherited on purpose: \`env -i\` would also drop TZ and the
+# locale, so a future non-epoch \`date\` would format in UTC/C under test and
+# in the runner's zone in production — a divergence that would surface only as
+# a mismatched formatted string.
+exec /usr/bin/env PATH=/usr/bin:/bin date "$@"
+`;
+    writeFileSync(path.join(bin, "date"), date);
+    chmodSync(path.join(bin, "date"), 0o755);
   }
   return { dir, bin };
 }
@@ -514,10 +674,13 @@ test("prcheckloop: a merged PR exits 3 without querying checks", () => {
 });
 
 test("prcheckloop: a sub-minute interval is clamped to 60s", () => {
-  const stubs = makeStubs({ checkRunsJson: PENDING_RUNS, statusJson: NO_STATUSES, stubSleep: true });
+  const stubs = makeStubs({ checkRunsJson: PENDING_RUNS, statusJson: NO_STATUSES, virtualClock: true });
   const r = runBlock(PRCHECKLOOP_LOOP(), {
     stubs,
-    // Deadline long enough for one sleep, then the second pass times out.
+    // Deadline shorter than the clamped interval, on a clock that only moves
+    // when the loop sleeps: pass 1 sees elapsed 0 and sleeps, that sleep
+    // advances the clock past the deadline, pass 2 times out. Deterministic
+    // rather than a race against wall-clock second boundaries (BLO-31386).
     env: { CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "5" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
@@ -704,15 +867,23 @@ test("check-pr GitLab: clamps a sub-minute interval to the 60s floor", () => {
   // rate the network allows — the unbounded polling this skill exists to
   // remove, reintroduced through a missing clamp. Asserted via the recorded
   // sleep argument rather than by waiting a minute.
-  const stubs = makeStubs({ pipelineStatuses: ["running"], stubSleep: true });
+  const stubs = makeStubs({ pipelineStatuses: ["running"], virtualClock: true });
   const r = runBlock(CHECK_PR_GITLAB(), {
     stubs,
+    // Same virtual-clock reasoning as the prcheckloop clamp test above. This
+    // site failed differently — the loop exited before the sleep stub had
+    // created sleeps.log at all, so it died in readFileSync with ENOENT
+    // rather than on the assertion, which is why grepping CI for the
+    // assertion text did not find it (BLO-31386). The read below now goes
+    // through the guarded `sleeps()` helper, so if this ever regresses again
+    // it fails on the assertion that says what went wrong instead of
+    // reproducing that same opaque ENOENT.
     env: { ...GL_ENV, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "0" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);
-  const sleeps = readFileSync(path.join(stubs.dir, "sleeps.log"), "utf8").trim().split("\n");
-  assert.ok(sleeps.length > 0, "the loop never slept, so the clamp is untested");
-  for (const s of sleeps) assert.equal(s, "60", `slept ${s}s, below the documented floor`);
+  const slept = sleeps(stubs);
+  assert.ok(slept.length > 0, "the loop never slept, so the clamp is untested");
+  for (const s of slept) assert.equal(s, "60", `slept ${s}s, below the documented floor`);
 });
 
 test("prcheckloop: re-reads the head each iteration and queries the NEW sha", () => {
@@ -726,10 +897,14 @@ test("prcheckloop: re-reads the head each iteration and queries the NEW sha", ()
     headShas: [OLD, NEW],
     checkRunsJson: '{"check_runs":[{"name":"ci","status":"in_progress"}]}',
     statusJson: NO_STATUSES,
-    stubSleep: true,
+    virtualClock: true,
   });
   const r = runBlock(PRCHECKLOOP_LOOP(), {
     stubs,
+    // Virtual clock (BLO-31386): reaching the NEW sha requires a second pass,
+    // so under the real clock this shared the 1-second-deadline race and could
+    // exit 124 on pass 1 having never queried it — a third symptom of the same
+    // root cause ("never queried the new sha"), distinct from the other two.
     env: { HEAD_SHA: OLD, CHECK_DEADLINE_SEC: "1", CHECK_INTERVAL_SEC: "60" },
   });
   assert.equal(r.status, 124, `${r.stdout}${r.stderr}`);

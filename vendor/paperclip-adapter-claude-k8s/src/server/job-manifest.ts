@@ -1601,6 +1601,60 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
+  // BLO-31359: `git clone` points the new clone's `origin` at whatever it was
+  // cloned from, so cloning the project base checkout hands every ephemeral run
+  // a remote that writes back into shared, long-lived state on the PVC. Git only
+  // refuses a push to the base's *currently checked out* branch; any other
+  // refname lands, which is how base checkouts accumulate agent-authored
+  // `blo-*` branches. Keep the clone — cloning from local disk with `--shared`
+  // is what makes provisioning cheap — but repoint `origin` at the real
+  // upstream so a push leaves the cluster instead of mutating the base.
+  //
+  // Remove-then-add rather than `set-url`: `git remote remove` drops the whole
+  // `remote.origin` section, so the re-added remote cannot inherit a stale
+  // `pushurl` still aimed at the base.
+  //
+  // `remote remove` also deletes every `refs/remotes/origin/*`, so the clone is
+  // briefly left with no remote-tracking refs and `origin/<branch>` is an
+  // unknown revision. That is deliberate, not collateral: those refs described
+  // the *base's* local branches while being named as though they described
+  // upstream, and a lying ref is worse than a missing one. The best-effort
+  // fetch below repopulates `refs/remotes/origin/<branch>` from the real
+  // upstream, which is the first time `origin/master` in a run workspace has
+  // actually meant upstream.
+  //
+  // `fetch` restores branches but NOT `refs/remotes/origin/HEAD` (a symbolic
+  // ref that a plain clone does carry, and that tooling reads via
+  // `git symbolic-ref refs/remotes/origin/HEAD` to find the default branch),
+  // so the fetch is paired with `remote set-head -a`. Same reasoning as the
+  // branches: the old `origin/HEAD` pointed at the *base's* current branch, so
+  // it too was a lying ref, and this repoints it at upstream's default.
+  //
+  // Guarding rule for this chain: commands that establish the security property
+  // (the base must not be reachable as a remote) stay UNGUARDED so a failure
+  // fails the run closed rather than handing back a base-writable workspace.
+  // Commands that only provide ergonomics or diagnostics are guarded, so a
+  // network blip or a read-only config cannot take down pod startup.
+  const upstreamRepoUrl = asString(workspaceContext.repoUrl, "").trim();
+  const runWorkspaceGit = `git -C ${quoteShellArg(isolation.workspaceRoot)}`;
+  // Both calls below reach the network, so both carry the same bound rather
+  // than only the fetch: `set-head -a` queries the remote for its default
+  // branch even when every remote-tracking ref is already present locally.
+  // Measured against an unreachable https remote with refs/remotes/origin/HEAD
+  // and origin/master intact and `symbolic-ref refs/remotes/origin/HEAD`
+  // already resolving: exit 128, `unable to access ...: Failed to connect`.
+  // Sharing one constant keeps the two from drifting apart.
+  //
+  // Two limits on what this bound actually buys, both deliberate:
+  //   - it aborts a *transfer* that stalls below 1 KiB/s for 15s. A connect
+  //     that never completes is still bounded only by the kernel's TCP retry,
+  //     which is finite but longer.
+  //   - both knobs are consumed by the curl-based HTTP transport, so an
+  //     `ssh://` or `git@host:` remote would ignore them silently and the
+  //     calls would be unbounded again. Every configured workspace `repoUrl`
+  //     is https today so nothing reaches that path, but a future SSH remote
+  //     needs its own bound rather than inheriting this one.
+  const boundedRunWorkspaceGit = `${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1609,8 +1663,56 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
           // Git objects are immutable/content-addressed and may be shared read-only;
           // the clone still owns its refs, index, worktree, and lock files.
-          `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
-          `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
+          //
+          // `--origin origin` pins the remote name: `git clone` otherwise honors
+          // `clone.defaultRemoteName`, and because the removal below is unguarded,
+          // an image that ever set that config would hard-fail every run-isolated
+          // pod with `error: No such remote: 'origin'`.
+          `git clone --shared --no-checkout --origin origin -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
+          `${runWorkspaceGit} checkout --detach "$source_head"`,
+          `${runWorkspaceGit} remote remove origin`,
+          ...(upstreamRepoUrl
+            ? [
+                // `--` because `quoteShellArg` stops shell injection but not git's
+                // own option parsing, and a repoUrl starting with `-` would
+                // otherwise be read as a flag.
+                `${runWorkspaceGit} remote add origin -- ${quoteShellArg(upstreamRepoUrl)}`,
+                // Ergonomics, not security: restore `origin/<branch>` so the
+                // common `git rebase origin/master` / `git log origin/master..HEAD`
+                // phrasings resolve, then `set-head` so `origin/HEAD` resolves
+                // too. Guarded, and leaves a breadcrumb when it cannot run, so
+                // an offline pod degrades to "fetch first" rather than to a
+                // failed run or an unexplained `unknown revision`.
+                //
+                // This runs on every run-isolated pod start, so both network
+                // calls are bounded — see `boundedRunWorkspaceGit` above for
+                // exactly what that bound does and does not cover.
+                //
+                // `set-head` is nested inside its own guard so that when the
+                // fetch succeeds but `set-head` fails, the chain does not fall
+                // through and write the misleading `originFetchFailed`
+                // breadcrumb about a fetch that actually worked. It records its
+                // own breadcrumb instead, so both failure paths in this chain
+                // explain themselves on the workspace rather than leaving a
+                // bare `symbolic-ref` failure for an agent to diagnose. (The
+                // sibling `originRemoved` breadcrumb below is not a failure —
+                // it is the no-upstream branch.)
+                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved, possibly a stalled transfer hit by the low-speed bound; run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+              ]
+            : [
+                // No recorded upstream: leave the clone with no remote at all
+                // rather than one aimed at the base, and say so on the
+                // workspace so the resulting `fatal: 'origin' does not appear
+                // to be a git repository` is self-explaining.
+                //
+                // The reachable case is a `local_path` project workspace.
+                // `validateProjectWorkspace` requires only *one* of `cwd` or
+                // `repoUrl`, so a workspace configured by path satisfies it via
+                // `cwd` and carries `repoUrl: null` by construction. A project
+                // with no git workspace at all never reaches here — it fails the
+                // `rev-parse --verify HEAD` guard above.
+                `(${runWorkspaceGit} config paperclip.originRemoved 'no upstream recorded for this run; origin removed so the clone source (a shared base checkout) is not a push target (BLO-31359)' || true)`,
+              ]),
         ].join(" && ")};`,
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a

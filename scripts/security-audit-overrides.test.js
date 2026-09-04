@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { FAST_URI_ADVISORY, isVulnerableFastUri } from "./fast-uri-advisory.js";
+
 const execFileAsync = promisify(execFile);
 const repoRoot = new URL("..", import.meta.url);
 
@@ -47,35 +49,50 @@ async function main() {
     const packageJson = JSON.parse(
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
-    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.5");
+    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
-    const fastUriResolution = lockfile.match(
-      /^  fast-uri@(\d+)\.(\d+)\.(\d+):$/m,
-    );
-    assert.ok(fastUriResolution, "lockfile missing fast-uri resolution");
-    const [, major, minor, patch] = fastUriResolution.map(Number);
+    const fastUriResolutions = [
+      ...lockfile.matchAll(/^  fast-uri@(\d+\.\d+\.\d+):$/gm),
+    ].map((match) => match[1]);
     assert.ok(
-      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
-      `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
+      fastUriResolutions.length > 0,
+      "lockfile missing fast-uri resolution",
     );
+    for (const version of fastUriResolutions) {
+      assert.ok(
+        !isVulnerableFastUri(version),
+        `lockfile resolved fast-uri ${version}, vulnerable per ${FAST_URI_ADVISORY}`,
+      );
+    }
+
     const designerLockfile = JSON.parse(
       await readFile(
         join(fixtureRoot, "packages/services/designer/package-lock.json"),
         "utf8",
       ),
     );
-    const [designerMajor, designerMinor, designerPatch] = designerLockfile.packages[
-      "node_modules/fast-uri"
-    ].version
-      .split(".")
-      .map(Number);
-    assert.ok(
-      designerMajor > 3 ||
-        (designerMajor === 3 &&
-          (designerMinor > 1 || (designerMinor === 1 && designerPatch >= 5))),
-      "designer lockfile resolved vulnerable fast-uri",
+    // Enumerate every nested resolution, not just the top-level node — a
+    // second copy under a transitive dependency is exactly what a floor guard
+    // exists to catch. Asserting the set is non-empty keeps a dropped
+    // dependency from reading as "nothing vulnerable found".
+    const designerResolutions = Object.entries(
+      designerLockfile.packages,
+    ).filter(
+      ([path]) =>
+        path === "node_modules/fast-uri" ||
+        path.endsWith("/node_modules/fast-uri"),
     );
+    assert.ok(
+      designerResolutions.length > 0,
+      "designer lockfile missing fast-uri resolution",
+    );
+    for (const [path, fastUri] of designerResolutions) {
+      assert.ok(
+        !isVulnerableFastUri(fastUri.version),
+        `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${FAST_URI_ADVISORY}`,
+      );
+    }
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.29.0:", "lockfile");
     assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
