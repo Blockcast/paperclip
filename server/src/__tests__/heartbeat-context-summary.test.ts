@@ -1355,6 +1355,19 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No anomaly indicates yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No reply suggests yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No supply shows yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I am not certain yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not convinced that this head was already reviewed at \`${sha}\`.`, false],
+      [`It is not clear yet this head was already reviewed at \`${sha}\`.`, false],
+      [`It is not apparent yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not positive yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not positive that this head was already reviewed at \`${sha}\`.`, false],
+      [`Everything is clear so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I am satisfied with the checks so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The evidence is conclusive so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No blocker is apparent so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No positive drift detected, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No result was positive, but this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No coverage delta was positive, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
@@ -1378,6 +1391,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       ["I am unaware that this head was ", "fusedNegation"],
       ["No evidence yet this head was ", "negatedHeadConnective"],
       ["I cannot fully confirm yet this head was ", "negatedHeadConnective"],
+      ["I am not certain yet this head was ", "negatedHeadConnective"],
+      ["I am not convinced that this head was ", "negation"],
       ["No evidence that this head was ", "negation"],
       ["I am not aware that this head was ", "negation"],
       // Correct skips: no cue governs the clause, so nothing vetoes.

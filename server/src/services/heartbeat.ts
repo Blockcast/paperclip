@@ -9619,19 +9619,52 @@ const NEGATION_PREFIX_WORD =
       // now tolerates its own paradigm.
 const EPISTEMIC_NOUN_HEAD =
   "(?:evidence|indications?|signs?|records?|proofs?|traces?|suggestions?|statements?|assertions?|awareness|findings?|validations?|confirmation|verification|determination)";
-// The NOUN subset of EPISTEMIC_HEAD. An adjective may sit between a negation and
-// a noun head ("no CLEAR evidence yet"), but for a VERB head the intervening
-// words are the SUBJECT or a pre-verbal ADVERB ("no COMMITS appear yet"), so
-// unrestricted slack there
-// swallows the subject and misreads the main verb as the negation's head.
-// Present-tense verbs take no auxiliary, so the auxiliary exclusion alone did
-// not mark them (pass 18: appear/indicate/suggest all regressed). The
-// discriminator is part of speech, not the auxiliary.
+// The NOUN subset of EPISTEMIC_HEAD. An adjective may sit between a negation
+// and a noun head ("no CLEAR evidence yet"), but for a VERB head the
+// intervening words are the SUBJECT or a pre-verbal ADVERB ("no COMMITS appear
+// yet"), so unrestricted slack there swallows the subject and misreads the main
+// verb as the negation's head. Present-tense verbs take no auxiliary, so the
+// auxiliary exclusion alone did not mark them (pass 18: appear/indicate/suggest
+// all regressed). The discriminator is part of speech, not the auxiliary.
+//
+// EPISTEMIC_HEAD also carries the epistemic ADJECTIVES. Pass 20: it held only
+// `aware`, so "I am not certain yet …" and "It is not clear yet …" masked while
+// the FUSED `unconvinced` vetoed — the mirror of the defect fusedNegation's own
+// comment records solving in the other direction. `hedge` hand-adds
+// `not sure|not clear`, but its stem hardcodes a following `that`, so the
+// elided-complementizer form leaked. The family belongs HERE rather than in a
+// fourth list: one insertion makes it reachable by `negation`,
+// `negatedHeadConnective` and the copula arm at once, and it inherits
+// CLAUSE_REACH like every other head. Measured 2/14 -> 13/14 on the family with
+// 0/18 new false-vetoes on the same adjectives in NON-hedge roles ("Everything
+// is clear so …", "The evidence is conclusive so …") — COPULA_FILLER already
+// refuses to cross a consequence connective, so an adjective governing the
+// PREVIOUS clause still cannot reach this one.
+//
+// `positive` is INCLUDED, against the pass-20 review's recommendation to drop
+// it, because mutation-testing that recommendation refuted its premise. The
+// phrasing it was justified by — "no positive result" — measures identically
+// with and without the word, since `result` is not an EPISTEMIC_NOUN_HEAD and
+// so the noun arm never matches it. Excluding it therefore bought nothing and
+// left "I am not positive yet/that this head was …" masking (3/3). Included:
+// those 3 veto, and 7/7 NON-epistemic controls built to break it stay correct
+// skips ("No result was positive, but …", "No metric was positive however …",
+// "No coverage delta was positive, so …") — the connective-role exclusion in
+// COPULA_FILLER holds them. Strictly dominant, so the ambiguity of the word is
+// a reason to pin it with controls, not to omit it.
+//
+// Known residual, deliberately NOT pinned as correct: "I cannot BE certain yet
+// this head was …" still masks. `be` is neither an EPISTEMIC_ADVERB nor
+// admissible in the noun arm's non-auxiliary slack, so the
+// copula-between-negation-and-adjective shape has no cue that reaches the
+// clause. Narrower than the family above; recorded so the next pass does not
+// re-derive it.
 const EPISTEMIC_HEAD =
   "(?:evidence|indications?|indicat(?:e|es|ed|ing)|signs?|records?|proofs?|traces?" +
   "|suggestions?|statements?|assertions?|awareness|findings?|validations?" +
   "|believ(?:e|es|ed)|think(?:s|ing)?|thought|appear(?:s|ed|ing)?" +
-  "|suggest(?:s|ed|ing)?|aware|see|sees|seen|saw|seeing" +
+  "|suggest(?:s|ed|ing)?|aware|certain|convinced|confident|persuaded|satisfied" +
+  "|sure|clear|evident|apparent|conclusive|definitive|positive|see|sees|seen|saw|seeing" +
   "|confirm(?:s|ed|ing)?|confirmation|verif(?:y|ies|ied|ying)|verification" +
   "|establish(?:es|ed|ing)?|determin(?:e|es|ed|ing)|determination" +
   "|find|finds|found|finding|check(?:s|ed|ing)?|locat(?:e|es|ed|ing)" +
