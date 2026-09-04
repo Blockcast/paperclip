@@ -30,15 +30,39 @@ const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 /** The message every migration in this family raises when its index is absent. */
 const PRECREATE_RAISE_MARKER = "requires online index precreation";
 
-async function migrationFilesRequiringPrecreation(): Promise<string[]> {
+/**
+ * The same guard identified structurally rather than by wording: a
+ * `RAISE EXCEPTION` whose `HINT` tells the operator to build the index online
+ * because it is absent. `PRECREATE_RAISE_MARKER` is how we spell that
+ * contract; this is the contract itself.
+ *
+ * Both detectors are needed. The drift test below compares a hand-maintained
+ * registry against a scan of the same files, so a migration that phrases its
+ * raise differently is dropped from the scan — and the author who chose that
+ * wording is exactly the author who also missed the registry. Both sides of
+ * `toEqual` then lose it and the assertion passes while proving nothing. That
+ * is how 0217 stayed invisible to the pre-flight (BLO-31626). A detector whose
+ * miss removes an item from the expected *and* the actual set can never fail,
+ * so the check has to key on something the wording cannot silence.
+ *
+ * Deliberately does not match 0226: its only `RAISE EXCEPTION` fires for a
+ * *mismatched* index and remediates with `DROP ... IF EXISTS`. An absent index
+ * there is a documented no-op, so it is correctly absent from the registry.
+ */
+const PRECREATE_GUARD_SHAPE =
+  /RAISE\s+EXCEPTION\b[\s\S]{0,600}?HINT\s*=\s*'[^']*(?:''[^']*)*CREATE (?:UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS/i;
+
+async function readMigrationSqlFiles(): Promise<readonly { readonly file: string; readonly contents: string }[]> {
   const entries = await readdir(migrationsDir);
   const sqlFiles = entries.filter((entry) => entry.endsWith(".sql")).sort();
-  const matches: string[] = [];
-  for (const file of sqlFiles) {
-    const contents = await readFile(`${migrationsDir}/${file}`, "utf8");
-    if (contents.includes(PRECREATE_RAISE_MARKER)) matches.push(file);
-  }
-  return matches;
+  return Promise.all(
+    sqlFiles.map(async (file) => ({ file, contents: await readFile(`${migrationsDir}/${file}`, "utf8") })),
+  );
+}
+
+async function migrationFilesRequiringPrecreation(): Promise<string[]> {
+  const files = await readMigrationSqlFiles();
+  return files.filter(({ contents }) => contents.includes(PRECREATE_RAISE_MARKER)).map(({ file }) => file);
 }
 
 describe("PRECREATE_REQUIRED_INDEXES registry", () => {
@@ -48,6 +72,20 @@ describe("PRECREATE_REQUIRED_INDEXES registry", () => {
     // A guarded migration missing from the registry is invisible to the
     // pre-flight, which reproduces the exact outage this module prevents.
     expect(registered).toEqual(onDisk);
+  });
+
+  it("catches a guarded migration whose raise wording escapes the marker", async () => {
+    const files = await readMigrationSqlFiles();
+    const guardShaped = files.filter(({ contents }) => PRECREATE_GUARD_SHAPE.test(contents)).map(({ file }) => file);
+    const markerMatched = await migrationFilesRequiringPrecreation();
+
+    // Non-vacuity: a shape detector that matches nothing would make this test
+    // green for the same reason the bug it guards against was green.
+    expect(guardShaped.length).toBeGreaterThan(0);
+    // The shape is ground truth; the marker is only the wording. A migration
+    // in the first set but not the second is invisible to the drift test on
+    // *both* sides, so it never reaches the pre-flight.
+    expect(guardShaped.filter((file) => !markerMatched.includes(file))).toEqual([]);
   });
 
   it("registers no migration that does not actually exist on disk", async () => {
