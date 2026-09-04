@@ -819,6 +819,16 @@ jobs:
           approval_log="${approver_dir}/approval.log"
           deploy_kubeconfig="${KUBECONFIG}"
           approved_server_plan="$(mktemp "${RUNNER_TEMP}/paperclip-api-approved.XXXXXXXX.json")"
+          # BLO-31666: where the approval records the owner of the lock it mints,
+          # so the cleanup step at the end of this job can name that exact lock.
+          # Deliberately NOT created: the approval writes this file only for a
+          # lock it minted itself and is therefore entitled to retire, so ABSENT
+          # is the meaningful "nothing to retire" signal. An adopted lock belongs
+          # to a rollout that may still be running and is left unnamed. Inside
+          # approver_dir because mktemp -d just created it empty at 0700, which
+          # is exactly the guarantee this needs — a stale file at a fixed path
+          # would hand the cleanup step an owner from an earlier workload.
+          lock_owner_file="${approver_dir}/lock-owner.txt"
           api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${DEPLOY_PLAN}")"
 
           # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
@@ -833,9 +843,38 @@ jobs:
             PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
             PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
+            PAPERCLIP_APPROVAL_LOCK_OWNER_OUT="${lock_owner_file}" \
             PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${ABANDON_IN_FLIGHT}" \
             PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${ABANDON_IN_FLIGHT_OWNER}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
+
+          # BLO-31666: publish the lock BEFORE the plan verification below, not
+          # after. The stranding window is "a lock exists and helm never ran",
+          # and it opens the instant the script above exits 0 — which includes
+          # the rest of THIS step. Writing the outputs after the jq check would
+          # leave a jq failure here stranding a lock the cleanup step cannot
+          # name, reproducing the exact BLO-31598 wedge one step earlier than
+          # the one this fix is about.
+          if [ -s "${lock_owner_file}" ]; then
+            lock_owner="$(tr -d '[:space:]' < "${lock_owner_file}")"
+            if [[ "${lock_owner}" =~ ^[0-9a-f]{64}$ ]]; then
+              {
+                echo "lock_digest=${DIGEST}"
+                echo "lock_owner=${lock_owner}"
+              } >> "$GITHUB_OUTPUT"
+              echo "::notice::holding in-flight approval lock ${DIGEST} (owner ${lock_owner})"
+            else
+              # Unnameable, so unretireable — the approval script mints this from
+              # SecureRandom.hex(32) and validates the same shape on the way back
+              # in, so a malformed value here means something is badly wrong.
+              # Deliberately NOT fatal: the approval itself succeeded, and failing
+              # the step now would strand this very lock while ALSO cancelling a
+              # deploy that would otherwise consume it legitimately at helm
+              # upgrade. Publishing nothing makes the cleanup step no-op, which
+              # is the honest reading of an owner nobody can name.
+              echo "::warning::approval wrote a malformed in-flight lock owner; the automatic cleanup cannot name this lock. Retire it by hand if this deploy fails before helm upgrade."
+            fi
+          fi
 
           jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
@@ -872,6 +911,13 @@ jobs:
       # approved commit is exactly the image Kubernetes pulls. The committed
       # tag remains the readable source reference for non-CI deploys.
       - name: helm upgrade
+        # BLO-31666: the cleanup step at the end of this job reads this step's
+        # conclusion to decide whether the cluster was ever touched. `skipped`
+        # (an earlier step failed, so this never ran) is the ONLY value that
+        # licenses retiring the lock. Renaming or removing this id silently
+        # turns that condition into "" and disables the cleanup, which is why
+        # scripts/check-docker-retire-in-flight-lock.test.js asserts on it.
+        id: helm
         env:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
@@ -887,6 +933,16 @@ jobs:
           PAPERCLIP_DEPLOY_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -euo pipefail
+          # BLO-31666: positive evidence that this step began executing, written
+          # before anything that can fail. The cleanup step at the end of the job
+          # refuses to retire the approval lock while this is set, because from
+          # here on a rollout may have been started. Deliberately independent of
+          # steps.helm.conclusion: this marker survives a step that failed on its
+          # very first assertion, and the conclusion covers the case where the
+          # runner is killed mid-`helm upgrade` before outputs are collected.
+          # Either signal alone means "helm ran"; only their joint absence means
+          # the cluster was never touched.
+          echo "started=true" >> "$GITHUB_OUTPUT"
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
           api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${APPROVED_SERVER_PLAN}")"
@@ -1153,3 +1209,118 @@ jobs:
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
             -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount
+
+      # BLO-31666. The approval above holds an in-flight lock from the moment it
+      # rotates the ring until that digest's rollout actually lands, and only a
+      # landing rollout releases it. So a deploy that dies between the approval
+      # and `helm upgrade` strands a lock for a digest that was never applied,
+      # and every subsequent production deploy is then refused at admission with
+      # `refusing to approve <new>: <stranded> is still locked`. That is not
+      # hypothetical: run 33763503004 died in the pending-migration pre-flight,
+      # and run 33810092507 was refused against the lock it left behind
+      # (BLO-31598). The pre-flight budget that triggered it has been widened,
+      # but that removed the trigger, not the class — ANY failure between those
+      # two steps does the same thing.
+      #
+      # `if: always()` rather than `failure()` on purpose: this must also run
+      # when the job is CANCELLED, which is exactly how a job timeout during the
+      # pre-flight looks, and which strands a lock identically.
+      #
+      # The safety condition deliberately lives in the shell below rather than in
+      # this `if:`. It is the whole design, and a condition expressed as a GitHub
+      # expression cannot be executed by a test — #1636's review demonstrated two
+      # presence-only assertions passing against mutated code, so the condition
+      # this one guards is exercised for real by
+      # scripts/check-docker-retire-in-flight-lock.test.js instead.
+      - name: Retire the in-flight approval lock if helm never ran
+        if: ${{ always() }}
+        env:
+          # Empty unless the approval minted a lock of its own. It stays empty
+          # for a lock ADOPTED from an earlier attempt, whose rollout may still
+          # be running — see PAPERCLIP_APPROVAL_LOCK_OWNER_OUT in the approval
+          # script. So "empty" already means "no lock this job may retire".
+          LOCK_OWNER: ${{ steps.approval.outputs.lock_owner }}
+          LOCK_DIGEST: ${{ steps.approval.outputs.lock_digest }}
+          HELM_CONCLUSION: ${{ steps.helm.conclusion }}
+          # Set by the helm step's own first line. Two independent signals
+          # because neither is sufficient alone — see the guard below.
+          HELM_STARTED: ${{ steps.helm.outputs.started }}
+          APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
+          APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
+        run: |
+          set -euo pipefail
+          # BEGIN RETIRE_IN_FLIGHT_LOCK_GUARD
+          # "The job failed" is NOT sufficient grounds to retire the lock. A
+          # failure during or after `helm upgrade` may leave a rollout genuinely
+          # in flight, and retiring that lock would let a competing release
+          # rotate the ring underneath a landing one — precisely what the lock
+          # exists to prevent. The condition is "this job took a lock AND helm
+          # upgrade never executed", and nothing weaker.
+          if [ -z "${LOCK_OWNER}" ] || [ -z "${LOCK_DIGEST}" ]; then
+            echo "this job minted no in-flight approval lock of its own; nothing to retire"
+            exit 0
+          fi
+
+          # Signal 1: the helm step's own marker, written as its first line.
+          # Positive evidence that it began, so it is conclusive on its own and
+          # is checked first. It also covers a helm step that died on its very
+          # first assertion, which has no rollout but is still not something to
+          # infer from a conclusion alone.
+          if [ -n "${HELM_STARTED}" ]; then
+            echo "helm upgrade started (marker '${HELM_STARTED}'), so a rollout may exist; leaving the lock on ${LOCK_DIGEST} intact"
+            exit 0
+          fi
+
+          # Signal 2: the step conclusion. Only two values are consistent with a
+          # step that never began — `skipped` (an earlier step failed, so this
+          # one never started) and empty (a never-started step may be absent
+          # from the steps context entirely). This is deliberately an ALLOW-list
+          # of "did not run" rather than a deny-list of {success, failure,
+          # cancelled}: an unrecognised value then preserves the lock instead of
+          # retiring it, which is the direction that fails safely. `cancelled`
+          # matters most — a runner killed mid-`helm upgrade` may lose the marker
+          # above while --atomic is still rolling the release back, so the
+          # conclusion is the signal that catches it.
+          case "${HELM_CONCLUSION}" in
+            "" | skipped) ;;
+            *)
+              echo "helm upgrade concluded '${HELM_CONCLUSION}', so a rollout may have started; leaving the lock on ${LOCK_DIGEST} intact"
+              exit 0
+              ;;
+          esac
+          # END RETIRE_IN_FLIGHT_LOCK_GUARD
+
+          if [ -z "${APPROVER_KUBECONFIG}" ] || [ ! -x "${APPROVE_SCRIPT:-}" ]; then
+            echo "::error::cannot retire stranded in-flight approval lock ${LOCK_DIGEST} (owner ${LOCK_OWNER}): approver credential or release tooling unavailable. Retire it with PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 before the next deploy."
+            exit 1
+          fi
+
+          # Same mktemp -d discipline as the approval step: arc-deploy is a
+          # self-hosted pool, so a fixed path could be a symlink left by an
+          # earlier workload redirecting this credential somewhere it survives.
+          approver_dir="$(mktemp -d "${RUNNER_TEMP}/retire.XXXXXXXX")"
+          trap 'rm -rf "${approver_dir}"' EXIT
+          approver_kubeconfig="${approver_dir}/kubeconfig"
+          (umask 077; printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}")
+          unset APPROVER_KUBECONFIG
+
+          echo "::warning::retiring the in-flight approval lock on ${LOCK_DIGEST} (owner ${LOCK_OWNER}): this deploy failed before helm upgrade ran, so the cluster was never touched"
+
+          # Retire-only mode approves nothing and matches on digest AND owner
+          # together, so it cannot touch a lock another run took — a
+          # configuration-only release can legitimately reuse a digest, which is
+          # why the owner is the identifying half. It exits 0 without writing
+          # when no such lock is present, so a lock already retired (by the
+          # script's own abort path, or by an operator) is a silent no-op here.
+          KUBECONFIG="${approver_kubeconfig}" \
+            PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
+            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${LOCK_DIGEST}" \
+            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${LOCK_OWNER}" \
+            "${APPROVE_SCRIPT}" | tee "${approver_dir}/retire.log"
+
+          {
+            echo "### Retired unused in-flight approval lock"
+            echo '```'
+            cat "${approver_dir}/retire.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

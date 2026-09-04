@@ -65,6 +65,19 @@
 # never touched can then feed that owner back through
 # PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER above. No file is written when the
 # lock is not this invocation's to abandon.
+#
+# That later step retires the lock through this same script, in retire-only mode
+# (BLO-31666):
+#
+#   PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
+#     PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<the digest it approved> \
+#     PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<the owner it was handed> \
+#     scripts/approve-paperclip-api-digest.sh
+#
+# which removes that one lock and approves nothing. It takes no positional
+# arguments, matches on digest AND owner so it can never retire a lock another
+# run took, and exits 0 without writing when no such lock is present -- "not
+# ours" and "already gone" are the same fact, and neither is an error.
 
 set -euo pipefail
 
@@ -85,6 +98,48 @@ LOCK_MARKER_ANNOTATION="paperclip.blockcast.net/approval-in-flight-rollout-marke
 LOCK_SERVER_PLAN_ANNOTATION="paperclip.blockcast.net/approval-in-flight-server-plan-sha256"
 LOCK_OWNER_ANNOTATION="paperclip.blockcast.net/approval-in-flight-owner"
 ROLLOUT_MARKER_ANNOTATION="paperclip.blockcast.net/approval-plan-sha256"
+
+# Retiring a lock means removing every annotation that constitutes it, and the
+# set has grown three times (uid, generation, server-plan). Two copies of this
+# list would drift on the fourth: a copy that forgets one key leaves a partial
+# lock behind, and a partial lock is worse than none -- the digest field is what
+# the next approval refuses on, so a retirement that clears the owner but keeps
+# the digest wedges the channel while reporting success. So it is written once
+# and used by both retirement paths: release_in_flight_lock (this invocation
+# aborting after it took the lock) and the retire-only mode below (a caller that
+# knows the cluster was never touched).
+#
+# The ring in .data is deliberately untouched by both. The digest is legitimately
+# approved, the window bound still holds, and dropping entries here could evict a
+# rollback target.
+read -r -d '' CLEAR_IN_FLIGHT_LOCK_JQ <<'CLEAR_JQ' || true
+del(.metadata.annotations[$digest_key])
+| del(.metadata.annotations[$plan_key])
+| del(.metadata.annotations[$uid_key])
+| del(.metadata.annotations[$generation_key])
+| del(.metadata.annotations[$marker_key])
+| del(.metadata.annotations[$server_plan_key])
+| del(.metadata.annotations[$owner_key])
+CLEAR_JQ
+
+# resourceVersion rides along inside the object read here, so `kubectl replace`
+# is rejected with a 409 if anyone else changed the transaction in between --
+# the same optimistic-concurrency guard the rotation write uses, for the same
+# reason. Retried from a fresh read rather than forced.
+clear_in_flight_lock() {
+  local json="$1"
+  jq \
+    --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
+    --arg plan_key "$LOCK_PLAN_ANNOTATION" \
+    --arg uid_key "$LOCK_UID_ANNOTATION" \
+    --arg generation_key "$LOCK_GENERATION_ANNOTATION" \
+    --arg marker_key "$LOCK_MARKER_ANNOTATION" \
+    --arg server_plan_key "$LOCK_SERVER_PLAN_ANNOTATION" \
+    --arg owner_key "$LOCK_OWNER_ANNOTATION" \
+    "$CLEAR_IN_FLIGHT_LOCK_JQ" <<<"$json" \
+    | kubectl replace -f - >/dev/null 2>&1
+}
+
 # Must stay in lockstep with the `maxApprovedApiDigests` CEL variable in
 # paperclip/paperclip-public-tools.yaml. The policy denies everything if the
 # list is longer, so a drift here is a hard outage, not a silent widening.
@@ -112,19 +167,51 @@ usage() {
   exit 2
 }
 
-[[ $# -eq 2 ]] || usage
-DIGEST="$1"
-PLANNED_DEPLOYMENT="$2"
+# BLO-31666. A release that took a lock and then died BEFORE `helm upgrade` ever
+# executed knows something no other actor can know: the cluster was never
+# touched, so this lock names a rollout that will never happen. Nothing clears it
+# on its own -- the ring still lists the digest, so every subsequent production
+# deploy is refused at admission until a human retires it by hand. That is
+# BLO-31598, and it cost hours. This mode is the entry point for the cleanup step
+# that closes the window.
+#
+# It approves nothing. So it needs no plan manifest, no deploy credential, and no
+# admissibility probe: it is the removal half of the transaction and nothing else.
+# The lock is named entirely by the ABANDON pair validated below, which is why
+# this mode takes NO positional arguments -- a digest supplied in two places
+# could disagree with itself, and the resulting ambiguity is precisely what the
+# digest+owner pairing rule exists to eliminate.
+RETIRE_IN_FLIGHT_ONLY="${PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY:-}"
 
-if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "refusing to approve '${DIGEST}': not a well-formed lowercase sha256 digest" >&2
-  echo "pass the bare digest only — the repository is fixed inside the admission policy" >&2
+retire_only_usage() {
+  echo "usage: PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \\" >&2
+  echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<64 lowercase hex> \\" >&2
+  echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<64 lowercase hex> $0" >&2
+  echo "retire-only mode takes no positional arguments; it names the lock by env" >&2
   exit 2
-fi
+}
 
-if [[ ! -f "$PLANNED_DEPLOYMENT" ]]; then
-  echo "planned Deployment manifest not found: $PLANNED_DEPLOYMENT" >&2
-  exit 2
+if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
+  [[ $# -eq 0 ]] || retire_only_usage
+  # Defined so the shared validation below can reference them under `set -u`.
+  # Neither is meaningful in this mode: nothing is approved.
+  DIGEST=""
+  PLANNED_DEPLOYMENT=""
+else
+  [[ $# -eq 2 ]] || usage
+  DIGEST="$1"
+  PLANNED_DEPLOYMENT="$2"
+
+  if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "refusing to approve '${DIGEST}': not a well-formed lowercase sha256 digest" >&2
+    echo "pass the bare digest only — the repository is fixed inside the admission policy" >&2
+    exit 2
+  fi
+
+  if [[ ! -f "$PLANNED_DEPLOYMENT" ]]; then
+    echo "planned Deployment manifest not found: $PLANNED_DEPLOYMENT" >&2
+    exit 2
+  fi
 fi
 
 # Escape hatch for a release that will never complete: a rollout that failed and
@@ -151,6 +238,67 @@ if [[ -n "$ABANDON_IN_FLIGHT" && -z "$ABANDON_IN_FLIGHT_OWNER" ]] \
   echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER must be set together" >&2
   exit 2
 fi
+
+# BLO-31666: retire-only mode executes here and exits, before anything that
+# needs a plan, a deploy credential, or the admission probe. Placed immediately
+# after the ABANDON pair is validated because that pair IS the whole input.
+if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
+  if [[ -z "$ABANDON_IN_FLIGHT" ]]; then
+    echo "retire-only mode requires the lock to retire to be named explicitly" >&2
+    retire_only_usage
+  fi
+  for dep in kubectl jq; do
+    command -v "$dep" >/dev/null 2>&1 || { echo "$dep is required" >&2; exit 2; }
+  done
+
+  for attempt in 1 2 3; do
+    # `get` is the approver's only read verb and it is scoped to this one name.
+    # A failure is fail-closed and must be surfaced: a caller that cannot read
+    # the lock cannot conclude anything about it, and reporting success here
+    # would leave the wedge in place while claiming it was cleared.
+    if ! retire_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>/dev/null)"; then
+      echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock." >&2
+      echo "The approval ConfigMap is installed by the cluster-admin bootstrap;" >&2
+      echo "this script never creates it." >&2
+      exit 1
+    fi
+
+    # Digest AND owner, together, exactly as the operator hatch matches. The
+    # owner is a per-invocation nonce, so this is what makes the retirement
+    # incapable of touching a lock some other run took -- and the digest alone
+    # could not: a configuration-only release legitimately reuses a digest.
+    if ! jq -e \
+        --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
+        --arg digest "$ABANDON_IN_FLIGHT" \
+        --arg owner_key "$LOCK_OWNER_ANNOTATION" \
+        --arg owner "$ABANDON_IN_FLIGHT_OWNER" '
+          .metadata.annotations[$digest_key] == $digest and
+          .metadata.annotations[$owner_key] == $owner
+        ' <<<"$retire_json" >/dev/null; then
+      # Not ours, or already gone. Both are the same fact -- there is no lock
+      # this caller is entitled to retire -- and neither is an error. The caller
+      # is a cleanup step on an already-failing job; turning "nothing to do"
+      # into a second red step would bury the real failure underneath it.
+      echo "no in-flight approval lock matching ${ABANDON_IN_FLIGHT} owner ${ABANDON_IN_FLIGHT_OWNER}; nothing to retire"
+      exit 0
+    fi
+
+    if clear_in_flight_lock "$retire_json"; then
+      echo "Retired the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER})."
+      echo "The ring still lists that digest, so a corrected plan or a rollback is"
+      echo "admitted without an out-of-band edit."
+      exit 0
+    fi
+    sleep "$attempt"
+  done
+
+  echo "could not retire the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER})." >&2
+  echo "The next approval will refuse until it is retired. Re-run this mode, or pass" >&2
+  echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER" >&2
+  echo "on the next approval." >&2
+  exit 1
+fi
+
 # Admissibility-probe pacing. Validated here, with the other operator-facing
 # env, so a typo fails before the ring is touched rather than mid-probe with an
 # in-flight lock held. The exhaustion message at the end of this script actively
@@ -465,23 +613,7 @@ release_in_flight_lock() {
         ' <<<"$json" >/dev/null; then
       return 0
     fi
-    if jq \
-        --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
-        --arg plan_key "$LOCK_PLAN_ANNOTATION" \
-        --arg uid_key "$LOCK_UID_ANNOTATION" \
-        --arg generation_key "$LOCK_GENERATION_ANNOTATION" \
-        --arg marker_key "$LOCK_MARKER_ANNOTATION" \
-        --arg server_plan_key "$LOCK_SERVER_PLAN_ANNOTATION" \
-        --arg owner_key "$LOCK_OWNER_ANNOTATION" '
-          del(.metadata.annotations[$digest_key])
-          | del(.metadata.annotations[$plan_key])
-          | del(.metadata.annotations[$uid_key])
-          | del(.metadata.annotations[$generation_key])
-          | del(.metadata.annotations[$marker_key])
-          | del(.metadata.annotations[$server_plan_key])
-          | del(.metadata.annotations[$owner_key])
-        ' <<<"$json" \
-        | kubectl replace -f - >/dev/null 2>&1; then
+    if clear_in_flight_lock "$json"; then
       return 0
     fi
     sleep 1
