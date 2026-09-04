@@ -199,9 +199,24 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
 // survives) and text inside a quoted string. Enumerating those two as escapes
 // was the alternative; command position removes the class instead, and costs
 // nothing -- every real spelling above still matches, via `(`, `["']` (the
-// quote in `bash -c "cd ...` is adjacent to `cd`), or `\b(?:if|then|else|do)`
-// for the `if cd <dir>; then` form. `)` joins the right-hand
-// class for `(cd <dir>)` with no trailing command inside the subshell.
+// quote in `bash -c "cd ...` is adjacent to `cd`), or
+// `\b(?:if|elif|then|else|do|while|until)` for the `if cd <dir>; then` form.
+// `)` joins the right-hand class for `(cd <dir>)` with no trailing command
+// inside the subshell.
+//
+// `{` and `!` are in the left-hand class, and the keyword list carries `elif`,
+// `while` and `until`, because the first cut of that class -- bare `[\n;&|(]`
+// with `if|then|else|do` -- dropped five command positions along with the
+// whitespace it was narrowing away: `{ cd <chart> && ...; }`, `elif cd ...`,
+// `while cd ...`, `until cd ...`, `! cd ... || ...`. The brace group is the one
+// that matters: it is the same "chdir without leaking into everything after"
+// idiom as the subshell this list already covers via `(`, minus the subshell,
+// so covering one spelling and not its sibling was arbitrary. `elif` needs its
+// own alternative rather than riding on `if`, because `\b` fails inside it --
+// the preceding `l` is a word character. Re-admitting `{` and `!` does not
+// reopen the prose class they were removed for: both false reds put a bare
+// SPACE before `cd` (`# never cd <dir>`, `echo "do not cd <dir>"`), and neither
+// `{` nor `!` is whitespace.
 // `pushd` is in the alternation because it is `cd` with a
 // stack: nothing here pushd's into the chart for any other purpose, so naming
 // it as an escape and covering it cost the same, and only one of those two
@@ -240,7 +255,7 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
     const step = workflow.slice(at, next === -1 ? undefined : next);
     if (!step.includes("node --test")) continue;
     const chdirs = new RegExp(
-      `(?:[\\n;&|(]|run:|\\b(?:if|then|else|do)[ \\t]|["'])[ \\t]*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
+      `(?:[\\n;&|({!]|run:|\\b(?:if|elif|then|else|do|while|until)[ \\t]|["'])[ \\t]*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
     ).test(step);
     if (chdirs && jobOwning(at) !== "helm_chart") {
       offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
@@ -279,6 +294,16 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 // A wildcard in the FILENAME is fine and stays fine -- `helm_chart`'s own
 // `./deploy/helm/paperclip/tests/*.test.mjs` has one, and its `*` is followed
 // by no `/`, which is precisely the distinction being drawn.
+//
+// Node's own value-taking flags, so a flag's VALUE is never mistaken for the
+// positional path argument. Only space-separated forms are a hazard --
+// `--flag=value` is one token and already reads as a flag. Listed explicitly
+// rather than inferred from a shape: a value-taking flag added to node in a
+// later release reopens the same hole, but that costs a missed row, not a false
+// red, which is the direction this file prefers to fail in. Worth re-checking
+// against `node --help` whenever the pinned major moves.
+const VALUE_FLAGS =
+  /^--(?:test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard)|import|require|loader|conditions)$/;
 test("every node --test names explicit paths, so the text match above is sound (BLO-31516)", () => {
   const marker = "\n      - name: ";
   const offenders = [];
@@ -290,24 +315,37 @@ test("every node --test names explicit paths, so the text match above is sound (
     // invocation, so the continuation branch never gets to match and that
     // step's two paths read as no paths at all -- a false red on the real file.
     for (const invocation of step.matchAll(/node --test((?:[^\n\\]|\\\n)*)/g)) {
-      const args = invocation[1]
-        .split(/[\s\\]+/)
-        .filter(Boolean)
-        .filter((arg) => !arg.startsWith("--"))
-        // A path, not merely a non-flag token. A flag taking a SPACE-separated
-        // value (`--test-reporter spec`, `--test-timeout 60000`) leaves its
-        // value behind as a bare token, which satisfied a non-flag check with
-        // the value itself and reopened the argless hazard one flag away --
-        // node consumes the value and then default-discovers, so from the repo
-        // root such a step picks the chart suite up silently. Verified on the
-        // pinned node 24: `node --test --test-reporter spec` in a directory
-        // containing `tests/a.test.mjs` runs it, with no path argument given.
-        // Requiring `/` is the same house-style claim as the rest of this gate
-        // -- all 40 invocations name a rooted path -- and it leaves legitimate
-        // flag use alone, including the `$GITHUB_WORKSPACE/...` form.
-        .filter((arg) => arg.includes("/"));
-      if (args.length === 0) {
+      // A flag taking a SPACE-separated value leaves that value behind as a
+      // bare token, which satisfies a non-flag check with the VALUE and
+      // reopens the argless hazard one flag away -- node consumes the value and
+      // then default-discovers, so from the repo root such a step picks the
+      // chart suite up silently. Requiring the token look like a rooted path
+      // narrowed that class but did not close it, because a flag value can be a
+      // rooted path too. Verified on the pinned node 24, from a directory
+      // containing `tests/a.test.mjs`, all three of these run it with no path
+      // argument given: `--test-reporter ./my-reporter.mjs`,
+      // `--test-reporter-destination ./coverage/out.tap`,
+      // `--test-name-pattern a/b`. `--test-reporter-destination` is the
+      // plausible one -- writing a TAP artifact for CI collection is exactly
+      // why a step grows a reporter flag, and `--test-reporter` is required
+      // alongside it. Consuming the value of a known value-taking flag is what
+      // actually discriminates, so that is the check; the rooted-path filter
+      // below is kept on top of it, narrower and for a different reason.
+      const tokens = invocation[1].split(/[\s\\]+/).filter(Boolean);
+      const operands = tokens
+        .filter((arg, i) => !(tokens[i - 1] && VALUE_FLAGS.test(tokens[i - 1])))
+        .filter((arg) => !arg.startsWith("--"));
+      // Rooted, not merely non-flag. This is the house-style claim the rest of
+      // this gate rests on -- all 40 invocations name a rooted path -- and it
+      // is what keeps the exactly-once TEXT match sound. It is reported apart
+      // from the argless case because they are different defects with different
+      // fixes: `node --test a.test.mjs` HAS a path argument, so calling it
+      // "no path argument" sends the next reader looking for the wrong thing.
+      const args = operands.filter((arg) => arg.includes("/"));
+      if (operands.length === 0) {
         offenders.push(`${jobOwning(at)}: node --test with no path argument`);
+      } else if (args.length === 0) {
+        offenders.push(`${jobOwning(at)}: node --test with no rooted path argument`);
       }
       // `{` alongside `**`: brace expansion wildcards a directory without ever
       // spelling `**`, and its `*` is not followed by `/`, so
@@ -315,7 +353,18 @@ test("every node --test names explicit paths, so the text match above is sound (
       // shapes -- the sibling spelling of the `deploy/helm/*/tests/` row above,
       // in exactly the "a second chart under deploy/helm/" scenario that makes
       // it the natural way to write "all chart suites".
-      for (const arg of args.filter((path) => path.includes("**") || path.includes("{") || /\*[^\s]*\//.test(path))) {
+      //
+      // Variable expansions are stripped before that test, because `${VAR}` is
+      // just the brace-delimited spelling of the bare `$VAR` form left alone
+      // above, and the chdir preamble already names a shell-variable path as a
+      // known-and-accepted escape. Testing the raw string accepted that form in
+      // one assertion and rejected it in another, false-redding
+      // `${GITHUB_WORKSPACE}/...`; `${{ github.workspace }}/...` survived only
+      // because its `}}` leaves no bare `{` behind, which is luck, not intent.
+      const literal = (path) => path.replace(/\$\{\{?[^}]*\}\}?/g, "");
+      for (const arg of args.filter(
+        (path) => path.includes("**") || literal(path).includes("{") || /\*[^\s]*\//.test(path),
+      )) {
         offenders.push(`${jobOwning(at)}: wildcard directory in ${arg}`);
       }
     }
@@ -378,11 +427,11 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
 // that round trip wrong is a value whose fractional part ENDS in zero, and the
 // zero-only case is the one to keep in mind: `3.0` and `4.0` reach the action as
 // `3` and `4`, an unpinned major line, which is the same floating-render hazard
-// this pin exists to close. `4.0` is the live one -- helm v4 shipped
-// 2026-08-13, so a bump to the 4.x line is a plausible edit and `version: 4.0`
-// is a natural way to write it. `3.16` is unaffected (it renders back as
-// `3.16`), and either quoting the value or naming the patch component clears
-// any of these.
+// this pin exists to close. `4.0` is the live one -- helm's 4.x line exists
+// (v4.0.0 2025-11-12, v4.2.4 2026-08-13), so a bump to it is a plausible edit
+// and `version: 4.0` is a natural way to write it. `3.16` is unaffected (it
+// renders back as `3.16`), and either quoting the value or naming the patch
+// component clears any of these.
 test("the chart render job pins the helm it renders with (BLO-31516)", () => {
   const region = jobRegion("helm_chart");
   const step = region
