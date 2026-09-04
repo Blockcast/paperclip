@@ -492,7 +492,12 @@ export interface PrCommentReviewGateCheckInput {
   prNumber: number;
   headSha?: string | null;
   prUrl?: string | null;
-  db?: Db;
+  // Required, not optional. This handle is the only cross-process boundary
+  // serializing evaluations of one head: the in-process `gateEvaluationChains`
+  // map below does not span API pods. When it was optional, any caller that
+  // forgot it silently got the unsynchronized path and re-opened the
+  // out-of-order-verdict race. Test injection passes a stub.
+  db: Db;
 }
 
 const TRANSIENT_RETRY_DELAYS_MS = [250, 1000];
@@ -542,6 +547,19 @@ export async function runPrCommentReviewGateCheck(
   const config = loadConfig();
   const context = config.prCommentReviewGateStatusContext.trim();
   if (!context) return { posted: false, reason: "not_configured" };
+
+  // Fail closed rather than evaluating unsynchronized. `db` is required by the
+  // type, but this module is reachable from JS callers and from tests that are
+  // excluded from `tsc`, so the invariant needs a runtime edge too. Publishing
+  // a verdict without the cross-process lock is the out-of-order-write bug this
+  // gate already had once; refusing to publish is the recoverable direction,
+  // because the next webhook for this head re-evaluates.
+  if (!input.db) {
+    throw new Error(
+      "runPrCommentReviewGateCheck requires `db`: it is the cross-process lock that keeps a " +
+        "stale verdict from overwriting a newer one. Pass the request's database handle.",
+    );
+  }
 
   const key = `${input.repoFullName}#${input.prNumber}#${context}`;
   return serializeGateEvaluation(key, () => executeCommentReviewGateCheck(input, context, config));
@@ -637,10 +655,10 @@ async function executeCommentReviewGateCheck(
   };
 
   // Serialize evidence reads, verdict computation, and all status writes with
-  // forced retries. The transaction-scoped lock is the cross-process boundary.
-  return input.db
-    ? withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish)
-    : publish();
+  // forced retries. The transaction-scoped lock is the cross-process boundary,
+  // and it is unconditional: `db` is required precisely so there is no
+  // unsynchronized fall-through for a caller to reach by omission.
+  return withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish);
 }
 
 /**

@@ -2446,6 +2446,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       prNumber: number;
       headSha?: string | null;
       prUrl?: string | null;
+      db?: unknown;
     }> = [];
     let markCalled!: () => void;
     const called = new Promise<void>((resolve) => {
@@ -2484,11 +2485,18 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({ ignored: "no_paperclip_identifier" });
-    expect(calls).toEqual([{
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
       repoFullName: "Blockcast/paperclip",
       prNumber: 1049,
       prUrl: "https://github.com/Blockcast/paperclip/pull/1049",
-    }]);
+    });
+    // The db handle is the gate's only cross-process serialization boundary,
+    // and production supplying it is a property of THIS call site. Assert it
+    // on the argument the seam actually received: while the seam was invoked
+    // with the bare trigger, the real handle was unobservable from here and a
+    // caller could drop it without any test noticing.
+    expect(calls[0]!.db).toBeDefined();
   });
 
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {

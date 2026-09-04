@@ -16,6 +16,10 @@ import {
 
 type DeliveryRow = typeof githubCommitStatusDeliveries.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+// Either handle works for the delivery bookkeeping below. Code reached from
+// inside withGithubStatusDeliveryLock must use the transaction handle so the
+// critical section does not take a second pool connection.
+type DbHandle = Db | DbTransaction;
 type DeliveryTerminalStatus = "delivered" | "skipped" | "failed" | "failed_permanent";
 
 const POLL_INTERVAL_MS = 5_000;
@@ -30,15 +34,40 @@ const RETRY_DELAYS_MS = [
   2 * 60 * 60_000,
 ];
 
+// How long a waiter may queue for the delivery advisory lock before giving up,
+// and how long a holder may sit idle-in-transaction (i.e. inside its external
+// GitHub calls) before Postgres terminates it and releases the lock. Both are
+// far above the normal critical-section cost — they exist to make pool
+// exhaustion recoverable, not to bound healthy work.
+const DELIVERY_LOCK_WAIT_TIMEOUT_MS = 30_000;
+const DELIVERY_LOCK_HOLD_TIMEOUT_MS = 120_000;
+
 /** Serialize the final read and external write for one GitHub status key. */
 export async function withGithubStatusDeliveryLock<T>(
   db: Db,
   key: string,
-  operation: () => Promise<T>,
+  operation: (tx: DbTransaction) => Promise<T>,
 ): Promise<T> {
   return db.transaction(async (tx) => {
+    // Bound both sides of the lock. The critical section performs external
+    // GitHub I/O (paginated list calls and status POSTs with retries), so the
+    // holder sits idle-in-transaction pinning a pool connection, and every
+    // waiter queued on an untimed pg_advisory_xact_lock pins one too. Without
+    // these bounds a hung GitHub call can exhaust the pool, and once exhausted
+    // the holder cannot finish, so the lock is never released.
+    //
+    // set_config(..., true) is transaction-local; SET LOCAL cannot be
+    // parameterized, so it is spelled this way deliberately.
+    await tx.execute(
+      sql`select set_config('lock_timeout', ${`${DELIVERY_LOCK_WAIT_TIMEOUT_MS}ms`}, true)`,
+    );
+    await tx.execute(
+      sql`select set_config('idle_in_transaction_session_timeout', ${`${DELIVERY_LOCK_HOLD_TIMEOUT_MS}ms`}, true)`,
+    );
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
-    return operation();
+    // Hand the transaction handle to the caller: taking a second pool
+    // connection here is what makes the exhaustion above reachable.
+    return operation(tx);
   });
 }
 
@@ -111,7 +140,7 @@ function deliveryClaimWhere(row: DeliveryRow) {
   );
 }
 
-async function refreshDeliveryClaimBeforeExternalWrite(db: Db, row: DeliveryRow): Promise<DeliveryRow | null> {
+async function refreshDeliveryClaimBeforeExternalWrite(db: DbHandle, row: DeliveryRow): Promise<DeliveryRow | null> {
   const [updated] = await db
     .update(githubCommitStatusDeliveries)
     .set({ updatedAt: new Date() })
@@ -126,7 +155,7 @@ function statusCreatedAtOrAfterQueueSecond(statusCreatedAt: number, queuedAt: Da
   return statusCreatedAt >= queuedAtSecond;
 }
 
-async function handleFreshCommitStatusIfPresent(db: Db, row: DeliveryRow): Promise<boolean> {
+async function handleFreshCommitStatusIfPresent(db: DbHandle, row: DeliveryRow): Promise<boolean> {
   const latestStatus = await githubGetLatestCommitStatusForContext({
     repoFullName: row.repoFullName,
     sha: row.sha,
@@ -164,7 +193,7 @@ async function handleFreshCommitStatusIfPresent(db: Db, row: DeliveryRow): Promi
 
 // A forced retirement retry may supersede the status that existed when it was
 // queued, but it must not overwrite any later evaluation of the same head.
-async function handleFreshSuccessForForcedDelivery(db: Db, row: DeliveryRow): Promise<boolean> {
+async function handleFreshSuccessForForcedDelivery(db: DbHandle, row: DeliveryRow): Promise<boolean> {
   if (!row.forceWrite) return false;
   const latestStatus = await githubGetLatestCommitStatusForContext({
     repoFullName: row.repoFullName,
@@ -200,7 +229,7 @@ async function handleFreshSuccessForForcedDelivery(db: Db, row: DeliveryRow): Pr
 }
 
 async function appendDeliveryRunEvent(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   level: "info" | "warn",
   message: string,
@@ -238,7 +267,7 @@ async function appendDeliveryRunEvent(
 }
 
 async function markTerminal(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   status: DeliveryTerminalStatus,
   level: "info" | "warn",
@@ -278,7 +307,7 @@ async function markTerminal(
 }
 
 async function retryOrFailDelivery(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   reason: string,
   result: Record<string, unknown>,
@@ -332,7 +361,7 @@ async function retryOrFailDelivery(
 }
 
 async function failPermanentDelivery(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   reason: string,
   result: Record<string, unknown>,
@@ -413,10 +442,12 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     ? await withGithubStatusDeliveryLock(
         db,
         `${fencedRow.repoFullName}#${fencedRow.sha}`,
-        async () => {
+        async (tx) => {
           // The lock is shared with the live gate evaluation. Re-check inside
           // it so a clean evaluation that won the lock cannot be overwritten.
-          if (await handleFreshSuccessForForcedDelivery(db, fencedRow)) {
+          // Use `tx`, not `db`: a second pool connection taken here is what
+          // lets a saturated pool wedge the lock holder.
+          if (await handleFreshSuccessForForcedDelivery(tx, fencedRow)) {
             return { ok: true as const, skipped: true as const };
           }
           return { ...(await post()), skipped: false as const };
