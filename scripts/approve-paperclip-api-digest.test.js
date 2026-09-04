@@ -587,29 +587,115 @@ test("a landed rollout that omits unavailableReplicas is still read as serving",
   assert.equal(runningDigestFor(deployment), live);
 });
 
+// Split a jq predicate block into the condition lines of its top-level
+// conjunction. ROLLOUT_COMPLETE_JQ opens with a `def advanced: … ;` helper whose
+// body is control flow rather than conditions; jq definitions end in `;` and
+// condition lines never do, so the conjunction is everything after the last one.
+function jqConditions(block) {
+  const lines = block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const endOfDefs = lines.reduce((at, line, index) => (line.endsWith(";") ? index : at), -1);
+  return lines.slice(endOfDefs + 1).map((line) => line.replace(/ and$/, ""));
+}
+
+// The clauses ROLLOUT_COMPLETE_JQ carries that ROLLOUT_SERVING_JQ deliberately
+// does not. Each establishes that MY plan's rollout landed, not that whatever
+// template is written is the one serving: the expected image and its structural
+// precondition, the rollout marker, and the generation advance. Everything else
+// in the completion predicate is a rollout-health condition, and the drift test
+// below requires it to appear in the serving predicate too.
+const LOCK_IDENTITY_CONDITIONS = [
+  '(.spec.template.spec.containers | type == "array" and length > 0)',
+  "(.spec.template.spec.containers | all(.image == $image))",
+  '(.spec.template.metadata.annotations[$marker_key] // "") == $marker',
+  "advanced",
+];
+
 // The reader's health gate and the in-flight lock's completion predicate must
 // agree on what "this rollout has landed" means. They are separate jq programs
 // because they answer different questions -- the lock also proves plan identity
 // and generation advance -- so nothing but this test stops one from being
 // tightened while the other silently keeps the old reading.
+//
+// The comparison is set equality over the health half, in BOTH directions. The
+// reverse direction is the load-bearing one: a health condition added to the
+// completion predicate alone would silently make the reader the weaker of the
+// two definitions, so it would pin a digest the lock itself would not call
+// landed -- the exact failure this gate was introduced to close, reintroduced
+// by drift rather than by code.
 test("the serving predicate does not drift from the completion predicate", () => {
-  const complete = extractJqBlock("ROLLOUT_COMPLETE_JQ");
-  const conditions = SERVING_JQ.split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"))
-    .map((line) => line.replace(/ and$/, ""));
+  const serving = jqConditions(SERVING_JQ);
+  const complete = jqConditions(extractJqBlock("ROLLOUT_COMPLETE_JQ"));
 
   assert.ok(
-    conditions.length >= 6,
-    `expected the serving predicate to carry the rollout-health conditions, got ${conditions.length}`,
+    serving.length >= 6,
+    `expected the serving predicate to carry the rollout-health conditions, got ${serving.length}`,
   );
-  for (const condition of conditions) {
+
+  // Keep the classification honest: a lock-only clause that no longer exists
+  // must not sit here silently exempting a condition name from the comparison.
+  for (const condition of LOCK_IDENTITY_CONDITIONS) {
     assert.ok(
       complete.includes(condition),
+      `LOCK_IDENTITY_CONDITIONS in this test lists \`${condition}\` as lock-only, but ` +
+        "ROLLOUT_COMPLETE_JQ no longer carries it — update the classification",
+    );
+  }
+
+  const completeHealth = complete.filter((condition) => !LOCK_IDENTITY_CONDITIONS.includes(condition));
+
+  for (const condition of serving) {
+    assert.ok(
+      completeHealth.includes(condition),
       `ROLLOUT_SERVING_JQ requires \`${condition}\` but ROLLOUT_COMPLETE_JQ no longer does — ` +
         "the two definitions of a landed rollout have drifted apart",
     );
   }
+
+  for (const condition of completeHealth) {
+    assert.ok(
+      serving.includes(condition),
+      `ROLLOUT_COMPLETE_JQ requires \`${condition}\` but ROLLOUT_SERVING_JQ does not — ` +
+        "the reader would pin a digest the lock's own predicate would not call landed. " +
+        "Add it to ROLLOUT_SERVING_JQ, or to LOCK_IDENTITY_CONDITIONS in this test if it " +
+        "proves plan identity rather than rollout health",
+    );
+  }
+});
+
+const FORMATTER_FUNCTION_NAME = "format_digest_list";
+const formatterSource = extractShellFunction(FORMATTER_FUNCTION_NAME);
+
+// The list reaches the formatter exactly as it does in the script: through a
+// command substitution (which strips trailing newlines) and then double-quoted,
+// so a multi-line window is one argument rather than several.
+function formatDigestList(list) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-digest-list-"));
+  const fixture = path.join(dir, "window.txt");
+  writeFileSync(fixture, list);
+  const harness = [
+    "set -euo pipefail",
+    formatterSource,
+    `window="$(cat ${JSON.stringify(fixture)})"`,
+    `${FORMATTER_FUNCTION_NAME} "$window"`,
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `formatter must always succeed; stderr: ${result.stderr}`);
+  return result.stdout;
+}
+
+// The read-back guards print this on their failure paths, where the contents are
+// the actionable part. An empty window must not render as a blank line, or the
+// "did not persist" report would say nothing at all about what the cluster holds.
+test("the digest-list formatter indents each entry and marks an empty window", () => {
+  const a = digest(0xaa);
+  const b = digest(0xbb);
+
+  assert.equal(formatDigestList(`${a}\n${b}`), `  - ${a}\n  - ${b}\n`);
+  assert.equal(formatDigestList(a), `  - ${a}\n`);
+  assert.equal(formatDigestList(""), "  (none)\n");
 });
 
 
