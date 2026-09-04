@@ -479,7 +479,18 @@ export async function enqueueGithubCommitStatusDelivery(
 ): Promise<DeliveryRow> {
   const now = new Date();
   const nowSql = sql`${now.toISOString()}::timestamptz`;
-  // NOTE the NULL semantics, which are load-bearing. Migration 0237 made
+  // Normalize the two optional provenance fields ONCE, before anything below
+  // reads them. `undefined` and `null` are different inputs to drizzle and only
+  // the second is safe here: an `undefined` chunk renders as the empty string
+  // with no bound parameter, so `source_run_id = ${undefined}` becomes
+  // `source_run_id = ` and a CASE ELSE arm becomes `else  end` — both Postgres
+  // 42601 at parse time. Webhook-originated retirements omit these keys
+  // entirely (`github-webhook.ts`), so that is the shape production actually
+  // sends. Deriving the insert values and both CASE arms from these two
+  // constants is what keeps them from drifting apart again.
+  const companyId = input.companyId ?? null;
+  const sourceRunId = input.sourceRunId ?? null;
+  // NOTE the NULL semantics, which are load-bearing. Migration 0238 made
   // source_run_id nullable, so for webhook-originated rows both sides of the
   // comparison are NULL and `source_run_id = NULL` evaluates to NULL, not
   // true. preserveExistingDelivery is therefore NULL, every CASE below takes
@@ -495,10 +506,10 @@ export async function enqueueGithubCommitStatusDelivery(
     githubCommitStatusDeliveries.status
   } in ('delivered', 'skipped') and ${
     githubCommitStatusDeliveries.sourceRunId
-  } = ${input.sourceRunId})`;
+  } = ${sourceRunId})`;
   const values = {
-    companyId: input.companyId,
-    sourceRunId: input.sourceRunId,
+    companyId,
+    sourceRunId,
     repoFullName: input.repoFullName,
     sha: input.sha,
     context: input.context,
@@ -528,8 +539,8 @@ export async function enqueueGithubCommitStatusDelivery(
         githubCommitStatusDeliveries.context,
       ],
       set: {
-        companyId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.companyId} else ${input.companyId} end`,
-        sourceRunId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.sourceRunId} else ${input.sourceRunId} end`,
+        companyId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.companyId} else ${companyId} end`,
+        sourceRunId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.sourceRunId} else ${sourceRunId} end`,
         prNumber: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
         prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
         state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,

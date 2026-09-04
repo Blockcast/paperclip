@@ -512,7 +512,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     setCreds();
     const { companyId, delivery } = await seedRun();
     const deliveredAt = new Date(Date.now() - 60_000);
-    // Webhook-originated rows carry no source run (migration 0237 made
+    // Webhook-originated rows carry no source run (migration 0238 made
     // source_run_id nullable), so preserveExistingDelivery compares NULL to
     // NULL. In SQL that is NULL, not true, which is what lets a terminal row
     // be revived. Pin it: if someone "fixes" the comparison to
@@ -547,6 +547,60 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
 
     expect(revived).toMatchObject({
       id: delivery.id,
+      sourceRunId: null,
+      status: "queued",
+      attempts: 0,
+      forceWrite: true,
+      description: "Retired. Findings now publish elsewhere.",
+    });
+  });
+
+  it("enqueues a retirement when the provenance keys are omitted entirely", async () => {
+    setCreds();
+    // The webhook retirement call site omits `companyId` and `sourceRunId`
+    // rather than passing null, so both arrive as `undefined`. That is a
+    // DIFFERENT input from null: drizzle renders an `undefined` chunk as the
+    // empty string with no bound parameter, which turns
+    // `source_run_id = ${...}` into `source_run_id = ` and a CASE ELSE arm into
+    // `else  end` — Postgres 42601 at parse time. Every webhook-originated
+    // retirement therefore rejected before writing a row, so the outbox, the
+    // force_write column and the forced-retry lock had no reachable caller.
+    // The sibling test above passes `sourceRunId: null` explicitly and so
+    // cannot catch this; only the omitted shape reproduces production.
+    const { delivery } = await seedRun();
+    const deliveredAt = new Date(Date.now() - 60_000);
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        status: "delivered",
+        companyId: null,
+        sourceRunId: null,
+        deliveredAt,
+        createdAt: deliveredAt,
+        updatedAt: deliveredAt,
+        nextAttemptAt: deliveredAt,
+        lastResult: { posted: { ok: true } },
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    const revived = await enqueueGithubCommitStatusDelivery(db, {
+      repoFullName: "Blockcast/hang",
+      sha: HEAD_SHA,
+      context: "review/ally-complete",
+      state: "failure",
+      description: "Retired. Findings now publish elsewhere.",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7",
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7",
+      forceWrite: true,
+    });
+
+    // Both the insert values and the two CASE arms must normalize to NULL, and
+    // the row must actually be revived — an omitted sourceRunId has to compare
+    // the same way an explicit null does, or the retirement is dropped.
+    expect(revived).toMatchObject({
+      id: delivery.id,
+      companyId: null,
       sourceRunId: null,
       status: "queued",
       attempts: 0,
