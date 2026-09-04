@@ -20,9 +20,12 @@ import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   PRECREATE_REQUIRED_INDEXES,
+  decidePreflightBlocker,
   formatPreflightFailure,
   selectGuardedPendingIndexes,
+  type PrecreateRequiredIndex,
   type PreflightBlocker,
+  type TablePopulation,
 } from "./pending-migration-preflight.js";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
@@ -123,6 +126,121 @@ describe("selectGuardedPendingIndexes", () => {
     // The whole point: 0236 applied is not a blocker, even though it is in the
     // registry. Only *pending* guarded migrations can stall a deploy.
     expect(selectGuardedPendingIndexes(["0999_unrelated.sql"], specs)).toEqual([]);
+  });
+});
+
+describe("decidePreflightBlocker", () => {
+  const spec: PrecreateRequiredIndex = {
+    migration: "0217_heartbeat_runs_queued_age_idx.sql",
+    name: "heartbeat_runs_queued_age_idx",
+    table: "heartbeat_runs",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_queued_age_idx ON heartbeat_runs USING btree (agent_id)",
+  };
+
+  const absent = { exists: false, usable: false } as const;
+  const halfBuilt = { exists: true, usable: false } as const;
+  const usable = { exists: true, usable: true } as const;
+
+  // The case this function exists for. A fresh bootstrap has every migration
+  // pending, every index absent, and every table empty or not yet created —
+  // and every one of those migrations builds its own index inline and
+  // succeeds. Reporting them failed a deploy that needed no operator at all.
+  it.each<TablePopulation>(["empty", "absent"])(
+    "does not block an absent index when the table is %s",
+    (population) => {
+      expect(decidePreflightBlocker(spec, absent, population)).toBeNull();
+    },
+  );
+
+  // The load-bearing direction: this is the outage BLO-30895 built the
+  // pre-flight for. A fix that merely stopped reporting blockers would satisfy
+  // the empty-table cases above while re-opening this one.
+  it("still blocks an absent index when the table is populated", () => {
+    expect(decidePreflightBlocker(spec, absent, "populated")).toEqual({
+      migration: spec.migration,
+      index: spec.name,
+      state: "absent",
+      remediation: spec.createStatement,
+    });
+  });
+
+  // A half-built index takes the migration's *structural* branch, which
+  // demands `indisvalid` and raises with no emptiness test at all. Emptiness
+  // must not exempt it, or the pre-flight waves through a migration that then
+  // fails the slow way from inside server startup.
+  it.each<TablePopulation>(["empty", "absent", "populated"])(
+    "blocks a half-built index regardless of the table being %s",
+    (population) => {
+      expect(decidePreflightBlocker(spec, halfBuilt, population)?.state).toBe("build-incomplete");
+    },
+  );
+
+  it("never blocks when the index is already valid and ready", () => {
+    for (const population of ["empty", "absent", "populated"] as const) {
+      expect(decidePreflightBlocker(spec, usable, population)).toBeNull();
+    }
+  });
+
+  it("reports the spec's own remediation verbatim", () => {
+    const blocker = decidePreflightBlocker(spec, absent, "populated");
+    expect(blocker?.remediation).toBe(spec.createStatement);
+  });
+
+  it("applies uniformly to every registered entry, with no special-casing", () => {
+    // The behaviour is a property of the shared decision function, so a newly
+    // added registry entry inherits it without extra work. Asserted over the
+    // real registry so that stays true as entries are added.
+    for (const registered of PRECREATE_REQUIRED_INDEXES) {
+      expect(decidePreflightBlocker(registered, absent, "empty")).toBeNull();
+      expect(decidePreflightBlocker(registered, absent, "populated")?.state).toBe("absent");
+      expect(decidePreflightBlocker(registered, halfBuilt, "empty")?.state).toBe("build-incomplete");
+    }
+  });
+});
+
+describe("guarded migrations gate their raise on table population", () => {
+  it("gates only the absent-index path on emptiness, never the structural one", async () => {
+    // `decidePreflightBlocker` exempts an empty table for an *absent* index and
+    // deliberately does not for a half-built one. That asymmetry is only
+    // correct while the migrations keep this shape, so pin the shape here.
+    //
+    // Keyed on the two remediations rather than on branch syntax: the family
+    // spells the same logic as both `IF/ELSE` (0217) and `IF/ELSIF` (0205),
+    // and an `ELSE`-matching detector silently passes on five of the eight
+    // files. The mismatch raise is identifiable by its `DROP INDEX
+    // CONCURRENTLY` hint, which appears exactly once per file.
+    for (const spec of PRECREATE_REQUIRED_INDEXES) {
+      const contents = await readFile(`${migrationsDir}/${spec.migration}`, "utf8");
+
+      const structuralHint = contents.indexOf("DROP INDEX CONCURRENTLY");
+      expect(structuralHint, `${spec.migration} has no mismatch remediation`).toBeGreaterThan(-1);
+
+      const emptinessChecks = [...contents.matchAll(/EXISTS \(SELECT 1 FROM/g)].map(
+        (match) => match.index,
+      );
+      expect(
+        emptinessChecks.length,
+        `${spec.migration} lost its empty-table guard; the pre-flight exemption assumes one`,
+      ).toBeGreaterThan(0);
+
+      // Every emptiness check sits after the structural raise, so no emptiness
+      // test can gate it. A half-built index therefore raises on an empty
+      // table too — which is why the exemption must not cover it.
+      for (const at of emptinessChecks) {
+        expect(
+          at,
+          `${spec.migration} gained an emptiness check that could gate its structural raise`,
+        ).toBeGreaterThan(structuralHint);
+      }
+
+      // And the absent-index path really does build the index itself, inline
+      // and without CONCURRENTLY — which is what makes an empty table need no
+      // operator at all.
+      expect(contents, `${spec.migration} no longer builds its index inline`).toMatch(
+        /CREATE (?:UNIQUE )?INDEX "/,
+      );
+    }
   });
 });
 
