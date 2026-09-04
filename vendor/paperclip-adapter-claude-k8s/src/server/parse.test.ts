@@ -828,6 +828,159 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     ).toBe(false);
   });
 
+  // The generalisation, and the reason this guard is an allowlist rather than a
+  // fourth blocklist entry. `stream_event` wraps partial assistant deltas, so
+  // it carries model prose exactly as shapes (a)-(c) do, and it was enumerated
+  // by no previous version of this guard — so it must fail closed on that basis
+  // alone rather than on being recognised.
+  //
+  // Not hypothetical, and not merely reachable in principle: running
+  // `claude --print - --output-format stream-json --verbose
+  // --include-partial-messages` on v2.1.210 emits 9 `stream_event`s for a
+  // two-word prompt, and the line below is that observed shape (nested
+  // `event.delta.text_delta`, with `session_id`/`parent_tool_use_id`/`uuid`
+  // siblings). `--include-partial-messages` is not in the adapter's argv, but
+  // `job-manifest.ts` appends `config.extraArgs` verbatim, so any one agent's
+  // `adapterConfig` turns this on with no code change and no review.
+  it("refuses to scan when an unenumerated event type carries the phrase", () => {
+    const delta = "Skill 'verification-before-completion' not found";
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":${JSON.stringify(delta)}}},"session_id":"e45846ad","parent_tool_use_id":null,"uuid":"e07a5776"}`,
+      "Error: pod terminated",
+    ].join("\n");
+    // Preconditions: the phrase is present verbatim, and this event is not one
+    // of the roles any previous version of this guard enumerated — so only an
+    // allowlist can catch it.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(transcript).not.toContain('"type":"assistant"');
+    expect(transcript).not.toContain('"type":"user"');
+    const parsed = parseClaudeStreamJson(transcript);
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
+  // The counterweight to the test above, and the one that keeps this fix from
+  // becoming a silent disabling of the feature: a REAL init line is far richer
+  // than the minimal fixture at the top of this describe, and detection must
+  // survive that richness. Field set captured from the CLI this adapter runs
+  // (`claude --print - --output-format stream-json --verbose`, v2.1.210) — a
+  // 1717-byte line. Note what it does NOT contain: `mcp_servers` entries are
+  // `{name, status}` with no `type` of their own, and `output_style` is a bare
+  // string, so the whole line carries exactly ONE `"type"`. That measurement is
+  // the point of the assertion below — it is the fact that makes per-line
+  // scoping defence-in-depth rather than a fix for a live break, and if a
+  // future CLI adds a nested `type` here this test is where that shows up.
+  it("still classifies on a full production-shaped init line", () => {
+    const initLine = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      cwd: "/runtime-cache/workspace",
+      session_id: "76be93da-ad0c-44d0-98f1-d6a400d48ee5",
+      tools: ["Task", "Bash", "Read", "Edit", "Write"],
+      mcp_servers: [{ name: "gbrain", status: "connected" }],
+      model: "claude-opus-4-8[1m]",
+      permissionMode: "bypassPermissions",
+      slash_commands: ["verify", "code-review"],
+      apiKeySource: "ANTHROPIC_API_KEY",
+      claude_code_version: "2.1.210",
+      output_style: "default",
+      agents: ["claude", "Explore"],
+      skills: ["verify", "code-review"],
+      plugins: [],
+      capabilities: ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+      uuid: "6a5da5b1-9274-4b86-b930-a350a1e22e12",
+      fast_mode_state: "off",
+    });
+    // The measured invariant, pinned so a CLI change breaks this and not prod.
+    expect(initLine.match(/"type"\s*:\s*"/g)).toHaveLength(1);
+    const transcript = [initLine, 'Error: Skill "verification-before-completion" not found'].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Forward-looking, and labelled as such: no CLI version measured here emits a
+  // nested `type` on an init line (see the assertion above). This pins the
+  // behaviour if one ever does — the line keeps its detection, because the
+  // guard reads only the first type per line. Without per-line scoping this
+  // case would fail closed and silently disable detection in production while
+  // every minimal fixture in this file kept passing.
+  it("still classifies if an allowlisted line ever carries a nested type", () => {
+    const initLine = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [{ name: "gbrain", type: "http", status: "connected" }],
+    });
+    const transcript = [initLine, 'Error: Skill "verification-before-completion" not found'].join("\n");
+    // Precondition: the line really does carry a nested non-system type.
+    expect(initLine).toContain('"type":"http"');
+    expect(initLine).not.toContain('"type":"assistant"');
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // v2.1.210 emits `subtype:"status"` before the first turn, so allowlisting
+  // `system` wholesale has to cover it — a transcript that died after it is
+  // still a genuine startup death with no model output.
+  it("still classifies when a system:status event follows init", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"system","subtype":"status","status":"requesting","uuid":"3d1a9017","session_id":"e45846ad"}',
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Second detection-preserving case: a harness-authored event type other than
+  // `system` legitimately follows init with no model output at all.
+  // `rate_limit_event` is not hypothetical — `[initLine, rateLimitEvent]` is
+  // the verbatim FAR-32 production repro in execute.test.ts. Its payload is
+  // counters and ids, so it cannot carry the trigger phrase, and rejecting it
+  // would lose a real detection for nothing.
+  it("still classifies when a harness-authored rate_limit_event follows init", () => {
+    const rateLimitEvent = JSON.stringify({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "allowed", resetsAt: 1777056000, rateLimitType: "five_hour" },
+      uuid: "3ab8f9eb-b9d6-4bf6-9c39-4608427717fc",
+      session_id: "ad5f3e11-3c0c-4144-b53d-d4b959e57cee",
+    });
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      rateLimitEvent,
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Reading only the first type per line rests on Claude emitting the
+  // discriminator first. This pins the direction in which that assumption is
+  // allowed to fail: a re-ordered line whose nested type appears first is still
+  // rejected, because no nested type the CLI emits is on the allowlist. The
+  // symmetric cost — a re-ordered `system` line losing its detection — is the
+  // safe direction, since a missed detection degrades to the untyped
+  // `buildPartialRunError` while a false positive suppresses retries for good.
+  it("refuses to scan a conversation event whose type key is not first", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"message":{"content":[{"type":"text","text":"Skill \'verification-before-completion\' not found"}]},"type":"assistant"}',
+    ].join("\n");
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
+  });
+
   it("returns false for an unrelated startup failure", () => {
     expect(
       isClaudeSkillNotFoundStartupFailure({
