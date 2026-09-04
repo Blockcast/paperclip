@@ -1097,6 +1097,15 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           // plugin author who tested the fallback here would see `true` in the
           // harness and `false` in production. Seed `closed: true` to exercise
           // the torn-down-workspace fallback.
+          //
+          // The three CONDITIONS are mirrored; the host's path/name
+          // TRANSFORMATIONS are not. The host's third condition is really
+          // "`sanitizeWorkspacePath(cwd)` is non-empty", which additionally
+          // rejects a `cwd` with no slash or one matching `UUID_PATTERN`, and
+          // the host labels via `sanitizeWorkspaceName(name, path)`, which
+          // rejects UUID- or path-shaped names. Any realistic seeded path and
+          // name pass both, so nothing diverges today — but do not read this
+          // block as a full reimplementation of the host's sanitizers.
           if (
             isInCompany(executionWorkspace, companyId) &&
             !executionWorkspace?.closed &&
@@ -1117,7 +1126,14 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               branchName: executionWorkspace.branchName,
               isPrimary: false,
               isIssueScoped: true,
-              mode: executionWorkspace.mode ?? null,
+              // Never `null`/`undefined` on this limb: the host's `mode` is a
+              // non-null column, so an issue-scoped result always carries a
+              // real mode. Emitting `{ isIssueScoped: true, mode: null }` would
+              // contradict the `mode` contract in `types.ts`, which tells
+              // callers to read a falsy `mode` as project-scoped — so a plugin
+              // following that advice, against a workspace seeded without the
+              // optional `mode`, would see a result claiming both at once.
+              mode: executionWorkspace.mode ?? "isolated_workspace",
               createdAt: now,
               updatedAt: now,
             };

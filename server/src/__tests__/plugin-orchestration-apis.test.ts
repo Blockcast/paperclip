@@ -161,15 +161,67 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       companyId,
       projectId,
       projectWorkspaceId: null,
+      name: "Feature workspace",
       path: "/tmp/paperclip-feature",
       cwd: "/tmp/paperclip-feature",
       repoUrl: "https://example.com/paperclip.git",
       baseRef: "main",
       branchName: "feature/workspace",
       providerType: "git_worktree",
+      mode: "isolated_workspace",
+      closed: false,
       providerMetadata: { sandboxId: "sandbox-1" },
     });
     await expect(services.executionWorkspaces.get({ workspaceId, companyId: otherCompanyId })).resolves.toBeNull();
+  });
+
+  // Ally review of #1617: the mapper's `closed` is the one definition the SDK
+  // test double's fallback guard trusts, and it must stay MODE-INDEPENDENT.
+  // This case is seeded to fail under either of the two narrowings that have
+  // actually been made in this file's history:
+  //   - swapping to `isClosedIsolatedExecutionWorkspace` -> `mode` is not
+  //     `isolated_workspace`, so it short-circuits to `closed: false` and an
+  //     archived shared checkout reaches a plugin flagged live (the defect
+  //     fixed at `plugin-host-services.ts:1828`);
+  //   - re-deriving from `closedAt` alone -> `closedAt` is deliberately null
+  //     here, so `cleanup_failed` is missed.
+  // The happy-path case above pins `closed: false`; only this one pins the
+  // predicate's shape.
+  it("computes `closed` mode-independently, including the cleanup_failed status", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspaces",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      // NOT `isolated_workspace`, and NOT closed via `closedAt`.
+      mode: "shared_workspace",
+      strategyType: "git_worktree",
+      name: "Torn-down shared checkout",
+      status: "cleanup_failed",
+      closedAt: null,
+      cwd: "/tmp/paperclip-shared",
+      repoUrl: "https://example.com/paperclip.git",
+      baseRef: "main",
+      branchName: "shared/workspace",
+      providerType: "git_worktree",
+      providerRef: "/tmp/paperclip-shared",
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+
+    await expect(services.executionWorkspaces.get({ workspaceId, companyId })).resolves.toMatchObject({
+      id: workspaceId,
+      mode: "shared_workspace",
+      closed: true,
+    });
   });
 
   // BLO-31349: getWorkspaceForIssue took an issueId but used it only to find
