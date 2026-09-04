@@ -67,21 +67,77 @@ permissions:
   pull-requests: write
   statuses: read
 
-concurrency:
-  group: review-gate-sweep
-  cancel-in-progress: false
+# No `concurrency` block, deliberately -- BLO-31818. There used to be one
+# (`group: review-gate-sweep`, `cancel-in-progress: false`), added to stop a
+# backlog of sweeps piling up on top of each other. It could not deliver that:
+# GitHub holds at most ONE pending run per concurrency group, so a group cannot
+# serialise a backlog of N -- when a new run arrives and the slot is occupied it
+# EVICTS the run sitting there. `cancel-in-progress: false` means "do not cancel
+# a RUNNING job", not "never cancel". So the only thing the group could actually
+# do for a starved backlog was discard it.
+#
+# That is not theoretical. Measured 2026-09-04 on this repo, with the `default`
+# runner pool wedged from ~13:52Z (nothing on that label executed for 5h, while
+# `arc-light`/`arc-paperclip-general` PR runs started instantly):
+#
+#   33877561971  13:20Z  success  -- last sweep that actually ran
+#   33883204083  14:20Z  queued 4h+, zero jobs  -- holds the slot, never evicted
+#   33888968885  15:21Z  cancelled, zero jobs   -- evicted at 16:22:56 by its successor
+#   33894806243  16:22Z  cancelled, zero jobs   -- evicted at 17:17:57
+#   33899818405  17:17Z  cancelled, zero jobs   -- evicted at 18:23:58
+#
+# Each cancelled run's `updated_at` is exactly its successor's `created_at`, and
+# each reports `jobs: []` -- evicted while pending, never a timeout and never a
+# runner failure. This is worse than a late reconciler: the AC4 alarm (below)
+# surfaces a stranded PR by exiting non-zero, and a job that never starts cannot
+# exit non-zero, while `cancelled` is not `failure` -- so the Actions tab stays
+# clean. The backstop and the alarm on the backstop shared a single point of
+# failure.
+#
+# `cancel-in-progress: true` was the first candidate and is REJECTED: it does not
+# stop runs being cancelled, it only changes WHICH run dies -- the newest evicts
+# the oldest instead of the reverse. Cancelled-with-zero-jobs runs would still
+# appear every hour, so it fails the census this fix is verified by. It is also
+# actively worse under a dead pool, because runner allocation here is NOT FIFO by
+# creation and each new run re-enters the queue from the back.
+#
+# With no group, runs accumulate instead of evicting -- exactly what the sibling
+# guards on this label already do (`lockfile-drift-monitor`, `codeowners-guard`,
+# `relay-ssl-multicert-guard`, `ally-review-consistency` carry no `concurrency`
+# block and were merely late through the same window, never lost). The first run
+# to get a runner reconciles from live API state and re-fires whatever it finds
+# stalled, so a queued backlog costs latency, not correctness.
+#
+# RESIDUAL, stated rather than implied (BLO-31818 AC3): when capacity returns,
+# every queued sweep runs. At 90 open PRs that is ~270 reads each against the
+# 1,000/hour/repository `github.token` budget, so a long starvation window can
+# exhaust it. That degrades LOUDLY -- the script detects rate-limit exhaustion
+# explicitly and reports it, and writes stay capped by MAX_REFIRES_PER_RUN -- so
+# it turns the tab red rather than going quiet, which is the failure direction
+# this reconciler must never have. Overlapping sweeps do not double-post: the
+# re-fire cooldown is derived per-PR from the marker comments already on the PR
+# (`existing_marker_epochs`), i.e. from GitHub state, not from run-local state.
 
 jobs:
   sweep:
     name: Sweep stalled Ally reviews
     runs-on: default
-    # Bounded so one hung API call cannot hold the job to the Actions 6-hour
-    # ceiling. That matters more here than on a normal job: with
-    # `cancel-in-progress: false` above, every subsequent 30-minute run queues
-    # behind a hung one, so a single stalled socket becomes a multi-hour
-    # reconciler outage. Matches the sibling `ally-review-consistency.yml`
-    # (10m); slightly higher because this sweep makes one request per open PR.
-    # The script also bounds each individual request (REQUEST_TIMEOUT_SECONDS).
+    # WHAT THIS BOUND COVERS: a job that has STARTED and then hangs -- one
+    # stalled socket cannot hold it to the Actions 6-hour ceiling. Matches the
+    # sibling `ally-review-consistency.yml` (10m); slightly higher because this
+    # sweep makes one request per open PR. The script also bounds each
+    # individual request (REQUEST_TIMEOUT_SECONDS).
+    #
+    # WHAT IT DOES NOT COVER, and cannot: a run starved in `queued` before a
+    # runner is ever assigned. `timeout-minutes` is a JOB-level bound and only
+    # engages once the job starts, so a run with `jobs: []` is not bounded by it
+    # at any value. Measured 2026-09-04 (BLO-31818): run 33883204083 sat queued
+    # over 4 hours, 16x this 15-minute ceiling, having never started a step.
+    # There is no workflow-level equivalent -- GitHub exposes no queue-time
+    # bound -- so do not try to raise or lower this number to address a starved
+    # queue. That failure mode is a runner-capacity problem, and the thing this
+    # workflow does about it is refuse to lose runs to it (see the note on the
+    # absent `concurrency` block above).
     timeout-minutes: 15
     steps:
       - name: Checkout
