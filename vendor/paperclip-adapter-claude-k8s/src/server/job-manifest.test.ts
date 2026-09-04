@@ -1249,7 +1249,7 @@ describe("buildJobManifest", () => {
     it("sets default resource requests and limits", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const resources = job.spec?.template?.spec?.containers[0]?.resources;
-      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1.5Gi" });
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1536Mi" });
       expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
     });
 
@@ -1270,7 +1270,7 @@ describe("buildJobManifest", () => {
       };
       const { job } = buildJobManifest({ ctx, selfPod });
       const resources = job.spec?.template?.spec?.containers[0]?.resources;
-      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1.5Gi" });
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1536Mi" });
       expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
     });
 

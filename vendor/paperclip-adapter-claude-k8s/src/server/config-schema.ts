@@ -100,7 +100,7 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "text",
       key: "resources.requests.memory",
       label: "Memory Request",
-      hint: "Memory request for Job pods (e.g. 128Mi, 512Mi, 1Gi).",
+      hint: "Memory request for Job pods (e.g. 128Mi, 512Mi, 1Gi). Default '1536Mi'.",
     },
     {
       type: "text",
