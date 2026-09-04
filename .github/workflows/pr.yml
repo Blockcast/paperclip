@@ -121,6 +121,25 @@ jobs:
         run: node --test ./scripts/check-docker-abandon-in-flight-inputs.test.js
         timeout-minutes: 1
 
+      # BLO-31666: the automatic half of the above. The escape hatch pinned by
+      # its neighbour is recovery and needs a human who knows it exists; this is
+      # prevention — the deploy job retires the lock it took when `helm upgrade`
+      # never ran. The safety condition is the whole design, since retiring a
+      # lock whose rollout IS in flight lets a competing release rotate the ring
+      # underneath a landing one.
+      #
+      # Deliberately NOT render-level, unlike its neighbours. #1636's review
+      # showed two presence-only assertions passing against mutated code — an
+      # inverted-polarity guard and a condition gutted to `if false; then` — so
+      # this extracts the step's real shell and runs the full conclusion matrix,
+      # and runs the retirement itself against a stubbed cluster to prove it
+      # clears every constituent annotation, leaves the approval ring alone, and
+      # never touches a lock whose digest+owner pair it did not write.
+      - name: Validate in-flight lock retirement on a skipped helm upgrade (BLO-31666)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-retire-in-flight-lock.test.js
+        timeout-minutes: 1
+
       # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
       # are load-bearing: running it after the rollout starts reports the
       # problem only once the 30-minute timeout has already burned, and an
