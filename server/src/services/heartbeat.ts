@@ -9620,6 +9620,13 @@ const EPISTEMIC_HEAD =
   "|stat(?:e|es|ed|ing)|assert(?:s|ed|ing)?|claim(?:s|ed|ing)?" +
   "|rul(?:e|es|ed|ing)\\s+out)";
 
+// See the use site in prReviewOutputHasAlreadyReviewedSkip: a sentence-initial
+// hedge adverb's own trailing comma is rejoined to its clause. Anchored to a
+// sentence start (beginning of window, or after . : ; newline) so it cannot
+// touch a comma that is genuinely separating two clauses.
+const LEADING_ADVERB_COMMA =
+  /(^|[.:;\n]\s*)((?:possibly|probably|presumably|apparently|perhaps|maybe|likely|arguably|seemingly|supposedly|allegedly|reportedly)),\s*/gi;
+
 // Ally passes six through ten each found exactly one more cue matching
 // unbound — a veto reaching a clause it does not govern, which is the
 // false-`missing` direction this function exists to remove. Binding them one
@@ -9672,7 +9679,7 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   {
     name: "assumption",
     stem:
-      "\\b(?:possibly|probably|presumably|assuming|assumption|apparently|guess(?:es|ing|ed)?" +
+      "\\b(?:possibly|probably|presumably|assum(?:e|es|ed|ing|ption|ptions)|presum(?:e|es|ed|ption|ptions)|apparently|guess(?:es|ing|ed)?" +
       "|perhaps|maybe|likely|plausible|seem(?:s|ed)?|appear(?:s|ed)?|believ(?:e|es|ed)" +
       "|think(?:s|ing)?|thought|suspect(?:s|ed)?|look(?:s|ed)?\\s+like" +
       // Thirteenth pass: predicative adjectives whose ADVERB was already
@@ -9825,7 +9832,15 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
       const rescuedSha = rescued?.[1] ?? "";
       if (!/^[0-9a-f]+$/.test(rescuedSha) || !/[a-f]/.test(rescuedSha)) continue;
     }
-    const before = clauseBefore.exec(text.slice(Math.max(0, m.index - CLAUSE_SCOPE_CHARS), m.index))?.[0] ?? "";
+    // A sentence-initial hedge adverb followed by its own comma ("Possibly,
+    // this head was …") is one clause, not two: the comma belongs to the
+    // adverb, and treating it as a boundary severs the adverb from the clause
+    // it governs — measured as a masking gap by the parallel probe. Only that
+    // one shape is rejoined; a comma anywhere else remains a boundary.
+    const window = text
+      .slice(Math.max(0, m.index - CLAUSE_SCOPE_CHARS), m.index)
+      .replace(LEADING_ADVERB_COMMA, "$1$2 ");
+    const before = clauseBefore.exec(window)?.[0] ?? "";
     if (GOVERNING_CUES.some(({ re }) => re.test(before))) continue;
     return true;
   }
