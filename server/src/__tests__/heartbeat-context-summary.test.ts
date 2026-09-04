@@ -1310,6 +1310,17 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`Nothing new was seen still that head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No evidence yet that this head was already reviewed at \`${sha}\`.`, false],
       [`No evidence still that this head was already reviewed at \`${sha}\`.`, false],
+      [`I assume this head was already reviewed at \`${sha}\`.`, false],
+      [`I assumed this head was already reviewed at \`${sha}\`.`, false],
+      [`The run assumes this head was already reviewed at \`${sha}\`.`, false],
+      [`My assumptions are that this head was already reviewed at \`${sha}\`.`, false],
+      [`I presume this head was already reviewed at \`${sha}\`.`, false],
+      [`Possibly, this head was already reviewed at \`${sha}\`.`, false],
+      [`Probably, this head was already reviewed at \`${sha}\`.`, false],
+      [`Perhaps, this head was already reviewed at \`${sha}\`.`, false],
+      [`I checked the wake. Possibly, a retry so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The wake was possibly a duplicate, so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Not possibly, this head was already reviewed at \`${sha}\`.`, true],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
