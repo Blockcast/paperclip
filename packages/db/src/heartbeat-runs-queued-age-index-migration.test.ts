@@ -53,7 +53,7 @@ describeEmbeddedPostgres("heartbeat-run queued-age index migration", () => {
     `;
 
     await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
-      message: "migration 0217 requires online queued-age index precreation",
+      message: "migration 0217 requires online index precreation",
       hint: expect.stringContaining(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME}`),
     });
     expect(await inspectMigrations(database.connectionString)).toMatchObject({

@@ -48,7 +48,7 @@ BEGIN
   ELSE
     IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0217 requires online queued-age index precreation',
+        MESSAGE = 'migration 0217 requires online index precreation',
         HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_queued_age_idx ON heartbeat_runs USING btree (agent_id, (coalesce(queued_at, created_at))) WHERE status = ''queued''; then retry migrations.';
     END IF;
 
@@ -57,7 +57,7 @@ BEGIN
     LOCK TABLE "heartbeat_runs" IN SHARE MODE;
     IF EXISTS (SELECT 1 FROM "heartbeat_runs" LIMIT 1) THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0217 requires online queued-age index precreation',
+        MESSAGE = 'migration 0217 requires online index precreation',
         HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_queued_age_idx ON heartbeat_runs USING btree (agent_id, (coalesce(queued_at, created_at))) WHERE status = ''queued''; then retry migrations.';
     END IF;
 
