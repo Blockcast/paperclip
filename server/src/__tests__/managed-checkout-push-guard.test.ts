@@ -218,6 +218,14 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     // The displaced value is recorded rather than destroyed.
     const recorded = await git(["config", "--local", "--get", PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY], base);
     expect(recorded.stdout.trim()).toBe(globalHooks);
+
+    // The warning claims run worktrees inherit the takeover harmlessly. Worktrees
+    // share the git common dir, so the local core.hooksPath written above applies
+    // to them too -- exercise that rather than asserting it in prose. This is the
+    // displaced case specifically; test 6 covers worktrees without a takeover.
+    const worktree = path.join(root, `worktree-displaced-${counter++}`);
+    await git(["worktree", "add", "-b", "wt-displaced-probe", worktree], base);
+    expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toMatch(/^[0-9a-f]{40}$/);
   });
 
   it("installs into a repo-private core.hooksPath without touching config", async () => {
@@ -388,17 +396,32 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     const operatorHook = "#!/bin/sh\n# operator policy\nexit 0\n";
     await fs.writeFile(hookPath, operatorHook, { encoding: "utf8", mode: 0o755 });
 
-    await fs.writeFile(`${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`, "old-0\n", "utf8");
-    for (let index = 1; index <= PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS; index += 1) {
-      await fs.writeFile(`${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}.${index}`, `old-${index}\n`, "utf8");
+    // Exactly the names reserveDisplacedHookPath() reserves: the unnumbered one
+    // plus `.1`..`.MAX-1`, MAX in total. Occupying one FEWER must still SUCCEED,
+    // and that half is what pins the loop bound -- a test that only over-fills
+    // passes just as happily against an off-by-one budget.
+    const backupName = (index: number) =>
+      index === 0
+        ? `${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`
+        : `${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}.${index}`;
+    for (let index = 0; index < PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS - 1; index += 1) {
+      await fs.writeFile(backupName(index), `old-${index}\n`, "utf8");
     }
 
+    // One slot left: the guard installs and consumes it.
+    const spare = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(spare.state).toBe("installed");
+    expect(spare.displacedHookPath).toBe(backupName(PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS - 1));
+    expect(await fs.readFile(spare.displacedHookPath!, "utf8")).toBe(operatorHook);
+
+    // Re-arm with every slot now taken.
+    await fs.writeFile(hookPath, operatorHook, { encoding: "utf8", mode: 0o755 });
     const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
     expect(result.state).toBe("install_failed");
     expect(result.warning).toContain("declined");
     // Nothing touched: neither the live hook nor any existing backup.
     expect(await fs.readFile(hookPath, "utf8")).toBe(operatorHook);
-    expect(await fs.readFile(`${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`, "utf8")).toBe("old-0\n");
+    expect(await fs.readFile(backupName(0), "utf8")).toBe("old-0\n");
   });
 
   it("materializes the receive.* keys locally even when a global config already sets them", async () => {
