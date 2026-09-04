@@ -155,15 +155,32 @@
 --
 --   1. Under the lever, production's plan for the head scan is ordered and
 --      index-only — `Index Only Scan`, no `Sort`. Check that PROPERTY, not
---      which index supplies it. Expect the plan to name THIS index rather than
---      `heartbeat_runs_agent_dispatch_idx`: 0237 is deliberately narrower for
---      exactly this predicate, so a custom plan legitimately prefers it (the
---      pinned index-name assertions in heartbeat-dispatch-query-plan.test.ts
---      failed on this branch's first run for that reason, and were relaxed to
---      `expectOrderedDispatchIndex`). Seeing this index is the EXPECTED result
---      and is not a sign the lever failed — that is why the assertions encode
+--      which index supplies it. Expect EITHER ordered index; NEITHER name is a
+--      signal about the lever, and seeing one rather than the other is not a
+--      sign the lever failed — that is why the assertions encode
 --      `ORDERED_DISPATCH_INDEXES` instead of one name, and the same reasoning
 --      applies here.
+--
+--      Do NOT expect THIS index specifically. An earlier draft of this step
+--      did, on the reasoning that 0237 is deliberately narrower for exactly
+--      this predicate so a custom plan should prefer it. The numbers recorded
+--      in heartbeat-dispatch-query-plan.test.ts do not support that: 0208
+--      costs 4.30 VACUUMed (:1083) and 8.30 at relallvisible=0 (:1084), and
+--      0237 costs 4.30 and 8.30 at those same two settings (:1101, :1102).
+--      They TIE in both regimes, so narrowness does not show up as a cost
+--      advantage at this estimate at all — consistent with the note 25 lines
+--      above, that at a 1-row estimate the width difference does not register
+--      in the cost model. Caveat that inference honestly: both tables measure
+--      against 0217 as the comparator in separate runs, so reading a
+--      0208-vs-0237 tie ACROSS them is a cross-table inference and not a
+--      head-to-head measurement. If you need the head-to-head, measure it.
+--
+--      What the pinned index-name assertions actually showed, when they failed
+--      on this branch's first run and were relaxed to
+--      `expectOrderedDispatchIndex`, is therefore a TIE-BREAK on the VACUUMed
+--      fixture and not a cost preference. A tie-break is arbitrary — it can
+--      land on either index and can differ between the fixture and production,
+--      which is precisely why step 1 checks the property and not the name.
 --
 --   2. Then, before dropping, confirm 0208's index alone still supplies that
 --      ordered index-only path with THIS index absent, because step 1 cannot
