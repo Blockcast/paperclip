@@ -6398,10 +6398,10 @@ export function buildK8sRunIsolationDescriptor(input: {
   // no lock-ordering or retry fix available and no configuration in which the
   // race closes.
   //
-  // Grep the three symbols named above rather than trusting line numbers. An
-  // earlier draft of this very comment cited absolute lines and its own +3-line
-  // edit silently moved them onto a different cancel branch; each symbol
-  // resolves to exactly one definition site, so the numbers bought nothing.
+  // Grep `executionRunClaimCondition`, `allowsIssueInteractionWake` and
+  // `issueLockRequired` rather than trusting line numbers. Each resolves to
+  // exactly one definition site, and a line number cited from inside the file
+  // it points into goes stale on the next edit to that same file.
   //
   // This is still strictly better than the behavior it replaces, which is why
   // it ships: the pre-fix run did not get an exclusive workspace either, it got
