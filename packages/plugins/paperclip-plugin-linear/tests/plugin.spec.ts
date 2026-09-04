@@ -3497,6 +3497,13 @@ describe("paperclip-plugin-linear", () => {
       });
 
       const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+      // "`create` never pays the round-trip" is load-bearing — it is why the
+      // legacy guard is gated on `action` rather than run unconditionally, and
+      // it is half of what BLO-31657 buys (one fewer RPC per bridged comment).
+      // Nothing else in this spec pins it: hoisting the guard above the `action`
+      // check in a later refactor would silently restore the round-trip and
+      // every outcome assertion would still pass.
+      const listSpy = vi.spyOn(harness.ctx.issues, "listComments");
 
       await plugin.definition.onWebhook!({
         endpointKey: "linear-events",
@@ -3519,7 +3526,9 @@ describe("paperclip-plugin-linear", () => {
       expect(createSpy.mock.calls[0]![3]).toMatchObject({
         idempotencyKey: "linear-comment:lin-comment-uuid-key",
       });
+      expect(listSpy).not.toHaveBeenCalled();
       createSpy.mockRestore();
+      listSpy.mockRestore();
     });
 
     // BLO-31657 regression. A comment bridged before the key shipped carries

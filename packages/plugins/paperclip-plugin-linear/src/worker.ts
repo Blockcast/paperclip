@@ -3663,12 +3663,20 @@ async function handleWebhookEvent(
     // insert still dedups, so proceeding is only a risk for the legacy rows this
     // guard exists for, and an occasional duplicate beats dropping a real edit
     // of a comment that was never mirrored at all.
+    //
+    // This is also where BLO-31634 (edit propagation) hooks in, and the reason
+    // the match is kept rather than tested away: the sentinel is written for
+    // every `linearCommentId` (below), so *every* mirror carries one — keyed and
+    // legacy alike — and this guard is therefore where all edits of an
+    // already-mirrored comment actually stop. Propagating an edit needs an
+    // update keyed on the existing comment, and `mirrored.id` is that handle.
     if (action === "update" && linearCommentId) {
       try {
         const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
         const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
-        if (existing.some((c) => typeof c.body === "string" && c.body.includes(sentinel))) {
-          ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping edit (BLO-31634)`);
+        const mirrored = existing.find((c) => typeof c.body === "string" && c.body.includes(sentinel));
+        if (mirrored) {
+          ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier} as comment ${mirrored.id}; skipping edit (BLO-31634)`);
           return;
         }
       } catch (err) {
@@ -3705,15 +3713,16 @@ async function handleWebhookEvent(
       // did not happen, once per duplicate delivery — exactly the noise the
       // key is bought to remove.
       //
-      // An `action: "update"` delivery for a post-BLO-31657 mirror also lands
-      // here: a Linear edit keeps the comment's UUID, so the key is unchanged
-      // and the edit dedups against the original mirror instead of propagating.
-      // (Pre-BLO-31657 mirrors have no key and are caught by the sentinel guard
-      // above instead — same outcome, different mechanism.) Either way the edit
-      // is skipped, not propagated. That is BLO-31634, deliberately *unchanged*
-      // here rather than fixed in passing: propagating an edit needs an update
-      // call keyed on the existing comment, not a create. The comment id handed
-      // back on this path is what such a fix would target.
+      // In practice this is a `create`-only branch. An `action: "update"` for an
+      // already-mirrored comment — keyed or legacy — stops at the sentinel guard
+      // above and never reaches here, because the sentinel is written under the
+      // same `linearCommentId` condition as the key, so every keyed mirror
+      // carries one too. The sole residual is an `update` whose `listComments`
+      // threw: the catch proceeds, and a keyed mirror then dedups here.
+      //
+      // Edits are skipped either way, not propagated. That is BLO-31634,
+      // deliberately *unchanged* here rather than fixed in passing; the guard
+      // above is where it hooks in, not this branch.
       if (created.deduplicated) {
         ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
         return;
