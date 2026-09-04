@@ -1753,6 +1753,14 @@ export interface PluginIssuesClient {
        * Checked under a share lock inside the insert's transaction.
        */
       fencing?: PluginFencingPrecondition;
+      /**
+       * Dedup key, unique per (issue, author scope). A second create carrying a
+       * key already written to this issue returns the existing comment instead
+       * of inserting — atomically, in the database, so it holds across replicas
+       * and across concurrent deliveries. Omit for today's behaviour: no key
+       * means no dedup.
+       */
+      idempotencyKey?: string | null;
     },
   ): Promise<IssueComment>;
   createInteraction(

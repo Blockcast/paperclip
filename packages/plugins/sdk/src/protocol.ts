@@ -1667,6 +1667,14 @@ export interface WorkerToHostMethods {
       companyId: string;
       authorAgentId?: string;
       fencing?: PluginFencingPrecondition;
+      /**
+       * Dedup key, unique per (issue, author scope). A second create carrying a
+       * key already written to this issue returns the existing comment instead
+       * of inserting — atomically, in the database, so it holds across replicas
+       * and across concurrent deliveries. Omit for today's behaviour: no key
+       * means no dedup.
+       */
+      idempotencyKey?: string | null;
     },
     result: IssueComment,
   ];
