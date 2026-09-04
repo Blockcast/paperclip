@@ -26,6 +26,7 @@ import {
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import type { FallbackOwnerResolution } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
@@ -1095,14 +1096,14 @@ function suppressionExpiryLabel(
  * delivery (rather than the module) is what keeps it correct: a config edit or
  * an agent being paused takes effect on the very next delivery.
  */
-export type FallbackOwnerMemo = Map<string, Promise<string | undefined>>;
+export type FallbackOwnerMemo = Map<string, Promise<FallbackOwnerResolution>>;
 
 function resolveFallbackAgentIdMemoized(
   ctx: Pick<PluginContext, "agents" | "logger">,
   companyId: string,
   fallbackAgentName: string | undefined,
   memo: FallbackOwnerMemo | undefined,
-): Promise<string | undefined> {
+): Promise<FallbackOwnerResolution> {
   if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
   // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
   // operator-supplied config, so any single-character separator could be
@@ -1115,11 +1116,12 @@ function resolveFallbackAgentIdMemoized(
     companyId,
     fallbackAgentName,
   ).catch((err: unknown) => {
-    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to
-    // `undefined` and IS cached — it is a config fact, stable for the delivery.
-    // A *throw* is a transient host fault, and caching it would let one failed
-    // `agents.list` poison every remaining alert in the batch, converting a
-    // blip that previously cost one alert into a whole-delivery failure.
+    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to a
+    // `refusal` value and IS cached — the underlying condition is stable for the
+    // delivery, whether or not it is permanent beyond it. A *throw* is a
+    // transient host fault, and caching it would let one failed `agents.list`
+    // poison every remaining alert in the batch, converting a blip that
+    // previously cost one alert into a whole-delivery failure.
     memo.delete(key);
     throw err;
   });
@@ -1552,7 +1554,7 @@ export async function handleFiring(
         ? `agent:${resolution.agentId}`
         : resolution.email ?? "(none)";
   }
-  const fallbackAssigneeAgentId =
+  const fallbackResolution =
     retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
@@ -1561,18 +1563,40 @@ export async function handleFiring(
           config.fallbackAgentName,
           fallbackOwnerMemo,
         );
+  const fallbackAssigneeAgentId = fallbackResolution?.agentId;
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
   if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+    // Only `terminated` / wrong-name / genuinely-ambiguous is unfixable by
+    // retrying. A `paused` or `pending_approval` fallback owner becomes
+    // invokable without anyone editing config, and Alertmanager's retry window
+    // is the only thing that lets the alert land within minutes of that rather
+    // than waiting out a whole `repeat_interval`. Absent a classification we
+    // take the transient branch: a needless retry burst is survivable, a
+    // wrongly-dropped alert is not.
+    const isPermanent = fallbackResolution?.refusal === "permanent";
     ctx.logger.warn(
-      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous (${
+        isPermanent ? "permanent" : "transient"
+      })`,
     );
-    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
-      alertname,
-      severity,
-    });
-    throw new PermanentAlertError(
-      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
-    );
+    try {
+      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+        alertname,
+        severity,
+      });
+    } catch (metricErr) {
+      // Best-effort, matching the severity-floor and opt-out drops above. On the
+      // permanent branch this is load-bearing: letting a metrics outage throw
+      // would surface a *metrics* error instead of `PermanentAlertError`, the
+      // per-alert catch would push the fingerprint, and the delivery would 502
+      // — reinstating exactly the doomed retry burst this path removes, and
+      // taking the rest of the batch down with it.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record fallback owner metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    const message = `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`;
+    throw isPermanent ? new PermanentAlertError(message) : new Error(message);
   }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);

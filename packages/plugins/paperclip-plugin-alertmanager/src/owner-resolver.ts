@@ -7,6 +7,7 @@
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { getAgentWorkEligibility } from "@paperclipai/shared";
+import type { AgentEligibilityLifecycleReason } from "@paperclipai/shared";
 import {
   ASSIGNEE_OVERRIDE_ANNOTATION,
   ASSIGNEE_OVERRIDE_LABEL,
@@ -176,12 +177,12 @@ export async function resolveAssigneeUserId(
  * can review in a config diff. That makes the lookup ambiguous in principle,
  * so anything other than exactly one match is refused: zero matches means the
  * name is wrong, and more than one means the caller cannot know which agent
- * the operator meant. Both return `undefined`, and the caller fails closed
- * rather than filing an ownerless issue.
+ * the operator meant. Both refuse, and the caller fails closed rather than
+ * filing an ownerless issue.
  *
- * Returning `undefined` for blank/absent config is deliberate: an instance
- * with no `fallbackAgentName` at all is a misconfiguration for this plugin,
- * and the caller — not this resolver — decides how loudly to fail.
+ * Refusing for blank/absent config is deliberate: an instance with no
+ * `fallbackAgentName` at all is a misconfiguration for this plugin, and the
+ * caller — not this resolver — decides how loudly to fail.
  *
  * A name match is not enough: the agent must also be *invokable*. The host's
  * `agents.list` filters only `terminated` (`server/src/services/agents.ts`), so
@@ -195,14 +196,71 @@ export async function resolveAssigneeUserId(
  * in step with what `invoke` actually enforces (including an invalid reporting
  * chain, which blocks invoke just as surely as a paused status). The whole
  * company snapshot is already in hand, which is exactly the input it needs.
+ *
+ * A refusal is additionally classified `permanent` or `transient`, because the
+ * caller reports the two through different channels: a permanent refusal is
+ * dropped with a 200 (retrying cannot help), while a transient one keeps
+ * Alertmanager's retry window, which is the only thing that lets an alert land
+ * within minutes of a pause lifting. See `REFUSAL_CLASS_BY_INVOKABILITY_REASON`.
+ */
+export type FallbackOwnerRefusal = "permanent" | "transient";
+
+/**
+ * Either a resolved fallback owner, or a refusal with its class. Exactly one
+ * field is ever set — the caller checks `agentId` first and only consults
+ * `refusal` on the miss.
+ */
+export type FallbackOwnerResolution =
+  | { agentId: string; refusal?: undefined }
+  | { agentId?: undefined; refusal: FallbackOwnerRefusal };
+
+/**
+ * Which non-invokable reasons clear on their own, and which need a human to
+ * change config or the roster.
+ *
+ * `paused` and `pending_approval` are process state: an unpause or a board
+ * approval flips them with nobody editing config, and `invalid_org_chain`
+ * clears when the manager upstream is restored. Only `terminated` is the
+ * roster fact that no amount of waiting fixes.
+ *
+ * `unknown_status` is deliberately transient: it means this resolver does not
+ * recognise the status, so it cannot claim the condition is unfixable.
+ * Misclassifying transient-as-permanent drops an alert; permanent-as-transient
+ * only costs a retry burst, so the unknown case takes the survivable error.
+ *
+ * Declared as an exhaustive `Record` rather than a `Set` of the permanent ones
+ * so that adding a reason to `AgentEligibilityLifecycleReason` fails to compile
+ * here instead of silently defaulting a new condition into either class.
+ */
+const REFUSAL_CLASS_BY_INVOKABILITY_REASON: Record<
+  AgentEligibilityLifecycleReason,
+  FallbackOwnerRefusal
+> = {
+  terminated: "permanent",
+  paused: "transient",
+  pending_approval: "transient",
+  invalid_org_chain: "transient",
+  unknown_status: "transient",
+  // Never reached: an `eligible` agent is invokable and so never refused.
+  // Present only to keep the record exhaustive. Mapped to `transient` rather
+  // than `permanent` so that the unreachable case, if a future refactor ever
+  // does reach it, fails in the same survivable direction as `unknown_status`:
+  // a needless retry burst, not a dropped alert.
+  eligible: "transient",
+};
+
+/**
+ * Resolve the configured `fallbackAgentName` to exactly one invokable agent id,
+ * or explain why it could not.
  */
 export async function resolveFallbackAgentId(
   ctx: Pick<PluginContext, "agents" | "logger">,
   companyId: string,
   fallbackAgentName: string | undefined,
-): Promise<string | undefined> {
+): Promise<FallbackOwnerResolution> {
   const target = fallbackAgentName?.trim().toLowerCase();
-  if (!target) return undefined;
+  // No name configured at all: nothing resolves until someone edits config.
+  if (!target) return { refusal: "permanent" };
   // One unwindowed company-wide snapshot rather than a paged scan: the host's
   // list is unordered, so paging could drift a match across page boundaries
   // and turn a stable config into an intermittent ownerless-issue bug.
@@ -227,17 +285,31 @@ export async function resolveFallbackAgentId(
             `${entry.agent.id}=${entry.eligibility.invokabilityReason}`,
         )
         .join(", ");
+      // Any one self-clearing candidate makes the whole refusal transient: a
+      // paused duplicate alongside a terminated one still becomes resolvable
+      // the moment the pause lifts, with no config edit.
+      const refusal: FallbackOwnerRefusal = evaluated.some(
+        (entry) =>
+          REFUSAL_CLASS_BY_INVOKABILITY_REASON[
+            entry.eligibility.invokabilityReason
+          ] === "transient",
+      )
+        ? "transient"
+        : "permanent";
       ctx.logger.warn(
-        `Fallback agent "${fallbackAgentName}" matched ${evaluated.length} agent(s) but none are invokable (${reasons}); refusing ownerless issue creation`,
+        `Fallback agent "${fallbackAgentName}" matched ${evaluated.length} agent(s) but none are invokable (${reasons}); refusing ownerless issue creation (${refusal})`,
       );
-      return undefined;
+      return { refusal };
     }
     ctx.logger.warn(
       `Fallback agent "${fallbackAgentName}" resolved to ${invokable.length} invokable agents; refusing ownerless issue creation`,
     );
-    return undefined;
+    // Zero name matches (wrong name) and two or more invokable matches
+    // (genuinely ambiguous) are both config facts: neither changes on its own.
+    return { refusal: "permanent" };
   }
-  return invokable[0]?.agent.id;
+  const agentId = invokable[0]?.agent.id;
+  return agentId ? { agentId } : { refusal: "permanent" };
 }
 
 function normalizeEmail(email: string): string {
