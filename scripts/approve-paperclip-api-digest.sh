@@ -122,22 +122,35 @@ del(.metadata.annotations[$digest_key])
 | del(.metadata.annotations[$owner_key])
 CLEAR_JQ
 
+# kubectl's stderr from the most recent clear_in_flight_lock call. Declared
+# here so it is readable under `set -u` even if the function never ran.
+CLEAR_IN_FLIGHT_LOCK_ERR=""
+
 # resourceVersion rides along inside the object read here, so `kubectl replace`
 # is rejected with a 409 if anyone else changed the transaction in between --
 # the same optimistic-concurrency guard the rotation write uses, for the same
 # reason. Retried from a fresh read rather than forced.
 clear_in_flight_lock() {
   local json="$1"
-  jq \
-    --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
-    --arg plan_key "$LOCK_PLAN_ANNOTATION" \
-    --arg uid_key "$LOCK_UID_ANNOTATION" \
-    --arg generation_key "$LOCK_GENERATION_ANNOTATION" \
-    --arg marker_key "$LOCK_MARKER_ANNOTATION" \
-    --arg server_plan_key "$LOCK_SERVER_PLAN_ANNOTATION" \
-    --arg owner_key "$LOCK_OWNER_ANNOTATION" \
-    "$CLEAR_IN_FLIGHT_LOCK_JQ" <<<"$json" \
-    | kubectl replace -f - >/dev/null 2>&1
+  local status=0
+  # `2>&1 >/dev/null` in that order: stderr is duplicated onto the command
+  # substitution's pipe first, then stdout is discarded. Capturing rather than
+  # discarding is what lets the retire-only loop tell a 409 (retrying may win)
+  # from an RBAC denial or a vanished ConfigMap (retrying cannot), the same
+  # distinction the rotation write makes further down this file.
+  CLEAR_IN_FLIGHT_LOCK_ERR="$(
+    jq \
+      --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
+      --arg plan_key "$LOCK_PLAN_ANNOTATION" \
+      --arg uid_key "$LOCK_UID_ANNOTATION" \
+      --arg generation_key "$LOCK_GENERATION_ANNOTATION" \
+      --arg marker_key "$LOCK_MARKER_ANNOTATION" \
+      --arg server_plan_key "$LOCK_SERVER_PLAN_ANNOTATION" \
+      --arg owner_key "$LOCK_OWNER_ANNOTATION" \
+      "$CLEAR_IN_FLIGHT_LOCK_JQ" <<<"$json" \
+      | kubectl replace -f - 2>&1 >/dev/null
+  )" || status=$?
+  return "$status"
 }
 
 # Must stay in lockstep with the `maxApprovedApiDigests` CEL variable in
@@ -188,6 +201,12 @@ retire_only_usage() {
   echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<64 lowercase hex> \\" >&2
   echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<64 lowercase hex> $0" >&2
   echo "retire-only mode takes no positional arguments; it names the lock by env" >&2
+  echo >&2
+  echo "The owner must be the CURRENT one. An exact retry adopts the lock and" >&2
+  echo "rewrites that annotation, so if a deploy re-ran after a cleanup step" >&2
+  echo "already failed, the owner in that first run's log is stale and will be" >&2
+  echo "refused here as 'nothing to retire'. Take the owner from the most recent" >&2
+  echo "deploy's approval-step epilogue, which prints the lock it actually holds." >&2
   exit 2
 }
 
@@ -288,6 +307,18 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
       echo "The ring still lists that digest, so a corrected plan or a rollback is"
       echo "admitted without an out-of-band edit."
       exit 0
+    fi
+
+    # A conflict proves this write lost a race, so a fresh read may win the
+    # next one. Anything else -- an approver Role missing `update`, a deleted
+    # ConfigMap -- fails identically on all three attempts, and spending 6s to
+    # then report the generic "could not retire" below hides the actual cause
+    # from the operator who now has to clear the lock by hand. Same test, and
+    # same reasoning, as the rotation write's non-retriable bail.
+    if ! grep -qiE 'conflict|modified|latest version' <<<"$CLEAR_IN_FLIGHT_LOCK_ERR"; then
+      echo "cannot retire the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}):" >&2
+      printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" >&2
+      exit 1
     fi
     sleep "$attempt"
   done

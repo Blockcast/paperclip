@@ -1312,15 +1312,41 @@ jobs:
           # why the owner is the identifying half. It exits 0 without writing
           # when no such lock is present, so a lock already retired (by the
           # script's own abort path, or by an operator) is a silent no-op here.
-          KUBECONFIG="${approver_kubeconfig}" \
-            PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
-            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${LOCK_DIGEST}" \
-            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${LOCK_OWNER}" \
-            "${APPROVE_SCRIPT}" | tee "${approver_dir}/retire.log"
+          # `2>&1` because the give-up guidance is printed to stderr, and that is
+          # the one path where a human has to act: a bare `| tee` captures only
+          # stdout, so the recovery instructions would be missing from exactly
+          # the log an operator opens. Run under `if !` rather than bare, so
+          # `set -e` cannot abort the step before the summary and the annotation
+          # below are written; `pipefail` keeps the pipeline status the script's
+          # own rather than tee's.
+          retire_status=0
+          if ! KUBECONFIG="${approver_kubeconfig}" \
+              PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
+              PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${LOCK_DIGEST}" \
+              PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${LOCK_OWNER}" \
+              "${APPROVE_SCRIPT}" 2>&1 | tee "${approver_dir}/retire.log"; then
+            retire_status=1
+          fi
 
+          # Written on both outcomes. A failed retirement is the case most in
+          # need of a summary, since the ring stays wedged and the next deploy
+          # fails at admission on someone else's unrelated release.
           {
-            echo "### Retired unused in-flight approval lock"
+            if [ "${retire_status}" -eq 0 ]; then
+              echo "### Retired unused in-flight approval lock"
+            else
+              echo "### FAILED to retire unused in-flight approval lock"
+            fi
             echo '```'
             cat "${approver_dir}/retire.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Annotation parity with the missing-credential branch above: both are
+          # paths where the automation is handing the lock back to a human, and
+          # an unannotated red step inside a job that already failed for another
+          # reason is easy to read past.
+          if [ "${retire_status}" -ne 0 ]; then
+            echo "::error::could not retire the in-flight approval lock on ${LOCK_DIGEST} (owner ${LOCK_OWNER}). Every production deploy is refused at admission until it is retired — see this step's log for the recovery command."
+            exit 1
+          fi
