@@ -794,6 +794,7 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     { label: "could not confirm whether", summary: "I could not confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the API call failed." },
     { label: "unclear if", summary: "Unclear if already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`. Aborting before the post step." },
     { label: "prior head, did not post", summary: "The prior head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, but the branch moved and I did not post a review for the new head." },
+    { label: "unclear that + copula", summary: "It is unclear that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`." },
   ])("BLO-31374: rejects hedged or prior-head already-reviewed narration ($label)", ({ summary }) => {
     expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
       status: "missing",
@@ -1022,6 +1023,46 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     });
   });
 
+  // Ninth Ally pass, over-veto direction: an epistemic NOUN whose negated
+  // object is not the review claim. Master accepted all of these.
+  it.each([
+    "No evidence of a force-push, so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "No indication the branch advanced, so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "There is no record of a newer wake, and already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I do not believe the payload was fresh, but already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "Nothing suggests a retry storm; already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I did not check whether a newer head exists so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+  ])("BLO-31374: a negated NON-review object is still a skip (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // …and the same nouns bound to the clause still veto.
+  it.each([
+    "No evidence that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "No indication this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I do not believe this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: an epistemic noun bound to the clause still vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Ninth pass, masking direction: a hedge outside the stem vocabulary that
+  // still questions THIS clause through `whether`.
+  it.each([
+    "It remains an open question whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "The evidence is inconclusive as to whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I would have to guess whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: any question whose complement is the clause vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
   // An assumption in the PREVIOUS clause does not reach the review clause.
   it("BLO-31374: an assumption in an earlier clause does not veto the clause", () => {
     expect(
@@ -1065,8 +1106,13 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`Possibly already reviewed at \`${sha}\`, but I could not check.`, false],
       [`The wake was probably a duplicate dispatch so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`I cannot say this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence of a force-push, so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence that this head was already reviewed at \`${sha}\`.`, false],
+      [`It remains an open question whether this head was already reviewed at \`${sha}\`.`, false],
       [`Unable to establish that this head was already reviewed at \`${sha}\`.`, false],
       [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
+      [`It is unclear that this head was already reviewed at \`${sha}\`.`, false],
+      [`Unclear that a rerun helps so already reviewed at \`${sha}\`.`, true],
       [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
       [`The prior head was already reviewed at \`${sha}\`, but the branch moved.`, false],
       [`alreadyreviewed at \`${sha}\`.`, false],
@@ -1074,6 +1120,18 @@ describe("evaluatePrReviewCompletionEvidence", () => {
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
     });
+  });
+
+  // A hedge about something OTHER than the review does not mask the skip: the
+  // `that`-complement closes before the clause, so no copula reaches it. Drop
+  // the copula bind from the hedge cue and this row flips to `missing` — the
+  // false-`missing` regression this PR exists to eliminate.
+  it("BLO-31374: a hedge whose complement closes before the clause still skips", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "Unclear that a rerun helps so already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "already_reviewed" });
   });
 
   // `notalready` is not a negation and not the clause: no word boundary before
