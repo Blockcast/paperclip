@@ -975,15 +975,65 @@ function operatorSuppressionMs(config: AlertmanagerPluginConfig): number | null 
 }
 
 /**
+ * Did the *plugin* author this issue's current terminal status, or did a human
+ * or an agent? (BLO-31736)
+ *
+ * This used to be inferred from `existing.resolvedAt`, which does not record
+ * authorship — it records only that the alert last cleared. The two diverge on
+ * exactly the case the terminal guard in `handleResolved` exists to protect: an
+ * agent closes the row `done`, the alert then resolves, the guard correctly
+ * declines to overwrite the close, and `resolvedAt` is written anyway. The next
+ * re-fire read that as "the plugin closed this" and resurrected the row to
+ * `todo`; the resolve after it then found a non-terminal row and cancelled it.
+ * A deliberate `done` became a plugin-authored `cancelled`, once per fire/clear
+ * cycle, indefinitely — and BLO-24234's operator suppression was unreachable
+ * for any alert that had ever resolved, which is every flapping alert, i.e.
+ * precisely the ones operators close by hand.
+ *
+ * Two signals, in precedence order:
+ *
+ * 1. **`done` is never a close of ours.** The plugin's only status writes are
+ *    `todo` (fire, re-open) and `cancelled` (resolve) — it has no path that
+ *    closes an issue `done`, so a `done` row was dispositioned by someone
+ *    else whatever the state says. (An `issueRouteMap` entry could in
+ *    principle *create* a row `done`; that is still not a close on resolve,
+ *    and re-opening such a row on re-fire would be wrong for the same
+ *    reason.) This signal holds for rows written before `pluginClosedAt`
+ *    existed too, which is what makes the reported defect fixed on contact
+ *    rather than one migration cycle later.
+ * 2. **`pluginClosedAt` is the recorded fact** for anything else: set when a
+ *    resolve delivery's cancel actually landed, `null` when we positively know
+ *    it did not.
+ *
+ * `undefined` means the row predates the field, so authorship is unknown. We
+ * fall back to the old `resolvedAt` reading rather than assuming an operator
+ * close, because the two errors are not symmetric: reading a plugin close as
+ * operator-authored *mutes a live recurring alert* for the suppression window,
+ * while reading an operator close as plugin-authored costs one unwanted
+ * re-open that the very next firing state-write corrects. Silence is the worse
+ * failure. Legacy rows drain on their first post-deploy firing, which writes
+ * the field explicitly.
+ */
+export function closedByPlugin(
+  issue: { status: string },
+  existing: Pick<AlertStateRecord, "resolvedAt" | "pluginClosedAt">,
+): boolean {
+  if (issue.status === "done") return false;
+  if (existing.pluginClosedAt !== undefined) return existing.pluginClosedAt !== null;
+  return Boolean(existing.resolvedAt);
+}
+
+/**
  * Decide what a re-fire should do to an issue that already exists for this
  * fingerprint. Split out from `handleFiring` so the four decision points the
  * incident review asked for are enumerable in one place, and testable without
  * driving a whole webhook delivery.
  *
- * `terminal + resolvedAt` means the plugin closed it when the alert cleared, so
- * a re-fire is a genuine recurrence → re-open. `terminal` with no `resolvedAt`
- * means a human closed it while the alert was still firing → honour that, but
- * only until the suppression window expires (BLO-24234).
+ * A terminal issue the plugin closed when the alert cleared means a re-fire is
+ * a genuine recurrence → re-open. A terminal issue closed by anyone else means
+ * a human or an agent dispositioned it while the alert was still firing →
+ * honour that, but only until the suppression window expires (BLO-24234). See
+ * `closedByPlugin` for why that distinction cannot be read off `resolvedAt`.
  */
 type RefireDecision =
   | { kind: "refresh" }
@@ -993,7 +1043,10 @@ type RefireDecision =
 
 export function decideRefire(
   issue: { status: string } | null | undefined,
-  existing: Pick<AlertStateRecord, "resolvedAt" | "operatorSuppressedAt">,
+  existing: Pick<
+    AlertStateRecord,
+    "resolvedAt" | "operatorSuppressedAt" | "pluginClosedAt"
+  >,
   config: AlertmanagerPluginConfig,
   nowMs: number,
 ): RefireDecision {
@@ -1001,7 +1054,9 @@ export function decideRefire(
 
   const terminal = issue.status === "done" || issue.status === "cancelled";
   if (!terminal) return { kind: "refresh" };
-  if (existing.resolvedAt) return { kind: "reopen", reason: "plugin_resolved" };
+  if (closedByPlugin(issue, existing)) {
+    return { kind: "reopen", reason: "plugin_resolved" };
+  }
 
   // Operator-closed. Anchor the window on the first re-fire we see against the
   // closed issue — not on the close itself, which the plugin never observes.
@@ -1382,6 +1437,25 @@ export async function handleFiring(
           : decision.kind === "suppressed"
             ? decision.suppressedAt
             : null;
+      // BLO-31736: same rule, same reason, for the closure-authorship record.
+      // A firing delivery that applied a decision has observed the issue's
+      // status first-hand, so whatever close we had recorded is spent — we
+      // either re-opened the row or judged the close to be someone else's.
+      // Writing `null` there is what makes BLO-24234's suppression reachable
+      // on the *next* re-fire for an alert that has resolved before: a later
+      // hand-cancel of this row is then read as the operator close it is,
+      // rather than inheriting our stale authorship. It also drains legacy
+      // rows, whose `undefined` still falls back to `resolvedAt`.
+      //
+      // `issue_missing` and a failed RPC learn nothing, so they must leave it
+      // alone. Clearing on those would let one transient `issues.get` failure
+      // convert our own close into an apparent operator close and mute a live
+      // recurring alert for a whole suppression window — the failure
+      // direction this ticket exists to remove, arriving from the other side.
+      const pluginClosureUpdate: Partial<Pick<AlertStateRecord, "pluginClosedAt">> =
+        !decisionApplied || decision.kind === "issue_missing"
+          ? {}
+          : { pluginClosedAt: null };
 
       await upsertAggregateMember(
         ctx,
@@ -1399,6 +1473,7 @@ export async function handleFiring(
         severity,
         lastFiredAt: nowIso,
         resolvedAt: null,
+        ...pluginClosureUpdate,
         operatorSuppressedAt: suppressionAnchor,
         nextEscalationAt: ladderRestart
           ? (() => {
@@ -1655,6 +1730,10 @@ export async function handleFiring(
     firstSeenAt: alert.startsAt || nowIso,
     lastFiredAt: nowIso,
     resolvedAt: null,
+    // BLO-31736: a freshly tracked fingerprint has no close of ours behind it.
+    // Explicit rather than `undefined` so a new row never enters the legacy
+    // `resolvedAt` authorship fallback.
+    pluginClosedAt: null,
     nextEscalationAt: (() => {
       const delay = escalationDeadlineMs(alert, config);
       return delay === null ? null : new Date(Date.now() + delay).toISOString();
@@ -1848,6 +1927,10 @@ export async function handleResolved(
   );
   let cancellationToken: string | null = null;
   let cancelWithheldForRunId: string | null = null;
+  // BLO-31736: authorship, recorded rather than inferred. Flipped only on the
+  // branch where our own `status: "cancelled"` patch actually landed, so the
+  // next re-fire can tell our close from an operator's.
+  let pluginCancelLanded = false;
 
   try {
     if (config.autoCloseOnResolve !== false) {
@@ -1897,6 +1980,7 @@ export async function handleResolved(
               },
               existing.paperclipCompanyId,
             );
+            pluginCancelLanded = true;
           } catch (err) {
             if (!isExecutionLockPreconditionFailure(err)) throw err;
             // The diagnostic read before update is racy. Re-read after the
@@ -1956,6 +2040,16 @@ export async function handleResolved(
       aggregateKey,
       paperclipIssueId: aggregateResolution.issueId,
       resolvedAt,
+      // BLO-31736: stamp authorship only when our cancel landed. Every other
+      // branch — the terminal guard declining to overwrite someone else's
+      // close, a withheld cancel, a missing membership, autoCloseOnResolve
+      // off — deliberately leaves the previous value untouched via the spread
+      // rather than writing `null`, because this delivery learned nothing new
+      // about who closed the row. Overwriting here would break the recurrence
+      // contract on a repeated `resolved` notification: Alertmanager may
+      // re-deliver one, the guard would hold (we already cancelled it), and
+      // clearing the flag would then mute the next real re-fire.
+      ...(pluginCancelLanded ? { pluginClosedAt: resolvedAt } : {}),
       nextEscalationAt: null,
       escalationComplete: true,
       cancelWithheldForRunId,
@@ -2036,6 +2130,11 @@ function buildRecoveredStateRecord(
     firstSeenAt: alert.startsAt || new Date().toISOString(),
     lastFiredAt: alert.startsAt || new Date().toISOString(),
     resolvedAt: null,
+    // BLO-31736: reconstructed rows are built only from a *non-terminal* issue
+    // (both callers reject `done`/`cancelled` before getting here), so no close
+    // of ours can be outstanding. Explicit rather than `undefined` so a
+    // reconstructed row does not enter the legacy authorship fallback.
+    pluginClosedAt: null,
     // BLO-20467: arm the ladder on the recovered record. The firing path now
     // adopts this when state was lost, and the re-fire branch carries these
     // fields through unchanged for a still-firing alert — so leaving them unset
