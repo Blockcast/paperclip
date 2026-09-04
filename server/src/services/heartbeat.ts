@@ -9621,7 +9621,8 @@ const EPISTEMIC_NOUN_HEAD =
   "(?:evidence|indications?|signs?|records?|proofs?|traces?|suggestions?|statements?|assertions?|awareness|findings?|validations?|confirmation|verification|determination)";
 // The NOUN subset of EPISTEMIC_HEAD. An adjective may sit between a negation and
 // a noun head ("no CLEAR evidence yet"), but for a VERB head the intervening
-// words are necessarily the SUBJECT ("no COMMITS appear yet"), so slack there
+// words are the SUBJECT or a pre-verbal ADVERB ("no COMMITS appear yet"), so
+// unrestricted slack there
 // swallows the subject and misreads the main verb as the negation's head.
 // Present-tense verbs take no auxiliary, so the auxiliary exclusion alone did
 // not mark them (pass 18: appear/indicate/suggest all regressed). The
@@ -9638,6 +9639,15 @@ const EPISTEMIC_HEAD =
   "|demonstrat(?:e|es|ed|ing)|show(?:s|ed|ing|n)?|mention(?:s|ed|ing)?|report(?:s|ed|ing)?|tell(?:s|ing)?|told|say(?:s|ing)?|said" +
   "|stat(?:e|es|ed|ing)|assert(?:s|ed|ing)?|claim(?:s|ed|ing)?" +
   "|rul(?:e|es|ed|ing)\\s+out)";
+// A CLOSED set of pre-verbal adverbs that may sit between a negation and a
+// verb/adjective head without being its subject ("cannot FULLY confirm yet",
+// "not CURRENTLY aware yet"). Pass 19: the strict-adjacent verb arm from pass
+// 18 dropped exactly this third category and accepted 12/12 such hedges — the
+// masking direction. NOT `\w+ly`: English nouns end in -ly too (anomaly, reply,
+// supply, family), and that variant false-vetoed 6/6 correct skips, scoring
+// worse than no slack at all. A closed set converges; a suffix pattern does not.
+const EPISTEMIC_ADVERB =
+  "(?:yet|longer|ever|still|now|quite|fully|really|actually|truly|entirely|completely|definitively|conclusively|reliably|independently|positively|currently|firmly|confidently|necessarily|clearly|directly|certainly|categorically|absolutely)";
 
 // See the use site in prReviewOutputHasAlreadyReviewedSkip: a sentence-initial
 // hedge adverb's own trailing comma is rejoined to its clause. Anchored to a
@@ -9746,7 +9756,7 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
     name: "negatedHeadConnective",
     stem:
       `(?:${NEGATION_PREFIX_WORD}\\s+(?:(?!(?:was|were|is|are|has|have|had|been|be|did|does|do)\\b)\\w+\\s+){0,2}${EPISTEMIC_NOUN_HEAD}` +
-      `|${NEGATION_PREFIX_WORD}\\s+${EPISTEMIC_HEAD})\\s+(?:${ADVERSATIVE_CONNECTIVES})\\b`,
+      `|${NEGATION_PREFIX_WORD}\\s+(?:${EPISTEMIC_ADVERB}\\s+){0,2}${EPISTEMIC_HEAD})\\s+(?:${ADVERSATIVE_CONNECTIVES})\\b`,
   },
   // An epistemic negation governing the clause from further back: a negation
   // word, then within three words a head that could establish the claim. One
