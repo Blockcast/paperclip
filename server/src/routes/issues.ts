@@ -6923,8 +6923,13 @@ export function issueRoutes(
           .set({ statusOnlyDocumentWriteRefusedAt: new Date(), updatedAt: new Date() })
           .where(eq(heartbeatRuns.id, run.id));
       } catch (err) {
+        // `documentKey` is absent on the revision-restore route, which passes
+        // `"document"` with no key so it gets the strict gate (see this
+        // function's doc comment). Log the request line too, or a restore
+        // refusal and an upsert refusal are indistinguishable in production —
+        // both would read `documentKey: undefined`.
         logger.warn(
-          { err, runId: run.id, issueId: issue.id, documentKey },
+          { err, runId: run.id, issueId: issue.id, documentKey, method: req.method, url: req.originalUrl },
           "status_only_document_write_refusal_stamp_failed",
         );
       }
