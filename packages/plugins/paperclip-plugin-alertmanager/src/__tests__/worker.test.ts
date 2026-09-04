@@ -700,9 +700,15 @@ describe("handleWebhook — firing first time", () => {
     // processing before PEN-2581. The catch is inside the loop and
     // `AlertDeliveryIncompleteError` is thrown only after it completes, so a
     // sibling alert's issue was created on the first attempt even when the
-    // delivery reported 502. Verified, not assumed: neutralise the carve-out
-    // and the only assertion that fails is `resolves.toBeUndefined()` below —
-    // the `issues.create` assertions pass on the pre-change source.
+    // delivery reported 502. Verified by running it, not assumed, and
+    // reproducible as written: neutralise the carve-out (`const permanent =
+    // false` at the per-alert catch in `webhook-handler.ts`), then comment out
+    // BOTH the outcome assertion below and the `permanent_error` assertion at
+    // the end — on the pre-change source that alert reports through
+    // `alertmanager.alert.error`. The `issues.create` and `alert:` state
+    // assertions still pass. Both have to be neutralised first because Vitest
+    // aborts a test at its first failing assertion, so a run that trips the
+    // outcome assertion never reaches the ones that carry the point.
     //
     // What PEN-2581 actually changed is the delivery's reported *outcome*: the
     // ownerless fingerprint is no longer accumulated, so Alertmanager is no
@@ -816,6 +822,20 @@ describe("handleWebhook — firing first time", () => {
       "alertmanager.alert.permanent_error",
       1,
       expect.anything(),
+    );
+    // The `refusal` label's other value, pinned here because the permanent test
+    // above pins only `"permanent"`. Splitting drop-from-retry within this one
+    // series is the label's entire purpose, so a regression that hardcoded
+    // `"permanent"` at the write site would otherwise pass the whole suite —
+    // the alert-level metric split asserted just above would still be correct.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "transient",
+      },
     );
     // The operator-facing warning names the blocking reason, so the next
     // occurrence is diagnosable from the log alone (PEN-2581).

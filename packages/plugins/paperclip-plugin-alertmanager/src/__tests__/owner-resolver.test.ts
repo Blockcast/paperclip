@@ -599,6 +599,25 @@ describe("resolveFallbackAgentId", () => {
     );
   });
 
+  it("refuses a status it does not recognise as transient", async () => {
+    // The one `REFUSAL_CLASS_BY_INVOKABILITY_REASON` entry with no other
+    // coverage, and the one that encodes the asymmetry policy stated at
+    // `owner-resolver.ts:226-229`: an unrecognised status means this resolver
+    // cannot claim the condition is unfixable, so it takes the survivable
+    // branch. Pinned so a later tidy-up does not read it as an arbitrary
+    // default and flip it — misclassifying transient-as-permanent drops an
+    // alert, which is the single outcome this whole path exists to prevent.
+    const { ctx, logger } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage", status: "hibernating" },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toEqual({ refusal: "transient" });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-1=unknown_status"),
+    );
+  });
+
   it("names the blocking reason rather than reporting an unmatched name", async () => {
     // "paused" and "name is wrong" need different fixes, so an operator must
     // not be sent hunting for a typo that isn't there.
