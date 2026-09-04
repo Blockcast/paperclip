@@ -107,6 +107,20 @@ jobs:
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
         timeout-minutes: 1
 
+      # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
+      # approval holds a lock until its rollout lands, so a deploy dying between
+      # the approval step and `helm upgrade` strands a lock nothing can clear
+      # and every later deploy is refused at admission. The remedy existed in
+      # `approve-paperclip-api-digest.sh` but was unreachable from this
+      # workflow, so recovery required a human holding the approver credential.
+      # Render-level, like its neighbours: it asserts the inputs exist, that
+      # both reach the script, and that a half-supplied pair is refused before
+      # the approver credential is written to disk.
+      - name: Validate abandon-in-flight approval inputs (BLO-31598)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-abandon-in-flight-inputs.test.js
+        timeout-minutes: 1
+
       # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
       # are load-bearing: running it after the rollout starts reports the
       # problem only once the 30-minute timeout has already burned, and an
