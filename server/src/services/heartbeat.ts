@@ -365,6 +365,7 @@ import {
   ensureCheckoutGitIdentity,
 } from "./git-checkout-identity.js";
 import { ensureManagedCheckoutCanServeClones } from "./managed-checkout-partial-clone.js";
+import { ensureManagedCheckoutRejectsPushes } from "./managed-checkout-push-guard.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -3254,6 +3255,11 @@ async function resolveManagedProjectWorkspaceCheckout(input: {
  * return is deliberately covered too -- a project with no workspace rows still
  * resolves to a managed `_default` dir, and that is precisely the path the
  * mirror behind BLO-31338 was serving.
+ *
+ * BLO-31555 adds the inbound-push guard here, and "already cloned" is once more
+ * the case that matters: every base checkout that a run could push into already
+ * exists, so a guard installed after the `git clone` would protect only the one
+ * checkout nobody has had a chance to push to yet.
  */
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
@@ -3266,6 +3272,11 @@ async function ensureManagedProjectWorkspace(input: {
     cwd: realized.cwd,
     agent: input.agent ?? null,
   });
+  // Ordered before the partial-clone check on purpose. That check can end the
+  // run, and the checkout outlives the run either way -- so hardening it first
+  // means an unservable mirror is still closed to pushes rather than left open
+  // because provisioning aborted one step earlier. The guard never throws.
+  const pushGuard = await ensureManagedCheckoutRejectsPushes({ cwd: realized.cwd });
   const partialClone = await ensureManagedCheckoutCanServeClones({ cwd: realized.cwd });
   if (partialClone.state === "partial_cannot_serve") {
     // Raised as a workspace validation failure rather than a bare Error so the
@@ -3285,7 +3296,7 @@ async function ensureManagedProjectWorkspace(input: {
   }
   return {
     cwd: realized.cwd,
-    warnings: [realized.warning, identity.warning, partialClone.warning].filter(
+    warnings: [realized.warning, identity.warning, pushGuard.warning, partialClone.warning].filter(
       (value): value is string => Boolean(value),
     ),
   };
