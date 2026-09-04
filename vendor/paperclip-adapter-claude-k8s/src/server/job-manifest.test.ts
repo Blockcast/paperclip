@@ -910,6 +910,7 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
       const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+      const boundedGit = `git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
 
       expect(command).toContain(`fetch --no-tags --quiet origin`);
       // Fetch only after origin points at upstream — fetching earlier would pull
@@ -925,15 +926,78 @@ describe("buildJobManifest", () => {
       // refs/remotes/origin/HEAD, so `set-head` is paired with it — otherwise
       // `git symbolic-ref refs/remotes/origin/HEAD` stays broken in every
       // run-isolated workspace.
-      expect(command).toContain(`git -C '${workspaceRoot}' remote set-head origin -a`);
+      expect(command).toContain("remote set-head origin -a");
       expect(command.indexOf("fetch --no-tags")).toBeLessThan(command.indexOf("remote set-head"));
       // set-head carries its own nested guard, so a set-head failure after a
       // successful fetch cannot fall through to the "fetch failed" breadcrumb.
-      expect(command).toContain(`(git -C '${workspaceRoot}' remote set-head origin -a >/dev/null 2>&1 || true)`);
+      // It records its own breadcrumb instead of failing silently, so every
+      // failure path in this block explains itself on the workspace.
+      expect(command).toContain(
+        `(${boundedGit} remote set-head origin -a >/dev/null 2>&1 || git -C '${workspaceRoot}' config paperclip.originHeadUnset`,
+      );
 
-      // The fetch runs on every run-isolated pod start, so it is bounded: a
-      // transfer stalling below the floor aborts instead of holding startup open.
-      expect(command).toContain("-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15");
+      // Both calls in this block reach the network — `set-head -a` queries the
+      // remote for its default branch even when the tracking refs are already
+      // local — so the bound must be on both, not just the fetch.
+      expect(command).toContain(`${boundedGit} fetch --no-tags --quiet origin`);
+      expect(command).toContain(`${boundedGit} remote set-head origin -a`);
+
+      // The guard against future drift is the *invariant* "every network-reaching
+      // git call carries the bound", not a count of how often the bound appears.
+      // Counting the bound asserts the inverse of what it looks like it asserts:
+      // a third call added WITHOUT the bound leaves the count at 2 and passes
+      // silently — exactly the regression worth catching — while a correctly
+      // bounded one pushes it to 3 and fails, training the next reader to bump
+      // the literal instead of reading the block.
+      const boundFlags = ["-c http.lowSpeedLimit=1000", "-c http.lowSpeedTime=15"];
+      const gitPrefix = `git -C '${workspaceRoot}'`;
+      // Deny-list, deliberately, because the two sets are not symmetric: the
+      // verbs this block uses that stay local are enumerable, the ones that can
+      // reach a remote are not. An allowlist of network verbs fails OPEN — an
+      // unnamed verb is classified local, so an unbounded call using it passes
+      // every assertion below. `remote prune` and `remote show` are two that
+      // exist today: both block on an unreachable remote exactly as
+      // `set-head -a` does. Treating anything unrecognised as network-reaching
+      // fails CLOSED instead, so a new verb reddens this suite until a human
+      // classifies it — which is the whole point of a drift guard.
+      const staysLocal = (args: string) =>
+        /^\s*(config|checkout|rev-parse|symbolic-ref)\b/.test(args) ||
+        /^\s*remote\s+(add|remove|rename|set-url)\b/.test(args);
+      const reachesNetwork = (args: string) => !staysLocal(args);
+
+      const invocations = command
+        .split(gitPrefix)
+        .slice(1)
+        .map((tail) => {
+          // One invocation ends at the next shell separator.
+          const raw = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
+          // Peel every leading `-c <key>=<value>` so boundedness is a question
+          // of which flags are present, not of them being adjacent and in this
+          // exact order — and so the verb match sees the subcommand either way.
+          let rest = raw.trimStart();
+          const flags: string[] = [];
+          for (let m = rest.match(/^-c\s+(\S+)\s+/); m; m = rest.match(/^-c\s+(\S+)\s+/)) {
+            flags.push(`-c ${m[1]}`);
+            rest = rest.slice(m[0].length);
+          }
+          return { args: rest, bounded: boundFlags.every((flag) => flags.includes(flag)) };
+        });
+
+      const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
+      // The real guard: no unbounded network call, however this block grows.
+      // Needs no edit when a third bounded call is legitimately added. Scope is
+      // every `git -C '<workspaceRoot>'`-prefixed call — a call written against
+      // a different `-C`, or as `cd "$root" && git ...`, is not seen here.
+      expect(networkCalls.filter((i) => !i.bounded).map((i) => i.args.trim())).toEqual([]);
+      // ...and nothing that stays local pays the bound, so the bound tracks the
+      // set of network calls in both directions.
+      expect(invocations.filter((i) => i.bounded && !reachesNetwork(i.args)).map((i) => i.args.trim())).toEqual([]);
+      // Deliberate change-tripwire, NOT a boundedness check: the two calls above
+      // are the whole network surface of run-workspace setup today. A third one
+      // is a decision worth a human reading this block, so bumping this literal
+      // is the correct response to a legitimate addition — the invariant above
+      // is what keeps that addition honest.
+      expect(networkCalls).toHaveLength(2);
 
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");
