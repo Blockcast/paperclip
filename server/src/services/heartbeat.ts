@@ -9532,7 +9532,13 @@ function prReviewOutputHasSelfReviewSkip(
 // governing a DIFFERENT noun phrase reach the clause across the connective —
 // "No newer commits were found so this head was already reviewed at …"
 // (eleventh pass: 5 of 5 regressed against master).
-const COPULA_FILLER = "(?:(?!(?:so|but|and|because|since|therefore|thus|hence)\\b)\\w+\\s+){0,4}";
+const CONNECTIVES =
+  "so|but|and|because|since|therefore|thus|hence" +
+  // Adversative and consecutive (fourteenth pass): a negation crossed all of
+  // these and vetoed a clause it does not govern. Unlike the hedge vocabulary,
+  // the connective set is CLOSED, so completing it converges.
+  "|yet|however|though|although|still|nonetheless|nevertheless|whereas|while|then|consequently|accordingly";
+const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b)\\w+\\s+){0,4}`;
 const COPULA_EDGE = `${COPULA_FILLER}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s\`*_]*$`;
 const CLAUSE_REACH = `(?:[\\s\`*_]*$|\\s+${COPULA_EDGE})`;
 
@@ -9654,18 +9660,33 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
     // by whitespace or markdown. The same `+` class joins already/reviewed/at,
     // so "**Already reviewed** at `<sha>`" (markdown closing before the sha)
     // matches while `alreadyreviewed` cannot.
-    "(?<negated>\\b(?:not|never|wasn['\u2019]?t|weren['\u2019]?t|isn['\u2019]?t|aren['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been)[\\s`*_]+){0,2})?" +
+    "(?<negated>\\b(?:not|never|wasn['\u2019]?t|weren['\u2019]?t|isn['\u2019]?t|aren['\u2019]?t|hasn['\u2019]?t)[\\s`*_]+(?:(?:yet|been|was|were|is|are)[\\s`*_]+){0,2})?" +
       // `+` after `at` too: `at8b237675…` with no separator is not the clause.
       "\\balready[\\s`*_]+reviewed[\\s`*_]+at[\\s`*_]+" +
       // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
-      `(?:[^\\s\`*_]{1,40}${md}for${md})?(?:(?:head|commit)[\\s\`*_]+)?` +
-      "([0-9a-f]{7,40})(?![0-9a-f])",
+      `(?<forMarker>[^\\s\`*_]{1,40}${md}for${md})?(?<nounMarker>(?:head|commit)[\\s\`*_]+)?` +
+      "(?<sha>[0-9a-f]{7,40})(?![0-9a-f])",
     "gi",
   );
   // Same-sentence scope: a clause boundary is any of . : ; , — – or a newline.
   const clauseBefore = /[^.\n:;,\u2014\u2013]*$/;
   for (const m of text.matchAll(pattern)) {
     if (m.groups?.negated) continue;
+    // A sha is not a timestamp, and the comment above promises a sha-less
+    // claim is refused — so the code has to hold that, not merely document it
+    // (fourteenth pass). The compact ISO form `20260902T204153Z` contains a
+    // 7+ hex run (`20260902`) whose next character is not hex, so the anchor
+    // alone accepted it, as it did a bare `1234567`. An all-decimal token is
+    // therefore a commit only when a `for`/`head`/`commit` marker says so;
+    // that still admits a genuinely all-decimal abbreviated sha, which is
+    // ~3.7% of 7-character abbreviations and not negligible.
+    //
+    // Lowercase is re-checked here because the pattern's `i` flag exists for
+    // `Already`, not for the sha, and the attestation contract mandates
+    // lowercase hex.
+    const sha = m.groups?.sha ?? "";
+    if (!/^[0-9a-f]+$/.test(sha)) continue;
+    if (!/[a-f]/.test(sha) && !m.groups?.forMarker && !m.groups?.nounMarker) continue;
     const before = clauseBefore.exec(text.slice(Math.max(0, m.index - 120), m.index))?.[0] ?? "";
     if (GOVERNING_CUES.some(({ re }) => re.test(before))) continue;
     return true;
