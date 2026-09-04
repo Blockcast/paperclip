@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -565,4 +565,131 @@ test("the approval publishes the lock before it can fail on anything else", () =
     publish < verify,
     "the lock owner must be published BEFORE the approved-plan verification that can fail",
   );
+});
+
+// ---------------------------------------------------------------------------
+// The hand-back to a human, executed
+// ---------------------------------------------------------------------------
+//
+// The guard above decides WHETHER to retire. This section covers what happens
+// once it has decided to try, and specifically the path where the attempt
+// fails -- the only path on which a human has to finish the job. Getting that
+// wrong is quiet: the step goes red inside a job that already failed for
+// another reason, and the ring stays wedged so the next deploy is refused at
+// admission on someone else's unrelated release.
+//
+// Three properties, none of which a presence check can establish:
+//   1. the give-up guidance reaches the log an operator opens -- the script
+//      prints it to stderr, which a bare `| tee` would drop on the floor;
+//   2. the step summary is written on BOTH outcomes, `set -e` notwithstanding;
+//   3. the failure carries an `::error::` annotation, for parity with the
+//      missing-credential branch above it.
+
+function extractHandback() {
+  const beginMarker = "# BEGIN RETIRE_IN_FLIGHT_LOCK_HANDBACK";
+  const endMarker = "# END RETIRE_IN_FLIGHT_LOCK_HANDBACK";
+  const start = workflow.indexOf(beginMarker);
+  assert.notEqual(start, -1, `could not locate ${beginMarker} in docker.yml`);
+  const end = workflow.indexOf(endMarker, start);
+  assert.notEqual(end, -1, `could not locate ${endMarker} in docker.yml`);
+
+  return workflow
+    .slice(start + beginMarker.length, end)
+    .split("\n")
+    .map((line) => (line.startsWith(" ".repeat(10)) ? line.slice(10) : line))
+    .join("\n");
+}
+
+// Runs the real hand-back shell with a stubbed approve script, under the same
+// `set -euo pipefail` the step body inherits from the workflow's shell setting.
+// `pipefail` is what makes the tee'd pipeline report the script's status rather
+// than tee's, so running without it would test a shell the step never uses.
+function runHandback({ scriptExitCode, scriptStdout = "", scriptStderr = "" }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "retire-handback-"));
+  const fakeScript = path.join(dir, "approve.sh");
+  const summaryPath = path.join(dir, "step-summary.md");
+  writeFileSync(
+    fakeScript,
+    [
+      "#!/usr/bin/env bash",
+      scriptStdout ? `printf '%s\\n' ${JSON.stringify(scriptStdout)}` : "",
+      scriptStderr ? `printf '%s\\n' ${JSON.stringify(scriptStderr)} >&2` : "",
+      `exit ${scriptExitCode}`,
+    ].join("\n"),
+  );
+  chmodSync(fakeScript, 0o755);
+  writeFileSync(summaryPath, "");
+
+  const harness = `set -euo pipefail\n${extractHandback()}\necho REACHED_END\n`;
+  const result = spawnSync("bash", ["-c", harness], {
+    encoding: "utf8",
+    env: {
+      PATH: process.env.PATH,
+      approver_dir: dir,
+      approver_kubeconfig: path.join(dir, "kubeconfig"),
+      APPROVE_SCRIPT: fakeScript,
+      LOCK_DIGEST: VALID_DIGEST,
+      LOCK_OWNER: VALID_OWNER,
+      GITHUB_STEP_SUMMARY: summaryPath,
+    },
+  });
+
+  return {
+    code: result.status,
+    stdout: result.stdout,
+    summary: readFileSync(summaryPath, "utf8"),
+    retireLog: existsSync(path.join(dir, "retire.log"))
+      ? readFileSync(path.join(dir, "retire.log"), "utf8")
+      : null,
+  };
+}
+
+test("a successful retirement is summarised and does not fail the step", () => {
+  const result = runHandback({
+    scriptExitCode: 0,
+    scriptStdout: `Retired the in-flight approval lock on ${VALID_DIGEST}.`,
+  });
+
+  assert.equal(result.code, 0, `the success path must not fail the step: ${result.stdout}`);
+  assert.match(result.stdout, /REACHED_END/, "the step body must run to completion");
+  assert.match(result.summary, /### Retired unused in-flight approval lock/);
+  assert.match(result.summary, /Retired the in-flight approval lock/);
+  // No annotation on the path that needs no human.
+  assert.doesNotMatch(result.stdout, /::error::/);
+});
+
+test("a failed retirement annotates, summarises, and keeps the stderr guidance", () => {
+  // The script's real give-up text, which it prints to STDERR.
+  const guidance =
+    "could not retire the in-flight approval lock.\n" +
+    "The next approval will refuse until it is retired. Re-run this mode, or pass\n" +
+    "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER";
+  const result = runHandback({ scriptExitCode: 1, scriptStderr: guidance });
+
+  // A retirement that did not happen must fail the step -- reporting success
+  // here would leave the channel wedged while claiming it was cleared.
+  assert.equal(result.code, 1, "a failed retirement must fail the step");
+
+  // 1. The guidance survives into the log an operator opens. This is the
+  //    assertion that fails if `2>&1` is dropped from the pipeline: with a bare
+  //    `| tee` the log is empty and the operator gets no recovery command.
+  assert.match(
+    result.retireLog ?? "",
+    /PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT/,
+    "the stderr give-up guidance must be captured into retire.log",
+  );
+
+  // 2. The summary is written even though the pipeline failed under `set -e`,
+  //    and says which outcome it describes.
+  assert.match(result.summary, /### FAILED to retire unused in-flight approval lock/);
+  assert.match(result.summary, /PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT/);
+  assert.doesNotMatch(
+    result.summary,
+    /### Retired unused in-flight approval lock/,
+    "a failure must not be summarised as a success",
+  );
+
+  // 3. Annotation parity with the missing-credential branch.
+  assert.match(result.stdout, /::error::could not retire the in-flight approval lock/);
+  assert.match(result.stdout, new RegExp(VALID_OWNER), "the annotation must name the owner");
 });
