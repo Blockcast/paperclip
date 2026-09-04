@@ -32,9 +32,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   ensureManagedCheckoutRejectsPushes,
+  PUSH_GUARD_DISPLACED_HOOK_SUFFIX,
   PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY,
   PUSH_GUARD_HOOK,
+  PUSH_GUARD_HOOK_MARKER,
+  PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS,
   PUSH_GUARD_PRIVATE_HOOKS_DIRNAME,
+  PUSH_GUARD_RECEIVE_CONFIG,
 } from "../services/managed-checkout-push-guard.js";
 
 const execFile = promisify(execFileCallback);
@@ -296,7 +300,11 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     const run = await createRunWorkspace(base);
     const first = await ensureManagedCheckoutRejectsPushes({ cwd: base });
 
-    // A previous guard version, or someone defanging it by hand.
+    // Someone defanging the guard by replacing the file wholesale. Because the
+    // replacement carries no ownership marker it is treated as foreign and
+    // preserved rather than destroyed -- but the guard is still reinstated, so
+    // the security property (a defanged guard does not survive a provision) is
+    // unchanged. The preserved copy is asserted in the foreign-hook test below.
     await fs.writeFile(first.hookPath!, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
     const refreshed = await ensureManagedCheckoutRejectsPushes({ cwd: base });
     expect(refreshed.state).toBe("installed");
@@ -304,6 +312,124 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
 
     await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-stale"], run);
     expect(await refExists(base, "refs/heads/probe-stale")).toBe(false);
+  });
+
+  it("refreshes a marker-bearing older guard IN PLACE, leaving no backup behind", async () => {
+    // The reason PUSH_GUARD_HOOK_MARKER carries no version. A previous guard
+    // version is still *ours*, so bumping PUSH_GUARD_HOOK_VERSION must refresh
+    // it in place. If the marker were version-stamped, every checkout on the
+    // fleet would sprout a `.paperclip-displaced` backup on the next provision.
+    //
+    // Asserted directly, because the behavioural half below can only catch a
+    // version-stamped marker if its fixture is independent of the constant.
+    expect(PUSH_GUARD_HOOK_MARKER).not.toMatch(/v\d/);
+
+    const base = await createUnguardedBase();
+    const run = await createRunWorkspace(base);
+    const first = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+
+    // Deliberately a LITERAL rather than interpolating PUSH_GUARD_HOOK_MARKER: a
+    // fixture built from the constant under test moves with it, so stamping the
+    // marker would also stamp the fixture and this test would pass either way.
+    // The version here must differ from PUSH_GUARD_HOOK_VERSION for that reason.
+    const olderGuard =
+      "#!/bin/sh\n# paperclip-push-guard v0 -- installed by Paperclip (BLO-31555). Do not edit.\nexit 1\n";
+    await fs.writeFile(first.hookPath!, olderGuard, { encoding: "utf8", mode: 0o755 });
+
+    const refreshed = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(refreshed.state).toBe("installed");
+    expect(refreshed.displacedHookPath).toBeNull();
+    expect(await fs.readFile(first.hookPath!, "utf8")).toBe(PUSH_GUARD_HOOK);
+    await expect(fs.stat(`${first.hookPath!}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`)).rejects.toThrow();
+
+    await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-older-guard"], run);
+    expect(await refExists(base, "refs/heads/probe-older-guard")).toBe(false);
+  });
+
+  it("preserves an operator's own pre-receive instead of destroying it", async () => {
+    // Default `git init`/`clone` templates ship `pre-receive.sample`, never
+    // `pre-receive`, so a real file here is operator-installed. Overwriting it
+    // would be silent and irreversible -- the one failure mode this module must
+    // not have, since it runs unattended on every provisioning pass.
+    const base = await createUnguardedBase();
+    const run = await createRunWorkspace(base);
+
+    const operatorHook = "#!/bin/sh\n# operator policy: audit inbound refs\necho audited >&2\nexit 0\n";
+    const hooksDir = path.join(base, ".git", "hooks");
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, "pre-receive");
+    await fs.writeFile(hookPath, operatorHook, { encoding: "utf8", mode: 0o755 });
+
+    const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(result.state).toBe("installed");
+    expect(result.hookPath).toBe(hookPath);
+
+    // Moved aside, byte-for-byte, and reported rather than silently dropped.
+    const backup = `${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`;
+    expect(result.displacedHookPath).toBe(backup);
+    expect(await fs.readFile(backup, "utf8")).toBe(operatorHook);
+    expect(result.warning).toContain("non-Paperclip");
+
+    // ...and the guard is genuinely the hook git now runs.
+    expect(await fs.readFile(hookPath, "utf8")).toBe(PUSH_GUARD_HOOK);
+    await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-operator-hook"], run);
+    expect(await refExists(base, "refs/heads/probe-operator-hook")).toBe(false);
+  });
+
+  it("declines to install rather than overwrite an exhausted backup budget", async () => {
+    // `fs.rename` overwrites, so reusing an occupied backup name would destroy
+    // an EARLIER displaced hook. When there is nowhere safe left to put it, the
+    // operator's file wins: this guard is defence-in-depth (BLO-31359's fix
+    // already closed the path runs took) and never outranks operator intent.
+    const base = await createUnguardedBase();
+    const hooksDir = path.join(base, ".git", "hooks");
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, "pre-receive");
+    const operatorHook = "#!/bin/sh\n# operator policy\nexit 0\n";
+    await fs.writeFile(hookPath, operatorHook, { encoding: "utf8", mode: 0o755 });
+
+    await fs.writeFile(`${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`, "old-0\n", "utf8");
+    for (let index = 1; index <= PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS; index += 1) {
+      await fs.writeFile(`${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}.${index}`, `old-${index}\n`, "utf8");
+    }
+
+    const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(result.state).toBe("install_failed");
+    expect(result.warning).toContain("declined");
+    // Nothing touched: neither the live hook nor any existing backup.
+    expect(await fs.readFile(hookPath, "utf8")).toBe(operatorHook);
+    expect(await fs.readFile(`${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`, "utf8")).toBe("old-0\n");
+  });
+
+  it("materializes the receive.* keys locally even when a global config already sets them", async () => {
+    // These keys exist so ref protection survives the hook file being deleted
+    // (AC6). That only holds if they live in config the CHECKOUT owns: an
+    // inherited global value belongs to the host, and a different pod or image
+    // need not carry it. An idempotency read that resolves across scopes sees
+    // the global value, concludes "already set", and writes nothing -- leaving
+    // the durability property claimed but absent.
+    const base = await createUnguardedBase();
+
+    const globalConfig = path.join(root, `gitconfig-receive-${counter++}`);
+    await fs.writeFile(
+      globalConfig,
+      `[receive]\n${PUSH_GUARD_RECEIVE_CONFIG.map(([key, value]) => `\t${key.replace(/^receive\./, "")} = ${value}`).join("\n")}\n`,
+      "utf8",
+    );
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+
+    // Control: the values really are visible from the effective scope already,
+    // so this test cannot pass just because the global config failed to load.
+    for (const [key, value] of PUSH_GUARD_RECEIVE_CONFIG) {
+      expect((await git(["config", "--get", key], base)).stdout.trim()).toBe(value);
+    }
+
+    await ensureManagedCheckoutRejectsPushes({ cwd: base });
+
+    for (const [key, value] of PUSH_GUARD_RECEIVE_CONFIG) {
+      const local = await git(["config", "--local", "--get", key], base);
+      expect(local.stdout.trim()).toBe(value);
+    }
   });
 
   it("is a no-op on a path that is not a checkout, without walking up to an ancestor repo", async () => {

@@ -2,7 +2,11 @@
  * Make a managed project checkout refuse inbound pushes (BLO-31555 / BLO-31359).
  *
  * BLO-31359 found agent runs pushing branches straight into the project *base*
- * checkout: 67 push-created refs across 3 bases, 117 push events. Its fix
+ * checkout: 44 push-created refs across 3 bases, 117 push events. (67 refs were
+ * *touched* by a push; 44 is the subset a push brought into existence, which is
+ * the number this guard is about. The two are easy to conflate -- BLO-31555's
+ * own acceptance criteria cited 67 for the created-count and were corrected.)
+ * Its fix
  * (#1616) stopped the ephemeral run clone from carrying the base as its
  * configured `origin`, which closed the path runs actually took. It did not
  * close the capability. The run pod and the base share one filesystem, so this
@@ -43,17 +47,32 @@
  *   `pre-receive` there and write no config at all. This covers the unset case
  *   (`<commondir>/hooks`, measured as 40 of 40 managed checkouts on 2026-09-03)
  *   and the repo-private-override case (`.git/no-hooks`, what the two test
- *   fixtures above create). Every pre-existing hook keeps working and the
- *   operator's intent is preserved.
+ *   fixtures above create). Every pre-existing hook of a *different* name keeps
+ *   working untouched; a pre-existing `pre-receive` is the one file this module
+ *   must own, so it is moved aside to `pre-receive.paperclip-displaced` and
+ *   reported rather than overwritten in place. Nothing is ever destroyed.
  * - **Effective hooks dir is outside the repo** (a shared or global directory)
  *   -> do NOT write into it; a file dropped in a global hooks dir would apply to
  *   every repository on the host. Instead set a *local* `core.hooksPath` to a
  *   private dir and install there. Local config beats global, so this is
  *   deterministic rather than dependent on discovery defaults.
  *
- * Only the second branch displaces anything, and it records what it displaced in
- * `paperclip.pushGuard.displacedHooksPath` and warns, so the change is legible
- * and reversible rather than silent.
+ * Both displacing branches record what they displaced -- the hooks dir in
+ * `paperclip.pushGuard.displacedHooksPath`, an operator hook by leaving the file
+ * on disk under a suffixed name -- and warn, so the change is legible and
+ * reversible rather than silent.
+ *
+ * Note the second branch's blast radius: git stores `--local` config in the git
+ * *common* dir, which every linked worktree shares. This project provisions run
+ * workspaces as worktrees, so taking `core.hooksPath` over repoints hook
+ * resolution for those run workspaces too, not only for the base. That is
+ * checked rather than assumed: as of 2026-09-04 no non-test source path in this
+ * repository reads `core.hooksPath` or installs/depends on any git hook, so
+ * nothing in the run-workspace flow relies on an inherited `post-checkout` /
+ * `pre-commit` / `commit-msg`. Per-worktree scoping (`extensions.worktreeConfig`
+ * plus `--worktree`) is therefore deliberately not used -- it carries its own
+ * consequences and buys nothing here. The warning names the wider scope so an
+ * operator with such hooks is not surprised.
  *
  * ## What this must not break
  *
@@ -92,7 +111,42 @@ export const PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY = "paperclip.pushGuard.displace
  */
 export const PUSH_GUARD_HOOK_VERSION = 1;
 
-const PUSH_GUARD_HOOK_MARKER = `paperclip-push-guard v${PUSH_GUARD_HOOK_VERSION}`;
+/**
+ * Ownership marker, deliberately **version-free**.
+ *
+ * Two different questions get asked about an existing `pre-receive`, and
+ * conflating them is what lets an operator's own hook be destroyed:
+ *
+ * - *Is it current?* -- answered verbatim against {@link PUSH_GUARD_HOOK}, so a
+ *   bumped version or a hand-edit is refreshed rather than accepted.
+ * - *Is it ours to overwrite?* -- answered by this marker. It must not carry the
+ *   version, or bumping {@link PUSH_GUARD_HOOK_VERSION} would make every
+ *   previously-installed guard look foreign and leave a backup behind on every
+ *   checkout at the next provision.
+ *
+ * A file that does not carry it is treated as the operator's and preserved (see
+ * {@link PUSH_GUARD_DISPLACED_HOOK_SUFFIX}). That is the safe direction: the
+ * cost of a false "foreign" reading is one unused backup file, and the cost of a
+ * false "ours" reading is someone's hook silently and irreversibly gone.
+ */
+export const PUSH_GUARD_HOOK_MARKER = "paperclip-push-guard";
+
+/** Suffix for an operator `pre-receive` we had to move aside. */
+export const PUSH_GUARD_DISPLACED_HOOK_SUFFIX = ".paperclip-displaced";
+
+/**
+ * Cap on displaced-hook backups before we refuse rather than overwrite one.
+ *
+ * Reaching this means an operator has re-installed their own `pre-receive`
+ * several times over. Destroying an earlier backup to make room would be the
+ * exact silent data loss this whole path exists to avoid, so the guard declines
+ * to install instead -- it is defence-in-depth (BLO-31359's fix already removed
+ * the path runs actually took), and hardening never outranks operator intent.
+ */
+export const PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS = 8;
+
+// paperclip:allow-git-push: remediation text printed to a rejected pusher, not an invocation
+const PUSH_GUARD_REMEDIATION_COMMAND = "git push origin HEAD:refs/heads/<your-branch>";
 
 /**
  * Refuse every inbound push, whatever the ref.
@@ -107,11 +161,11 @@ const PUSH_GUARD_HOOK_MARKER = `paperclip-push-guard v${PUSH_GUARD_HOOK_VERSION}
  * that just had a push rejected and will otherwise retry it.
  */
 export const PUSH_GUARD_HOOK = `#!/bin/sh
-# ${PUSH_GUARD_HOOK_MARKER} -- installed by Paperclip (BLO-31555). Do not edit.
+# ${PUSH_GUARD_HOOK_MARKER} v${PUSH_GUARD_HOOK_VERSION} -- installed by Paperclip (BLO-31555). Do not edit.
 #
 # This is a Paperclip-managed *base* checkout, shared by every run for this
 # project. It is not a publishing target: refs pushed here are invisible to the
-# forge, invisible to review, and accumulate silently (BLO-31359 found 67 such
+# forge, invisible to review, and accumulate silently (BLO-31359 found 44 such
 # refs across 3 base checkouts).
 # Git already prefixes everything a hook writes to stderr with "remote: ", so
 # these lines carry no prefix of their own -- adding one renders as "remote: remote:".
@@ -119,14 +173,15 @@ cat >&2 <<'PAPERCLIP_PUSH_GUARD_EOF'
 error: This is a Paperclip-managed base checkout and does not accept pushes.
 
 Refs pushed here are invisible to the forge and to review, and they
-accumulate silently (BLO-31359 found 67 such refs across 3 base checkouts).
+accumulate silently (BLO-31359 found 44 such refs across 3 base checkouts).
 If you are trying to hand work to another run, open a pull request.
 
 Publish from your own run workspace instead, via the forge remote:
 PAPERCLIP_PUSH_GUARD_EOF
 # Emitted separately so the reason marker below stays a shell comment rather than
-# becoming part of the message the rejected pusher sees.
-echo '    git push origin HEAD:refs/heads/<your-branch>' >&2 # paperclip:allow-git-push: remediation text printed to a rejected pusher, not an invocation
+# becoming part of the message the rejected pusher sees. The command itself is
+# interpolated from a constant so this file ships no Paperclip lint pragmas.
+echo '    ${PUSH_GUARD_REMEDIATION_COMMAND}' >&2
 echo 'See BLO-31555.' >&2
 exit 1
 `;
@@ -161,6 +216,8 @@ export type ManagedCheckoutPushGuardResult = {
   hookPath: string | null;
   /** Set when we had to take `core.hooksPath` over from an out-of-repo dir. */
   displacedHooksPath: string | null;
+  /** Set when an operator's own `pre-receive` was moved aside to this path. */
+  displacedHookPath: string | null;
   warning: string | null;
 };
 
@@ -180,14 +237,27 @@ async function defaultRunGit(args: string[], cwd: string): Promise<string> {
  * unreadable config look like a clean repo, so a locked or unreadable config
  * would silently take the "hooks are unset" branch. Same reasoning as the
  * sibling partial-clone guard, and the same failure direction to avoid.
+ *
+ * `scope` is load-bearing and differs per key:
+ *
+ * - `"effective"` resolves across system/global/local, which is what
+ *   `core.hooksPath` needs: the question there is "where does `receive-pack`
+ *   *actually* look", and an inherited value is the whole hazard.
+ * - `"local"` reads only this checkout's own config, which is what
+ *   {@link PUSH_GUARD_RECEIVE_CONFIG} needs. Those keys exist so protection
+ *   survives in config *the checkout owns*; an effective read would see an
+ *   inherited global value, skip the write as already-satisfied, and leave the
+ *   checkout depending on config a different pod or image may not carry.
  */
 async function readConfigValue(
   runGit: PushGuardGitRunner,
   cwd: string,
   key: string,
+  scope: "effective" | "local" = "effective",
 ): Promise<{ value: string | null; unreadable: string | null }> {
+  const scopeArgs = scope === "local" ? ["--local"] : [];
   try {
-    const raw = await runGit(["config", "--get", key], cwd);
+    const raw = await runGit(["config", ...scopeArgs, "--get", key], cwd);
     const trimmed = typeof raw === "string" ? raw.trim() : "";
     return { value: trimmed.length > 0 ? trimmed : null, unreadable: null };
   } catch (error) {
@@ -202,6 +272,30 @@ async function readConfigValue(
 function isInside(parent: string, child: string): boolean {
   const relative = path.relative(parent, child);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Pick a free path to move an operator's `pre-receive` aside to.
+ *
+ * Never returns a path that already exists: `fs.rename` overwrites silently, so
+ * reusing an occupied backup name would destroy an *earlier* displaced hook --
+ * the same irreversible loss this function exists to prevent, one step removed.
+ * Returns `null` once {@link PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS} is exhausted,
+ * which the caller treats as "do not install" rather than "overwrite".
+ */
+async function reserveDisplacedHookPath(hookPath: string): Promise<string | null> {
+  for (let attempt = 0; attempt <= PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS; attempt += 1) {
+    const candidate =
+      attempt === 0
+        ? `${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`
+        : `${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}.${attempt}`;
+    const taken = await fs
+      .lstat(candidate)
+      .then(() => true)
+      .catch(() => false);
+    if (!taken) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -223,6 +317,7 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     state: "not_a_checkout",
     hookPath: null,
     displacedHooksPath: null,
+    displacedHookPath: null,
     warning: null,
   };
   if (!cwd) return base;
@@ -295,10 +390,29 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
   const hookPath = path.join(hooksDir, "pre-receive");
 
   const existing = await fs.readFile(hookPath, "utf8").catch(() => null);
-  // Compared verbatim rather than by marker so a bumped hook version, or a
-  // hand-edited file, is rewritten rather than accepted as current.
+  // Two distinct questions -- see PUSH_GUARD_HOOK_MARKER. "Current" is verbatim
+  // so a bumped version or a hand-edit is refreshed; "ours" is by marker so an
+  // operator's own hook is preserved rather than clobbered.
   const hookCurrent = existing === PUSH_GUARD_HOOK;
+  const foreignHook = existing !== null && !existing.includes(PUSH_GUARD_HOOK_MARKER);
 
+  // Reserved before any write so an exhausted backup budget aborts cleanly,
+  // leaving the operator's hook exactly where it was.
+  const foreignBackupPath = foreignHook ? await reserveDisplacedHookPath(hookPath) : null;
+  if (foreignHook && !foreignBackupPath) {
+    return {
+      ...base,
+      state: "install_failed",
+      warning:
+        `Managed checkout "${cwd}": a non-Paperclip \`pre-receive\` hook is installed at "${hookPath}" and ` +
+        `Paperclip has already displaced ${PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS} earlier ones, so it declined ` +
+        `to install the inbound-push guard rather than overwrite a backup. The operator hook is untouched. ` +
+        `Remove the stale "${path.basename(hookPath)}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}*" backups to re-enable ` +
+        `the guard; until then this checkout may still accept pushes from run workspaces (BLO-31359).`,
+    };
+  }
+
+  let hookInstalled = hookCurrent;
   try {
     if (!hookCurrent) {
       await fs.mkdir(hooksDir, { recursive: true });
@@ -309,7 +423,12 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       // Explicit chmod: `mode` on writeFile is masked by the process umask, and
       // a hook without the execute bit is skipped by git in silence.
       await fs.chmod(staging, 0o755);
+      // Displace only once our replacement is fully staged, so a failed write
+      // cannot leave the checkout with the operator's hook moved and nothing in
+      // its place.
+      if (foreignBackupPath) await fs.rename(hookPath, foreignBackupPath);
       await fs.rename(staging, hookPath);
+      hookInstalled = true;
     }
 
     if (displacedHooksPath) {
@@ -321,7 +440,7 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     // so a failure here must not discard a guard that is already installed.
     const configFailures: string[] = [];
     for (const [key, value] of PUSH_GUARD_RECEIVE_CONFIG) {
-      const current = await readConfigValue(runGit, cwd, key);
+      const current = await readConfigValue(runGit, cwd, key, "local");
       if (current.value === value) continue;
       const failure = await runGit(["config", "--local", key, value], cwd).then(
         () => null,
@@ -331,12 +450,23 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     }
 
     const notes: string[] = [];
+    if (foreignBackupPath) {
+      notes.push(
+        `Managed checkout "${cwd}" already had a non-Paperclip \`pre-receive\` hook. Paperclip moved it to ` +
+          `"${foreignBackupPath}" and installed the inbound-push guard in its place; it is no longer run. ` +
+          `Restore it by merging its contents into the guard, or move it back to disable the guard.`,
+      );
+    }
     if (displacedHooksPath) {
       notes.push(
         `Managed checkout "${cwd}" loaded hooks from "${displacedHooksPath}", which is outside the ` +
           `repository. Paperclip set a local core.hooksPath to "${hooksDir}" instead of writing into a ` +
           `shared hooks directory. The previous value is recorded in ` +
-          `${PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY}; hooks that lived in it no longer run for this checkout.`,
+          `${PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY}. Note the scope: git stores --local config in the git ` +
+          `*common* dir, which every linked worktree shares, so hooks that lived in "${displacedHooksPath}" ` +
+          `no longer run for this checkout OR for any run workspace provisioned as a worktree from it ` +
+          `(post-checkout, pre-commit, commit-msg and the rest). Paperclip installs only \`pre-receive\`, ` +
+          `which run worktrees inherit harmlessly -- nothing pushes into one either.`,
       );
     }
     if (configFailures.length > 0) {
@@ -348,22 +478,36 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     }
 
     return {
-      state: hookCurrent && !displacedHooksPath && configFailures.length === 0 ? "already_installed" : "installed",
+      state:
+        hookCurrent && !displacedHooksPath && configFailures.length === 0 ? "already_installed" : "installed",
       hookPath,
       displacedHooksPath,
+      displacedHookPath: foreignBackupPath,
       warning: notes.length > 0 ? notes.join(" ") : null,
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    // Report what was actually achieved. The hook is written before both config
+    // writes, so a `git config` failure leaves the guard genuinely in force --
+    // telling an operator their checkout still accepts pushes would send them
+    // hunting for a hazard that is already closed.
+    const consequence = hookInstalled
+      ? `The \`pre-receive\` guard itself IS installed at "${hookPath}" and inbound pushes are refused, but ` +
+        `the follow-up configuration did not complete` +
+        (displacedHooksPath
+          ? `, so core.hooksPath may still point at "${displacedHooksPath}" and the guard may therefore not ` +
+            `be the hook git loads. Re-provisioning will retry.`
+          : `, so the receive.* keys that protect existing refs if the hook file is removed may be unset. ` +
+            `Re-provisioning will retry.`)
+      : `This checkout may still accept pushes from run workspaces, creating refs that are invisible to the ` +
+        `forge and to review (BLO-31359).`;
     return {
       ...base,
       state: "install_failed",
-      hookPath: null,
+      hookPath: hookInstalled ? hookPath : null,
       displacedHooksPath,
-      warning:
-        `Managed checkout "${cwd}": could not install the inbound-push guard at "${hookPath}" (${reason}). ` +
-        `This checkout may still accept \`git push <path>\` from run workspaces, creating refs that are ` + // paperclip:allow-git-push: operator-facing warning text, not an invocation
-        `invisible to the forge and to review (BLO-31359).`,
+      displacedHookPath: foreignBackupPath,
+      warning: `Managed checkout "${cwd}": could not fully install the inbound-push guard at "${hookPath}" (${reason}). ${consequence}`,
     };
   }
 }
