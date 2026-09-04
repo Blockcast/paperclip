@@ -238,6 +238,63 @@ export const PROCESS_LOST_LIVENESS_NULL_METRIC = "paperclip_process_lost_livenes
  */
 export const ORPHANED_MANAGED_POD_REAPED_METRIC = "paperclip_orphaned_managed_pod_reaped_total";
 /**
+ * gbrain-context recall-prefetch outcome counter (BLO-25892).
+ *
+ * Incremented once per `agent.run.started` prefetch, at the single server-side
+ * write path (`pluginStateStore.set`, `stateKey="gbrain-context"`,
+ * `scopeKind="run"`) rather than inside the gbrain plugin worker — the worker
+ * runs out-of-process with no access to this registry, whereas every prefetch
+ * result already round-trips through `ctx.state.set` to persist to
+ * `plugin_state`, so hooking the existing write is free of a second RPC.
+ *
+ * This exists because container-restart-count monitoring is structurally
+ * blind to a recall outage: the 2026-08-08T11:00–22:00Z incident (1,629
+ * failed `traverse_graph` calls, 0 successes for 11h) left `gbrain-mcp`'s
+ * restart count untouched, because the fetch failed at the transport layer
+ * while the pod's own liveness probe (not routed through the same Service
+ * path) kept passing. `rate(...{status="error"}[15m])` crossing a threshold
+ * catches that class of failure regardless of whether the backing pod ever
+ * restarts.
+ *
+ * Scope limit — this counter detects a FAILING recall, not an ABSENT one. When
+ * the plugin worker stops writing altogether (BLO-30067 measured 76 such hours
+ * across 2026-08-18..08-23) every series here stays flat and the error ratio is
+ * 0/0, i.e. green. The complementary detector for that mode is activity-side
+ * coverage (`plugin_state` rows per hour over `heartbeat_runs` per hour), which
+ * is owned by BLO-30067. Neither signal subsumes the other; both are required.
+ *
+ * Labels: `status`, bounded to {@link KNOWN_GBRAIN_RECALL_STATUSES} (else
+ * "other" — see {@link normalizeGbrainRecallStatus}). Cardinality is fixed at
+ * 7 series, independent of agent/company/issue.
+ */
+export const GBRAIN_RECALL_METRIC = "paperclip_gbrain_recall_total";
+
+/**
+ * Closed set of `CachedRecallStatus` values from
+ * `packages/plugins/paperclip-plugin-gbrain/src/recall.ts`. Duplicated here
+ * (rather than imported) to keep this module's cardinality guardrail
+ * self-contained and independent of the plugin package's exports drifting.
+ */
+export const KNOWN_GBRAIN_RECALL_STATUSES = [
+  "ok",
+  "no-issue-page",
+  "empty",
+  "island",
+  "skipped",
+  "error",
+] as const;
+
+export const UNKNOWN_GBRAIN_RECALL_STATUS = "other";
+
+const knownGbrainRecallStatusSet: ReadonlySet<string> = new Set(KNOWN_GBRAIN_RECALL_STATUSES);
+
+export function normalizeGbrainRecallStatus(status: string | null | undefined): string {
+  return typeof status === "string" && knownGbrainRecallStatusSet.has(status)
+    ? status
+    : UNKNOWN_GBRAIN_RECALL_STATUS;
+}
+
+/**
  * GitHub review-request delivery-state counter (BLO-18859, parent BLO-18848).
  * One series per (`state`, `reason`) so an operator can read the full delivery
  * funnel for reviewer wakes driven by the in-tree GitHub receiver
@@ -1321,6 +1378,7 @@ let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
+let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
 let agentErrorDuration: Gauge<"agent_id"> | null = null;
@@ -1366,6 +1424,7 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
+  gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
   agentErrorDurationGauge: Gauge<"agent_id">;
@@ -1411,6 +1470,7 @@ function ensureRegistry(): {
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
     || !authRequest
+    || !gbrainRecallTotal
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
     || !agentErrorDuration
@@ -1911,6 +1971,20 @@ function ensureRegistry(): {
         authRequest.inc({ operation, outcome }, 0);
       }
     }
+    gbrainRecallTotal = new Counter({
+      name: GBRAIN_RECALL_METRIC,
+      help:
+        "Count of gbrain-context recall-prefetch outcomes (BLO-25892), labeled by bounded "
+        + "status (ok/no-issue-page/empty/island/skipped/error/other). Incremented at the "
+        + "pluginStateStore.set write path, once per agent.run.started prefetch. Detects a "
+        + "recall outage independent of gbrain-mcp container restart count -- see "
+        + GBRAIN_RECALL_METRIC + "'s doc comment for the 2026-08-08 incident this closes.",
+      labelNames: ["status"],
+      registers: [registry],
+    });
+    for (const status of [...KNOWN_GBRAIN_RECALL_STATUSES, UNKNOWN_GBRAIN_RECALL_STATUS]) {
+      gbrainRecallTotal.inc({ status }, 0);
+    }
     agentHeartbeatAge = new Gauge({
       name: AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
       help:
@@ -2020,6 +2094,7 @@ function ensureRegistry(): {
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
     authRequestCounter: authRequest,
+    gbrainRecallCounter: gbrainRecallTotal,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
     agentErrorDurationGauge: agentErrorDuration,
@@ -2739,6 +2814,17 @@ export function recordAuthRequest(input: {
     outcome: normalizeAuthOutcome(input.outcome),
   };
   ensureRegistry().authRequestCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Record one gbrain-context recall-prefetch outcome (BLO-25892). `status` is
+ * normalized into the bounded label set, so an unrecognized value from a newer
+ * plugin build lands on "other" rather than minting an unbounded series.
+ */
+export function recordGbrainRecallOutcome(status: string | null | undefined): { status: string } {
+  const labels = { status: normalizeGbrainRecallStatus(status) };
+  ensureRegistry().gbrainRecallCounter.inc(labels);
   return labels;
 }
 

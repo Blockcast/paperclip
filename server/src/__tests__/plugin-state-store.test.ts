@@ -6,6 +6,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { pluginStateStore } from "../services/plugin-state-store.js";
+import { GBRAIN_RECALL_METRIC, __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -77,5 +78,32 @@ describeEmbeddedPostgres("plugin state store", () => {
       expect(result.rows.map((row) => row.stateKey)).toEqual(expected);
       expect(result.hasMore).toBe(false);
     }
+  });
+
+  it("increments the gbrain recall metric on a run-scoped gbrain-context write, and not on other writes (BLO-25892)", async () => {
+    __resetMetricsForTest();
+    const store = pluginStateStore(db);
+
+    await store.set(pluginId, {
+      scopeKind: "run",
+      scopeId: randomUUID(),
+      stateKey: "gbrain-context",
+      value: { status: "error", note: "traverse_graph failed: fetch failed" },
+    });
+    await store.set(pluginId, {
+      scopeKind: "instance",
+      stateKey: "gbrain-context",
+      value: { status: "ok" },
+    });
+    await store.set(pluginId, {
+      scopeKind: "run",
+      scopeId: randomUUID(),
+      stateKey: "some-other-state-key",
+      value: { status: "ok" },
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="error"} 1`);
+    expect(body).not.toMatch(new RegExp(`${GBRAIN_RECALL_METRIC}\\{status="ok"\\} [1-9]`));
   });
 });
