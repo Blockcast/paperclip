@@ -483,9 +483,15 @@ export interface PluginWorkspace {
   isIssueScoped?: boolean;
   /**
    * Mode of the bound execution workspace, when `isIssueScoped` is `true`.
-   * `null` for project-scoped results. This is the field that answers "is this
-   * path private to my issue" — see {@link PluginWorkspaceMode}. Optional for
-   * SDK back-compat.
+   * `null` **or absent** for project-scoped results: `getWorkspaceForIssue`'s
+   * fallback limb writes `null`, while the project-scoped readers
+   * (`listWorkspaces`, `getPrimaryWorkspace`) leave it `undefined` for the same
+   * reason they leave `isIssueScoped` undefined. Branch on truthiness or
+   * compare against a specific mode — do NOT test `mode === null` to mean
+   * "project-scoped", as that misses the `undefined` case.
+   *
+   * This is the field that answers "is this path private to my issue" — see
+   * {@link PluginWorkspaceMode}. Optional for SDK back-compat.
    */
   mode?: PluginWorkspaceMode | null;
   /** ISO 8601 creation timestamp. */
@@ -512,6 +518,13 @@ export interface PluginExecutionWorkspaceMetadata {
   projectId: string;
   /** UUID of the backing project workspace, when present. */
   projectWorkspaceId: string | null;
+  /**
+   * The workspace's own label (e.g. the branch slug), as stored on the row.
+   * This is what `getWorkspaceForIssue` renders as {@link PluginWorkspace.name}
+   * for an issue-scoped result, so a double that seeds workspaces should carry
+   * it to label them the way the host does. Optional for SDK back-compat.
+   */
+  name?: string | null;
   /** Absolute filesystem path to the workspace when locally realized. */
   path: string | null;
   /** Current working directory for local workspace tooling. */
@@ -524,6 +537,21 @@ export interface PluginExecutionWorkspaceMetadata {
   branchName: string | null;
   /** Host provider type for the realized workspace. */
   providerType: string | null;
+  /**
+   * BLO-31349: whether the host considers this workspace closed — its directory
+   * may already have been torn down, so `cwd`/`path` can point at nothing.
+   * `getWorkspaceForIssue` refuses to resolve a closed workspace and falls back
+   * to the project-scoped result, so seed `closed: true` to exercise that
+   * fallback in tests.
+   *
+   * Deliberately a host-computed boolean rather than the raw `status`/`closedAt`
+   * columns: "closed" is `closedAt != null || status is archived/cleanup_failed`,
+   * and a plugin re-deriving that from raw columns would very likely check
+   * `closedAt` alone and miss `cleanup_failed`. Keeping the predicate on the
+   * host side keeps it single-sourced. Optional for SDK back-compat; absent or
+   * `false` both mean "not closed".
+   */
+  closed?: boolean;
   /**
    * Mode of this execution workspace — the field that answers whether its
    * path is private to one issue. Optional for SDK back-compat.
