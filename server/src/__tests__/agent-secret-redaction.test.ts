@@ -155,11 +155,11 @@ vi.mock("../services/index.js", () => ({
   workspaceOperationService: () => mockWorkspaceOperationService,
 }));
 
-function createDbStub() {
+function createDbStub(requireBoardApprovalForNewAgents = false) {
   const rows = [{
     id: companyId,
     name: "Paperclip",
-    requireBoardApprovalForNewAgents: false,
+    requireBoardApprovalForNewAgents,
   }];
   return {
     select: vi.fn().mockReturnValue({
@@ -175,14 +175,14 @@ function createDbStub() {
   };
 }
 
-function createApp(actor: Record<string, unknown>) {
+function createApp(actor: Record<string, unknown>, requireBoardApprovalForNewAgents = false) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", agentRoutes(createDbStub() as any));
+  app.use("/api", agentRoutes(createDbStub(requireBoardApprovalForNewAgents) as any));
   app.use(errorHandler);
   return app;
 }
@@ -820,8 +820,74 @@ describe("agent secret redaction on mutating responses", () => {
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
   });
 
-  // `secret_ref` bindings are pointers, never plaintext, so they survive the
-  // redactor by design — but a resolved `value` riding along on one is a secret
+  // The fifth converted site, and the last one this suite did not reach. The
+  // hire approval payload is the one place the *stored* value is deliberately
+  // left credential-bearing — `activatePendingApproval` replays it verbatim
+  // over the agent row, so redacting it on the way in would write masks back
+  // over live credentials. Containment on the way out is therefore the only
+  // control here, not a second layer behind one.
+  //
+  // Both cases drive the real route rather than calling the helper: the value
+  // being contained is whatever `approvalsSvc.create` RESOLVES, so a test that
+  // asserted on the object literal the route builds would pass while the
+  // returned row went out uncontained.
+  async function hire(payload: unknown) {
+    // `instructionsRootPath` takes the early return in
+    // `materializeDefaultInstructionsBundleForNewAgent`, so the hire lands
+    // without dragging bundle materialization (and its disk reads) into a test
+    // about response containment.
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+    });
+    mockApprovalService.create.mockResolvedValue({
+      id: "44444444-4444-4444-8444-444444444444",
+      type: "hire_agent",
+      status: "pending",
+      payload,
+    });
+
+    return request(createApp(boardActor, true))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ name: "Hire", role: "engineer", adapterType: "claude_local" });
+  }
+
+  it("POST /companies/:companyId/agent-hires contains an approval payload whose prototype is not Object.prototype", async () => {
+    // `asRecord` admits any non-array object, so the old expression handed a
+    // foreign-prototype payload to a redactor that returns it BY REFERENCE.
+    // The secret sits outside `env` for the reason given at the adapterConfig
+    // case above: the top-level `env` loop would mask it either way and hide
+    // the by-reference return that is actually under test.
+    const res = await hire(
+      Object.assign(Object.create({ inherited: true }), {
+        adapterConfig: { sidecarConfig: { env: { BAZ: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } } },
+      }),
+    );
+
+    expect(res.status).toBe(201);
+    // Plaintext first, deliberately: the shape assertion below also fails on
+    // the pre-fix expression, so leading with it would let this test report a
+    // changed shape when what it exists to catch is a credential on the wire.
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expect(res.body.approval.payload).toEqual({});
+    // The rest of the approval row still projects — containment is scoped to
+    // `payload`, not to the whole response.
+    expect(res.body.approval.type).toBe("hire_agent");
+  });
+
+  // Not a leak on either side of the change, and pinned for exactly that
+  // reason: it is the one converted line whose output shape moved for a
+  // plausible input, so leaving it unasserted means the next reader cannot
+  // tell the delta was intended. `asRecord` rejects arrays and mapped this to
+  // `null`; `containAgentConfig` withholds it as `{}`.
+  it("POST /companies/:companyId/agent-hires withholds an ARRAY-valued approval payload as {}, not null", async () => {
+    const res = await hire([{ type: "plain", value: SNAPSHOT_DRIFT_SECRET }]);
+
+    expect(res.status).toBe(201);
+    expect(res.body.approval.payload).toEqual({});
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+  });
+
   // that leaked in, and the schema has no field for it.
   it("never serializes a resolved value for a secret_ref env binding", async () => {
     const refAgent = {
