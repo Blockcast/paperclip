@@ -377,6 +377,13 @@ export interface ClaudeUpstreamClassification {
 
 const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s+found\b/i;
 
+// Presence of an assistant event in the RAW transcript. Read on the same
+// surface as the skill scan below, which is the whole point: a parsed signal
+// cannot bound what a raw regex sees. Whitespace-tolerant because this matches
+// text rather than JSON structure, and a truncated event still carries this
+// prefix — truncation drops the tail, not the leading `"type":"assistant"`.
+const CLAUDE_ASSISTANT_EVENT_RE = /"type"\s*:\s*"assistant"/;
+
 /**
  * Detect Claude's "Skill "<name>" not found" death (BLO-7991 AC3).
  *
@@ -422,17 +429,42 @@ function isClaudeSkillNotFoundError(input: {
  * structured envelope at all — `stdout` (the whole pod log) is the only
  * surface left, and execute.ts's `!parsed` branch returns an *untyped* partial
  * run error. Scanning that transcript is normally unsafe for a retry-killing
- * code, so the guard is structural rather than advisory: if any assistant
- * event ever produced output tokens, this returns false unconditionally. Model
- * prose about a missing skill requires the model to have spoken; a
- * skill-resolution death at startup means it never did.
+ * code, so it is guarded twice, and the second guard is the load-bearing one.
+ *
+ * `assistantContentSeen` is a *parsed* signal and is NOT equivalent to "the
+ * model has not spoken", so it cannot bound what a raw scan sees. Two shapes
+ * slip between them, both of which the parser produces deliberately:
+ *
+ *   (a) A line that fails `parseJson` is skipped (`:33`) and never touches the
+ *       flag, yet it remains verbatim in the `stdout` being tested. This is the
+ *       OOMKill-mid-first-message shape.
+ *   (b) `outputTokens` falls back to `-1` (`:54`) when neither
+ *       `message.output_tokens` nor `message.usage.output_tokens` is present,
+ *       so a fully-written assistant event carrying text still leaves the flag
+ *       false — `assistantTexts` is populated (`:74`) while the flag is not.
+ *
+ * Either shape reaches this scan with model prose in `stdout` and the flag
+ * false. Because `skill_not_found` is in NON_RETRYABLE_CONTINUATION_ERROR_CODES
+ * and is excluded from the zero-token session reset, that false positive
+ * suppresses retries *permanently* — so a transient OOM whose truncated message
+ * happened to discuss a missing skill would never be retried. Single quotes and
+ * backticks are not escaped inside a JSON string, so quoting does not prevent
+ * the match (this file's own fixtures rely on that).
+ *
+ * The fix is to guard on the same surface the scan reads: positive evidence of
+ * an assistant event anywhere in the raw transcript. That is strictly stronger
+ * than the token flag and immune to both shapes. A genuine startup skill death
+ * has only the `system:init` line and the error, so detection is unaffected.
+ * The parsed flag is retained as a cheap first check, not as the guarantee.
  */
 export function isClaudeSkillNotFoundStartupFailure(input: {
   stdout?: string | null;
   assistantContentSeen: boolean;
 }): boolean {
   if (input.assistantContentSeen) return false;
-  return typeof input.stdout === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout);
+  if (typeof input.stdout !== "string") return false;
+  if (CLAUDE_ASSISTANT_EVENT_RE.test(input.stdout)) return false;
+  return CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout);
 }
 
 /**
