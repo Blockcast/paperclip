@@ -328,22 +328,51 @@ resources:
     # the measured peak and the configured design envelope, so it would have
     # left the same failure mode in place under exactly the load that triggers
     # it. Measured 2026-09-04 over 14d, max_over_time on
-    # container_memory_working_set_bytes:
-    #   paperclip-0 (worker)  peak 6.24 GiB   (instantaneous at read: 2.97 GiB)
+    # container_memory_working_set_bytes — the signal the kubelet actually
+    # ranks eviction on:
+    #   paperclip-0 (worker)  peak 5.86 GiB   (instantaneous at read: 2.97 GiB)
     #   paperclip-api         peak 4.70 GiB across replicas (live ~0.85 GiB)
-    # and NODE_OPTIONS above pins --max-old-space-size=6144, a 6 GiB V8 old-space
+    # Do NOT re-derive these from container_memory_usage_bytes: it peaks at
+    # 6.19 GiB on the same selector because it counts reclaimable page cache,
+    # and it is not the eviction signal. An earlier revision of this comment
+    # quoted 6.24 GiB from that metric while naming working_set, so the figure
+    # did not reproduce from the query as written (caught in review, PR #1643).
+    # Switching to working_set makes the argument stronger, not weaker — 5.86
+    # GiB still exceeds the 5Gi PEN-2943 proposed, so that remains insufficient.
+    # NODE_OPTIONS above also pins --max-old-space-size=6144, a 6 GiB V8 old-space
     # ceiling, so ~6 GiB of heap is by design and not an anomaly to be squeezed.
     # 7Gi sits above the worker's 14d peak, above the V8 ceiling, and above the
     # API tier's peak, while staying 3Gi under the 10Gi limit for off-heap burst.
     # It matches the 7Gi chosen for paperclip-pg on PEN-2956 for the same reason.
     #
     # COST: +5Gi on each of 3 pods = +15 GiB of cluster memory *reservation*
-    # (not usage). Affordable at time of writing — phase-filtered free-vs-
-    # allocatable on 2026-09-04 was 78.7 GiB on k8s-paperclip-10 (where
-    # paperclip-0 runs) and 18.9–57.6 GiB on the other paperclip nodes. Filter
-    # `kube_pod_container_resource_requests` by
-    # `kube_pod_status_phase{phase=~"Running|Pending"}` before re-checking this;
-    # unfiltered it counts Succeeded pods and reads ~44 GiB too pessimistic.
+    # (not usage). Exactly two templates render `.Values.resources` —
+    # templates/statefulset.yaml (paperclip-0) and templates/deployment-api.yaml
+    # (2 replicas) — and there is no `api.resources` override, which is why this
+    # one value moves 3 pods rather than 1. (`paperclip-api-deploy-drift` matches
+    # the same name prefix but is an unrelated BLO-22032 monitoring exporter with
+    # its own 32Mi request, not part of this chart.)
+    #
+    # AFFORDABILITY — read the invariant, not the number. Per-node headroom here
+    # moves fast: the same phase-filtered query below returned 78.7, then 62.7,
+    # then 91.2 GiB for k8s-paperclip-10 over the course of 2026-09-04, so any
+    # single figure pinned in this comment is stale within hours and the next
+    # engineer will fail to reproduce it. The durable claim is the binding
+    # constraint: +5Gi has to fit in the SMALLEST headroom in the paperclip pool,
+    # and across all of those reads the pool floor stayed at roughly 18-24 GiB
+    # (k8s-paperclip-3 was ~23.5 GiB at the last read). +5Gi per pod clears that
+    # floor by ~4x, so this is affordable anywhere in the observed range — which
+    # is the thing worth knowing, and it does not decay. Re-derive with:
+    #   sum by (node) (kube_node_status_allocatable{resource="memory"})
+    #   - sum by (node) (
+    #       kube_pod_container_resource_requests{resource="memory"}
+    #       * on (namespace,pod) group_left()
+    #       (max by (namespace,pod) (kube_pod_status_phase{phase=~"Running|Pending"} == 1))
+    #     )
+    # The phase join is mandatory, not tidiness: unfiltered it also counts
+    # Succeeded pods' requests and reads ~44 GiB too pessimistic on
+    # k8s-paperclip-6 (that node reads -3.6 GiB over-committed unfiltered vs
+    # +40.6 GiB free filtered) — see PEN-2957 item B.
     #
     # The API tier is over-provisioned by this at its ~0.85 GiB steady state.
     # That is the accepted cost of a shared block; splitting `api.resources` out
