@@ -9567,9 +9567,58 @@ const CONNECTIVES =
 // pass, pre-existing at every prior head).
 const CLAUSE_SCOPE_CHARS = 120;
 const COPULA_FILLER_WORDS = Math.floor(CLAUSE_SCOPE_CHARS / 5);
-const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b(?!\\s+(?:\\w+\\s+){0,2}(?:that|whether)\\b))\\w+\\s+){0,${COPULA_FILLER_WORDS}}`;
-const COPULA_EDGE = `${COPULA_FILLER}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s\`*_]*$`;
+// The filler token is anything that is NOT a clause boundary, rather than a
+// word character. The excluded set is EXACTLY clauseBefore's boundary set plus
+// whitespace, so the filler can cross a backtick, a possessive, a parenthesis
+// or a hyphen but can never cross a boundary — one definition of "clause",
+// used in both places. With `\\w+` the cue was blocked by its own citation:
+// "I cannot confirm `<sha>` was already reviewed at …" leaked (masking).
+// …and a complementizer immediately followed by an anchor NOUN is a
+// demonstrative, not a complementizer ("yet THAT HEAD was" vs "yet that THIS
+// head was"), so it must not flip the connective into its filler role and let
+// the negation cross (Ally pass 16 suggestion: 20/20 connectives false-vetoed).
+const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b(?!\\s+(?:[^\\s.\\n:;,\u2014\u2013]+\\s+){0,2}(?:that|whether)\\b(?!\\s+(?:head|commit|sha|branch|pr)\\b)))[^\\s.\\n:;,\u2014\u2013]+\\s+){0,${COPULA_FILLER_WORDS}}`;
+// A relative pronoun abutting the copula is NOT a complementizer, and the
+// distinction is syntactic rather than lexical: a complementizer is always
+// followed by a SUBJECT before the copula ("confirm that this head was"), so
+// `that` sitting directly against the copula can only head a relative clause
+// modifying the preceding noun phrase. Without the lookbehind the cue reached
+// across it and refused correct skips like "no newer commit was found for the
+// head that was already reviewed at …" (false-missing direction).
+const COPULA_EDGE = `${COPULA_FILLER}(?<!\\b(?:that|what|which|who|whom)\\s)(?:was|were|is|are|has\\s+been|had\\s+been)[\\s\`*_]*$`;
 const CLAUSE_REACH = `(?:[\\s\`*_]*$|\\s+${COPULA_EDGE})`;
+
+// The negation cue's two halves, as named constants so a second cue
+// (negatedHeadConnective) can reuse them without a copy that drifts.
+//
+// NOT a bare negation — "Exiting without posting since …", "No action taken
+// because …" are how a correct skip explains itself. `cannot`/`can't` are
+// listed because a bare not-boundary does not match inside `cannot`. The
+// contracted and inflected auxiliaries were an oversight: the SAME file's
+// prReviewOutputHasPostedReviewNegation already enumerates them.
+const NEGATION_PREFIX_WORD =
+  "\\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|couldn['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|didn['’]t|hasn['’]t|haven['’]t|hadn['’]t|weren['’]t|aren['’]t|unable\\s+to|fail(?:s|ed|ing)\\s+to|failure\\s+to)";
+      // Evidence nouns and mental-state predicates, the establishing verbs, and
+      // the reporting verbs whose complementizer is routinely elided ("cannot
+      // say this head WAS already reviewed at …" — caught by the copula arm).
+      // Morphological STEMS, not enumerated surface forms. Every prior pass
+      // added whichever inflection it happened to meet, so the list carried
+      // `indicates` and `indicating` but not `indicated`, `record` but not
+      // `records`. A parallel probe found seven such gaps at once. Enumerating
+      // inflections does not converge; enumerating LEMMAS does, so each entry
+      // now tolerates its own paradigm.
+const EPISTEMIC_HEAD =
+  "(?:evidence|indications?|indicat(?:e|es|ed|ing)|signs?|records?|proofs?|traces?" +
+  "|suggestions?|statements?|assertions?|awareness|findings?|validations?" +
+  "|believ(?:e|es|ed)|think(?:s|ing)?|thought|appear(?:s|ed|ing)?" +
+  "|suggest(?:s|ed|ing)?|aware|see|sees|seen|saw|seeing" +
+  "|confirm(?:s|ed|ing)?|confirmation|verif(?:y|ies|ied|ying)|verification" +
+  "|establish(?:es|ed|ing)?|determin(?:e|es|ed|ing)|determination" +
+  "|find|finds|found|finding|check(?:s|ed|ing)?|locat(?:e|es|ed|ing)" +
+  "|ascertain(?:s|ed|ing)?|validat(?:e|es|ed|ing)|prov(?:e|es|en|ed|ing)" +
+  "|demonstrat(?:e|es|ed|ing)|show(?:s|ed|ing|n)?|mention(?:s|ed|ing)?|report(?:s|ed|ing)?|tell(?:s|ing)?|told|say(?:s|ing)?|said" +
+  "|stat(?:e|es|ed|ing)|assert(?:s|ed|ing)?|claim(?:s|ed|ing)?" +
+  "|rul(?:e|es|ed|ing)\\s+out)";
 
 // Ally passes six through ten each found exactly one more cue matching
 // unbound — a veto reaching a clause it does not govern, which is the
@@ -9652,6 +9701,21 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
       "\\b(?:(?:prior|previous|earlier|stale|old|superseded)\\s+head" +
       "|branch\\s+(?:has\\s+)?moved|head\\s+(?:has\\s+)?moved)",
   },
+  // A negated head IMMEDIATELY followed by a connective, with the
+  // complementizer elided: "No evidence yet this head was …", "I cannot say
+  // yet this head was …". The role test above keys on a FOLLOWING
+  // complementizer, so when `that` is dropped the filler-role connective reads
+  // as connective-role and the negation never reaches the clause (Ally pass
+  // 16: 35/35 such phrasings accepted, at every head since the connectives
+  // were excluded). The discriminator is the GAP between the negation and its
+  // head: zero intervening words is the filler role ("no evidence yet"), one
+  // or more is the connective role ("no newer commits were found yet") — the
+  // head noun alone cannot tell them apart, since `found` is itself a head.
+  // Dropping the exclusion instead trades back 20/20 connective-sense skips.
+  {
+    name: "negatedHeadConnective",
+    stem: `${NEGATION_PREFIX_WORD}\\s+${EPISTEMIC_HEAD}\\s+(?:${CONNECTIVES})\\b`,
+  },
   // An epistemic negation governing the clause from further back: a negation
   // word, then within three words a head that could establish the claim. One
   // list, one binding rule — evidence nouns are NOT exempt (ninth pass:
@@ -9662,14 +9726,22 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // NOT a bare negation — "Exiting without posting since …", "No action taken
   // because …" are how a correct skip explains itself. `cannot`/`can't` are
   // listed because a bare not-boundary does not match inside `cannot`.
+  // A FUSED negation: the negative morpheme is part of the head word itself
+  // ("I am UNaware that this head was …", "UNconfirmed whether this head was
+  // …"), so there is no separate negation word for the `negation` prefix to
+  // anchor on, and listing these as heads left them unreachable — measured:
+  // "not aware that" vetoed while "unaware that" did not. They get their own
+  // stem, which inherits CLAUSE_REACH like every other, so the fused form binds
+  // exactly as the spelled-out one does. `hedge` already covers unclear/unsure/
+  // uncertain/unconfirmed/unverified; this entry adds the mental-state
+  // participles that `hedge` does not carry.
+  {
+    name: "fusedNegation",
+    stem: "\\b(?:unaware|unconvinced|unpersuaded|unsatisfied)\\s+(?:\\w+\\s+){0,3}(?:that|whether|if)",
+  },
   {
     name: "negation",
-    stem:
-      "\\b(?:no|not|never|nothing|neither|nor|cannot|can['\u2019]t|couldn['\u2019]t|doesn['\u2019]t|don['\u2019]t|isn['\u2019]t|wasn['\u2019]t|unable\\s+to|failed\\s+to)\\s+(?:\\w+\\s+){0,3}" +
-      // Evidence nouns and mental-state predicates, the establishing verbs, and
-      // the reporting verbs whose complementizer is routinely elided ("cannot
-      // say this head WAS already reviewed at …" — caught by the copula arm).
-      "(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|appears?|suggests?|aware|see|seen|confirms?|confirmed|confirmation|verification|determination|rule\\s+out|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tells?|says?|said|states?|asserts?|claims?)",
+    stem: `${NEGATION_PREFIX_WORD}\\s+(?:\\w+\\s+){0,3}${EPISTEMIC_HEAD}`,
   },
 ];
 
@@ -9699,7 +9771,15 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
       // `+` after `at` too: `at8b237675…` with no separator is not the clause.
       "\\balready[\\s`*_]+reviewed[\\s`*_]+at[\\s`*_]+" +
       // optional "<timestamp> for" (plain shape) and/or a "head"/"commit" noun
-      `(?<forMarker>[^\\s\`*_]{1,40}${md}for${md})?(?<nounMarker>(?:head|commit)[\\s\`*_]+)?` +
+      `(?<forMarker>[^\\s\`*_]{1,40}${md}for${md})?` +
+      // The anchor noun tolerates a determiner, an optional `sha` apposition,
+      // and punctuation separators: "at head: <sha>", "at the head <sha>" and
+      // "at head sha <sha>" were all refused (false-missing direction, found by
+      // a parallel probe rather than by review). The separator quantifier stays
+      // `+`, so `head<sha>` with no separator is still not the clause. A bare
+      // `sha` noun is deliberately NOT admitted: it would widen the all-decimal
+      // surface, since "at sha 1234567" would then count as marker-qualified.
+      "(?<nounMarker>(?:(?:the|this|current|latest)[\\s`*_]+)?(?:head|commit)(?:[\\s`*_]+sha)?[:=,\\s`*_]+)?" +
       "(?<sha>[0-9a-f]{7,40})(?![0-9a-f])",
     "gi",
   );
@@ -9733,7 +9813,13 @@ export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
       // rule the rejected token just failed: without that, any incidental hex
       // word in the tail ("…and the deadbeef branch") would be read as the
       // cited commit, which is the masking direction.
-      const tail = text.slice(m.index + m[0].length);
+      // Bounded by the clause cap: an unbounded slice copies O(n) per rejected
+      // token and `matchAll` yields one per `already reviewed at <decimal>`, so
+      // the classifier went quadratic on run output — measured 12.8s at 547KB
+      // against 11ms before (Ally pass 16). `sameClause` stops at the first
+      // boundary anyway, so nothing past CLAUSE_SCOPE_CHARS was ever reachable.
+      const start = m.index + m[0].length;
+      const tail = text.slice(start, start + CLAUSE_SCOPE_CHARS);
       const sameClause = /^[^.\n:;,—–]*/.exec(tail)?.[0] ?? "";
       const rescued = /\b(?:sha|commit|head)[\s`*_:=]+([0-9a-f]{7,40})(?![0-9a-f])/i.exec(sameClause);
       const rescuedSha = rescued?.[1] ?? "";
