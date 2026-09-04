@@ -423,10 +423,13 @@ async function seed(sql: postgres.Sql) {
  * rather than the ordered dispatch index, because that index's partial
  * predicate is exactly `status = 'queued'` while its `Index Cond` bounds only
  * `agent_id = $1`. So the assertions below can be green while production runs
- * the plan they forbid. That live defect is BLO-31392, which owns the
- * `EXPLAIN (GENERIC_PLAN)` assertion; nothing in this file covers it. Read
- * every plan-shape claim here as "for the statement as written", not "for the
- * plan production executes".
+ * the plan they forbid. That live defect is BLO-31392. The generic plan is
+ * asserted separately, in the head-depth test below that loops over
+ * `DISPATCH_PREDICATE_SHAPES` through `explainGeneric` — the `explain()`
+ * assertions here do not cover it, and that test's own NEGATIVE CONTROL block
+ * records what the generic assertion does and does not catch. Read every
+ * plan-shape claim here as "for the statement as written", not "for the plan
+ * production executes".
  */
 async function explain(sql: postgres.Sql, query: string) {
   const rows = await sql.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query}`);
