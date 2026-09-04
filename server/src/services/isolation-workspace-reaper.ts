@@ -191,11 +191,31 @@ export interface IsolationWorkspaceReapResult {
   /** Resolved to a workspace row used inside the window — the live cohort. */
   retainedInUse: number;
   /**
+   * Idle at the sweep's opening snapshot, but used again before this pass
+   * reached its unlink — the race the pre-unlink re-read exists to catch.
+   *
+   * Separate from `retainedInUse` on purpose. Both retain, but they mean
+   * opposite things operationally: `retainedInUse` is the ordinary steady
+   * state, whereas any non-zero value here is a workspace that came within one
+   * query of being deleted underneath a live run. Folding it into the ordinary
+   * counter would make the near-miss this module exists to prevent report
+   * identically to routine, and its frequency unmeasurable in production —
+   * which is the only evidence that can confirm or retire the exposure window
+   * argued at the re-read below.
+   */
+  retainedResurrected: number;
+  /**
    * Materialized inside the window, so it cannot have been idle longer than it
    * has existed. Counted rather than left as the arithmetic remainder, so an
    * operator reading a sweep log can name every outcome: with no concurrent
    * removals, `scanned` is exactly
-   * `retainedFresh + retainedInUse + skippedLayout + eligible`.
+   * `retainedFresh + retainedInUse + retainedResurrected + skippedLayout +
+   * failed + eligible`.
+   *
+   * `failed` is named in that sum rather than assumed away: a present but
+   * unreadable directory (`EACCES`, or an MDS hiccup on this filesystem) lands
+   * there and needs no concurrency to occur, so omitting it would leave the
+   * identity quietly false on exactly the tree an operator is inspecting.
    */
   retainedFresh: number;
   /** Disappeared between scan and delete (concurrent reaper, or a live run). */
@@ -203,6 +223,13 @@ export interface IsolationWorkspaceReapResult {
   failed: number;
   /** True when `maxDeletesPerTick` stopped the pass with work remaining. */
   capped: boolean;
+  /**
+   * True when the pre-unlink re-read faulted and ended the tick early. Distinct
+   * from `capped`: both stop the pass with work remaining, but this one means
+   * the stop was a fault rather than a budget, so the remaining directories
+   * were never assessed at all.
+   */
+  lookupFaulted: boolean;
 }
 
 function isReapableLayout(entries: string[]): boolean {
@@ -231,10 +258,12 @@ export async function reapIsolationWorkspaces(
     deleted: 0,
     skippedLayout: 0,
     retainedInUse: 0,
+    retainedResurrected: 0,
     retainedFresh: 0,
     vanished: 0,
     failed: 0,
     capped: false,
+    lookupFaulted: false,
   };
 
   let entries;
@@ -300,6 +329,17 @@ export async function reapIsolationWorkspaces(
       // baseline of 1 means the tree is more heterogeneous than the allowlist
       // was validated against, and that is worth a human look before the next
       // pass widens.
+      //
+      // Scope, so the baseline is not over-read: this observes **aged**
+      // directories only. The fresh-`mtime` retention above `continue`s before
+      // the layout check, so a newly created worktree-shaped directory is
+      // counted `retainedFresh` and goes unreported until it crosses
+      // `maxAgeDays`. Checking layout first would surface it during the window
+      // a human could act on it most cheaply, but it costs a `readdir` on every
+      // young directory on every sweep — and bounding exactly that MDS
+      // metadata load is property 4 of this module. The safety allowlist is
+      // unaffected either way, since both paths retain; only the warning is
+      // delayed. Deliberate trade, recorded rather than left to be rediscovered.
       log.warn(
         {
           dir,
@@ -339,14 +379,50 @@ export async function reapIsolationWorkspaces(
     // consequence is that a dry run may report as eligible a workspace the live
     // pass would then retain, which is the harmless direction.
     //
-    // A lookup fault propagates and ends the tick rather than being swallowed
-    // per directory: unlike an unreadable directory it is not local to one
-    // entry, and the fail-closed reading of "cannot confirm idle" is "do not
-    // delete". The next tick retries from a fresh snapshot.
+    // A lookup fault ends the tick rather than being swallowed per directory:
+    // unlike an unreadable directory it is not local to one entry, and the
+    // fail-closed reading of "cannot confirm idle" is "do not delete". The next
+    // tick retries from a fresh snapshot.
+    //
+    // It `break`s rather than throwing, and that distinction is load-bearing.
+    // This is the only call in the sweep that can fault *after* irreversible
+    // removals — up to `maxDeletes` of them — so letting it propagate would
+    // discard `result` and with it the count of what was already unlinked, on
+    // precisely the run an operator most needs to reconstruct. Breaking keeps
+    // the fail-closed semantics identical (no further deletions this tick) and
+    // still reaches the summary log with real counts. It is also what keeps the
+    // "never throws for a per-directory fault" contract on this function true.
     if (!options.dryRun) {
-      const current = (await lookupWorkspaceUsage([entry.name])).get(entry.name);
+      let current: WorkspaceUsageRow | undefined;
+      try {
+        current = (await lookupWorkspaceUsage([entry.name])).get(entry.name);
+      } catch (err) {
+        result.lookupFaulted = true;
+        log.error(
+          { err, dir, deleted: result.deleted },
+          "isolation-workspace reaper could not re-confirm a workspace was idle; " +
+            "ending the tick with deletions already performed",
+        );
+        break;
+      }
       if (current && current.lastUsedAt.getTime() >= cutoff) {
-        result.retainedInUse += 1;
+        // The near miss. Counted and logged separately from the ordinary
+        // snapshot-time retention above because this one is a workspace that
+        // was one query away from being deleted underneath a live run — the
+        // exact event this re-read was added to prevent. Both timestamps go in
+        // the record so the width of the window that was actually observed can
+        // be read off production rather than argued from the MDS throughput
+        // estimate.
+        result.retainedResurrected += 1;
+        log.warn(
+          {
+            dir,
+            snapshotLastUsedAt: owner ? owner.lastUsedAt.toISOString() : null,
+            currentLastUsedAt: current.lastUsedAt.toISOString(),
+            cutoff: new Date(cutoff).toISOString(),
+          },
+          "isolation-workspace reaper retained a workspace resurrected mid-sweep",
+        );
         continue;
       }
     }

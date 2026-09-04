@@ -385,7 +385,15 @@ describe("reapIsolationWorkspaces", () => {
       lookupWorkspaceUsage: lookup,
     });
 
-    expect(res).toMatchObject({ scanned: 1, retainedInUse: 1, eligible: 0, deleted: 0 });
+    // The near miss reports as its own outcome, not as routine retention: this
+    // workspace was one query away from being deleted underneath a live run.
+    expect(res).toMatchObject({
+      scanned: 1,
+      retainedResurrected: 1,
+      retainedInUse: 0,
+      eligible: 0,
+      deleted: 0,
+    });
     await expect(
       fs.readFile(path.join(root, "ws-resurrected", "session/.claude/projects/a.jsonl"), "utf8"),
     ).resolves.toBe("{}");
@@ -490,12 +498,58 @@ describe("reapIsolationWorkspaces", () => {
       deleted: 1,
       vanished: 0,
     });
-    expect(res.retainedFresh + res.retainedInUse + res.skippedLayout + res.eligible).toBe(
-      res.scanned,
-    );
+    expect(
+      res.retainedFresh +
+        res.retainedInUse +
+        res.retainedResurrected +
+        res.skippedLayout +
+        res.failed +
+        res.eligible,
+    ).toBe(res.scanned);
   });
 
-  it("returns an empty result when the root does not exist", async () => {    const res = await reapIsolationWorkspaces({
+  /**
+   * The re-read is the only call in the sweep that can fault *after*
+   * irreversible removals, so a propagating throw would discard the record of
+   * what was already unlinked — on exactly the run an operator most needs to
+   * reconstruct. Fail-closed is still correct; losing the receipt is not.
+   *
+   * Two workspaces, `maxDeletes` unreached: the first deletes, the second
+   * faults. The sweep must end there and still return the first deletion.
+   */
+  it("keeps the sweep record when the pre-unlink re-read faults mid-pass", async () => {
+    await makeWorkspace("ws-a", [...REAPABLE_LAYOUT], 45);
+    await makeWorkspace("ws-b", [...REAPABLE_LAYOUT], 45);
+
+    let recheckCalls = 0;
+    const lookupWorkspaceUsage = async (ids: string[]) => {
+      // The batched opening snapshot resolves normally; only the per-directory
+      // re-reads are driven to reject, and only after the first has succeeded.
+      if (ids.length > 1) return new Map();
+      recheckCalls += 1;
+      if (recheckCalls > 1) throw new Error("db unavailable");
+      return new Map();
+    };
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage,
+    });
+
+    // The receipt survives: one deletion actually happened and is reported.
+    expect(res).toMatchObject({ deleted: 1, lookupFaulted: true, failed: 0 });
+    expect(recheckCalls).toBe(2);
+    // Fail-closed: the faulting directory is not removed, and the tick stops
+    // rather than assessing anything further.
+    const survivors = (await fs.readdir(root)).sort();
+    expect(survivors).toHaveLength(1);
+  });
+
+  it("returns an empty result when the root does not exist", async () => {
+    const res = await reapIsolationWorkspaces({
       root: path.join(root, "absent"),
       maxAgeDays: 30,
       now,
