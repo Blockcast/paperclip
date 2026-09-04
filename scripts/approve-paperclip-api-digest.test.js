@@ -263,3 +263,86 @@ test("valid knobs pass validation and the script proceeds to the deploy credenti
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /is not a positive integer/);
 });
+
+// --- in-flight lock owner handoff (BLO-31598) -------------------------------
+//
+// Production deploys wedged when an approval succeeded and the job then died at
+// the pending-migration pre-flight, before helm touched the cluster. The lock
+// that approval took can never self-clear — its rollout never happened — and the
+// owner id needed to retire it existed only as prose on stdout, so no workflow
+// step could name it. emit_lock_owner is the handoff that closes that gap.
+//
+// The safety property is the one worth guarding: it must stay SILENT for a lock
+// adopted from an earlier attempt, because that rollout may still be running and
+// retiring its lock would reopen the approval ring underneath it.
+const OWNER_FN = "emit_lock_owner";
+const emitOwnerSource = extractShellFunction(OWNER_FN);
+
+// Runs the real shipping function against a scratch path and reports what the
+// caller would observe: whether a file appeared, its contents, and its mode.
+function emitOwner({ ours, outPathSet = true, ownerId = "a".repeat(64) }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-lock-owner-"));
+  const outPath = path.join(dir, "lock-owner.txt");
+  const harness = [
+    "set -euo pipefail",
+    `LOCK_OWNER_ID=${ownerId}`,
+    `lock_owner_is_ours=${ours ? "yes" : '""'}`,
+    outPathSet ? `PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=${JSON.stringify(outPath)}` : "",
+    emitOwnerSource,
+    OWNER_FN,
+    // Report mode via stat so the umask is asserted, not assumed.
+    `if [ -e ${JSON.stringify(outPath)} ]; then`,
+    `  printf 'WROTE %s %s' "$(cat ${JSON.stringify(outPath)})" "$(stat -c %a ${JSON.stringify(outPath)})"`,
+    "else",
+    "  printf 'NOFILE'",
+    "fi",
+  ].filter(Boolean).join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `emit_lock_owner harness failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+test("a lock this invocation minted hands its owner to the workflow", () => {
+  const ownerId = "b".repeat(64);
+  assert.equal(emitOwner({ ours: true, ownerId }), `WROTE ${ownerId} 600`);
+});
+
+// The safety-critical case. An adopted lock belongs to a rollout that may still
+// be live; naming its owner would invite a caller to abandon it.
+test("a lock adopted from an earlier attempt is never named", () => {
+  assert.equal(emitOwner({ ours: false }), "NOFILE");
+});
+
+test("the handoff is opt-in and silently absent when unrequested", () => {
+  assert.equal(emitOwner({ ours: true, outPathSet: false }), "NOFILE");
+});
+
+// The flag is only meaningful if it tracks the script's own provenance split.
+// These assert against the shipping source, so deleting either assignment — and
+// thereby letting an adopted lock be reported as ours — fails here.
+test("ownership is cleared on exactly the branches that inherit or lose the lock", () => {
+  const adopted = script.slice(script.indexOf("lock_preserve_on_failure=yes"));
+  assert.match(
+    adopted.slice(0, 200),
+    /lock_owner_is_ours=""/,
+    "the adopted-lock branch must disown the lock, or an inherited lock can be abandoned",
+  );
+  const conflict = script.slice(script.indexOf("# A conflict proves this write did not land"));
+  assert.match(
+    conflict.slice(0, 400),
+    /lock_owner_is_ours=""/,
+    "a conflicting write did not land, so no lock with our owner exists",
+  );
+});
+
+// Emitting before the write would name a lock that does not exist if the replace
+// then fails, sending a cleanup step to abandon another process's transaction.
+test("the owner is emitted only after the ring write actually lands", () => {
+  const rotated = script.indexOf("rotated=yes");
+  const emitCall = script.indexOf(`\n    ${OWNER_FN}\n`);
+  assert.notEqual(emitCall, -1, `${OWNER_FN} is never called from the rotate loop`);
+  assert.ok(
+    emitCall > rotated,
+    `${OWNER_FN} must be called after the successful kubectl replace, not before it`,
+  );
+});

@@ -36,7 +36,19 @@
 #     PAPERCLIP_DEPLOY_KUBECONFIG=... scripts/approve-paperclip-api-digest.sh ...
 #
 # The script retires its own lock automatically when it aborts after taking it,
-# so an inadmissible plan does not wedge the channel on its own.
+# so an inadmissible plan does not wedge the channel on its own. It cannot do
+# the same for a caller that fails AFTER this script exits 0 -- success
+# deliberately leaves the lock live for the next release to retire. A release
+# workflow closes that window by setting
+#
+#   PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=/path/to/lock-owner.txt
+#
+# which receives the 64-hex owner of the lock this invocation minted, and only
+# that lock: a lock adopted from an earlier attempt is left unnamed, because
+# its rollout may still be running. A later step that knows the cluster was
+# never touched can then feed that owner back through
+# PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER above. No file is written when the
+# lock is not this invocation's to abandon.
 
 set -euo pipefail
 
@@ -398,6 +410,24 @@ release_in_flight_lock() {
   return 1
 }
 
+# A release workflow that sets this learns the owner id of the lock this
+# invocation minted, so a later step can retire it when the deploy dies after
+# the approval succeeded but before the cluster was ever touched (BLO-31598).
+# Success deliberately leaves the lock live for the next release to retire
+# after observing this plan marker roll out, so the owner is otherwise only
+# ever prose on stdout and the workflow cannot name it.
+#
+# Written ONLY for a lock this invocation created. An adopted lock belongs to a
+# rollout that may still be running, and retiring it would reopen the ring
+# underneath that rollout -- the same distinction lock_preserve_on_failure
+# encodes at the transfer below. Absent file therefore means "this invocation
+# has no lock it is entitled to abandon", which is the safe default.
+emit_lock_owner() {
+  [[ -n "${PAPERCLIP_APPROVAL_LOCK_OWNER_OUT:-}" ]] || return 0
+  [[ -n "$lock_owner_is_ours" ]] || return 0
+  (umask 077; printf '%s\n' "$LOCK_OWNER_ID" >"$PAPERCLIP_APPROVAL_LOCK_OWNER_OUT")
+}
+
 # Rotation is a read-modify-write, so the write MUST be guarded by the version
 # that was read. With an unconditional merge-patch, two releases approving
 # concurrently silently clobber each other: A and B both read [x], A writes
@@ -440,6 +470,7 @@ server_plan_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-server-plan.XXXXXX"
 probe_attempts_log="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-probe-log.XXXXXX")"
 lock_cleanup_armed=""
 lock_preserve_on_failure=""
+lock_owner_is_ours=""
 
 cleanup_on_exit() {
   local status=$?
@@ -627,13 +658,17 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
     # while the original rollout may still be running.
     lock_cleanup_armed=""
     lock_preserve_on_failure=yes
+    lock_owner_is_ours=""
   else
     lock_cleanup_armed=yes
     lock_preserve_on_failure=""
+    lock_owner_is_ours=yes
   fi
   if printf '%s\n' "$replacement_json" \
       | kubectl replace -f - >/dev/null 2>"$replace_err"; then
     rotated=yes
+    # Only after the write landed: before it, no lock with this owner exists.
+    emit_lock_owner
     break
   fi
 
@@ -646,6 +681,7 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
   # later exact-match retry cannot retire a lock acquired by another process.
   lock_cleanup_armed=""
   lock_preserve_on_failure=""
+  lock_owner_is_ours=""
   echo "approval ring changed underneath us; retrying (${attempt}/${MAX_ROTATE_ATTEMPTS})" >&2
   sleep $(( attempt ))
 done
