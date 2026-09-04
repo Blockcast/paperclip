@@ -377,14 +377,31 @@ export interface ClaudeUpstreamClassification {
 
 const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s+found\b/i;
 
+/**
+ * Detect Claude's "Skill "<name>" not found" death (BLO-7991 AC3).
+ *
+ * Deliberately does NOT read `stdout`. `stdout` is the entire pod log — every
+ * intermediate assistant message — so an agent that merely *discusses* a
+ * missing skill would match. Unlike the transient families, where a false
+ * positive costs one extra retry, `skill_not_found` is listed in
+ * NON_RETRYABLE_CONTINUATION_ERROR_CODES and is excluded from the zero-token
+ * session reset, so a false positive suppresses retries permanently. That
+ * asymmetry is why this classifier reads only bounded, harness-authored error
+ * surfaces: the terminal result text, the structured `errors[]` envelope, the
+ * adapter's own error message, and stderr.
+ */
 function isClaudeSkillNotFoundError(input: {
   parsed?: Record<string, unknown> | null;
-  stdout?: string | null;
   stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
-  return [input.errorMessage, input.stdout, input.stderr, input.parsed?.result]
-    .some((value) => typeof value === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(value));
+  const parsed = input.parsed ?? null;
+  return [
+    input.errorMessage,
+    input.stderr,
+    parsed ? asString(parsed.result, "") : "",
+    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
+  ].some((value) => typeof value === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(value));
 }
 
 /**
