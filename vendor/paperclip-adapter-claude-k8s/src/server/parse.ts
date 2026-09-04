@@ -387,21 +387,52 @@ const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s
  * NON_RETRYABLE_CONTINUATION_ERROR_CODES and is excluded from the zero-token
  * session reset, so a false positive suppresses retries permanently. That
  * asymmetry is why this classifier reads only bounded, harness-authored error
- * surfaces: the terminal result text, the structured `errors[]` envelope, the
- * adapter's own error message, and stderr.
+ * surfaces.
+ *
+ * `stderr` is NOT among them: the sole production call site (execute.ts) never
+ * passes it, and the k8s adapter has no separate Claude-CLI stderr to pass —
+ * `onLog("stderr", …)` is the adapter's own log channel to Paperclip.
+ *
+ * `parsed.result` is only harness-authored on an *error* subtype. A run can
+ * exit non-zero while carrying `subtype: "success"` (observed on this very
+ * issue: `Claude run failed: subtype=success: Failed to authenticate…`), and
+ * on such an event `result` is the model's own final message — model prose
+ * again, just the last turn instead of the whole transcript. `errorMessage` is
+ * `describeClaudeFailure(parsed)`, which embeds that same `result` text
+ * verbatim, so the two are gated together. The structured `errors[]` envelope
+ * is always harness-authored and needs no gate.
  */
 function isClaudeSkillNotFoundError(input: {
   parsed?: Record<string, unknown> | null;
-  stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
   const parsed = input.parsed ?? null;
-  return [
-    input.errorMessage,
-    input.stderr,
-    parsed ? asString(parsed.result, "") : "",
-    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
-  ].some((value) => typeof value === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(value));
+  const surfaces: (string | null | undefined)[] = parsed ? extractClaudeErrorMessages(parsed) : [];
+  const subtype = parsed ? asString(parsed.subtype, "") : "";
+  if (subtype !== "" && subtype !== "success") {
+    surfaces.push(parsed ? asString(parsed.result, "") : "", input.errorMessage);
+  }
+  return surfaces.some((value) => typeof value === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(value));
+}
+
+/**
+ * The `!parsed` counterpart of the classifier above (BLO-7991 AC3).
+ *
+ * When the CLI dies before emitting a `type: "result"` event there is no
+ * structured envelope at all — `stdout` (the whole pod log) is the only
+ * surface left, and execute.ts's `!parsed` branch returns an *untyped* partial
+ * run error. Scanning that transcript is normally unsafe for a retry-killing
+ * code, so the guard is structural rather than advisory: if any assistant
+ * event ever produced output tokens, this returns false unconditionally. Model
+ * prose about a missing skill requires the model to have spoken; a
+ * skill-resolution death at startup means it never did.
+ */
+export function isClaudeSkillNotFoundStartupFailure(input: {
+  stdout?: string | null;
+  assistantContentSeen: boolean;
+}): boolean {
+  if (input.assistantContentSeen) return false;
+  return typeof input.stdout === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout);
 }
 
 /**

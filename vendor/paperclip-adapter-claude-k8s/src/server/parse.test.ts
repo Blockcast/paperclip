@@ -10,6 +10,7 @@ import {
   isClaudeTransientUpstreamError,
   matchClaudeUpstreamCapacityCode,
   classifyClaudeUpstreamFailure,
+  isClaudeSkillNotFoundStartupFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
 
@@ -411,7 +412,7 @@ describe("classifyClaudeUpstreamFailure", () => {
       classifyClaudeUpstreamFailure({
         failed: true,
         zeroTokenProgress: true,
-        stderr: 'Error: Skill "verification-before-completion" not found',
+        parsed: { subtype: "error", result: 'Error: Skill "verification-before-completion" not found' },
       }),
     ).toEqual({ family: null, errorCode: "skill_not_found", capacityCode: null });
   });
@@ -421,7 +422,28 @@ describe("classifyClaudeUpstreamFailure", () => {
       classifyClaudeUpstreamFailure({
         failed: false,
         zeroTokenProgress: true,
-        stderr: 'Skill "verification-before-completion" not found',
+        parsed: { subtype: "error", result: 'Skill "verification-before-completion" not found' },
+      }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
+  });
+
+  // A run can exit non-zero while its result event still carries
+  // `subtype: "success"` — observed on BLO-7991 itself as
+  // `Claude run failed: subtype=success: Failed to authenticate…`. On such an
+  // event `parsed.result` is the model's OWN final message, so trusting it
+  // would re-admit exactly the model-prose false positive the transcript fix
+  // removed, one turn narrower. `errorMessage` embeds that same text verbatim
+  // (describeClaudeFailure uses `result` as its detail), so it is gated too —
+  // this asserts the leak is closed on both surfaces at once.
+  it("does not classify model prose in a subtype=success result as a skill failure", () => {
+    const modelProse = "Root cause: the run died with Skill 'verification-before-completion' not found.";
+    expect(modelProse).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        parsed: { subtype: "success", result: modelProse },
+        errorMessage: `Claude run failed: subtype=success: ${modelProse}`,
       }),
     ).toEqual({ family: null, errorCode: null, capacityCode: null });
   });
@@ -696,5 +718,51 @@ describe("isClaudeImmutableThinkingBlockError", () => {
 
   it("returns false for unrelated thinking text", () => {
     expect(isClaudeImmutableThinkingBlockError({ result: "thinking about the next step" })).toBe(false);
+  });
+});
+
+// When the CLI dies before emitting a `type:"result"` event, execute.ts's
+// `!parsed` branch returns before classifyClaudeUpstreamFailure is ever
+// called, so AC3 was inert on exactly the startup-time fault BLO-7991
+// describes. `stdout` is the only surface left there, and scanning it is safe
+// only because a model cannot have discussed anything without producing
+// output tokens first.
+describe("isClaudeSkillNotFoundStartupFailure", () => {
+  const startupLog = [
+    '{"type":"system","subtype":"init"}',
+    'Error: Skill "verification-before-completion" not found',
+  ].join("\n");
+
+  it("classifies a skill death that produced no assistant output", () => {
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: startupLog, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // The guard, not a comment, is what keeps the transcript scan safe: once the
+  // model has spoken, the same phrase may be its own prose about a missing
+  // skill, and `skill_not_found` suppresses retries permanently.
+  it("refuses to scan the transcript once assistant output exists", () => {
+    const transcript = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":',
+      "\"Root cause: the run died with Skill 'verification-before-completion' not found.\"}]}}",
+    ].join("\n");
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: true }),
+    ).toBe(false);
+  });
+
+  it("returns false for an unrelated startup failure", () => {
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: "Error: connect ECONNREFUSED 10.0.0.1:443",
+        assistantContentSeen: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when there is no stdout at all", () => {
+    expect(isClaudeSkillNotFoundStartupFailure({ stdout: null, assistantContentSeen: false })).toBe(false);
   });
 });
