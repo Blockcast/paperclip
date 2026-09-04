@@ -27,8 +27,19 @@ import {
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 
-/** The message every migration in this family raises when its index is absent. */
-const PRECREATE_RAISE_MARKER = "requires online index precreation";
+/**
+ * The message every migration in this family raises when its index is absent.
+ *
+ * Deliberately a pattern rather than a fixed substring. Migrations are free to
+ * name *which* index they mean — 0217 raises "requires online queued-age index
+ * precreation" — and an exact-substring marker silently drops those, which is
+ * the defect this file exists to close (BLO-31626). The alternative, editing
+ * 0217 to match one canonical phrase, is not available: this repo derives
+ * applied-migration state from a migration's content hash, so rewording an
+ * applied migration reports it pending everywhere and re-runs it on deploy.
+ * The wording is the migration's to choose; matching it is this test's job.
+ */
+const PRECREATE_RAISE_MARKER = /requires online (?:\w+[- ])*index precreation/;
 
 /**
  * A remediation that builds the index online *because it is absent*. This is
@@ -82,17 +93,23 @@ function raisesForPrecreation(sql: string): boolean {
   });
 }
 
+let migrationSqlFilesPromise: Promise<readonly { readonly file: string; readonly contents: string }[]> | null = null;
+
+/** Read once per suite: the corpus is ~240 files and three callers want it. */
 async function readMigrationSqlFiles(): Promise<readonly { readonly file: string; readonly contents: string }[]> {
-  const entries = await readdir(migrationsDir);
-  const sqlFiles = entries.filter((entry) => entry.endsWith(".sql")).sort();
-  return Promise.all(
-    sqlFiles.map(async (file) => ({ file, contents: await readFile(`${migrationsDir}/${file}`, "utf8") })),
-  );
+  migrationSqlFilesPromise ??= (async () => {
+    const entries = await readdir(migrationsDir);
+    const sqlFiles = entries.filter((entry) => entry.endsWith(".sql")).sort();
+    return Promise.all(
+      sqlFiles.map(async (file) => ({ file, contents: await readFile(`${migrationsDir}/${file}`, "utf8") })),
+    );
+  })();
+  return migrationSqlFilesPromise;
 }
 
 async function migrationFilesRequiringPrecreation(): Promise<string[]> {
   const files = await readMigrationSqlFiles();
-  return files.filter(({ contents }) => contents.includes(PRECREATE_RAISE_MARKER)).map(({ file }) => file);
+  return files.filter(({ contents }) => PRECREATE_RAISE_MARKER.test(contents)).map(({ file }) => file);
 }
 
 describe("PRECREATE_REQUIRED_INDEXES registry", () => {
@@ -115,6 +132,13 @@ describe("PRECREATE_REQUIRED_INDEXES registry", () => {
     // The shape is ground truth; the marker is only the wording. A migration
     // in the first set but not the second is invisible to the drift test on
     // *both* sides, so it never reaches the pre-flight.
+    //
+    // One-way containment on purpose. Set equality would also catch the
+    // reverse — marker-matched but shape-unmatched — but that direction fails
+    // the moment a legitimately-registered migration phrases its `HINT`
+    // differently, turning an unrelated PR red for a wording choice that
+    // breaks nothing. The asymmetry is deliberate: a missed guard is an
+    // outage, an unrecognised HINT is a style difference.
     expect(guardShaped.filter((file) => !markerMatched.includes(file))).toEqual([]);
   });
 
