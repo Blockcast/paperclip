@@ -9635,14 +9635,23 @@ const EPISTEMIC_NOUN_HEAD =
 // side here briefly created a NEW asymmetry (spelled-out 7/7 vetoing, fused
 // 0/12) rather than closing an old one. `fusedNegation` is bare as of pass 21
 // and both sides now bind through CLAUSE_REACH. The family belongs HERE rather
-// than in a
-// fourth list: one insertion makes it reachable by `negation`,
+// than in a fourth list: one insertion makes it reachable by `negation`,
 // `negatedHeadConnective` and the copula arm at once, and it inherits
 // CLAUSE_REACH like every other head. Measured 2/14 -> 13/14 on the family with
-// 0/18 new false-vetoes on the same adjectives in NON-hedge roles ("Everything
-// is clear so …", "The evidence is conclusive so …") — COPULA_FILLER already
+// 0/18 new false-vetoes on CONNECTIVE- OR COMMA-BEARING non-hedge uses
+// ("Everything is clear so …", "The evidence is conclusive so …") — COPULA_FILLER
 // refuses to cross a consequence connective, so an adjective governing the
-// PREVIOUS clause still cannot reach this one.
+// PREVIOUS clause cannot reach this one.
+//
+// Pass 22 scopes that claim, which was unqualified and had the same defect the
+// pass-21 one did: every control carried a connective. The family alone in a
+// bare adjunct is inert ("Despite the obvious drift this head was …" stays a
+// skip, since these words bind only after a negation), but a bare NEGATED
+// adjunct does false-veto, and two of those are new here: "Given no certain
+// match this head was …" (pass 20) and "Aside from no obvious drift this head
+// was …" (pass 21) both flip true -> false, while "Despite no evidence of a
+// force-push this head was …" false-vetoes at every head. Same CLAUSE_REACH
+// residual as the fused stem's; see the characterization rows.
 //
 // `obvious` joined the family in pass 21 as an exact synonym of `apparent` and
 // `evident`, which were already in it. Probing the same frame across 24
@@ -9672,7 +9681,7 @@ const EPISTEMIC_NOUN_HEAD =
 // re-derive it.
 const EPISTEMIC_HEAD =
   "(?:evidence|indications?|indicat(?:e|es|ed|ing)|signs?|records?|proofs?|traces?" +
-  "|suggestions?|statements?|assertions?|awareness|findings?|validations?" +
+  "|suggestions?|statements?|assertions?|awareness|findings?|validations?|ideas?" +
   "|believ(?:e|es|ed)|think(?:s|ing)?|thought|appear(?:s|ed|ing)?" +
   "|suggest(?:s|ed|ing)?|aware|certain|convinced|confident|persuaded|satisfied" +
   "|sure|clear|evident|apparent|obvious|conclusive|definitive|positive|see|sees|seen|saw|seeing" +
@@ -9828,8 +9837,19 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // pass 20 made for the spelled-out side — let CLAUSE_REACH bind it instead of
   // enumerating a complementizer-free variant. Measured 12/12 vetoing with 0
   // rows changed in the committed corpus and 0/12 new false-vetoes on
-  // adversarial non-hedge uses ("No unknown commits were found so …", "I
-  // resolved every unclear row, so …"). The leading `\b` is load-bearing and
+  // CONNECTIVE- OR COMMA-BEARING non-hedge uses ("No unknown commits were found
+  // so …", "I resolved every unclear row, so …"). That qualifier is the whole
+  // claim: both controls carry a connective, so they exercise only the shape
+  // COPULA_FILLER already made immune. A connective-free, comma-free
+  // preposition-led adjunct DOES false-veto — "Despite the unclear wake payload
+  // this head was …" measures 11/11 flipping true -> false at this commit. It
+  // is a residual of CLAUSE_REACH, not of this stem: the same frame built on
+  // the untouched `negation` cue ("Despite no evidence of a force-push this
+  // head was …") false-vetoes at BOTH heads, so a bare adjunct has never been
+  // survivable for any epistemic cue. This commit widens an accepted trade to
+  // 12 more words rather than opening a new hole, and it fails toward
+  // `missing` — a re-review, not a masked non-review. Pinned as a
+  // CHARACTERIZATION row, not as correct behaviour. The leading `\b` is load-bearing and
   // separately pinned: "It is unambiguous this head was …" is a correct skip
   // that false-vetoes without it, because `ambiguous` matches inside
   // `unambiguous`. A connective- or comma-bearing control does NOT pin it — the

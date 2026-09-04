@@ -1365,6 +1365,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`I am unaware this head was already reviewed at \`${sha}\`.`, false],
       [`It is inconclusive this head was already reviewed at \`${sha}\`.`, false],
       [`It is not obvious yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I have no idea this head was already reviewed at \`${sha}\`.`, false],
+      [`No idea yet this head was already reviewed at \`${sha}\`.`, false],
       [`Everything is clear so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`I am satisfied with the checks so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`The evidence is conclusive so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
@@ -1374,6 +1376,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No coverage delta was positive, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`Results are unambiguous so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`It is unambiguous this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No new idea landed so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I dropped the idea of a rebase, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`I resolved every unclear row, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`It is obvious no newer head exists so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No unknown commits were found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
@@ -1404,6 +1408,7 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       ["I am not convinced that this head was ", "negation"],
       ["It is unclear this head was ", "fusedNegation"],
       ["It is not obvious yet this head was ", "negatedHeadConnective"],
+      ["I have no idea this head was ", "negation"],
       ["No evidence that this head was ", "negation"],
       ["I am not aware that this head was ", "negation"],
       // Correct skips: no cue governs the clause, so nothing vetoes.
@@ -1416,6 +1421,51 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       expect(prReviewAlreadyReviewedVetoCue(before)).toBe(cue);
     });
   });
+
+  // CHARACTERIZATION, NOT CORRECTNESS. Every row below is a KNOWN FALSE-VETO:
+  // the verdict asserted is the one the classifier currently produces, and it
+  // is wrong. They are pinned so that a future change which widens or narrows
+  // the residual is visible in the diff rather than discovered by the twenty-
+  // third review pass.
+  //
+  // The shape is a preposition-led adjunct with no connective, no comma and no
+  // sentence boundary, so nothing in CLAUSE_REACH separates the adjunct from
+  // the review clause. It has never been survivable for any epistemic cue —
+  // the `negation` row here false-vetoes at every head in this PR's history —
+  // and it fails toward `missing`, a re-review rather than a masked
+  // non-review. Passes 20-22 each widened it to more words; none opened it.
+  //
+  // If a later pass fixes CLAUSE_REACH so an adjunct no longer swallows the
+  // clause, these expectations flip to `true` and SHOULD be updated to `true`.
+  // Do not "fix" a failure here by re-narrowing a cue.
+  describe("BLO-31374: known CLAUSE_REACH adjunct residual (characterization)", () => {
+    const sha = "8b237675b19fa5ae061821fd3b1d87cd8cd1836f";
+    it.each([
+      // pre-existing at every head — the control that proves the class is old
+      [`Despite no evidence of a force-push this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-21 bare fusedNegation stem
+      [`Despite the unclear wake payload this head was already reviewed at \`${sha}\`.`, false],
+      [`Following the inconclusive CI run this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-20 adjective family and the pass-21 `obvious`
+      [`Given no certain match this head was already reviewed at \`${sha}\`.`, false],
+      [`Aside from no obvious drift this head was already reviewed at \`${sha}\`.`, false],
+    ])("known residual: %s -> %s", (text, want) => {
+      expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
+    });
+
+    // The same words in the shapes real output actually uses. These are the
+    // rows that must never change: a connective, a comma or a sentence
+    // boundary separates the adjunct, and the skip survives.
+    it.each([
+      `Skipping: the merge state is unknown but this head was already reviewed at \`${sha}\`.`,
+      `The wake head was unknown, so this head was already reviewed at \`${sha}\`.`,
+      `Merge state unknown; nothing to do. This head was already reviewed at \`${sha}\`.`,
+      `Nothing ambiguous remained, so this head was already reviewed at \`${sha}\`.`,
+    ])("house-style skip containing a residual word still classifies (%#)", (text) => {
+      expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(true);
+    });
+  });
+
 
   // A hedge about something OTHER than the review does not mask the skip: the
   // `that`-complement closes before the clause, so no copula reaches it. Drop
