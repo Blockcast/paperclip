@@ -256,6 +256,11 @@ function act(callback: () => void | Promise<void>): void | Promise<void> {
     : undefined;
 }
 
+// Drains one macrotask tick inside `act`. This is NOT a settle: anything that
+// needs a query to resolve first — `instanceSettingsApi.getExperimental`, the
+// project list, the reusable-workspace summaries — may still be pending when
+// this returns, and does resolve later under CI load. Assert flag-gated DOM
+// through `waitForAssertion` instead, or the assertion reads the pre-flag DOM.
 async function flush() {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -281,6 +286,17 @@ async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   await flush();
 }
 
+// Polls `assertion` until it stops throwing, flushing a tick between attempts.
+//
+// It only settles the gate its OWN assertion reads, and it flushes nothing at
+// all when the assertion already holds on the first attempt. That last part is
+// the trap behind BLO-31671: `expect(submitButton.hasAttribute("disabled"))
+// .toBe(false)` is driven by `titleHasText`, which the draft/defaults restore
+// sets synchronously during `root.render`, so waiting on it returns on attempt
+// 0 having advanced nothing. It reads like a settle and is not one.
+//
+// So never place a read of query-gated DOM after a wait on some unrelated
+// condition. Wait on the gated thing itself.
 async function waitForAssertion(assertion: () => void, attempts = 20) {
   let lastError: unknown;
 
@@ -550,8 +566,48 @@ describe("NewIssueDialog", () => {
   });
 
   it("does not show user-secret warnings when the draft will not run an env binding that needs them", async () => {
+    // The banner keys off `currentAssignee.adapterConfig.env`, so it cannot
+    // render until the agents query resolves. Asserting its absence after a
+    // bare `flush()` therefore passed for the wrong reason — and with the
+    // suite defaults (`agents: []`, no assignee) there was no binding of any
+    // kind to reject, so it never exercised the "does not need them" path.
+    //
+    // Give it a binding that genuinely does not need a secret: `required:
+    // false` is excluded by `isRequiredUserSecretBinding`. Absence is now a
+    // statement about that filter. No `projectId` is selected, so
+    // `currentProject` is undefined before and after the projects query
+    // resolves and contributes nothing either way — leaving the agents query
+    // as the single gate to settle.
+    dialogState.newIssueDefaults = {
+      title: "Run without required secrets",
+      assigneeAgentId: "agent-1",
+    };
+    mockAgentsApi.list.mockResolvedValue([
+      {
+        id: "agent-1",
+        name: "CodexCoder",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {
+          env: {
+            OPTIONAL_TOKEN: { type: "user_secret_ref", key: "optional_token", required: false },
+          },
+        },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
     const { root } = renderDialog(container);
-    await flush();
+
+    // "Codex options" is derived from `currentAssignee.adapterType`, so it
+    // appears only once the agents query has resolved and been applied — it
+    // reads "Agent options" until then. Settling on it means the assertion
+    // below sees a DOM where the binding is present and was filtered out,
+    // rather than one where the agent has not arrived yet.
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Codex options");
+    });
 
     expect(mockMissingUserSecretsBannerRender).not.toHaveBeenCalled();
 
@@ -1256,14 +1312,18 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
-    await flush();
 
+    // The workspace mode select is gated on `getExperimental` resolving
+    // `enableIsolatedWorkspaces: true`. Two flushes are still a fixed number of
+    // ticks, so under load this read could miss the select entirely.
+    let modeSelect: HTMLSelectElement | undefined;
+    await waitForAssertion(() => {
+      modeSelect = (container.querySelector("select") as HTMLSelectElement | null) ?? undefined;
+      expect(modeSelect).not.toBeUndefined();
+    });
+
+    // Only meaningful once the gate above has applied.
     expect(container.textContent).not.toContain("will no longer use the parent task workspace");
-
-    const selects = Array.from(container.querySelectorAll("select"));
-    const modeSelect = selects[0] as HTMLSelectElement | undefined;
-    expect(modeSelect).not.toBeUndefined();
 
     await act(async () => {
       modeSelect!.value = "shared_workspace";
@@ -1284,17 +1344,19 @@ describe("NewIssueDialog", () => {
     });
 
     const { root } = renderDialog(container);
-    await flush();
 
-    // The watchdog row is hidden until the menu item is toggled on.
-    expect(container.querySelector('textarea[placeholder^="What should the watchdog"]')).toBeNull();
-
+    // Settle on the flag-gated menu item before asserting the row is absent.
+    // Asserting absence first passes vacuously against the pre-flag DOM, where
+    // nothing watchdog-related has rendered yet for any reason.
     let watchdogMenuItem: HTMLButtonElement | undefined;
     await waitForAssertion(() => {
       watchdogMenuItem = Array.from(container.querySelectorAll("button"))
         .find((button) => button.textContent?.trim() === "Watchdog");
       expect(watchdogMenuItem).not.toBeUndefined();
     });
+
+    // The watchdog row is hidden until the menu item is toggled on.
+    expect(container.querySelector('textarea[placeholder^="What should the watchdog"]')).toBeNull();
 
     await act(async () => {
       watchdogMenuItem!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1333,9 +1395,14 @@ describe("NewIssueDialog", () => {
     );
 
     const { root } = renderDialog(container);
-    await flush();
 
-    expect(container.textContent).toContain("Keep it moving");
+    // The watchdog block renders only once `getExperimental` resolves
+    // `enableTaskWatchdogs: true`. Settling on the button's disabled attribute
+    // below does not cover this: that is driven by the draft restore, which
+    // lands on mount and is independent of the experimental query.
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Keep it moving");
+    });
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
