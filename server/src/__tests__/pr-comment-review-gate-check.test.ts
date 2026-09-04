@@ -325,7 +325,10 @@ describe("retired status contexts", () => {
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
       posted: false,
-      reason: "post_failed",
+      // `retirement_failed`, not `post_failed`: the live verdict below DID
+      // publish. The two states must be distinguishable without inspecting
+      // `retirementDeliveries`.
+      reason: "retirement_failed",
       postFailure: "review/ally-comment: commit_status_write_http_403",
     });
     expect(postFor("gate/ally-comment-findings")).toBeDefined();
