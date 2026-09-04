@@ -44,6 +44,24 @@ chart's disabled-by-default `PrometheusRule`. A merged chart rule is therefore
 not proof that the production alert is live; verify the authoritative rules and
 the `monitoring-rules` Argo sync before closing an incident.
 
+> **Inside `onprem-k8s`, the ConfigMap is the authoritative half of that pair —
+> not the CRD.** Prometheus loads the `*.rules.yml` keys out of
+> `monitoring/prometheus-rules-*-configmap.yaml`; the `PrometheusRule` CRD
+> (`paperclip/*-prometheusrule.yaml`) is a copy kept in lockstep beside it. So
+> editing only the CRD changes nothing a responder will ever see, even after the
+> PR merges and Argo syncs. Edit **both**, and let
+> `scripts/check-prometheus-rules-lockstep.sh` confirm it — that script names the
+> ConfigMap as authoritative in its own failure text.
+>
+> Two CI gates catch this, and both name the CRD, which is why the failure reads
+> as two unrelated problems instead of one missed file: `CRD vs CM lockstep`
+> diffs the pair, and `promtool check config (parse gate)` extracts its rules
+> **from the ConfigMap shards**, so a unit-test expectation updated alongside the
+> CRD is asserted against the stale ConfigMap text. Fixing the ConfigMap clears
+> both at once. This is not hypothetical: it is exactly how
+> [BLO-31174](/BLO/issues/BLO-31174)'s own mirror PR
+> ([onprem-k8s#3047](https://github.com/Blockcast/onprem-k8s/pull/3047)) went red.
+
 This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
 
 - **Park horizon implausible:** the due time was booked too far out; investigate
