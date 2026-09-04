@@ -888,6 +888,8 @@ describe("agent secret redaction on mutating responses", () => {
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
   });
 
+  // `secret_ref` bindings are pointers, never plaintext, so they survive the
+  // redactor by design — but a resolved `value` riding along on one is a secret
   // that leaked in, and the schema has no field for it.
   it("never serializes a resolved value for a secret_ref env binding", async () => {
     const refAgent = {
