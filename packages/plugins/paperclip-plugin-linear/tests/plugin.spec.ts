@@ -3522,6 +3522,108 @@ describe("paperclip-plugin-linear", () => {
       createSpy.mockRestore();
     });
 
+    // BLO-31657 regression. A comment bridged before the key shipped carries
+    // the sentinel but `idempotency_key IS NULL`, and all three partial indexes
+    // in 0206 are `WHERE idempotency_key IS NOT NULL` — so the legacy row is
+    // not in the index and `ON CONFLICT` cannot fire against it.
+    //
+    // `update` is an unbounded trigger: editing a comment bridged last month
+    // delivers here today. Without the sentinel guard that edit inserts a
+    // *second* mirror carrying the edited body while the original keeps the
+    // stale one — two versions in the thread with nothing marking which is
+    // current. That is the one dedup failure that is not additive noise, and it
+    // covers the whole pre-deploy backlog until each comment is edited once.
+    //
+    // Live check, not inherited: drop the `action === "update"` guard in
+    // `worker.ts` and this goes to two bridged comments.
+    it("does not duplicate a pre-BLO-31657 mirror when its Linear comment is edited", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      // A legacy mirror: sentinel present, created with NO idempotency key —
+      // exactly what the pre-BLO-31657 handler wrote.
+      await harness.ctx.issues.createComment(
+        paperclipIssue.id,
+        "<!-- linear-comment-id: lin-comment-uuid-legacy -->\n**Linear Author** (from Linear):\n\nOriginal body",
+        "comp-1",
+      );
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-legacy",
+            body: "Edited body",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "legacy-edit",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      // And it is the original row, not a second copy carrying the edit.
+      expect(bridged[0]!.body).toContain("Original body");
+      expect(bridged[0]!.body).not.toContain("Edited body");
+    });
+
+    // Companion control for the test above. A guard that returned on *every*
+    // `update` would satisfy that assertion while silently dropping real work,
+    // so pin the other side: an edit to a comment that was never mirrored must
+    // still bridge it, which is what the pre-BLO-31657 scan did on a miss.
+    it("still bridges an update for a Linear comment that was never mirrored", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-unmirrored",
+            body: "Edited before we ever saw it",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "unmirrored-edit",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Edited before we ever saw it");
+    });
+
     // A deduplicated create returns the first delivery's comment instead of
     // throwing, so the handler must not go on to log activity — that would
     // report a sync that did not happen, once per duplicate delivery, which is

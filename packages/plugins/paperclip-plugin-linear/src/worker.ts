@@ -3601,25 +3601,79 @@ async function handleWebhookEvent(
     // sentinel HTML comment, plus a process-local `inFlightComments` claim
     // (BLO-3267) to cover the concurrent case the scan structurally could not —
     // a read-then-write cannot see a sibling that has not written yet, and the
-    // duplicate pair actually observed landed 3ms apart. Both are gone: the
-    // host now offers `idempotencyKey`, which dedups in the insert itself
-    // against a partial unique index, so it is atomic, holds across concurrent
-    // deliveries, and — unlike a process-local Set — keeps holding if the
-    // plugin tier ever runs more than one replica.
+    // duplicate pair actually observed landed 3ms apart. The Set is gone
+    // outright and the scan is gone from the `create` path: the host now offers
+    // `idempotencyKey`, which dedups in the insert itself against a partial
+    // unique index, so it is atomic, holds across concurrent deliveries, and —
+    // unlike a process-local Set — keeps holding if the plugin tier ever runs
+    // more than one replica. The scan survives only as the legacy-row guard on
+    // `update`, described below.
     //
-    // Dropping the scan also drops one RPC round-trip per bridged comment.
+    // Dropping the scan off the `create` path also drops one RPC round-trip
+    // per bridged comment, which is the overwhelming majority of deliveries.
     //
-    // The sentinel is still *written*: it is load-bearing for edit propagation
-    // (BLO-31634), which matches on it. It is simply no longer *read* here.
+    // The sentinel is still *written*, for two reasons. It is the legacy-row
+    // fallback just below, and it is intended to carry edit propagation
+    // (BLO-31634) — that work is unstarted, so nothing matches on it yet and
+    // the write has no reader outside this handler today.
     //
-    // Migration window: comments bridged before this shipped carry the sentinel
-    // but no idempotency key, so a redelivery of one of those does not dedup.
-    // Linear only retries within a bounded window, so this is confined to
-    // comments bridged minutes either side of the deploy, and it fails in the
-    // safe direction (one duplicate comment, never a wrong body).
+    // Legacy rows: comments bridged before this shipped carry the sentinel but
+    // `idempotency_key IS NULL`, and all three partial indexes in 0206 are
+    // `WHERE idempotency_key IS NOT NULL`. So a legacy row is not in the index,
+    // `ON CONFLICT` cannot fire against it, and the key dedups against nothing.
+    //
+    // On `create` that is bounded and safe: a `create` redelivery is a Linear
+    // (or own-retry-layer) retry of the original, so the exposure really is
+    // confined to the deploy window and fails in the safe direction — one extra
+    // comment, correct body.
+    //
+    // On `update` it is neither. `update` is admitted by the guard above and is
+    // an unbounded trigger: editing a comment bridged last month delivers here
+    // today, misses the key, and inserts a *second* mirror carrying the edited
+    // body while the original keeps the stale one — two versions in the thread
+    // with nothing marking which is current. That is the one case where the
+    // failure is not additive noise, and it covers the whole pre-deploy backlog
+    // until each comment has been edited once. So the sentinel scan is retained
+    // for `update` only.
+    //
+    // It has to be a pre-check rather than a post-insert fallback: `ON CONFLICT
+    // DO NOTHING` reports the miss only after the row is written, by which point
+    // the duplicate exists. There is nothing to fall back to.
+    //
+    // A backfill would retire the sentinel outright, and was considered and
+    // rejected as riskier than the bug: the host namespaces the key with the
+    // *install row's* PK (`plugin:${pluginId}:`, `plugin-host-services.ts`), so
+    // a migration would have to resolve which install bridged each comment, per
+    // company; and duplicate pairs from BLO-2973/BLO-3267 are known to exist in
+    // this exact population, so backfilling one key across a pair violates the
+    // unique index and fails the migration. This path self-retires when
+    // BLO-31634 rewrites `update` to propagate rather than skip.
     const linearCommentId = data.id as string | undefined;
     if (!linearCommentId) {
       ctx.logger.warn("Comment webhook missing data.id; creating without an idempotency key (may double-post)");
+    }
+
+    // Legacy-row guard, `update` only — see the reasoning above. A pre-deploy
+    // mirror carries the sentinel but no key, so the key cannot dedup it and an
+    // edit would insert a second, divergent copy. Cost is one round-trip on the
+    // rare path; `create` never pays it.
+    //
+    // A listing failure proceeds rather than returning, matching the behaviour
+    // this scan had before BLO-31657: for a comment that *does* have a key the
+    // insert still dedups, so proceeding is only a risk for the legacy rows this
+    // guard exists for, and an occasional duplicate beats dropping a real edit
+    // of a comment that was never mirrored at all.
+    if (action === "update" && linearCommentId) {
+      try {
+        const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
+        const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
+        if (existing.some((c) => typeof c.body === "string" && c.body.includes(sentinel))) {
+          ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping edit (BLO-31634)`);
+          return;
+        }
+      } catch (err) {
+        ctx.logger.warn(`Legacy-row check failed for comment ${linearCommentId}: ${err}; proceeding (may double-post a pre-BLO-31657 mirror)`);
+      }
     }
 
     const userName = (data.user as Record<string, unknown>)?.name as string ?? "Linear user";
@@ -3651,14 +3705,15 @@ async function handleWebhookEvent(
       // did not happen, once per duplicate delivery — exactly the noise the
       // key is bought to remove.
       //
-      // This branch is also where an `action: "update"` delivery lands. A
-      // Linear edit keeps the comment's UUID, so the key is unchanged and the
-      // edit dedups against the original mirror instead of propagating — the
-      // same outcome the sentinel scan used to produce, reached a different
-      // way. That is BLO-31634, and it is deliberately *unchanged* here rather
-      // than fixed in passing: propagating an edit needs an update call keyed
-      // on the existing comment, not a create. The comment id handed back on
-      // this path is what such a fix would target.
+      // An `action: "update"` delivery for a post-BLO-31657 mirror also lands
+      // here: a Linear edit keeps the comment's UUID, so the key is unchanged
+      // and the edit dedups against the original mirror instead of propagating.
+      // (Pre-BLO-31657 mirrors have no key and are caught by the sentinel guard
+      // above instead — same outcome, different mechanism.) Either way the edit
+      // is skipped, not propagated. That is BLO-31634, deliberately *unchanged*
+      // here rather than fixed in passing: propagating an edit needs an update
+      // call keyed on the existing comment, not a create. The comment id handed
+      // back on this path is what such a fix would target.
       if (created.deduplicated) {
         ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
         return;
