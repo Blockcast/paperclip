@@ -45,6 +45,28 @@ function usageLookup(rows: Record<string, Partial<WorkspaceUsageRow> & { lastUse
   };
 }
 
+/**
+ * A lookup whose answer changes after the opening snapshot, which is the only
+ * way to exercise the pre-unlink re-read: the first (batched) call sees the
+ * sweep's view of the world, every later per-id call sees `after`. `onRecheck`
+ * runs before the re-read answers, so a test can mutate the filesystem in the
+ * same window a resuming run would.
+ */
+function racingUsageLookup(
+  before: Record<string, { lastUsedDaysAgo: number }>,
+  after: Record<string, { lastUsedDaysAgo: number }>,
+  onRecheck?: () => Promise<void>,
+): WorkspaceUsageLookup & { calls: string[][] } {
+  const calls: string[][] = [];
+  const lookup = async (ids: string[]) => {
+    const first = calls.length === 0;
+    calls.push(ids);
+    if (!first && onRecheck) await onRecheck();
+    return usageLookup(first ? before : after)(ids);
+  };
+  return Object.assign(lookup, { calls });
+}
+
 /** Materialize a workspace dir with a given top-level layout and age. */
 async function makeWorkspace(
   name: string,
@@ -177,7 +199,7 @@ describe("reapIsolationWorkspaces", () => {
       lookupWorkspaceUsage: usageLookup({ "ws-recent-dir": { lastUsedDaysAgo: 90 } }),
     });
 
-    expect(res).toMatchObject({ eligible: 0, deleted: 0 });
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, retainedFresh: 1 });
     await expect(fs.stat(path.join(root, "ws-recent-dir"))).resolves.toBeDefined();
   });
 
@@ -335,8 +357,145 @@ describe("reapIsolationWorkspaces", () => {
     expect(res.vanished).toBe(1);
   });
 
-  it("returns an empty result when the root does not exist", async () => {
+  /**
+   * The residual from the `lastUsedAt` fix: the sweep's opening snapshot is a
+   * single read that then authorizes unlinks for the rest of the tick, and a
+   * tick is bounded by `maxDeletesPerTick` unlinks against an MDS measured at
+   * 145 files/s — minutes, not microseconds. A run that resurrects a long-idle
+   * workspace inside that window refreshes `lastUsedAt` and writes under
+   * `home`/`session`, which moves neither the root's existence, nor its layout,
+   * nor its `mtime`, so the two pre-existing re-checks are all blind to it.
+   * Without the pre-unlink re-read this deletes persistent state underneath a
+   * run that has already started writing.
+   */
+  it("retains a workspace resurrected between the snapshot and the unlink", async () => {
+    await makeWorkspace("ws-resurrected", [...REAPABLE_LAYOUT], 45, {
+      "session/.claude/projects/a.jsonl": "{}",
+    });
+    const lookup = racingUsageLookup(
+      { "ws-resurrected": { lastUsedDaysAgo: 44 } },
+      { "ws-resurrected": { lastUsedDaysAgo: 0 } },
+    );
+
     const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: lookup,
+    });
+
+    expect(res).toMatchObject({ scanned: 1, retainedInUse: 1, eligible: 0, deleted: 0 });
+    await expect(
+      fs.readFile(path.join(root, "ws-resurrected", "session/.claude/projects/a.jsonl"), "utf8"),
+    ).resolves.toBe("{}");
+  });
+
+  /** The re-read must not resurrect a row that is still idle at unlink time. */
+  it("still deletes when the re-read confirms the workspace is idle", async () => {
+    await makeWorkspace("ws-still-idle", [...REAPABLE_LAYOUT], 45);
+    const lookup = racingUsageLookup(
+      { "ws-still-idle": { lastUsedDaysAgo: 44 } },
+      { "ws-still-idle": { lastUsedDaysAgo: 44 } },
+    );
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: lookup,
+    });
+
+    expect(res).toMatchObject({ eligible: 1, deleted: 1, retainedInUse: 0 });
+    expect(lookup.calls).toEqual([["ws-still-idle"], ["ws-still-idle"]]);
+  });
+
+  /**
+   * The re-read costs one primary-key lookup per prospective unlink and is
+   * bounded by the same cap as the unlinks. A dry run pays neither: it is a
+   * preview, and a per-directory round trip would make previewing a large tree
+   * more expensive than the pass it previews.
+   */
+  it("re-reads once per prospective unlink, and not at all in dryRun", async () => {
+    for (let i = 0; i < 4; i += 1) await makeWorkspace(`ws-${i}`, [...REAPABLE_LAYOUT], 45);
+    const preview = racingUsageLookup({}, {});
+    const live = racingUsageLookup({}, {});
+    const sweep = { root, maxAgeDays: 30, maxDeletesPerTick: 2, now, logger: silentLogger };
+
+    // dryRun first: it leaves the tree intact for the live pass that follows.
+    const previewRes = await reapIsolationWorkspaces({
+      ...sweep,
+      dryRun: true,
+      lookupWorkspaceUsage: preview,
+    });
+    const liveRes = await reapIsolationWorkspaces({ ...sweep, lookupWorkspaceUsage: live });
+
+    expect(previewRes).toMatchObject({ eligible: 2, deleted: 0, capped: true });
+    expect(preview.calls).toHaveLength(1);
+    expect(liveRes).toMatchObject({ eligible: 2, deleted: 2, capped: true });
+    expect(live.calls).toHaveLength(3); // one batched snapshot + one per unlink
+  });
+
+  /**
+   * `force` was dropped from `fs.rm` so a directory removed mid-sweep raises
+   * ENOENT instead of being silently reported as a deletion — but the only test
+   * reaching `vanished` did so through the *readdir* ENOENT path, so re-adding
+   * `force: true` would leave the suite green. The pre-unlink re-read is the
+   * natural seam for closing that window: it is the last thing to run before
+   * `fs.rm`.
+   */
+  it("counts a workspace removed after the final re-check as vanished, not deleted", async () => {
+    const dir = await makeWorkspace("ws-late-race", [...REAPABLE_LAYOUT], 45);
+    const lookup = racingUsageLookup({}, {}, async () => {
+      await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: lookup,
+    });
+
+    expect(res).toMatchObject({ eligible: 1, deleted: 0, vanished: 1, failed: 0 });
+  });
+
+  /**
+   * The point of `retainedFresh`: with no concurrent removals every scanned
+   * directory lands in exactly one named bucket, so an operator reading the
+   * first live sweep does not have to infer an outcome from a subtraction.
+   */
+  it("names every outcome, leaving no unexplained remainder in the sweep log", async () => {
+    await makeWorkspace("ws-fresh-dir", [...REAPABLE_LAYOUT], 2);
+    await makeWorkspace("ws-live-row", [...REAPABLE_LAYOUT], 45);
+    await makeWorkspace("ws-worktree", ["home", "session", "wt-blo-19094"], 60);
+    await makeWorkspace("ws-orphan", [...REAPABLE_LAYOUT], 45);
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({ "ws-live-row": { lastUsedDaysAgo: 0 } }),
+    });
+
+    expect(res).toMatchObject({
+      scanned: 4,
+      retainedFresh: 1,
+      retainedInUse: 1,
+      skippedLayout: 1,
+      eligible: 1,
+      deleted: 1,
+      vanished: 0,
+    });
+    expect(res.retainedFresh + res.retainedInUse + res.skippedLayout + res.eligible).toBe(
+      res.scanned,
+    );
+  });
+
+  it("returns an empty result when the root does not exist", async () => {    const res = await reapIsolationWorkspaces({
       root: path.join(root, "absent"),
       maxAgeDays: 30,
       now,

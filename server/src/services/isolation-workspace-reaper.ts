@@ -33,8 +33,9 @@
  *
  * 3. **Idempotent and concurrency-tolerant.** Something else was observed
  *    reclaiming this same tree mid-incident (1,235 -> 1,065 dirs in ~5h, cause
- *    unidentified). Every directory is re-checked immediately before removal and
- *    a vanished entry is counted, not an error.
+ *    unidentified). Every signal the delete decision rests on — existence,
+ *    layout, and `lastUsedAt` — is re-checked immediately before removal, and a
+ *    vanished entry is counted, not an error.
  *
  * 4. **Bounded per tick.** `maxDeletesPerTick` caps the unlink volume. Deletion
  *    here is MDS-metadata-bound, not data-bound — measured 145 files/s serial
@@ -68,7 +69,7 @@
  * - **Row found** -> gate on `lastUsedAt`, which *is* maintained on use: the
  *   workspace-restore path refreshes it on every reuse
  *   (`heartbeat.ts:27159`), as does creation (`heartbeat.ts:27186`). The column
- *   is `notNull` and indexed (`execution_workspaces.ts:35,59-62`).
+ *   is `notNull` (`execution_workspaces.ts:35`).
  * - **No row** -> the true orphan cohort this reaper is aimed at, and the only
  *   population with no database truth to consult. Here filesystem age carries
  *   the decision, where "materialized more than N days ago with no owning row"
@@ -79,6 +80,15 @@
  * *deletion* signal does not make it a useless *retention* one: a workspace
  * materialized yesterday cannot have been idle for a month, whatever a stale
  * row says. Requiring both can only ever retain more.
+ *
+ * Because `lastUsedAt` is the only signal that can protect a live workspace, it
+ * is also the only one whose staleness is dangerous, and the sweep's opening
+ * snapshot is exactly that: a read taken potentially minutes before the unlink
+ * it authorizes. So it is re-read per directory immediately before `fs.rm`.
+ * Neither of the other two re-checks can substitute — a run resuming a
+ * long-idle workspace refreshes the row and writes under `home`/`session`,
+ * which changes the root's existence not at all, its top-level layout not at
+ * all, and (per the paragraph above) its `mtime` not at all.
  *
  * Deleting a genuinely idle workspace costs a cold start, not source: durable
  * transcripts live separately under `data/run-logs/`.
@@ -114,10 +124,20 @@ export interface WorkspaceUsageRow {
  * the age predicate — the part of this module that decides what gets deleted —
  * is testable without an embedded Postgres, and therefore runs on every host
  * rather than being skipped on some.
+ *
+ * Called twice per sweep in the live path: once batched over every directory,
+ * then once per prospective unlink to re-check the one row that matters.
  */
 export type WorkspaceUsageLookup = (ids: string[]) => Promise<Map<string, WorkspaceUsageRow>>;
 
-/** The production lookup: one batched query per sweep, served by the `lastUsedAt` index. */
+/**
+ * The production lookup. Served by the primary key — the predicate is
+ * `id IN (...)`, and the only index touching `lastUsedAt` is
+ * `execution_workspaces_company_last_used_idx` on `(companyId, lastUsedAt)`
+ * (`execution_workspaces.ts:59-62`), whose leading column this query does not
+ * constrain. The PK is the better path anyway; the note is here so nobody
+ * "optimizes" toward an index that was never in play.
+ */
 export function createDbWorkspaceUsageLookup(db: Db): WorkspaceUsageLookup {
   return async (ids) => {
     const resolvable = ids.filter((id) => UUID_PATTERN.test(id));
@@ -170,6 +190,14 @@ export interface IsolationWorkspaceReapResult {
   skippedLayout: number;
   /** Resolved to a workspace row used inside the window — the live cohort. */
   retainedInUse: number;
+  /**
+   * Materialized inside the window, so it cannot have been idle longer than it
+   * has existed. Counted rather than left as the arithmetic remainder, so an
+   * operator reading a sweep log can name every outcome: with no concurrent
+   * removals, `scanned` is exactly
+   * `retainedFresh + retainedInUse + skippedLayout + eligible`.
+   */
+  retainedFresh: number;
   /** Disappeared between scan and delete (concurrent reaper, or a live run). */
   vanished: number;
   failed: number;
@@ -203,6 +231,7 @@ export async function reapIsolationWorkspaces(
     deleted: 0,
     skippedLayout: 0,
     retainedInUse: 0,
+    retainedFresh: 0,
     vanished: 0,
     failed: 0,
     capped: false,
@@ -242,7 +271,10 @@ export async function reapIsolationWorkspaces(
       result.vanished += 1;
       continue;
     }
-    if (idleSinceMs >= cutoff) continue;
+    if (idleSinceMs >= cutoff) {
+      result.retainedFresh += 1;
+      continue;
+    }
 
     if (owner) {
       // A row exists, so the filesystem no longer gets a vote on deletion.
@@ -288,6 +320,37 @@ export async function reapIsolationWorkspaces(
       result.scanned -= 1;
       break;
     }
+
+    // Property 3, for the one signal that can protect a live workspace.
+    //
+    // Existence and layout were both re-checked just above, and neither can see
+    // a resurrection: restoring a workspace refreshes `lastUsedAt` and writes
+    // *under* `home`/`session`, leaving the root present, its top level
+    // unchanged, and its `mtime` unchanged. So the sweep's opening snapshot is
+    // the only stale input here — and it is not stale by a hair. `maxDeletes`
+    // unlinks against an MDS measured at 145 files/s serial can hold that
+    // window open for minutes, which is long enough for a run to restore this
+    // workspace and start writing to it. Deleting underneath such a run is
+    // strictly worse than the cold start this module budgets for.
+    //
+    // One primary-key lookup per prospective unlink, at most `maxDeletes` per
+    // tick on a pass that runs daily — negligible against the unlink it guards.
+    // `dryRun` skips it, so a preview still costs exactly one query; the
+    // consequence is that a dry run may report as eligible a workspace the live
+    // pass would then retain, which is the harmless direction.
+    //
+    // A lookup fault propagates and ends the tick rather than being swallowed
+    // per directory: unlike an unreadable directory it is not local to one
+    // entry, and the fail-closed reading of "cannot confirm idle" is "do not
+    // delete". The next tick retries from a fresh snapshot.
+    if (!options.dryRun) {
+      const current = (await lookupWorkspaceUsage([entry.name])).get(entry.name);
+      if (current && current.lastUsedAt.getTime() >= cutoff) {
+        result.retainedInUse += 1;
+        continue;
+      }
+    }
+
     result.eligible += 1;
 
     if (options.dryRun) {
