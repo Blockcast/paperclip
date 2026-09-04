@@ -178,10 +178,29 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
 // `run: |` block form; and it can open a subshell or sit inside a quoted
 // command -- `(cd <dir> && ...)`, `bash -c "cd <dir> && ..."`, `if cd <dir>;
 // then ...` -- which is the idiomatic way to chdir without leaking the
-// directory into everything after it. Widening the left side to whitespace is
-// safe here specifically because the alternation still requires the literal
-// token `cd`/`pushd`/`working-directory:` immediately before the path, so it
-// cannot fire on a word that merely ends in `cd`. `)` joins the right-hand
+// directory into everything after it.
+//
+// The left side admits command position, NOT bare whitespace. Requiring the
+// literal token `cd`/`pushd`/`working-directory:` stops a word that merely ends
+// in `cd`, but it does not stop `cd` appearing mid-sentence, and bare `\s` in
+// front of it made the gate fire on the chart path merely NAMED in prose:
+//
+//     run: node --test ./x.test.mjs  # never cd <dir> here
+//     run: |
+//       echo "do not cd <dir>"
+//
+// Both are false reds, and this file's own premise (the comment-stripper at the
+// top) is that a sentence about a rule must not count as an instance of
+// breaking it -- most
+// sharply here, since a step that runs `node --test` and explains why it must
+// not chdir is exactly where that sentence belongs. Whole-line comments are
+// already blanked, so the exposure was the two contexts the stripper
+// deliberately leaves alone: a TRAILING comment (left alone so `"${#failed[@]}"`
+// survives) and text inside a quoted string. Enumerating those two as escapes
+// was the alternative; command position removes the class instead, and costs
+// nothing -- every real spelling above still matches, via `(`, `["']` (the
+// quote in `bash -c "cd ...` is adjacent to `cd`), or `\b(?:if|then|else|do)`
+// for the `if cd <dir>; then` form. `)` joins the right-hand
 // class for `(cd <dir>)` with no trailing command inside the subshell.
 // `pushd` is in the alternation because it is `cd` with a
 // stack: nothing here pushd's into the chart for any other purpose, so naming
@@ -221,7 +240,7 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
     const step = workflow.slice(at, next === -1 ? undefined : next);
     if (!step.includes("node --test")) continue;
     const chdirs = new RegExp(
-      `(?:[\\s;&|("']|run:)\\s*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
+      `(?:[\\n;&|(]|run:|\\b(?:if|then|else|do)[ \\t]|["'])[ \\t]*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
     ).test(step);
     if (chdirs && jobOwning(at) !== "helm_chart") {
       offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
@@ -232,9 +251,14 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 
 // The exactly-once assertion matches the suite's path as TEXT, so it is only as
 // strong as the guarantee that every invocation names its paths literally. All
-// 42 `node --test` calls in pr.yml do -- there is not a single `**` in the file
+// 40 `node --test` calls in pr.yml do -- there is not a single `**` in the file
 // -- so that assertion can be trusted today, and nothing was holding it in
-// place. A glob wide enough to reach the suite without ever spelling its
+// place. Count that 40 against the comment-stripped source, the way this gate
+// reads it: `grep -c` on the raw file gives 42, because two of the calls are
+// prose in comments. Miscounting them as code is the exact confusion this file
+// exists to remove, so it is worth not reproducing in its own margin.
+//
+// A glob wide enough to reach the suite without ever spelling its
 // directory escapes the exactly-once assertion AND the chdir one above, while
 // still running the tests. No chdir is involved, so neither escape named above
 // covers it:
@@ -245,7 +269,7 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 //
 // The first is the one to weigh: a second chart under `deploy/helm/` makes it
 // the natural way to write "all chart suites". Argless is the other: pr.yml has
-// 42 near-identical single-file steps, so consolidating them is a plausible
+// 40 near-identical single-file steps, so consolidating them is a plausible
 // refactor, and default discovery from the repo root picks the suite up
 // silently -- reintroducing exactly the duplicate this gate exists to catch.
 //
@@ -269,11 +293,29 @@ test("every node --test names explicit paths, so the text match above is sound (
       const args = invocation[1]
         .split(/[\s\\]+/)
         .filter(Boolean)
-        .filter((arg) => !arg.startsWith("--"));
+        .filter((arg) => !arg.startsWith("--"))
+        // A path, not merely a non-flag token. A flag taking a SPACE-separated
+        // value (`--test-reporter spec`, `--test-timeout 60000`) leaves its
+        // value behind as a bare token, which satisfied a non-flag check with
+        // the value itself and reopened the argless hazard one flag away --
+        // node consumes the value and then default-discovers, so from the repo
+        // root such a step picks the chart suite up silently. Verified on the
+        // pinned node 24: `node --test --test-reporter spec` in a directory
+        // containing `tests/a.test.mjs` runs it, with no path argument given.
+        // Requiring `/` is the same house-style claim as the rest of this gate
+        // -- all 40 invocations name a rooted path -- and it leaves legitimate
+        // flag use alone, including the `$GITHUB_WORKSPACE/...` form.
+        .filter((arg) => arg.includes("/"));
       if (args.length === 0) {
         offenders.push(`${jobOwning(at)}: node --test with no path argument`);
       }
-      for (const arg of args.filter((path) => path.includes("**") || /\*[^\s]*\//.test(path))) {
+      // `{` alongside `**`: brace expansion wildcards a directory without ever
+      // spelling `**`, and its `*` is not followed by `/`, so
+      // `./deploy/helm/{paperclip,other}/tests/*.test.mjs` slipped past both
+      // shapes -- the sibling spelling of the `deploy/helm/*/tests/` row above,
+      // in exactly the "a second chart under deploy/helm/" scenario that makes
+      // it the natural way to write "all chart suites".
+      for (const arg of args.filter((path) => path.includes("**") || path.includes("{") || /\*[^\s]*\//.test(path))) {
         offenders.push(`${jobOwning(at)}: wildcard directory in ${arg}`);
       }
     }
