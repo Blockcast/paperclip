@@ -235,9 +235,13 @@ function redactUriCredentialsInValue(value: string): string {
  * `sanitizeValue` and `redactAgentConfigPayload` both return their argument
  * *by reference* when it fails this predicate. A caller that admits a payload
  * on some weaker "is it an object" test therefore has a fail-open the sanitizer
- * cannot see — it hands back the raw value and the caller spreads it. Callers
- * that gate before redacting should gate on this, so the two tests cannot
- * disagree.
+ * cannot see — it hands back the raw value and the caller spreads it.
+ *
+ * Gating on this is necessary but not sufficient: where the caller's assignment
+ * sits *inside* the gate, a failing gate leaves the raw value wherever it
+ * already was. The value has to be replaced with a contained one. See
+ * `containAgentConfig` in `routes/agents.ts`, which is the shared wrapper that
+ * does both and is what call sites there should use.
  */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;

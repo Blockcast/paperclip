@@ -710,7 +710,119 @@ describe("agent secret redaction on mutating responses", () => {
     expectNoPlaintextSecrets(res.body);
   });
 
+  // Same hole, one level down and one key over. `metadata` matches no tier and
+  // no special case in `sanitizeRecord`, so it goes to `sanitizeValue`, which
+  // returns a non-plain non-array object BY REFERENCE — `contained.metadata`
+  // was the caller's object, unsanitized, and `?? null` emitted it verbatim.
+  // `adapterConfig` and `runtimeConfig` beside it already failed closed on this
+  // exact shape; `metadata` failed open.
+  //
+  // Asserted as a pair, because the two halves can regress independently: the
+  // array case must SURVIVE as a masked array (above) and the foreign-prototype
+  // case must be WITHHELD. A fix that collapses either into the other passes one
+  // assertion and fails the other.
+  it("contains a metadata field whose prototype is not Object.prototype", async () => {
+    const foreignMetadata = Object.assign(Object.create({ inherited: true }), {
+      leaked: { type: "plain", value: SNAPSHOT_DRIFT_SECRET },
+    });
+    const snapshot = { ...snapshotWithUnnamedConfigField(), metadata: foreignMetadata };
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: snapshot,
+      afterConfig: snapshot,
+    });
 
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.afterConfig.metadata).toBeNull();
+    expect(res.body.beforeConfig.metadata).toBeNull();
+    // The rest of the snapshot is a plain object, so it must still project —
+    // this is containment of the one un-sanitizable field, not of the response.
+    expect(res.body.afterConfig.name).toBe("Builder");
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // `redactAgentSecrets` is the primary agent serializer — its own doc comment
+  // says every agent-serializing response must go through it — and it gated on
+  // `asRecord`, which admits a foreign-prototype object the redactor then hands
+  // straight back by reference.
+  //
+  // Note what does NOT fix this: swapping the gate to `isPlainObject`. The
+  // assignment is inside the `if`, so a failing gate leaves the RAW value on the
+  // `{ ...agent }` spread — same value on the wire, by a different route. The
+  // contained value has to be written back, which is why the fix is a helper
+  // rather than a one-word predicate change.
+  it("PATCH /agents/:id contains an adapterConfig whose prototype is not Object.prototype", async () => {
+    const foreignConfig = Object.assign(Object.create({ inherited: true }), {
+      // The top-level `env` is masked by its own loop over `asRecord(config.env)`
+      // regardless of the parent's prototype, so it would hide the leak. The
+      // secret has to sit OUTSIDE `env` to exercise the by-reference return:
+      // `redactedConfig` is the raw object, and the spread carries this out.
+      env: { FOO: { type: "plain", value: "unrelated" } },
+      sidecarConfig: { env: { BAZ: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
+    });
+    const foreignAgent = { ...baseAgent, adapterConfig: foreignConfig };
+    mockAgentService.getById.mockResolvedValue(foreignAgent);
+    mockAgentService.update.mockResolvedValue(foreignAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expect(res.body.adapterConfig).toEqual({});
+  });
+
+  it("PATCH /agents/:id contains a runtimeConfig whose prototype is not Object.prototype", async () => {
+    const foreignRuntime = Object.assign(Object.create({ inherited: true }), {
+      modelProfiles: { main: { adapterConfig: { env: { BAR: SNAPSHOT_DRIFT_SECRET } } } },
+    });
+    const foreignAgent = { ...baseAgent, runtimeConfig: foreignRuntime };
+    mockAgentService.getById.mockResolvedValue(foreignAgent);
+    mockAgentService.update.mockResolvedValue(foreignAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig).toEqual({});
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+  });
+
+  // `redactAgentConfiguration` passes the value in with no plain-object gate at
+  // all, so the redactor's own by-reference return was the only thing between a
+  // foreign-prototype config and the wire. Both of its config fields, because
+  // they are two separate call sites that can regress independently.
+  it("GET /agents/:id/configuration contains configs whose prototype is not Object.prototype", async () => {
+    const foreignAgent = {
+      ...baseAgent,
+      adapterConfig: Object.assign(Object.create({ inherited: true }), {
+        env: { FOO: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } },
+      }),
+      runtimeConfig: Object.assign(Object.create({ inherited: true }), {
+        env: { BAR: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } },
+      }),
+    };
+    mockAgentService.getById.mockResolvedValue(foreignAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/configuration`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig).toEqual({});
+    expect(res.body.runtimeConfig).toEqual({});
+    // The enumerated readable fields still project — containment is scoped to
+    // the two config fields, not to the whole response.
+    expect(res.body.name).toBe("Builder");
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+  });
+
+  // `secret_ref` bindings are pointers, never plaintext, so they survive the
+  // redactor by design — but a resolved `value` riding along on one is a secret
+  // that leaked in, and the schema has no field for it.
   it("never serializes a resolved value for a secret_ref env binding", async () => {
     const refAgent = {
       ...baseAgent,
