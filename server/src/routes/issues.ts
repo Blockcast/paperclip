@@ -6919,13 +6919,24 @@ export function issueRoutes(
     //
     // On the co-written `updatedAt`: deliberately NOT justified by enumerating
     // today's readers, because such a list is wrong the moment one is added.
-    // The stamp fires mid-run, and the run's own terminal finalize
-    // (`setRunStatus`) always writes a strictly later `updatedAt` — so the stamp
-    // cannot move this row across any time threshold its own completion does not
-    // already move it across, which holds for every reader present and future.
-    // The column carries no `$onUpdate`; ~50 sites in `heartbeat.ts` bump it
-    // explicitly across a run's life, so one more mid-run bump is not a new
-    // class of event on this row.
+    //
+    // What carries the weight is that a mid-run bump is not a new class of event
+    // on this row. The column has no `$onUpdate`, and ~50 sites in
+    // `heartbeat.ts` bump it explicitly across a run's life, so every reader of
+    // it already has to tolerate one landing at an arbitrary mid-run instant —
+    // this stamp included.
+    //
+    // Supporting only, and deliberately not the load-bearing half: the row's
+    // eventual state is unaffected, because every terminal path writes a
+    // strictly later `updatedAt` through `setRunStatus` — normal completion and
+    // the reaper's `process_lost` finalize alike, so this holds even for a run
+    // that dies immediately after stamping. That argument is about the eventual
+    // state ONLY. Inside the live window between the stamp and the finalize the
+    // row is genuinely fresher than it would otherwise have been, so a reader
+    // shaped as "`updatedAt` older than N ⇒ abandoned" that samples in that
+    // window has its verdict postponed by exactly that interval, and the later
+    // finalize cannot retroactively correct a read already taken. Only the
+    // bump-tolerance argument above covers that reader; do not lean on this one.
     if (statusOnly && mutationKind === "document") {
       try {
         await db
