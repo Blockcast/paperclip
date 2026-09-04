@@ -508,6 +508,53 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(events.at(-1)?.message).toContain("Set PR-review gate status review/ally-complete to failure");
   });
 
+  it("re-queues a delivered webhook-originated row", async () => {
+    setCreds();
+    const { companyId, delivery } = await seedRun();
+    const deliveredAt = new Date(Date.now() - 60_000);
+    // Webhook-originated rows carry no source run (migration 0237 made
+    // source_run_id nullable), so preserveExistingDelivery compares NULL to
+    // NULL. In SQL that is NULL, not true, which is what lets a terminal row
+    // be revived. Pin it: if someone "fixes" the comparison to
+    // `is not distinct from`, the row below stays `delivered` and the retirement
+    // re-delivery is silently dropped.
+    await db
+      .update(githubCommitStatusDeliveries)
+      .set({
+        status: "delivered",
+        sourceRunId: null,
+        deliveredAt,
+        createdAt: deliveredAt,
+        updatedAt: deliveredAt,
+        nextAttemptAt: deliveredAt,
+        lastResult: { posted: { ok: true } },
+      })
+      .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+
+    const revived = await enqueueGithubCommitStatusDelivery(db, {
+      companyId,
+      sourceRunId: null,
+      repoFullName: "Blockcast/hang",
+      sha: HEAD_SHA,
+      context: "review/ally-complete",
+      state: "failure",
+      description: "Retired. Findings now publish elsewhere.",
+      targetUrl: "https://github.com/Blockcast/hang/pull/7",
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7",
+      forceWrite: true,
+    });
+
+    expect(revived).toMatchObject({
+      id: delivery.id,
+      sourceRunId: null,
+      status: "queued",
+      attempts: 0,
+      forceWrite: true,
+      description: "Retired. Findings now publish elsewhere.",
+    });
+  });
+
   it("skips the failure write when an approved App review exists on GitHub", async () => {
     setCreds();
     const { delivery } = await seedRun();

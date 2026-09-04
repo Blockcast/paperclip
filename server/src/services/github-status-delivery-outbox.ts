@@ -479,6 +479,16 @@ export async function enqueueGithubCommitStatusDelivery(
 ): Promise<DeliveryRow> {
   const now = new Date();
   const nowSql = sql`${now.toISOString()}::timestamptz`;
+  // NOTE the NULL semantics, which are load-bearing. Migration 0237 made
+  // source_run_id nullable, so for webhook-originated rows both sides of the
+  // comparison are NULL and `source_run_id = NULL` evaluates to NULL, not
+  // true. preserveExistingDelivery is therefore NULL, every CASE below takes
+  // its ELSE branch, and a `delivered`/`skipped` row is reset to `queued`.
+  // That is the wanted behavior: a retirement write that already delivered
+  // must be redone when a fresh failure re-enqueues the same key. Do NOT
+  // "correct" this to `is not distinct from` — that would make the comparison
+  // true for two NULLs, preserve the terminal row, and silently drop the
+  // re-delivery. Pinned by test: "re-queues a delivered webhook-originated row".
   const preserveExistingDelivery = sql`${
     githubCommitStatusDeliveries.status
   } = 'processing' or (${

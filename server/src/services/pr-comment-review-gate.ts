@@ -439,18 +439,25 @@ export function commentReviewGateRetirementDescription(
   state: CommentReviewGateVerdict["state"] = "success",
 ): string {
   const target = liveContext.trim();
-  const [full, short] =
+  const renderShort = (name: string) =>
     state === "failure"
-      ? [
-          `Retired. Unresolved finding stands; "${target}" carries the verdict.`,
-          `Retired. Unresolved finding; see "${target}".`,
-        ]
-      : [
-          `Retired. Comment-shaped review findings now publish to "${target}".`,
-          `Retired. Findings now publish to "${target}".`,
-        ];
+      ? `Retired. Unresolved finding; see "${name}".`
+      : `Retired. Findings now publish to "${name}".`;
+  const full =
+    state === "failure"
+      ? `Retired. Unresolved finding stands; "${target}" carries the verdict.`
+      : `Retired. Comment-shaped review findings now publish to "${target}".`;
   if (full.length <= MAX_COMMIT_STATUS_DESCRIPTION) return full;
-  return short.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
+  const short = renderShort(target);
+  if (short.length <= MAX_COMMIT_STATUS_DESCRIPTION) return short;
+  // Both phrasings overflow, so the context name itself is what is long.
+  // Elide the NAME rather than slicing the rendered sentence: a blind slice
+  // cuts the name mid-token and drops the closing quote, which is exactly the
+  // "cut in half" outcome the fallback exists to avoid. Unreachable with
+  // today's names; pinned by test so it stays true if a name grows.
+  const budget = MAX_COMMIT_STATUS_DESCRIPTION - renderShort("").length - 1;
+  if (budget <= 0) return short.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
+  return renderShort(`${target.slice(0, budget)}…`);
 }
 
 /**

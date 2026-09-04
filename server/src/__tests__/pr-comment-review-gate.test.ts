@@ -709,5 +709,17 @@ describe("retired context supersede", () => {
     expect(
       commentReviewGateRetirementDescription(longContext, "failure").length,
     ).toBeLessThanOrEqual(140);
+
+    // Length alone was the weaker half of this promise: slicing the rendered
+    // sentence also satisfies it, while severing the name and dropping the
+    // closing quote — the exact "cut in half" outcome the fallback exists to
+    // prevent. Assert the sentence stays well-formed: the name is elided with
+    // an ellipsis and the quoted pointer still closes.
+    for (const state of ["success", "failure"] as const) {
+      const description = commentReviewGateRetirementDescription(longContext, state);
+      expect(description.length).toBeLessThanOrEqual(140);
+      expect(description).toMatch(/"[^"]*…"\.$/);
+      expect(description.split('"').length - 1).toBe(2);
+    }
   });
 });
