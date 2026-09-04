@@ -107,17 +107,18 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
 });
 
 // BLO-31690. `policy`'s cap is sized against measured setup cost, and the larger,
-// more variable half of that cost is its `fetch-depth: 0` checkout (0.5-4.4m over
-// 75 runs). Until that bound was added the step carried none, so a wedged fetch
+// more variable half of that cost is its `fetch-depth: 0` checkout (0.5-4.6m over
+// 120 runs). Until that bound was added the step carried none, so a wedged fetch
 // could only ever surface as an unattributable job-cap `cancelled` — the exact
 // mode the cap raise exists to remove, which makes the bound load-bearing rather
 // than decorative. By this file's own convention that means gating it: the
 // mutation case above exists because a bound nothing asserts is a bound that can
 // be quietly deleted, and this one is the only step bound in `policy` that had no
-// test behind it. The sizing argument (6m ≈ 1.4× the p100, and why not 8m) lives
-// in the workflow comment; the invariants worth gating are that the bound exists
-// and that it stays under the cap, since a step bound at or above the job cap can
-// never fire and silently stops being attribution.
+// test behind it. The sizing argument (6m ≈ 1.3× the p100, why not 8m, and the
+// 0.2m residual band it leaves) lives in the workflow comment; the invariants
+// worth gating are that the bound exists and that it stays under the cap, since a
+// step bound at or above the job cap can never fire and silently stops being
+// attribution.
 function assertCheckoutBounded(region) {
   const jobCap = Number(region.match(/\n    timeout-minutes: (\d+)\n/)?.[1]);
   assert.ok(jobCap > 0, "policy must declare a job-level timeout-minutes");

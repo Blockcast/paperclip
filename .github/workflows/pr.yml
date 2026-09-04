@@ -35,11 +35,21 @@ jobs:
     # does not distinguish them, which is why this class hid for so long.
     # Sized against that sample, worst observed:
     #
-    #   `Checkout repository` + `Setup pnpm`   8.1m   (the two are
+    #   `Checkout repository` + `Setup pnpm`   8.1m   (worst observed COMBINED,
+    #                                                 NOT the sum of the two
+    #                                                 p100s. Both legs are
     #                                                 independently bimodal --
-    #                                                 checkout 0.5-4.4m, pnpm
+    #                                                 checkout 0.5-4.6m, pnpm
     #                                                 0.2-4.3m -- so setup is
-    #                                                 the whole variable)
+    #                                                 the whole variable, but
+    #                                                 they do not co-peak: over
+    #                                                 120 runs the worst
+    #                                                 combined is 8.05m, at
+    #                                                 checkout 3.8m + pnpm 4.2m
+    #                                                 with neither leg at its
+    #                                                 own p100. The 8.9m
+    #                                                 sum-of-maxima has never
+    #                                                 occurred and over-budgets)
     #   every other step in the job            3.9m   (p100; the MEDIAN is
     #                                                 2.0m. Sizing a bound to
     #                                                 the median is what
@@ -55,13 +65,18 @@ jobs:
     #                                         -------
     #                                         13.0m   -> 15m = 2.0m (13%)
     #
-    # That is the worst OBSERVED case. With the 6m checkout bound below the
-    # worst case is also bounded from above rather than merely unobserved:
-    # 6.0m checkout + 4.3m pnpm p100 + 3.9m gate work = 14.2m, still inside
-    # 15m -- and a checkout slower than that now fails as the checkout step
+    # That is the worst OBSERVED case. With the 6m checkout bound below, the
+    # worst case is also bounded from above rather than merely unobserved --
+    # and note the instrument deliberately changes here, because an upper bound
+    # may not assume the two legs keep declining to co-peak the way the
+    # observed 8.1m above records that they did:
+    # 6.0m checkout bound + 4.3m pnpm p100 + 3.9m gate work = 14.2m, inside 15m
+    # so long as the 1.0m step reserve is unconsumed -- if a gate step also
+    # hangs for its full bound the same arithmetic is 15.2m and the cap is
+    # reachable again. A checkout slower than 6m now fails as the checkout step
     # instead of as the cap. `Setup pnpm` is the one leg still unbounded (see
-    # the residuals below), so it is the only remaining way to reach the cap
-    # without an attributable step failure.
+    # the residuals below), so with that reserve unconsumed it is the only
+    # remaining way to reach the cap without an attributable step failure.
     #
     # This supersedes an earlier 5 -> 10 raise whose arithmetic was "2 x
     # (bootstrap + 120s fetch) + backoff ~= 5m", covering a second
@@ -103,19 +118,30 @@ jobs:
         # `fetch-depth: 0` is load-bearing -- the lockfile guard below diffs
         # PR_BASE_SHA...PR_HEAD_SHA and needs the merge base on disk -- which
         # makes this the larger and more variable half of the setup cost the
-        # job budget above is sized against (0.5m-4.4m observed over 75 runs).
+        # job budget above is sized against (0.5m-4.6m observed over 120 runs).
         # It previously carried no bound at all, so a wedged fetch could only
         # ever surface as an unattributable job-cap cancellation.
         #
         # 6m, not 8m: a bound only helps if it is the thing that fires first.
-        # With pnpm at its 4.3m p100 and gate work at its 3.9m p100, the 15m
-        # cap leaves checkout 6.8m -- so an 8m bound left a 6.8-8.0m band in
-        # which a checkout passes its own bound and then dies at the cap
-        # anyway, unattributed, which is precisely the mode this bound exists
-        # to remove. 6m is ~1.4x the 4.4m p100: loose enough not to flake on a
-        # slow-but-working fetch, tight enough to stay attributable across the
-        # whole budget rather than most of it. Adding this raises no existing
-        # bound; it bounds a step that had none, and both facts are gated by
+        # With pnpm at its 4.3m p100, gate work at its 3.9m p100 and the 1.0m
+        # step reserve, the 15m cap leaves checkout 5.8m -- so an 8m bound left
+        # a 5.8-8.0m band in which a checkout passes its own bound and then
+        # dies at the cap anyway, unattributed, which is precisely the mode
+        # this bound exists to remove. 6m narrows that band rather than closing
+        # it: 5.8-6.0m remains, a 0.2m residual, and only bites while a gate
+        # step is simultaneously burning its full 1m reserve. Closing it
+        # outright means a 5m bound -- 1.09x the measured 4.57m p100, tight
+        # enough to fire on a slow-but-working fetch, which trades a rare
+        # unattributable death for a routine false one. 6m is ~1.3x that p100.
+        # Treat the ratio as drifting rather than fixed: `fetch-depth: 0` cost
+        # grows monotonically with history, so it tightens on its own and is
+        # worth re-measuring rather than trusting.
+        #
+        # Adding this bound raises no existing bound -- it bounds a step that
+        # had none -- but that is a property of this diff, not an invariant,
+        # and nothing asserts it. What CI does gate is narrower and is the part
+        # to rely on: that the bound EXISTS and that it SITS UNDER THE CAP,
+        # both asserted, with a deletion mutation case, in
         # scripts/__tests__/policy-node-test-timeouts.test.mjs (BLO-31690).
         uses: actions/checkout@v6
         with:
