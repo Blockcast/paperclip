@@ -9,16 +9,26 @@ import { pluginStateStore } from "../services/plugin-state-store.js";
 import { GBRAIN_RECALL_METRIC, __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
 // Imported from the gbrain plugin's real producer on purpose (BLO-25892). The
 // server-side extractor in plugin-state-store.ts duck-types `value.status` out
-// of a payload owned by packCacheEntry, and nothing in server/ imports
-// StoredRecall, so there is no type-level link between the two packages. If
-// this fixture were hand-built and the producer ever moved `status` under an
-// envelope key, normalizeGbrainRecallStatus would send every real prefetch to
-// "other", status="error" would stay flat at 0, and the alert would never fire
-// — indistinguishable from a healthy fleet, with both tests still green.
-// Building the fixture from the producer makes a producer-side rename break
-// this test instead of silently zeroing the detector. Same relative
-// cross-package import pattern as linear-webhook-fixture-replay.test.ts.
+// of a payload owned by packCacheEntry, and matches on a private literal copy
+// of the state key; nothing in server/ imports StoredRecall or
+// RECALL_STATE_KEY, so there is no type-level link between the two packages.
+// Both halves of that contract are bound here rather than hand-written:
+//
+//   - payload shape: if the producer moved `status` under an envelope key,
+//     normalizeGbrainRecallStatus would send every real prefetch to "other".
+//   - state key: if RECALL_STATE_KEY's value changed, the plugin would keep
+//     working (its write and read move together) while the server's matcher
+//     silently stopped matching.
+//
+// Either drift zeroes status="error" and the alert never fires —
+// indistinguishable from a healthy fleet, with both tests still green. The
+// state-key leg is the more silent of the two: `status` has an independent
+// brake in the value_json->>'status' partial indexes and the RAG-health route,
+// whereas nothing on the server notices a state-key rename except this counter.
+// Same relative cross-package import pattern as
+// linear-webhook-fixture-replay.test.ts.
 import {
+  RECALL_STATE_KEY,
   buildCacheEntry,
   packCacheEntry,
 } from "../../../packages/plugins/paperclip-plugin-gbrain/src/recall.js";
@@ -123,14 +133,19 @@ describeEmbeddedPostgres("plugin state store", () => {
     await store.set(pluginId, {
       scopeKind: "run",
       scopeId: randomUUID(),
-      stateKey: "gbrain-context",
+      stateKey: RECALL_STATE_KEY,
       value: erroredRecall,
     });
+    // Scope-filter negative: the *real* recall key under the wrong scope. Bound
+    // to the constant so a rename keeps this case exercising the scope filter
+    // against the live key instead of degrading into a second stale-key case.
     await store.set(pluginId, {
       scopeKind: "instance",
-      stateKey: "gbrain-context",
+      stateKey: RECALL_STATE_KEY,
       value: erroredRecall,
     });
+    // Key-filter negative: deliberately a literal, since it must stay a
+    // non-matching key no matter what RECALL_STATE_KEY becomes.
     await store.set(pluginId, {
       scopeKind: "run",
       scopeId: randomUUID(),
