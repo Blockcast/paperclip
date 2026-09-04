@@ -282,9 +282,14 @@ function isInside(parent: string, child: string): boolean {
  * the same irreversible loss this function exists to prevent, one step removed.
  * Returns `null` once {@link PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS} is exhausted,
  * which the caller treats as "do not install" rather than "overwrite".
+ *
+ * The bound is `<`, not `<=`: attempt 0 is the unnumbered name, so the loop
+ * yields exactly MAX candidates (unnumbered plus `.1`..`.MAX-1`). With `<=` it
+ * yielded MAX+1, which made both the constant's name and the decline warning's
+ * count understate reality by one.
  */
 async function reserveDisplacedHookPath(hookPath: string): Promise<string | null> {
-  for (let attempt = 0; attempt <= PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS; attempt += 1) {
+  for (let attempt = 0; attempt < PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS; attempt += 1) {
     const candidate =
       attempt === 0
         ? `${hookPath}${PUSH_GUARD_DISPLACED_HOOK_SUFFIX}`
@@ -403,6 +408,10 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     return {
       ...base,
       state: "install_failed",
+      // Carried deliberately: this is the exit where an operator most needs the
+      // full picture, and `base` would report a resolved out-of-repo hooks dir
+      // as null.
+      displacedHooksPath,
       warning:
         `Managed checkout "${cwd}": a non-Paperclip \`pre-receive\` hook is installed at "${hookPath}" and ` +
         `Paperclip has already displaced ${PUSH_GUARD_MAX_DISPLACED_HOOK_BACKUPS} earlier ones, so it declined ` +
@@ -454,7 +463,11 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       notes.push(
         `Managed checkout "${cwd}" already had a non-Paperclip \`pre-receive\` hook. Paperclip moved it to ` +
           `"${foreignBackupPath}" and installed the inbound-push guard in its place; it is no longer run. ` +
-          `Restore it by merging its contents into the guard, or move it back to disable the guard.`,
+          `Do NOT merge your logic into the installed guard: \`pre-receive\` is Paperclip-owned and is ` +
+          `rewritten wholesale on the next provisioning pass. A merged file carries Paperclip's ownership ` +
+          `marker, so it reads as ours to overwrite -- the merge would be discarded silently, with no ` +
+          `backup and no warning. Two remedies survive re-provisioning: keep your logic under a different ` +
+          `hook name, or move "${path.basename(foreignBackupPath)}" back over the guard to disable it.`,
       );
     }
     if (displacedHooksPath) {
