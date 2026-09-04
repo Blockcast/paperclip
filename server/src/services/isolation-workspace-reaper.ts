@@ -62,17 +62,23 @@
  * `storage.session` are both `"persistent"` (`heartbeat.ts:6458-6459`), so what
  * that would destroy is durable per-workspace state.
  *
- * So the age test resolves each directory name against `execution_workspaces`:
+ * So the age test resolves each directory name against `execution_workspaces`,
+ * and deletes only when **every available signal says idle**:
  *
  * - **Row found** -> gate on `lastUsedAt`, which *is* maintained on use: the
  *   workspace-restore path refreshes it on every reuse
  *   (`heartbeat.ts:27159`), as does creation (`heartbeat.ts:27186`). The column
  *   is `notNull` and indexed (`execution_workspaces.ts:35,59-62`).
  * - **No row** -> the true orphan cohort this reaper is aimed at, and the only
- *   population with no database truth to consult. Only here does filesystem age
- *   apply, where "materialized more than N days ago with no owning row" is
- *   exactly the intended meaning. Taking `max(mtime)` of `home`/`session`
+ *   population with no database truth to consult. Here filesystem age carries
+ *   the decision, where "materialized more than N days ago with no owning row"
+ *   is exactly the intended meaning. Taking `max(mtime)` of `home`/`session`
  *   instead would not help: the same rule applies one level down.
+ *
+ * `mtime` is still consulted for every directory, because being a useless
+ * *deletion* signal does not make it a useless *retention* one: a workspace
+ * materialized yesterday cannot have been idle for a month, whatever a stale
+ * row says. Requiring both can only ever retain more.
  *
  * Deleting a genuinely idle workspace costs a cold start, not source: durable
  * transcripts live separately under `data/run-logs/`.
@@ -220,24 +226,31 @@ export async function reapIsolationWorkspaces(
     const dir = path.join(root, entry.name);
     const owner = usage.get(entry.name);
 
-    // The age test. A resolvable row is authoritative and the filesystem is not
-    // consulted at all; `mtime` is the orphan-only fallback. See the module doc
-    // comment for why the two cannot be swapped.
+    // The age test: delete only when EVERY available signal says idle.
+    //
+    // `lastUsedAt` is the authoritative one and the only one that can keep a
+    // live workspace alive — see the module doc comment. Filesystem `mtime` is
+    // materialization time, so it is a valid *retention* signal even though it
+    // is a useless deletion signal: a directory materialized yesterday cannot
+    // have been idle for a month, whatever a stale row claims. Requiring both
+    // can only ever retain more, which is the correct bias for an irreversible
+    // operation, and it costs one `stat`.
     let idleSinceMs: number;
+    try {
+      idleSinceMs = (await fs.stat(dir)).mtimeMs;
+    } catch {
+      result.vanished += 1;
+      continue;
+    }
+    if (idleSinceMs >= cutoff) continue;
+
     if (owner) {
+      // A row exists, so the filesystem no longer gets a vote on deletion.
       idleSinceMs = owner.lastUsedAt.getTime();
       if (idleSinceMs >= cutoff) {
         result.retainedInUse += 1;
         continue;
       }
-    } else {
-      try {
-        idleSinceMs = (await fs.stat(dir)).mtimeMs;
-      } catch {
-        result.vanished += 1;
-        continue;
-      }
-      if (idleSinceMs >= cutoff) continue;
     }
 
     let children: string[];

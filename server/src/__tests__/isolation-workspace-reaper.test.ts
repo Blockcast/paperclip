@@ -159,11 +159,14 @@ describe("reapIsolationWorkspaces", () => {
   });
 
   /**
-   * `lastUsedAt` overrides the filesystem in both directions: a row used inside
-   * the window protects a directory whose own mtime is ancient, and the reverse
-   * pairing must not resurrect the old behaviour.
+   * `lastUsedAt` is the only signal that can protect a live workspace, but it is
+   * not the only one that can *retain*. A directory materialized yesterday
+   * cannot have been idle for a month, so a row claiming otherwise is stale and
+   * the conservative reading wins. This state should not arise — materializing
+   * a workspace sets `lastUsedAt` — which is exactly why acting on it would be
+   * acting on a contradiction.
    */
-  it("prefers the owning row over filesystem age for a freshly materialized but long-idle workspace", async () => {
+  it("retains when the row says idle but the directory was materialized inside the window", async () => {
     await makeWorkspace("ws-recent-dir", [...REAPABLE_LAYOUT], 1);
 
     const res = await reapIsolationWorkspaces({
@@ -174,7 +177,8 @@ describe("reapIsolationWorkspaces", () => {
       lookupWorkspaceUsage: usageLookup({ "ws-recent-dir": { lastUsedDaysAgo: 90 } }),
     });
 
-    expect(res).toMatchObject({ eligible: 1, deleted: 1 });
+    expect(res).toMatchObject({ eligible: 0, deleted: 0 });
+    await expect(fs.stat(path.join(root, "ws-recent-dir"))).resolves.toBeDefined();
   });
 
   it("falls back to filesystem age only for a directory with no owning row", async () => {
