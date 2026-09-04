@@ -1846,6 +1846,14 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         //  - Empty and whitespace-only keys count as omitted, matching the
         //    host's `readNonEmptyParam`. Otherwise `""` would dedup every
         //    keyless-looking create against the first one.
+        // One detail is deliberately *not* reproduced: this stores the raw
+        // caller key, where the host stores `plugin:${pluginId}:${key}`. Tests
+        // asserting the key should assert the call argument, which is the level
+        // a plugin controls. Do not read this fake as evidence that the host's
+        // namespacing is unnecessary — it cannot model the cross-plugin
+        // collision that namespacing exists to prevent, where two plugins
+        // sharing a natural key on one issue would hand the second caller the
+        // first's body with `deduplicated: true` and no error.
         // Everything up to the push below is synchronous, so concurrent callers
         // cannot interleave here — the same atomicity the unique index gives us
         // in Postgres, which is what makes the concurrency tests meaningful.
