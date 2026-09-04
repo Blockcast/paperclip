@@ -17,6 +17,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImmutableThinkingBlockError,
   classifyClaudeUpstreamFailure,
+  isClaudeSkillNotFoundStartupFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
@@ -2182,11 +2183,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: { stdout },
       };
     }
+    // No result event ever arrived, so classifyClaudeUpstreamFailure (which
+    // needs `parsed`) is unreachable from here and this return would otherwise
+    // carry no errorCode at all. `truncatedMidStream` is the
+    // assistant-produced-output flag, and it is false on every path that
+    // reaches this line — passing it keeps the transcript-scan guard explicit
+    // rather than positional.
+    const skillNotFound = isClaudeSkillNotFoundStartupFailure({
+      stdout,
+      assistantContentSeen: parsedStream.truncatedMidStream,
+    });
     return {
       exitCode,
       signal: null,
       timedOut: false,
       errorMessage: buildPartialRunError(exitCode, parsedStream.model, stdout, podTerminatedState, containerLogTail),
+      ...(skillNotFound ? { errorCode: "skill_not_found" } : {}),
       resultJson: { stdout },
     };
   }

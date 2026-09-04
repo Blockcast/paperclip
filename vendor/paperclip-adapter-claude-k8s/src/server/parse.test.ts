@@ -10,6 +10,7 @@ import {
   isClaudeTransientUpstreamError,
   matchClaudeUpstreamCapacityCode,
   classifyClaudeUpstreamFailure,
+  isClaudeSkillNotFoundStartupFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
 
@@ -405,6 +406,99 @@ describe("classifyClaudeUpstreamFailure", () => {
       }),
     ).toEqual({ family: null, errorCode: null, capacityCode: null });
   });
+
+  it("classifies a missing Skill as deterministic configuration failure", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: true,
+        parsed: { subtype: "error", result: 'Error: Skill "verification-before-completion" not found' },
+      }),
+    ).toEqual({ family: null, errorCode: "skill_not_found", capacityCode: null });
+  });
+
+  it("does not classify a successful output mentioning the error", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: false,
+        zeroTokenProgress: true,
+        parsed: { subtype: "error", result: 'Skill "verification-before-completion" not found' },
+      }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
+  });
+
+  // A run can exit non-zero while its result event still carries
+  // `subtype: "success"` — observed on BLO-7991 itself as
+  // `Claude run failed: subtype=success: Failed to authenticate…`. On such an
+  // event `parsed.result` is the model's OWN final message, so trusting it
+  // would re-admit exactly the model-prose false positive the transcript fix
+  // removed, one turn narrower. `errorMessage` embeds that same text verbatim
+  // (describeClaudeFailure uses `result` as its detail), so it is gated too —
+  // this asserts the leak is closed on both surfaces at once.
+  it("does not classify model prose in a subtype=success result as a skill failure", () => {
+    const modelProse = "Root cause: the run died with Skill 'verification-before-completion' not found.";
+    expect(modelProse).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        parsed: { subtype: "success", result: modelProse },
+        errorMessage: `Claude run failed: subtype=success: ${modelProse}`,
+      }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
+  });
+
+  // `stdout` is the WHOLE pod log (execute.ts sets it from the tailed/on-disk
+  // log file), so it contains every intermediate assistant message. Matching
+  // the skill phrase there lets a failed run be reclassified as deterministic
+  // purely because the model *talked about* a missing skill — and
+  // `skill_not_found` is in NON_RETRYABLE_CONTINUATION_ERROR_CODES and is
+  // excluded from the zero-token session reset, so a false positive
+  // permanently suppresses retries. That is the opposite blast radius from the
+  // transient codes, where a false positive costs one extra retry.
+  //
+  // The quoting matters: a JSON-encoded transcript escapes `"` as `\"`, which
+  // the regex's `["'`]` class rejects. Single quotes and backticks are NOT
+  // escaped inside a JSON string, so prose like `Skill 'x' not found` reaches
+  // the matcher verbatim. This run failed on an upstream overload while
+  // discussing BLO-7991 — it must stay retryable.
+  it("does not classify a transcript that merely discusses a missing skill", () => {
+    const transcript = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":',
+      "\"Root cause: the run died with Skill 'verification-before-completion' not found.\"}]}}",
+      '{"type":"result","subtype":"error","result":"Overloaded"}',
+    ].join("\n");
+    // Precondition: the phrase really is present unescaped, so this test
+    // cannot pass merely because the fixture failed to reproduce it.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        stdout: transcript,
+        errorMessage: "Claude run failed: subtype=error: Overloaded",
+      }),
+    ).toEqual({
+      family: "transient_upstream",
+      errorCode: "claude_transient_upstream",
+      capacityCode: null,
+    });
+  });
+
+  // The production call site passes `parsed`/`stdout`/`errorMessage` and never
+  // `stderr`, so detection has to work through the structured error envelope.
+  it("classifies a missing Skill reported in the structured error envelope", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: true,
+        parsed: {
+          subtype: "error",
+          errors: [{ message: 'Skill "verification-before-completion" not found' }],
+        },
+      }),
+    ).toEqual({ family: null, errorCode: "skill_not_found", capacityCode: null });
+  });
 });
 
 describe("extractClaudeRetryNotBefore", () => {
@@ -624,5 +718,126 @@ describe("isClaudeImmutableThinkingBlockError", () => {
 
   it("returns false for unrelated thinking text", () => {
     expect(isClaudeImmutableThinkingBlockError({ result: "thinking about the next step" })).toBe(false);
+  });
+});
+
+// When the CLI dies before emitting a `type:"result"` event, execute.ts's
+// `!parsed` branch returns before classifyClaudeUpstreamFailure is ever
+// called, so AC3 was inert on exactly the startup-time fault BLO-7991
+// describes. `stdout` is the only surface left there, and scanning it is safe
+// only because the guard reads that same raw surface: the parsed
+// `assistantContentSeen` flag does NOT imply the model stayed silent, so it
+// cannot bound what the raw scan sees.
+describe("isClaudeSkillNotFoundStartupFailure", () => {
+  const startupLog = [
+    '{"type":"system","subtype":"init"}',
+    'Error: Skill "verification-before-completion" not found',
+  ].join("\n");
+
+  it("classifies a skill death that produced no assistant output", () => {
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: startupLog, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // The guard, not a comment, is what keeps the transcript scan safe: once the
+  // model has spoken, the same phrase may be its own prose about a missing
+  // skill, and `skill_not_found` suppresses retries permanently.
+  it("refuses to scan the transcript once assistant output exists", () => {
+    const transcript = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":',
+      "\"Root cause: the run died with Skill 'verification-before-completion' not found.\"}]}}",
+    ].join("\n");
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: true }),
+    ).toBe(false);
+  });
+
+  // Shape (a): an OOMKill mid-first-assistant-message. The truncated line
+  // fails parseJson, so it never sets `assistantContentSeen` — yet it sits
+  // verbatim in `stdout`. Misclassifying this as `skill_not_found` would
+  // permanently suppress retries for a transient pod kill, so the raw-surface
+  // guard has to catch it even though the parsed flag is false.
+  it("refuses to scan when a truncated, unparseable assistant line is present", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      // Truncated mid-write: no closing braces, so parseJson rejects it.
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Skill \'verification-before-completion\' not found is the err',
+    ].join("\n");
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    const parsed = parseClaudeStreamJson(transcript);
+    // Precondition: the parser really does leave the flag false here.
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
+  // Shape (b): a complete, parseable assistant event carrying text but no
+  // usage data at all. `outputTokens` defaults to -1, so `outputTokens > 0` is
+  // false and the flag stays clear even though the model demonstrably spoke.
+  it("refuses to scan when an assistant event carries text but no usage data", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Root cause: Skill \'verification-before-completion\' not found."}]}}',
+    ].join("\n");
+    const parsed = parseClaudeStreamJson(transcript);
+    // Preconditions: the model's text was captured, yet the flag is false.
+    expect(parsed.summary).toContain("Skill 'verification-before-completion' not found");
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
+  // Shape (c): a `user`-typed event before any `assistant` event. `user` events
+  // carry tool_result content, i.e. arbitrary text the harness did not author —
+  // and this very issue's text contains the trigger phrase verbatim, so a run
+  // reading BLO-7991 is the natural first false positive. The parser ignores
+  // `user` events entirely (no branch in parseClaudeStreamJson), so the flag
+  // stays false. `buildPartialRunError`'s own "skips user events alongside
+  // system events" test (execute.test.ts) models exactly this init -> user ->
+  // error ordering on this same `!parsed` path, so the shape is one the adapter
+  // already expects rather than one hypothesised here.
+  it("refuses to scan when a user event precedes any assistant event", () => {
+    const toolResult =
+      'Skill \'verification-before-completion\' not found — quoted from the issue body';
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":${JSON.stringify(toolResult)}}]}}`,
+      "Error: pod terminated",
+    ].join("\n");
+    // Preconditions: the phrase is present verbatim, no assistant event exists,
+    // and the parser leaves the flag false — so only the guard can save this.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(transcript).not.toContain('"type":"assistant"');
+    const parsed = parseClaudeStreamJson(transcript);
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for an unrelated startup failure", () => {
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: "Error: connect ECONNREFUSED 10.0.0.1:443",
+        assistantContentSeen: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when there is no stdout at all", () => {
+    expect(isClaudeSkillNotFoundStartupFailure({ stdout: null, assistantContentSeen: false })).toBe(false);
   });
 });
