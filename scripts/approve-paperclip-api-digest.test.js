@@ -263,3 +263,218 @@ test("valid knobs pass validation and the script proceeds to the deploy credenti
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /is not a positive integer/);
 });
+
+// --- Approval window eviction order (BLO-28483) ---------------------------
+//
+// The window is bounded and was ordered purely by age, which is backwards under
+// the failure it exists to cover: a deploy that fails before its rollout lands
+// still consumes a slot forever, so a run of consecutive failures ages out the
+// digest actually serving traffic. helm then cannot roll back to the running
+// state and a transient upgrade failure becomes a permanently wedged release.
+// The fix pins the running digest behind the one being released. These tests
+// hold that guarantee, and the control below proves they can actually fail.
+
+const RING_FUNCTION_NAME = "build_approval_ring";
+const ringSource = extractShellFunction(RING_FUNCTION_NAME);
+
+// Read the bound out of the script for the same reason the knobs are: a test
+// asserting against a hard-coded 3 would go quietly green if the constant and
+// the CEL variable it must match were ever moved together.
+function shellReadonly(name) {
+  const m = script.match(new RegExp(`^readonly ${name}=(\\d+)$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+const MAX_APPROVED_DIGESTS = shellReadonly("MAX_APPROVED_DIGESTS");
+
+// Distinct, well-formed, lowercase-hex digests keyed by a short label.
+function digest(label) {
+  const hex = label.toString(16).padStart(2, "0");
+  return `sha256:${hex.repeat(32).slice(0, 64)}`;
+}
+
+// Runs the shipping ring builder. `liveDigest` of "" is the pre-fix behaviour:
+// the running digest could not be established, so ordering falls back to age.
+function ringFor(newDigest, liveDigest, existing, max = MAX_APPROVED_DIGESTS) {
+  const harness = [
+    "set -euo pipefail",
+    ringSource,
+    `printf '%s' "$1" | ${RING_FUNCTION_NAME} "$2" "$3" "$4"`,
+  ].join("\n");
+  const result = spawnSync(
+    "bash",
+    ["-c", harness, "harness", existing.join("\n"), newDigest, liveDigest, String(max)],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `ring harness failed: ${result.stderr}`);
+  return result.stdout.trim().split("\n").filter(Boolean);
+}
+
+test("the digest being released is first and the running digest is pinned right behind it", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, [digest(0x22), live, digest(0x33)]);
+  assert.equal(ring[0], digest(0x11));
+  assert.equal(ring[1], live);
+  assert.ok(ring.length <= MAX_APPROVED_DIGESTS);
+});
+
+test("the running digest survives an unbounded run of deploys that never land", () => {
+  const live = digest(0xaa);
+  // The live ring as it stood on 2026-09-04: a dead slot holding a digest that
+  // was approved and never applied, the running digest, and one older entry.
+  let ring = [digest(0x6c), live, digest(0x68)];
+  for (let i = 0; i < 25; i += 1) {
+    ring = ringFor(digest(0x10 + i), live, ring);
+    assert.ok(
+      ring.includes(live),
+      `the running digest was evicted after ${i + 1} consecutive deploys — rollback is now impossible`,
+    );
+    assert.ok(ring.length <= MAX_APPROVED_DIGESTS, `window grew to ${ring.length}`);
+  }
+});
+
+test("CONTROL: without the pin the running digest is evicted in two deploys", () => {
+  // Guards the test above from going hollow. This is the pre-fix ordering, and
+  // it reproduces the exact arithmetic BLO-28483 was filed on: with one slot
+  // already consumed by a digest that never ran, the running digest is two
+  // failed deploys away from eviction. If this ever passes, the pin has stopped
+  // being load-bearing and the regression test above proves nothing.
+  const live = digest(0xaa);
+  let ring = [digest(0x6c), live, digest(0x68)];
+  ring = ringFor(digest(0x10), "", ring);
+  assert.ok(ring.includes(live), "still present after one deploy");
+  ring = ringFor(digest(0x11), "", ring);
+  assert.ok(!ring.includes(live), "pre-fix ordering must evict the running digest on the second deploy");
+});
+
+test("a config-only release reusing the running digest does not duplicate it", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(live, live, [digest(0x22), digest(0x33)]);
+  assert.equal(ring[0], live);
+  assert.equal(ring.filter((entry) => entry === live).length, 1);
+  assert.ok(ring.length <= MAX_APPROVED_DIGESTS);
+});
+
+test("a running digest already in the window is pinned rather than duplicated", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, [live, digest(0x22)]);
+  assert.equal(ring.filter((entry) => entry === live).length, 1);
+  assert.equal(ring[1], live);
+});
+
+test("an unestablished running digest degrades to newest-first, never to a failure", () => {
+  const ring = ringFor(digest(0x11), "", [digest(0x22), digest(0x33), digest(0x44)]);
+  assert.deepEqual(ring, [digest(0x11), digest(0x22), digest(0x33)]);
+});
+
+test("a malformed running digest is ignored rather than pinned", () => {
+  const ring = ringFor(digest(0x11), "not-a-digest", [digest(0x22), digest(0x33)]);
+  assert.deepEqual(ring, [digest(0x11), digest(0x22), digest(0x33)]);
+});
+
+test("malformed entries are discarded rather than consuming a slot", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, ["", "  ", "sha256:nope", "garbage", live, digest(0x22)]);
+  assert.deepEqual(ring, [digest(0x11), live, digest(0x22)]);
+  for (const entry of ring) {
+    assert.match(entry, /^sha256:[0-9a-f]{64}$/);
+  }
+});
+
+test("the window never exceeds the bound the admission policy enforces", () => {
+  const live = digest(0xaa);
+  const crowded = Array.from({ length: 12 }, (_, index) => digest(0x30 + index));
+  const ring = ringFor(digest(0x11), live, [...crowded, live]);
+  assert.equal(ring.length, MAX_APPROVED_DIGESTS);
+});
+
+test("an empty window yields just the released digest and the running one", () => {
+  const live = digest(0xaa);
+  assert.deepEqual(ringFor(digest(0x11), live, []), [digest(0x11), live]);
+  assert.deepEqual(ringFor(digest(0x11), "", []), [digest(0x11)]);
+});
+
+test("a one-slot window still releases, dropping the pin rather than overflowing", () => {
+  // Defensive: the pin must never be able to push the window past the bound, so
+  // a hypothetical max of 1 keeps only the digest being released.
+  assert.deepEqual(ringFor(digest(0x11), digest(0xaa), [digest(0x22)], 1), [digest(0x11)]);
+});
+
+// The ring builder being correct proves nothing unless the script actually hands
+// it the running digest, so the reader on the other side of that seam is
+// exercised too — against a stubbed kubectl, since it is the one part that talks
+// to a cluster. Its contract is narrow: name the digest when it can be
+// established beyond doubt, otherwise say nothing and succeed. It must never
+// fail a release to protect a rollback target.
+
+const READER_FUNCTION_NAME = "live_running_digest";
+const readerSource = extractShellFunction(READER_FUNCTION_NAME);
+
+function shellAssign(name) {
+  const m = script.match(new RegExp(`^${name}="([^"]+)"$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return m[1];
+}
+
+const IMAGE_REPOSITORY = shellAssign("IMAGE_REPOSITORY");
+
+// `deployment` of null makes the stub exit non-zero, standing in for "no such
+// Deployment" or an unreachable apiserver.
+function runningDigestFor(deployment) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
+  const fixture = path.join(dir, "deployment.json");
+  writeFileSync(fixture, deployment === null ? "" : JSON.stringify(deployment));
+  const harness = [
+    "set -euo pipefail",
+    `DEPLOY_NAMESPACE=paperclip`,
+    `DEPLOYMENT=paperclip-api`,
+    `IMAGE_REPOSITORY=${JSON.stringify(IMAGE_REPOSITORY)}`,
+    `fake_kubectl() { [[ -s ${JSON.stringify(fixture)} ]] || return 1; cat ${JSON.stringify(fixture)}; }`,
+    "deploy_kubectl=(fake_kubectl)",
+    readerSource,
+    READER_FUNCTION_NAME,
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `reader must always succeed; stderr: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function deploymentWithImages(...images) {
+  return { spec: { template: { spec: { containers: images.map((image) => ({ image })) } } } };
+}
+
+test("the running digest is read off a single-container Deployment", () => {
+  const live = digest(0xaa);
+  assert.equal(runningDigestFor(deploymentWithImages(`${IMAGE_REPOSITORY}@${live}`)), live);
+});
+
+test("identical images across containers still name the running digest", () => {
+  const live = digest(0xaa);
+  const image = `${IMAGE_REPOSITORY}@${live}`;
+  assert.equal(runningDigestFor(deploymentWithImages(image, image)), live);
+});
+
+test("an unreachable or absent Deployment yields no digest and still succeeds", () => {
+  assert.equal(runningDigestFor(null), "");
+});
+
+test("a tag-pinned image is not mistaken for a digest", () => {
+  assert.equal(runningDigestFor(deploymentWithImages(`${IMAGE_REPOSITORY}:latest`)), "");
+});
+
+test("an image from another repository is never pinned", () => {
+  const live = digest(0xaa);
+  assert.equal(runningDigestFor(deploymentWithImages(`ghcr.io/someone/else@${live}`)), "");
+});
+
+test("containers disagreeing on their image yield no digest rather than a guess", () => {
+  const images = [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xbb)}`];
+  assert.equal(runningDigestFor(deploymentWithImages(...images)), "");
+});
+
+test("a Deployment with no containers yields no digest", () => {
+  assert.equal(runningDigestFor({ spec: { template: { spec: {} } } }), "");
+});
+
+
