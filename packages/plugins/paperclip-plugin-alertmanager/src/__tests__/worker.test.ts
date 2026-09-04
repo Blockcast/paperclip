@@ -748,6 +748,78 @@ describe("handleWebhook — firing first time", () => {
     );
   });
 
+  it("keeps the retry window when the fallback agent is only paused", async () => {
+    // The counterpart to the permanent drop above, and the case that makes the
+    // refusal *class* load-bearing rather than cosmetic. A paused fallback owner
+    // becomes invokable again with nobody editing config, so Alertmanager's
+    // 15-17 retries are the only thing that lets the alert land within minutes
+    // of the unpause instead of waiting out a whole `repeat_interval`. Dropping
+    // it at 200 here would be a time-to-detect regression for a critical alert.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    mocks.agents.list.mockResolvedValue([
+      { id: "agent-fallback", name: "Alert Fallback", status: "paused" },
+    ]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // Fail-closed is still intact — a paused owner is no more assignable than a
+    // terminated one; only the reporting channel differs.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    // Reported as transient, NOT permanent.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
+    );
+    // The operator-facing warning names the blocking reason, so the next
+    // occurrence is diagnosable from the log alone (PEN-2581).
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-fallback=paused"),
+    );
+  });
+
+  it("still acknowledges a permanent drop when the metrics write fails", async () => {
+    // The permanent drop's own invariant must not depend on telemetry being up.
+    // If the `fallback_failed` write threw, handleFiring would surface a
+    // *metrics* error instead of PermanentAlertError, the per-alert catch would
+    // treat it as transient and push the fingerprint, and the delivery would
+    // 502 — reinstating the doomed retry burst this path exists to remove, and
+    // taking the rest of the batch down with it.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.owner.fallback_failed") {
+        throw new Error("metrics backend unavailable");
+      }
+    });
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    // The permanent classification survived the telemetry outage.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh" },
+    );
+    // And the swallowed metrics failure is still audible in the log.
+    expect(mocks.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to record fallback owner metric"),
+    );
+  });
+
   it("still fails the delivery for a transient per-alert fault", async () => {
     // Control for the two tests above: the permanent carve-out must not have
     // widened into "swallow every per-alert failure". A transient fault still
