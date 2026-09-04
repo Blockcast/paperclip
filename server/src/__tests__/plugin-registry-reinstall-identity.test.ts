@@ -60,6 +60,13 @@ describeEmbeddedPostgres("plugin registry: dedup namespace identity across reins
     expect(installed).not.toBeNull();
     const originalId = installed!.id;
 
+    // `false` here is the registry default (`plugin-registry.ts:279`), but the
+    // docstring's claim is made at the HTTP surface, and getting there depends on
+    // two defaults this suite does not exercise: `lifecycle.unload`'s own
+    // `removeData = false` (`plugin-lifecycle.ts:560`, forwarded at `:590`) and
+    // the route's `purge = req.query.purge === "true"` (`routes/plugins.ts:2368`,
+    // passed at `:2377`). Flipping either would falsify the docstring with this
+    // suite still green — check them too if this test ever has to be revisited.
     const softUninstalled = await registry.uninstall(originalId, false);
     expect(softUninstalled?.status).toBe("uninstalled");
     // Soft delete retains the row — the id is still resolvable.
@@ -81,6 +88,11 @@ describeEmbeddedPostgres("plugin registry: dedup namespace identity across reins
     expect(await registry.getByKey(MANIFEST.id)).toBeNull();
 
     const reinstalled = await registry.install({ packageName: "pkg-a" }, MANIFEST);
+    // Guard before the negative assertion: `reinstalled?.id` is `undefined` if
+    // `install` ever returns nullish, and `undefined !== originalId` would
+    // satisfy `.not.toBe` without observing a new id at all. Mirrors the
+    // `expect(installed).not.toBeNull()` guard in the soft-uninstall case.
+    expect(reinstalled).not.toBeNull();
     expect(reinstalled?.id).not.toBe(originalId);
   });
 });
