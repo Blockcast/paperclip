@@ -617,11 +617,38 @@ export function currentWindowEnd(now = Date.now()) {
  * window from a completed one — an explicit `end` (the fixtures, a backfill) may
  * be either — and silently widening the tolerance by one would be the more
  * dangerous default (Ally review, PR #1571).
+ *
+ * Since BLO-31838 `silent` is keyed on the RECEIPT, not on the run row, which
+ * makes that default spend reliable rather than incidental: the newest window is
+ * now silent whether or not its run row has appeared, where before a started-but-
+ * not-yet-emitted run made it `receipt-only` and left both slots of tolerance
+ * nominally free. The budget is unchanged and still absorbs one late older slot;
+ * what changed is that the census no longer under-reports the newest window's
+ * true state. Read `silent` as "no receipt", never as "no run" — see
+ * classifyWindowRows.
  */
 export const MAX_SILENT_WINDOWS = 2;
 
 function hasClassificationReceipt(row) {
   return row?.classification != null && row?.commentId != null;
+}
+
+/**
+ * A receipt of ANY kind — deliberately weaker than hasClassificationReceipt.
+ *
+ * `failed_preflight` and `missed_window` receipts carry no classification but
+ * ARE emissions, so the two predicates separate "emitted something that did not
+ * classify" (`receipt-only`) from "emitted nothing" (`silent`, which runbook §0
+ * defines as an emission-contract failure). Collapsing them into one predicate
+ * is what let a sustained outage read green: see classifyWindowRows.
+ *
+ * `classification != null` is NOT sufficient. A run row can record what it
+ * decided and still never post the comment — the recorded `2026-09-03T12` slot
+ * classified `issue_created` with `commentId: null`. A decision is not an
+ * emission, so this keys on `commentId` alone.
+ */
+function hasAnyReceipt(row) {
+  return row?.commentId != null;
 }
 
 /**
@@ -640,6 +667,31 @@ function hasClassificationReceipt(row) {
  * precedence fix closed, one level up: a duplicate-run storm co-occurring with a
  * receiptless terminal run reported `counts.duplicate === 0` in the summary an
  * operator actually reads (Ally review, PR #1571).
+ *
+ * `silent` is checked SECOND, and is an independent check rather than part of
+ * the terminal fallback below, for two reasons (BLO-31838):
+ *
+ *   1. It used to be reachable only from the zero-candidate-rows branch in
+ *      classifyRoutineRuns, so it meant "no routine run fired" while runbook §0
+ *      means "no qualifying receipt exists". A window that ran and emitted
+ *      nothing fell through to `receipt-only` — and since `census.complete` is
+ *      derived from the silent count, a fleet whose routine fires reliably while
+ *      every run fails to post a receipt reported `counts.silent === 0` and
+ *      `complete: true`. That is precisely the sustained emission-contract
+ *      outage this census exists to detect.
+ *   2. It sits above the run-SHAPE states (`duplicate`, `coalesced`, `runless`)
+ *      for the same reason `completed-without-comment` does: an emission-contract
+ *      failure must not be masked for display by a co-occurring shape finding.
+ *      Placing it below would let a duplicate storm that emitted nothing display
+ *      as `duplicate` — the identical masking the PR #1571 review chain found
+ *      twice. It sits BELOW `completed-without-comment` because that is the
+ *      strictly more specific diagnosis of the same failure: it names a terminal
+ *      run that owed a receipt, where `silent` alone does not.
+ *
+ * `silent` and `classification-producing` are mutually exclusive by
+ * construction — a classification receipt has a `commentId`, so a window
+ * carrying one can never be silent — which is what keeps published coverage
+ * ratios for historical windows unmoved by this change.
  */
 function classifyWindowRows(candidates) {
   const fingerprints = candidates
@@ -650,6 +702,7 @@ function classifyWindowRows(candidates) {
   if (candidates.some((row) => ["completed", "succeeded"].includes(row.status) && !row.commentId)) {
     states.push("completed-without-comment");
   }
+  if (!candidates.some(hasAnyReceipt)) states.push("silent");
   if (new Set(fingerprints).size !== fingerprints.length) states.push("duplicate");
   if (candidates.some((row) => row.coalescedIntoRunId != null)) states.push("coalesced");
   if (candidates.every((row) => row.runId == null)) states.push("runless");
@@ -721,9 +774,14 @@ export function classifyRoutineRuns(rows, end) {
   const counts = Object.fromEntries(REQUIRED_STATES.map((state) => [state, 0]));
   // Over `states`, not `state`: a slot can be several things at once, so these
   // counts sum to MORE than the 28 windows. That over-count is the honest
-  // reading — see classifyWindowRows. `silent` is unaffected either way, since a
-  // slot with no candidate rows carries exactly one state, which is what keeps
-  // the completeness gate below reading the same as it did.
+  // reading — see classifyWindowRows.
+  //
+  // `silent` is now a compound state too (BLO-31838): a window that ran and
+  // emitted nothing is both `completed-without-comment` and `silent`. The
+  // completeness arithmetic below is unaffected, because what it needs is not
+  // that a silent slot carries exactly one state but that each slot contributes
+  // AT MOST ONE to `counts.silent` — and both branches push "silent" at most
+  // once per slot, so `observedWindows` stays a true window count.
   for (const row of classified) for (const state of row.states) counts[state] += 1;
 
   // Derived from what was observed, so it can actually be false. Expressed in
