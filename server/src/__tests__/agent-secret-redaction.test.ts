@@ -456,6 +456,14 @@ describe("agent secret redaction on mutating responses", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // `clearAllMocks` clears calls but KEEPS implementations, so a fixture set
+    // inside a helper outlives the test that needed it. `hire()` is the only
+    // setter of these two in this block, and `mockApprovalService.create` has
+    // no other setter in the file — so reset them rather than seeding a value:
+    // a test added later that reaches a create path should fail loudly on an
+    // unset mock instead of silently inheriting a hire-shaped row.
+    mockAgentService.create.mockReset();
+    mockApprovalService.create.mockReset();
     mockAgentService.getById.mockResolvedValue(baseAgent);
     mockAgentService.update.mockResolvedValue(baseAgent);
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
