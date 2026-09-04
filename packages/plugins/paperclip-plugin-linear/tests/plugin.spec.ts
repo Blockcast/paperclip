@@ -3420,6 +3420,13 @@ describe("paperclip-plugin-linear", () => {
     // BLO-3267 landed 3ms apart — i.e. concurrent delivery, where the
     // read-then-write `listComments` check cannot see a sibling that has not
     // written yet. This is the case that regressed.
+    //
+    // BLO-31657 removed both the `listComments` scan and the process-local
+    // `inFlightComments` claim, so this assertion now rests entirely on the
+    // `idempotencyKey` handed to the host. That makes it a live plumbing check
+    // rather than an inherited one: drop the key in `worker.ts` and both
+    // deliveries insert, so this fails. It previously passed because of the
+    // in-flight Set, which would have masked exactly that regression.
     it("does not double-post when the same Linear comment is delivered concurrently", async () => {
       const paperclipIssue = await harness.ctx.issues.create({
         companyId: "comp-1",
@@ -3470,9 +3477,105 @@ describe("paperclip-plugin-linear", () => {
       expect(bridged[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-99 -->");
     });
 
-    // The in-flight claim must be released even when the create throws, or one
-    // failed delivery would suppress every later retry of that comment.
-    it("releases the in-flight claim when the bridged create fails", async () => {
+    // Direct plumbing assertion. The dedup tests above observe an *outcome*
+    // (one row), which the harness could in principle deliver for the wrong
+    // reason. This pins the key itself: derived from the Linear comment UUID,
+    // exactly as BLO-31657 specifies, so a rename or a dropped forward is a
+    // named failure rather than a silently weaker guarantee.
+    it("passes an idempotency key derived from the Linear comment UUID", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "create" as const,
+          data: {
+            id: "lin-comment-uuid-key",
+            body: "Hello from Linear",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "key-check",
+      });
+
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(createSpy.mock.calls[0]![3]).toMatchObject({
+        idempotencyKey: "linear-comment:lin-comment-uuid-key",
+      });
+      createSpy.mockRestore();
+    });
+
+    // A deduplicated create returns the first delivery's comment instead of
+    // throwing, so the handler must not go on to log activity — that would
+    // report a sync that did not happen, once per duplicate delivery, which is
+    // the noise the key is bought to remove.
+    it("does not log sync activity for a deduplicated redelivery", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-activity",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      const activitySpy = vi.spyOn(harness.ctx.activity, "log");
+
+      for (const requestId of ["activity-first", "activity-retry"]) {
+        await plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: commentPayload,
+          headers: {},
+          rawBody: "",
+          requestId,
+        });
+      }
+
+      const syncedLogs = activitySpy.mock.calls.filter(
+        ([entry]: [any]) => entry?.message === "issue.comment.synced_from_linear",
+      );
+      expect(syncedLogs).toHaveLength(1);
+      activitySpy.mockRestore();
+    });
+
+    // A failed delivery must leave nothing behind that suppresses its own
+    // retry. Under the old process-local claim that meant releasing the claim
+    // in a `finally`; under the idempotency key it means the failed create
+    // wrote no row, so no key exists to dedup the retry against. The mechanism
+    // changed with BLO-31657 — the guarantee did not, so this stays pinned.
+    it("still bridges the comment on retry when the first create fails", async () => {
       const paperclipIssue = await harness.ctx.issues.create({
         companyId: "comp-1",
         title: "Issue with Linear comments",
@@ -3527,13 +3630,12 @@ describe("paperclip-plugin-linear", () => {
       expect(bridged).toHaveLength(1);
     });
 
-    // The third and last release shape. `resolveLinearWorkspaceSlug` sits
-    // *outside* the inner try/catch, so its rejection propagates through the
-    // `finally` rather than being caught by it — a structurally different path
-    // to the same release than a failing `createComment`. It is also the path
-    // most likely to move in a later refactor, which is exactly why it is
-    // worth pinning.
-    it("releases the in-flight claim when workspace-slug resolution throws", async () => {
+    // The other failure shape: `resolveLinearWorkspaceSlug` rejects *before*
+    // the create is ever attempted, so the handler exits without writing a row
+    // or a key. Structurally distinct from a failing `createComment` (which
+    // fails after the attempt), and the path most likely to move in a later
+    // refactor — which is exactly why it is worth pinning.
+    it("still bridges the comment on retry when workspace-slug resolution throws", async () => {
       const paperclipIssue = await harness.ctx.issues.create({
         companyId: "comp-1",
         title: "Issue with Linear comments",
@@ -3583,8 +3685,8 @@ describe("paperclip-plugin-linear", () => {
       slugFailure.mockRestore();
       expect(alreadyFailed).toBe(true);
 
-      // Nothing bridged, and no sentinel written — so the claim is the only
-      // thing that could suppress the retry.
+      // Nothing bridged, and no idempotency key written — so nothing exists
+      // that could suppress the retry.
       const afterFailure = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
       expect(afterFailure.filter((c) => c.body.includes("(from Linear)"))).toHaveLength(0);
 
