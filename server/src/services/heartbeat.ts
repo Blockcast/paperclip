@@ -9565,6 +9565,16 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // Tenth pass added `guess`, which was reaching `already_reviewed` in the
   // masking direction ("I am guessing this head was already reviewed at …").
   //
+  // Twelfth pass added the BELIEF and APPEARANCE predicates. `negation` below
+  // already lists believe / think / appears / suggests, but only reachable
+  // AFTER a negation word — so "no indication" and "cannot see" were caught
+  // while the bare hedging form ("I believe this head was …", "It appears this
+  // head was …") reached `already_reviewed` unvetoed: 12 phrasings of a run
+  // that never established the claim. That is the masking failure this whole
+  // mechanism exists to prevent, and it is specific to the shapes this
+  // function newly admits — master's mandatory-`for` pattern rejected the text
+  // incidentally, so there is no veto regression, only a widening to close.
+  //
   // `doubt` carries a negative lookbehind because a NEGATED doubt is an
   // affirmation: "there is no doubt this head was already reviewed at …" is the
   // strongest possible statement of a correct skip, and an unguarded stem
@@ -9578,7 +9588,9 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   {
     name: "assumption",
     stem:
-      "\\b(?:possibly|probably|presumably|assuming|apparently|guess(?:es|ing|ed)?" +
+      "\\b(?:possibly|probably|presumably|assuming|assumption|apparently|guess(?:es|ing|ed)?" +
+      "|perhaps|maybe|likely|plausible|seem(?:s|ed)?|appears?|believ(?:e|es|ed)" +
+      "|think(?:s)?|thought|suspect(?:s|ed)?|looks?\\s+like" +
       "|(?<!\\b(?:no|not|without|beyond|never|in)\\s(?:\\w+\\s){0,2})doubt(?:s|ed|ful)?" +
       "|may\\s+have\\s+been|might\\s+have\\s+been)",
   },
@@ -9616,7 +9628,7 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
       // Evidence nouns and mental-state predicates, the establishing verbs, and
       // the reporting verbs whose complementizer is routinely elided ("cannot
       // say this head WAS already reviewed at …" — caught by the copula arm).
-      "(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|appears?|suggests?|aware|see|seen|confirms?|confirmed|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tells?|says?|said|states?|asserts?|claims?)",
+      "(?:evidence|indications?|indicates?|indicating|signs?|record|proof|trace|believe|think|appears?|suggests?|aware|see|seen|confirms?|confirmed|confirmation|verification|determination|rule\\s+out|verif(?:y|ies|ied)|establish(?:es|ed)?|determin(?:e|es|ed)|find|finds|found|check(?:s|ed)?|locat(?:e|es|ed)|ascertain(?:ed)?|validat(?:e|es|ed)|prov(?:e|es|en)|demonstrat(?:e|es|ed)|tells?|says?|said|states?|asserts?|claims?)",
   },
 ];
 
