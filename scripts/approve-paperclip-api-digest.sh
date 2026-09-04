@@ -270,15 +270,39 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
     command -v "$dep" >/dev/null 2>&1 || { echo "$dep is required" >&2; exit 2; }
   done
 
-  for attempt in 1 2 3; do
+  # kubectl's stderr on the read below is the only thing that separates an
+  # approver Role missing `get` from a ConfigMap deleted out from under the run,
+  # and the operator reading it is about to clear a lock by hand. It goes to a
+  # file rather than a combined `2>&1` capture because kubectl writes warnings
+  # on the SUCCESS path too, and those would be spliced into the JSON parsed
+  # below. Same idiom as the admissibility probe's `server_plan_err`, created
+  # here because this mode exits before that one is set up.
+  if ! retire_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-retire-err.XXXXXX")"; then
+    echo "cannot create a temporary file for the retire read's error output" >&2
+    exit 1
+  fi
+  trap 'rm -f "$retire_err"' EXIT
+
+  # Bound named rather than spelled `1 2 3`, so the trailing-sleep guard below
+  # cannot drift out of step with the loop it is guarding.
+  readonly RETIRE_ATTEMPTS=3
+  for attempt in $(seq 1 "$RETIRE_ATTEMPTS"); do
     # `get` is the approver's only read verb and it is scoped to this one name.
     # A failure is fail-closed and must be surfaced: a caller that cannot read
     # the lock cannot conclude anything about it, and reporting success here
     # would leave the wedge in place while claiming it was cleared.
-    if ! retire_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>/dev/null)"; then
-      echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock." >&2
-      echo "The approval ConfigMap is installed by the cluster-admin bootstrap;" >&2
-      echo "this script never creates it." >&2
+    if ! retire_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>"$retire_err")"; then
+      echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock:" >&2
+      sed 's/^/    /' "$retire_err" >&2
+      # Gated on the cause: the bootstrap is only the answer for a ConfigMap
+      # that is not there. Printed blind, it sends an operator whose approver
+      # Role is missing `get` to re-run a bootstrap that is already in place --
+      # the one hint guaranteed not to help, on the path where they have the
+      # least time to spare. Same NotFound test as the server-plan probe.
+      if grep -qiE 'not[[:space:]]+found|notfound' "$retire_err"; then
+        echo "The approval ConfigMap is installed by the cluster-admin bootstrap;" >&2
+        echo "this script never creates it." >&2
+      fi
       exit 1
     fi
 
@@ -311,7 +335,7 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
 
     # A conflict proves this write lost a race, so a fresh read may win the
     # next one. Anything else -- an approver Role missing `update`, a deleted
-    # ConfigMap -- fails identically on all three attempts, and spending 6s to
+    # ConfigMap -- fails identically on all three attempts, and spending 3s to
     # then report the generic "could not retire" below hides the actual cause
     # from the operator who now has to clear the lock by hand. Same test, and
     # same reasoning, as the rotation write's non-retriable bail.
@@ -320,7 +344,15 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
       printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" >&2
       exit 1
     fi
-    sleep "$attempt"
+    # No sleep after the final attempt: the loop is about to end, so it buys
+    # nothing and delays the exhaustion message below by a whole ceiling while
+    # a release is wedged. Spelled as an `if` rather than `(( … )) && sleep` for
+    # the same reason as the admissibility probe's backoff: a false `(( … ))`
+    # yields a non-zero status, and this is the last command in the loop body,
+    # so under `set -e` that would abort mid-retirement.
+    if (( attempt < RETIRE_ATTEMPTS )); then
+      sleep "$attempt"
+    fi
   done
 
   echo "could not retire the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER})." >&2
