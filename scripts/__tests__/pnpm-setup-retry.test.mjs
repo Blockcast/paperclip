@@ -14,11 +14,24 @@ const workflowDir = ".github/workflows";
 const actionPath = ".github/actions/setup-pnpm/action.yml";
 const wrapperRef = "./.github/actions/setup-pnpm";
 
-// Worst case for the wrapper is two attempts at (bootstrap + a 120s registry
-// stall) plus up to 25s of jittered backoff, ~5 minutes. A job budgeted below
-// this turns a degraded registry into a job timeout, which ejects a merge-queue
-// candidate exactly the same way but burns the runner for the full budget first.
-const MIN_TIMEOUT_MINUTES_FOR_RETRY = 10;
+// A job that sets up pnpm needs room for the wrapper's second attempt AND for
+// its own work. This floor used to be 10, derived from "two attempts at
+// (bootstrap + a 120s registry stall) plus up to 25s of jittered backoff, ~5
+// minutes". Measuring pr.yml's `policy` job over 40 runs (2026-09-04,
+// BLO-31690) showed that model understates the real cost twice over:
+//
+//   - the retry fired in 0 of 40 runs, and a SUCCESSFUL first attempt still
+//     reached 259s, so the ~4.3m is one slow success rather than two attempts;
+//   - so the retry-path worst case is a first attempt failing on its 120s
+//     fetch timeout (~150s with bootstrap) + up to 25s of backoff + a
+//     slow-success retry at 259s = ~7.2m for `Setup pnpm` alone.
+//
+// Add the 4.4m p100 checkout that has to precede it and setup alone exceeds a
+// 10m job before a single test runs. 15 is the floor that actually holds, and
+// it is what every budgeted wrapper job in this repo except `policy` already
+// declared -- `policy` was the lone outlier at 10 and the only one observed
+// dying at its cap.
+const MIN_TIMEOUT_MINUTES_FOR_RETRY = 15;
 
 // Direct calls are allowed at exactly these grandfathered sites. Keyed by
 // (workflow, ref) rather than matched as `@v\d+`, because a SHA pin -- the

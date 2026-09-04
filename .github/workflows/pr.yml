@@ -25,22 +25,63 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
-    # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
-    # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
-    # into a job timeout, which ejects a merge-queue candidate just the same but
-    # burns a runner for the full budget first. Worst case here is roughly
-    # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
-    # headroom above it.
-    timeout-minutes: 10
+    # 15, not 10. Setup -- not the gate work -- is what spends this budget, and
+    # at 10 the cap was the binding constraint rather than a backstop: 2 of 40
+    # sampled runs were cancelled AT the cap and 2 more finished within 0.5m of
+    # it (BLO-31690). Sized against that 40-run sample of this job, 2026-09-04,
+    # worst observed:
+    #
+    #   `Checkout repository` + `Setup pnpm`   8.05m  (483s; the two are
+    #                                                 independently bimodal at
+    #                                                 0.5-4.4m each, so setup
+    #                                                 is the whole variable)
+    #   every other step in the job            3.58m  (215s -- and note ~2.1m
+    #                                                 is the MEDIAN. Sizing a
+    #                                                 bound to the median is
+    #                                                 what produced BLO-31405)
+    #   one 1-minute step bound                1.00m  (headroom for a single
+    #                                                 hung gate step to fail as
+    #                                                 THAT step instead of as
+    #                                                 the job cap -- BLO-29182)
+    #                                         -------
+    #                                         12.63m  -> 15m = 2.37m (19%)
+    #
+    # This supersedes an earlier 5 -> 10 raise whose arithmetic was "2 x
+    # (bootstrap + 120s fetch) + backoff ~= 5m", covering a second
+    # `./.github/actions/setup-pnpm` attempt against a stalled npm registry
+    # (BLO-28813). That raise was directionally right -- at 5 a degraded
+    # registry converted a fast red into a job timeout, which ejects a
+    # merge-queue candidate just the same but burns a runner for the full
+    # budget first -- but its model does not survive measurement: the retry
+    # fired in 0 of those 40 runs, so pnpm's ~4.3m worst case is ONE slow
+    # success, not two attempts.
+    #
+    # Both historical blowouts died with seconds of work left (reconstructed at
+    # ~10.4m and ~10.7m needed) and now fit with over 4m to spare. Residual
+    # deliberately NOT covered: the retry firing on a p100-checkout run would
+    # be 7.2m pnpm + 4.4m checkout + 3.6m work = 15.2m. That is unobserved
+    # here, and the structural fix is baking the pinned pnpm into the ARC
+    # runner image -- an onprem-k8s change tracked separately, see the
+    # wrapper's own header.
+    timeout-minutes: 15
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
     steps:
       - name: Checkout repository
+        # `fetch-depth: 0` is load-bearing -- the lockfile guard below diffs
+        # PR_BASE_SHA...PR_HEAD_SHA and needs the merge base on disk -- which
+        # makes this the larger and more variable half of the setup cost the
+        # job budget above is sized against (0.5m-4.4m observed over 40 runs).
+        # It previously carried no bound at all, so a wedged fetch could only
+        # ever surface as an unattributable job-cap cancellation. 8m is ~1.8x
+        # the 4.4m p100: loose enough not to flake on a slow-but-working
+        # fetch, tight enough to name the culprit when one hangs. Adding this
+        # raises no existing bound; it bounds a step that had none (BLO-31690).
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+        timeout-minutes: 8
 
       - name: Block manual lockfile edits
         # Exemptions: (1) the dedicated chore/refresh-lockfile branch that CI
