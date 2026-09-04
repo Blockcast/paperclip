@@ -2474,6 +2474,18 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const fencingPrecondition = await resolveCallerFencingPrecondition(params.fencing);
+        // Namespaced so one plugin's delivery ids can never resolve to another's
+        // comment. The system-author uniqueness scope is
+        // `(issue_id, idempotency_key)` alone — no plugin discriminator — so a
+        // raw natural key (`comment:<id>`, a delivery id, `sync:1`) shared by two
+        // plugins on one issue would hand the second caller the first's comment,
+        // a different body, with `deduplicated: true` and no error. The same
+        // collision reaches server-internal keys such as
+        // `issueRepoBindingCommentIdempotencyKey(...)`. Matches `agents.invoke`.
+        const callerIdempotencyKey = readNonEmptyParam(params.idempotencyKey);
+        const idempotencyKey = callerIdempotencyKey
+          ? `plugin:${pluginId}:${callerIdempotencyKey}`
+          : null;
         // `addComment` does not open its own transaction, and a share lock only
         // fences for as long as its transaction lives — so when a generation is
         // supplied, open one here and hand it down.
@@ -2483,7 +2495,7 @@ export function buildHostServices(
                 params.issueId,
                 params.body,
                 { agentId: params.authorAgentId },
-                { fencingPrecondition, idempotencyKey: params.idempotencyKey },
+                { fencingPrecondition, idempotencyKey },
                 tx,
               ),
             )
@@ -2491,7 +2503,7 @@ export function buildHostServices(
               params.issueId,
               params.body,
               { agentId: params.authorAgentId },
-              { idempotencyKey: params.idempotencyKey },
+              { idempotencyKey },
             )) as IssueComment & { deduplicated?: true };
         // On the dedup path no row was written, so logging `issue.comment.created`
         // would report a creation that did not happen — once per duplicate

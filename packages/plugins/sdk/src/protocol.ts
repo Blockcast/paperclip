@@ -1668,15 +1668,23 @@ export interface WorkerToHostMethods {
       authorAgentId?: string;
       fencing?: PluginFencingPrecondition;
       /**
-       * Dedup key, unique per (issue, author scope). A second create carrying a
-       * key already written to this issue returns the existing comment instead
-       * of inserting — atomically, in the database, so it holds across replicas
-       * and across concurrent deliveries. Omit for today's behaviour: no key
-       * means no dedup.
+       * Dedup key, scoped to the calling plugin: the host namespaces it as
+       * `plugin:<pluginId>:<key>`, so a natural key cannot collide with another
+       * plugin's or with a server-internal one. A second create carrying a key
+       * already written to this issue returns the existing comment —
+       * `deduplicated: true` — instead of inserting, atomically in the database,
+       * so it holds across replicas and across concurrent deliveries. Empty and
+       * whitespace-only strings are treated as omitted. Omit for today's
+       * behaviour: no key means no dedup.
+       *
+       * Caveat when combined with `fencing`: the generation is asserted *before*
+       * the dedup lookup, so a duplicate delivery arriving after the generation
+       * has advanced throws a fencing error rather than returning the existing
+       * comment. Treat that error as "may already be applied".
        */
       idempotencyKey?: string | null;
     },
-    result: IssueComment,
+    result: IssueComment & { deduplicated?: boolean },
   ];
   "issues.createInteraction": [
     params: {

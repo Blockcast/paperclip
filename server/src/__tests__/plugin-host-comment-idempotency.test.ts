@@ -88,6 +88,12 @@ describeEmbeddedPostgres("plugin host createComment idempotency", () => {
     return fn(services).finally(() => services.dispose());
   }
 
+  /** A second, unrelated plugin installation — same host, same database. */
+  function withOtherPluginServices<T>(fn: (services: ReturnType<typeof buildHostServices>) => Promise<T>) {
+    const services = buildHostServices(db, "other-plugin-record-id", "paperclip.github", createEventBusStub());
+    return fn(services).finally(() => services.dispose());
+  }
+
   it("collapses concurrent creates sharing an idempotencyKey into one comment", async () => {
     const { companyId, issueId } = await seedIssue();
     const idempotencyKey = `linear-comment:${randomUUID()}`;
@@ -103,7 +109,16 @@ describeEmbeddedPostgres("plugin host createComment idempotency", () => {
     // errors, so a duplicate delivery is a no-op rather than something the
     // plugin has to catch.
     expect(first.id).toBe(second.id);
+    const [surviving] = await commentRows(issueId);
     expect(await commentRows(issueId)).toHaveLength(1);
+
+    // Whose body survived is *not* specified — the loser's body is discarded and
+    // its caller is handed the winner's row. A plugin passing a key must accept
+    // that it may get back content it did not send, so pin only that the
+    // survivor is one of the two and that both callers agree on it.
+    expect(["[Linear] delivery A", "[Linear] delivery B"]).toContain(surviving!.body);
+    expect(first.body).toBe(surviving!.body);
+    expect(second.body).toBe(surviving!.body);
 
     // Exactly one of the two took the dedup path.
     expect([("deduplicated" in first), ("deduplicated" in second)].filter(Boolean)).toHaveLength(1);
@@ -166,6 +181,61 @@ describeEmbeddedPostgres("plugin host createComment idempotency", () => {
     });
 
     expect(await commentRows(issueId)).toHaveLength(2);
+  });
+
+  // The load-bearing test for the key *namespace*, as distinct from the dedup
+  // mechanism. The system-author uniqueness scope is `(issue_id,
+  // idempotency_key)` alone — it carries no plugin discriminator — so if the
+  // host forwarded the caller's key raw, two plugins using the same natural key
+  // (a delivery id, `comment:<id>`, `sync:1`) on one issue would collide: the
+  // second insert is discarded and that caller is handed the *first plugin's
+  // comment*, a different body, with `deduplicated: true` and no error. Deleting
+  // the `plugin:${pluginId}:` prefix in `plugin-host-services.ts` must turn this
+  // red.
+  it("scopes the key per plugin: two plugins sharing a raw key do not collide", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = "comment:42";
+
+    const mine = await withServices((services) =>
+      services.issues.createComment({ issueId, companyId, body: "[Linear] mine", idempotencyKey }),
+    );
+    const theirs = await withOtherPluginServices((services) =>
+      services.issues.createComment({ issueId, companyId, body: "[GitHub] theirs", idempotencyKey }),
+    );
+
+    expect(theirs.id).not.toBe(mine.id);
+    expect(theirs.body).toBe("[GitHub] theirs");
+    expect("deduplicated" in theirs).toBe(false);
+    expect(await commentRows(issueId)).toHaveLength(2);
+
+    // ...while a repeat within one plugin still dedups, so the isolation above
+    // is namespacing rather than dedup having been switched off.
+    const again = await withServices((services) =>
+      services.issues.createComment({ issueId, companyId, body: "[Linear] repeat", idempotencyKey }),
+    );
+    expect(again.id).toBe(mine.id);
+    expect(await commentRows(issueId)).toHaveLength(2);
+  });
+
+  // `??` only catches null/undefined, and the partial unique indexes exclude
+  // only NULL — so an un-normalized `""` is a *live* key. A plugin deriving one
+  // from an optional upstream field (`event.id ?? ""`, an empty template
+  // render) would silently collapse every subsequent system comment on the
+  // issue into the first, with no error. Whitespace-only keys are the same
+  // hazard wearing a different hat.
+  it("treats empty and whitespace-only keys as omitted rather than as a live key", async () => {
+    const { companyId, issueId } = await seedIssue();
+
+    await withServices(async (services) => {
+      await services.issues.createComment({ issueId, companyId, body: "first", idempotencyKey: "" });
+      await services.issues.createComment({ issueId, companyId, body: "second", idempotencyKey: "" });
+      await services.issues.createComment({ issueId, companyId, body: "third", idempotencyKey: "   " });
+    });
+
+    const rows = await commentRows(issueId);
+    expect(rows).toHaveLength(3);
+    // Stored as NULL, so they sit outside the partial unique index entirely.
+    expect(rows.every((row) => row.idempotencyKey === null)).toBe(true);
   });
 
   // Negative control. Without this the suite above would still pass if
