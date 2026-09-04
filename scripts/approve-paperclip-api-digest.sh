@@ -35,6 +35,11 @@
 # (BLO-28483). Pinning reorders eviction only; the bound is unchanged, so
 # the maxApprovedApiDigests CEL variable does not move.
 #
+# "Currently running" means a rollout that has actually landed and is serving,
+# not merely one that was written to the pod template — a digest applied by a
+# failed deploy stays in spec.template forever, and pinning that would burn the
+# reserved slot on an image which never carried traffic.
+#
 # An approval holds an in-flight lock until its rollout actually lands, so two
 # releases cannot rotate the ring underneath each other. Retiring that lock —
 # whether automatically on abort or explicitly via the escape hatch below —
@@ -328,6 +333,28 @@ advanced
 # END ROLLOUT_COMPLETE_JQ
 ROLLOUT_JQ
 
+# The health half of ROLLOUT_COMPLETE_JQ above: the controller has observed the
+# current generation, and every replica is updated to the current pod template,
+# ready, and available, with none unavailable. It deliberately carries none of
+# that predicate's lock-identity clauses — the rollout marker, the generation
+# nonce, the expected image — because it answers a different question: not "did
+# MY plan's rollout land?" but "is the template that is written also the one
+# serving traffic?".
+#
+# The condition lines are kept byte-identical to their counterparts above, and
+# scripts/approve-paperclip-api-digest.test.js fails if the two drift apart, so
+# "this rollout has landed" has one definition in this file rather than two.
+read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true
+# BEGIN ROLLOUT_SERVING_JQ
+(.spec.replicas // 1) > 0 and
+(.status.observedGeneration // 0) >= (.metadata.generation // 1) and
+(.status.updatedReplicas // 0) == (.spec.replicas // 1) and
+(.status.readyReplicas // 0) == (.spec.replicas // 1) and
+(.status.availableReplicas // 0) == (.spec.replicas // 1) and
+(.status.unavailableReplicas // 0) == 0
+# END ROLLOUT_SERVING_JQ
+SERVING_JQ
+
 # The rollout nonce is read fresh inside the rotation loop, immediately before
 # the write that stores it — not once up front. A retry can lose a race to a
 # rollout that lands between attempts, and recording the pre-retry generation
@@ -451,13 +478,24 @@ live_deployment_completed_digest() {
 # every container to carry the same image, so disagreement means something outside
 # this channel's model is going on and pinning would be a guess.
 #
+# The pod template alone is NOT sufficient evidence, because it records what was
+# asked for rather than what is running. Nothing reverts spec.template after a
+# failed rollout, so a digest that was applied and never became ready sits there
+# indefinitely -- and pinning that would hold a slot for a digest which never
+# served traffic while the last healthy one aged out, reaching the very wedge
+# BLO-28483 exists to prevent by a different route. So the spec is believed only
+# once ROLLOUT_SERVING_JQ confirms the rollout of that spec has fully landed.
+#
 # Every failure path returns empty and succeeds. This is an availability
 # safeguard, not a gate: not being able to name the live digest must degrade to
 # the previous age-ordered behaviour, never fail an otherwise valid release.
+# Tightening the evidence therefore costs no availability -- a rollout in flight,
+# or one that never landed, simply goes unpinned.
 live_running_digest() {
   local live_json image
   live_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
     get deployment "$DEPLOYMENT" -o json 2>/dev/null)" || return 0
+  jq -e "$ROLLOUT_SERVING_JQ" <<<"$live_json" >/dev/null 2>&1 || return 0
   image="$(jq -r '
     [ .spec.template.spec.containers[]?.image // empty ] as $images
     | if ($images | length) > 0 and (($images | unique | length) == 1)
@@ -739,8 +777,6 @@ if [[ -z "$rotated" ]]; then
 fi
 
 echo "Approving ${DIGEST} for harbor.blockcast.net/paperclip/paperclip"
-echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}):"
-printf '  - %s\n' "${approved[@]}"
 
 # Read back rather than trusting the replace exit code. The digest and its
 # transaction lock must be one observed resource version before any probe.
@@ -764,6 +800,19 @@ if (( verify_count > MAX_APPROVED_DIGESTS )); then
   echo "the admission policy will now deny every rollout until this is trimmed" >&2
   exit 1
 fi
+
+# Report the window that was READ BACK, not the one just built. On the exact-retry
+# path the replacement only re-owns the lock and never rewrites .data, so the
+# locally-built ring is not what the cluster holds. That gap was cosmetic while
+# the window was a plain age-ordered list; now that a slot is reserved for the
+# running digest, an operator reading "the rollback target is pinned" off a list
+# that was never persisted would be misled at exactly the wrong moment.
+echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}), as persisted:"
+printf '%s\n' "$verify_raw" \
+  | sed $'s/^\r*//; s/\r*$//' \
+  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+  | grep -E '^sha256:[0-9a-f]{64}$' \
+  | sed 's/^/  - /' || true
 
 if ! jq -e \
     --arg digest_key "$LOCK_DIGEST_ANNOTATION" \

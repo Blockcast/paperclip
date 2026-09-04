@@ -419,6 +419,18 @@ function shellAssign(name) {
 
 const IMAGE_REPOSITORY = shellAssign("IMAGE_REPOSITORY");
 
+// The reader's health gate lives in a jq block, not in the function body, so it
+// has to be lifted out of the script and injected alongside it — same reason as
+// everything else here: a rewrite of the predicate must fail this test rather
+// than leave it asserting against a copy that no longer ships.
+function extractJqBlock(name) {
+  const m = script.match(new RegExp(`^# BEGIN ${name}$\\n([\\s\\S]*?)^# END ${name}$`, "m"));
+  assert.ok(m, `could not read the ${name} jq block out of ${scriptPath}`);
+  return m[1];
+}
+
+const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
+
 // `deployment` of null makes the stub exit non-zero, standing in for "no such
 // Deployment" or an unreachable apiserver.
 function runningDigestFor(deployment) {
@@ -430,6 +442,9 @@ function runningDigestFor(deployment) {
     `DEPLOY_NAMESPACE=paperclip`,
     `DEPLOYMENT=paperclip-api`,
     `IMAGE_REPOSITORY=${JSON.stringify(IMAGE_REPOSITORY)}`,
+    "read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true",
+    SERVING_JQ.replace(/\n$/, ""),
+    "SERVING_JQ",
     `fake_kubectl() { [[ -s ${JSON.stringify(fixture)} ]] || return 1; cat ${JSON.stringify(fixture)}; }`,
     "deploy_kubectl=(fake_kubectl)",
     readerSource,
@@ -440,8 +455,35 @@ function runningDigestFor(deployment) {
   return result.stdout.trim();
 }
 
+// A Deployment whose rollout has fully landed. Fixtures default to that shape so
+// a case which only cares about the image does not have to restate six status
+// fields, and `status` overrides merge over the healthy defaults.
+//
+// `unavailableReplicas` is deliberately ABSENT from the healthy default, because
+// that is the shape the apiserver actually returns: the live paperclip-api
+// Deployment omits the field entirely while healthy (observed 2026-09-04 at
+// generation 560, replicas 2/2/2). The predicate's `// 0` default is what makes
+// that read as "none unavailable" rather than as missing data, so the common
+// fixture exercises that path rather than a shape production never produces.
+function deploymentWith({ images = [], replicas = 2, generation = 7, status = {} } = {}) {
+  return {
+    metadata: { generation },
+    spec: {
+      replicas,
+      template: { spec: { containers: images.map((image) => ({ image })) } },
+    },
+    status: {
+      observedGeneration: generation,
+      updatedReplicas: replicas,
+      readyReplicas: replicas,
+      availableReplicas: replicas,
+      ...status,
+    },
+  };
+}
+
 function deploymentWithImages(...images) {
-  return { spec: { template: { spec: { containers: images.map((image) => ({ image })) } } } };
+  return deploymentWith({ images });
 }
 
 test("the running digest is read off a single-container Deployment", () => {
@@ -474,7 +516,100 @@ test("containers disagreeing on their image yield no digest rather than a guess"
 });
 
 test("a Deployment with no containers yields no digest", () => {
-  assert.equal(runningDigestFor({ spec: { template: { spec: {} } } }), "");
+  // Built healthy on purpose: with no status the health gate would refuse this
+  // anyway, and the test would pass without ever reaching the container check.
+  assert.equal(runningDigestFor(deploymentWith({ images: [] })), "");
+});
+
+// The pod template records what was ASKED for. Nothing reverts spec.template
+// after a failed rollout, so believing it on its own pins a digest that never
+// carried traffic -- burning the reserved slot and letting the last healthy
+// digest age out, which is the BLO-28483 wedge reached from the other side.
+// These cases are the reason the reader gates on rollout status at all.
+
+test("a rollout applied but never made ready is not pinned as the running digest", () => {
+  const applied = digest(0xbb);
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${applied}`],
+        status: { readyReplicas: 0, availableReplicas: 0, unavailableReplicas: 2 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a rollout still in flight yields no digest rather than a half-rolled one", () => {
+  // maxSurge brings a new pod up before the old one leaves, so the template
+  // already names the new digest while the old one is still serving. Neither is
+  // unambiguously the running digest, so name neither.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+        status: { updatedReplicas: 1, readyReplicas: 1, availableReplicas: 1 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a pod template the controller has not observed yet is not believed", () => {
+  // spec.template was just patched, so status still describes the previous one.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+        generation: 8,
+        status: { observedGeneration: 7 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a Deployment scaled to zero has nothing serving and yields no digest", () => {
+  assert.equal(
+    runningDigestFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xee)}`], replicas: 0 })),
+    "",
+  );
+});
+
+test("a landed rollout that omits unavailableReplicas is still read as serving", () => {
+  // The shape production actually returns; see deploymentWith.
+  const live = digest(0xaa);
+  const deployment = deploymentWith({ images: [`${IMAGE_REPOSITORY}@${live}`] });
+  assert.ok(
+    !Object.hasOwn(deployment.status, "unavailableReplicas"),
+    "this test is only meaningful while the healthy fixture omits unavailableReplicas",
+  );
+  assert.equal(runningDigestFor(deployment), live);
+});
+
+// The reader's health gate and the in-flight lock's completion predicate must
+// agree on what "this rollout has landed" means. They are separate jq programs
+// because they answer different questions -- the lock also proves plan identity
+// and generation advance -- so nothing but this test stops one from being
+// tightened while the other silently keeps the old reading.
+test("the serving predicate does not drift from the completion predicate", () => {
+  const complete = extractJqBlock("ROLLOUT_COMPLETE_JQ");
+  const conditions = SERVING_JQ.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => line.replace(/ and$/, ""));
+
+  assert.ok(
+    conditions.length >= 6,
+    `expected the serving predicate to carry the rollout-health conditions, got ${conditions.length}`,
+  );
+  for (const condition of conditions) {
+    assert.ok(
+      complete.includes(condition),
+      `ROLLOUT_SERVING_JQ requires \`${condition}\` but ROLLOUT_COMPLETE_JQ no longer does — ` +
+        "the two definitions of a landed rollout have drifted apart",
+    );
+  }
 });
 
 
