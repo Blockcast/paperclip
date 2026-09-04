@@ -888,6 +888,43 @@ describe("agent secret redaction on mutating responses", () => {
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
   });
 
+  // The masking arm — the one every REAL hire takes, since a hire payload is an
+  // ordinary plain object. The two cases above both land on the withholding arm
+  // (`{}`), so without this the production path at agents.ts:3177 is unpinned.
+  //
+  // ⚠️ This is a characterization test, NOT a fail-first leak guard: the pre-fix
+  // expression `redactAgentConfigPayload(asRecord(payload) ?? null)` masks a
+  // plain object identically, so it passes on both sides of the change. Its job
+  // is to hold the arm still — a future edit to `containAgentConfig` that turned
+  // masking into withholding would satisfy every other test in this block while
+  // silently blanking the payload the board reads to approve a hire. Proven able
+  // to fail by mutating that branch to `return {}`.
+  //
+  // Both keys carry the secret on purpose: the payload embeds the requested
+  // adapterConfig twice, the second time under `requestedConfigurationSnapshot`,
+  // so masking only the first would leave the same credential one key over
+  // (BLO-18969) — which is the concern the route comment at :3171 states.
+  it("POST /companies/:companyId/agent-hires MASKS a plain approval payload and still projects it", async () => {
+    const binding = { type: "plain", value: SNAPSHOT_DRIFT_SECRET };
+    const res = await hire({
+      adapterConfig: { env: { API_KEY: { ...binding } } },
+      requestedConfigurationSnapshot: { adapterConfig: { env: { API_KEY: { ...binding } } } },
+    });
+
+    expect(res.status).toBe(201);
+    // Plaintext first, for the reason given at the foreign-prototype case above.
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+
+    // Masked AND projected — this is what distinguishes this arm from the
+    // withholding one. An assertion that only checked for absence of the secret
+    // would also pass if the whole payload were blanked to `{}`. The mask is
+    // spelled literally, per this file's convention: asserting against the
+    // exported constant would still pass if the constant itself became "".
+    const masked = { type: "plain", value: "***REDACTED***" };
+    expect(res.body.approval.payload.adapterConfig.env.API_KEY).toEqual(masked);
+    expect(res.body.approval.payload.requestedConfigurationSnapshot.adapterConfig.env.API_KEY).toEqual(masked);
+  });
+
   // `secret_ref` bindings are pointers, never plaintext, so they survive the
   // redactor by design — but a resolved `value` riding along on one is a secret
   // that leaked in, and the schema has no field for it.
