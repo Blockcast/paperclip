@@ -2481,7 +2481,12 @@ export function buildHostServices(
         // plugins on one issue would hand the second caller the first's comment,
         // a different body, with `deduplicated: true` and no error. The same
         // collision reaches server-internal keys such as
-        // `issueRepoBindingCommentIdempotencyKey(...)`. Matches `agents.invoke`.
+        // `issueRepoBindingCommentIdempotencyKey(...)`. Matches `agents.invoke`
+        // (`plugin:${pluginId}:` there too), deliberately: `pluginId` is the
+        // install row's PK rather than the durable manifest `pluginKey`, so the
+        // namespace is per-installation and a reinstall orphans earlier keys.
+        // That fails safe (an extra comment, never a wrong body), and both call
+        // sites must move together if it is ever keyed on `pluginKey`.
         const callerIdempotencyKey = readNonEmptyParam(params.idempotencyKey);
         const idempotencyKey = callerIdempotencyKey
           ? `plugin:${pluginId}:${callerIdempotencyKey}`
