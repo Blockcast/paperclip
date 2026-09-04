@@ -20,19 +20,47 @@ Owner: Platform / SRE (BLO-21116)
 ## Scheduled-retry park horizon is a different signal
 
 `paperclip_scheduled_retry_park_horizon_seconds` measures the booked interval
-from `heartbeat_runs.created_at` to `scheduled_retry_at` for live
-`status='scheduled_retry'` rows. `PaperclipScheduledRetryParkHorizonImplausible`
+from `heartbeat_runs.updated_at` to `scheduled_retry_at` for live
+`status='scheduled_retry'` rows — i.e. how far out the most recent park decision
+booked. `PaperclipScheduledRetryParkHorizonImplausible`
 fires when that future-due horizon exceeds 5,400 seconds, based on the
 observed seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s).
 `PaperclipScheduledRetryParkHorizonMetricsRefreshFailed` is the companion
 alert for a failed gauge refresh; while it is firing, the horizon alert is
 gated off and its last snapshot is not trustworthy.
 
+> **Do not measure this from `created_at`** ([BLO-31174](/BLO/issues/BLO-31174)).
+> A park is re-decided in place: each re-check UPDATEs the same row with a new
+> `scheduled_retry_at` and `updated_at`, while `created_at` stays pinned at the
+> first park. Measured from `created_at` the value reports how long the row has
+> been *re-parking*, climbs by one backoff interval per re-check without bound,
+> and crosses the threshold after ~2 re-checks however sane each booking was. On
+> 2026-09-03 that had 9 agents firing simultaneously, every one of them booking a
+> correct ~1h `dependency_blocked` backoff.
+
 The Helm rule is a mirror only: Blockcast production loads the corresponding
 rules from the lockstep `onprem-k8s` Prometheus ConfigMap/CRD pair, not this
 chart's disabled-by-default `PrometheusRule`. A merged chart rule is therefore
 not proof that the production alert is live; verify the authoritative rules and
 the `monitoring-rules` Argo sync before closing an incident.
+
+> **Inside `onprem-k8s`, the ConfigMap is the authoritative half of that pair —
+> not the CRD.** Prometheus loads the `*.rules.yml` keys out of
+> `monitoring/prometheus-rules-*-configmap.yaml`; the `PrometheusRule` CRD
+> (`paperclip/*-prometheusrule.yaml`) is a copy kept in lockstep beside it. So
+> editing only the CRD changes nothing a responder will ever see, even after the
+> PR merges and Argo syncs. Edit **both**, and let
+> `scripts/check-prometheus-rules-lockstep.sh` confirm it — that script names the
+> ConfigMap as authoritative in its own failure text.
+>
+> Two CI gates catch this, and both name the CRD, which is why the failure reads
+> as two unrelated problems instead of one missed file: `CRD vs CM lockstep`
+> diffs the pair, and `promtool check config (parse gate)` extracts its rules
+> **from the ConfigMap shards**, so a unit-test expectation updated alongside the
+> CRD is asserted against the stale ConfigMap text. Fixing the ConfigMap clears
+> both at once. This is not hypothetical: it is exactly how
+> [BLO-31174](/BLO/issues/BLO-31174)'s own mirror PR
+> ([onprem-k8s#3047](https://github.com/Blockcast/onprem-k8s/pull/3047)) went red.
 
 This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
 
@@ -44,14 +72,21 @@ This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
 For the horizon alert, query the parked rows directly:
 
 ```sql
-select id, agent_id, created_at, scheduled_retry_at,
-       extract(epoch from scheduled_retry_at - created_at) as park_horizon_seconds,
+select id, agent_id, created_at, updated_at, scheduled_retry_at,
+       scheduled_retry_attempt,
+       extract(epoch from scheduled_retry_at - updated_at) as park_horizon_seconds,
+       extract(epoch from scheduled_retry_at - created_at) as cumulative_reparking_seconds,
        scheduled_retry_reason
 from heartbeat_runs
 where status = 'scheduled_retry'
   and agent_id = '<agent_id from the alert>'
 order by park_horizon_seconds desc;
 ```
+
+A row where `park_horizon_seconds` is sane but `cumulative_reparking_seconds` is
+large is **not** a bad booking — it is a row that has been re-parking for a long
+time, which is a dependency/capacity question, not a scheduler one. Read
+`scheduled_retry_reason` and `scheduled_retry_attempt` to tell which.
 
 ## The invariant
 

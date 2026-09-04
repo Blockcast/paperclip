@@ -21,15 +21,31 @@
 # the SHA-256 of the canonical full Deployment with that annotation removed.
 # The approval probe and the release must submit the same stamped manifest.
 #
-# The window is a ring of at most MAX_APPROVED_DIGESTS entries, newest first:
-# the digest being released plus the most recently approved ones. That keeps an
-# immediate rollback available without accepting every historical digest. Rolling
-# back past the window is deliberately an explicit act — re-run this script
-# naming that digest.
+# The window is a ring of at most MAX_APPROVED_DIGESTS entries: the digest being
+# released, then the digest the cluster is currently running, then the most
+# recently approved ones. That keeps an immediate rollback available without
+# accepting every historical digest. Rolling back past the window is deliberately
+# an explicit act — re-run this script naming that digest.
+#
+# The running digest is pinned ahead of the age-ordered fill rather than taking
+# its chances in it. A deploy that fails before its rollout lands still consumes
+# a slot permanently, so under plain newest-first ordering a run of consecutive
+# failures — exactly when a rollback is wanted — is what ages out the digest
+# actually serving traffic, and helm can then no longer roll back to it
+# (BLO-28483). Pinning reorders eviction only; the bound is unchanged, so
+# the maxApprovedApiDigests CEL variable does not move.
+#
+# "Currently running" means a rollout that has actually landed and is serving,
+# not merely one that was written to the pod template — a digest applied by a
+# failed deploy stays in spec.template forever, and pinning that would burn the
+# reserved slot on an image which never carried traffic.
 #
 # An approval holds an in-flight lock until its rollout actually lands, so two
-# releases cannot rotate the ring underneath each other. If a release fails and
-# will never complete, retire its lock explicitly:
+# releases cannot rotate the ring underneath each other. Retiring that lock —
+# whether automatically on abort or explicitly via the escape hatch below —
+# deliberately leaves the ring alone, so an abandoned digest keeps its slot until
+# it ages out normally. If a release fails and will never complete, retire its
+# lock explicitly:
 #
 #   PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<the stuck digest> \
 #     PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<the stuck 64-hex owner> \
@@ -317,6 +333,30 @@ advanced
 # END ROLLOUT_COMPLETE_JQ
 ROLLOUT_JQ
 
+# The health half of ROLLOUT_COMPLETE_JQ above: the controller has observed the
+# current generation, and every replica is updated to the current pod template,
+# ready, and available, with none unavailable. It deliberately carries none of
+# that predicate's lock-identity clauses — the rollout marker, the generation
+# nonce, the expected image — because it answers a different question: not "did
+# MY plan's rollout land?" but "is the template that is written also the one
+# serving traffic?".
+#
+# The condition lines are kept byte-identical to their counterparts above, and
+# scripts/approve-paperclip-api-digest.test.js compares the two blocks for set
+# equality over the health half -- in both directions, so neither predicate can
+# gain or lose a health condition without the other -- so "this rollout has
+# landed" has one definition in this file rather than two.
+read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true
+# BEGIN ROLLOUT_SERVING_JQ
+(.spec.replicas // 1) > 0 and
+(.status.observedGeneration // 0) >= (.metadata.generation // 1) and
+(.status.updatedReplicas // 0) == (.spec.replicas // 1) and
+(.status.readyReplicas // 0) == (.spec.replicas // 1) and
+(.status.availableReplicas // 0) == (.spec.replicas // 1) and
+(.status.unavailableReplicas // 0) == 0
+# END ROLLOUT_SERVING_JQ
+SERVING_JQ
+
 # The rollout nonce is read fresh inside the rotation loop, immediately before
 # the write that stores it — not once up front. A retry can lose a race to a
 # rollout that lands between attempts, and recording the pre-retry generation
@@ -431,6 +471,112 @@ live_deployment_completed_digest() {
         --arg marker_key "$ROLLOUT_MARKER_ANNOTATION" \
         --arg marker "$marker" \
         "$ROLLOUT_COMPLETE_JQ" <<<"$live_json" >/dev/null
+}
+
+# The digest the cluster is actually serving right now, or empty when that cannot
+# be established. Only a digest of OUR repository counts: a sidecar's image is not
+# a rollback target for this Deployment. A multi-image pod template is likewise
+# refused rather than guessed at -- the completion predicate above already requires
+# every container to carry the same image, so disagreement means something outside
+# this channel's model is going on and pinning would be a guess.
+#
+# The pod template alone is NOT sufficient evidence, because it records what was
+# asked for rather than what is running. Nothing reverts spec.template after a
+# failed rollout, so a digest that was applied and never became ready sits there
+# indefinitely -- and pinning that would hold a slot for a digest which never
+# served traffic while the last healthy one aged out, reaching the very wedge
+# BLO-28483 exists to prevent by a different route. So the spec is believed only
+# once ROLLOUT_SERVING_JQ confirms the rollout of that spec has fully landed.
+#
+# Every failure path returns empty and succeeds. This is an availability
+# safeguard, not a gate: not being able to name the live digest must degrade to
+# the previous age-ordered behaviour, never fail an otherwise valid release.
+# Tightening the evidence therefore costs no availability -- a rollout in flight,
+# or one that never landed, simply goes unpinned.
+live_running_digest() {
+  local live_json image
+  live_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
+    get deployment "$DEPLOYMENT" -o json 2>/dev/null)" || return 0
+  jq -e "$ROLLOUT_SERVING_JQ" <<<"$live_json" >/dev/null 2>&1 || return 0
+  image="$(jq -r '
+    [ .spec.template.spec.containers[]?.image // empty ] as $images
+    | if ($images | length) > 0 and (($images | unique | length) == 1)
+      then $images[0]
+      else ""
+      end
+  ' <<<"$live_json" 2>/dev/null)" || return 0
+  [[ "$image" == "${IMAGE_REPOSITORY}@sha256:"* ]] || return 0
+  printf '%s\n' "${image#*@}"
+}
+
+# Build the approval window, newest-first, from the digest being released, the
+# digest currently running, and the existing list on stdin.
+#
+# A plain prepend-and-truncate evicts by age alone, which is exactly backwards
+# under the failure this window exists to cover. Every failed deploy approves a
+# digest that never reached the cluster and permanently consumes a slot, so a run
+# of consecutive failures -- precisely when a rollback is needed -- is what ages
+# the running digest out. Once it is gone, helm cannot roll back to the state
+# actually serving traffic, and a transient upgrade failure becomes a wedged
+# release that cannot self-heal (BLO-28483).
+#
+# So the running digest is pinned immediately behind the one being released,
+# ahead of the age-ordered fill. This REORDERS eviction; it does not widen the
+# window. The total stays bounded by $3, so the maxApprovedApiDigests CEL
+# variable in paperclip/paperclip-public-tools.yaml is untouched and cannot
+# drift. The cost is one historical slot, which is the correct trade: an older
+# digest is a convenience, the running one is the only guaranteed-good rollback
+# target.
+#
+# Extracted verbatim and exercised by scripts/approve-paperclip-api-digest.test.js,
+# so a rewrite fails that test rather than silently reverting the guarantee.
+build_approval_ring() {
+  local new_digest="$1" live_digest="$2" max="$3"
+  local -a ring=("$new_digest")
+  local entry
+
+  # Pin only a well-formed, distinct digest, and only when there is a slot for it
+  # after the released digest. A config-only release reusing the running digest
+  # lands in the "not distinct" branch and needs no pin -- it is already slot 1.
+  if (( max >= 2 )) \
+      && [[ "$live_digest" =~ ^sha256:[0-9a-f]{64}$ && "$live_digest" != "$new_digest" ]]; then
+    ring+=("$live_digest")
+  else
+    live_digest=""
+  fi
+
+  # Anything malformed already in the list is discarded rather than carried
+  # forward -- the policy would ignore it anyway, and leaving it in place would
+  # consume a slot in the window. Entries already placed above are dropped here so
+  # they cannot appear twice.
+  while IFS= read -r entry; do
+    (( ${#ring[@]} < max )) || break
+    [[ -n "$entry" ]] || continue
+    ring+=("$entry")
+  done < <(
+    sed $'s/^\r*//; s/\r*$//' \
+      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+      | grep -E '^sha256:[0-9a-f]{64}$' \
+      | grep -Fxv "$new_digest" \
+      | { if [[ -n "$live_digest" ]]; then grep -Fxv "$live_digest"; else cat; fi } \
+      || true
+  )
+
+  printf '%s\n' "${ring[@]}"
+}
+
+# Render an approval window for operator output: one indented entry per line, or
+# an explicit marker when empty so a failure report never renders as a silent
+# blank line. Used by the read-back guards as well as the success path, because
+# on the failure paths the contents are the actionable part -- a bare count says
+# the window is wrong without saying what is in it to trim.
+format_digest_list() {
+  local list="$1"
+  if [[ -z "$list" ]]; then
+    echo "  (none)"
+    return 0
+  fi
+  printf '%s\n' "$list" | sed 's/^/  - /'
 }
 
 MAX_ROTATE_ATTEMPTS="${PAPERCLIP_APPROVAL_ROTATE_ATTEMPTS:-5}"
@@ -548,25 +694,15 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
 
   current_raw="$(jq -r --arg key "$DATA_KEY" '.data[$key] // ""' <<<"$current_json")"
 
-  # Keep only well-formed digests, drop the one being approved wherever it already
-  # sits, then prepend it. Anything malformed already in the list is discarded here
-  # rather than carried forward — the policy would ignore it anyway, and leaving it
-  # in place would consume a slot in the window.
-  mapfile -t existing < <(
-    printf '%s\n' "$current_raw" \
-      | sed $'s/^\r*//; s/\r*$//' \
-      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-      | grep -E '^sha256:[0-9a-f]{64}$' \
-      | grep -Fxv "$DIGEST" \
-      || true
-  )
+  # Read the running digest fresh on every rotation attempt: a 409 sends us back
+  # through here, and a rollout that landed in the meantime changes what the
+  # rollback target is.
+  live_digest="$(live_running_digest)"
 
-  approved=("$DIGEST")
-  for entry in "${existing[@]:-}"; do
-    [[ -n "$entry" ]] || continue
-    (( ${#approved[@]} < MAX_APPROVED_DIGESTS )) || break
-    approved+=("$entry")
-  done
+  mapfile -t approved < <(
+    printf '%s\n' "$current_raw" \
+      | build_approval_ring "$DIGEST" "$live_digest" "$MAX_APPROVED_DIGESTS"
+  )
 
   payload=$(printf '%s\n' "${approved[@]}")
 
@@ -657,31 +793,44 @@ if [[ -z "$rotated" ]]; then
 fi
 
 echo "Approving ${DIGEST} for harbor.blockcast.net/paperclip/paperclip"
-echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}):"
-printf '  - %s\n' "${approved[@]}"
 
 # Read back rather than trusting the replace exit code. The digest and its
 # transaction lock must be one observed resource version before any probe.
 verify_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json)"
 verify_raw="$(jq -r --arg key "$DATA_KEY" '.data[$key] // ""' <<<"$verify_json")"
-verify_count=$(printf '%s\n' "$verify_raw" \
+# Normalise once. The count, the absence test, and every operator-facing report
+# below all read this same list, so they cannot disagree about what the cluster
+# holds -- previously each derived its own view from verify_raw.
+verify_digests="$(printf '%s\n' "$verify_raw" \
   | sed $'s/^\r*//; s/\r*$//' \
   | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Ec '^sha256:[0-9a-f]{64}$' || true)
+  | grep -E '^sha256:[0-9a-f]{64}$' \
+  || true)"
+verify_count=$(printf '%s' "$verify_digests" | grep -c . || true)
 
-if ! printf '%s\n' "$verify_raw" \
-  | sed $'s/^\r*//; s/\r*$//' \
-  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Fxq "$DIGEST"; then
+if ! printf '%s\n' "$verify_digests" | grep -Fxq "$DIGEST"; then
   echo "approval did not persist: ${DIGEST} is absent from ${NAMESPACE}/${CONFIGMAP}" >&2
+  echo "the window holds ${verify_count} entries, as persisted:" >&2
+  format_digest_list "$verify_digests" >&2
   exit 1
 fi
 
 if (( verify_count > MAX_APPROVED_DIGESTS )); then
   echo "approval window is ${verify_count} entries, over the ${MAX_APPROVED_DIGESTS} the policy accepts;" >&2
-  echo "the admission policy will now deny every rollout until this is trimmed" >&2
+  echo "the admission policy will now deny every rollout until this is trimmed." >&2
+  echo "The window, as persisted:" >&2
+  format_digest_list "$verify_digests" >&2
   exit 1
 fi
+
+# Report the window that was READ BACK, not the one just built. On the exact-retry
+# path the replacement only re-owns the lock and never rewrites .data, so the
+# locally-built ring is not what the cluster holds. That gap was cosmetic while
+# the window was a plain age-ordered list; now that a slot is reserved for the
+# running digest, an operator reading "the rollback target is pinned" off a list
+# that was never persisted would be misled at exactly the wrong moment.
+echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}), as persisted:"
+format_digest_list "$verify_digests"
 
 if ! jq -e \
     --arg digest_key "$LOCK_DIGEST_ANNOTATION" \

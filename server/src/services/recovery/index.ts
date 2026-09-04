@@ -34,6 +34,7 @@ export {
   strandedRecoveryWakeAttemptsExhausted,
 } from "./service.js";
 export {
+  DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
   ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
   isLegacySessionUnavailableAdapterMismatch,

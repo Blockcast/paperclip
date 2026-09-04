@@ -139,9 +139,40 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
  * Refresh the per-agent maximum booked `scheduled_retry` park horizon
  * (BLO-25036). Unlike the overdue sibling above, this measures the selected
  * due time itself, including future due times, so it catches an implausibly
- * distant retry before the run becomes overdue. `created_at` is the durable
- * park-start timestamp for a scheduled-retry row; queued_at represents a later
- * promotion back to queued and must not be used here.
+ * distant retry before the run becomes overdue.
+ *
+ * The subtrahend is `updated_at`, NOT `created_at` (BLO-31174). A park is
+ * re-decided IN PLACE: both re-park paths in `heartbeat.ts` UPDATE the same row
+ * with `scheduledRetryAt = now + backoff`, a bumped `scheduledRetryAttempt`, and
+ * `updatedAt = now`, while `created_at` stays pinned at the FIRST park. Measured
+ * against `created_at` the gauge therefore reports how long a row has been
+ * re-parking rather than how far out any decision booked: it climbs by one
+ * backoff interval per re-check, without bound, and crosses a 5400s threshold
+ * after ~2 re-checks no matter how sane each individual booking was. That is a
+ * breach guaranteed by construction rather than a diagnostic one, and no
+ * threshold value fixes it — 9 agents were firing this way on 2026-09-03, all
+ * of them booking a correct ~1h `dependency_blocked` backoff.
+ *
+ * `updated_at` is bumped at exactly the moment the due time is chosen, so the
+ * difference recovers the booked interval itself — which is the quantity the
+ * alert is named for and the one its body tells the responder to inspect. A
+ * fresh park writes `updated_at == created_at`, so single-shot parks (including
+ * the 518,000s capacity park that motivated BLO-25036) read identically to
+ * before and the detector keeps its original sensitivity.
+ *
+ * Known limit: a writer that touches a still-parked row without re-deciding the
+ * due time also bumps `updated_at`. The paths known today are
+ * `coalesceGithubReviewDelivery` and the run-liveness backfill in
+ * `services/activity.ts`, whose update guards only on `id` +
+ * `isNull(liveness_state)` while its row selector admits parked rows
+ * (`status not in ('queued', 'running')`); that one is one-shot per run, since
+ * `classifyRunLiveness` always sets a non-null state. This is the set known
+ * today, not a proof that no other writer exists. Either way the reading
+ * degrades to the REMAINING horizon rather than zeroing it, so an implausibly
+ * distant park stays far above threshold and is still caught; it is a mild
+ * understatement, not a blind spot.
+ *
+ * `queued_at` represents a later promotion back to queued and must not be used.
  */
 export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<void> {
   try {
@@ -150,7 +181,7 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
       db
         .select({
           agentId: heartbeatRuns.agentId,
-          horizonSeconds: sql<number | string>`max(extract(epoch from ${heartbeatRuns.scheduledRetryAt} - ${heartbeatRuns.createdAt}))`,
+          horizonSeconds: sql<number | string>`max(extract(epoch from ${heartbeatRuns.scheduledRetryAt} - ${heartbeatRuns.updatedAt}))`,
         })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.status, "scheduled_retry"), isNotNull(heartbeatRuns.scheduledRetryAt)))
@@ -161,7 +192,10 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
     setScheduledRetryParkHorizonMetrics(
       horizonByAgent.map((row) => ({
         agentId: row.agentId,
-        horizonSeconds: Number(row.horizonSeconds),
+        // Clamp as the overdue sibling does: a row whose due time has already
+        // passed can be touched again (see the known limit above), which would
+        // otherwise surface a negative horizon. Lateness is BLO-22094's gauge.
+        horizonSeconds: Math.max(0, Number(row.horizonSeconds)),
       })),
       knownAgentIds,
     );

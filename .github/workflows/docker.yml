@@ -9,6 +9,28 @@ on:
         description: Full approved commit SHA, reachable from master
         required: true
         type: string
+      # BLO-31598. The approval below holds an in-flight lock until its rollout
+      # lands. A deploy that dies after approving but before `helm upgrade`
+      # therefore strands a lock no rollout can clear, and every later deploy is
+      # refused at admission. `approve-paperclip-api-digest.sh` documents the
+      # remedy, but until these inputs existed the workflow could not reach it —
+      # the only way out was a human holding the approver credential running the
+      # script by hand. Both values are echoed in the refusal message, so a
+      # wedged deploy hands the operator exactly what to paste here.
+      abandon_in_flight:
+        description: >-
+          Optional. Digest (sha256:<64 hex>) of a stranded in-flight approval to
+          retire. Only for a release that failed, was rolled back, or can never
+          complete — confirm the rollout is not merely still landing first.
+        required: false
+        type: string
+      abandon_in_flight_owner:
+        description: >-
+          Optional. Owner (64 hex) of that stranded approval. Required whenever
+          abandon_in_flight is given: a configuration-only release can reuse a
+          digest, so the owner is what identifies which approval is retired.
+        required: false
+        type: string
   push:
     branches:
       - "master"
@@ -402,11 +424,16 @@ jobs:
     environment:
       name: paperclip-production
     # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
-    # rollout wait (BLO-29008), plus checkout, approval, final verification, and
-    # cleanup margin. scripts/check-docker-deploy-timeout.test.js sums EVERY
-    # `rollout status --timeout=` in this job, so adding a third tier wait
-    # without raising this fails CI rather than silently overrunning the job.
-    timeout-minutes: 85
+    # rollout wait (BLO-29008), plus the pending-migration pre-flight's 600s
+    # startup + 180s run budgets (BLO-31254), plus checkout, approval, final
+    # verification, and cleanup margin. scripts/check-docker-deploy-timeout.test.js
+    # sums EVERY `rollout status --timeout=` in this job AND reads both
+    # PREFLIGHT_*_SECONDS defaults out of .github/scripts/check-pending-migrations.sh,
+    # so raising any of them without raising this fails CI rather than silently
+    # overrunning the job. Overrunning is not a clean failure: GitHub cancels the
+    # job mid-`helm upgrade --atomic`, killing the process whose job is to roll
+    # back, which is the half-applied release BLO-21492 added --atomic to prevent.
+    timeout-minutes: 98
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -736,6 +763,12 @@ jobs:
           COMMIT: ${{ steps.target.outputs.full }}
           DEPLOY_PLAN: ${{ steps.plan.outputs.path }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          # BLO-31598: passed through `env:` and never interpolated into the
+          # script body below. Both render empty on `push`, which the approval
+          # script treats as "no abandon requested" via its own `:-` defaults,
+          # so the ordinary deploy path is unchanged.
+          ABANDON_IN_FLIGHT: ${{ inputs.abandon_in_flight }}
+          ABANDON_IN_FLIGHT_OWNER: ${{ inputs.abandon_in_flight_owner }}
           # The approval window size is deliberately NOT set here. It is a
           # readonly constant inside the approval script, kept in lockstep with
           # maxApprovedApiDigests in the admission policy; a workflow-side value
@@ -748,6 +781,31 @@ jobs:
             echo "KUBECONFIG_PAPERCLIP_RELEASE_APPROVER is not set in the paperclip-production environment." >&2
             echo "Admission will deny this rollout until the approver credential is provisioned." >&2
             exit 1
+          fi
+
+          # BLO-31598: validate the abandon pair BEFORE the approver credential
+          # reaches disk. A malformed value should never get as far as the
+          # higher-privilege credential, and the operator gets a message naming
+          # the input they mistyped rather than the script's internal variable.
+          if [ -n "${ABANDON_IN_FLIGHT}${ABANDON_IN_FLIGHT_OWNER}" ]; then
+            if [ -z "${ABANDON_IN_FLIGHT}" ] || [ -z "${ABANDON_IN_FLIGHT_OWNER}" ]; then
+              echo "abandon_in_flight and abandon_in_flight_owner must be supplied together." >&2
+              echo "The digest alone is ambiguous: a configuration-only release can reuse a digest," >&2
+              echo "so the owner is what identifies which in-flight approval is being retired." >&2
+              echo "Both values appear verbatim in the admission refusal that sent you here." >&2
+              exit 1
+            fi
+            if [[ ! "${ABANDON_IN_FLIGHT}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "abandon_in_flight must be a full digest of the form sha256:<64 hex>" >&2
+              exit 1
+            fi
+            if [[ ! "${ABANDON_IN_FLIGHT_OWNER}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "abandon_in_flight_owner must be 64 hexadecimal characters" >&2
+              exit 1
+            fi
+            # Surfaced in the run summary so retiring a lock is never a silent
+            # side effect of a deploy someone skim-approved.
+            echo "::warning::retiring stranded in-flight approval ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}) before approving ${DIGEST}"
           fi
 
           # mktemp -d, not a fixed path: `> "$RUNNER_TEMP/.kube/approver"`
@@ -775,6 +833,8 @@ jobs:
             PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
             PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
+            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${ABANDON_IN_FLIGHT}" \
+            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${ABANDON_IN_FLIGHT_OWNER}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
 
           jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" --arg name "${api_deployment}" '
@@ -998,7 +1058,7 @@ jobs:
           # `timeout 45s` plugin-seed calls (~9m45s) and the startup probe budget
           # is failureThreshold 30 x periodSeconds 10 (5m). Raise this only
           # alongside that arithmetic, and keep the deploy job's timeout-minutes
-          # covering helm + api + worker + 10m (pinned by
+          # covering helm + api + worker + pre-flight + 10m (pinned by
           # scripts/check-docker-deploy-timeout.test.js).
           kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=15m
 

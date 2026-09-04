@@ -370,9 +370,115 @@ export type ClaudeUpstreamFailureFamily = "upstream_capacity_exhausted" | "trans
 
 export interface ClaudeUpstreamClassification {
   readonly family: ClaudeUpstreamFailureFamily | null;
-  readonly errorCode: "claude_upstream_capacity_exhausted" | "claude_transient_upstream" | null;
+  readonly errorCode: "claude_upstream_capacity_exhausted" | "claude_transient_upstream" | "skill_not_found" | null;
   /** The penstock exhaustion code, set only when `family === "upstream_capacity_exhausted"`. */
   readonly capacityCode: string | null;
+}
+
+const CLAUDE_SKILL_NOT_FOUND_RE = /\bskill\s+["'`][^\r\n"'`]{1,240}["'`]\s+not\s+found\b/i;
+
+// Presence of a conversation-turn event in the RAW transcript. Read on the same
+// surface as the skill scan below, which is the whole point: a parsed signal
+// cannot bound what a raw regex sees. Whitespace-tolerant because this matches
+// text rather than JSON structure, and a truncated event still carries its
+// leading `"type":"<role>"` prefix — truncation drops the tail, not the head.
+//
+// `user` is included alongside `assistant` because `user` events carry
+// tool_result payloads — arbitrary text the harness did not author, which can
+// quote the trigger phrase (this issue's own text does). The parser has no
+// `user` branch at all, so such an event never touches `assistantContentSeen`;
+// only this raw check sees it. A genuine startup skill death emits neither
+// (just `system:init` + the error), so widening costs nothing in detection.
+const CLAUDE_CONVERSATION_EVENT_RE = /"type"\s*:\s*"(assistant|user)"/;
+
+/**
+ * Detect Claude's "Skill "<name>" not found" death (BLO-7991 AC3).
+ *
+ * Deliberately does NOT read `stdout`. `stdout` is the entire pod log — every
+ * intermediate assistant message — so an agent that merely *discusses* a
+ * missing skill would match. Unlike the transient families, where a false
+ * positive costs one extra retry, `skill_not_found` is listed in
+ * NON_RETRYABLE_CONTINUATION_ERROR_CODES and is excluded from the zero-token
+ * session reset, so a false positive suppresses retries permanently. That
+ * asymmetry is why this classifier reads only bounded, harness-authored error
+ * surfaces.
+ *
+ * `stderr` is NOT among them: the sole production call site (execute.ts) never
+ * passes it, and the k8s adapter has no separate Claude-CLI stderr to pass —
+ * `onLog("stderr", …)` is the adapter's own log channel to Paperclip.
+ *
+ * `parsed.result` is only harness-authored on an *error* subtype. A run can
+ * exit non-zero while carrying `subtype: "success"` (observed on this very
+ * issue: `Claude run failed: subtype=success: Failed to authenticate…`), and
+ * on such an event `result` is the model's own final message — model prose
+ * again, just the last turn instead of the whole transcript. `errorMessage` is
+ * `describeClaudeFailure(parsed)`, which embeds that same `result` text
+ * verbatim, so the two are gated together. The structured `errors[]` envelope
+ * is always harness-authored and needs no gate.
+ */
+function isClaudeSkillNotFoundError(input: {
+  parsed?: Record<string, unknown> | null;
+  errorMessage?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  const surfaces: (string | null | undefined)[] = parsed ? extractClaudeErrorMessages(parsed) : [];
+  const subtype = parsed ? asString(parsed.subtype, "") : "";
+  if (subtype !== "" && subtype !== "success") {
+    surfaces.push(parsed ? asString(parsed.result, "") : "", input.errorMessage);
+  }
+  return surfaces.some((value) => typeof value === "string" && CLAUDE_SKILL_NOT_FOUND_RE.test(value));
+}
+
+/**
+ * The `!parsed` counterpart of the classifier above (BLO-7991 AC3).
+ *
+ * When the CLI dies before emitting a `type: "result"` event there is no
+ * structured envelope at all — `stdout` (the whole pod log) is the only
+ * surface left, and execute.ts's `!parsed` branch returns an *untyped* partial
+ * run error. Scanning that transcript is normally unsafe for a retry-killing
+ * code, so it is guarded twice, and the second guard is the load-bearing one.
+ *
+ * `assistantContentSeen` is a *parsed* signal and is NOT equivalent to "the
+ * model has not spoken", so it cannot bound what a raw scan sees. Three shapes
+ * slip between them, all of which the parser produces deliberately:
+ *
+ *   (a) A line that fails `parseJson` is skipped (`:33`) and never touches the
+ *       flag, yet it remains verbatim in the `stdout` being tested. This is the
+ *       OOMKill-mid-first-message shape.
+ *   (b) `outputTokens` falls back to `-1` (`:54`) when neither
+ *       `message.output_tokens` nor `message.usage.output_tokens` is present,
+ *       so a fully-written assistant event carrying text still leaves the flag
+ *       false — `assistantTexts` is populated (`:74`) while the flag is not.
+ *   (c) A `user`-typed event before any `assistant` event. These carry
+ *       tool_result content — text the harness did not author, which can quote
+ *       the trigger phrase (BLO-7991's own body does) — and the parser has no
+ *       `user` branch at all, so the flag is never touched.
+ *       `buildPartialRunError` already models this `init` -> `user` -> error
+ *       ordering on this same `!parsed` path.
+ *
+ * Each shape reaches this scan with the phrase in `stdout` and the flag false.
+ * Because `skill_not_found` is in NON_RETRYABLE_CONTINUATION_ERROR_CODES
+ * and is excluded from the zero-token session reset, that false positive
+ * suppresses retries *permanently* — so a transient OOM whose truncated message
+ * happened to discuss a missing skill would never be retried. Single quotes and
+ * backticks are not escaped inside a JSON string, so quoting does not prevent
+ * the match (this file's own fixtures rely on that).
+ *
+ * The fix is to guard on the same surface the scan reads: positive evidence of
+ * a conversation-turn event anywhere in the raw transcript. That is strictly
+ * stronger than the token flag and immune to all three shapes. A genuine skill
+ * death at startup has only the `system:init` line and the error, so detection
+ * is unaffected. The parsed flag is retained as a cheap first check, not as the
+ * guarantee.
+ */
+export function isClaudeSkillNotFoundStartupFailure(input: {
+  stdout?: string | null;
+  assistantContentSeen: boolean;
+}): boolean {
+  if (input.assistantContentSeen) return false;
+  if (typeof input.stdout !== "string") return false;
+  if (CLAUDE_CONVERSATION_EVENT_RE.test(input.stdout)) return false;
+  return CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout);
 }
 
 /**
@@ -398,6 +504,11 @@ export function classifyClaudeUpstreamFailure(input: {
 }): ClaudeUpstreamClassification {
   if (!input.failed) {
     return { family: null, errorCode: null, capacityCode: null };
+  }
+  // This is a deterministic configuration failure from Claude's Skill tool,
+  // not an upstream outage. Keep it out of every transient retry family.
+  if (isClaudeSkillNotFoundError(input)) {
+    return { family: null, errorCode: "skill_not_found", capacityCode: null };
   }
   if (input.zeroTokenProgress) {
     const capacityCode = matchClaudeUpstreamCapacityCode(input);

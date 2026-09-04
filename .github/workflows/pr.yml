@@ -107,6 +107,20 @@ jobs:
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
         timeout-minutes: 1
 
+      # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
+      # approval holds a lock until its rollout lands, so a deploy dying between
+      # the approval step and `helm upgrade` strands a lock nothing can clear
+      # and every later deploy is refused at admission. The remedy existed in
+      # `approve-paperclip-api-digest.sh` but was unreachable from this
+      # workflow, so recovery required a human holding the approver credential.
+      # Render-level, like its neighbours: it asserts the inputs exist, that
+      # both reach the script, and that a half-supplied pair is refused before
+      # the approver credential is written to disk.
+      - name: Validate abandon-in-flight approval inputs (BLO-31598)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-abandon-in-flight-inputs.test.js
+        timeout-minutes: 1
+
       # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
       # are load-bearing: running it after the rollout starts reports the
       # problem only once the 30-minute timeout has already burned, and an
@@ -115,6 +129,27 @@ jobs:
       - name: Validate pending-migration deploy pre-flight
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-pending-migration-preflight.test.js
+        timeout-minutes: 1
+
+      # BLO-31254: executes the pre-flight's two-phase wait against a stub
+      # kubectl. The defect it guards was pure control flow — a single budget
+      # charged image transfer against the migration allowance, so a cold pull
+      # of the 1.7 GB image (measured 3m3s) failed a good build at 180s — and
+      # the render-level test above cannot tell a fix apart from a rewording.
+      # Slower than its neighbours because it must let real budgets expire.
+      #
+      # The 1-minute bound is measured, not guessed: 21.5s locally and 23s on a
+      # runner (run 33714085042, policy job), a 7% spread, so ~2.5x margin. It
+      # does not need the 3x that BLO-31405 asks of the Helm render suite,
+      # because the two have different variance profiles: this file's cost is
+      # almost entirely fixed `sleep`, which does not dilate under runner
+      # contention, whereas that suite forks `helm template` 18 times and ranges
+      # 21.8s local to 32-73s on CI. Keep this bound honest by re-measuring
+      # rather than by analogy -- but if you add a test here that waits on a new
+      # budget, it lands on the bound directly, so check the total.
+      - name: Test pending-migration pre-flight phase budgets (BLO-31254)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
         timeout-minutes: 1
 
       # BLO-29008: executes the two-tier convergence gate's shell against
@@ -159,6 +194,11 @@ jobs:
       - name: Test @penstock publish-drift comparison
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
+        timeout-minutes: 1
+
+      - name: Test Ally agent instruction contract
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs
         timeout-minutes: 1
 
       - name: Reject git push in adapter/runtime code
@@ -234,6 +274,18 @@ jobs:
             ./.github/scripts/tests/post-environment-protection-alert.test.mjs
         timeout-minutes: 1
 
+      # The stuck-approval escalation only ever runs inside the scheduled
+      # dispatcher, and only on the branch where a deploy is already pending —
+      # so without this it could regress for weeks unnoticed, and the first
+      # signal would be another silent no-op. The suite pins the two properties
+      # that cannot be re-checked after the fact: that severity stays `critical`
+      # (anything else routes to the paperclip webhook only, which is not a
+      # human), and that queued/building runs never page the reviewers.
+      - name: Test stuck production-approval escalation (PEN-2848)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-pending-deploy-alert.test.mjs
+        timeout-minutes: 1
+
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
       # ONLY inside the scheduled `review-gate-sweep` job, where a non-zero exit
       # is the deliberate stranded-PR alarm (EXIT_ALARM=1). That conflates two
@@ -275,22 +327,9 @@ jobs:
         run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
         timeout-minutes: 1
 
-      - name: Setup Helm
-        if: ${{ !cancelled() }}
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.16.3
-
-      - name: Test Helm chart render suite (deploy/helm/paperclip)
-        if: ${{ !cancelled() }}
-        # These render tests (topology-spread, probes, role-rbac, prometheus-rule,
-        # service-monitor, blockcast-auth, runtime-cache) previously ran nowhere in
-        # CI — a chart edit could silently break or regress any of them and every
-        # required check would stay green. BLO-20901's whole premise is that
-        # paperclip-api node spread is "enforced by scheduler policy, not left to
-        # chance"; that claim only holds if the test asserting it actually runs.
-        run: node --test deploy/helm/paperclip/tests/*.test.mjs
-        timeout-minutes: 1
+      # BLO-31405: the chart render suite deliberately does NOT run here. It has
+      # its own `helm_chart` job below; see the comment there before adding it
+      # back.
 
       - name: Test Ally review-consistency guard
         if: ${{ !cancelled() }}
@@ -459,6 +498,15 @@ jobs:
   # Deliberately its own job rather than a step in `policy`: it needs helm and
   # the runner image's pinned yq, and a tooling regression in provisioning those
   # should not take down the gate that every unrelated PR depends on.
+  #
+  # BLO-31405: a second copy of this suite had landed in parallel as a `policy`
+  # step (#965 and #995 crossed, each believing the tests ran nowhere), which is
+  # exactly the coupling the paragraph above rejects. It shelled out to `helm
+  # template` once per test file, so under `policy`'s 60s step bound its p100 of
+  # 73s failed 3 of 25 sampled runs on duration alone — each one skipping every
+  # lane that `needs: policy`, on PRs that never touched the chart. Removed. Do
+  # not re-add it here: this job is a `verify` lane (see its `needs:`), so a red
+  # chart already fails the required check without any `policy` coupling.
   helm_chart:
     name: Helm chart
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
@@ -478,6 +526,16 @@ jobs:
 
       - name: Test Helm chart renders
         run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
+        # BLO-29182 observed THIS invocation hang: `node --test` has no default
+        # per-test timeout and these tests shell out to `helm`, which does
+        # network I/O, so a stalled fetch has no upper bound below the job cap.
+        # That was fixed by bounding the `policy` copy, and BLO-31405 has now
+        # removed that copy as a duplicate — so the bound has to live here, or
+        # deleting the duplicate would leave the one invocation known to hang
+        # unbounded again. 4 min is 3.3x the suite's measured p100 of 73s (25
+        # sampled pr.yml runs) and well inside the 10-minute job cap, so a hang
+        # fails this step attributably instead of burning the whole budget.
+        timeout-minutes: 4
 
   typecheck_release_registry:
     name: Typecheck + Release Registry

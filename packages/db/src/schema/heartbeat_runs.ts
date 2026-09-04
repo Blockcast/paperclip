@@ -191,6 +191,42 @@ export const heartbeatRuns = pgTable(
     queuedAgeIdx: index("heartbeat_runs_queued_age_idx")
       .on(table.agentId, sql`coalesce(${table.queuedAt}, ${table.createdAt})`)
       .where(sql`${table.status} = 'queued'`),
+    // BLO-31392: serves the dispatcher's head scan under the GENERIC plan.
+    //
+    // The head scan runs through a prepared statement with only agent_id bound,
+    // so after five executions PostgreSQL may adopt a generic plan and keep it
+    // for the life of a pooled connection. In that pass agent_id is unknown, the
+    // row estimate collapses to the table-wide average, and at ~1 row a Sort
+    // looks free — so the comparison reduces to index size and queuedAgeIdx
+    // above, whose predicate is also exactly `status = 'queued'`, used to win it
+    // with an `Index Scan` + `Sort`. Measured on production 2026-09-03.
+    //
+    // This index has that same narrow predicate but carries (created_at, id) as
+    // trailing keys, so it indexes the same ROWS as queuedAgeIdx AND supplies
+    // the ORDER BY directly: the page comes back ordered with no Sort, the LIMIT
+    // truncates the scan, and the projection stays Index Only. Same rows is not
+    // the same size — three keys to queuedAgeIdx's two, so ~1.4x the page space
+    // per entry (see migration 0237 for the arithmetic). That width does not
+    // show up in the comparison below, which is decided at a 1-row estimate.
+    //
+    // How decisively it beats queuedAgeIdx depends on the visibility map, and
+    // that qualifier matters — measured generic cost, this index vs
+    // queuedAgeIdx, at a 1-row generic estimate: 4.30 vs 8.32 (48%) when the
+    // heap is all-visible, but 8.30 vs 8.32 (0.24%, inside the 1%
+    // STD_FUZZ_FACTOR) when it is not. Production is the second case: queued
+    // rows are freshly written by definition, so they never earn the
+    // index-only discount. So this index is necessary but probably not
+    // sufficient on its own; making the choice deterministic needs the
+    // statement off the generic plan entirely. See migration 0237 and
+    // BLO-31392.
+    //
+    // On a populated database this index is created out of band with
+    // `CREATE INDEX CONCURRENTLY` (see migration 0237). Declared here so
+    // drizzle's schema diff stays clean and so fresh/bootstrap databases get it
+    // automatically.
+    agentQueuedDispatchIdx: index("heartbeat_runs_agent_queued_dispatch_idx")
+      .on(table.agentId, table.createdAt, table.id)
+      .where(sql`${table.status} = 'queued'`),
     // BLO-19722: serves the startup crash-recovery candidate scan, which is
     // bounded by batch size and ordered oldest-first rather than by wall time.
     // The partial predicate keeps this index near-empty in steady state — only

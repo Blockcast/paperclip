@@ -263,3 +263,439 @@ test("valid knobs pass validation and the script proceeds to the deploy credenti
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /is not a positive integer/);
 });
+
+// --- Approval window eviction order (BLO-28483) ---------------------------
+//
+// The window is bounded and was ordered purely by age, which is backwards under
+// the failure it exists to cover: a deploy that fails before its rollout lands
+// still consumes a slot forever, so a run of consecutive failures ages out the
+// digest actually serving traffic. helm then cannot roll back to the running
+// state and a transient upgrade failure becomes a permanently wedged release.
+// The fix pins the running digest behind the one being released. These tests
+// hold that guarantee, and the control below proves they can actually fail.
+
+const RING_FUNCTION_NAME = "build_approval_ring";
+const ringSource = extractShellFunction(RING_FUNCTION_NAME);
+
+// Read the bound out of the script for the same reason the knobs are: a test
+// asserting against a hard-coded 3 would go quietly green if the constant and
+// the CEL variable it must match were ever moved together.
+function shellReadonly(name) {
+  const m = script.match(new RegExp(`^readonly ${name}=(\\d+)$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+const MAX_APPROVED_DIGESTS = shellReadonly("MAX_APPROVED_DIGESTS");
+
+// Distinct, well-formed, lowercase-hex digests keyed by a short label.
+function digest(label) {
+  const hex = label.toString(16).padStart(2, "0");
+  return `sha256:${hex.repeat(32).slice(0, 64)}`;
+}
+
+// Runs the shipping ring builder. `liveDigest` of "" is the pre-fix behaviour:
+// the running digest could not be established, so ordering falls back to age.
+function ringFor(newDigest, liveDigest, existing, max = MAX_APPROVED_DIGESTS) {
+  const harness = [
+    "set -euo pipefail",
+    ringSource,
+    `printf '%s' "$1" | ${RING_FUNCTION_NAME} "$2" "$3" "$4"`,
+  ].join("\n");
+  const result = spawnSync(
+    "bash",
+    ["-c", harness, "harness", existing.join("\n"), newDigest, liveDigest, String(max)],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `ring harness failed: ${result.stderr}`);
+  return result.stdout.trim().split("\n").filter(Boolean);
+}
+
+test("the digest being released is first and the running digest is pinned right behind it", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, [digest(0x22), live, digest(0x33)]);
+  assert.equal(ring[0], digest(0x11));
+  assert.equal(ring[1], live);
+  assert.ok(ring.length <= MAX_APPROVED_DIGESTS);
+});
+
+test("the running digest survives an unbounded run of deploys that never land", () => {
+  const live = digest(0xaa);
+  // The live ring as it stood on 2026-09-04: a dead slot holding a digest that
+  // was approved and never applied, the running digest, and one older entry.
+  let ring = [digest(0x6c), live, digest(0x68)];
+  for (let i = 0; i < 25; i += 1) {
+    ring = ringFor(digest(0x10 + i), live, ring);
+    assert.ok(
+      ring.includes(live),
+      `the running digest was evicted after ${i + 1} consecutive deploys — rollback is now impossible`,
+    );
+    assert.ok(ring.length <= MAX_APPROVED_DIGESTS, `window grew to ${ring.length}`);
+  }
+});
+
+test("CONTROL: without the pin the running digest is evicted in two deploys", () => {
+  // Guards the test above from going hollow. This is the pre-fix ordering, and
+  // it reproduces the exact arithmetic BLO-28483 was filed on: with one slot
+  // already consumed by a digest that never ran, the running digest is two
+  // failed deploys away from eviction. If this ever passes, the pin has stopped
+  // being load-bearing and the regression test above proves nothing.
+  const live = digest(0xaa);
+  let ring = [digest(0x6c), live, digest(0x68)];
+  ring = ringFor(digest(0x10), "", ring);
+  assert.ok(ring.includes(live), "still present after one deploy");
+  ring = ringFor(digest(0x11), "", ring);
+  assert.ok(!ring.includes(live), "pre-fix ordering must evict the running digest on the second deploy");
+});
+
+test("a config-only release reusing the running digest does not duplicate it", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(live, live, [digest(0x22), digest(0x33)]);
+  assert.equal(ring[0], live);
+  assert.equal(ring.filter((entry) => entry === live).length, 1);
+  assert.ok(ring.length <= MAX_APPROVED_DIGESTS);
+});
+
+test("a running digest already in the window is pinned rather than duplicated", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, [live, digest(0x22)]);
+  assert.equal(ring.filter((entry) => entry === live).length, 1);
+  assert.equal(ring[1], live);
+});
+
+test("an unestablished running digest degrades to newest-first, never to a failure", () => {
+  const ring = ringFor(digest(0x11), "", [digest(0x22), digest(0x33), digest(0x44)]);
+  assert.deepEqual(ring, [digest(0x11), digest(0x22), digest(0x33)]);
+});
+
+test("a malformed running digest is ignored rather than pinned", () => {
+  const ring = ringFor(digest(0x11), "not-a-digest", [digest(0x22), digest(0x33)]);
+  assert.deepEqual(ring, [digest(0x11), digest(0x22), digest(0x33)]);
+});
+
+test("malformed entries are discarded rather than consuming a slot", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, ["", "  ", "sha256:nope", "garbage", live, digest(0x22)]);
+  assert.deepEqual(ring, [digest(0x11), live, digest(0x22)]);
+  for (const entry of ring) {
+    assert.match(entry, /^sha256:[0-9a-f]{64}$/);
+  }
+});
+
+test("the window never exceeds the bound the admission policy enforces", () => {
+  const live = digest(0xaa);
+  const crowded = Array.from({ length: 12 }, (_, index) => digest(0x30 + index));
+  const ring = ringFor(digest(0x11), live, [...crowded, live]);
+  assert.equal(ring.length, MAX_APPROVED_DIGESTS);
+});
+
+test("an empty window yields just the released digest and the running one", () => {
+  const live = digest(0xaa);
+  assert.deepEqual(ringFor(digest(0x11), live, []), [digest(0x11), live]);
+  assert.deepEqual(ringFor(digest(0x11), "", []), [digest(0x11)]);
+});
+
+test("a one-slot window still releases, dropping the pin rather than overflowing", () => {
+  // Defensive: the pin must never be able to push the window past the bound, so
+  // a hypothetical max of 1 keeps only the digest being released.
+  assert.deepEqual(ringFor(digest(0x11), digest(0xaa), [digest(0x22)], 1), [digest(0x11)]);
+});
+
+// The ring builder being correct proves nothing unless the script actually hands
+// it the running digest, so the reader on the other side of that seam is
+// exercised too — against a stubbed kubectl, since it is the one part that talks
+// to a cluster. Its contract is narrow: name the digest when it can be
+// established beyond doubt, otherwise say nothing and succeed. It must never
+// fail a release to protect a rollback target.
+
+const READER_FUNCTION_NAME = "live_running_digest";
+const readerSource = extractShellFunction(READER_FUNCTION_NAME);
+
+function shellAssign(name) {
+  const m = script.match(new RegExp(`^${name}="([^"]+)"$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return m[1];
+}
+
+const IMAGE_REPOSITORY = shellAssign("IMAGE_REPOSITORY");
+
+// The reader's health gate lives in a jq block, not in the function body, so it
+// has to be lifted out of the script and injected alongside it — same reason as
+// everything else here: a rewrite of the predicate must fail this test rather
+// than leave it asserting against a copy that no longer ships.
+function extractJqBlock(name) {
+  const m = script.match(new RegExp(`^# BEGIN ${name}$\\n([\\s\\S]*?)^# END ${name}$`, "m"));
+  assert.ok(m, `could not read the ${name} jq block out of ${scriptPath}`);
+  return m[1];
+}
+
+const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
+
+// `deployment` of null makes the stub exit non-zero, standing in for "no such
+// Deployment" or an unreachable apiserver.
+function runningDigestFor(deployment) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
+  const fixture = path.join(dir, "deployment.json");
+  writeFileSync(fixture, deployment === null ? "" : JSON.stringify(deployment));
+  const harness = [
+    "set -euo pipefail",
+    `DEPLOY_NAMESPACE=paperclip`,
+    `DEPLOYMENT=paperclip-api`,
+    `IMAGE_REPOSITORY=${JSON.stringify(IMAGE_REPOSITORY)}`,
+    "read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true",
+    SERVING_JQ.replace(/\n$/, ""),
+    "SERVING_JQ",
+    `fake_kubectl() { [[ -s ${JSON.stringify(fixture)} ]] || return 1; cat ${JSON.stringify(fixture)}; }`,
+    "deploy_kubectl=(fake_kubectl)",
+    readerSource,
+    READER_FUNCTION_NAME,
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `reader must always succeed; stderr: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+// A Deployment whose rollout has fully landed. Fixtures default to that shape so
+// a case which only cares about the image does not have to restate six status
+// fields, and `status` overrides merge over the healthy defaults.
+//
+// `unavailableReplicas` is deliberately ABSENT from the healthy default, because
+// that is the shape the apiserver actually returns: the live paperclip-api
+// Deployment omits the field entirely while healthy (observed 2026-09-04 at
+// generation 560, replicas 2/2/2). The predicate's `// 0` default is what makes
+// that read as "none unavailable" rather than as missing data, so the common
+// fixture exercises that path rather than a shape production never produces.
+function deploymentWith({ images = [], replicas = 2, generation = 7, status = {} } = {}) {
+  return {
+    metadata: { generation },
+    spec: {
+      replicas,
+      template: { spec: { containers: images.map((image) => ({ image })) } },
+    },
+    status: {
+      observedGeneration: generation,
+      updatedReplicas: replicas,
+      readyReplicas: replicas,
+      availableReplicas: replicas,
+      ...status,
+    },
+  };
+}
+
+function deploymentWithImages(...images) {
+  return deploymentWith({ images });
+}
+
+test("the running digest is read off a single-container Deployment", () => {
+  const live = digest(0xaa);
+  assert.equal(runningDigestFor(deploymentWithImages(`${IMAGE_REPOSITORY}@${live}`)), live);
+});
+
+test("identical images across containers still name the running digest", () => {
+  const live = digest(0xaa);
+  const image = `${IMAGE_REPOSITORY}@${live}`;
+  assert.equal(runningDigestFor(deploymentWithImages(image, image)), live);
+});
+
+test("an unreachable or absent Deployment yields no digest and still succeeds", () => {
+  assert.equal(runningDigestFor(null), "");
+});
+
+test("a tag-pinned image is not mistaken for a digest", () => {
+  assert.equal(runningDigestFor(deploymentWithImages(`${IMAGE_REPOSITORY}:latest`)), "");
+});
+
+test("an image from another repository is never pinned", () => {
+  const live = digest(0xaa);
+  assert.equal(runningDigestFor(deploymentWithImages(`ghcr.io/someone/else@${live}`)), "");
+});
+
+test("containers disagreeing on their image yield no digest rather than a guess", () => {
+  const images = [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xbb)}`];
+  assert.equal(runningDigestFor(deploymentWithImages(...images)), "");
+});
+
+test("a Deployment with no containers yields no digest", () => {
+  // Built healthy on purpose: with no status the health gate would refuse this
+  // anyway, and the test would pass without ever reaching the container check.
+  assert.equal(runningDigestFor(deploymentWith({ images: [] })), "");
+});
+
+// The pod template records what was ASKED for. Nothing reverts spec.template
+// after a failed rollout, so believing it on its own pins a digest that never
+// carried traffic -- burning the reserved slot and letting the last healthy
+// digest age out, which is the BLO-28483 wedge reached from the other side.
+// These cases are the reason the reader gates on rollout status at all.
+
+test("a rollout applied but never made ready is not pinned as the running digest", () => {
+  const applied = digest(0xbb);
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${applied}`],
+        status: { readyReplicas: 0, availableReplicas: 0, unavailableReplicas: 2 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a rollout still in flight yields no digest rather than a half-rolled one", () => {
+  // maxSurge brings a new pod up before the old one leaves, so the template
+  // already names the new digest while the old one is still serving. Neither is
+  // unambiguously the running digest, so name neither.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+        status: { updatedReplicas: 1, readyReplicas: 1, availableReplicas: 1 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a pod template the controller has not observed yet is not believed", () => {
+  // spec.template was just patched, so status still describes the previous one.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+        generation: 8,
+        status: { observedGeneration: 7 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a Deployment scaled to zero has nothing serving and yields no digest", () => {
+  assert.equal(
+    runningDigestFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xee)}`], replicas: 0 })),
+    "",
+  );
+});
+
+test("a landed rollout that omits unavailableReplicas is still read as serving", () => {
+  // The shape production actually returns; see deploymentWith.
+  const live = digest(0xaa);
+  const deployment = deploymentWith({ images: [`${IMAGE_REPOSITORY}@${live}`] });
+  assert.ok(
+    !Object.hasOwn(deployment.status, "unavailableReplicas"),
+    "this test is only meaningful while the healthy fixture omits unavailableReplicas",
+  );
+  assert.equal(runningDigestFor(deployment), live);
+});
+
+// Split a jq predicate block into the condition lines of its top-level
+// conjunction. ROLLOUT_COMPLETE_JQ opens with a `def advanced: … ;` helper whose
+// body is control flow rather than conditions; jq definitions end in `;` and
+// condition lines never do, so the conjunction is everything after the last one.
+function jqConditions(block) {
+  const lines = block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const endOfDefs = lines.reduce((at, line, index) => (line.endsWith(";") ? index : at), -1);
+  return lines.slice(endOfDefs + 1).map((line) => line.replace(/ and$/, ""));
+}
+
+// The clauses ROLLOUT_COMPLETE_JQ carries that ROLLOUT_SERVING_JQ deliberately
+// does not. Each establishes that MY plan's rollout landed, not that whatever
+// template is written is the one serving: the expected image and its structural
+// precondition, the rollout marker, and the generation advance. Everything else
+// in the completion predicate is a rollout-health condition, and the drift test
+// below requires it to appear in the serving predicate too.
+const LOCK_IDENTITY_CONDITIONS = [
+  '(.spec.template.spec.containers | type == "array" and length > 0)',
+  "(.spec.template.spec.containers | all(.image == $image))",
+  '(.spec.template.metadata.annotations[$marker_key] // "") == $marker',
+  "advanced",
+];
+
+// The reader's health gate and the in-flight lock's completion predicate must
+// agree on what "this rollout has landed" means. They are separate jq programs
+// because they answer different questions -- the lock also proves plan identity
+// and generation advance -- so nothing but this test stops one from being
+// tightened while the other silently keeps the old reading.
+//
+// The comparison is set equality over the health half, in BOTH directions. The
+// reverse direction is the load-bearing one: a health condition added to the
+// completion predicate alone would silently make the reader the weaker of the
+// two definitions, so it would pin a digest the lock itself would not call
+// landed -- the exact failure this gate was introduced to close, reintroduced
+// by drift rather than by code.
+test("the serving predicate does not drift from the completion predicate", () => {
+  const serving = jqConditions(SERVING_JQ);
+  const complete = jqConditions(extractJqBlock("ROLLOUT_COMPLETE_JQ"));
+
+  assert.ok(
+    serving.length >= 6,
+    `expected the serving predicate to carry the rollout-health conditions, got ${serving.length}`,
+  );
+
+  // Keep the classification honest: a lock-only clause that no longer exists
+  // must not sit here silently exempting a condition name from the comparison.
+  for (const condition of LOCK_IDENTITY_CONDITIONS) {
+    assert.ok(
+      complete.includes(condition),
+      `LOCK_IDENTITY_CONDITIONS in this test lists \`${condition}\` as lock-only, but ` +
+        "ROLLOUT_COMPLETE_JQ no longer carries it — update the classification",
+    );
+  }
+
+  const completeHealth = complete.filter((condition) => !LOCK_IDENTITY_CONDITIONS.includes(condition));
+
+  for (const condition of serving) {
+    assert.ok(
+      completeHealth.includes(condition),
+      `ROLLOUT_SERVING_JQ requires \`${condition}\` but ROLLOUT_COMPLETE_JQ no longer does — ` +
+        "the two definitions of a landed rollout have drifted apart",
+    );
+  }
+
+  for (const condition of completeHealth) {
+    assert.ok(
+      serving.includes(condition),
+      `ROLLOUT_COMPLETE_JQ requires \`${condition}\` but ROLLOUT_SERVING_JQ does not — ` +
+        "the reader would pin a digest the lock's own predicate would not call landed. " +
+        "Add it to ROLLOUT_SERVING_JQ, or to LOCK_IDENTITY_CONDITIONS in this test if it " +
+        "proves plan identity rather than rollout health",
+    );
+  }
+});
+
+const FORMATTER_FUNCTION_NAME = "format_digest_list";
+const formatterSource = extractShellFunction(FORMATTER_FUNCTION_NAME);
+
+// The list reaches the formatter exactly as it does in the script: through a
+// command substitution (which strips trailing newlines) and then double-quoted,
+// so a multi-line window is one argument rather than several.
+function formatDigestList(list) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-digest-list-"));
+  const fixture = path.join(dir, "window.txt");
+  writeFileSync(fixture, list);
+  const harness = [
+    "set -euo pipefail",
+    formatterSource,
+    `window="$(cat ${JSON.stringify(fixture)})"`,
+    `${FORMATTER_FUNCTION_NAME} "$window"`,
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `formatter must always succeed; stderr: ${result.stderr}`);
+  return result.stdout;
+}
+
+// The read-back guards print this on their failure paths, where the contents are
+// the actionable part. An empty window must not render as a blank line, or the
+// "did not persist" report would say nothing at all about what the cluster holds.
+test("the digest-list formatter indents each entry and marks an empty window", () => {
+  const a = digest(0xaa);
+  const b = digest(0xbb);
+
+  assert.equal(formatDigestList(`${a}\n${b}`), `  - ${a}\n  - ${b}\n`);
+  assert.equal(formatDigestList(a), `  - ${a}\n`);
+  assert.equal(formatDigestList(""), "  (none)\n");
+});
+
+

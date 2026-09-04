@@ -2474,6 +2474,32 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const fencingPrecondition = await resolveCallerFencingPrecondition(params.fencing);
+        // Namespaced so one plugin's delivery ids can never resolve to another's
+        // comment. The system-author uniqueness scope is
+        // `(issue_id, idempotency_key)` alone — no plugin discriminator — so a
+        // raw natural key (`comment:<id>`, a delivery id, `sync:1`) shared by two
+        // plugins on one issue would hand the second caller the first's comment,
+        // a different body, with `deduplicated: true` and no error. The same
+        // collision reaches server-internal keys such as
+        // `issueRepoBindingCommentIdempotencyKey(...)`. Matches `agents.invoke`
+        // (`plugin:${pluginId}:` there too), deliberately: `pluginId` is the
+        // install row's PK rather than the durable manifest `pluginKey`, so the
+        // namespace is per-installation. It is more durable than that sounds —
+        // `install` reuses the existing row on reinstall after the default soft
+        // uninstall (`plugin-registry.ts`, `.where(eq(plugins.id, existing.id))`,
+        // pinned by `plugin-registry-reinstall-identity.test.ts`), so the id and
+        // this namespace survive an uninstall/reinstall cycle. Only a purge
+        // (`?purge=true`) or a table reseed orphans earlier keys, and that fails
+        // safe (an extra comment, never a wrong body). If this is ever re-keyed
+        // on `pluginKey`, the two *dedup* namespaces — here and `agents.invoke`
+        // below — must move together. The third `plugin:${pluginId}:` derivation
+        // below, `scopeKey`, deliberately stays put: it is a run-coalescing
+        // scope, not a durable namespace, and its keyless branch is already
+        // `plugin:${pluginId}:${randomUUID()}`.
+        const callerIdempotencyKey = readNonEmptyParam(params.idempotencyKey);
+        const idempotencyKey = callerIdempotencyKey
+          ? `plugin:${pluginId}:${callerIdempotencyKey}`
+          : null;
         // `addComment` does not open its own transaction, and a share lock only
         // fences for as long as its transaction lives — so when a generation is
         // supplied, open one here and hand it down.
@@ -2483,7 +2509,7 @@ export function buildHostServices(
                 params.issueId,
                 params.body,
                 { agentId: params.authorAgentId },
-                { fencingPrecondition },
+                { fencingPrecondition, idempotencyKey },
                 tx,
               ),
             )
@@ -2491,19 +2517,26 @@ export function buildHostServices(
               params.issueId,
               params.body,
               { agentId: params.authorAgentId },
-            )) as IssueComment;
-        await logPluginActivity({
-          companyId,
-          action: "issue.comment.created",
-          entityType: "issue",
-          entityId: issue.id,
-          actor: { actorAgentId: params.authorAgentId ?? null },
-          details: {
-            identifier: issue.identifier,
-            commentId: comment.id,
-            bodySnippet: comment.body.slice(0, 120),
-          },
-        });
+              { idempotencyKey },
+            )) as IssueComment & { deduplicated?: true };
+        // On the dedup path no row was written, so logging `issue.comment.created`
+        // would report a creation that did not happen — once per duplicate
+        // delivery, which is exactly the noise an idempotency key is bought to
+        // remove.
+        if (!comment.deduplicated) {
+          await logPluginActivity({
+            companyId,
+            action: "issue.comment.created",
+            entityType: "issue",
+            entityId: issue.id,
+            actor: { actorAgentId: params.authorAgentId ?? null },
+            details: {
+              identifier: issue.identifier,
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+            },
+          });
+        }
         return comment;
       },
       async createInteraction(params) {

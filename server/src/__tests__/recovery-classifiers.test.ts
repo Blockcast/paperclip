@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness as classifyIssueGraphLivenessCompat } from "../services/issue-liveness.js";
 import { decideRunLivenessContinuation as decideRunLivenessContinuationCompat } from "../services/run-continuations.js";
 import {
+  DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
   RECOVERY_KEY_PREFIXES,
   RECOVERY_ORIGIN_KINDS,
   RECOVERY_REASON_KINDS,
+  ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
   buildIssueGraphLivenessIncidentKey,
   buildIssueGraphLivenessLeafKey,
   buildRunLivenessContinuationIdempotencyKey,
@@ -79,6 +81,53 @@ describe("recovery classifier boundary", () => {
     };
 
     expect(classifyIssueGraphLiveness(input)).toEqual(classifyIssueGraphLivenessCompat(input));
+  });
+
+  // Ally flagged the original version of this test as non-discriminating, and
+  // that was correct: with errorCode "skill_not_found",
+  // isLegacySessionUnavailableAdapterFailure hard-requires "adapter_failed", so
+  // the explicit early return in isZeroTokenStartupFailureRun is unreachable and
+  // deleting it changes nothing. The exclusion holds in production by *set
+  // non-membership*, so that is what this asserts — it fails loudly if anyone
+  // adds the code to the set.
+  it("excludes a missing skill from the zero-token startup family by set non-membership", () => {
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
+  });
+
+  // The early return is kept as a backstop for exactly the case the assertion
+  // above forbids. This is the only test in which it is load-bearing: with the
+  // code temporarily in the set, removing the guard flips this to true.
+  it("keeps excluding a missing skill even if it joins the zero-token set", () => {
+    ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.add(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    try {
+      expect(isZeroTokenStartupFailureRun({
+        status: "failed",
+        errorCode: DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      })).toBe(false);
+    } finally {
+      ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.delete(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    }
+    // Restored, so the production invariant above still holds for other tests.
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+  });
+
+  it("routes a missing skill to blocked escalation instead of retry", () => {
+    expect(classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_not_found",
+      error: 'Skill "verification-before-completion" not found',
+      resultJson: null,
+    } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+      errorCode: "skill_not_found",
+    });
   });
 
   it("treats a scheduled monitor as an explicit review action path", () => {

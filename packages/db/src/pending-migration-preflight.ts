@@ -118,6 +118,14 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "WHERE origin_kind = 'pr_review' AND origin_fingerprint <> 'default' " +
       "AND hidden_at IS NULL AND status NOT IN ('done', 'cancelled')",
   },
+  {
+    migration: "0237_heartbeat_runs_agent_queued_dispatch_index.sql",
+    name: "heartbeat_runs_agent_queued_dispatch_idx",
+    table: "heartbeat_runs",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_agent_queued_dispatch_idx " +
+      "ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = 'queued'",
+  },
 ];
 
 export type PreflightBlocker = {

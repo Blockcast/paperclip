@@ -68,6 +68,37 @@ test("pre-flight is bounded so it cannot become the stall it prevents", () => {
   assert.match(script, /--timeout="\$\{TIMEOUT_SECONDS\}s"/, "the wait must use the bound");
 });
 
+test("startup and run budgets are separate, and startup clears a cold pull", () => {
+  // BLO-31254: one budget covering pull + run is sized as if it only covered
+  // run, so a cold pull of the ~1.7 GB image (measured 3m3s) failed a good
+  // build at 180s. The startup budget must stay comfortably above that
+  // measurement; the behavioural suite overrides both, so only a render-level
+  // check can hold the shipped defaults.
+  //
+  // Anchor on the assignment at start-of-line, matching
+  // check-docker-deploy-timeout.test.js: a comment naming a budget in
+  // `${...}` form ahead of the real assignment would otherwise feed the wrong
+  // number in. No such comment exists today -- this keeps that a property of
+  // the regex rather than of the script's current prose.
+  const runBudget = Number(
+    script.match(/^TIMEOUT_SECONDS="\$\{PREFLIGHT_TIMEOUT_SECONDS:-(\d+)\}"/m)?.[1],
+  );
+  const startupBudget = Number(
+    script.match(/^STARTUP_TIMEOUT_SECONDS="\$\{PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-(\d+)\}"/m)?.[1],
+  );
+
+  assert.ok(Number.isFinite(runBudget), "the run budget must have a numeric default");
+  assert.ok(Number.isFinite(startupBudget), "the startup budget must have a numeric default");
+  assert.ok(
+    startupBudget >= 366,
+    `startup budget must clear the measured 183s cold pull with margin (got ${startupBudget}s)`,
+  );
+  assert.ok(
+    startupBudget > runBudget,
+    "image transfer is slower than the check it precedes, so the startup budget must exceed the run budget",
+  );
+});
+
 test("pre-flight cleans up its job", () => {
   assert.match(script, /trap cleanup EXIT/, "the script must remove its job on exit");
   assert.match(script, /ttlSecondsAfterFinished/, "the job must also self-expire");

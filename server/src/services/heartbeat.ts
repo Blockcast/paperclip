@@ -363,6 +363,7 @@ import {
   applyAgentGitIdentityToRuntimeConfig,
   ensureCheckoutGitIdentity,
 } from "./git-checkout-identity.js";
+import { ensureManagedCheckoutCanServeClones } from "./managed-checkout-partial-clone.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
@@ -3243,6 +3244,15 @@ async function resolveManagedProjectWorkspaceCheckout(input: {
  * return, the "exists but isn't a checkout" return (which includes linked
  * worktrees), the repo-less return (a no-op, since there is no git metadata to
  * write into), and the post-clone return alike.
+ *
+ * BLO-31351 adds the partial-clone guard here for the same reason, and the
+ * "already cloned" case is again the one that matters: Paperclip never *creates*
+ * a partial mirror (the clone above passes no `--filter`), it only ever adopts
+ * one that something else left at the managed path. A guard placed after the
+ * clone would inspect the only checkout that cannot be partial. The repo-less
+ * return is deliberately covered too -- a project with no workspace rows still
+ * resolves to a managed `_default` dir, and that is precisely the path the
+ * mirror behind BLO-31338 was serving.
  */
 async function ensureManagedProjectWorkspace(input: {
   companyId: string;
@@ -3255,9 +3265,28 @@ async function ensureManagedProjectWorkspace(input: {
     cwd: realized.cwd,
     agent: input.agent ?? null,
   });
+  const partialClone = await ensureManagedCheckoutCanServeClones({ cwd: realized.cwd });
+  if (partialClone.state === "partial_cannot_serve") {
+    // Raised as a workspace validation failure rather than a bare Error so the
+    // recovery machinery treats it as the manual-repair, budget-exempt cause it
+    // is. A partial mirror missing objects cannot be fixed by retrying the same
+    // agent against the same path, and `workspace_validation_failed` is the one
+    // cause that neither wakes an owner nor spends a wake attempt.
+    throw new WorkspaceValidationFailure(partialClone.fatalMessage ?? "Managed checkout cannot serve clones.", {
+      workspaceValidation: {
+        reason: "managed_checkout_partial_clone_unservable",
+        companyId: input.companyId,
+        projectId: input.projectId,
+        repoUrl: input.repoUrl,
+        ...partialClone.evidence,
+      },
+    });
+  }
   return {
     cwd: realized.cwd,
-    warnings: [realized.warning, identity.warning].filter((value): value is string => Boolean(value)),
+    warnings: [realized.warning, identity.warning, partialClone.warning].filter(
+      (value): value is string => Boolean(value),
+    ),
   };
 }
 
@@ -6320,7 +6349,78 @@ export function buildK8sRunIsolationDescriptor(input: {
       ? path.posix.join("/runtime-cache/paperclip-workspaces", input.persistedExecutionWorkspaceId!)
       : null;
   const sharedHomeRoot = resolveDefaultAgentWorkspaceDir(input.agentId);
-  const workspaceRoot = isolationMode === "run"
+  // BLO-31282: `isolationMode` answers "what is the isolation *key*", not "where
+  // does the repo live". An agent with effective concurrency > 1 and no persisted
+  // execution workspace id lands in `run:<runId>` isolation
+  // (`resolveK8sRunIsolationIdentity`, third branch) even when a git worktree was
+  // cut for it on persistent disk: the workspace *id* is missing, the workspace
+  // *path* is not. Overriding the path there discards a good checkout and drops
+  // the agent into an empty scratch dir, from which the only repo location its
+  // issue payload names is the project BASE checkout. That is how base checkouts
+  // accumulate uncommitted work under an `isolated_workspace` policy.
+  //
+  // Key this off the *realized* strategy, never off the configured workspace
+  // mode. `strategy === "git_worktree"` is set only when a worktree was actually
+  // created (the same condition that populates `worktreePath`), whereas a project
+  // configured `isolated_workspace` whose strategy realizes to `project_primary`
+  // has `cwd` pointing straight at the base checkout — so trusting workspace
+  // *intent* here would route every such run into the base deterministically,
+  // which is the opposite of the fix. Callers that omit `strategy` keep the
+  // pre-existing ephemeral behavior.
+  //
+  // Stateless PR reviews stay fully ephemeral by design: they take the first
+  // branch of `resolveK8sRunIsolationIdentity` ahead of any persisted workspace
+  // and must not be pinned to a durable checkout.
+  //
+  // KNOWN, DELIBERATE NARROWING OF EXCLUSIVITY — read before widening this.
+  // The `run:<runId>` workspace path was unique *by construction*, so it also
+  // acted as a de-facto exclusion on the workspace. `cwd` under the default
+  // `per_issue` runScope is keyed by issue, not run, so that incidental
+  // exclusivity is gone: two runs of one issue hold distinct `run:` keys, both
+  // satisfy the single-writer guard on
+  // `external_runtime_reservations_active_isolation_writer_idx`, and both now
+  // resolve to the same worktree.
+  //
+  // Same-issue concurrency is REACHABLE — do not assume the checkout lock
+  // prevents it. `executionRunClaimCondition` is NOT skipped for an interaction
+  // wake: it is built unconditionally and is always present in the claiming
+  // UPDATE's `.where(...)`. What `allowsIssueInteractionWake` gates is
+  // `issueLockRequired`, and what happens is that the claim's *failure to
+  // match* is TOLERATED: the UPDATE matches zero rows when another run already
+  // holds `executionRunId`, the lock-not-acquired cancel is skipped, and
+  // control falls through to `return claimed`. That is deliberate — an
+  // issue-interaction wake carrying a comment id is allowed to run while
+  // another run holds the issue, so a human can talk to the assignee
+  // mid-flight.
+  //
+  // The second run therefore never acquires `issues.executionRunId` at all. It
+  // is a deliberately lock-less run, not a competing lock holder, so there is
+  // no lock-ordering or retry fix available and no configuration in which the
+  // race closes.
+  //
+  // Grep the three symbols named above rather than trusting line numbers. An
+  // earlier draft of this very comment cited absolute lines and its own +3-line
+  // edit silently moved them onto a different cancel branch; each symbol
+  // resolves to exactly one definition site, so the numbers bought nothing.
+  //
+  // This is still strictly better than the behavior it replaces, which is why
+  // it ships: the pre-fix run did not get an exclusive workspace either, it got
+  // an empty scratch dir and then reached for the project BASE checkout, which
+  // is shared across every issue AND every agent. Narrowing that to "two runs
+  // of the same issue share that issue's own worktree" is the sharing model
+  // `per_issue` runScope already describes.
+  //
+  // The principled repair is to key the isolation reservation off the resolved
+  // workspace PATH rather than the run id, so different issues still get
+  // distinct keys (preserving BLO-16842 sibling concurrency) while same-issue
+  // runs serialize. That changes BLO-16842's invariant and is tracked in
+  // BLO-31443 rather than smuggled in here.
+  const hasProvisionedWorktree =
+    !input.statelessPrReview &&
+    input.executionWorkspace.strategy === "git_worktree" &&
+    Boolean(input.executionWorkspace.cwd);
+  const usesEphemeralWorkspace = isolationMode === "run" && !hasProvisionedWorktree;
+  const workspaceRoot = usesEphemeralWorkspace
     ? path.posix.join(ephemeralIsolationRoot!, "workspace")
     : input.executionWorkspace.cwd;
   const homeRoot = isolationMode === "run"
@@ -6351,7 +6451,10 @@ export function buildK8sRunIsolationDescriptor(input: {
     cacheRoot,
     tmpRoot,
     storage: {
-      workspace: isolationMode === "run" ? "ephemeral" : "persistent",
+      // BLO-31282: must track `workspaceRoot` exactly. A run pinned to a
+      // provisioned worktree needs the persistent volume mounted, or the volume
+      // wiring would back a persistent-disk path with ephemeral storage.
+      workspace: usesEphemeralWorkspace ? "ephemeral" : "persistent",
       home: persistent,
       session: persistent,
       cache: isolationMode === "shared" ? "persistent" : "ephemeral",
@@ -13666,6 +13769,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : managedWorkspace.cwd;
             managedWorkspaceWarnings = managedWorkspace.warnings;
           } catch (error) {
+            // BLO-31351: a typed workspace-validation failure must NOT be
+            // absorbed into "try the next candidate". This catch exists to skip
+            // a workspace that merely could not be realized, but the fall-through
+            // below ends at `resolveDefaultAgentWorkspaceDir` — an EMPTY per-agent
+            // directory — because `buildRealizationFailedResult` returns non-null
+            // only for an explicitly-targeted non-primary workspace. Swallowing
+            // an unservable-mirror failure here would therefore run the agent to
+            // completion against the wrong tree, record no
+            // `workspace_validation_failed` cause, and reach none of that cause's
+            // budget exemptions. That is strictly worse than the pre-guard
+            // behaviour, where the mirror at least failed loudly at clone time.
+            //
+            // Tradeoff, stated because it is a real one: where candidates resolve
+            // to DIFFERENT managed dirs (distinct `repoUrl`s), this aborts rather
+            // than trying a sibling that might be healthy. That is deliberate. An
+            // unservable partial mirror is an infrastructure fault that will keep
+            // breaking every run routed through it, so surfacing it once with the
+            // real reason is worth more than quietly succeeding on a different
+            // tree and leaving it to strand someone else later.
+            if (error instanceof WorkspaceValidationFailure) throw error;
             if (preferredWorkspace?.id === workspace.id) {
               preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
             }
@@ -19861,6 +19984,128 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         details: Record<string, unknown>;
       };
 
+  function parseTimestamp(value: string | null | undefined) {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : new Date(parsed);
+  }
+
+  // BLO-27639: the continuation park gate cancels a retry by reading the
+  // summary's `Next Action` text, but only an EXECUTING run can rewrite that
+  // text. A park-shaped summary that events have overtaken therefore wedges the
+  // continuation lineage shut permanently: every retry is cancelled
+  // pre-invocation (`startedAt: null`) on the strength of a statement no
+  // reachable code path can refresh. Measured on BLO-22293, where a summary
+  // written 2026-08-14T04:33Z kept cancelling retries for 41h after the CTO
+  // ruling that cleared the blocker.
+  //
+  // So the park is only honoured while the summary is still the most recent
+  // word on the issue. Anything newer supersedes it and the run is allowed
+  // through to act on it.
+  //
+  // Deliberately NOT `issues.lastActivityAt`: migration 0076 installs a BEFORE
+  // UPDATE trigger mirroring every `issues.updated_at` bump into it, including
+  // the run-finalization write that immediately follows the summary write. That
+  // would make every summary look stale and disable the gate outright,
+  // regressing the BLO-16146 / BLO-18643 churn fix.
+  //
+  // System-authored comments are excluded on purpose. They are notices *about*
+  // the stall (recovery takeovers, and this gate's own cancellation notice),
+  // not new instruction for the executor — counting them would let the gate's
+  // own comment unpark the next retry and disable itself.
+  //
+  // The summary-writing run's OWN writes are excluded for the same reason, and
+  // this one is load-bearing rather than defensive: run finalization refreshes
+  // the summary FIRST and then posts its run-summary comment (see the
+  // `refreshContinuationSummaryForRun` → `addComment` pair in the finalizer),
+  // so that comment's `createdAt` is always strictly greater than the summary's
+  // `updatedAt`, and it is authored `agent` (issues.ts resolves an actor with
+  // `agentId` to `authorType: "agent"`), not `system`. Without this exclusion a
+  // park-shaped summary would be superseded by the very run that wrote it, on
+  // the ordinary success path — disabling the gate on exactly the population it
+  // exists to park and regressing BLO-16146 / BLO-18643. The summary write and
+  // the run comment are two halves of one finalization, not new activity.
+  // BLO-27639: which run authored the summary revision currently on the issue.
+  // `refreshIssueContinuationSummary` stamps `createdByRunId` on every revision
+  // it writes, so this is the run whose finalization writes must not be counted
+  // as superseding its own summary. Null when the revision predates that
+  // stamping or cannot be resolved — the fail-open direction.
+  async function resolveContinuationSummaryRunId(
+    companyId: string,
+    latestRevisionId: string | null,
+  ): Promise<string | null> {
+    if (!latestRevisionId) return null;
+    const revision = await db
+      .select({ createdByRunId: documentRevisions.createdByRunId })
+      .from(documentRevisions)
+      .where(and(
+        eq(documentRevisions.id, latestRevisionId),
+        eq(documentRevisions.companyId, companyId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return revision?.createdByRunId ?? null;
+  }
+
+  async function isContinuationParkSuperseded(
+    companyId: string,
+    issueId: string,
+    summaryUpdatedAt: Date | null,
+    summaryRunId: string | null,
+  ): Promise<boolean> {
+    // An undateable summary cannot be shown to be current. Fail open: the
+    // deadlock is unrecoverable without an executing run, while a spurious
+    // execution is self-limiting — it rewrites the summary and the next gate
+    // decision is made on fresh data.
+    if (!summaryUpdatedAt) return true;
+
+    const newerComment = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, companyId),
+        eq(issueComments.issueId, issueId),
+        isNull(issueComments.deletedAt),
+        or(isNull(issueComments.authorType), ne(issueComments.authorType, "system")),
+        gt(issueComments.createdAt, summaryUpdatedAt),
+        summaryRunId
+          ? or(isNull(issueComments.createdByRunId), ne(issueComments.createdByRunId, summaryRunId))
+          : undefined,
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (newerComment) return true;
+
+    const newerChange = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issueId),
+        gt(activityLog.createdAt, summaryUpdatedAt),
+        summaryRunId
+          ? or(isNull(activityLog.runId), ne(activityLog.runId, summaryRunId))
+          : undefined,
+        or(
+          eq(activityLog.action, "issue.blockers_updated"),
+          and(
+            eq(activityLog.action, "issue.updated"),
+            // `details` is the request payload, not a computed diff, so
+            // `->> 'status'` matches any PATCH that merely CARRIED status —
+            // including a no-op `{"status":"in_progress"}` rewrite. `_previous`
+            // is populated only for fields whose value actually changed, which
+            // is the "status change" both the comment above and the issue-facing
+            // park notice claim. Same predicate the issue-route precedent uses.
+            sql`${activityLog.details} -> '_previous' ? 'status'`,
+          ),
+        ),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(newerChange);
+  }
+
   async function evaluateQueuedRunStaleness(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -19913,26 +20158,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       (wakeReason === "issue_continuation_needed" || retryReason === "issue_continuation_needed")
     ) {
       const queuedWake = parseObject(context.paperclipWake);
-      const queuedContinuationSummary =
-        readNonEmptyString(parseObject(context.paperclipContinuationSummary).body) ??
-        readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
-      const currentContinuationSummary = queuedContinuationSummary
-        ? null
-        : await getIssueContinuationSummaryDocument(db, issueId);
-      const continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
+      const queuedSummary = parseObject(context.paperclipContinuationSummary);
+      const queuedWakeSummary = parseObject(queuedWake.continuationSummary);
+      // BLO-27639: the live document wins over the queued snapshot. The
+      // snapshot is frozen when the run is enqueued, so a retry queued before
+      // an executor refreshed the summary would otherwise be judged against
+      // text that has already been replaced.
+      //
+      // The live body is redacted the same way the snapshot was on its way into
+      // the wake context. Without this, preferring the live document would both
+      // leak raw quarantined text into the run-event payload below and let a
+      // quarantined summary park a run that the snapshot path let through.
+      const liveContinuationSummary = await getIssueContinuationSummaryDocument(db, issueId);
+      const currentContinuationSummary = liveContinuationSummary
+        ? redactQuarantinedBodyForHigherTrust(liveContinuationSummary)
+        : null;
+      // The live document is preferred as a UNIT — body, timestamp and
+      // authoring run all come from the same revision or none of them do.
+      // Sourcing the body from the snapshot while keeping the live timestamp
+      // (which `??` chains independently would do for an empty live body) would
+      // date stale park text with a fresh timestamp and make the freshness
+      // comparison below meaningless.
+      const liveContinuationSummaryBody = readNonEmptyString(currentContinuationSummary?.body);
+      const useLiveContinuationSummary = liveContinuationSummaryBody !== null;
+      const continuationSummaryBody = useLiveContinuationSummary
+        ? liveContinuationSummaryBody
+        : readNonEmptyString(queuedSummary.body) ?? readNonEmptyString(queuedWakeSummary.body) ?? null;
+      const continuationSummaryUpdatedAt = useLiveContinuationSummary
+        ? currentContinuationSummary?.updatedAt ?? null
+        : parseTimestamp(readNonEmptyString(queuedSummary.updatedAt) ?? readNonEmptyString(queuedWakeSummary.updatedAt));
+      // Only the live document can be attributed to the run that wrote it. The
+      // frozen snapshot carries no revision id, so it yields null — no
+      // self-write exclusion, which is the fail-open direction.
+      const continuationSummaryRunId = useLiveContinuationSummary
+        ? await resolveContinuationSummaryRunId(
+            run.companyId,
+            currentContinuationSummary?.latestRevisionId ?? null,
+          )
+        : null;
       if (continuationSummaryParksExecutor(continuationSummaryBody)) {
-        return {
-          stale: true,
-          errorCode: "issue_continuation_waiting_on_review",
-          reason:
-            "Cancelled because the continuation summary says the executor should wait for reviewer feedback or approval before more work starts",
-          details: {
-            issueId,
-            wakeReason,
-            retryReason,
-            nextAction: continuationSummaryBody,
-          },
-        };
+        const superseded = await isContinuationParkSuperseded(
+          run.companyId,
+          issueId,
+          continuationSummaryUpdatedAt,
+          continuationSummaryRunId,
+        );
+        if (!superseded) {
+          return {
+            stale: true,
+            errorCode: "issue_continuation_waiting_on_review",
+            reason:
+              "Cancelled because the continuation summary says the executor should wait for reviewer feedback or approval before more work starts",
+            details: {
+              issueId,
+              wakeReason,
+              retryReason,
+              nextAction: continuationSummaryBody,
+              continuationSummaryUpdatedAt: continuationSummaryUpdatedAt?.toISOString() ?? null,
+            },
+          };
+        }
+        // The park text has been overtaken by events. Let the run execute so it
+        // can act on them and rewrite the summary — the only code path that can.
       }
     }
 
@@ -20083,6 +20370,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: staleness.reason,
       payload: staleness.details,
     });
+
+    // BLO-27639: a continuation park was previously visible only in
+    // `/heartbeat-runs/{id}.resultJson`, so an agent reading the issue saw an
+    // `in_progress` row going silent with no stated cause. Surface it on the
+    // issue once per summary revision — keyed on the summary timestamp, so a
+    // refreshed summary that still parks says so again, while retries against
+    // the same summary stay quiet.
+    if (staleness.errorCode === "issue_continuation_waiting_on_review") {
+      const summaryUpdatedAt = readNonEmptyString(staleness.details.continuationSummaryUpdatedAt) ?? "unknown";
+      await issuesSvc.addComment(
+        issueId,
+        [
+          `Continuation retry \`${run.id}\` was cancelled before it started: the continuation summary`,
+          `(last written ${summaryUpdatedAt}) says executor work is waiting for reviewer feedback or approval.`,
+          "",
+          "Only an executing run can rewrite that summary, so this gate will keep cancelling continuation",
+          "retries until something newer lands on the issue — a non-system comment, a status change, or a",
+          "blocker-set change all release it.",
+        ].join("\n"),
+        { runId: run.id },
+        {
+          authorType: "system",
+          idempotencyKey: `continuation-park-gate:${issueId}:${summaryUpdatedAt}`,
+        },
+      ).catch((err) => {
+        // Dedupe does not need a swallow: addComment inserts with
+        // onConflictDoNothing and re-selects under the idempotency author
+        // scope, so a repeat notice returns the existing row rather than
+        // throwing. Anything reaching here is a genuine fault, and silently
+        // dropping it would negate the issue-visible park notice this change
+        // exists to deliver.
+        logger.warn(
+          { err, runId: run.id, issueId },
+          "failed to post continuation park notice",
+        );
+        return null;
+      });
+    }
 
     return cancelled;
   }
@@ -23980,9 +24305,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * BLO-20736: read one keyset page of an agent's queued runs in two phases.
    *
    * Phase 1 projects ONLY (created_at, id). Both live in
+   * heartbeat_runs_agent_queued_dispatch_idx (BLO-31392, migration 0237)
+   * alongside the leading agent_id, and in
    * heartbeat_runs_agent_dispatch_idx alongside the (agent_id, status) prefix,
    * so the whole page comes from the index with no heap access at all — an
    * `Index Only Scan`, ordered, that stops after `limit` entries.
+   *
+   * Which of the two serves it depends on whether PostgreSQL is costing a
+   * custom or a generic plan; both are ordered and index-only for this
+   * projection, which is the property that matters. See the `status` literal
+   * below for why the generic case needed its own index.
    *
    * That projection is the entire point, and it is a cost-model fix rather than
    * a cosmetic one. PostgreSQL estimates `agent_id = $1` and `status = 'queued'`
@@ -24049,8 +24381,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const queuedPagePredicate = and(
       eq(heartbeatRuns.agentId, input.agentId),
       // Keep the partial-index predicate a SQL literal. postgres.js uses
-      // prepared statements by default; a bound status parameter can receive a
-      // generic plan that cannot imply `status = 'queued'`.
+      // prepared statements by default, and a bound status parameter can
+      // receive a generic plan that cannot imply `status = 'queued'` — so
+      // neither partial index would be provably applicable and the scan falls
+      // back to a wider path.
+      //
+      // BLO-31392: the literal is necessary but NOT sufficient, and for a while
+      // this comment claimed more than it delivered. Being a literal lets the
+      // planner prove a partial index applicable — but it does not choose
+      // WHICH. Migration 0217 added heartbeat_runs_queued_age_idx with a
+      // predicate of exactly `status = 'queued'`, and in the generic pass
+      // (agent_id unknown, so the row estimate collapses to ~1 and a Sort looks
+      // free) that index won on size alone, producing `Index Scan` + `Sort` —
+      // the unbounded shape this function exists to avoid. Measured on
+      // production. Migration 0237 answers it where the planner actually
+      // decides: heartbeat_runs_agent_queued_dispatch_idx carries the same
+      // narrow predicate plus (created_at, id) as trailing keys, so it indexes
+      // the same ROWS as 0217's (wider per entry — three keys to two) and
+      // additionally supplies the ORDER BY. Do not drop it without
+      // re-measuring the GENERIC plan, not just the custom one.
+      //
+      // That index is still not the whole fix, and the gap is worth knowing
+      // before trusting this path. Measured generic cost, 0237 vs 0217, at the
+      // ~1-row estimate this statement gets: 48% cheaper when the heap is
+      // all-visible, but only 0.24% — inside the 1% STD_FUZZ_FACTOR — when it
+      // is not, and queued rows are freshly written so they never are. At a
+      // 1-row estimate a Sort costs ~0.02, so no index design can win this
+      // decisively; only taking the statement off the generic plan can (the
+      // custom plan picks the ordered scan every time, on production too).
+      // Until that lands, treat the ordered plan here as likely-but-unproven in
+      // production and re-measure `EXPLAIN (GENERIC_PLAN)` there rather than
+      // inferring it from a green CI run. BLO-31392.
       sql`${heartbeatRuns.status} = 'queued'`,
       input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
       // Keyset cursor. created_at alone is not unique (bulk wake fan-out stamps
