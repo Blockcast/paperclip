@@ -1733,6 +1733,7 @@ export async function startServer(): Promise<StartedServer> {
       "Isolation-workspace reaper enabled (BLO-31222)",
     );
     startIsolationWorkspaceReaper(
+      db,
       config.isolationWorkspaceReaperIntervalMinutes * 60 * 1000,
       {
         maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
