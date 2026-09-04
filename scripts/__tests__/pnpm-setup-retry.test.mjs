@@ -17,20 +17,40 @@ const wrapperRef = "./.github/actions/setup-pnpm";
 // A job that sets up pnpm needs room for the wrapper's second attempt AND for
 // its own work. This floor used to be 10, derived from "two attempts at
 // (bootstrap + a 120s registry stall) plus up to 25s of jittered backoff, ~5
-// minutes". Measuring pr.yml's `policy` job over 40 runs (2026-09-04,
-// BLO-31690) showed that model understates the real cost twice over:
+// minutes". Measuring pr.yml's `policy` job over 75 runs (2026-09-04,
+// BLO-31690) showed that model mis-attributes where the time goes, and so
+// understates every case built on it:
 //
-//   - the retry fired in 0 of 40 runs, and a SUCCESSFUL first attempt still
-//     reached 259s, so the ~4.3m is one slow success rather than two attempts;
-//   - so the retry-path worst case is a first attempt failing on its 120s
-//     fetch timeout (~150s with bootstrap) + up to 25s of backoff + a
-//     slow-success retry at 259s = ~7.2m for `Setup pnpm` alone.
+//   - the retry fired in 0 of 75 runs -- the wrapper's `Setup pnpm (retry)`
+//     and back-off nodes both log `conclusion=skipped` -- and a SUCCESSFUL
+//     first attempt still took 254.5s (259s for the step as a whole), so the
+//     ~4.3m is one slow success rather than two attempts;
+//   - that 254.5s is almost entirely the bootstrap `npm ci` -- 243s of it,
+//     logged as "added 1 package in 4m" -- and only ~7s the `pnpm
+//     self-update` the old model treated as the expensive part. The bootstrap
+//     is not a cheap prelude to a 120s fetch; it IS the cost.
 //
-// Add the 4.4m p100 checkout that has to precede it and setup alone exceeds a
-// 10m job before a single test runs. 15 is the floor that actually holds, and
-// it is what every budgeted wrapper job in this repo except `policy` already
-// declared -- `policy` was the lone outlier at 10 and the only one observed
-// dying at its cap.
+// Re-deriving the retry path on measured parts rather than assumed ones: a
+// first attempt that bootstraps (243s) and then loses its self-update to the
+// 120s fetch timeout is 363s, + up to 25s of backoff + a 259s slow-success
+// retry = ~10.8m for `Setup pnpm` alone. That floor is also why the 0-of-75
+// count above does not need 75 logs read to be sound: no observed step came
+// within half of it.
+//
+// So 15 does NOT buy full retry-path coverage, and this constant should not be
+// read as claiming it does: for `policy` that would be 10.8m pnpm + 4.4m p100
+// checkout + 3.9m gate work = ~19m. What 15 does buy is the observed
+// worst case -- a slow-but-successful setup plus the job's own work, which is
+// what both historical blowouts actually were -- with margin, and it is a
+// floor every other budgeted wrapper job in this repo already clears. Counted
+// 2026-09-04: 24 jobs reach for the wrapper, 23 declare a budget (the 24th is
+// listed in WRAPPER_JOBS_WITHOUT_A_BUDGET below), the next-lowest two declare
+// exactly 15, and `policy` was the lone outlier at 10 -- as well as the only
+// one observed dying at its cap. Closing the retry gap by raising budgets
+// further is the wrong lever;
+// the structural fix is baking the pinned pnpm into the ARC runner image so
+// the bootstrap stops being a registry round-trip at all (see the wrapper's
+// own header), and the residual is recorded at pr.yml's `policy` cap.
 const MIN_TIMEOUT_MINUTES_FOR_RETRY = 15;
 
 // Direct calls are allowed at exactly these grandfathered sites. Keyed by

@@ -26,25 +26,34 @@ jobs:
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     # 15, not 10. Setup -- not the gate work -- is what spends this budget, and
-    # at 10 the cap was the binding constraint rather than a backstop: 2 of 40
-    # sampled runs were cancelled AT the cap and 2 more finished within 0.5m of
-    # it (BLO-31690). Sized against that 40-run sample of this job, 2026-09-04,
-    # worst observed:
+    # at 10 the cap was the binding constraint rather than a backstop: over the
+    # last 75 completed runs of this job (2026-09-04, BLO-31690) 2 were
+    # cancelled AT the cap and 5 more landed between 9.5m and 9.9m, i.e. 7 of
+    # 75 survived on under 30s of luck. Note 6 of those runs read `cancelled`
+    # but only the 2 at 10.2m are cap deaths -- the other 4 stopped at 2.9-5.1m
+    # and are superseded pushes. The status alone does not distinguish them,
+    # which is why this class hid for so long. Sized against that sample, worst
+    # observed:
     #
-    #   `Checkout repository` + `Setup pnpm`   8.05m  (483s; the two are
-    #                                                 independently bimodal at
-    #                                                 0.5-4.4m each, so setup
-    #                                                 is the whole variable)
-    #   every other step in the job            3.58m  (215s -- and note ~2.1m
-    #                                                 is the MEDIAN. Sizing a
-    #                                                 bound to the median is
-    #                                                 what produced BLO-31405)
-    #   one 1-minute step bound                1.00m  (headroom for a single
+    #   `Checkout repository` + `Setup pnpm`   8.1m   (the two are
+    #                                                 independently bimodal --
+    #                                                 checkout 0.5-4.4m, pnpm
+    #                                                 0.2-4.3m -- so setup is
+    #                                                 the whole variable)
+    #   every other step in the job            3.9m   (p100; the MEDIAN is
+    #                                                 2.0m. Sizing a bound to
+    #                                                 the median is what
+    #                                                 produced BLO-31405, and
+    #                                                 the 9.9m near-miss above
+    #                                                 had only median setup --
+    #                                                 gate work alone nearly
+    #                                                 killed it)
+    #   one 1-minute step bound                1.0m   (headroom for a single
     #                                                 hung gate step to fail as
     #                                                 THAT step instead of as
     #                                                 the job cap -- BLO-29182)
     #                                         -------
-    #                                         12.63m  -> 15m = 2.37m (19%)
+    #                                         13.0m   -> 15m = 2.0m (13%)
     #
     # This supersedes an earlier 5 -> 10 raise whose arithmetic was "2 x
     # (bootstrap + 120s fetch) + backoff ~= 5m", covering a second
@@ -52,17 +61,31 @@ jobs:
     # (BLO-28813). That raise was directionally right -- at 5 a degraded
     # registry converted a fast red into a job timeout, which ejects a
     # merge-queue candidate just the same but burns a runner for the full
-    # budget first -- but its model does not survive measurement: the retry
-    # fired in 0 of those 40 runs, so pnpm's ~4.3m worst case is ONE slow
-    # success, not two attempts.
+    # budget first -- but its model mis-attributes the cost, which is why 10
+    # looked sufficient and was not. Read off the wrapper's own action markers:
+    # the retry fired in 0 of the 75 runs -- both `Back off before retrying
+    # pnpm setup` and `Setup pnpm (retry)` log `conclusion=skipped`, and no
+    # run's step even reaches the retry path's floor -- while a SUCCESSFUL
+    # first attempt still took 254.5s (`outcome=success;duration_ms=254504`,
+    # 259s for the step as a whole). 243s of that is the bootstrap `npm ci`
+    # ("added 1 package in 4m") and only ~7s the self-update the old model
+    # blamed. So pnpm's ~4.3m is one slow success whose cost sits in the
+    # bootstrap, not two attempts against a stalled registry.
     #
     # Both historical blowouts died with seconds of work left (reconstructed at
-    # ~10.4m and ~10.7m needed) and now fit with over 4m to spare. Residual
-    # deliberately NOT covered: the retry firing on a p100-checkout run would
-    # be 7.2m pnpm + 4.4m checkout + 3.6m work = 15.2m. That is unobserved
-    # here, and the structural fix is baking the pinned pnpm into the ARC
-    # runner image -- an onprem-k8s change tracked separately, see the
-    # wrapper's own header.
+    # ~10.4m and ~10.7m needed) and now fit with over 4m to spare. Two
+    # residuals deliberately NOT covered here, both bounded by the same
+    # structural fix -- baking the pinned pnpm into the ARC runner image, an
+    # onprem-k8s change tracked separately, see the wrapper's own header:
+    #   - the retry firing on a p100-checkout run would be 10.8m pnpm + 4.4m
+    #     checkout + 3.9m work = ~19m, unobserved in this sample (0 retries in
+    #     75 runs). Raising the cap to cover it would budget every run for a
+    #     path none of them took;
+    #   - `Setup pnpm` still carries no step bound, so a wedged bootstrap
+    #     surfaces as an unattributable job-cap cancellation the way a wedged
+    #     checkout did before the bound below. Bounding it means picking a
+    #     number above that 10.8m retry path, which only pays off once the
+    #     bootstrap stops being a 4m registry round-trip.
     timeout-minutes: 15
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
@@ -72,7 +95,7 @@ jobs:
         # `fetch-depth: 0` is load-bearing -- the lockfile guard below diffs
         # PR_BASE_SHA...PR_HEAD_SHA and needs the merge base on disk -- which
         # makes this the larger and more variable half of the setup cost the
-        # job budget above is sized against (0.5m-4.4m observed over 40 runs).
+        # job budget above is sized against (0.5m-4.4m observed over 75 runs).
         # It previously carried no bound at all, so a wedged fetch could only
         # ever surface as an unattributable job-cap cancellation. 8m is ~1.8x
         # the 4.4m p100: loose enough not to flake on a slow-but-working
