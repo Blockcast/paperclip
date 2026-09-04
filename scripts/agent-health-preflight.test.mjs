@@ -51,14 +51,22 @@ describe("agent-health v4 preflight", () => {
     rows[3].coalescedIntoRunId = "run-0";
     rows[4].fingerprint = "duplicate-fingerprint";
     rows.push({ ...rows[4], runId: "duplicate-run", fingerprint: "duplicate-fingerprint" });
-    rows[5].commentId = null;
+    // BLO-31838: this row used to carry `commentId: null` and was asserted to be
+    // `receipt-only`, which is exactly the mislabeling that defect was — a window
+    // that emitted NOTHING is `silent`, not "receipt-only". To keep exercising
+    // the real `receipt-only` shape the fixture now gives it a receipt that
+    // simply produced no classification (a `failed_preflight`-shaped emission).
+    rows[5].commentId = "receipt-5";
     rows[5].classification = null;
     rows[5].status = "running";
     rows.splice(6, 1);
     const census = classifyRoutineRuns(rows);
     assert.equal(census.complete, true);
     assert.equal(census.slots.length, 28);
-    assert.equal(census.counts["silent"], 1);
+    // Window 6 has no rows at all; window 1 ran to completion and emitted
+    // nothing. Both are silent — the second only since BLO-31838.
+    assert.equal(census.counts["silent"], 2);
+    assert.deepEqual(census.slots[1].states, ["completed-without-comment", "silent"]);
     assert.equal(census.counts["completed-without-comment"], 1);
     assert.equal(census.counts.runless, 1);
     assert.equal(census.counts.coalesced, 1);
@@ -184,7 +192,10 @@ describe("agent-health v4 preflight", () => {
     ]);
     // Neither row is silently absorbed into a slot...
     assert.equal(census.counts["completed-without-comment"], 1);
-    assert.equal(census.counts["silent"], 27);
+    // 27 windows hold no rows; the 28th ran to completion and emitted nothing,
+    // which is silent too since BLO-31838 — so the census observed no window.
+    assert.equal(census.counts["silent"], 28);
+    assert.equal(census.observedWindows, 0);
     // ...and a non-boundary key is a bucketing bug, so it lands in the failing
     // bucket the title names — not alongside merely-out-of-range boundaries.
     assert.deepEqual(census.malformedRows, [{ runId: "wrong", windowKey: "not-a-window" }]);
@@ -328,6 +339,97 @@ describe("census completeness is derived from observed coverage, not from the ke
     const overCensus = classifyRoutineRuns(overTolerance);
     assert.equal(overCensus.counts.silent, MAX_SILENT_WINDOWS + 1);
     assert.equal(overCensus.complete, false);
+  });
+
+  // --- Regression: BLO-31838 -------------------------------------------------
+  // `silent` was reachable ONLY through the zero-candidate-rows branch, so it
+  // meant "no routine run fired" while runbook §0 defines it as "no qualifying
+  // receipt exists". A window that ran and emitted nothing fell through to
+  // `receipt-only`, which suppressed the term `census.complete` is derived from.
+  it("counts a window that ran but emitted no receipt as silent, not receipt-only", () => {
+    // The discriminating case: the routine fires reliably on all 28 slots and
+    // every single run fails to post its receipt. That is a total
+    // emission-contract outage, and it used to report counts.silent === 0,
+    // observedWindows === 28, complete === true.
+    const ranButSilent = sevenDayWindowKeys().map((windowKey, index) => ({
+      windowKey,
+      runId: `run-${index}`,
+      status: "completed",
+      commentId: null,
+      classification: null,
+      fingerprint: `fp-${index}`,
+    }));
+    const census = classifyRoutineRuns(ranButSilent);
+    assert.equal(census.counts.silent, 28);
+    assert.equal(census.counts["receipt-only"], 0, "a window with no receipt is not receipt-only");
+    assert.equal(census.observedWindows, 0);
+    assert.equal(census.complete, false);
+    // The runs are real and terminal, so the more specific diagnosis survives
+    // alongside silent rather than being replaced by it.
+    assert.equal(census.counts["completed-without-comment"], 28);
+    assert.equal(census.slots[0].state, "completed-without-comment");
+  });
+
+  // Negative control: without this, the fix over-fires and every window whose
+  // receipt merely carries no classification (`failed_preflight`,
+  // `missed_window`) would be miscounted as an emission-contract failure.
+  it("still reports receipt-only when a receipt exists but produced no classification", () => {
+    const [windowKey] = sevenDayWindowKeys();
+    const census = classifyRoutineRuns([
+      { windowKey, runId: "r1", status: "failed", commentId: "receipt-1", classification: null },
+    ]);
+    assert.equal(census.slots[0].state, "receipt-only");
+    assert.deepEqual(census.slots[0].states, ["receipt-only"]);
+    assert.equal(census.counts["receipt-only"], 1);
+    // 27 empty windows are silent; this one emitted, so it is not.
+    assert.equal(census.counts.silent, 27);
+  });
+
+  it("reports a slot with neither a run row nor a receipt as both runless and silent", () => {
+    const [windowKey] = sevenDayWindowKeys();
+    const census = classifyRoutineRuns([
+      { windowKey, runId: null, status: "queued", commentId: null, classification: null },
+    ]);
+    // Neither masks the other: they are different failures with different
+    // owners — no run row is a scheduling failure, no receipt is an emission one.
+    assert.ok(census.slots[0].states.includes("runless"));
+    assert.ok(census.slots[0].states.includes("silent"));
+    assert.equal(census.counts.runless, 1);
+    assert.equal(census.counts.silent, 28);
+  });
+
+  // AC2: the recorded 2026-09-04T18 census input, which reported silent === 0.
+  it("classifies the recorded 2026-09-04T18 window as two silent slots", () => {
+    const end = "2026-09-04T18:00:00Z";
+    const receiptless = new Map([
+      // Terminal-failed run, linkedIssueId null, no receipt posted.
+      ["2026-09-02T00:00:00Z", { runId: "b3dc9f19", status: "failed", commentId: null, classification: null }],
+      // Classified `issue_created`, but the receipt comment never landed — a
+      // classification without a commentId is a decision, not an emission.
+      ["2026-09-03T12:00:00Z", { runId: "a9b2835a", status: "completed", commentId: null, classification: "issue_created" }],
+    ]);
+    const rows = sevenDayWindowKeys(end).map((windowKey, index) => ({
+      windowKey,
+      fingerprint: `fp-${index}`,
+      ...(receiptless.get(windowKey) ?? {
+        runId: `run-${index}`,
+        status: "completed",
+        commentId: `c-${index}`,
+        classification: "agent_in_error",
+      }),
+    }));
+
+    const census = classifyRoutineRuns(rows, end);
+    assert.equal(census.counts.silent, 2);
+    assert.deepEqual(
+      census.slots.filter((slot) => slot.states.includes("silent")).map((slot) => slot.windowKey),
+      ["2026-09-02T00:00:00Z", "2026-09-03T12:00:00Z"],
+    );
+    // Unchanged by the fix, so no historical coverage ratio moves.
+    assert.equal(census.counts["classification-producing"], 26);
+    // Two silent windows is exactly the documented tolerance, so this input is
+    // still complete — the point is that the term is now counted at all.
+    assert.equal(census.complete, true);
   });
 
   it("snaps the executable census end to the six-hour boundary rather than a pinned past date", () => {
