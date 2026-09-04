@@ -1,5 +1,5 @@
 {
-  "$comment": "Per-suite Vitest durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from four successful ARC PR jobs in run 31248977534 on 2026-08-08, then topped up as master added suites, most recently on 2026-08-24 via scripts/measure-general-server-shard-durations.mjs; coverage is 483/483. This sentence is regenerated on every refresh; see \"$notes\" for guidance that is meant to persist.",
+  "$comment": "Per-suite Vitest durations (ms) for the general-server lane, used by scripts/general-server-shard.mjs to balance suites across the PR shard matrix. Sampled from four successful ARC PR jobs in run 31248977534 on 2026-08-08, then topped up as master added suites, most recently on 2026-09-04 via scripts/measure-general-server-shard-durations.mjs; coverage is 483/483. This sentence is regenerated on every refresh; see \"$notes\" for guidance that is meant to persist.",
   "$notes": "DURABLE NOTES -- unlike \"$comment\" (regenerated on every refresh), this key is never rewritten by .github/workflows/refresh-shard-manifest.yml. Put guidance that must outlive a re-sample here. NOTE ON UNITS: these are per-file TEST-EXECUTION durations (the Vitest JSON reporter's testResults[].startTime->endTime), not full wall-clock -- they exclude each file's transform/setup/import cost, which is why a trivial suite can read as single-digit ms. That fixed per-file cost is roughly uniform and the LPT partition also lands near-equal file counts per shard, so it does not skew balance; do not 'fix' a small value here by hand. Suites absent from this manifest use the median fallback (defaultSuiteWeight in scripts/general-server-shard.mjs); the refresh workflow re-samples weekly so refresh does not depend on a human noticing drift.",
   "unit": "ms",
   "durations": {
@@ -179,7 +179,7 @@
     "server/src/__tests__/heartbeat-auto-checkout.test.ts": 7,
     "server/src/__tests__/heartbeat-ccrotate-capacity-retry.test.ts": 13324,
     "server/src/__tests__/heartbeat-comment-wake-batching.test.ts": 22996,
-    "server/src/__tests__/heartbeat-context-summary.test.ts": 54,
+    "server/src/__tests__/heartbeat-context-summary.test.ts": 7485,
     "server/src/__tests__/heartbeat-cooldown.test.ts": 12,
     "server/src/__tests__/heartbeat-cost-accounting.test.ts": 9,
     "server/src/__tests__/heartbeat-dependabot-stale-wake-backfill.test.ts": 12121,

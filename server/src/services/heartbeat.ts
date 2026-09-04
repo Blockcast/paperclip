@@ -9539,9 +9539,14 @@ function prReviewOutputHasSelfReviewSkip(
 // an ADVERSATIVE can sit inside a single clause with the complementizer
 // dropped ("no clear evidence YET this head was"). Measured (pass 17): treating
 // them alike vetoed 6 correct skips of the form "no evidence so this head was".
-const CONSEQUENCE_CONNECTIVES = "so|because|since|therefore|thus|hence|and|but";
+const CONSEQUENCE_CONNECTIVES = "so|because|since|therefore|thus|hence|consequently|accordingly|and|but";
 const ADVERSATIVE_CONNECTIVES =
-  "yet|however|though|although|still|nonetheless|nevertheless|whereas|while|then|consequently|accordingly";
+  "yet|however|though|although|still|nonetheless|nevertheless|whereas|while|then";
+// `consequently`/`accordingly` are exact synonyms of therefore/hence and have no
+// adversative reading, so they belong with the consequences (pass 18: an
+// identical frame diverged purely on which synonym the run wrote). `then` stays
+// here on purpose: it has a real filler reading — "no evidence THEN that …" =
+// "no evidence at that time" — so its veto is defensible.
 const CONNECTIVES = `${CONSEQUENCE_CONNECTIVES}|${ADVERSATIVE_CONNECTIVES}`;
 // The connectives are DUAL-ROLE words, so the exclusion is conditioned on the
 // role rather than applied to the word. In the CONNECTIVE role the word is
@@ -9612,6 +9617,15 @@ const NEGATION_PREFIX_WORD =
       // `records`. A parallel probe found seven such gaps at once. Enumerating
       // inflections does not converge; enumerating LEMMAS does, so each entry
       // now tolerates its own paradigm.
+const EPISTEMIC_NOUN_HEAD =
+  "(?:evidence|indications?|signs?|records?|proofs?|traces?|suggestions?|statements?|assertions?|awareness|findings?|validations?|confirmation|verification|determination)";
+// The NOUN subset of EPISTEMIC_HEAD. An adjective may sit between a negation and
+// a noun head ("no CLEAR evidence yet"), but for a VERB head the intervening
+// words are necessarily the SUBJECT ("no COMMITS appear yet"), so slack there
+// swallows the subject and misreads the main verb as the negation's head.
+// Present-tense verbs take no auxiliary, so the auxiliary exclusion alone did
+// not mark them (pass 18: appear/indicate/suggest all regressed). The
+// discriminator is part of speech, not the auxiliary.
 const EPISTEMIC_HEAD =
   "(?:evidence|indications?|indicat(?:e|es|ed|ing)|signs?|records?|proofs?|traces?" +
   "|suggestions?|statements?|assertions?|awareness|findings?|validations?" +
@@ -9730,7 +9744,9 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // Dropping the exclusion instead trades back 20/20 connective-sense skips.
   {
     name: "negatedHeadConnective",
-    stem: `${NEGATION_PREFIX_WORD}\\s+(?:(?!(?:was|were|is|are|has|have|had|been|be|did|does|do)\\b)\\w+\\s+){0,2}${EPISTEMIC_HEAD}\\s+(?:${ADVERSATIVE_CONNECTIVES})\\b`,
+    stem:
+      `(?:${NEGATION_PREFIX_WORD}\\s+(?:(?!(?:was|were|is|are|has|have|had|been|be|did|does|do)\\b)\\w+\\s+){0,2}${EPISTEMIC_NOUN_HEAD}` +
+      `|${NEGATION_PREFIX_WORD}\\s+${EPISTEMIC_HEAD})\\s+(?:${ADVERSATIVE_CONNECTIVES})\\b`,
   },
   // An epistemic negation governing the clause from further back: a negation
   // word, then within three words a head that could establish the claim. One
