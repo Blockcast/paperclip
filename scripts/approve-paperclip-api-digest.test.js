@@ -808,7 +808,7 @@ test("the owner is emitted only after the ring write actually lands", () => {
 // stops firing, and only running it catches that.
 const cleanupSource = extractShellFunction("cleanup_on_exit");
 
-function runCleanup({ armed, preserve, status }) {
+function runCleanup({ armed, preserve, status, releaseFails = false }) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-cleanup-"));
   const harness = [
     "set -uo pipefail",
@@ -816,11 +816,20 @@ function runCleanup({ armed, preserve, status }) {
     `lock_preserve_on_failure=${preserve ? "yes" : '""'}`,
     "DIGEST=sha256:feedface",
     // cleanup_on_exit rm -f's these; point them at unused paths in a scratch dir.
-    ...["replace_err", "nonce_err", "server_plan_err", "probe_attempts_log"].map(
+    ...["replace_err", "nonce_err", "server_plan_err", "probe_attempts_log", "release_err"].map(
       (name) => `${name}=${JSON.stringify(path.join(dir, name))}`,
     ),
+    // The failed-retirement branch names the cluster coordinates of the owner
+    // annotation, so the harness has to carry them or `set -u` aborts the
+    // cleanup before it reaches the branch under test. Real values, not
+    // placeholders: the assertion below reads the command it prints.
+    "NAMESPACE=paperclip-release-approvals",
+    "CONFIGMAP=paperclip-api-approved-images",
+    "LOCK_OWNER_ANNOTATION=paperclip.blockcast.net/approval-in-flight-owner",
     // Stubbed so the test observes the DECISION to retire, with no cluster.
-    'release_in_flight_lock() { echo "RELEASED" >&2; return 0; }',
+    releaseFails
+      ? "release_in_flight_lock() { return 1; }"
+      : 'release_in_flight_lock() { echo "RELEASED" >&2; return 0; }',
     cleanupSource,
     // cleanup_on_exit reads $?, so set it exactly as the trap would.
     `( exit ${status} )`,
@@ -1015,6 +1024,113 @@ test("nothing disarms the cleanup between the ring write and the probe", () => {
   );
 });
 
+// Exercises release_in_flight_lock's read failure directly, with kubectl stubbed
+// rather than mocked away, so the branch runs as written. Without this the
+// empty-stderr guard could be deleted and every other test here stays green --
+// which is exactly how the dangling-colon regression it fixes got shipped.
+function runRelease({ stderrText }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-"));
+  const errFile = path.join(dir, "release_err");
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+  const harness = [
+    "set -uo pipefail",
+    "NAMESPACE=paperclip-release-approvals",
+    "CONFIGMAP=paperclip-api-approved-images",
+    "RETIRE_ATTEMPTS=1",
+    `release_err=${JSON.stringify(errFile)}`,
+    // Fails, writing exactly what the case under test needs it to write.
+    `kubectl() { ${stderrText ? `printf '%s\\n' ${JSON.stringify(stderrText)} >&2; ` : ""}return 1; }`,
+    fn,
+    "release_in_flight_lock",
+  ].join("\n");
+  const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  return { status: r.status, stderr: r.stderr };
+}
+
+test("the retirement loop and its trailing-sleep guard cannot drift apart", () => {
+  // Sugg 1's actual point: the bound was spelled `1 2 3` while the guard it
+  // paces reads a named constant, so changing one silently desynchronises them.
+  // Asserted on the extracted function, and on the two bounds referring to the
+  // SAME identifier -- a presence check for "RETIRE_ATTEMPTS" would pass on a
+  // loop still hardcoded to `1 2 3` with the constant used only in the guard.
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+  const loop = fn.match(/for attempt in \$\(seq 1 "\$(\w+)"\); do/);
+  assert.ok(loop, "the retirement loop must take its bound from a named constant, not `1 2 3`");
+  const guard = fn.match(/if \(\( attempt < (\w+) \)\); then/);
+  assert.ok(guard, "the trailing sleep must be guarded by an explicit `if`, not `(( … )) && sleep`");
+  assert.equal(
+    guard[1],
+    loop[1],
+    `guard bound ${guard[1]} must be the loop bound ${loop[1]} -- two names is the drift this prevents`,
+  );
+  // And that name must resolve on the approval path. Declared inside retire-only
+  // mode it would be unset here, and `set -u` would abort cleanup_on_exit
+  // mid-retirement -- turning this parity fix into a fresh wedge.
+  const decl = new RegExp(`^readonly ${loop[1]}=\\d+$`, "m");
+  assert.match(script, decl, `${loop[1]} must be declared at top level, reachable from cleanup_on_exit`);
+  const declIndex = script.search(decl);
+  assert.ok(
+    declIndex < script.indexOf("release_in_flight_lock() {"),
+    "the declaration must precede the function that reads it",
+  );
+});
+
+test("a read failure with no stderr still explains itself", () => {
+  // kubectl killed by a signal, or dead before it wrote: the old code printed
+  // "cannot read ...:" and then nothing at all after the colon.
+  const result = runRelease({ stderrText: "" });
+  assert.equal(result.status, 1, "an unreadable ConfigMap must fail closed");
+  assert.match(
+    result.stderr,
+    /\(kubectl produced no error output\)/,
+    "an empty stderr must say so rather than leaving a dangling colon",
+  );
+  assert.doesNotMatch(
+    result.stderr,
+    /to retire the in-flight lock:\s*$/,
+    "the message must not end at the colon it promises to expand on",
+  );
+});
+
+test("a read failure WITH stderr passes the cause through", () => {
+  // The other direction: the guard must not swallow a real cause. Without this
+  // row, replacing the sed with an unconditional placeholder would pass.
+  const result = runRelease({ stderrText: 'Error from server (Forbidden): configmaps is forbidden' });
+  assert.match(result.stderr, /Forbidden/, "the real kubectl cause must survive");
+  assert.doesNotMatch(
+    result.stderr,
+    /\(kubectl produced no error output\)/,
+    "the placeholder must not appear when kubectl did write a cause",
+  );
+});
+
+test("a failed retirement names where the owner still exists, not a dead end", () => {
+  // The Important finding this replaces: the operator is handed the wedge on
+  // exactly this path, and every source the old text pointed at is empty of the
+  // owner -- LOCK_OWNER_ID reaches stdout only in the success epilogue, past
+  // this window entirely. Retire-only mode refuses to run without the owner, so
+  // "re-run with ABANDON_IN_FLIGHT_OWNER" without saying where to get it is not
+  // a recovery path. The annotation is the one place it provably still exists.
+  const result = runCleanup({ armed: true, preserve: false, status: 1, releaseFails: true });
+  assert.equal(result.released, false, "this test needs the retirement to have FAILED");
+  assert.match(
+    result.stderr,
+    /kubectl -n paperclip-release-approvals get configmap paperclip-api-approved-images/,
+    "the warning must name the cluster read that recovers the owner",
+  );
+  assert.match(
+    result.stderr,
+    /approval-in-flight-owner/,
+    "the warning must name the owner annotation specifically, not just the ConfigMap",
+  );
+});
+
 test("a signal is routed into the cleanup rather than killing the script outright", () => {
   // Without these three lines a SIGTERM kills bash with no trap, the lock stays
   // live, and the cleanup step in docker.yml cannot name it -- which is exactly
@@ -1023,6 +1139,25 @@ test("a signal is routed into the cleanup rather than killing the script outrigh
   for (const wiring of ["trap cleanup_on_exit EXIT", "trap 'exit 130' INT", "trap 'exit 143' TERM"]) {
     assert.ok(script.includes(wiring), `missing trap wiring: ${wiring}`);
   }
+
+  // Presence alone is the failure mode the sibling test above deliberately
+  // avoids. A second EXIT trap installed after this one silently displaces
+  // cleanup_on_exit and leaves every assertion here green -- and that is not
+  // hypothetical: this same script installs `trap 'rm -f "$retire_err"' EXIT`
+  // in retire-only mode. It is harmless only because that mode always exits
+  // first, a property nothing asserted until now. So assert on real source
+  // offsets: cleanup_on_exit must be the LAST EXIT trap in the file, and the
+  // retire-only trap that precedes it must sit on a path that has already
+  // exited.
+  const exitTraps = [...script.matchAll(/^[ \t]*trap[ \t]+(.+?)[ \t]+EXIT[ \t]*$/gm)];
+  assert.ok(exitTraps.length >= 1, "no EXIT trap found at all");
+  const lastTrap = exitTraps[exitTraps.length - 1];
+  assert.equal(
+    lastTrap[1],
+    "cleanup_on_exit",
+    `the last EXIT trap must be cleanup_on_exit, found ${lastTrap[1]} -- ` +
+      "a trap installed after it displaces the lock retirement entirely",
+  );
 
   // And the statuses those traps synthesise do land in the retire branch: the
   // branch keys on "non-zero", so 143/130 must behave exactly like any failure.
