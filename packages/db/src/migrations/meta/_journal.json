@@ -1611,6 +1611,13 @@
       "when": 1788480000000,
       "tag": "0237_heartbeat_runs_agent_queued_dispatch_index",
       "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1788560000000,
+      "tag": "0238_heartbeat_runs_status_only_document_write_refused",
+      "breakpoints": true
     }
   ]
 }

@@ -446,10 +446,27 @@ function createRunContextDb(
     select,
     insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
   };
+  // BLO-23197: the status-only guard stamps
+  // `heartbeat_runs.status_only_document_write_refused_at` before returning its
+  // 403, so the successful-run-handoff detector can escalate the corrective wake
+  // off a lane that provably cannot land the refused write. Every `.set()`
+  // payload is captured so a test can assert the stamp was written — and, just
+  // as importantly, that repeated refusals keep re-stamping, since the whole
+  // point of using a run column over the denied-write activity log is that a run
+  // column has no aggregate cap to silently drop the signal under burst.
+  const runUpdates: Array<Record<string, unknown>> = [];
+  const update = vi.fn(() => ({
+    set: vi.fn((values: Record<string, unknown>) => {
+      runUpdates.push(values);
+      return { where: vi.fn(async () => undefined) };
+    }),
+  }));
   return {
     transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
     execute: tx.execute,
     select,
+    update,
+    runUpdates,
   };
 }
 
@@ -3556,6 +3573,130 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.unlink).not.toHaveBeenCalled();
+  });
+
+  // BLO-23197: the refusal has to leave a durable mark, or the
+  // successful-run-handoff detector has nothing to escalate on and queues
+  // another status-only wake into the identical 403.
+  it("stamps the run when a status-only recovery run is refused an issue-document write", async () => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    const app = await createApp(ownerActor(), routeDb);
+
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# refused" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot update issue documents");
+    expect(res.body.details).toMatchObject({ resumeRequiresNormalModel: true });
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+
+    const stamps = routeDb.runUpdates.filter((values) => "statusOnlyDocumentWriteRefusedAt" in values);
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]!.statusOnlyDocumentWriteRefusedAt).toBeInstanceOf(Date);
+  });
+
+  // The reason this signal lives on the run row rather than in the denied-write
+  // activity log the sibling guards use: that log is capped at
+  // DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS = 5 per (company, actor, issue) and
+  // also repeat-deduped, and both bounds drop the record SILENTLY. An escalation
+  // keyed on it would go quiet exactly when an issue is churning through repeated
+  // denials — the load that produces the deadlock — while still passing the
+  // single-refusal test above. This asserts the replacement has no such bound.
+  it("keeps stamping the run across repeated document refusals, past the denied-write aggregate cap", async () => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    const app = await createApp(ownerActor(), routeDb);
+
+    const attempts = 8;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await request(app)
+        .put(`/api/issues/${issueId}/documents/plan`)
+        .send({ format: "markdown", body: `# refused ${attempt}` })
+        .expect(403);
+    }
+
+    const stamps = routeDb.runUpdates.filter((values) => "statusOnlyDocumentWriteRefusedAt" in values);
+    expect(stamps).toHaveLength(attempts);
+  });
+
+  // Scoped to documents on purpose. `planning_only` — the lane the detector
+  // escalates to — permits document updates but still bars deliverables and
+  // annotations, so stamping a refused deliverable write would escalate onto a
+  // lane that still cannot perform it. Those need a full normal-model run.
+  it.each([
+    [
+      "work product create",
+      (app: express.Express) =>
+        request(app).post(`/api/issues/${issueId}/work-products`).send({
+          type: "artifact",
+          provider: "test",
+          title: "Artifact",
+        }),
+    ],
+    [
+      "annotation thread creation",
+      (app: express.Express) => request(app)
+        .post(`/api/issues/${issueId}/documents/plan/annotations`)
+        .send({
+          baseRevisionId: "88888888-8888-4888-8888-888888888888",
+          baseRevisionNumber: 1,
+          selector: {
+            quote: { exact: "selected", prefix: "", suffix: "" },
+            position: { normalizedStart: 0, normalizedEnd: 8, markdownStart: 0, markdownEnd: 8 },
+          },
+          body: "Review this",
+        }),
+    ],
+  ])("does not stamp a document refusal when the refused write was %s", async (_name, sendRequest) => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    const app = await createApp(ownerActor(), routeDb);
+
+    await sendRequest(app).expect(403);
+
+    expect(routeDb.runUpdates.filter((values) => "statusOnlyDocumentWriteRefusedAt" in values)).toEqual([]);
+  });
+
+  // The 403 is this guard's contract and must survive a failing stamp: losing
+  // the refusal to a 500 would be a strictly worse outcome than losing the
+  // escalation signal.
+  it("still refuses the write when stamping the run fails", async () => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    routeDb.update = vi.fn(() => {
+      throw new Error("heartbeat_runs update failed");
+    }) as unknown as typeof routeDb.update;
+    const app = await createApp(ownerActor(), routeDb);
+
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# refused" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot update issue documents");
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
   });
 
   it("allows planning-only recovery to update its issue document but blocks implementation artifacts", async () => {

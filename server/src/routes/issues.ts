@@ -6894,6 +6894,42 @@ export function issueRoutes(
     if (statusOnly && writesStatusAdjudication) return true;
     if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
+    // BLO-23197: record the refusal on the run row so the successful-run-handoff
+    // detector can escalate the corrective wake off this lane. `details` below
+    // already names the remedy (`resumeRequiresNormalModel: true`), but it lives
+    // only in an HTTP response nobody re-reads, so `decideSuccessfulRunHandoff`
+    // was left inferring the lane from `issues.workMode` — a proxy that reads
+    // `standard` in exactly the deadlocking case and queues another status-only
+    // wake into the identical 403.
+    //
+    // Documents only: the escalation target is `planning_only`, which permits
+    // document updates but still bars deliverables and annotations, so a refused
+    // deliverable write would be escalated onto a lane that still cannot perform
+    // it. Deliberately NOT routed through `recordDeniedIssueWrite` like the
+    // sibling guards — that log's aggregate cap and repeat dedupe both drop
+    // records silently, so a signal read from it would go quiet under repeated
+    // denials, which is the very load that produces the deadlock.
+    //
+    // Best-effort by design: the 403 is the contract of this function and must
+    // be delivered even if the stamp fails, so a failure is logged and
+    // swallowed rather than surfacing as a 500. Unlike the activity-log cap this
+    // replaces, the drop is uncorrelated with denial volume — re-refusals
+    // re-stamp the same row by primary key — so it degrades on genuine database
+    // failure only, and says so in the log.
+    if (statusOnly && mutationKind === "document") {
+      try {
+        await db
+          .update(heartbeatRuns)
+          .set({ statusOnlyDocumentWriteRefusedAt: new Date(), updatedAt: new Date() })
+          .where(eq(heartbeatRuns.id, run.id));
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id, issueId: issue.id, documentKey },
+          "status_only_document_write_refusal_stamp_failed",
+        );
+      }
+    }
+
     res.status(403).json({
       error: planningOnly
         ? "Planning-only recovery runs can update issue documents but cannot create or modify annotations or deliverable artifacts"

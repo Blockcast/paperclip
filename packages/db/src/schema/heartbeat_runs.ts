@@ -111,6 +111,31 @@ export const heartbeatRuns = pgTable(
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
+    // BLO-23197: set when this run was refused an issue-DOCUMENT write by the
+    // status-only recovery guard (`assertDeliverableMutationAllowedByRunContext`).
+    // Read by `decideSuccessfulRunHandoff` to escalate the corrective wake off
+    // the status-only lane, so the write that was refused can actually land.
+    //
+    // Why a column and not the existing denied-write activity log: that log is
+    // bounded by DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS (5 per company/actor/
+    // issue) plus an exact-repeat dedupe, and BOTH drop the record silently. An
+    // escalation keyed on it would therefore stop escalating precisely when an
+    // issue is churning through repeated denials — the load that produces the
+    // deadlock — while passing a single-denial unit test. It is also written
+    // `quarantined: true` as untrusted-actor telemetry, which is the wrong
+    // layering for a control-plane scheduling signal.
+    //
+    // Scoped to documents on purpose. The escalation target is `planning_only`,
+    // which permits document updates but still bars deliverables and
+    // annotations, so escalating on a refused *deliverable* write would hand out
+    // a lane that still cannot perform it. Those need a full normal-model run,
+    // a wider grant than this detector should make on its own.
+    //
+    // Nullable with no default so the ADD COLUMN stays rewrite-free on this
+    // large table; absent means "never refused". See migration 0238.
+    statusOnlyDocumentWriteRefusedAt: timestamp("status_only_document_write_refused_at", {
+      withTimezone: true,
+    }),
     issueCommentStatus: text("issue_comment_status").notNull().default("not_applicable"),
     issueCommentSatisfiedByCommentId: uuid("issue_comment_satisfied_by_comment_id"),
     issueCommentRetryQueuedAt: timestamp("issue_comment_retry_queued_at", { withTimezone: true }),
