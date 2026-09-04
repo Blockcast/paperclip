@@ -132,10 +132,30 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
 // docker.yml does exactly that, four times), so a bare chdir is not the thing
 // being caught -- running the suite from inside the chart is.
 //
+// The directory is bounded by a delimiter class, not by end-of-line. An
+// end-of-line anchor only catches a chdir that is the whole line, so
+// `cd <dir> && node --test ...` -- the most idiomatic single-line spelling --
+// walked straight through it, as did `;`, `||` and a trailing comment. The left
+// side needs the same treatment for two separate reasons: a chdir can be the
+// second half of a compound command (`mkdir -p x && cd <dir>`), and on a
+// single-line `run:` there is no newline in front of `cd` at all, so anchoring
+// on one silently exempted the inline spelling while catching the identical
+// `run: |` block form. `pushd` is in the alternation because it is `cd` with a
+// stack: nothing here pushd's into the chart for any other purpose, so naming
+// it as an escape and covering it cost the same, and only one of those two
+// stays true as the file changes.
+//
 // Still not exhaustive, and deliberately not claimed to be: a chdir built from
-// a shell variable, a matrix value, or a `pushd` escapes both assertions. This
-// closes the two spellings a re-add would plausibly be written in, which is the
-// axis the assertion above leaves open -- not the whole space.
+// a shell variable or a matrix value escapes both assertions, because then the
+// path never appears literally at all. This closes the spellings a re-add would
+// plausibly be written in, which is the axis the assertion above leaves open --
+// not the whole space.
+//
+// Both this and `policySteps` split steps on `- name: `, so a step written
+// without a `name:` folds into the preceding step's chunk and is attributed to
+// that step's offset. It fails safe the same way `jobOwning` does, and for the
+// same reason: the text is still inside some chunk, and attribution can only
+// drift backwards, never forwards into a job that has not started yet.
 const CHART_DIR = "deploy/helm/paperclip";
 
 test("only helm_chart runs the chart suite from inside the chart directory (BLO-31516)", () => {
@@ -145,7 +165,9 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
     const next = workflow.indexOf(marker, at + 1);
     const step = workflow.slice(at, next === -1 ? undefined : next);
     if (!step.includes("node --test")) continue;
-    const chdirs = new RegExp(`\\n\\s+(?:working-directory:|cd) +\\.?/?${CHART_DIR}/?\\s*$`, "m").test(step);
+    const chdirs = new RegExp(
+      `(?:[\\n;&|]|run:)\\s*(?:working-directory:|cd|pushd) +\\.?/?${CHART_DIR}/?(?=[\\s&;|]|$)`,
+    ).test(step);
     if (chdirs && jobOwning(at) !== "helm_chart") {
       offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
     }
@@ -182,15 +204,32 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
 // image's pinned yq"), so pin the chart renderer the same way and gate it.
 //
 // Read the `version:` key on its own rather than matching the shape of the
-// whole `with:` block. The invariant is "a version is named and it isn't
-// `latest`" -- the action's default -- and nothing more. Requiring `version` to
-// be the first key under `with:` false-reds on a correctly pinned install the
-// moment a sibling lands above it (`token` and `downloadBaseURL` are both real
-// setup-helm inputs, and alphabetical ordering puts `downloadBaseURL` first);
-// requiring a leading `v` and three components rejects `3.16.3` and `v3.17`,
-// which the action documents as valid. All three of those failed with "must
-// pin an explicit version" against installs that were pinned, which sends the
-// next reader hunting for a pin that is right there.
+// whole `with:` block, and read only its value -- not the indent in front of
+// it, the quotes around it, or what follows it on the line. The invariant is "a
+// version is named and it isn't `latest`" -- the action's default -- and
+// nothing more. Requiring `version` to be the first key under `with:`
+// false-reds on a correctly pinned install the moment a sibling lands above it
+// (`token` and `downloadBaseURL` are both real setup-helm inputs, and
+// alphabetical ordering puts `downloadBaseURL` first); requiring a leading `v`
+// and three components rejects `3.16.3` and `v3.17`, which the action documents
+// as valid; and requiring a fixed ten-space indent with a bare value ending its
+// line rejects `"v3.16.3"`, a twelve-space indent, `with: { version: ... }`,
+// and a trailing comment on the pin line. That last one is the one to weigh:
+// this pin already carries four comment lines justifying it, so moving any of
+// that onto the pin line is the obvious next edit, and it would have turned
+// `verify` red. Every one of these reported "must pin an explicit version"
+// against an install that was pinned, which sends the next reader hunting for a
+// pin that is right there.
+//
+// `[\s{,]` in front of the key is what keeps this off `node-version:`; the
+// value ends at a quote, whitespace, `#`, `,` or `}`.
+//
+// The quote is captured rather than discarded for one narrow case in the other
+// direction. YAML resolves an unquoted `\d+\.\d+` as a float, so `version: 3.10`
+// reaches the action as `3.1` -- the `python-version: 3.10` trap. Only a
+// trailing zero survives that round trip wrong (`3.16` renders back as `3.16`),
+// so a trailing zero is all this rejects, and either quoting the value or
+// naming the patch component clears it.
 test("the chart render job pins the helm it renders with (BLO-31516)", () => {
   const region = jobRegion("helm_chart");
   const step = region
@@ -198,7 +237,8 @@ test("the chart render job pins the helm it renders with (BLO-31516)", () => {
     .slice(1)
     .find((candidate) => candidate.includes("azure/setup-helm"));
   assert.ok(step, "helm_chart must install helm");
-  const version = step.match(/\n {10}version: *(\S+)\n/)?.[1];
+  const pin = step.match(/[\s{,]version:[ \t]*(["']?)([^"'\s#,}]+)\1/);
+  const version = pin?.[2];
   assert.ok(
     version && version !== "latest",
     "the helm install must pin an explicit version, not float on the action's default (`latest`)",
@@ -207,5 +247,9 @@ test("the chart render job pins the helm it renders with (BLO-31516)", () => {
     version,
     /^v?\d+\.\d+(\.\d+)?(-[0-9A-Za-z.-]+)?$/,
     `the helm version must name a release, got ${version}`,
+  );
+  assert.ok(
+    pin[1] || !/^\d+\.\d+0+$/.test(version),
+    `unquoted ${version} is a YAML float and reaches the action as ${Number(version)}; quote it or name the patch component`,
   );
 });
