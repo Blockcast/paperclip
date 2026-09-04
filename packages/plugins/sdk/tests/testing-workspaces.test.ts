@@ -135,6 +135,18 @@ describe("createTestHarness getWorkspaceForIssue", () => {
     expect(result).toMatchObject({ id: primaryWorkspace.id, path: BASE_CHECKOUT, isIssueScoped: false, mode: null });
   });
 
+  // `closed` is documented as "absent or `false` both mean not closed"
+  // (`types.ts`). The happy path above inherits the helper's absent default, so
+  // this pins the other half of that promise explicitly.
+  it("resolves the bound workspace when `closed` is explicitly false", async () => {
+    const workspace = executionWorkspace({ id: "ws-a", closed: false });
+    const harness = harnessWith([workspace], [{ id: "issue-a", executionWorkspaceId: "ws-a" }]);
+
+    const result = await harness.ctx.projects.getWorkspaceForIssue("issue-a", COMPANY_ID);
+
+    expect(result).toMatchObject({ id: "ws-a", path: workspace.cwd, isIssueScoped: true });
+  });
+
   it("falls back when the bound workspace has no realized cwd", async () => {
     const harness = harnessWith(
       [executionWorkspace({ id: "ws-a", cwd: null })],
