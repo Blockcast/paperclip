@@ -6,12 +6,14 @@ import {
   EXPECTED_OUTPUT_SHA256,
   MAX_SILENT_WINDOWS,
   boundBlockers,
+  canonicalRows,
   classifyAgentHealth,
   classifyRoutineRuns,
   compareIdentifier,
   currentWindowEnd,
   deriveRendererOutput,
   executeDetailWrite,
+  maxStepPercent,
   planDetailShards,
   runComparatorCases,
   runDetailWriteFixture,
@@ -451,8 +453,62 @@ describe("census completeness is derived from observed coverage, not from the ke
   });
 });
 
-describe("synthetic renderer fixture is a real derivation, not a restated literal", () => {
-  it("matches the persisted canonical-input and transformed-output hashes", () => {
+// --- Regression: Ally Important findings #1 and #2 on PR #1571, head 3707eaca --
+// Neither `superseded_fingerprint` nor `cap_raise_july_backtest` was referenced
+// from this file at all, which is how both kept inert assertions: the fixture
+// suite reported them `pass` while their headline claims were asserted against
+// constants. These pin the derivations the fixtures now read.
+describe("fixture derivations are load-bearing, not restated literals", () => {
+  const canonical = [
+    { category: "agent_in_error", subjectId: "agent-1", severity: "p1" },
+    { category: "stalled_issue", subjectId: "BLO-1", severity: "p2" },
+  ];
+
+  it("drops superseded and category-less rows from the canonical fingerprint input", () => {
+    const superseded = {
+      approvalId: "fixture-1", agentId: "fixture-agent", requestedCapCents: 800000, currentCapCents: 1200000,
+    };
+    // The row the fixture is named for carries no `category` at all...
+    assert.deepEqual(canonicalRows([...canonical, superseded]), canonical);
+    // ...and an explicitly superseded row is dropped even with a canonical shape,
+    // so the rule under test is the supersession, not the absent category.
+    assert.deepEqual(canonicalRows([...canonical, { ...canonical[0], superseded: true }]), canonical);
+  });
+
+  it("keeps the canonical fingerprint responsive, so stable does not mean empty", () => {
+    // Two-sided control: a drop that discarded everything would make the
+    // fixture's "fingerprint stable" assertion vacuously true.
+    const extra = { category: "stalled_issue", subjectId: "BLO-2", severity: "p2" };
+    assert.deepEqual(canonicalRows([...canonical, extra]), [...canonical, extra]);
+    assert.deepEqual(canonicalRows([]), []);
+  });
+
+  it("derives the largest single step from the same array the cumulative reads", () => {
+    // The fixture's discriminating claim: cumulative crosses 25%, no single step does.
+    const steps = [1.08, 1.08, 1.08];
+    const cumulativePct = (steps.reduce((acc, step) => acc * step, 1) - 1) * 100;
+    assert.equal(Math.round(maxStepPercent(steps)), 8);
+    assert.ok(cumulativePct > 25, "cumulative must cross the threshold");
+    assert.ok(maxStepPercent(steps) < 25, "no individual step may cross it");
+
+    // Negative control — the mutation that used to leave the fixture green while
+    // it still printed "(max step 8%)". A 30%-per-step raise is exactly what the
+    // per-step half exists to reject, so it must now fail that half.
+    assert.ok(maxStepPercent([1.3, 1.3, 1.3]) > 25, "a 30% step must not read as under the threshold");
+    // ...and the bound tracks the largest step, not the first or the last.
+    assert.equal(Math.round(maxStepPercent([1.02, 1.3, 1.05])), 30);
+  });
+
+  it("reports the derived max step in the fixture detail, not a hardcoded 8", () => {
+    const capRaise = runMandatoryFixtures().fixtures.find((entry) => entry.name === "cap_raise_july_backtest");
+    assert.equal(capRaise.status, "pass");
+    // The detail string is read as evidence, so it must be interpolated from the
+    // same derivation the assertion uses.
+    assert.match(capRaise.detail, /max step 8%/);
+  });
+});
+
+describe("synthetic renderer fixture is a real derivation, not a restated literal", () => {  it("matches the persisted canonical-input and transformed-output hashes", () => {
     assert.equal(sha256(CANONICAL_INPUT_BYTES), CANONICAL_INPUT_SHA256);
     const result = runSyntheticRendererFixture();
     assert.equal(result.status, "pass");

@@ -16,6 +16,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 export const V4_FIXTURE_MANIFEST = Object.freeze([
   "agent_health_status_overrides_interleaved_runs",
@@ -419,27 +420,47 @@ export function runMandatoryFixtures() {
     { category: "agent_in_error", subjectId: "agent-1", severity: "p1" },
     { category: "stalled_issue", subjectId: "BLO-1", severity: "p2" },
   ];
+  // Total, not partial: a row that reached this sort without a `category` is
+  // exactly the regression this fixture exists to catch, and it must report as a
+  // clean fixture `fail` with a differing fingerprint rather than throwing a
+  // TypeError that takes the other six fixtures' reporting down with it.
   const fingerprintOf = (rows) => sha256(JSON.stringify(
-    [...rows].sort((a, b) => a.category.localeCompare(b.category) || compareIdentifier(a.subjectId, b.subjectId)),
+    [...rows].sort((a, b) => (a.category ?? "").localeCompare(b.category ?? "")
+      || compareIdentifier(a.subjectId, b.subjectId)),
   ));
   const f0 = fingerprintOf(canonical);
   const supersededRows = [{
     approvalId: "fixture-1", agentId: "fixture-agent", agentName: "FixtureAgent",
     requestedCapCents: 800000, currentCapCents: 1200000, capSource: "explicit_requested_cap",
   }];
-  const parseFailures = [{ approvalId: "fixture-2", reason: "unresolved_target" }];
-  // Superseded rows are deliberately NOT passed into the fingerprint input.
-  const f1 = fingerprintOf(canonical);
+  // The superseded rows ARE fed in now, through the drop that is supposed to
+  // exclude them, so a regression letting one reach the fingerprint fails here.
+  const fWithSuperseded = fingerprintOf(canonicalRows([...canonical, ...supersededRows]));
+  // ...and the same holds for a row that is superseded while otherwise carrying a
+  // canonical shape, so the rule under test is the supersession itself and not
+  // merely the absent `category`.
+  const fWithSupersededAlert = fingerprintOf(canonicalRows([
+    ...canonical,
+    { ...canonical[0], subjectId: "agent-9", superseded: true },
+  ]));
+  // Two-sided. Without this, a drop that discarded EVERYTHING would satisfy both
+  // assertions above: the fingerprint must still respond to a genuine canonical
+  // row, which is what makes "stable" mean stable rather than empty.
+  const fWithExtraCanonical = fingerprintOf(canonicalRows([
+    ...canonical,
+    { category: "stalled_issue", subjectId: "BLO-2", severity: "p2" },
+  ]));
   const renderedWithout = supersededSection([]);
   const renderedWith = supersededSection(supersededRows);
   fixtures.push(fixture(
     V4_FIXTURE_MANIFEST[2],
-    f0 === f1
-      && canonical.length === 2
+    fWithSuperseded === f0
+      && fWithSupersededAlert === f0
+      && fWithExtraCanonical !== f0
       && renderedWithout === null
-      && renderedWith === "$8,000 requested vs $12,000 current"
-      && parseFailures.length === 1,
-    `fingerprint stable=${f0 === f1} sectionAbsentWithout=${renderedWithout === null}`,
+      && renderedWith === "$8,000 requested vs $12,000 current",
+    `fingerprint stable across superseded=${fWithSuperseded === f0 && fWithSupersededAlert === f0}`
+      + ` responsive=${fWithExtraCanonical !== f0} sectionAbsentWithout=${renderedWithout === null}`,
   ));
 
   // 4. Human-review gate parks only on a LIVE pending card.
@@ -493,16 +514,19 @@ export function runMandatoryFixtures() {
   const pct = (current, prior) => ((current - prior) / prior) * 100;
   const ctoPct = pct(july.cto, 800000);
   const multicastPct = pct(july.multicast, 1000000);
-  const decomposition = [1.08, 1.08, 1.08].reduce((acc, step) => acc * step, 1);
+  const decompositionSteps = [1.08, 1.08, 1.08];
+  const decomposition = decompositionSteps.reduce((acc, step) => acc * step, 1);
   const decompositionPct = (decomposition - 1) * 100;
+  // Derived from the SAME array the cumulative reads — see maxStepPercent.
+  const maxStepPct = maxStepPercent(decompositionSteps);
   const capRaisePass =
     Math.round(ctoPct) === 190 && ctoPct > 25
     && Math.round(multicastPct) === 165 && multicastPct > 25
-    && decompositionPct > 25 && 8 < 25;
+    && decompositionPct > 25 && maxStepPct < 25;
   fixtures.push(fixture(
     V4_FIXTURE_MANIFEST[5],
     capRaisePass,
-    `cto=+${Math.round(ctoPct)}% multicast=+${Math.round(multicastPct)}% decomposition=+${decompositionPct.toFixed(0)}% (max step 8%)`,
+    `cto=+${Math.round(ctoPct)}% multicast=+${Math.round(multicastPct)}% decomposition=+${decompositionPct.toFixed(0)}% (max step ${maxStepPct.toFixed(0)}%)`,
   ));
 
   // 7. Large-state detail write, all four branches.
@@ -562,6 +586,35 @@ export function classifyAgentHealth(agent) {
     threeConsecutiveFailures,
     selectedFailingRun: runs.find((status) => FAILING_RUN_STATUSES.has(status)) ?? null,
   };
+}
+
+/**
+ * The production-facing drop the `superseded_fingerprint` fixture exists to pin:
+ * a superseded approval row, and any row carrying no alert `category`,
+ * contributes nothing to the canonical fingerprint input.
+ *
+ * Exported so the fixture's claim is reachable from a test. The fixture used to
+ * assert `fingerprintOf(canonical) === fingerprintOf(canonical)` — the
+ * determinism of a closure defined three lines above it — while the superseded
+ * rows it is named for were never passed into anything, so a regression that let
+ * one reach the fingerprint could not fail it (Ally review, PR #1571).
+ */
+export function canonicalRows(rows) {
+  return (rows ?? []).filter((row) => row?.category != null && row?.superseded !== true);
+}
+
+/**
+ * Largest single step of a multiplicative raise sequence, as a percentage.
+ *
+ * Derived from the same array the cumulative product reads. The
+ * `cap_raise_july_backtest` fixture asserted the literal `8 < 25` instead, so
+ * its discriminating claim — that no INDIVIDUAL step crosses the 25% threshold
+ * while the cumulative does — was asserted against a constant: replacing the
+ * three 1.08 steps with 1.30 left the fixture green and still printed
+ * "(max step 8%)" (Ally review, PR #1571).
+ */
+export function maxStepPercent(steps) {
+  return Math.max(...steps.map((step) => (step - 1) * 100));
 }
 
 function supersededSection(rows) {
@@ -809,7 +862,12 @@ export function runPreflight(rows, end) {
   return { fixtures, census, pass: fixtures.pass && census.complete };
 }
 
-if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
+// `fileURLToPath`, not `new URL(...).pathname`: the latter percent-encodes, so a
+// checkout under a directory containing a space made this comparison fail and the
+// CLI block silently no-op — exiting 0 having done nothing, which is the one
+// failure mode this file works hardest everywhere else to eliminate (Ally review,
+// PR #1571).
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const input = process.argv[2]
     ? JSON.parse(await import("node:fs/promises").then((fs) => fs.readFile(process.argv[2], "utf8")))
     : [];
