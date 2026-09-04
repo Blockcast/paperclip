@@ -4,6 +4,7 @@ import {
   derivePaperclipPrReview,
   evaluatePrReviewCompletionEvidence,
   mergeCoalescedContextSnapshot,
+  prReviewAlreadyReviewedVetoCue,
   prReviewOutputHasAlreadyReviewedSkip,
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
@@ -1136,9 +1137,47 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`It is doubtful this head was already reviewed at \`${sha}\`.`, false],
       [`alreadyreviewed at \`${sha}\`.`, false],
       [`Already reviewed at${sha}.`, false],
+      [`There is no real doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`There is no serious doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Beyond reasonable doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Without any doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I have no genuine doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`There is not the slightest doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer commits were found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head was found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing new was seen so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No later commit was found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No other review was found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head was found but this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head was found because this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
+    });
+  });
+
+  // Attribution: which cue vetoes. Eleven review passes have each needed a
+  // by-hand bisection to answer this; the table below pins one representative
+  // clause per cue so the next regression report can name the cue directly.
+  describe("BLO-31374: veto attribution names the governing cue", () => {
+    it.each([
+      ["It is unclear that this head was ", "hedge"],
+      ["Possibly ", "assumption"],
+      ["I am guessing this head was ", "assumption"],
+      ["I doubt this head was ", "assumption"],
+      ["It remains an open question whether this head was ", "questioned"],
+      ["Unclear if ", "questioned"],
+      ["The prior head was ", "priorHead"],
+      ["No evidence that this head was ", "negation"],
+      ["I cannot say this head was ", "negation"],
+      // Correct skips: no cue governs the clause, so nothing vetoes.
+      ["No evidence of a force-push, so ", null],
+      ["I did not check whether a newer head exists so ", null],
+      ["No newer commits were found so this head was ", null],
+      ["Beyond reasonable doubt this head was ", null],
+      ["The wake was probably a duplicate dispatch so ", null],
+    ])("%s -> %s", (before, cue) => {
+      expect(prReviewAlreadyReviewedVetoCue(before)).toBe(cue);
     });
   });
 
