@@ -1361,6 +1361,10 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`It is not apparent yet this head was already reviewed at \`${sha}\`.`, false],
       [`I am not positive yet this head was already reviewed at \`${sha}\`.`, false],
       [`I am not positive that this head was already reviewed at \`${sha}\`.`, false],
+      [`It is unclear this head was already reviewed at \`${sha}\`.`, false],
+      [`I am unaware this head was already reviewed at \`${sha}\`.`, false],
+      [`It is inconclusive this head was already reviewed at \`${sha}\`.`, false],
+      [`It is not obvious yet this head was already reviewed at \`${sha}\`.`, false],
       [`Everything is clear so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`I am satisfied with the checks so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`The evidence is conclusive so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
@@ -1368,6 +1372,11 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No positive drift detected, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No result was positive, but this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No coverage delta was positive, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Results are unambiguous so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It is unambiguous this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I resolved every unclear row, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It is obvious no newer head exists so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No unknown commits were found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
@@ -1393,6 +1402,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       ["I cannot fully confirm yet this head was ", "negatedHeadConnective"],
       ["I am not certain yet this head was ", "negatedHeadConnective"],
       ["I am not convinced that this head was ", "negation"],
+      ["It is unclear this head was ", "fusedNegation"],
+      ["It is not obvious yet this head was ", "negatedHeadConnective"],
       ["No evidence that this head was ", "negation"],
       ["I am not aware that this head was ", "negation"],
       // Correct skips: no cue governs the clause, so nothing vetoes.

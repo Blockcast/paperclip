@@ -9628,11 +9628,14 @@ const EPISTEMIC_NOUN_HEAD =
 // all regressed). The discriminator is part of speech, not the auxiliary.
 //
 // EPISTEMIC_HEAD also carries the epistemic ADJECTIVES. Pass 20: it held only
-// `aware`, so "I am not certain yet …" and "It is not clear yet …" masked while
-// the FUSED `unconvinced` vetoed — the mirror of the defect fusedNegation's own
-// comment records solving in the other direction. `hedge` hand-adds
-// `not sure|not clear`, but its stem hardcodes a following `that`, so the
-// elided-complementizer form leaked. The family belongs HERE rather than in a
+// `aware`, so "I am not certain yet …" and "It is not clear yet …" masked. Pass
+// 21 corrects how that pass described the asymmetry: it said the FUSED
+// `unconvinced` vetoed, and it does so ONLY with an explicit complementizer.
+// With the complementizer elided both sides masked, so fixing the spelled-out
+// side here briefly created a NEW asymmetry (spelled-out 7/7 vetoing, fused
+// 0/12) rather than closing an old one. `fusedNegation` is bare as of pass 21
+// and both sides now bind through CLAUSE_REACH. The family belongs HERE rather
+// than in a
 // fourth list: one insertion makes it reachable by `negation`,
 // `negatedHeadConnective` and the copula arm at once, and it inherits
 // CLAUSE_REACH like every other head. Measured 2/14 -> 13/14 on the family with
@@ -9640,6 +9643,14 @@ const EPISTEMIC_NOUN_HEAD =
 // is clear so …", "The evidence is conclusive so …") — COPULA_FILLER already
 // refuses to cross a consequence connective, so an adjective governing the
 // PREVIOUS clause still cannot reach this one.
+//
+// `obvious` joined the family in pass 21 as an exact synonym of `apparent` and
+// `evident`, which were already in it. Probing the same frame across 24
+// candidate adjectives left four other leaks — `settled`, `decided`,
+// `documented`, `visible` — which are deliberately NOT added: they describe the
+// state of the world rather than the speaker's confidence, so they are likelier
+// to appear in a correct skip than in a hedge. They remain known residuals, not
+// asserted-correct behaviour, on the same reasoning the `\w+ly` rejection gives.
 //
 // `positive` is INCLUDED, against the pass-20 review's recommendation to drop
 // it, because mutation-testing that recommendation refuted its premise. The
@@ -9664,7 +9675,7 @@ const EPISTEMIC_HEAD =
   "|suggestions?|statements?|assertions?|awareness|findings?|validations?" +
   "|believ(?:e|es|ed)|think(?:s|ing)?|thought|appear(?:s|ed|ing)?" +
   "|suggest(?:s|ed|ing)?|aware|certain|convinced|confident|persuaded|satisfied" +
-  "|sure|clear|evident|apparent|conclusive|definitive|positive|see|sees|seen|saw|seeing" +
+  "|sure|clear|evident|apparent|obvious|conclusive|definitive|positive|see|sees|seen|saw|seeing" +
   "|confirm(?:s|ed|ing)?|confirmation|verif(?:y|ies|ied|ying)|verification" +
   "|establish(?:es|ed|ing)?|determin(?:e|es|ed|ing)|determination" +
   "|find|finds|found|finding|check(?:s|ed|ing)?|locat(?:e|es|ed|ing)" +
@@ -9806,13 +9817,35 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // …"), so there is no separate negation word for the `negation` prefix to
   // anchor on, and listing these as heads left them unreachable — measured:
   // "not aware that" vetoed while "unaware that" did not. They get their own
-  // stem, which inherits CLAUSE_REACH like every other, so the fused form binds
-  // exactly as the spelled-out one does. `hedge` already covers unclear/unsure/
-  // uncertain/unconfirmed/unverified; this entry adds the mental-state
-  // participles that `hedge` does not carry.
+  // stem, which inherits CLAUSE_REACH like every other.
+  //
+  // Pass 21: that stem was NOT bare — it required `(?:that|whether|if)`, and
+  // `hedge` likewise hardcodes a following `that`. So the claim that "the fused
+  // form binds exactly as the spelled-out one does" held only for the
+  // complementizer-bearing case: with it elided, all 12 of these words masked
+  // (measured 0/12, cue `null`) while their spelled-out counterparts vetoed
+  // 7/7 after pass 20. The stem is bare now, which is the same structural move
+  // pass 20 made for the spelled-out side — let CLAUSE_REACH bind it instead of
+  // enumerating a complementizer-free variant. Measured 12/12 vetoing with 0
+  // rows changed in the committed corpus and 0/12 new false-vetoes on
+  // adversarial non-hedge uses ("No unknown commits were found so …", "I
+  // resolved every unclear row, so …"). The leading `\b` is load-bearing and
+  // separately pinned: "It is unambiguous this head was …" is a correct skip
+  // that false-vetoes without it, because `ambiguous` matches inside
+  // `unambiguous`. A connective- or comma-bearing control does NOT pin it — the
+  // clause-boundary rules block the veto either way, so the row has to be the
+  // bare frame. Measured: with `\b` true, without `\b` false.
+  //
+  // The eight `hedge` words are deliberately listed in BOTH places: `hedge`'s
+  // `that`-form stays the cheaper match, and this bare stem is what makes them
+  // reachable when the complementizer is dropped. `ambiguous` is the one member
+  // that is not morphologically a fused negation; it is kept here because it
+  // hedges identically and needs the same bare binding.
   {
     name: "fusedNegation",
-    stem: "\\b(?:unaware|unconvinced|unpersuaded|unsatisfied)\\s+(?:\\w+\\s+){0,3}(?:that|whether|if)",
+    stem:
+      "\\b(?:unaware|unconvinced|unpersuaded|unsatisfied|unclear|unsure|uncertain" +
+      "|unknown|unverified|unconfirmed|ambiguous|inconclusive)",
   },
   {
     name: "negation",
