@@ -201,12 +201,24 @@ function lockedConfigMap({ digest, owner }) {
 // A fake `kubectl` that serves one ConfigMap and records any replace. Real jq
 // and real bash; only the cluster is stubbed, so the script under test is the
 // shipping one, byte for byte.
-function runRetire({ liveConfigMap, digest, owner }) {
+//
+// `replaceStatus`/`replaceStderr` let a test make the write fail the way a real
+// cluster would, and every attempt is tallied so a test can assert on how many
+// times the script tried -- the difference between retrying a lost race and
+// pointlessly retrying a denial is a count, not a message.
+function runRetire({
+  liveConfigMap,
+  digest,
+  owner,
+  replaceStatus = 0,
+  replaceStderr = "",
+}) {
   const dir = mkdtempSync(path.join(tmpdir(), "retire-lock-"));
   const binDir = path.join(dir, "bin");
   execFileSync("mkdir", ["-p", binDir]);
   const statePath = path.join(dir, "configmap.json");
   const replacedPath = path.join(dir, "replaced.json");
+  const attemptsPath = path.join(dir, "replace-attempts");
   if (liveConfigMap !== null) {
     writeFileSync(statePath, JSON.stringify(liveConfigMap));
   }
@@ -217,6 +229,16 @@ function runRetire({ liveConfigMap, digest, owner }) {
     [
       "#!/usr/bin/env bash",
       'if [ "$1" = "replace" ]; then',
+      '  echo attempt >> "${FAKE_REPLACE_ATTEMPTS}"',
+      '  if [ -n "${FAKE_REPLACE_STDERR}" ]; then',
+      '    printf %s\\\\n "${FAKE_REPLACE_STDERR}" >&2',
+      "  fi",
+      '  if [ "${FAKE_REPLACE_STATUS}" != "0" ]; then',
+      "    # Drain stdin anyway, so the failure looks like a rejected write and",
+      "    # not a broken pipe upstream in jq.",
+      "    cat > /dev/null",
+      '    exit "${FAKE_REPLACE_STATUS}"',
+      "  fi",
       '  cat > "${FAKE_REPLACED}"',
       "  exit 0",
       "fi",
@@ -239,6 +261,9 @@ function runRetire({ liveConfigMap, digest, owner }) {
         HOME: dir,
         FAKE_STATE: statePath,
         FAKE_REPLACED: replacedPath,
+        FAKE_REPLACE_ATTEMPTS: attemptsPath,
+        FAKE_REPLACE_STATUS: String(replaceStatus),
+        FAKE_REPLACE_STDERR: replaceStderr,
         PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY: "1",
         PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT: digest,
         PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER: owner,
@@ -256,6 +281,9 @@ function runRetire({ liveConfigMap, digest, owner }) {
     code,
     stdout,
     stderr,
+    replaceAttempts: existsSync(attemptsPath)
+      ? readFileSync(attemptsPath, "utf8").trim().split("\n").filter(Boolean).length
+      : 0,
     wrote: existsSync(replacedPath),
     written: existsSync(replacedPath)
       ? JSON.parse(readFileSync(replacedPath, "utf8"))
@@ -339,6 +367,64 @@ test("a lock this run did not take is never retired, and that is not an error", 
     assert.equal(result.wrote, false, `${row.label}: wrote to the approval ConfigMap`);
     assert.match(result.stdout, /nothing to retire/, `${row.label}: must say why it declined`);
   }
+});
+
+// The two failure modes of the write are not interchangeable, and the whole
+// point of reading kubectl's stderr is to tell them apart. Asserted as attempt
+// COUNTS: a mutation that collapses either case into the other still produces a
+// red exit and a plausible message, so only the count catches it.
+test("a denial fails fast and surfaces its cause instead of retrying", () => {
+  const live = lockedConfigMap({ digest: VALID_DIGEST, owner: VALID_OWNER });
+  const result = runRetire({
+    liveConfigMap: live,
+    digest: VALID_DIGEST,
+    owner: VALID_OWNER,
+    replaceStatus: 1,
+    replaceStderr:
+      'Error from server (Forbidden): configmaps "paperclip-api-approved-digests" is forbidden: ' +
+      'User "system:serviceaccount:paperclip:release-approver" cannot update resource "configmaps"',
+  });
+
+  assert.equal(result.code, 1, "a lock the approver may not clear must fail");
+  assert.ok(!result.wrote, "nothing may be recorded as written");
+
+  // One attempt, not three. An approver Role missing `update` fails identically
+  // every time, so the retries buy nothing and only delay the operator.
+  assert.equal(
+    result.replaceAttempts,
+    1,
+    "a non-retriable denial must not burn the retry budget",
+  );
+
+  // The actual server message, not a generic "could not retire" -- this is the
+  // one path where a human has to act, and the cause is the whole content.
+  assert.match(result.stderr, /cannot retire the in-flight approval lock/);
+  assert.match(result.stderr, /Forbidden/);
+  assert.match(result.stderr, /cannot update resource/);
+});
+
+test("a lost race is still retried, and exhaustion still reports", () => {
+  const live = lockedConfigMap({ digest: VALID_DIGEST, owner: VALID_OWNER });
+  const result = runRetire({
+    liveConfigMap: live,
+    digest: VALID_DIGEST,
+    owner: VALID_OWNER,
+    replaceStatus: 1,
+    replaceStderr:
+      'Error from server (Conflict): Operation cannot be fulfilled on configmaps ' +
+      '"paperclip-api-approved-digests": the object has been modified; please apply ' +
+      "your changes to the latest version and try again",
+  });
+
+  // The control on the test above. A conflict proves the write lost a race, so
+  // re-reading and retrying is exactly what the loop exists to do; if this
+  // collapses to 1 attempt, the optimistic-concurrency retry has been broken.
+  assert.equal(result.replaceAttempts, 3, "a conflict must exhaust the retries");
+  assert.equal(result.code, 1);
+  assert.ok(!result.wrote);
+  assert.match(result.stderr, /could not retire the in-flight approval lock/);
+  // Still hands the operator the way out rather than only the diagnosis.
+  assert.match(result.stderr, /PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT/);
 });
 
 test("an unreadable approval ConfigMap fails loudly instead of claiming success", () => {
