@@ -342,8 +342,10 @@ ROLLOUT_JQ
 # serving traffic?".
 #
 # The condition lines are kept byte-identical to their counterparts above, and
-# scripts/approve-paperclip-api-digest.test.js fails if the two drift apart, so
-# "this rollout has landed" has one definition in this file rather than two.
+# scripts/approve-paperclip-api-digest.test.js compares the two blocks for set
+# equality over the health half -- in both directions, so neither predicate can
+# gain or lose a health condition without the other -- so "this rollout has
+# landed" has one definition in this file rather than two.
 read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true
 # BEGIN ROLLOUT_SERVING_JQ
 (.spec.replicas // 1) > 0 and
@@ -561,6 +563,20 @@ build_approval_ring() {
   )
 
   printf '%s\n' "${ring[@]}"
+}
+
+# Render an approval window for operator output: one indented entry per line, or
+# an explicit marker when empty so a failure report never renders as a silent
+# blank line. Used by the read-back guards as well as the success path, because
+# on the failure paths the contents are the actionable part -- a bare count says
+# the window is wrong without saying what is in it to trim.
+format_digest_list() {
+  local list="$1"
+  if [[ -z "$list" ]]; then
+    echo "  (none)"
+    return 0
+  fi
+  printf '%s\n' "$list" | sed 's/^/  - /'
 }
 
 MAX_ROTATE_ATTEMPTS="${PAPERCLIP_APPROVAL_ROTATE_ATTEMPTS:-5}"
@@ -782,22 +798,28 @@ echo "Approving ${DIGEST} for harbor.blockcast.net/paperclip/paperclip"
 # transaction lock must be one observed resource version before any probe.
 verify_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json)"
 verify_raw="$(jq -r --arg key "$DATA_KEY" '.data[$key] // ""' <<<"$verify_json")"
-verify_count=$(printf '%s\n' "$verify_raw" \
+# Normalise once. The count, the absence test, and every operator-facing report
+# below all read this same list, so they cannot disagree about what the cluster
+# holds -- previously each derived its own view from verify_raw.
+verify_digests="$(printf '%s\n' "$verify_raw" \
   | sed $'s/^\r*//; s/\r*$//' \
   | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Ec '^sha256:[0-9a-f]{64}$' || true)
+  | grep -E '^sha256:[0-9a-f]{64}$' \
+  || true)"
+verify_count=$(printf '%s' "$verify_digests" | grep -c . || true)
 
-if ! printf '%s\n' "$verify_raw" \
-  | sed $'s/^\r*//; s/\r*$//' \
-  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Fxq "$DIGEST"; then
+if ! printf '%s\n' "$verify_digests" | grep -Fxq "$DIGEST"; then
   echo "approval did not persist: ${DIGEST} is absent from ${NAMESPACE}/${CONFIGMAP}" >&2
+  echo "the window holds ${verify_count} entries, as persisted:" >&2
+  format_digest_list "$verify_digests" >&2
   exit 1
 fi
 
 if (( verify_count > MAX_APPROVED_DIGESTS )); then
   echo "approval window is ${verify_count} entries, over the ${MAX_APPROVED_DIGESTS} the policy accepts;" >&2
-  echo "the admission policy will now deny every rollout until this is trimmed" >&2
+  echo "the admission policy will now deny every rollout until this is trimmed." >&2
+  echo "The window, as persisted:" >&2
+  format_digest_list "$verify_digests" >&2
   exit 1
 fi
 
@@ -808,11 +830,7 @@ fi
 # running digest, an operator reading "the rollback target is pinned" off a list
 # that was never persisted would be misled at exactly the wrong moment.
 echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}), as persisted:"
-printf '%s\n' "$verify_raw" \
-  | sed $'s/^\r*//; s/\r*$//' \
-  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -E '^sha256:[0-9a-f]{64}$' \
-  | sed 's/^/  - /' || true
+format_digest_list "$verify_digests"
 
 if ! jq -e \
     --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
