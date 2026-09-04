@@ -1264,10 +1264,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Resource defaults — UI stores dotted keys (e.g. "resources.requests.cpu")
   // as flat config entries, so read them directly from config with the dotted key.
+  // The memory request is sized from observed usage (536 Mi mean, 1.79 GiB max
+  // across 38 pods), not from the limit: it is admission control, so it must
+  // cover the tail rather than the average. The 8Gi limit below is what absorbs
+  // a burst.
   const containerResources: k8s.V1ResourceRequirements = {
     requests: {
       cpu: asString(config["resources.requests.cpu"], "1000m"),
-      memory: asString(config["resources.requests.memory"], "2Gi"),
+      memory: asString(config["resources.requests.memory"], "1.5Gi"),
     },
     limits: {
       cpu: asString(config["resources.limits.cpu"], "4000m"),

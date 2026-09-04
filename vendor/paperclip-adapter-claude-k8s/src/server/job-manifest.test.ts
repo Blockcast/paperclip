@@ -1249,7 +1249,28 @@ describe("buildJobManifest", () => {
     it("sets default resource requests and limits", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const resources = job.spec?.template?.spec?.containers[0]?.resources;
-      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "2Gi" });
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1.5Gi" });
+      expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
+    });
+
+    // Characterises the lookup this default depends on, so the reclamation
+    // above cannot be silently undone. mergeEnvironmentConfig is a top-level
+    // merge, so an environment row nesting {resources:{requests:{memory}}}
+    // never satisfies the dotted lookup and the default stays in force —
+    // confirmed live: an agent whose environment row carries that nested block
+    // still runs at the default. Only the flat dotted key overrides.
+    //
+    // This pins current behaviour, not desired behaviour: the nested shape is
+    // dead config that its author meant to take effect. If that is ever fixed
+    // by deep-merging, this test SHOULD fail — update it deliberately rather
+    // than assuming it is stale.
+    it("ignores a nested resources block and keeps the default", () => {
+      ctx.config = {
+        resources: { requests: { cpu: "500m", memory: "1Gi" }, limits: { cpu: "4", memory: "16Gi" } },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const resources = job.spec?.template?.spec?.containers[0]?.resources;
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1.5Gi" });
       expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
     });
 
