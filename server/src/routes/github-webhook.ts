@@ -4234,9 +4234,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       config.prReviewerBotLogin,
     );
     if (commentReviewGateTrigger) {
+      // Build the input once and hand the SAME object to both branches, so the
+      // injection seam observes the real argument — including `db`. When the
+      // seam was called with the bare trigger, no webhook-level test could
+      // assert that production actually supplies the serialization handle.
+      const commentReviewGateInput = { ...commentReviewGateTrigger, db };
       const commentReviewGateCheck = config.runPrCommentReviewGateCheck
-        ? config.runPrCommentReviewGateCheck(commentReviewGateTrigger)
-        : runPrCommentReviewGateCheck({ ...commentReviewGateTrigger, db });
+        ? config.runPrCommentReviewGateCheck(commentReviewGateInput)
+        : runPrCommentReviewGateCheck(commentReviewGateInput);
       void commentReviewGateCheck
         .then((result) => {
           // The disabled default must be silent; otherwise every PR webhook in

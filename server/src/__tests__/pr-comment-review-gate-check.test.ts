@@ -43,11 +43,15 @@ vi.mock("../services/github-status-delivery-outbox.js", () => ({
 
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 
+// `db` is required on the input: the gate takes the shared delivery lock
+// unconditionally, so every caller — including these tests — must supply a
+// handle. The lock itself is mocked above, so a stub is sufficient here.
 const TARGET = {
   repoFullName: "Blockcast/paperclip",
   prNumber: 1022,
   headSha: "1234567890abcdef1234567890abcdef12345678",
   prUrl: "https://github.com/Blockcast/paperclip/pull/1022",
+  db: {} as never,
 };
 
 function blockingCommentFor(headSha: string) {
@@ -146,6 +150,22 @@ describe("runPrCommentReviewGateCheck", () => {
     await runPrCommentReviewGateCheck({ ...TARGET, db: {} as never });
 
     expect(events).toEqual(["lock", "fetch-comments", "post"]);
+  });
+
+  it("refuses to publish unsynchronized when db is missing", async () => {
+    mockListComments.mockResolvedValue([]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    // The old shape fell through to an unlocked publish() whenever db was
+    // absent, so a caller could silently reopen the out-of-order-verdict race.
+    // Absence must now fail closed: no lock, no status write, and a loud error
+    // rather than a green nobody serialized.
+    await expect(
+      runPrCommentReviewGateCheck({ ...TARGET, db: undefined } as never),
+    ).rejects.toThrow(/requires `db`/);
+
+    expect(mockStatusDeliveryLock).not.toHaveBeenCalled();
+    expect(mockPostStatus).not.toHaveBeenCalled();
   });
 
   it("serializes overlapping evaluations for one PR/context", async () => {

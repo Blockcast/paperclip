@@ -417,12 +417,19 @@ githubApp:
   # contexts it has observed recently, and this repo has never carried a commit
   # status, so the context has to be posted at least once before a human can
   # select it. Until then this is observe-only.
-  # This gate intentionally stays outside `review/`: it is not review evidence.
+  #
+  # Deliberately NOT under `review/` (BLO-29711). This gate reads only the
+  # comment-shaped surface, so "nothing attests this head" is a legitimate and
+  # common outcome for a formally-reviewed PR, and it must stay green there or
+  # every such PR deadlocks. A green under `review/` reads as review evidence,
+  # which this gate cannot supply — so the fail-open and the namespace cannot
+  # coexist. Moving the namespace is the half that is safe to change.
+  # Verified before renaming: `review/ally-comment` was not a required check on
+  # paperclip `master` (required: `verify`) nor on penstock-llm-proxy-core
+  # `main` (required: validate-and-build, secret-scan, redaction-tests,
+  # secrets-controls-static-check, review/ally-complete), so this drops nothing.
   prCommentReviewGateStatusContext: "gate/ally-comment-findings"
   prCommentReviewGateRetiredStatusContexts: "review/ally-comment"
-  # NOTE: `prReviewGateStatusContext` is shared by the legacy failure status
-  # and the durable review-gate authority below. The latter owns
-  # `review/ally-complete`, including its success writer.
   # PEN-2073 rollout order:
   # 1. Freeze review-gate merges.
   # 2. Deploy this producer migration/code with both flags false; wait for every pod.
@@ -440,25 +447,27 @@ githubApp:
     - Blockcast/penstock-llm-proxy-core
   reviewGateExpectedAppId: "3966421"
   reviewGateExpectedInstallationId: "138085375"
+  # NOTE: `prReviewGateStatusContext` IS set here (below), and it is required to
+  # be: the chart hard-fails when `reviewGateCaptureEnabled` is true and this is
+  # empty (templates/_helpers.tpl). Two server writers share the one field, and
+  # neither posts success:
+  #   * the legacy failure writer — `queueFailedPrReviewGateStatus` in
+  #     server/src/services/heartbeat.ts — posts state=failure only (reviewer
+  #     chain exhausted / non-retryable external lifecycle end);
+  #   * the durable review-gate authority —
+  #     server/src/services/github-review-gate-authority.ts — posts
+  #     state=pending only, then hands off via `repository_dispatch`
+  #     (`review_gate_reconcile`) to the consumer in the Penstock repo. That
+  #     external consumer is the success writer for this context; nothing in
+  #     this repo, server or workflow, ever posts success for it.
+  # Both flags above are false today, so only the legacy failure writer can
+  # fire; the authority is pre-configured for the rollout, not yet live.
+  # Therefore: do NOT mark this context required on paperclip `master`. With no
+  # in-repo success writer, every healthy PR would sit at "Expected — waiting
+  # for status" forever. Requiring it is correct only where an external producer
+  # posts success — step 7 of the rollout above, on penstock-llm-proxy-core, or
+  # a pre-existing external writer as on onprem-k8s.
   prReviewGateStatusContext: review/ally-complete
-  #
-  # Deliberately NOT under `review/` (BLO-29711). This gate reads only the
-  # comment-shaped surface, so "nothing attests this head" is a legitimate and
-  # common outcome for a formally-reviewed PR, and it must stay green there or
-  # every such PR deadlocks. A green under `review/` reads as review evidence,
-  # which this gate cannot supply — so the fail-open and the namespace cannot
-  # coexist. Moving the namespace is the half that is safe to change.
-  # Verified before renaming: `review/ally-comment` was not a required check on
-  # paperclip `master` (required: `verify`) nor on penstock-llm-proxy-core
-  # `main` (required: validate-and-build, secret-scan, redaction-tests,
-  # secrets-controls-static-check, review/ally-complete), so this drops nothing.
-  # NOTE: `prReviewGateStatusContext` is intentionally left unset here. Its only
-  # writer posts state=failure (reviewer chain exhausted / ended ambiguously) —
-  # nothing in the server ever posts success for it, and no workflow or script
-  # in this repo posts it either. It is meant to red-flag an already-required
-  # context owned by an external writer (as on onprem-k8s). Marking it required
-  # on this repo would leave every healthy PR at "Expected — waiting for status"
-  # forever. Do not enable + require it here without a success writer.
 
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service
