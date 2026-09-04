@@ -105,6 +105,15 @@ export interface Config {
   strandedRecoveryHandBackMaxPerPass: number;
   strandedRecoveryHandBackIntervalMinutes: number;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Isolation-workspace reaper (BLO-31222): removes aged per-execution-workspace
+  // scratch under `data/k8s-isolation/workspaces`, which had no retention path of
+  // any kind and reached 406.7 GiB on a CephFS volume that ran out of headroom.
+  // Worker-tier only. Opt-IN — it deletes irreversibly.
+  isolationWorkspaceReaperEnabled: boolean;
+  isolationWorkspaceReaperIntervalMinutes: number;
+  isolationWorkspaceReaperMaxAgeDays: number;
+  isolationWorkspaceReaperMaxDeletesPerTick: number;
+  isolationWorkspaceReaperDryRun: boolean;
   // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
   // to a durable, human-assigned issue refreshed in place each period. Worker-tier
   // only, same rationale as the reconcilers above.
@@ -322,6 +331,16 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  // BLO-31222. Daily is the right cadence: the cohort is defined in days, so a
+  // tighter interval re-scans the same tree for nothing. The age floor is 7 —
+  // below that a between-runs workspace looks reapable.
+  isolationWorkspaceReaperIntervalMinutes: {
+    fallback: 1440,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  isolationWorkspaceReaperMaxAgeDays: { fallback: 30, min: 7, max: 3650 },
+  isolationWorkspaceReaperMaxDeletesPerTick: { fallback: 200, min: 1, max: 10_000 },
   // BLO-19123. Per-tick ceiling on how many *distinct* rows the hand-back drain returns.
   //
   // The pass already had two per-issue guards — max 2 hand-backs per source issue and a 6h
@@ -421,6 +440,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   databaseBackupIntervalMinutes: 60_000,
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  isolationWorkspaceReaperIntervalMinutes: 60_000,
   // Minute-denominated like its neighbours, though it gates an elapsed-time comparison rather
   // than a `setInterval` delay. Registered anyway: the guard that requires this entry keys off
   // the name, and an unregistered minute setting is exactly the omission that guard exists to
@@ -733,6 +753,31 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
     "strandedBlockedIssueReconcilerIntervalMinutes",
   );
+
+  // BLO-31222. Opt-IN, like `strandedRecoveryHandBack` and unlike the
+  // reconcilers above: this removes directory trees irreversibly. Shipping it
+  // dark keeps "deploy the code" and "delete a month of workspaces" as two
+  // separate decisions, with a run in between to inspect what the predicate
+  // matched. `..._DRY_RUN=true` performs that inspection without deleting.
+  const isolationWorkspaceReaperEnabled =
+    process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED === "true";
+  const isolationWorkspaceReaperDryRun =
+    process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_DRY_RUN === "true";
+  const isolationWorkspaceReaperIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperIntervalMinutes,
+    "isolationWorkspaceReaperIntervalMinutes",
+  );
+  const isolationWorkspaceReaperMaxAgeDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxAgeDays,
+    "isolationWorkspaceReaperMaxAgeDays",
+  );
+  const isolationWorkspaceReaperMaxDeletesPerTick = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxDeletesPerTick,
+    "isolationWorkspaceReaperMaxDeletesPerTick",
+  );
   // BLO-19123. Opt-IN, unlike its sibling reconcilers above, and deliberately so: this pass
   // reassigns real in-flight work in bulk (~360 rows at the time of writing). Defaulting it
   // on would make "deploy the code" and "perform the data move" the same irreversible act,
@@ -909,6 +954,11 @@ export function loadConfig(): Config {
     strandedRecoveryHandBackMaxPerPass,
     strandedRecoveryHandBackIntervalMinutes,
     strandedBlockedIssueReconcilerIntervalMinutes,
+    isolationWorkspaceReaperEnabled,
+    isolationWorkspaceReaperIntervalMinutes,
+    isolationWorkspaceReaperMaxAgeDays,
+    isolationWorkspaceReaperMaxDeletesPerTick,
+    isolationWorkspaceReaperDryRun,
     humanGatedDigestEnabled,
     humanGatedDigestIntervalMinutes,
     humanGatedDigestPeriodDays,
