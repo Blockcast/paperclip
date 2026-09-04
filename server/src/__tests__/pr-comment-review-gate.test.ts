@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 // the retirement description is checked against the real thing, not a copy.
 import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
 
+import { hasActionablePrReviewFeedback } from "../services/ally-review-detection.js";
+
 import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
@@ -989,5 +991,131 @@ describe("retired context supersede", () => {
       expect(description).toMatch(/"[^"]*…"\.$/);
       expect(description.split('"').length - 1).toBe(2);
     }
+  });
+});
+
+/**
+ * BLO-31446 — Ally's clean-review boilerplate must not read as a blocking
+ * finding.
+ *
+ * `hasActionablePrReviewFeedback` ended with an unguarded `Recommended Action`
+ * … `fix` … `before merge` prose fallback. Ally's own 0-findings closing lines
+ * supply all three tokens, so the cleaner the review, the likelier the red —
+ * and because a 0/0 body yields no finding identities, no
+ * `Prior Findings Dispositioned` ledger entry could ever retire the carried
+ * head. The misclassification was therefore permanent, not transient.
+ *
+ * The bodies below are the load-bearing lines of four real reviews, verbatim.
+ * They are trimmed to the counted buckets plus the exact `Recommended Action`
+ * line rather than reproducing several KB of prose; the full verbatim
+ * multicast#589 body was executed against both the pre- and post-fix module
+ * and classifies identically to its trimmed form here, so the trim is
+ * measured, not assumed.
+ */
+describe("clean-review precedence over the Recommended Action prose fallback", () => {
+  const CLEAN_BUCKETS = ["### Critical Issues (0)", "### Important Issues (0)"];
+
+  // Each of the four differs in where and how the negation is phrased, which is
+  // why the fix is precedence rather than another regex: `hasNonNegatedMatch`
+  // only inspects the words *preceding* a match within its sentence, so the
+  // paperclip#1605 body's trailing `_(None.)_` is invisible to any look-back
+  // guard however its cue list is tuned.
+  const realCleanReviews: Array<[string, string]> = [
+    ["paperclip#1618 @999cc70", "1. No Critical issues to fix before merge."],
+    ["paperclip#1612 @383f074", "1. No Critical issues — nothing to fix before merge."],
+    ["multicast#589 @ef7a43a", "1. No Critical or Important issues — nothing to fix before merge."],
+    ["paperclip#1605 @123e1d2", "1. Fix Critical issues before merge. _(None.)_"],
+  ];
+
+  for (const [source, recommendedAction] of realCleanReviews) {
+    it(`does not treat a 0/0 review as blocking: ${source}`, () => {
+      const body = reviewBody(CURRENT_HEAD, [
+        ...CLEAN_BUCKETS,
+        "### Recommended Action",
+        recommendedAction,
+      ]);
+
+      expect(hasActionablePrReviewFeedback(body)).toBe(false);
+    });
+  }
+
+  // The fix must narrow only the prose fallback. Every other blocking signal
+  // stays live at 0/0, so a reviewer who explicitly asks for changes is still
+  // heard even when both buckets are empty.
+  const explicitChangeRequests: Array<[string, string[], string | undefined]> = [
+    ["decision: changes_requested", ["decision: changes_requested"], undefined],
+    ["a bare `changes requested`", ["Changes requested on this head."], undefined],
+    ["a bare `request changes`", ["I request changes here."], undefined],
+    ["a formal CHANGES_REQUESTED state", [], "changes_requested"],
+  ];
+
+  for (const [label, lines, state] of explicitChangeRequests) {
+    it(`still blocks a 0/0 review carrying ${label}`, () => {
+      const body = reviewBody(CURRENT_HEAD, [...CLEAN_BUCKETS, ...lines]);
+
+      expect(hasActionablePrReviewFeedback(body, state)).toBe(true);
+    });
+  }
+
+  it("still blocks an uncounted findings heading at 0/0", () => {
+    // An uncounted heading is not a count, so a body can carry both. The
+    // heading wins: it is a finding the reviewer did not tally.
+    const body = reviewBody(CURRENT_HEAD, [...CLEAN_BUCKETS, "### Critical Issues", "- a real one"]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("keeps the prose fallback live when only one bucket is declared", () => {
+    // Precedence requires an explicit statement about *both* severities. One
+    // bucket at zero says nothing about the other, so this is not a 0/0
+    // declaration and the fallback must still apply.
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Critical Issues (0)",
+      "### Recommended Action",
+      "Fix it before merge.",
+    ]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("keeps the prose fallback live when no bucket is declared", () => {
+    // Pins the same contract as the prose-only case further up this file: the
+    // fallback is load-bearing precisely where no counted bucket exists.
+    const body = reviewBody(CURRENT_HEAD, ["### Recommended Action", "Fix the gate before merge."]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("still counts a non-zero bucket alongside clean prose", () => {
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Critical Issues (0)",
+      "### Important Issues (1)",
+      "- a real finding",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("reports a clean verdict end to end for a boilerplate-carrying review", () => {
+    // The user-visible outcome, not just the predicate: before the fix this
+    // head was carried forward as `carried_finding` with no ledger entry able
+    // to retire it.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(
+          reviewBody(CURRENT_HEAD, [
+            ...CLEAN_BUCKETS,
+            "### Recommended Action",
+            "1. No Critical or Important issues — nothing to fix before merge.",
+          ]),
+          "2026-09-04T03:11:21Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
   });
 });
