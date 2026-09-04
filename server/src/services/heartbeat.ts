@@ -9481,8 +9481,9 @@ function prReviewOutputHasSelfReviewSkip(
 // went stale), so the clause is anchored to a 7–40 hex sha rather than to the
 // wake head — a sha-less "already reviewed" claim is NOT accepted. Five cues
 // keep the widened shape from masking a run that did NOT post (per Ally reviews
-// of #1613) — an adjacent negation, plus four tested against the clause scope
-// (hedge, assumption, questioned, priorHead, negation), all sharing one
+// of #1613) — an adjacent negation, plus the five GOVERNING_CUE_STEMS tested
+// against the clause scope (hedge, assumption, questioned, priorHead,
+// negation), so six in total, all sharing one
 // clause-binding rule: a negated clause ("was **not** already reviewed at …" — the
 // negation prefix tolerates the same markdown the clause does, so bold/italic
 // cannot slip past it), a hedge that governs the clause in the same sentence
@@ -9494,8 +9495,8 @@ function prReviewOutputHasSelfReviewSkip(
 // Ally pass: five plausible phrasings of a correct skip fell to `missing`).
 // Also NOT vetoed: stale/prior-head narration AFTER the clause ("… — the wake
 // carried a stale head, superseded by this one") — that is how a correct skip
-// explains the wake (third Ally pass), so both cues look only at the text
-// BEFORE the clause, and that scope ends at . : ; , — – or a newline, so a
+// explains the wake (third Ally pass), so every clause-scoped cue looks only at
+// the text BEFORE the clause, and that scope ends at . : ; , — – or a newline, so a
 // clause joined by a colon or dash does not inherit a hedge from the previous
 // clause. The same before-scope also carries an EPISTEMIC negation cue for the
 // non-adjacent form ("no evidence this head was already reviewed at …",
@@ -9525,7 +9526,14 @@ function prReviewOutputHasSelfReviewSkip(
 // earlier draft accepted a bare complementizer and vetoed exactly that
 // sentence. The copula is the anchor; a complementizer may precede it and is
 // simply absorbed as one of the intervening words.
-const COPULA_EDGE = "(?:\\w+\\s+){0,4}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s`*_]*$";
+// The filler EXCLUDES the connectives, so the code holds the invariant the
+// comment above documents. `\w+` matches `so`/`but`/`and`/`because`, so a bare
+// filler swallowed the very words that mark a correct skip and let a negation
+// governing a DIFFERENT noun phrase reach the clause across the connective —
+// "No newer commits were found so this head was already reviewed at …"
+// (eleventh pass: 5 of 5 regressed against master).
+const COPULA_FILLER = "(?:(?!(?:so|but|and|because|since|therefore|thus|hence)\\b)\\w+\\s+){0,4}";
+const COPULA_EDGE = `${COPULA_FILLER}(?:was|were|is|are|has\\s+been|had\\s+been)[\\s\`*_]*$`;
 const CLAUSE_REACH = `(?:[\\s\`*_]*$|\\s+${COPULA_EDGE})`;
 
 // Ally passes six through ten each found exactly one more cue matching
@@ -9562,11 +9570,16 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   // strongest possible statement of a correct skip, and an unguarded stem
   // classified it `missing` (tenth pass: 5 such phrasings regressed against
   // master). `in` covers the "not in doubt that …" form.
+  //
+  // The lookbehind spans up to two intervening words, because an adjective
+  // between the negation and the noun is the ORDINARY way these are written
+  // and "beyond reasonable doubt" is a stock idiom. An adjacency-only
+  // lookbehind restored none of them (eleventh pass: 6 of 6 regressed).
   {
     name: "assumption",
     stem:
       "\\b(?:possibly|probably|presumably|assuming|apparently|guess(?:es|ing|ed)?" +
-      "|(?<!\\b(?:no|not|without|beyond|never|in)\\s)doubt(?:s|ed|ful)?" +
+      "|(?<!\\b(?:no|not|without|beyond|never|in)\\s(?:\\w+\\s){0,2})doubt(?:s|ed|ful)?" +
       "|may\\s+have\\s+been|might\\s+have\\s+been)",
   },
   // `whether`/`if` whose complement IS this clause: the run is QUESTIONING the
@@ -9610,6 +9623,15 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
 const GOVERNING_CUES: ReadonlyArray<{ name: string; re: RegExp }> = GOVERNING_CUE_STEMS.map(
   ({ name, stem }) => ({ name, re: new RegExp(`${stem}${CLAUSE_REACH}`, "i") }),
 );
+
+// Which governing cue vetoes `before`, or null when none does. Every review
+// pass so far has had to bisect the cues by hand to attribute a veto; this
+// makes that attribution a single call, and keeps GOVERNING_CUES[].name
+// load-bearing rather than decorative.
+// Exported for attribution tests; not used by the classifier itself.
+export function prReviewAlreadyReviewedVetoCue(before: string): string | null {
+  return GOVERNING_CUES.find(({ re }) => re.test(before))?.name ?? null;
+}
 
 // Exported for direct table tests of the veto boundaries.
 export function prReviewOutputHasAlreadyReviewedSkip(text: string): boolean {
