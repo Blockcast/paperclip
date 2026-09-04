@@ -425,6 +425,58 @@ describe("classifyClaudeUpstreamFailure", () => {
       }),
     ).toEqual({ family: null, errorCode: null, capacityCode: null });
   });
+
+  // `stdout` is the WHOLE pod log (execute.ts sets it from the tailed/on-disk
+  // log file), so it contains every intermediate assistant message. Matching
+  // the skill phrase there lets a failed run be reclassified as deterministic
+  // purely because the model *talked about* a missing skill — and
+  // `skill_not_found` is in NON_RETRYABLE_CONTINUATION_ERROR_CODES and is
+  // excluded from the zero-token session reset, so a false positive
+  // permanently suppresses retries. That is the opposite blast radius from the
+  // transient codes, where a false positive costs one extra retry.
+  //
+  // The quoting matters: a JSON-encoded transcript escapes `"` as `\"`, which
+  // the regex's `["'`]` class rejects. Single quotes and backticks are NOT
+  // escaped inside a JSON string, so prose like `Skill 'x' not found` reaches
+  // the matcher verbatim. This run failed on an upstream overload while
+  // discussing BLO-7991 — it must stay retryable.
+  it("does not classify a transcript that merely discusses a missing skill", () => {
+    const transcript = [
+      '{"type":"assistant","message":{"content":[{"type":"text","text":',
+      "\"Root cause: the run died with Skill 'verification-before-completion' not found.\"}]}}",
+      '{"type":"result","subtype":"error","result":"Overloaded"}',
+    ].join("\n");
+    // Precondition: the phrase really is present unescaped, so this test
+    // cannot pass merely because the fixture failed to reproduce it.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        stdout: transcript,
+        errorMessage: "Claude run failed: subtype=error: Overloaded",
+      }),
+    ).toEqual({
+      family: "transient_upstream",
+      errorCode: "claude_transient_upstream",
+      capacityCode: null,
+    });
+  });
+
+  // The production call site passes `parsed`/`stdout`/`errorMessage` and never
+  // `stderr`, so detection has to work through the structured error envelope.
+  it("classifies a missing Skill reported in the structured error envelope", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: true,
+        parsed: {
+          subtype: "error",
+          errors: [{ message: 'Skill "verification-before-completion" not found' }],
+        },
+      }),
+    ).toEqual({ family: null, errorCode: "skill_not_found", capacityCode: null });
+  });
 });
 
 describe("extractClaudeRetryNotBefore", () => {
