@@ -145,14 +145,46 @@
 --
 -- SO RE-EVALUATE IT once the plan-cache lever lands. If forcing a custom plan
 -- (or otherwise keeping this statement off the generic plan) makes production
--- stably pick an ordered index-only path, then 0208's index already serves the
--- custom plan — that is exactly what force_custom_plan restored in production —
--- and this index has no remaining job. Drop it rather than leaving a third
--- partial index on the queue's hot write path out of inertia. The concrete
--- test: production's plan for the head scan is ordered and index-only with
--- `heartbeat_runs_agent_dispatch_idx` under the lever, at which point
--- `DROP INDEX CONCURRENTLY heartbeat_runs_agent_queued_dispatch_idx` should be
--- a no-op for the dispatcher.
+-- stably pick an ordered index-only path, then an ordering index already serves
+-- the custom plan — that is exactly what force_custom_plan restored in
+-- production — and this index may have no remaining job. Drop it rather than
+-- leaving a third partial index on the queue's hot write path out of inertia.
+--
+-- The concrete test, in two steps. Run them in order; step 1 alone is NOT
+-- grounds to drop.
+--
+--   1. Under the lever, production's plan for the head scan is ordered and
+--      index-only — `Index Only Scan`, no `Sort`. Check that PROPERTY, not
+--      which index supplies it. Expect the plan to name THIS index rather than
+--      `heartbeat_runs_agent_dispatch_idx`: 0237 is deliberately narrower for
+--      exactly this predicate, so a custom plan legitimately prefers it (the
+--      pinned index-name assertions in heartbeat-dispatch-query-plan.test.ts
+--      failed on this branch's first run for that reason, and were relaxed to
+--      `expectOrderedDispatchIndex`). Seeing this index is the EXPECTED result
+--      and is not a sign the lever failed — that is why the assertions encode
+--      `ORDERED_DISPATCH_INDEXES` instead of one name, and the same reasoning
+--      applies here.
+--
+--   2. Then, before dropping, confirm 0208's index alone still supplies that
+--      ordered index-only path with THIS index absent, because step 1 cannot
+--      observe it while 0237 is installed. Drop 0237 in a staging clone and
+--      re-read the plan.
+--
+--      Do NOT substitute the NEGATIVE CONTROL block in
+--      heartbeat-dispatch-query-plan.test.ts for this. That block runs the
+--      OPPOSITE direction — it drops 0208 and asserts 0237 serves the query —
+--      so it establishes that 0237 is sufficient, never that 0208 is.
+--      What does speak to step 2 is the measurement recorded in that block's
+--      preamble: on that fixture, with 0237 absent, the generic plan still
+--      picks 0208's index (4.30) over the queue-age index (8.32). That is the
+--      right direction, but it is a fixture that VACUUMs immediately before
+--      measuring and so gets a full index-only discount production does not
+--      (production reported `Heap Fetches: 18`), and low visibility is exactly
+--      the regime that produced the 0.24% inversion this migration exists for.
+--      Treat it as the shape of the check, not as the production answer.
+--
+-- Only with both steps green is `DROP INDEX CONCURRENTLY
+-- heartbeat_runs_agent_queued_dispatch_idx` a no-op for the dispatcher.
 --
 -- Deliberately NOT done here:
 --
