@@ -681,7 +681,11 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.owner.fallback_failed",
       1,
-      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "permanent",
+      },
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",
@@ -690,11 +694,28 @@ describe("handleWebhook — firing first time", () => {
     );
   });
 
-  it("does not let one ownerless alert dark-tier the rest of its batch", async () => {
-    // The PEN-2581 outage in one test: a single alert with no resolvable owner
-    // threw, the throw was accumulated into AlertDeliveryIncompleteError, and
-    // the whole delivery 502'd — so every *other* alert in the batch was lost
-    // too, and Alertmanager retried the doomed batch 15-17× before dropping it.
+  it("drops one ownerless alert without aborting the loop or failing the delivery", async () => {
+    // What this pins, stated precisely, because the obvious reading is wrong:
+    // the per-alert catch in `handleWebhook` ALREADY kept the rest of the batch
+    // processing before PEN-2581. The catch is inside the loop and
+    // `AlertDeliveryIncompleteError` is thrown only after it completes, so a
+    // sibling alert's issue was created on the first attempt even when the
+    // delivery reported 502. Verified, not assumed: neutralise the carve-out
+    // and the only assertion that fails is `resolves.toBeUndefined()` below —
+    // the `issues.create` assertions pass on the pre-change source.
+    //
+    // What PEN-2581 actually changed is the delivery's reported *outcome*: the
+    // ownerless fingerprint is no longer accumulated, so Alertmanager is no
+    // longer told to retry a batch 15-17× for a fault no retry can fix, and the
+    // resulting failure storm no longer masks genuinely-transient failures that
+    // retrying would have fixed.
+    //
+    // The production incident did dark-tier every alert, but for an
+    // incident-specific reason rather than a structural one: with
+    // `fallbackAgentName` unset, *every* unmapped alert in the batch took this
+    // same throw, so there were no healthy siblings left to survive. That case
+    // is real and reachable — it is just not what "one ownerless alert" does to
+    // a mixed batch, which is what this test covers.
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ fallbackAgentName: undefined });
     // team=platform resolves through ownerMap; team=storage is unmapped, and
@@ -734,13 +755,29 @@ describe("handleWebhook — firing first time", () => {
       ),
     ).resolves.toBeUndefined();
 
-    // The healthy alert still became tracked work despite sharing a batch with
-    // the ownerless one — and it is ordered FIRST in the payload, so this also
-    // pins that the drop does not abort the remainder of the loop.
+    // The healthy alert still became tracked work — and it is ordered SECOND in
+    // the payload, behind the ownerless one, so this pins that the permanent
+    // drop does not abort the remainder of the loop.
     expect(mocks.issues.create).toHaveBeenCalledTimes(1);
     expect(mocks.issues.create.mock.calls[0][0].title).toBe(
       "[critical] CiliumPolicyDropsHigh · platform",
     );
+    // The other half of the BLO-26613 fail-closed guarantee, asserted here and
+    // not only in the single-alert tests: the ownerless alert must leave no
+    // state row behind, and a multi-alert batch is where that is easiest to
+    // regress.
+    //
+    // Filtered to `alert:` keys rather than counting `state.set` calls
+    // outright: the healthy alert's owner lookup also memoises
+    // `owner-by-email:…` on the instance scope, so a raw count would be 2 and
+    // would couple this fail-closed assertion to an unrelated cache. Keying on
+    // the fingerprint says the thing we actually mean — one alert row, and it
+    // belongs to the alert that got an issue.
+    const alertStateWrites = mocks.state.set.mock.calls.filter((call) =>
+      String(call[0].stateKey).startsWith("alert:"),
+    );
+    expect(alertStateWrites).toHaveLength(1);
+    expect(alertStateWrites[0][0].stateKey).toBe(`alert:${owned.fingerprint}`);
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",
       1,

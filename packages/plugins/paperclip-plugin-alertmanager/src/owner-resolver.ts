@@ -288,11 +288,21 @@ export async function resolveFallbackAgentId(
       // Any one self-clearing candidate makes the whole refusal transient: a
       // paused duplicate alongside a terminated one still becomes resolvable
       // the moment the pause lifts, with no config edit.
+      //
+      // Tested as `!== "permanent"` rather than `=== "transient"` so that the
+      // *runtime* default matches the documented policy above: a reason missing
+      // from the map indexes to `undefined`, and only this direction lands that
+      // on the survivable branch. The exhaustive `Record` makes a gap
+      // unreachable within the monorepo, but the plugin resolves
+      // `getAgentWorkEligibility` from `@paperclipai/shared` at runtime, so a
+      // built plugin running against a newer host could see a reason its own
+      // copy of the map never had. That skew must not silently start dropping
+      // alerts.
       const refusal: FallbackOwnerRefusal = evaluated.some(
         (entry) =>
           REFUSAL_CLASS_BY_INVOKABILITY_REASON[
             entry.eligibility.invokabilityReason
-          ] === "transient",
+          ] !== "permanent",
       )
         ? "transient"
         : "permanent";
