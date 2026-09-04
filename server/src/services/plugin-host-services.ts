@@ -2484,9 +2484,18 @@ export function buildHostServices(
         // `issueRepoBindingCommentIdempotencyKey(...)`. Matches `agents.invoke`
         // (`plugin:${pluginId}:` there too), deliberately: `pluginId` is the
         // install row's PK rather than the durable manifest `pluginKey`, so the
-        // namespace is per-installation and a reinstall orphans earlier keys.
-        // That fails safe (an extra comment, never a wrong body), and both call
-        // sites must move together if it is ever keyed on `pluginKey`.
+        // namespace is per-installation. It is more durable than that sounds —
+        // `install` reuses the existing row on reinstall after the default soft
+        // uninstall (`plugin-registry.ts`, `.where(eq(plugins.id, existing.id))`,
+        // pinned by `plugin-registry-reinstall-identity.test.ts`), so the id and
+        // this namespace survive an uninstall/reinstall cycle. Only a purge
+        // (`?purge=true`) or a table reseed orphans earlier keys, and that fails
+        // safe (an extra comment, never a wrong body). If this is ever re-keyed
+        // on `pluginKey`, the two *dedup* namespaces — here and `agents.invoke`
+        // below — must move together. The third `plugin:${pluginId}:` derivation
+        // below, `scopeKey`, deliberately stays put: it is a run-coalescing
+        // scope, not a durable namespace, and its keyless branch is already
+        // `plugin:${pluginId}:${randomUUID()}`.
         const callerIdempotencyKey = readNonEmptyParam(params.idempotencyKey);
         const idempotencyKey = callerIdempotencyKey
           ? `plugin:${pluginId}:${callerIdempotencyKey}`
