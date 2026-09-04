@@ -1257,7 +1257,20 @@ jobs:
           # exists to prevent. The condition is "this job took a lock AND helm
           # upgrade never executed", and nothing weaker.
           if [ -z "${LOCK_OWNER}" ] || [ -z "${LOCK_DIGEST}" ]; then
-            echo "this job minted no in-flight approval lock of its own; nothing to retire"
+            # Three ways to reach here, and the message must not claim more than
+            # it knows. Two are ordinary: the approval minted no lock, or it
+            # ADOPTED one, whose owner is deliberately never published because
+            # its rollout may still be running. The third is that the approval
+            # step died before publishing — and that one is NOT a wedge, because
+            # the script arms its own cleanup before the ring write and keeps it
+            # armed through the admissibility probe, then traps INT and TERM into
+            # a non-zero exit that runs `release_in_flight_lock`. So an operator
+            # cancelling the deploy has its lock retired inside that script,
+            # before this step ever runs. Only a SIGKILL runs no trap at all, and
+            # there the approval log still carries the digest and owner for
+            # PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY. Pinned by the two
+            # cancellation tests in approve-paperclip-api-digest.test.js.
+            echo "this job's approval published no in-flight lock for this step to retire (none minted, adopted, or already retired by the approval's own cleanup)"
             exit 0
           fi
 

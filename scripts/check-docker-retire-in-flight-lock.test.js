@@ -212,6 +212,7 @@ function runRetire({
   owner,
   replaceStatus = 0,
   replaceStderr = "",
+  getStderr = "",
 }) {
   const dir = mkdtempSync(path.join(tmpdir(), "retire-lock-"));
   const binDir = path.join(dir, "bin");
@@ -243,8 +244,14 @@ function runRetire({
       "  exit 0",
       "fi",
       '# Anything else is the scoped `get`. An absent state file stands in for a',
-      '# ConfigMap the approver credential cannot read.',
-      'if [ ! -f "${FAKE_STATE}" ]; then exit 1; fi',
+      '# ConfigMap the approver credential cannot read, and FAKE_GET_STDERR is the',
+      "# error a real cluster would give for the specific reason it could not.",
+      'if [ ! -f "${FAKE_STATE}" ]; then',
+      '  if [ -n "${FAKE_GET_STDERR}" ]; then',
+      '    printf %s\\\\n "${FAKE_GET_STDERR}" >&2',
+      "  fi",
+      "  exit 1",
+      "fi",
       'cat "${FAKE_STATE}"',
       "",
     ].join("\n"),
@@ -264,6 +271,7 @@ function runRetire({
         FAKE_REPLACE_ATTEMPTS: attemptsPath,
         FAKE_REPLACE_STATUS: String(replaceStatus),
         FAKE_REPLACE_STDERR: replaceStderr,
+        FAKE_GET_STDERR: getStderr,
         PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY: "1",
         PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT: digest,
         PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER: owner,
@@ -435,6 +443,47 @@ test("an unreadable approval ConfigMap fails loudly instead of claiming success"
   assert.notEqual(result.code, 0, "an unreadable ConfigMap must not report success");
   assert.equal(result.wrote, false);
   assert.match(result.stderr, /cannot read/);
+});
+
+// The read is the one path where the operator is left to clear the lock by
+// hand, so the message has to name the actual cause. Asserted in BOTH
+// directions: a mutation that drops the stderr passthrough fails the first
+// pair, and one that ungates the bootstrap hint back to unconditional fails
+// the `doesNotMatch` on the denial row -- which is the assertion that matters,
+// because the hint is actively misleading there.
+test("a failed read surfaces its cause, and only hints at the bootstrap when that is the cause", () => {
+  const denial =
+    'Error from server (Forbidden): configmaps "paperclip-api-approved-images" is forbidden: ' +
+    'User "system:serviceaccount:paperclip-release-approvals:approver" cannot get resource "configmaps"';
+  const denied = runRetire({
+    liveConfigMap: null,
+    digest: VALID_DIGEST,
+    owner: VALID_OWNER,
+    getStderr: denial,
+  });
+  assert.notEqual(denied.code, 0, "an unreadable ConfigMap must not report success");
+  assert.match(denied.stderr, /Forbidden/, "the operator needs the actual API error");
+  assert.match(denied.stderr, /cannot get resource/);
+  assert.doesNotMatch(
+    denied.stderr,
+    /cluster-admin bootstrap/,
+    "the bootstrap hint is a red herring for an RBAC denial: the ConfigMap is there",
+  );
+
+  const missing = runRetire({
+    liveConfigMap: null,
+    digest: VALID_DIGEST,
+    owner: VALID_OWNER,
+    getStderr:
+      'Error from server (NotFound): configmaps "paperclip-api-approved-images" not found',
+  });
+  assert.notEqual(missing.code, 0);
+  assert.match(missing.stderr, /NotFound/);
+  assert.match(
+    missing.stderr,
+    /cluster-admin bootstrap/,
+    "a genuinely absent ConfigMap is exactly what the bootstrap hint is for",
+  );
 });
 
 test("retire-only mode refuses ambiguous or half-supplied input", () => {

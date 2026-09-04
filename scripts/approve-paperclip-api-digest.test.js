@@ -969,3 +969,66 @@ test("an unset handoff path skips validation entirely", () => {
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT/);
 });
+
+// Review of #1646 read the span between the ring write and the workflow
+// publishing `lock_owner` to `$GITHUB_OUTPUT` as a residual wedge: the
+// admissibility probe alone budgets ~286s, and an operator cancelling in there
+// was thought to leave a live lock the cleanup step cannot name.
+//
+// It does not, and the reason is entirely mechanical: INT and TERM are trapped
+// into a non-zero `exit`, which runs the EXIT trap, which is `cleanup_on_exit`
+// -- and the arm at the ring write is still set, because nothing disarms it
+// until the handoff has succeeded. So the script retires its own lock before the
+// step shell exits. `runCleanup` above already proves the armed+failure branch
+// retires; what was untested is the two facts that make a CANCELLATION reach it.
+//
+// Both are asserted on real source offsets rather than on text presence, because
+// the way this window reopens is a disarm migrating into that span, and that
+// would leave every other test in this file green.
+test("nothing disarms the cleanup between the ring write and the probe", () => {
+  const armIndex = script.indexOf("lock_cleanup_armed=yes");
+  assert.notEqual(armIndex, -1, "the arming site moved or was renamed");
+  const emitIndex = script.indexOf("    emit_lock_owner", armIndex);
+  assert.notEqual(emitIndex, -1, "the owner handoff no longer follows the arming site");
+
+  // The span has to be measured from the END of the rotation loop, not from the
+  // emit call. The loop's own tail DOES disarm -- deliberately, so that a later
+  // exact-match retry cannot retire a lock another process took -- and that line
+  // sits textually after the emit while being on a path that never emitted: the
+  // successful write `break`s straight past it. Slicing from the emit would
+  // therefore flag a correct disarm, which is the failure this test had on its
+  // first run. From `done` onwards, everything executes unconditionally on the
+  // path that minted a lock, so a disarm in THIS span is the real regression.
+  const loopEnd = script.indexOf("\ndone\n", emitIndex);
+  assert.notEqual(loopEnd, -1, "the rotation loop's end moved");
+  const probeIndex = script.indexOf('for attempt in $(seq 1 "$PROBE_ATTEMPTS")', loopEnd);
+  assert.notEqual(probeIndex, -1, "the admissibility probe moved");
+
+  const disarms = script
+    .slice(loopEnd, probeIndex)
+    .split("\n")
+    .filter((line) => line.trim() === 'lock_cleanup_armed=""');
+  assert.deepEqual(
+    disarms,
+    [],
+    "a disarm here would let a cancellation during the probe strand a live lock",
+  );
+});
+
+test("a signal is routed into the cleanup rather than killing the script outright", () => {
+  // Without these three lines a SIGTERM kills bash with no trap, the lock stays
+  // live, and the cleanup step in docker.yml cannot name it -- which is exactly
+  // the residual the review described. They are the whole reason it is a
+  // SIGKILL-only window and not a cancellation-shaped one.
+  for (const wiring of ["trap cleanup_on_exit EXIT", "trap 'exit 130' INT", "trap 'exit 143' TERM"]) {
+    assert.ok(script.includes(wiring), `missing trap wiring: ${wiring}`);
+  }
+
+  // And the statuses those traps synthesise do land in the retire branch: the
+  // branch keys on "non-zero", so 143/130 must behave exactly like any failure.
+  for (const status of [143, 130]) {
+    const result = runCleanup({ armed: true, preserve: false, status });
+    assert.equal(result.released, true, `exit ${status} must retire the lock it minted`);
+    assert.equal(result.status, status, "the cleanup must not swallow the signal's status");
+  }
+});
