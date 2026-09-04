@@ -483,7 +483,7 @@ export type PrCommentReviewGateCheckResult =
   | { posted: true; verdict: CommentReviewGateVerdict }
   | {
       posted: false;
-      reason: "not_configured" | "fetch_failed" | "post_failed";
+      reason: "not_configured" | "fetch_failed" | "post_failed" | "retirement_failed";
       postFailure?: string;
       retirementDeliveries?: Array<{
         sha: string;
@@ -644,9 +644,15 @@ async function executeCommentReviewGateCheck(
 
     const retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
     if (retirementFailures.length > 0) {
+      // NOT "post_failed": the live status published successfully at line 643
+      // above, and only the retired-context cleanup did not. Reporting this as
+      // a post failure states the opposite of what happened for the field that
+      // matters most. `retirementDeliveries` used to be the sole discriminator
+      // between the two, which is easy to get wrong from outside — a distinct
+      // reason makes both states self-describing.
       return {
         posted: false,
-        reason: "post_failed",
+        reason: "retirement_failed",
         postFailure: retirementFailures.map((failure) => `${failure.context}: ${failure.reason}`).join(", "),
         retirementDeliveries: retirementFailures.map((failure) => ({
           sha: headSha,
