@@ -271,7 +271,7 @@ export interface SharedDependencyConsistencyCheck {
   lockfileState: "missing" | "ok" | "invalid";
   installedState: "missing" | "ok" | "invalid";
   consistent: boolean;
-  problem: "metadata_invalid" | "version_mismatch" | null;
+  problem: "metadata_invalid" | "metadata_missing" | "version_mismatch" | null;
   diagnostic: string | null;
 }
 
@@ -420,10 +420,9 @@ async function readLockfileVersion(
  * package-lock.json against the version physically installed under
  * `installDir/node_modules`.
  *
- * Absence on either side is NOT treated as a mismatch — a missing lockfile
- * (local dev without one) or a not-yet-installed package makes no claim to
- * disagree with. Present-but-invalid metadata fails closed, as do two
- * present, differing versions.
+ * Both metadata sources are required for an installed plugin store. In
+ * particular, `(missing)/(missing)` is not congruent: it can describe an
+ * entirely uninstalled tree and must not make a boot fixture pass.
  */
 export async function checkSharedDependencyConsistency(
   installDir: string,
@@ -441,9 +440,8 @@ export async function checkSharedDependencyConsistency(
     lockfileRead.state === "ok" &&
     installedRead.state === "ok" &&
     lockfileVersion !== installedVersion;
-  const consistent =
-    !metadataInvalid &&
-    !versionMismatch;
+  const metadataPresent = lockfileRead.state === "ok" && installedRead.state === "ok";
+  const consistent = metadataPresent && !metadataInvalid && !versionMismatch;
   const diagnostics = [lockfileRead.diagnostic, installedRead.diagnostic].filter((detail): detail is string => !!detail);
 
   return {
@@ -453,7 +451,13 @@ export async function checkSharedDependencyConsistency(
     lockfileState: lockfileRead.state,
     installedState: installedRead.state,
     consistent,
-    problem: metadataInvalid ? "metadata_invalid" : versionMismatch ? "version_mismatch" : null,
+    problem: metadataInvalid
+      ? "metadata_invalid"
+      : !metadataPresent
+        ? "metadata_missing"
+        : versionMismatch
+          ? "version_mismatch"
+          : null,
     diagnostic: diagnostics.length > 0 ? diagnostics.join("; ") : null,
   };
 }
@@ -1672,6 +1676,49 @@ export function pluginLoader(
           ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts", "--legacy-peer-deps", "--cache", npmCacheDir],
           { timeout: 120_000 }, // 2 minute timeout for npm install
         );
+
+        // npm does not materialize peer dependencies when the peer is absent
+        // from the requested package's dependency graph. The host SDK is a
+        // peer for some operator-installed plugins, so install the workspace
+        // fork into the isolated prefix rather than relying on upward
+        // resolution through the sibling shared store. Running npm here also
+        // records the SDK in the isolated lockfile, keeping the consistency
+        // guard meaningful on the next boot.
+        if (isIsolatedSdkPluginPackage(packageName)) {
+          const isolatedSdkDir = path.join(
+            targetInstallDir,
+            "node_modules",
+            ...STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE.split("/"),
+          );
+          const sharedSdkDir = path.join(
+            localPluginDir,
+            "node_modules",
+            ...STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE.split("/"),
+          );
+          if (!existsSync(isolatedSdkDir)) {
+            if (!existsSync(sharedSdkDir)) {
+              throw new Error(
+                `Cannot materialize ${STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE} for isolated plugin ${packageName}: ` +
+                `host SDK is missing at ${sharedSdkDir}`,
+              );
+            }
+            await execFileAsync(
+              "npm",
+              [
+                "install",
+                `${STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE}@file:${sharedSdkDir}`,
+                "--prefix",
+                targetInstallDir,
+                "--save",
+                "--ignore-scripts",
+                "--legacy-peer-deps",
+                "--cache",
+                npmCacheDir,
+              ],
+              { timeout: 120_000 },
+            );
+          }
+        }
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
       }

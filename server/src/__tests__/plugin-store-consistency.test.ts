@@ -138,7 +138,7 @@ describe("checkSharedDependencyConsistency", () => {
     expect(result.installedVersion).toBe("1.0.0");
   }, 25_000);
 
-  it("does not flag a mismatch when there is no lockfile at all (local dev)", async () => {
+  it("fails closed when there is no lockfile", async () => {
     const installDir = await tempInstallDir();
     await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "1.0.0");
 
@@ -149,13 +149,13 @@ describe("checkSharedDependencyConsistency", () => {
       installedVersion: "1.0.0",
       lockfileState: "missing",
       installedState: "ok",
-      consistent: true,
-      problem: null,
+      consistent: false,
+      problem: "metadata_missing",
       diagnostic: null,
     });
   });
 
-  it("does not flag a mismatch when the package isn't installed yet", async () => {
+  it("fails closed when the package isn't installed yet", async () => {
     const installDir = await tempInstallDir();
     await writeLockfileVersion(installDir, SDK_PACKAGE, "2026.513.0");
 
@@ -166,8 +166,25 @@ describe("checkSharedDependencyConsistency", () => {
       installedVersion: null,
       lockfileState: "ok",
       installedState: "missing",
-      consistent: true,
-      problem: null,
+      consistent: false,
+      problem: "metadata_missing",
+      diagnostic: null,
+    });
+  });
+
+  it("does not treat an entirely absent store as congruent", async () => {
+    const installDir = await tempInstallDir();
+
+    const result = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+
+    expect(result).toEqual({
+      packageName: SDK_PACKAGE,
+      lockfileVersion: null,
+      installedVersion: null,
+      lockfileState: "missing",
+      installedState: "missing",
+      consistent: false,
+      problem: "metadata_missing",
       diagnostic: null,
     });
   });
