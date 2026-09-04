@@ -57,7 +57,17 @@ function raiseBlocks(sql: string): string[] {
   return starts.map((start, index) => sql.slice(start, starts[index + 1] ?? sql.length));
 }
 
-/** That raise's own `HINT`, with SQL's doubled-quote escaping undone. */
+/**
+ * That raise's own `HINT`, with SQL's doubled-quote escaping undone.
+ *
+ * Known hole: only single-quoted literals are recognised. A dollar-quoted hint
+ * (`HINT = $q$CREATE INDEX CONCURRENTLY IF NOT EXISTS ...$q$`) returns `null`
+ * and evades the shape detector below. Latent — nothing in the corpus uses
+ * dollar quoting — and left open deliberately rather than closed with an
+ * untested second branch. If a migration ever needs it, widen to
+ * `/HINT\s*=\s*(?:'((?:[^']|'')*)'|\$(\w*)\$([\s\S]*?)\$\2\$)/i` and add a
+ * fixture; do not assume the shape detector covered it in the meantime.
+ */
 function hintOf(block: string): string | null {
   const match = /HINT\s*=\s*'((?:[^']|'')*)'/i.exec(block);
   return match ? match[1].replace(/''/g, "'") : null;
@@ -95,7 +105,7 @@ function raisesForPrecreation(sql: string): boolean {
 
 let migrationSqlFilesPromise: Promise<readonly { readonly file: string; readonly contents: string }[]> | null = null;
 
-/** Read once per suite: the corpus is ~240 files and three callers want it. */
+/** Read once per suite: the corpus is ~240 files and four callers want it. */
 async function readMigrationSqlFiles(): Promise<readonly { readonly file: string; readonly contents: string }[]> {
   migrationSqlFilesPromise ??= (async () => {
     const entries = await readdir(migrationsDir);
@@ -126,9 +136,22 @@ describe("PRECREATE_REQUIRED_INDEXES registry", () => {
     const guardShaped = files.filter(({ contents }) => raisesForPrecreation(contents)).map(({ file }) => file);
     const markerMatched = await migrationFilesRequiringPrecreation();
 
-    // Non-vacuity: a shape detector that matches nothing would make this test
-    // green for the same reason the bug it guards against was green.
-    expect(guardShaped.length).toBeGreaterThan(0);
+    // Non-vacuity, pinned to a named file rather than a count. The assertion
+    // below is containment, so a *shrinking* `guardShaped` makes it easier to
+    // satisfy — a bare `length > 0` floor would tolerate the shape detector
+    // degrading to near-inert (a `HINT` form `hintOf` cannot parse, a refactor
+    // of the slicing) while staying green, which is this file's own thesis one
+    // level up.
+    //
+    // 0217 is the right pin: it is the file whose wording escaped the old
+    // marker, so its detection lapsing is never a wording preference and
+    // always a real regression. It also cannot go stale — this repo derives
+    // applied-migration state from a migration's content hash, so 0217's text
+    // is immutable, and the same constraint that caused this bug is what makes
+    // the pin permanent. A `>= 8` floor would also work but decays into a
+    // weaker and weaker bound as the corpus grows; set equality against the
+    // marker is the reverse direction rejected below.
+    expect(guardShaped).toContain("0217_heartbeat_runs_queued_age_idx.sql");
     // The shape is ground truth; the marker is only the wording. A migration
     // in the first set but not the second is invisible to the drift test on
     // *both* sides, so it never reaches the pre-flight.
@@ -179,10 +202,15 @@ describe("PRECREATE_REQUIRED_INDEXES registry", () => {
     // Duplication is only safe while something pins the copy to the original:
     // without this, an edited HINT leaves the pre-flight printing remediation
     // that no longer works, which is worse than printing nothing.
+    const files = await readMigrationSqlFiles();
+    const contentsByFile = new Map(files.map(({ file, contents }) => [file, contents]));
     for (const spec of PRECREATE_REQUIRED_INDEXES) {
-      const contents = await readFile(`${migrationsDir}/${spec.migration}`, "utf8");
+      const contents = contentsByFile.get(spec.migration);
+      // A registered file absent from the corpus would otherwise read as
+      // `undefined` and fail on the wrong assertion.
+      expect(contents, `${spec.migration} is registered but not on disk`).toBeDefined();
       // Migration files escape single quotes for the SQL string literal.
-      const unescaped = contents.replace(/''/g, "'");
+      const unescaped = contents!.replace(/''/g, "'");
       expect(unescaped).toContain(spec.createStatement);
     }
   });
