@@ -4250,6 +4250,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           if (!result.posted && result.retirementDeliveries) {
             void Promise.all(result.retirementDeliveries.map((delivery) =>
               enqueueGithubCommitStatusDelivery(db, {
+                // Explicitly provenance-less: a retirement is triggered by the
+                // webhook, not by an agent run, so there is no company or run
+                // to attribute it to. Passing `null` rather than omitting the
+                // keys is deliberate — the enqueue normalizes either shape, but
+                // the omission read as an oversight to several reviewers and is
+                // what the NULL semantics of preserveExistingDelivery rely on.
+                companyId: null,
+                sourceRunId: null,
                 repoFullName: commentReviewGateTrigger.repoFullName,
                 sha: delivery.sha,
                 context: delivery.context,
