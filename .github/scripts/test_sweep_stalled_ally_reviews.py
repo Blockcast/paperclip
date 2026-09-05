@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import tempfile
 import unittest
 import urllib.error
 
@@ -1538,6 +1539,145 @@ class TestRereadGuardResidualIsStated(unittest.TestCase):
         doc = sweep.refire_still_permitted.__doc__ or ""
         self.assertIn("RESIDUAL", doc)
         self.assertIn("does NOT close it", doc)
+
+
+class TestCooldownReasonWordingUnderClockSkew(unittest.TestCase):
+    """The cooldown reason rendered a NEGATIVE age in exactly the headline case.
+
+    `now` is sampled once at the top of the run and shared with should_refire,
+    so a marker posted by a concurrent sweep mid-run is genuinely newer than
+    this run's clock and `since_last` goes negative -- producing
+    "re-asked -3s ago < cooldown 7200s". The decision is correct, but the line
+    reads as an arithmetic bug, and that log line is the operator's only
+    evidence that sweeps are overlapping.
+    """
+
+    NOW = 1_000_000.0
+
+    def test_a_marker_in_the_past_still_reads_as_elapsed_time(self):
+        """Negative control: the ordinary case must not be reworded."""
+        blocked, reason = sweep.cooldown_blocks_refire([self.NOW - 60], self.NOW)
+
+        self.assertTrue(blocked)
+        self.assertIn("re-asked 60s ago", reason)
+
+    def test_a_marker_newer_than_the_scan_clock_renders_no_negative_age(self):
+        blocked, reason = sweep.cooldown_blocks_refire([self.NOW + 3], self.NOW)
+
+        self.assertTrue(blocked)
+        self.assertNotIn("-3s", reason)
+        self.assertIn("3s AFTER", reason)
+
+    def test_the_skew_is_named_rather_than_clamped_away(self):
+        """max(0, ...) would render "re-asked 0s ago", which is worse: it hides
+        that the marker POSTDATES this run, which is the informative part."""
+        _blocked, reason = sweep.cooldown_blocks_refire([self.NOW + 3], self.NOW)
+
+        self.assertIn("concurrent writer", reason)
+
+    def test_the_wording_change_does_not_touch_the_decision(self):
+        """The clamp must stay out of the comparison.
+
+        A marker newer than the clock is still inside the cooldown, and one
+        older than the cooldown still permits the write.
+        """
+        self.assertTrue(sweep.cooldown_blocks_refire([self.NOW + 3], self.NOW)[0])
+        self.assertTrue(sweep.cooldown_blocks_refire([self.NOW - 1], self.NOW)[0])
+        self.assertFalse(
+            sweep.cooldown_blocks_refire([self.NOW - sweep.REFIRE_COOLDOWN_SECONDS - 1], self.NOW)[0]
+        )
+
+
+class TestGuardSkipsAreVisibleInTheStepSummary(unittest.TestCase):
+    """The guard's outcomes were the least visible of the run's, inverting the
+    priority.
+
+    `failed`, `deferred` and `alarming` each get a GITHUB_STEP_SUMMARY section.
+    The two guard outcomes did not -- they reached an operator only through the
+    per-PR stdout line. The contended count is the ONLY direct evidence that
+    dropping the concurrency group (BLO-31818) has a live cost, i.e. that
+    sweeps genuinely overlap, so it was the one you had to grep logs to find.
+    """
+
+    def setUp(self):
+        self._real_sweep = sweep.sweep
+        self._env = {
+            key: os.environ.get(key)
+            for key in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_STEP_SUMMARY")
+        }
+        os.environ["GITHUB_REPOSITORY"] = "Blockcast/paperclip"
+        os.environ["GITHUB_TOKEN"] = "t"
+        handle = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+        handle.close()
+        self.summary_path = handle.name
+        os.environ["GITHUB_STEP_SUMMARY"] = self.summary_path
+
+    def tearDown(self):
+        sweep.sweep = self._real_sweep
+        os.unlink(self.summary_path)
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _summary_for(self, results):
+        sweep.sweep = lambda *a, **k: results
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sweep.main([])
+        except SystemExit:
+            pass
+        with open(self.summary_path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def _skip(self, number, prefix, detail):
+        return (_pr(number), "%040x" % number, None, False, "%s -- %s" % (prefix, detail))
+
+    def test_a_contended_skip_is_named_as_concurrency_evidence(self):
+        summary = self._summary_for([
+            self._skip(1, sweep.REREAD_SKIP_REASON_PREFIX, "re-asked 3s AFTER this run's scan clock"),
+        ])
+
+        self.assertIn("withheld by the pre-write guard", summary)
+        self.assertIn("1 contended", summary)
+        self.assertIn("BLO-31818", summary, "the summary must name the concurrency-group cost")
+        self.assertIn("#1", summary)
+
+    def test_an_answered_skip_is_reported_separately_from_a_contended_one(self):
+        """AC3 on the summary surface, not only on the per-PR log line.
+
+        Collapsing the two would make a healthy outcome (Ally answered
+        mid-run) read as evidence of contention, which is the specific
+        misreading the separate counts exist to prevent.
+        """
+        summary = self._summary_for([
+            self._skip(1, sweep.REVIEWED_SKIP_REASON_PREFIX, "consolidated report on the reviews surface"),
+        ])
+
+        self.assertIn("1 answered", summary)
+        self.assertNotIn("contended", summary)
+
+    def test_both_kinds_are_counted_separately_in_one_run(self):
+        summary = self._summary_for([
+            self._skip(1, sweep.REREAD_SKIP_REASON_PREFIX, "marker"),
+            self._skip(2, sweep.REVIEWED_SKIP_REASON_PREFIX, "comment surface"),
+            self._skip(3, sweep.REVIEWED_SKIP_REASON_PREFIX, "reviews surface"),
+        ])
+
+        self.assertIn("3 re-fire(s) withheld", summary)
+        self.assertIn("1 contended", summary)
+        self.assertIn("2 answered", summary)
+
+    def test_a_clean_run_writes_no_guard_section(self):
+        """Negative control: the section is conditional, not always-on.
+
+        An unconditional block would put a permanent "0 withheld" line on
+        every summary, which is how a signal stops being read.
+        """
+        summary = self._summary_for([(_pr(1), "%040x" % 1, None, False, "skip: not pending")])
+
+        self.assertNotIn("withheld by the pre-write guard", summary)
 
 
 if __name__ == "__main__":
