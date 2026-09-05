@@ -1277,7 +1277,13 @@ function runReleaseWrite({ stderrText, attempts = 3 }) {
   );
   // Heredoc body and terminator sit at column 0 deliberately; indenting them
   // here would make the generated bash unparseable rather than failing loudly.
-  const harness = `set -uo pipefail
+  // Flags match the shipping script's `set -euo pipefail` (`:82`) so what runs
+  // here runs under production's error handling; all three cases behave
+  // identically either way, so the fidelity is free. It is NOT extra mutation
+  // coverage for the trailing-sleep guard below: bash exempts the left side of
+  // an `&&` list from `set -e`, so rewriting the guard as `(( ... )) && sleep 1`
+  // does not abort and this harness passes with it either way (measured).
+  const harness = `set -euo pipefail
 NAMESPACE=paperclip-release-approvals
 CONFIGMAP=paperclip-api-approved-images
 RETIRE_ATTEMPTS=${attempts}
@@ -1349,5 +1355,28 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
     r.stderr,
     /cannot retire the in-flight lock on/,
     "the non-retriable message must not fire on a retriable conflict",
+  );
+});
+
+test("a retirement write with no stderr still explains itself", () => {
+  // The empty capture is not an exotic case on THIS path: the loop runs inside a
+  // trap reached from `trap 'exit 143' TERM`, so kubectl signal-killed mid-
+  // `replace` is the expected teardown. An empty capture matches none of the
+  // conflict vocabulary, so it takes the non-retriable bail -- which is correct
+  // (nothing proves a retry would win) but must not print a header promising a
+  // cause and then a blank line. Same guard, and same reason, as the read path's
+  // above.
+  const r = runReleaseWrite({ stderrText: "" });
+  assert.equal(r.writes, 1, "an empty stderr proves no race, so it must not be retried");
+  assert.equal(r.status, 1, "the retirement must still report failure");
+  assert.match(
+    r.stderr,
+    /\(kubectl produced no error output\)/,
+    "an empty stderr must say so rather than leaving a dangling colon",
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /\(owner owner-nonce-1\):\s*$/,
+    "the message must not end at the colon it promises to expand on",
   );
 });
