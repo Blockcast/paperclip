@@ -33,6 +33,18 @@ const PIPE_PRESSURE_BYTES = 200_000;
 /** Child startup is outside the measured crash deadline and can lag on loaded CI runners. */
 const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
 /**
+ * Harness backstop for `runFixture`, never the thing under test: those tests assert
+ * exit code and stderr content and never elapsed time, so unlike the stalled-exit
+ * watchdog below this one competes with no assertion. It is derived rather than
+ * literal because at a bare 5_000 it contradicted the constant directly above — this
+ * budget spans spawn through child exit, a superset of the startup that
+ * FIXTURE_STARTUP_TIMEOUT_MS already says can take 10s on a loaded runner, and it
+ * additionally has to cover the crash and draining PIPE_PRESSURE_BYTES through a
+ * 64 KB pipe. Deriving it keeps the two watchdogs in this file from disagreeing
+ * again about how slow a loaded runner is allowed to be.
+ */
+const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
+/**
  * The behaviour under test: with stderr stalled, the guard must still exit this fast.
  * This is the contract — tighten or loosen it only when the guard's own deadline moves.
  */
@@ -72,8 +84,14 @@ function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections
     let stderr = "";
     const watchdog = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error(`crash fixture timed out (${kind})`));
-    }, 5_000);
+      reject(
+        new Error(
+          `crash fixture (${kind}) had not exited ${FIXTURE_RUN_WATCHDOG_MS}ms after spawn ` +
+            `(harness backstop; these tests assert output rather than timing, so the child was ` +
+            `SIGKILLed here, not observed failing)`,
+        ),
+      );
+    }, FIXTURE_RUN_WATCHDOG_MS);
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
