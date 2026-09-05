@@ -52,9 +52,16 @@ const mockIssuesApi = vi.hoisted(() => ({
 }));
 
 // `list` is deliberately absent. The real `executionWorkspacesApi` has it, but
-// NewIssueDialog must only ever reach for the cheaper `listSummaries`; leaving
-// it off the double turns a regression into a TypeError here rather than a
-// silent extra fetch.
+// NewIssueDialog must only ever reach for the cheaper `listSummaries`. Omitting
+// it is what let the vacuous `expect(list).not.toHaveBeenCalled()` assertion go
+// away — it is not itself a tripwire, so do not read it as one. A regression to
+// `list` throws inside a react-query `queryFn`; React Query catches that into
+// `isError` (the client below sets `retry: false` with no `throwOnError`, and
+// there is no ErrorBoundary), so the dialog renders its error branch instead of
+// crashing the test. Measured by forcing the regression: it reddens 2 of 26
+// tests — the `toHaveBeenCalledWith` in "submits parent and goal context for
+// sub-issues" and the "Reusing PAP-100" assertion in "applies project and
+// execution workspace defaults for normal new issues". The other 24 swallow it.
 const mockExecutionWorkspacesApi = vi.hoisted(() => ({
   listSummaries: vi.fn(),
 }));
@@ -557,8 +564,10 @@ describe("NewIssueDialog", () => {
     // dialog must ask for reuse-eligible summaries rather than the full
     // workspace list. The `not.toHaveBeenCalled()` check on `list` that used to
     // sit here could never fail — the dialog has no `list` call site, so it was
-    // vacuous by construction. Omitting `list` from the module double enforces
-    // the same invariant for real: a regression to it throws here instead.
+    // vacuous by construction. This `toHaveBeenCalledWith` is the enforcement
+    // that replaces it: a switch to `list` reddens exactly this assertion and
+    // one other in the file, because React Query swallows the resulting throw
+    // everywhere else (see the module-double comment above).
     await waitForAssertion(() => {
       expect(mockExecutionWorkspacesApi.listSummaries).toHaveBeenCalledWith("company-1", {
         projectId: "project-1",
