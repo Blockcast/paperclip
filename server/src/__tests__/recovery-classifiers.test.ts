@@ -160,11 +160,23 @@ describe("recovery classifier boundary", () => {
     );
   });
 
-  // The AC's second half: it must also stay eligible for the zero-token session
-  // reset, which `skill_not_found` is deliberately excluded from.
-  it("does not exclude a mid-materialization skill fault from the session reset", () => {
+  // The AC's second half. Stated precisely, because the intuitive reading is
+  // backwards and acting on it would undo this whole change: like the
+  // `adapter_failed` it replaces, this code is ABSENT from
+  // ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES, so `isZeroTokenStartupFailureRun`
+  // stays false and the run is NOT escalated as a structural startup wedge — it
+  // takes ordinary transient recovery instead. That set marks wedges the sweep
+  // escalates straight to `blocked` (service.ts, the `isZeroTokenStartupFailureRun`
+  // branch), and a self-healing materialization race is the opposite of one.
+  // It is separately not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE, so nothing
+  // else excludes it either — but that non-membership does NOT imply zero-token
+  // eligibility; the two tests are independent.
+  it("is not treated as a structural zero-token wedge", () => {
     expect("skill_materialization_pending").not.toBe(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
     expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("skill_materialization_pending")).toBe(false);
+    // Parity with the code being replaced is the actual invariant: neither is a
+    // zero-token startup failure, so this change moves nothing.
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("adapter_failed")).toBe(false);
     expect(isZeroTokenStartupFailureRun({
       status: "failed",
       errorCode: "skill_materialization_pending",

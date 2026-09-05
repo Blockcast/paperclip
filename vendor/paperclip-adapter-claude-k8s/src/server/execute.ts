@@ -1478,8 +1478,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // on its own, so this must stay retryable: `skill_materialization_pending`
       // is a member of TRANSIENT_INFRA_CONTINUATION_ERROR_CODES (the set that
       // already held `adapter_failed`, so retryability is preserved exactly, not
-      // widened) and is not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE excluded
-      // from the zero-token session reset.
+      // widened). Like `adapter_failed` it is also absent from
+      // ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES, so it is NOT escalated as a
+      // structural startup wedge — a self-healing race is the opposite of one.
+      // It is separately not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE; that
+      // non-membership does not imply zero-token eligibility, which is an
+      // independent test.
       //
       // No catalog row => a genuine, permanent configuration fault, which keeps
       // the existing non-retryable `skill_not_found`.
