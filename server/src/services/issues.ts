@@ -4595,6 +4595,21 @@ function blockedInboxResponseDescription(entry: BlockedInboxAttentionEntry, row:
  * needed the declaration to sit past `ISSUE_LIST_DESCRIPTION_MAX_CHARS`). Emitting both fields
  * from one place is what makes "asserted redacted" and "actually redacted" hard to separate
  * again. `entry.externalWait` stays internal: it holds the very strings being removed.
+ *
+ * Two limits of this flag, recorded so a later reader does not over-read it:
+ *
+ * 1. It is a **response-consistency invariant, not a disclosure boundary.** Do not build an
+ *    access-control decision on it. `list()` matches `q` with `${issues.description} ILIKE …`
+ *    against the *full* column, so `?includeBlockedInboxAttention=true&q=<owner>` still returns
+ *    the row — body redacted, presence confirming the guess. The same string is also available
+ *    by simply omitting the flag. The blocked-inbox path does not have this property: its `q`
+ *    filters in JS over `blockedInboxSearchText`, which reads the redacted description.
+ * 2. The two paths agree on the returned description **only because `decodeDatabaseTextPreview`
+ *    is provably the identity here** — PG `substring(text, 1, n)` already counts code points, so
+ *    `truncateByCodePoint` is a no-op even for astral characters. `listBlockedInboxIssues`
+ *    applies it before redacting and `list()` does not. The cross-endpoint equality test couples
+ *    them, so if that step ever stops being an identity, `list()` becomes the wrong one and that
+ *    test fails some distance from the cause — mirror the decode into this helper at that point.
  */
 function blockedInboxAttentionResponseFields(
   entry: BlockedInboxAttentionEntry | undefined,
