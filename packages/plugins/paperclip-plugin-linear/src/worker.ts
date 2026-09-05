@@ -3669,7 +3669,11 @@ async function handleWebhookEvent(
     // every `linearCommentId` (below), so *every* mirror carries one — keyed and
     // legacy alike — and this guard is therefore where all edits of an
     // already-mirrored comment actually stop. Propagating an edit needs an
-    // update keyed on the existing comment, and `mirrored.id` is that handle.
+    // update keyed on the existing comment, and `mirrored.id` is that handle —
+    // but the handle is the argument, not the missing mechanism: the SDK has no
+    // comment-update call at all today (`listComments` and `createComment` are
+    // the whole surface), so BLO-31634 needs a new host RPC and its
+    // worker-rpc-host forward before `mirrored.id` has anything to be passed to.
     if (action === "update" && linearCommentId) {
       try {
         const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
@@ -3717,8 +3721,15 @@ async function handleWebhookEvent(
       // already-mirrored comment — keyed or legacy — stops at the sentinel guard
       // above and never reaches here, because the sentinel is written under the
       // same `linearCommentId` condition as the key, so every keyed mirror
-      // carries one too. The sole residual is an `update` whose `listComments`
-      // threw: the catch proceeds, and a keyed mirror then dedups here.
+      // carries one too. Two residuals reach here anyway. An `update` whose
+      // `listComments` threw: the catch proceeds, and a keyed mirror then dedups
+      // here. And an `update` of a mirror that was since soft-deleted: the scan
+      // cannot see it, because a deleted comment comes back with its body
+      // blanked, and the key cannot match it either, because all three 0206
+      // indexes are `WHERE ... deleted_at IS NULL` as well as
+      // `idempotency_key IS NOT NULL`. So the insert succeeds and this is falsy
+      // — the edit re-bridges, which is what you would want once the mirror is
+      // gone, and the two mechanisms agree rather than diverging.
       //
       // Edits are skipped either way, not propagated. That is BLO-31634,
       // deliberately *unchanged* here rather than fixed in passing; the guard
