@@ -174,9 +174,10 @@ test("every job that sets up pnpm clears the measured setup floor", async () => 
         `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${declared[1]}, ` +
           `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. A slow-but-successful setup ` +
           `alone measured 8.1m (worst observed checkout + pnpm combined, NOT the sum of ` +
-          `the two p100s), and the job's own work adds up to ` +
-          `4.8m on top, so a budget under the floor is spent before the work starts — the ` +
-          `job dies at its cap as an unattributable \`cancelled\` (BLO-31690)`,
+          `the two p100s), and on \`policy\`, the job this floor was measured against, ` +
+          `gate work adds up to 4.8m on top, so a budget under the floor leaves too little ` +
+          `for the job's own work — the job dies at its cap as an unattributable ` +
+          `\`cancelled\` (BLO-31690)`,
       );
     }
   }

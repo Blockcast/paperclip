@@ -78,9 +78,16 @@ jobs:
     #                                                 have moved since this was
     #                                                 written)
     #   one 1-minute step bound                1.0m   (headroom for a single
-    #                                                 hung gate step to fail as
-    #                                                 THAT step instead of as
-    #                                                 the job cap -- BLO-29182)
+    #                                                 hung BOUNDED gate step to
+    #                                                 fail as THAT step instead
+    #                                                 of as the job cap --
+    #                                                 BLO-29182. The qualifier
+    #                                                 is load-bearing: 18 of
+    #                                                 `policy`'s 59 steps carry
+    #                                                 no bound, so the reserve
+    #                                                 delivers this only over
+    #                                                 the bounded 41. See the
+    #                                                 attribution note below)
     #                                         -------
     #                                         13.9m   -> 15m = 1.1m (7%)
     #
@@ -115,8 +122,27 @@ jobs:
     # the 4.8m gate record (33922988027) carried only 3.1m of setup, finishing
     # at 7.9m. What the 6m checkout bound buys is therefore not headroom but
     # ATTRIBUTION: a checkout slower than 6m now fails as the checkout step
-    # rather than as the cap, which leaves `Setup pnpm` as the only remaining
-    # way to reach the cap without an attributable step failure.
+    # rather than as the cap, which leaves `Setup pnpm` as the only unbounded
+    # step large enough to reach the cap on its own.
+    #
+    # "Large enough on its own" is the honest form of that claim and an earlier
+    # revision overstated it as "the only remaining way". `Setup pnpm` is one of
+    # EIGHTEEN unbounded steps here -- 59 steps, 41 bounded, 18 not (2026-09-05,
+    # this head) -- so any of the other 17 wedging also produces an
+    # unattributable job-cap `cancelled`. What separates them is size, not
+    # boundedness: over the same 200-run / 181-success window their combined
+    # cost is 1.47m in the worst single run, or 1.83m summing each one's p100
+    # across DIFFERENT runs (the deliberately over-budgeted form used in the
+    # table above), against `Setup pnpm`'s 4.27m alone. The largest of the 17 is
+    # `Set up Python for the review-gate sweep suite` at 1.05m. So one of them
+    # reaching a 15m cap means a HANG, which a bound would catch, not slow work,
+    # which a bound would not distinguish -- whereas pnpm can plausibly get
+    # there by being slow. Three of the 17 (`Setup Node.js`, `Setup actionlint`,
+    # `setup-python`) fetch over the network, the same degraded-registry mode
+    # this whole BLO-28813 -> BLO-31690 family is about, so the gap is real
+    # rather than theoretical; it is a diagnostic-record gap, not a sizing one,
+    # since the 9.73m total-step-time p100 the cap is sized against already
+    # includes all 18.
     #
     # This supersedes an earlier 5 -> 10 raise whose arithmetic was "2 x
     # (bootstrap + 120s fetch) + backoff ~= 5m", covering a second
@@ -159,7 +185,11 @@ jobs:
     #     surfaces as an unattributable job-cap cancellation the way a wedged
     #     checkout did before the bound below. Bounding it means picking a
     #     number above that 10.8m retry path, which only pays off once the
-    #     bootstrap stops being a 4m registry round-trip.
+    #     bootstrap stops being a 4m registry round-trip. It is the largest
+    #     unbounded step, not the only one -- 17 others are listed in the
+    #     attribution note above, and a hang in any of them lands the same way;
+    #     pnpm is singled out here because it is the only one whose ORDINARY
+    #     cost is within striking distance of the cap.
     timeout-minutes: 15
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}

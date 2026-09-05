@@ -115,10 +115,12 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
 // mutation case above exists because a bound nothing asserts is a bound that can
 // be quietly deleted, and this one is the only step bound in `policy` that had no
 // test behind it. The sizing argument (6m ≈ 1.3× the p100, why not 8m, and the
-// 0.2m residual band it leaves) lives in the workflow comment; the invariants
-// worth gating are that the bound exists and that it stays under the cap, since a
-// step bound at or above the job cap can never fire and silently stops being
-// attribution.
+// residual band it leaves) lives in the workflow comment — deliberately without
+// the figure here, since that band is a function of the drifting gate-work term
+// and a copy of it in this file went stale within one commit (0.2m → 1.1m); the
+// invariants worth gating are that the bound exists and that it stays under the
+// cap, since a step bound at or above the job cap can never fire and silently
+// stops being attribution.
 function assertCheckoutBounded(region) {
   const jobCap = Number(region.match(/\n    timeout-minutes: (\d+)\n/)?.[1]);
   assert.ok(jobCap > 0, "policy must declare a job-level timeout-minutes");
