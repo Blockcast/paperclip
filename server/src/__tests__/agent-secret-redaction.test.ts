@@ -782,6 +782,7 @@ describe("agent secret redaction on mutating responses", () => {
     expect(res.status).toBe(200);
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
     expect(res.body.adapterConfig).toEqual({});
+    expectNoPlaintextSecrets(res.body);
   });
 
   it("PATCH /agents/:id contains a runtimeConfig whose prototype is not Object.prototype", async () => {
@@ -798,6 +799,10 @@ describe("agent secret redaction on mutating responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.runtimeConfig).toEqual({});
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    // Only `runtimeConfig` is replaced here, so `adapterConfig` is still the
+    // shared fixture's — every PEN-2747 shape rides this response and the sweep
+    // is what pins them.
+    expectNoPlaintextSecrets(res.body);
   });
 
   // `redactAgentConfiguration` passes the value in with no plain-object gate at
@@ -826,6 +831,7 @@ describe("agent secret redaction on mutating responses", () => {
     // the two config fields, not to the whole response.
     expect(res.body.name).toBe("Builder");
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
   });
 
   // The fifth converted site, and the last one this suite did not reach. The
@@ -881,6 +887,13 @@ describe("agent secret redaction on mutating responses", () => {
     // The rest of the approval row still projects — containment is scoped to
     // `payload`, not to the whole response.
     expect(res.body.approval.type).toBe("hire_agent");
+    // `SNAPSHOT_DRIFT_SECRET` lives only in the payload this test builds, so the
+    // assertion above says nothing about the OTHER half of this response.
+    // `POST /agent-hires` returns `{ agent: redactAgentSecrets(agent), approval }`
+    // and `hire()` resolves a `baseAgent`-derived row, so an edit that serialized
+    // `agent` directly would leave every PEN-2747 shape on the wire with all
+    // three hire tests still green. The shared-fixture sweep is what catches it.
+    expectNoPlaintextSecrets(res.body);
   });
 
   // Not a leak on either side of the change, and pinned for exactly that
@@ -894,6 +907,7 @@ describe("agent secret redaction on mutating responses", () => {
     expect(res.status).toBe(201);
     expect(res.body.approval.payload).toEqual({});
     expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
   });
 
   // The masking arm — the one every REAL hire takes, since a hire payload is an
@@ -931,6 +945,7 @@ describe("agent secret redaction on mutating responses", () => {
     const masked = { type: "plain", value: "***REDACTED***" };
     expect(res.body.approval.payload.adapterConfig.env.API_KEY).toEqual(masked);
     expect(res.body.approval.payload.requestedConfigurationSnapshot.adapterConfig.env.API_KEY).toEqual(masked);
+    expectNoPlaintextSecrets(res.body);
   });
 
   // `secret_ref` bindings are pointers, never plaintext, so they survive the
