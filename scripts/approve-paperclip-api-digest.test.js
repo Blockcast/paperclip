@@ -1405,7 +1405,7 @@ test("a retirement write that succeeds returns at the first attempt without slee
   // spends, and would still pass if the sleep had migrated above the success
   // check and started charging every caller. A succeeding retirement is the
   // common case on this path, and it must cost nothing.
-  const r = runReleaseWrite({ stderrText: "", writeSucceeds: true });
+  const r = runReleaseWrite({ writeSucceeds: true });
   assert.equal(r.writes, 1, "a succeeding write must not be repeated");
   assert.equal(r.status, 0, "a retired lock must report success");
   assert.deepEqual(r.sleeps, [], "the success path must not sleep");
@@ -1496,12 +1496,9 @@ JSON
       ;;
     replace)
       echo x >>${JSON.stringify(countFile)}
-      # Drains the manifest jq pipes in, as the real \`kubectl replace -f -\`
-      # does. Not cosmetic: the write is a \`jq | kubectl\` pipeline under
-      # \`pipefail\`, so a stub that exits without reading kills jq with EPIPE
-      # and fails the pipeline on jq's status. The failing branch below cannot
-      # show that -- it fails the pipeline itself either way -- so the bug only
-      # surfaces on the succeeding branch, as a success reported as status 1.
+      # Drains the manifest, for the reason spelled out in \`runReleaseWrite\`:
+      # the write is a \`jq | kubectl\` pipeline under \`pipefail\`, so a stub
+      # that exits without reading fails it on jq's EPIPE status.
       cat >/dev/null
 ${
   writeSucceeds
@@ -1583,7 +1580,7 @@ test("retire-only mode's succeeding write exits 0 at the first attempt without s
   // release loop `return 0`s, so this also pins that the success exit survives
   // the slice -- a mode that retired the lock and then exited non-zero would
   // fail the deploy step that called it.
-  const r = runRetireOnlyWrite({ stderrText: "", writeSucceeds: true });
+  const r = runRetireOnlyWrite({ writeSucceeds: true });
   assert.equal(r.writes, 1, "a succeeding write must not be repeated");
   assert.equal(r.status, 0, "a retired lock must exit 0");
   assert.deepEqual(r.sleeps, [], "the success path must not spend the backoff");
