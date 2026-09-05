@@ -1119,6 +1119,76 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     expect(hasActionablePrReviewFeedback(body)).toBe(true);
   });
 
+  // `still-present` is the ledger verb for "this prior finding still stands",
+  // and `classifyPriorDisposition` already returns `blocks` for it. The
+  // contract says such a finding is mirrored into the current buckets, which
+  // would make a count non-zero and block here anyway — these two cases pin the
+  // defence for when that mirroring is omitted, which the precedence fix would
+  // otherwise turn from a heuristic red into a deterministic green.
+  it("still blocks a 0/0 review whose ledger asserts a prior finding is still-present", () => {
+    const body = [
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("clears a 0/0 review whose ledger only retires prior findings", () => {
+    // The control for the case above: `fixed` classifies as `retires`, so it
+    // must not block. Without this, the still-present guard could be satisfied
+    // by any ledger entry at all and the fix would silently stop working.
+    const body = [
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed"),
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  it("clears a 0/0 review whose ledger carries a verb this parser does not know", () => {
+    // Deliberate, and the asymmetry with the carry-forward path is the point.
+    // There the question is "was this prior finding retired?", so an
+    // `unrecognized` verb fails closed — `isRetired` demands `retires`. Here the
+    // question is "does this review report findings against *this* head?", and
+    // the 0/0 answers it directly. Only `still-present` is excluded, because it
+    // is the one verb that positively asserts a finding still stands and so
+    // contradicts the tally beside it. Widening this to `unrecognized` would
+    // block on a typo, which is why it is pinned rather than left ambiguous.
+    const body = [
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "deferred"),
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  it("fails the gate at the current head when a still-present ledger entry rides a 0/0 body", () => {
+    // The unit assertions above cannot reach this. `evaluateCommentReviewGate`
+    // short-circuits on a current-head attestation before it consults the
+    // carry-forward, so the still-present entry is never re-examined there —
+    // the existing still-present test in this file attests INTERMEDIATE_HEAD
+    // and therefore exercises the carry-forward path instead.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(
+          [
+            dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
+            "### Recommended Action",
+            "1. No Critical issues to fix before merge.",
+          ].join("\n"),
+          "2026-09-05T20:00:00Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
   it("still counts a non-zero bucket alongside clean prose", () => {
     const body = reviewBody(CURRENT_HEAD, [
       "### Critical Issues (0)",
