@@ -890,16 +890,24 @@ describe("buildJobManifest", () => {
     // not security, so unlike the remove/add pair it is guarded — an offline pod
     // must degrade to "fetch first", never to a failed run.
     it("refetches remote-tracking refs and origin/HEAD after repointing origin, without letting a fetch failure fail the run", () => {
+      // Each path is read twice — once to build the fixture, once to spell the
+      // `git -C` prefixes the assertions match on — so bind them rather than
+      // re-typing the literals. The desync fails closed but points the wrong
+      // way: editing a fixture literal alone leaves both calls unrecognised, so
+      // the suite reports "unclassified git call" and sends the reader to the
+      // run-workspace git block they did not touch instead of the path they did.
+      const sourceCheckout = "/paperclip/instances/default/projects/co1/proj-1/paperclip";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
       ctx.context = {
         paperclipWorkspace: {
-          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          cwd: sourceCheckout,
           repoUrl: "https://github.com/Blockcast/paperclip.git",
         },
       };
       setRuntimeIsolation(ctx, {
         isolationMode: "run",
         isolationKey: "run:run-abc12345",
-        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        workspaceRoot,
         homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
         sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
         cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
@@ -909,7 +917,6 @@ describe("buildJobManifest", () => {
 
       const { job } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
-      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
       const boundedGit = `git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
 
       expect(command).toContain(`fetch --no-tags --quiet origin`);
@@ -999,7 +1006,14 @@ describe("buildJobManifest", () => {
       // repo URL, the `git ...` spelled inside the breadcrumb prose (always
       // preceded by a backtick), and the tail of a flag such as `--git-dir`,
       // which is reported by the flag's own call rather than twice.
-      const sourceCheckout = "/paperclip/instances/default/projects/co1/proj-1/paperclip";
+      //
+      // Scope is deliberately the WHOLE container command, not just this block:
+      // the command also carries buildEnvGuardSetupShell(), ccrotateRefresh,
+      // DIND_WAIT_PREAMBLE, claudeArgsEscaped and failFastFilter. That is the
+      // fail-closed choice — a git call added to any of them still lands here —
+      // but the coupling runs the other way too, so an unrelated file can redden
+      // this assertion. If that happens the fix is to classify the new call, not
+      // to narrow this match back to the block.
       const unclassifiedGitCalls = [...command.matchAll(/(?<![-.`\w])git\b/g)]
         .map((m) => command.slice(m.index))
         .filter(
