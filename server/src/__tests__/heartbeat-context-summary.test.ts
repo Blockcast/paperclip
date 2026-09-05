@@ -1381,6 +1381,16 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`I resolved every unclear row, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`It is obvious no newer head exists so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       [`No unknown commits were found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      // pass 23: a negation governing the PREVIOUS clause may not cross a
+      // consequence connective into this one (was false-vetoed 7/10).
+      [`Nothing changed so I see this head was already reviewed at \`${sha}\`.`, true],
+      [`Not stale since I verified this head was already reviewed at \`${sha}\`.`, true],
+      [`No drift so we confirm this head was already reviewed at \`${sha}\`.`, true],
+      [`Nothing moved therefore I see this head was already reviewed at \`${sha}\`.`, true],
+      // …but a connective in FILLER role (complementizer follows) still lets
+      // the negation govern this clause — the pass-15 balance, unchanged.
+      [`No sign but that this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence so far that this head was already reviewed at \`${sha}\`.`, false],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
@@ -1415,6 +1425,7 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       ["No evidence of a force-push, so ", null],
       ["I did not check whether a newer head exists so ", null],
       ["No newer commits were found so this head was ", null],
+      ["Nothing changed so I see this head was ", null],
       ["Beyond reasonable doubt this head was ", null],
       ["The wake was probably a duplicate dispatch so ", null],
     ])("%s -> %s", (before, cue) => {
@@ -1433,7 +1444,9 @@ describe("evaluatePrReviewCompletionEvidence", () => {
   // the review clause. It has never been survivable for any epistemic cue —
   // the `negation` row here false-vetoes at every head in this PR's history —
   // and it fails toward `missing`, a re-review rather than a masked
-  // non-review. Passes 20-22 each widened it to more words; none opened it.
+  // non-review. Passes 20-22 each widened it to more words; none opened it. The
+  // pass-23 connective-role exclusion on `negation`'s filler does not touch
+  // it either: these frames carry no connective for the exclusion to act on.
   //
   // If a later pass fixes CLAUSE_REACH so an adjunct no longer swallows the
   // clause, these expectations flip to `true` and SHOULD be updated to `true`.
@@ -1449,6 +1462,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       // widened by the pass-20 adjective family and the pass-21 `obvious`
       [`Given no certain match this head was already reviewed at \`${sha}\`.`, false],
       [`Aside from no obvious drift this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-22 `ideas?` lemma
+      [`No new idea landed for this head was already reviewed at \`${sha}\`.`, false],
     ])("known residual: %s -> %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
     });
@@ -1465,7 +1480,6 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(true);
     });
   });
-
 
   // A hedge about something OTHER than the review does not mask the skip: the
   // `that`-complement closes before the clause, so no copula reaches it. Drop
