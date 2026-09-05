@@ -555,6 +555,13 @@ export interface PluginExecutionWorkspaceMetadata {
   /**
    * Mode of this execution workspace — the field that answers whether its
    * path is private to one issue. Optional for SDK back-compat.
+   *
+   * Absent *or* `null` both mean "unspecified", and the test double substitutes
+   * a concrete `shared_workspace` rather than passing the blank through — the
+   * host's column is non-null, so an issue-scoped result always carries a real
+   * mode. The substitute is deliberately one of the non-isolated modes: seeding
+   * nothing must not read as a claim that the path is private. Seed the mode
+   * explicitly if your plugin branches on isolation.
    */
   mode?: PluginWorkspaceMode | null;
   /** Provider metadata already safe for plugin consumption. */

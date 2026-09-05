@@ -116,6 +116,63 @@ describe("createTestHarness getWorkspaceForIssue", () => {
     expect([a?.path, b?.path]).not.toContain(BASE_CHECKOUT);
   });
 
+  // BLO-31349 / Ally review of 97cd239: the happy path above asserts
+  // `mode: "isolated_workspace"` against a helper that SEEDS that same literal,
+  // so it passes identically whether the double passes the seeded mode through,
+  // falls back, or hard-codes it — replacing the mapping with a bare literal
+  // would break nothing. These two cases separate the limbs: the first seeds a
+  // mode that is not the default and asserts it survives (passthrough), the
+  // second omits the field entirely and asserts the substitute (default).
+  it("passes a seeded non-isolated mode through rather than substituting", async () => {
+    const workspace = executionWorkspace({ id: "ws-a", mode: "operator_branch" });
+    const harness = harnessWith([workspace], [{ id: "issue-a", executionWorkspaceId: "ws-a" }]);
+
+    const result = await harness.ctx.projects.getWorkspaceForIssue("issue-a", COMPANY_ID);
+
+    // `operator_branch` is issue-bound but NOT isolated, so a plugin asking the
+    // isolation question must get `false` here even though the workspace did
+    // resolve issue-scoped. Those two facts are independent.
+    expect(result).toMatchObject({ id: "ws-a", isIssueScoped: true, mode: "operator_branch" });
+  });
+
+  it("substitutes a non-isolated mode when the seeded workspace omits one", async () => {
+    // Seeded as a raw metadata object rather than via `executionWorkspace`,
+    // because that helper always seeds a `mode` — omission is the case under
+    // test and the helper cannot express it.
+    const cwd = `${BASE_CHECKOUT}/.paperclip/worktrees/ws-a`;
+    const harness = harnessWith(
+      [
+        {
+          id: "ws-a",
+          companyId: COMPANY_ID,
+          projectId: PROJECT_ID,
+          projectWorkspaceId: primaryWorkspace.id,
+          name: "wt-ws-a",
+          path: cwd,
+          cwd,
+          repoUrl: null,
+          baseRef: "origin/master",
+          branchName: "branch-ws-a",
+          providerType: "git_worktree",
+          providerMetadata: null,
+        },
+      ],
+      [{ id: "issue-a", executionWorkspaceId: "ws-a" }],
+    );
+
+    const result = await harness.ctx.projects.getWorkspaceForIssue("issue-a", COMPANY_ID);
+
+    // Non-null, because the host's column is non-null and `mode: null` on an
+    // issue-scoped result would tell callers to read it as project-scoped...
+    expect(result?.mode).not.toBeNull();
+    // ...but NOT one of the two isolation-guaranteeing modes. An author who
+    // seeded nothing about isolation must not be handed the strongest claim:
+    // this is the assertion that fails if the default is flipped back to
+    // `isolated_workspace`.
+    expect(result?.mode).toBe("shared_workspace");
+    expect(result).toMatchObject({ id: "ws-a", isIssueScoped: true });
+  });
+
   // BLO-31349 / Ally review of a8a2628: the host rejects a bound workspace on
   // THREE tests — wrong company, closed/archived, and no realized `cwd`. Before
   // `closed` existed on PluginExecutionWorkspaceMetadata a plugin author could
