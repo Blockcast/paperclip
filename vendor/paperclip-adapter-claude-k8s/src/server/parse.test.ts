@@ -828,6 +828,321 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     ).toBe(false);
   });
 
+  // The generalisation, and the reason this guard is an allowlist rather than a
+  // fourth blocklist entry. `stream_event` wraps partial assistant deltas, so
+  // it carries model prose exactly as shapes (a)-(c) do, and it was enumerated
+  // by no previous version of this guard — so it must fail closed on that basis
+  // alone rather than on being recognised.
+  //
+  // Not hypothetical, and not merely reachable in principle: running
+  // `claude --print - --output-format stream-json --verbose
+  // --include-partial-messages` on v2.1.210 emits 9 `stream_event`s for a
+  // two-word prompt, and the line below is that observed shape (nested
+  // `event.delta.text_delta`, with `session_id`/`parent_tool_use_id`/`uuid`
+  // siblings). `--include-partial-messages` is not in the adapter's argv, but
+  // `job-manifest.ts` appends `config.extraArgs` verbatim, so any one agent's
+  // `adapterConfig` turns this on with no code change and no review.
+  it("refuses to scan when an unenumerated event type carries the phrase", () => {
+    const delta = "Skill 'verification-before-completion' not found";
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":${JSON.stringify(delta)}}},"session_id":"e45846ad","parent_tool_use_id":null,"uuid":"e07a5776"}`,
+      "Error: pod terminated",
+    ].join("\n");
+    // Preconditions: the phrase is present verbatim, and this event is not one
+    // of the roles any previous version of this guard enumerated — so only an
+    // allowlist can catch it.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(transcript).not.toContain('"type":"assistant"');
+    expect(transcript).not.toContain('"type":"user"');
+    const parsed = parseClaudeStreamJson(transcript);
+    expect(parsed.truncatedMidStream).toBe(false);
+    expect(
+      isClaudeSkillNotFoundStartupFailure({
+        stdout: transcript,
+        assistantContentSeen: parsed.truncatedMidStream,
+      }),
+    ).toBe(false);
+  });
+
+  // The counterweight to the test above, and the one that keeps this fix from
+  // becoming a silent disabling of the feature: a REAL init line is far richer
+  // than the minimal fixture at the top of this describe, and detection must
+  // survive that richness. Field set captured from the CLI this adapter runs
+  // (`claude --print - --output-format stream-json --verbose`, v2.1.210) — a
+  // 1717-byte line. Note what it does NOT contain: `mcp_servers` entries are
+  // `{name, status}` with no `type` of their own, and `output_style` is a bare
+  // string, so the whole line carries exactly ONE `"type"`. That measurement is
+  // the point of the assertion below — it is the fact that makes per-line
+  // scoping defence-in-depth rather than a fix for a live break. Note the
+  // assertion pins the FIXTURE's shape, not the CLI's: `initLine` is a
+  // hardcoded literal, so no CLI change can redden it. It documents the
+  // measured invariant; it does not detect drift away from it.
+  it("still classifies on a full production-shaped init line", () => {
+    const initLine = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      cwd: "/runtime-cache/workspace",
+      session_id: "76be93da-ad0c-44d0-98f1-d6a400d48ee5",
+      tools: ["Task", "Bash", "Read", "Edit", "Write"],
+      mcp_servers: [{ name: "gbrain", status: "connected" }],
+      model: "claude-opus-4-8[1m]",
+      permissionMode: "bypassPermissions",
+      slash_commands: ["verify", "code-review"],
+      apiKeySource: "ANTHROPIC_API_KEY",
+      claude_code_version: "2.1.210",
+      output_style: "default",
+      agents: ["claude", "Explore"],
+      skills: ["verify", "code-review"],
+      plugins: [],
+      capabilities: ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+      uuid: "6a5da5b1-9274-4b86-b930-a350a1e22e12",
+      fast_mode_state: "off",
+    });
+    // The measured invariant, pinned so a CLI change breaks this and not prod.
+    expect(initLine.match(/"type"\s*:\s*"/g)).toHaveLength(1);
+    const transcript = [initLine, 'Error: Skill "verification-before-completion" not found'].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Forward-looking, and labelled as such: no CLI version measured here emits a
+  // nested `type` on an init line (see the assertion above). This pins the
+  // behaviour if one ever does — the line keeps its detection, because the
+  // guard reads only the first type per line. Without per-line scoping this
+  // case would fail closed and silently disable detection in production while
+  // every minimal fixture in this file kept passing.
+  it("still classifies if an allowlisted line ever carries a nested type", () => {
+    const initLine = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [{ name: "gbrain", type: "http", status: "connected" }],
+    });
+    const transcript = [initLine, 'Error: Skill "verification-before-completion" not found'].join("\n");
+    // Precondition: the line really does carry a nested non-system type.
+    expect(initLine).toContain('"type":"http"');
+    expect(initLine).not.toContain('"type":"assistant"');
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // v2.1.210 emits `subtype:"status"` before the first turn under
+  // `--include-partial-messages` (across 3 runs it appeared in no plain
+  // `--print --output-format stream-json --verbose` invocation). That is also
+  // the mode in which `init -> status -> death` is a real startup shape —
+  // before any `stream_event` exists to reject the transcript — so the
+  // allowlist entry is load-bearing rather than incidental.
+  it("still classifies when a system:status event follows init", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"system","subtype":"status","status":"requesting","uuid":"3d1a9017","session_id":"e45846ad"}',
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Second detection-preserving case: a harness-authored event type other than
+  // `system` legitimately follows init with no model output at all.
+  // `rate_limit_event` is not hypothetical — `[initLine, rateLimitEvent]` is
+  // the verbatim FAR-32 production repro in execute.test.ts. Its payload is
+  // counters and ids, so it cannot carry the trigger phrase, and rejecting it
+  // would lose a real detection for nothing.
+  it("still classifies when a harness-authored rate_limit_event follows init", () => {
+    const rateLimitEvent = JSON.stringify({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "allowed", resetsAt: 1777056000, rateLimitType: "five_hour" },
+      uuid: "3ab8f9eb-b9d6-4bf6-9c39-4608427717fc",
+      session_id: "ad5f3e11-3c0c-4144-b53d-d4b959e57cee",
+    });
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      rateLimitEvent,
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // `system` is a multiplexer, so admitting the type wholesale would reproduce
+  // the very defect this file's guard fixes, one level down: a new subtype
+  // admitted by default, exactly as a new top-level type was admitted by the
+  // old blocklist. This is not future-proofing — the v2.1.210 binary builds
+  // `{type:"system",subtype:"hook_response",…,output,stdout,stderr}`, embedding
+  // a hook process's raw stdout. Hooks are operator-configured via `--settings`,
+  // which `job-manifest.ts` appends verbatim from `config.extraArgs` — the same
+  // one-config-edit-away channel that motivated inverting this guard at all.
+  it("refuses to scan when a system event carries operator-configured hook output", () => {
+    // Single-quoted on purpose: `JSON.stringify` escapes `"` to `\"`, and the
+    // phrase regex does not match across the backslash, so a double-quoted
+    // fixture here would pass vacuously — proving nothing about the subtype
+    // gate. Single quotes survive JSON encoding unescaped and do match.
+    const phrase = "Error: Skill 'verification-before-completion' not found";
+    const hookResponse = JSON.stringify({
+      type: "system",
+      subtype: "hook_response",
+      hook_id: "b0d1f2a3",
+      hook_name: "SessionStart",
+      hook_event: "SessionStart",
+      output: phrase,
+      stdout: phrase,
+      stderr: "",
+      exit_code: 0,
+      outcome: "success",
+    });
+    const transcript = ['{"type":"system","subtype":"init"}', hookResponse].join("\n");
+    // Precondition: the phrase really is present *and* in a form the scan
+    // matches, so a pass here would be a false positive and therefore
+    // *permanent* retry suppression.
+    expect(hookResponse).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
+  });
+
+  // The counterweight to the test above, and the reason this guard attributes
+  // the phrase to its line instead of demanding a globally clean transcript.
+  //
+  // Hooks are Paperclip-provisioned, not merely reachable via `extraArgs`, so
+  // `hook_started`/`hook_response` open the transcript BEFORE `init` on the
+  // large majority of real runs. Measured on this instance's pod logs: 6510 of
+  // 8036 `init`-carrying logs contain `hook_started` (81%), and in a 399-log
+  // sample carrying both, the hook line preceded `init` 399/399 times. The
+  // three lines below are the verbatim shape of that preamble.
+  //
+  // A whole-transcript "every line must be harness-authored" veto returns false
+  // here — i.e. it silently disables detection on ~81% of production runs while
+  // every other fixture in this file keeps passing, because they all use the
+  // synthetic two-line shape that no production run has. That is exactly the
+  // "fix the false positive by disabling detection entirely" failure mode this
+  // issue's acceptance criteria warn about, so it gets a dedicated test.
+  it("still classifies behind the production hook preamble that precedes init", () => {
+    const hookStarted = JSON.stringify({
+      type: "system",
+      subtype: "hook_started",
+      hook_id: "f7ecab0f-3f81-439f-b193-4efd3d7f1b48",
+      hook_name: "SessionStart:startup",
+      hook_event: "SessionStart",
+      uuid: "6350f706-ab90-4e8f-89d9-32df2493eae4",
+      session_id: "439039b2-7606-4593-99f6-476e33a06535",
+    });
+    // Operator-authored text, verbatim in shape from a real pod log: this
+    // `output` is a ccrotate status message. Its presence must NOT veto the
+    // genuine death on the bare line below — but it must also never itself be
+    // scanned, which the preceding test pins.
+    const hookResponse = JSON.stringify({
+      type: "system",
+      subtype: "hook_response",
+      hook_id: "f7ecab0f-3f81-439f-b193-4efd3d7f1b48",
+      hook_name: "SessionStart:startup",
+      hook_event: "SessionStart",
+      output: '{"systemMessage":"Currently on extra usage (7d resets at 9:00 PM, 3275m)."}',
+      stdout: '{"systemMessage":"Currently on extra usage (7d resets at 9:00 PM, 3275m)."}',
+      stderr: "",
+      exit_code: 0,
+      outcome: "success",
+    });
+    const transcript = [
+      hookStarted,
+      hookResponse,
+      '{"type":"system","subtype":"init"}',
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    // Preconditions: the preamble really does carry non-allowlisted subtypes,
+    // and really does precede init — so only per-line attribution can pass this.
+    expect(transcript).toContain('"subtype":"hook_started"');
+    expect(transcript).toContain('"subtype":"hook_response"');
+    expect(transcript.indexOf("hook_started")).toBeLessThan(transcript.indexOf('"subtype":"init"'));
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Either hook line alone is sufficient to trip a whole-transcript veto, so
+  // both are pinned independently rather than only in combination.
+  it("still classifies when either hook line alone precedes init", () => {
+    const errorLine = 'Error: Skill "verification-before-completion" not found';
+    for (const hookLine of [
+      '{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}',
+      '{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","stdout":"ok"}',
+    ]) {
+      const transcript = [hookLine, '{"type":"system","subtype":"init"}', errorLine].join("\n");
+      expect(
+        isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+      ).toBe(true);
+    }
+  });
+
+  // Attribution must survive an untrusted line appearing AFTER the genuine
+  // death as well as before it — the veto this replaces was order-insensitive,
+  // and so is this. A `stream_event` here carries model prose, is not
+  // allowlisted, and still must not veto the bare error line above it.
+  it("still classifies when an untrusted event follows the genuine death", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      'Error: Skill "verification-before-completion" not found',
+      '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"unrelated prose"}}}',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // An unreadable subtype fails closed like an unrecognised type. The property
+  // that matters is about the line CARRYING the phrase: a `system` line whose
+  // subtype cannot be read might be a truncated `hook_response`, so the phrase
+  // on it must never be attributed to the harness.
+  it("refuses to scan a system event with no readable subtype that carries the phrase", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"system","session_id":"e45846ad","stdout":"Skill \'verification-before-completion\' not found',
+    ].join("\n");
+    // Precondition: the phrase is present, in a matchable form, on the
+    // unreadable line — so a pass here would be permanent retry suppression.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
+  });
+
+  // The converse, and a deliberate behaviour change from the whole-transcript
+  // veto this replaces: an unreadable line that does NOT carry the phrase is
+  // simply not where the evidence is, so it no longer vetoes a genuine death
+  // elsewhere in the transcript. Under the veto this returned false — which is
+  // the same over-suppression that silently disabled detection behind the
+  // production hook preamble.
+  it("still classifies when an unreadable system event does not carry the phrase", () => {
+    const transcript = [
+      '{"type":"system","session_id":"e45846ad"}',
+      'Error: Skill "verification-before-completion" not found',
+    ].join("\n");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(true);
+  });
+
+  // Reading only the first type per line rests on Claude emitting the
+  // discriminator first. This pins the direction in which that assumption is
+  // allowed to fail: a re-ordered line whose nested type appears first is still
+  // rejected, because no nested type the CLI emits is on the allowlist. The
+  // symmetric cost — a re-ordered `system` line losing its detection — is the
+  // safe direction, since a missed detection degrades to the untyped
+  // `buildPartialRunError` while a false positive suppresses retries for good.
+  it("refuses to scan a conversation event whose type key is not first", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"message":{"content":[{"type":"text","text":"Skill \'verification-before-completion\' not found"}]},"type":"assistant"}',
+    ].join("\n");
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
+  });
+
   it("returns false for an unrelated startup failure", () => {
     expect(
       isClaudeSkillNotFoundStartupFailure({
