@@ -10,7 +10,7 @@
 // script and sourcing it, so a rename or a rewrite fails this test rather than
 // silently leaving it asserting against a copy.
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -410,6 +410,8 @@ test("a one-slot window still releases, dropping the pin rather than overflowing
 
 const READER_FUNCTION_NAME = "live_running_digest";
 const readerSource = extractShellFunction(READER_FUNCTION_NAME);
+const REPLICASET_READER_FUNCTION_NAME = "serving_replicaset_image";
+const replicaSetReaderSource = extractShellFunction(REPLICASET_READER_FUNCTION_NAME);
 
 function shellAssign(name) {
   const m = script.match(new RegExp(`^${name}="([^"]+)"$`, "m"));
@@ -433,26 +435,89 @@ const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
 
 // `deployment` of null makes the stub exit non-zero, standing in for "no such
 // Deployment" or an unreachable apiserver.
-function runningDigestFor(deployment) {
+//
+// `replicaSets` covers the second object this reader consults. It defaults to an
+// empty list — a SUCCESSFUL list that names nothing — so every case written
+// before the ReplicaSet fallback existed keeps exercising what it was written to
+// exercise: "the spec is not believed, and nothing else names a digest either".
+// `null` is the distinct case where the list call itself fails, which is what the
+// deploy identity losing its apps/replicasets grant looks like (BLO-31842).
+//
+// `repeat` drives the reader more than once inside ONE shell, which is what the
+// rotate loop does on every 409: the reader is re-read per attempt. Combined with
+// `callerOwnedStateDir` — the caller minting the state directory, as the script
+// does at its own top level — that is the only way to observe warn-once, because
+// the reader runs inside $( ) and a subshell variable could never have carried
+// the flag. TMPDIR is redirected into the case's own directory so what the reader
+// leaves behind can be counted rather than assumed.
+function readerRunFor(
+  deployment,
+  { replicaSets = [], repeat = 1, callerOwnedStateDir = false } = {},
+) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
-  const fixture = path.join(dir, "deployment.json");
-  writeFileSync(fixture, deployment === null ? "" : JSON.stringify(deployment));
+  const tmpRoot = path.join(dir, "tmp");
+  mkdirSync(tmpRoot);
+  const deploymentFixture = path.join(dir, "deployment.json");
+  const replicaSetFixture = path.join(dir, "replicasets.json");
+  const argsLog = path.join(dir, "args.log");
+  writeFileSync(deploymentFixture, deployment === null ? "" : JSON.stringify(deployment));
+  writeFileSync(
+    replicaSetFixture,
+    replicaSets === null ? "" : JSON.stringify({ items: replicaSets }),
+  );
   const harness = [
     "set -euo pipefail",
+    `export TMPDIR=${JSON.stringify(tmpRoot)}`,
     `DEPLOY_NAMESPACE=paperclip`,
     `DEPLOYMENT=paperclip-api`,
     `IMAGE_REPOSITORY=${JSON.stringify(IMAGE_REPOSITORY)}`,
     "read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true",
     SERVING_JQ.replace(/\n$/, ""),
     "SERVING_JQ",
-    `fake_kubectl() { [[ -s ${JSON.stringify(fixture)} ]] || return 1; cat ${JSON.stringify(fixture)}; }`,
+    // Dispatches on the resource the reader asked for, so the two objects cannot
+    // be confused for each other, and records the argv so a test can assert the
+    // label selector was actually derived and passed rather than assumed.
+    `fake_kubectl() {`,
+    `  printf '%s\\n' "$*" >> ${JSON.stringify(argsLog)}`,
+    `  case "$*" in`,
+    `    *replicasets*)`,
+    `      if [[ ! -s ${JSON.stringify(replicaSetFixture)} ]]; then`,
+    `        echo 'Error from server (Forbidden): replicasets.apps is forbidden' >&2`,
+    `        return 1`,
+    `      fi`,
+    `      cat ${JSON.stringify(replicaSetFixture)}`,
+    `      ;;`,
+    `    *)`,
+    `      [[ -s ${JSON.stringify(deploymentFixture)} ]] || return 1`,
+    `      cat ${JSON.stringify(deploymentFixture)}`,
+    `      ;;`,
+    `  esac`,
+    `}`,
     "deploy_kubectl=(fake_kubectl)",
+    replicaSetReaderSource,
     readerSource,
-    READER_FUNCTION_NAME,
+    // Mints and clears the state directory exactly as the script's own top level
+    // and EXIT trap do, so leftover-file accounting measures the reader rather
+    // than the harness.
+    ...(callerOwnedStateDir
+      ? ['rs_state_dir="$(mktemp -d "${TMPDIR}/paperclip-approve-rs.XXXXXX")"']
+      : []),
+    ...Array.from({ length: repeat }, () => READER_FUNCTION_NAME),
+    ...(callerOwnedStateDir ? ['rm -rf "$rs_state_dir"'] : []),
   ].join("\n");
   const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
   assert.equal(result.status, 0, `reader must always succeed; stderr: ${result.stderr}`);
-  return result.stdout.trim();
+  return {
+    digest: result.stdout.trim(),
+    digests: result.stdout.trim().split("\n").filter(Boolean),
+    stderr: result.stderr,
+    leftoverTempFiles: readdirSync(tmpRoot),
+    argv: existsSync(argsLog) ? readFileSync(argsLog, "utf8").trim().split("\n") : [],
+  };
+}
+
+function runningDigestFor(deployment, options) {
+  return readerRunFor(deployment, options).digest;
 }
 
 // A Deployment whose rollout has fully landed. Fixtures default to that shape so
@@ -465,11 +530,29 @@ function runningDigestFor(deployment) {
 // generation 560, replicas 2/2/2). The predicate's `// 0` default is what makes
 // that read as "none unavailable" rather than as missing data, so the common
 // fixture exercises that path rather than a shape production never produces.
-function deploymentWith({ images = [], replicas = 2, generation = 7, status = {} } = {}) {
+// `metadata.uid` and `spec.selector` are on the default fixture because the
+// ReplicaSet fallback needs both to run at all, and a fixture missing them would
+// make every fallback-path case pass for the wrong reason — bailing out before
+// the list rather than on what the list contained.
+const DEPLOYMENT_UID = "3f0a5f6e-1c4b-4d2a-9a77-0b6c1f2e3d40";
+const DEPLOYMENT_SELECTOR = {
+  "app.kubernetes.io/name": "paperclip",
+  "app.kubernetes.io/component": "api",
+};
+
+function deploymentWith({
+  images = [],
+  replicas = 2,
+  generation = 7,
+  status = {},
+  uid = DEPLOYMENT_UID,
+  selector = { matchLabels: DEPLOYMENT_SELECTOR },
+} = {}) {
   return {
-    metadata: { generation },
+    metadata: { generation, uid },
     spec: {
       replicas,
+      selector,
       template: { spec: { containers: images.map((image) => ({ image })) } },
     },
     status: {
@@ -479,6 +562,21 @@ function deploymentWith({ images = [], replicas = 2, generation = 7, status = {}
       availableReplicas: replicas,
       ...status,
     },
+  };
+}
+
+// A ReplicaSet as the apiserver returns it, owned by the Deployment fixture
+// above. `readyReplicas` of 0 is written as an ABSENT field by default, matching
+// what a never-ready ReplicaSet actually looks like on the live cluster —
+// observed 2026-09-04 across the 7 scaled-down paperclip-api ReplicaSets.
+function replicaSetWith({ name, images = [], ready = 0, uid = DEPLOYMENT_UID } = {}) {
+  return {
+    metadata: {
+      name,
+      ownerReferences: [{ kind: "Deployment", name: "paperclip-api", uid }],
+    },
+    spec: { template: { spec: { containers: images.map((image) => ({ image })) } } },
+    status: ready > 0 ? { readyReplicas: ready } : {},
   };
 }
 
@@ -585,6 +683,281 @@ test("a landed rollout that omits unavailableReplicas is still read as serving",
     "this test is only meaningful while the healthy fixture omits unavailableReplicas",
   );
   assert.equal(runningDigestFor(deployment), live);
+});
+
+// Refusing to believe an unlanded spec is only half the guarantee. Nothing
+// reverts spec.template, so after a rollout that never became ready the
+// Deployment permanently names a digest that never carried traffic, the serving
+// gate above correctly declines to pin it -- and then NOTHING names the digest
+// that is still serving, so the ring is back to pure age ordering. That is the
+// BLO-28483 wedge reached one failure later. The previous ReplicaSet is the only
+// object that still names the last-healthy digest, so these cases cover reading
+// it (BLO-31842).
+
+const NEVER_READY = { readyReplicas: 0, availableReplicas: 0, unavailableReplicas: 2 };
+
+test("a never-ready rollout falls back to the digest the serving ReplicaSet carries", () => {
+  const applied = digest(0xbb);
+  const serving = digest(0xaa);
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${applied}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({ name: "paperclip-api-new", images: [`${IMAGE_REPOSITORY}@${applied}`] }),
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`${IMAGE_REPOSITORY}@${serving}`],
+            ready: 2,
+          }),
+        ],
+      },
+    ),
+    serving,
+  );
+});
+
+test("the ReplicaSet list is narrowed by the Deployment's own selector", () => {
+  const run = readerRunFor(
+    deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+  );
+  const listed = run.argv.filter((line) => line.includes("replicasets"));
+  assert.equal(listed.length, 1, `expected exactly one ReplicaSet list; got ${run.argv.join(" | ")}`);
+  for (const [key, value] of Object.entries(DEPLOYMENT_SELECTOR)) {
+    assert.ok(
+      listed[0].includes(`${key}=${value}`),
+      `selector label ${key}=${value} was not passed to kubectl: ${listed[0]}`,
+    );
+  }
+});
+
+test("a landed rollout is answered from the Deployment and never consults ReplicaSets", () => {
+  // The fallback is for the failure case only; reaching for ReplicaSets on the
+  // happy path would make every release depend on a grant it does not need.
+  const run = readerRunFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`] }));
+  assert.equal(run.argv.filter((line) => line.includes("replicasets")).length, 0);
+});
+
+test("two ReplicaSets with ready pods are ambiguous and yield no digest", () => {
+  // A rollout genuinely in flight: both digests are serving and neither is "the
+  // running one". Naming the newer would pin a half-rolled digest.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "paperclip-api-new",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+            ready: 1,
+          }),
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+            ready: 1,
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("a serving ReplicaSet owned by a different Deployment is never pinned", () => {
+  // An overlapping label selector elsewhere in the namespace must not be able to
+  // contribute a rollback target for this workload.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "someone-elses-rs",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+            ready: 2,
+            uid: "99999999-9999-4999-8999-999999999999",
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("a serving ReplicaSet from another repository is never pinned", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`ghcr.io/someone/else@${digest(0xaa)}`],
+            ready: 2,
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("a serving ReplicaSet whose containers disagree yields no digest rather than a guess", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+            ready: 2,
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("no ReplicaSet with ready pods yields no digest and still succeeds", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({ name: "paperclip-api-new", images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`] }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+// As of 2026-09-04 the deploy identity holds apps/replicasets get+list only
+// through the deprecated RoleBinding/paperclip-ci-deploy-admin -> ClusterRole/
+// admin; the scoped Role/paperclip-ci-deploy that is meant to replace it has no
+// replicasets rule at all (BLO-21598). So this is not a hypothetical failure
+// mode: on the day that cutover lands, every release takes this path. It has to
+// stay non-fatal AND stop being silent, or the guarantee is hollowed out with
+// this very file still green.
+test("a failed ReplicaSet list degrades to no digest without failing the release", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      { replicaSets: null },
+    ),
+    "",
+  );
+});
+
+test("a failed ReplicaSet list warns, naming the grant and carrying kubectl's reason", () => {
+  const run = readerRunFor(
+    deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+    { replicaSets: null },
+  );
+  assert.match(run.stderr, /cannot list ReplicaSets/);
+  assert.match(run.stderr, /apps\/replicasets/);
+  assert.match(run.stderr, /Forbidden/);
+});
+
+test("the happy path stays quiet — no warning when nothing is wrong", () => {
+  const run = readerRunFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`] }));
+  assert.equal(run.stderr.trim(), "");
+});
+
+// A selector the reader cannot turn into a label query is the OTHER way this
+// fallback silently stops working, and it is the one that leaves no trace at the
+// apiserver: no call is made, so nothing appears in an audit log either. The
+// reader still degrades to empty-and-succeed — this is an availability safeguard,
+// not a gate — but it now says so, on the same principle as the list-failure
+// branch below it. Not reachable against the Helm-rendered paperclip-api
+// Deployment, which uses matchLabels.
+test("a selector the reader cannot use warns instead of degrading silently", () => {
+  const run = readerRunFor(
+    deploymentWith({
+      images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`],
+      status: NEVER_READY,
+      selector: {
+        matchExpressions: [
+          { key: "app.kubernetes.io/name", operator: "In", values: ["paperclip"] },
+        ],
+      },
+    }),
+    {
+      replicaSets: [
+        replicaSetWith({ name: "paperclip-api-old", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2 }),
+      ],
+    },
+  );
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /no matchLabels selector/);
+  assert.match(run.stderr, /BLO-31842/);
+  // No ReplicaSet call is attempted, so the warning is the only evidence there is.
+  assert.equal(
+    run.argv.filter((line) => line.includes("replicasets")).length,
+    0,
+    "a selector that cannot be built must not reach the apiserver",
+  );
+});
+
+// The rotate loop re-reads the running digest on EVERY 409 retry, so an unguarded
+// warning prints its five lines up to MAX_ROTATE_ATTEMPTS times and buries itself.
+// The guard has to be a file: the reader runs inside $( ), so a variable set there
+// never survives back to the loop. Driving the reader repeatedly against one
+// caller-owned state directory is what distinguishes a real guard from a variable
+// that happens to look like one.
+test("a repeated ReplicaSet list failure warns once, not once per rotation", () => {
+  const run = readerRunFor(
+    deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+    { replicaSets: null, repeat: 5, callerOwnedStateDir: true },
+  );
+  assert.equal(
+    run.stderr.match(/cannot list ReplicaSets/g)?.length,
+    1,
+    `warned more than once across 5 rotations:\n${run.stderr}`,
+  );
+  // The reader still ran all five times — the guard suppresses the message, not
+  // the work, so a rotation that would now succeed still gets a fresh read.
+  assert.equal(run.argv.filter((line) => line.includes("replicasets")).length, 5);
+});
+
+// Every temp path this reader mints has to be reclaimed on the paths it takes.
+// The one it cannot reclaim from a trap is the one it creates itself, because
+// $( ) hides it from the caller's EXIT trap — so the caller owns it instead, and
+// the no-caller case cleans up after itself.
+test("the ReplicaSet reader leaves no temp files behind, caller-owned or not", () => {
+  for (const callerOwnedStateDir of [true, false]) {
+    for (const replicaSets of [null, []]) {
+      const run = readerRunFor(
+        deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+        { replicaSets, repeat: 2, callerOwnedStateDir },
+      );
+      assert.deepEqual(
+        run.leftoverTempFiles,
+        [],
+        `leftover temp files (callerOwned=${callerOwnedStateDir}, list=${replicaSets === null ? "forbidden" : "empty"})`,
+      );
+    }
+  }
+});
+
+// The caller-owned directory only survives the run if the EXIT trap clears it;
+// the harness above mints and clears its own, so it cannot observe the script's.
+// Asserted against the shipping source instead, for the same reason every other
+// constant here is read out of the script rather than restated.
+test("the script's EXIT trap clears the ReplicaSet reader's state directory", () => {
+  assert.match(
+    script,
+    /^rs_state_dir="\$\(mktemp -d /m,
+    "the reader's state directory must be minted at script scope, not inside the reader",
+  );
+  const cleanup = extractShellFunction("cleanup_on_exit");
+  assert.match(
+    cleanup,
+    /rm -rf "\$rs_state_dir"/,
+    "cleanup_on_exit must clear the reader's state directory",
+  );
 });
 
 // Split a jq predicate block into the condition lines of its top-level
@@ -820,7 +1193,7 @@ function runCleanup({ armed, preserve, status, releaseFails = false }) {
     `lock_preserve_on_failure=${preserve ? "yes" : '""'}`,
     "DIGEST=sha256:feedface",
     // cleanup_on_exit rm -f's these; point them at unused paths in a scratch dir.
-    ...["replace_err", "nonce_err", "server_plan_err", "probe_attempts_log", "release_err"].map(
+    ...["replace_err", "nonce_err", "server_plan_err", "probe_attempts_log", "release_err", "rs_state_dir"].map(
       (name) => `${name}=${JSON.stringify(path.join(dir, name))}`,
     ),
     // The failed-retirement branch names the cluster coordinates of the owner
