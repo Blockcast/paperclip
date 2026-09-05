@@ -1639,9 +1639,10 @@ test("a signal is routed into the cleanup rather than killing the script outrigh
 // cause, on the path with the LEAST operator visibility -- the caller prints
 // only the bare "could not retire the in-flight lock" and nobody is at a
 // terminal to re-run it with more logging.
-function runReleaseWrite({ stderrText, attempts = 3 }) {
+function runReleaseWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-write-"));
   const countFile = path.join(dir, "replace_count");
+  const sleepLog = path.join(dir, "sleeps");
   // Sliced out of the shipping script, not restated: this carries the annotation
   // constants, the shared jq program, and the `2>&1 >/dev/null` capture. Losing
   // that redirection order fails this test instead of silently blinding the bail.
@@ -1688,20 +1689,39 @@ JSON
       ;;
     replace)
       echo x >>${JSON.stringify(countFile)}
-      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
-      return 1
+      # Drains the manifest jq pipes in, as the real \`kubectl replace -f -\`
+      # does. Not cosmetic: the write is a \`jq | kubectl\` pipeline under
+      # \`pipefail\`, so a stub that exits without reading kills jq with EPIPE
+      # and fails the pipeline on jq's status. The failing branch below cannot
+      # show that -- it fails the pipeline itself either way -- so the bug only
+      # surfaces on the succeeding branch, as a success reported as status 1.
+      cat >/dev/null
+${
+  writeSucceeds
+    ? "      return 0"
+    : `      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
+      return 1`
+}
       ;;
   esac
 }
-# Stubbed so the retriable case does not actually spend the loop's pacing.
-sleep() { :; }
+# Records the argument rather than discarding it. A bare \`sleep() { :; }\` still
+# keeps the retriable case from spending real time, but it also discards the
+# only remaining behavioural difference between this loop and retire-only mode's
+# -- flat \`sleep 1\` here vs linear \`sleep "$attempt"\` there -- so every
+# collapse of one into the other passed (Ally, at 24e5b345: all four measured
+# 62/62 green). The recorded arguments are what the exhaustion tests assert.
+sleep() { printf '%s\\n' "$*" >>${JSON.stringify(sleepLog)}; }
 ${fn}
 release_in_flight_lock`;
   const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
   const writes = existsSync(countFile)
     ? readFileSync(countFile, "utf8").split("\n").filter(Boolean).length
     : 0;
-  return { status: r.status, stderr: r.stderr, writes };
+  const sleeps = existsSync(sleepLog)
+    ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
+    : [];
+  return { status: r.status, stderr: r.stderr, writes, sleeps };
 }
 
 test("a non-retriable retirement write bails once and reports the cause", () => {
@@ -1709,6 +1729,9 @@ test("a non-retriable retirement write bails once and reports the cause", () => 
   const r = runReleaseWrite({ stderrText: 'Error from server (Forbidden): configmaps "x" is forbidden' });
   assert.equal(r.writes, 1, "a non-retriable write must not be retried -- it fails the same way every time");
   assert.equal(r.status, 1, "the retirement must report failure");
+  // The bail's whole point is not spending the pacing it skips. Counting writes
+  // alone would still pass if the bail moved below the sleep.
+  assert.deepEqual(r.sleeps, [], "bailing at the first attempt must not sleep at all");
   assert.match(
     r.stderr,
     /cannot retire the in-flight lock on sha256:deadbeef \(owner owner-nonce-1\)/,
@@ -1732,11 +1755,33 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
   });
   assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
   assert.equal(r.status, 1, "exhausting the attempts still reports failure");
+  // FLAT, and asserted by argument rather than by count: `:747-756` spends ten
+  // lines defending this flatness against the "helpful parity fix" that would
+  // spell it `sleep "$attempt"` like retire-only mode's, and until the stub
+  // recorded its argument that defence was enforced by nothing. ["1","1"] is
+  // the 2s the comment itself cites as beating retire-only's 3s; the third
+  // attempt records nothing because the trailing-sleep guard skips it.
+  assert.deepEqual(
+    r.sleeps,
+    ["1", "1"],
+    "this loop paces flat -- it runs inside a trap reached from `trap 'exit 143' TERM`, so the runner's grace period is the whole budget",
+  );
   assert.doesNotMatch(
     r.stderr,
     /cannot retire the in-flight lock on/,
     "the non-retriable message must not fire on a retriable conflict",
   );
+});
+
+test("a retirement write that succeeds returns at the first attempt without sleeping", () => {
+  // The control for the two pacing assertions: they pin what an EXHAUSTED loop
+  // spends, and would still pass if the sleep had migrated above the success
+  // check and started charging every caller. A succeeding retirement is the
+  // common case on this path, and it must cost nothing.
+  const r = runReleaseWrite({ stderrText: "", writeSucceeds: true });
+  assert.equal(r.writes, 1, "a succeeding write must not be repeated");
+  assert.equal(r.status, 0, "a retired lock must report success");
+  assert.deepEqual(r.sleeps, [], "the success path must not sleep");
 });
 
 test("a retirement write with no stderr still explains itself", () => {
@@ -1775,9 +1820,10 @@ test("a retirement write with no stderr still explains itself", () => {
 // rather than by presetting CLEAR_IN_FLIGHT_LOCK_ERR, so the variable is proven
 // populated by the script's own `2>&1 >/dev/null` capture -- the same standard
 // the release harness sets, for the same reason.
-function runRetireOnlyWrite({ stderrText, attempts = 3 }) {
+function runRetireOnlyWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-retire-write-"));
   const countFile = path.join(dir, "replace_count");
+  const sleepLog = path.join(dir, "sleeps");
   // Retire-only mode is top-level script, not a function, so there is nothing
   // to source: the loop is sliced out between two anchors that bracket it.
   // The start anchor is the read-error tempfile's trap, which is unique to this
@@ -1823,25 +1869,43 @@ JSON
       ;;
     replace)
       echo x >>${JSON.stringify(countFile)}
-      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
-      return 1
+      # Drains the manifest jq pipes in, as the real \`kubectl replace -f -\`
+      # does. Not cosmetic: the write is a \`jq | kubectl\` pipeline under
+      # \`pipefail\`, so a stub that exits without reading kills jq with EPIPE
+      # and fails the pipeline on jq's status. The failing branch below cannot
+      # show that -- it fails the pipeline itself either way -- so the bug only
+      # surfaces on the succeeding branch, as a success reported as status 1.
+      cat >/dev/null
+${
+  writeSucceeds
+    ? "      return 0"
+    : `      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
+      return 1`
+}
       ;;
   esac
 }
-# Stubbed so the retriable case does not spend the loop's linear backoff.
-sleep() { :; }
+# Records the argument, for the reason spelled out in \`runReleaseWrite\`: this
+# loop's linear backoff is the mirror half of the pair that a discarding stub
+# left unasserted, so the exhaustion test below pins ["1","2"] against that
+# harness's ["1","1"].
+sleep() { printf '%s\\n' "$*" >>${JSON.stringify(sleepLog)}; }
 ${retireRegion}`;
   const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
   const writes = existsSync(countFile)
     ? readFileSync(countFile, "utf8").split("\n").filter(Boolean).length
     : 0;
-  return { status: r.status, stderr: r.stderr, writes };
+  const sleeps = existsSync(sleepLog)
+    ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
+    : [];
+  return { status: r.status, stderr: r.stderr, writes, sleeps };
 }
 
 test("retire-only mode's non-retriable write bails once and reports the cause", () => {
   const r = runRetireOnlyWrite({ stderrText: 'Error from server (Forbidden): configmaps "x" is forbidden' });
   assert.equal(r.writes, 1, "a non-retriable write must not be retried -- it fails the same way every time");
   assert.equal(r.status, 1, "the retirement must report failure");
+  assert.deepEqual(r.sleeps, [], "bailing at the first attempt must not spend the backoff it skips");
   assert.match(
     r.stderr,
     /cannot retire the in-flight approval lock on sha256:cafe \(owner owner-9\)/,
@@ -1864,6 +1928,17 @@ test("retire-only mode's conflicting write is still retried to exhaustion", () =
   });
   assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
   assert.equal(r.status, 1, "exhausting the attempts still reports failure");
+  // LINEAR, and the mirror of the release loop's ["1","1"] above. Asserting the
+  // arguments rather than the attempt count is what makes the two loops'
+  // pacing a tested difference instead of a commented one: with a discarding
+  // stub, spelling this `sleep 1` -- or `sleep 0` -- left the suite green.
+  // 3s total, the number `:751-753` names as the cost retire-only mode can
+  // afford because it has an operator at a terminal and no grace-period clock.
+  assert.deepEqual(
+    r.sleeps,
+    ["1", "2"],
+    "retire-only mode backs off linearly -- it has no runner grace period to spend, unlike `release_in_flight_lock`",
+  );
   assert.doesNotMatch(
     r.stderr,
     /cannot retire the in-flight approval lock on/,
@@ -1874,6 +1949,17 @@ test("retire-only mode's conflicting write is still retried to exhaustion", () =
     /could not retire the in-flight approval lock on sha256:cafe/,
     "exhaustion must still print this mode's own operator guidance",
   );
+});
+
+test("retire-only mode's succeeding write exits 0 at the first attempt without sleeping", () => {
+  // Same control as the release path's. Retire-only mode `exit 0`s where the
+  // release loop `return 0`s, so this also pins that the success exit survives
+  // the slice -- a mode that retired the lock and then exited non-zero would
+  // fail the deploy step that called it.
+  const r = runRetireOnlyWrite({ stderrText: "", writeSucceeds: true });
+  assert.equal(r.writes, 1, "a succeeding write must not be repeated");
+  assert.equal(r.status, 0, "a retired lock must exit 0");
+  assert.deepEqual(r.sleeps, [], "the success path must not spend the backoff");
 });
 
 test("retire-only mode's write with no stderr still explains itself", () => {
