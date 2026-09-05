@@ -316,13 +316,13 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
   throw lastError;
 }
 
-// Asserts the submit button is clickable. Deliberately NOT a wait.
+// Asserts the submit button exists and is clickable. Deliberately NOT a wait.
 //
 // `disabled` is `!titleHasText || createIssue.isPending`, and `titleHasText` is
 // set synchronously by every entry path into this dialog — typed input, dialog
-// defaults, draft restore — never by a query. Eleven call sites used to spell
-// this `await vi.waitFor(() => expect(...hasAttribute("disabled")).toBe(false))`,
-// which returned on attempt 0 having flushed nothing: it read as the settle
+// defaults, draft restore — never by a query. Eleven call sites used to wait on
+// this (nine spelled `vi.waitFor`, two `waitForAssertion`), and every one of
+// them returned on attempt 0 having flushed nothing: it read as the settle
 // before the click and was not one, which is the trap described above. Keeping
 // it a bare `expect` makes that visible at every call site — no `await`, so
 // nothing can be mistaken for synchronisation.
@@ -331,6 +331,10 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
 // the project list, the reusable-workspace summaries — settle on THAT state
 // with `waitForAssertion` first. This function will not do it for you.
 function expectSubmitEnabled(submitButton: HTMLButtonElement | undefined) {
+  // Presence first, so a missing button fails as "expected undefined not to be
+  // undefined". Asserting `hasAttribute` alone reports "expected undefined to
+  // be false", which names the optional chain rather than the absent button.
+  expect(submitButton).not.toBeUndefined();
   expect(submitButton?.hasAttribute("disabled")).toBe(false);
 }
 
@@ -565,7 +569,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Sub-Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -700,7 +703,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -733,7 +735,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -923,7 +924,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -964,7 +964,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -1001,7 +1000,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -1037,7 +1035,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -1182,7 +1179,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Sub-Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
@@ -1424,7 +1420,6 @@ describe("NewIssueDialog", () => {
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expect(submitButton).not.toBeUndefined();
     expectSubmitEnabled(submitButton);
 
     await act(async () => {
