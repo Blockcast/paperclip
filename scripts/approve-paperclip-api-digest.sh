@@ -710,6 +710,12 @@ release_in_flight_lock() {
     # wait for. Spelled as an `if` and not `(( ... )) && sleep` because it is the
     # final command in the loop body, where a false `(( ... ))` under `set -e`
     # would abort the retirement it is meant to pace.
+    #
+    # Flat, where retire-only mode backs off linearly (`sleep "$attempt"`). That
+    # asymmetry is deliberate, not an unfinished parity fix: this loop runs
+    # inside a trap reached from `trap 'exit 143' TERM`, so the runner's grace
+    # period is the whole budget and 2s of total sleep beats 3s. Retire-only
+    # mode has an operator at a terminal and no such deadline.
     if (( attempt < RETIRE_ATTEMPTS )); then
       sleep 1
     fi
@@ -898,10 +904,19 @@ cleanup_on_exit() {
       echo "Retired this approval's in-flight lock; the ring still lists ${DIGEST}." >&2
       echo "A corrected plan or a rollback can be approved without an out-of-band edit." >&2
     else
+      # Both halves are printed, not just the digest. This branch is gated on
+      # lock_cleanup_armed, which is only set after LOCK_OWNER_ID is assigned,
+      # so the owner is guaranteed in scope here -- and the likeliest way to
+      # arrive is a read failure, which returns without retrying. Sending the
+      # operator to the cluster for a value we are holding would ask them to
+      # re-run the very read that just failed. The annotation query stays as
+      # the fallback for the case where this process's value is genuinely gone.
       echo "WARNING: could not retire the in-flight lock on ${DIGEST}." >&2
-      echo "The next approval will refuse until it is retired with" >&2
-      echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=${DIGEST} and the owner read from" >&2
-      echo "the cluster -- the annotation is the one place it provably still exists:" >&2
+      echo "The next approval will refuse until it is retired with both halves:" >&2
+      echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=${DIGEST}" >&2
+      echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=${LOCK_OWNER_ID}" >&2
+      echo "If that owner is refused as 'nothing to retire', a later run adopted the" >&2
+      echo "lock and rewrote it; read the current one from the cluster instead:" >&2
       echo "  kubectl -n ${NAMESPACE} get configmap ${CONFIGMAP} \\" >&2
       echo "    -o jsonpath='{.metadata.annotations.${LOCK_OWNER_ANNOTATION//./\\.}}'" >&2
     fi

@@ -808,6 +808,10 @@ test("the owner is emitted only after the ring write actually lands", () => {
 // stops firing, and only running it catches that.
 const cleanupSource = extractShellFunction("cleanup_on_exit");
 
+// Shaped like the real thing (`SecureRandom.hex(32)`), so an assertion that the
+// warning reproduces it verbatim cannot pass on a truncated or reformatted echo.
+const CLEANUP_LOCK_OWNER_ID = "a".repeat(63) + "9";
+
 function runCleanup({ armed, preserve, status, releaseFails = false }) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-cleanup-"));
   const harness = [
@@ -826,6 +830,10 @@ function runCleanup({ armed, preserve, status, releaseFails = false }) {
     "NAMESPACE=paperclip-release-approvals",
     "CONFIGMAP=paperclip-api-approved-images",
     "LOCK_OWNER_ANNOTATION=paperclip.blockcast.net/approval-in-flight-owner",
+    // The warning prints the owner it is holding rather than only telling the
+    // operator where to look it up, so the harness must carry one. A real
+    // 64-hex value, because the assertion below reads it back out of stderr.
+    `LOCK_OWNER_ID=${CLEANUP_LOCK_OWNER_ID}`,
     // Stubbed so the test observes the DECISION to retire, with no cluster.
     releaseFails
       ? "release_in_flight_lock() { return 1; }"
@@ -1081,6 +1089,62 @@ test("the retirement loop and its trailing-sleep guard cannot drift apart", () =
   );
 });
 
+test("the retirement bound is actually SET on the approval path, not just spelled at column 0", () => {
+  // The assertion above is structural, and there is one mutation it cannot see:
+  // moving the declaration inside `if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]` carries
+  // it at column 0, so `^readonly …` still matches and the offset check still
+  // passes -- while the approval path, which never enters that block, leaves it
+  // unset. That IS the wedge the comment at the declaration describes. So run
+  // it: execute the script's real declaration region with
+  // PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY unset, then call the real
+  // release_in_flight_lock under `set -u` and see whether the loop bound
+  // resolves.
+  //
+  // The region is cut at the read of that env var -- the landmark BEFORE every
+  // retire-only-conditional site in the file -- so a declaration moved into any
+  // of them falls out of what gets executed here. Everything above it is
+  // comments, constant assignments and function definitions; the one `exit` is
+  // guarded on PAPERCLIP_MAX_APPROVED_DIGESTS, which this harness leaves unset.
+  const landmark = 'RETIRE_IN_FLIGHT_ONLY="${PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY:-}"';
+  const landmarkIndex = script.indexOf(landmark);
+  assert.notEqual(landmarkIndex, -1, "retire-only mode's env read moved; this harness cuts the script there");
+  const declarations = script.slice(0, landmarkIndex);
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-bound-"));
+  const harness = [
+    declarations,
+    // The declarations set -e; keep -u (the whole point) but drop -e so an
+    // unbound expansion surfaces as a message to assert on rather than a bare
+    // non-zero exit that a missing message would also produce.
+    "set +e",
+    "set -uo pipefail",
+    `release_err=${JSON.stringify(path.join(dir, "release_err"))}`,
+    // Fails on the read, which is the shortest path through the loop. The `for`
+    // expands the bound BEFORE this ever runs, so an unset bound aborts first.
+    "kubectl() { printf 'boom\\n' >&2; return 1; }",
+    fn,
+    "release_in_flight_lock",
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+
+  assert.doesNotMatch(
+    result.stderr,
+    /unbound variable/,
+    `the retirement loop's bound must resolve with PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY unset; got: ${result.stderr}`,
+  );
+  // Positive control: prove the loop body actually ran. Without this the test
+  // would also pass on a script whose loop never iterates at all.
+  assert.match(
+    result.stderr,
+    /cannot read paperclip-release-approvals\/paperclip-api-approved-images/,
+    "the loop must have entered and reached the read, not been skipped",
+  );
+});
+
 test("a read failure with no stderr still explains itself", () => {
   // kubectl killed by a signal, or dead before it wrote: the old code printed
   // "cannot read ...:" and then nothing at all after the colon.
@@ -1116,13 +1180,34 @@ test("a failed retirement names where the owner still exists, not a dead end", (
   // owner -- LOCK_OWNER_ID reaches stdout only in the success epilogue, past
   // this window entirely. Retire-only mode refuses to run without the owner, so
   // "re-run with ABANDON_IN_FLIGHT_OWNER" without saying where to get it is not
-  // a recovery path. The annotation is the one place it provably still exists.
+  // a recovery path.
   const result = runCleanup({ armed: true, preserve: false, status: 1, releaseFails: true });
   assert.equal(result.released, false, "this test needs the retirement to have FAILED");
+  // First: the owner this process is holding, verbatim. The likeliest way to
+  // reach this branch is a read failure, which returns WITHOUT retrying -- so a
+  // message that only pointed at the cluster would be telling the operator to
+  // re-run the read that just failed.
+  assert.match(
+    CLEANUP_LOCK_OWNER_ID,
+    /^[0-9a-f]{64}$/,
+    "the fixture owner must be a real 64-hex id; a short or empty one would make the check below vacuous",
+  );
+  assert.ok(
+    result.stderr.includes(`PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=${CLEANUP_LOCK_OWNER_ID}`),
+    "the warning must hand over the owner it is holding, not only where to look it up",
+  );
+  assert.ok(
+    result.stderr.includes("PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:feedface"),
+    "both halves are required by the pairing rule, so both must be printed",
+  );
+  // Second: the cluster query survives as the fallback. An exact retry adopts
+  // the lock and rewrites the annotation, which makes this process's value
+  // stale -- that is the case the annotation read exists to cover, and dropping
+  // it while adding the interpolation would trade one dead end for another.
   assert.match(
     result.stderr,
     /kubectl -n paperclip-release-approvals get configmap paperclip-api-approved-images/,
-    "the warning must name the cluster read that recovers the owner",
+    "the warning must keep the cluster read that recovers a rewritten owner",
   );
   assert.match(
     result.stderr,
