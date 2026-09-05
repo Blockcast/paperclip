@@ -215,17 +215,40 @@ describe("readCatalogBackedSkillKeys (BLO-32055)", () => {
     expect(readCatalogBackedSkillKeys({ paperclipRuntimeSkills: "not-an-array" }).size).toBe(0);
   });
 
-  it("mirrors the server-utils key fallback and drops unusable entries", () => {
+  it("mirrors the server-utils key fallback, including an EMPTY key falling back to name", () => {
+    // The one divergent shape. `asString` falls back on an empty string, not
+    // merely on a non-string, so upstream normalizes this entry to key
+    // `legacy-name-only`. A `typeof key === "string"` test resolves it to `""`
+    // and drops it — marking a catalog-backed skill un-backed, i.e. permanent
+    // retry suppression on a self-healing condition. Negative control: this
+    // case fails against the hand-rolled predicate it replaced, while the two
+    // below pass against both.
     expect(readCatalogBackedSkillKeys({
       paperclipRuntimeSkills: [
-        { name: "legacy-name-only" },
-        { key: "  padded/key  " },
-        { key: "" },
-        { key: 42 },
+        { key: "", name: "legacy-name-only", runtimeName: "legacy--37354dfd0d", source: "/z" },
+        { name: "name-only", runtimeName: "name-only--9debdeaf08", source: "/y" },
+        { key: "  padded/key  ", runtimeName: "padded--1a2b3c4d5e", source: "/x" },
+      ],
+    })).toEqual(new Set(["legacy-name-only", "name-only", "padded/key"]));
+  });
+
+  it("drops the same unusable entries server-utils drops", () => {
+    // `normalizeConfiguredPaperclipRuntimeSkills` discards any entry missing
+    // `runtimeName` or `source`, so such an entry can never reach the `.has()`
+    // lookup as a real skill. Contributing its key anyway would let a
+    // source-less entry colliding with a BUNDLED skill's key mark a read-only
+    // image-path packaging fault as retryable — three futile retries.
+    expect(readCatalogBackedSkillKeys({
+      paperclipRuntimeSkills: [
+        { key: "no-source", runtimeName: "no-source--0000000000" },
+        { key: "no-runtime-name", source: "/x" },
+        { key: "blank-source", runtimeName: "blank--0000000000", source: "   " },
+        { key: 42, runtimeName: "n", source: "/x" },
+        { key: "", name: "", runtimeName: "n", source: "/x" },
         null,
         "a-string",
         ["an-array"],
       ],
-    })).toEqual(new Set(["legacy-name-only", "padded/key"]));
+    })).toEqual(new Set());
   });
 });

@@ -90,6 +90,11 @@ const {
   execute,
 } = await import("./execute.js");
 
+// Real class, not a stub: the prompt-cache mock above is a partial that passes
+// `original` through, so this is the exact constructor execute.ts imports and
+// the `instanceof` guard under test compares against.
+const { ClaudeSkillSourceUnavailableError } = await import("./prompt-cache.js");
+
 function makeJob(opts: {
   runId?: string;
   name?: string;
@@ -1048,6 +1053,66 @@ describe("execute: concurrency guard", () => {
     expect(mockBatchPatchJob).not.toHaveBeenCalled();
     expect(result.errorCode).toBe("k8s_concurrent_run_blocked");
     expect(result.errorMessage).toContain("active run");
+  });
+});
+
+// ─── execute: skill-source classification (BLO-32055) ────────────────────────
+
+// The seam this PR exists to produce. Both halves were already covered and the
+// JOIN was not: prompt-cache.test.ts proves the error carries the right
+// `catalogBacked` flag, recovery-classifiers.test.ts proves the classifier
+// treats `skill_materialization_pending` as transient — but nothing asserted
+// that execute() maps one to the other. Invert the ternary or drop the
+// `instanceof` guard and every other test in this PR still passes while the
+// stated acceptance criterion silently regresses to `adapter_failed`.
+describe("execute: skill source unavailable", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+  });
+
+  function makeSkillError(catalogBacked: boolean) {
+    return new ClaudeSkillSourceUnavailableError({
+      skillKey: "garrytan/gstack/investigate",
+      skillSource: "/paperclip/instances/default/skills/co/__runtime__/investigate--9debdeaf08",
+      missingPath:
+        "/paperclip/instances/default/skills/co/__runtime__/investigate--9debdeaf08/SKILL.md",
+      catalogBacked,
+      cause: Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" }),
+    });
+  }
+
+  it("classifies a catalog-backed skill as retryable skill_materialization_pending", async () => {
+    // A catalog row exists => the sweep is mid-refresh and the tree completes on
+    // its own. Measured live at 43m36s to self-heal, so this MUST stay retryable.
+    mockPrepareBundle.mockRejectedValueOnce(makeSkillError(true));
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("skill_materialization_pending");
+    expect(result.errorCode).not.toBe("adapter_failed");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("classifies a non-catalog-backed skill as non-retryable skill_not_found", async () => {
+    // No catalog row => the path is a bundled skill in a read-only image path,
+    // i.e. a packaging fault no retry can fix. Keeps the existing permanent code.
+    mockPrepareBundle.mockRejectedValueOnce(makeSkillError(false));
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("skill_not_found");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("rethrows a non-skill bundle failure rather than laundering it", async () => {
+    // Pins the `instanceof` guard. Without it, any prepareClaudePromptBundle
+    // failure would be reported as a skill fault. The rethrow propagates out of
+    // execute() entirely — it does NOT become a typed result — so the caller
+    // keeps classifying it as the anonymous adapter fault it has always been.
+    // That is the pre-existing behaviour for every non-skill bundle failure and
+    // this change must not alter it.
+    mockPrepareBundle.mockRejectedValueOnce(new Error("disk full"));
+    await expect(execute(makeCtx())).rejects.toThrow("disk full");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
   });
 });
 
