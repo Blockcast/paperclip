@@ -1710,6 +1710,39 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Isolation-workspace reaper (BLO-31222). Worker-tier singleton, opt-IN.
+  //
+  // `buildK8sRunIsolationDescriptor` mounts every workspace-isolated run under
+  // `data/k8s-isolation/workspaces/<executionWorkspaceId>` and nothing has ever
+  // removed one. That tree reached 406.7 GiB on the CephFS volume whose pool
+  // produced BLO-31222's write-block incident. Opt-in rather than default-on
+  // for the same reason as `strandedRecoveryHandBack`: this deletes files
+  // irreversibly, so "deploy the code" and "perform the deletion" must not be
+  // the same act. Enable with `dryRun` first if the tree has not been audited.
+  if (config.isolationWorkspaceReaperEnabled && config.paperclipNodeRole !== "api") {
+    const { startIsolationWorkspaceReaper } = await import(
+      "./services/isolation-workspace-reaper.js"
+    );
+    logger.info(
+      {
+        intervalMinutes: config.isolationWorkspaceReaperIntervalMinutes,
+        maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+        maxDeletesPerTick: config.isolationWorkspaceReaperMaxDeletesPerTick,
+        dryRun: config.isolationWorkspaceReaperDryRun,
+      },
+      "Isolation-workspace reaper enabled (BLO-31222)",
+    );
+    startIsolationWorkspaceReaper(
+      db,
+      config.isolationWorkspaceReaperIntervalMinutes * 60 * 1000,
+      {
+        maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+        maxDeletesPerTick: config.isolationWorkspaceReaperMaxDeletesPerTick,
+        dryRun: config.isolationWorkspaceReaperDryRun,
+      },
+    );
+  }
+
   // Human-gated ageing digest (BLO-29420). Worker-tier singleton. BLO-19130's
   // ageing module shipped as 683 lines of tested pure functions with zero
   // production importers, so the escalation it describes had never fired once;
