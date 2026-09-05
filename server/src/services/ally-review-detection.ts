@@ -35,6 +35,15 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
 // Negation cues flip an otherwise-actionable bare phrase into a confirmation
 // that no follow-up is required. Limit the lookback to the local sentence so
 // an unrelated earlier negation does not mask a real later finding.
+//
+// Deliberately NOT extended with `nothing` for BLO-31890, even though the
+// phrasing that motivated it is "nothing to fix before merge". This set is
+// shared with the `changes requested` rules, so every cue added here can mask
+// a real finding somewhere else — "Nothing else to note, but changes requested
+// for the auth path" would stop blocking. That is the fail-open direction this
+// module argues against at RESOLVED_PRIOR_DISPOSITIONS. The clean template
+// carries a leading `No`, which the existing cues already catch, so widening
+// the vocabulary buys nothing and costs a live finding.
 const NEGATION_CUE_REGEX =
   /\b(?:no|not|zero|none|never|without|isn't|aren't|doesn't|didn't|won't|cannot)\b/i;
 const NEGATION_LOOKBACK_WORDS = 8;
@@ -210,5 +219,29 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
   if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
-  return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
+
+  // Recommended-Action prose telling the author to fix something before
+  // merging. Negation-guarded on `fix`, because Ally's *clean* form is
+  // "No Critical issues — nothing to fix before merge": the sentence that
+  // declares a PR mergeable carries the same three tokens as one that blocks
+  // it, so an unguarded match reads every clean review as blocking. Measured
+  // 2026-09-04: PRs #1571, #1644 and #1655 were all simultaneously red on
+  // `review/ally-comment` with 0 Critical / 0 Important (BLO-31890). The two
+  // rules above already guard this way; this was the only prose rule that
+  // did not.
+  //
+  // The slice is anchored at the heading and sized at 820 = the previous
+  // rule's 400-char gap before `fix` plus its 400-char gap after, so any
+  // `fix` that rule could reach (at most 400 in) still leaves >=420 chars —
+  // more than the lookahead needs. Past 400 the slice can truncate the
+  // lookahead, but only for matches the previous rule never made, so this
+  // cannot lose a finding that used to block. Pinned by the boundary test.
+  const recommendedAction = /\bRecommended\s+Action\b([\s\S]{0,820})/i.exec(text);
+  return (
+    recommendedAction != null &&
+    hasNonNegatedMatch(
+      recommendedAction[1]!,
+      /\bfix\b(?=[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b)/i,
+    )
+  );
 }

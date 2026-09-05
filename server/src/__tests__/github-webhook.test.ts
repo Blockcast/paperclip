@@ -8907,6 +8907,71 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback("- Important Issues\n- Auth check bypassed.")).toBe(true);
     expect(__test_hasActionablePrReviewFeedback("**Critical Issues**\nprobePort mismatch.")).toBe(true);
   });
+
+  // BLO-31890: the Recommended-Action prose rule was the only prose rule not
+  // routed through the negation guard, and Ally's *clean* template is
+  // "No Critical issues — nothing to fix before merge" — the same three tokens
+  // (Recommended Action / fix / before merge) a blocking one carries. So the
+  // gate went red precisely when the review was clean. Before the fix this
+  // body returned true, and `review/ally-comment` read `failure` on #1571,
+  // #1644 and #1655 simultaneously, each with 0 Critical / 0 Important.
+  it("does not treat Ally's clean recommended-action template as actionable", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### Critical Issues (0)",
+      "",
+      "### Important Issues (0)",
+      "",
+      "### Recommended Action",
+      "",
+      "1. No Critical issues — nothing to fix before merge.",
+      "2. No Important issues.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  // The fix deliberately guards the rule rather than widening
+  // NEGATION_CUE_REGEX with `nothing`. That set is shared with the
+  // `changes requested` rules, so a cue added there can mask a real finding
+  // elsewhere — this body is the one that would stop blocking. Keeping it
+  // actionable is the fail-closed direction the module argues for at
+  // RESOLVED_PRIOR_DISPOSITIONS; the clean template needs no such widening
+  // because it carries a leading "No".
+  it("still blocks a genuine 'changes requested' that merely follows the word 'Nothing'", () => {
+    const body = "Nothing else to note, but changes requested for the auth path.";
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  // The other direction, and the reason the guard is per-occurrence rather than
+  // applied to the block as a whole: a clean first line must not mask a real
+  // demand after it. This is what fails if the negation is read too broadly.
+  it("does not let a clean recommended-action line mask a later genuine fix demand", () => {
+    const body = [
+      "### Recommended Action",
+      "",
+      "1. No Critical issues — nothing to fix before merge.",
+      "2. Fix the unguarded cast at parse.ts:88 before merging.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  // The replacement widened the anchored slice to 820 chars and moved the
+  // "before merg" test into a lookahead. Neither may narrow what used to
+  // block: for every gap the previous 400/400 window admitted, the rule must
+  // still be actionable.
+  it("keeps every fix-before-merge gap the previous 400/400 window admitted", () => {
+    for (const gapBefore of [0, 100, 396]) {
+      for (const gapAfter of [0, 100, 396]) {
+        const body = `### Recommended Action\n\n${"x".repeat(gapBefore)} fix ${"y".repeat(gapAfter)} before merge.`;
+        expect({
+          gapBefore,
+          gapAfter,
+          actionable: __test_hasActionablePrReviewFeedback(body),
+        }).toEqual({ gapBefore, gapAfter, actionable: true });
+      }
+    }
+  });
 });
 
 describe("PR review feedback comment heading (BLO-19067)", () => {
