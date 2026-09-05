@@ -1474,6 +1474,10 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No new idea landed for this head was already reviewed at \`${sha}\`.`, false],
       // widened by the pass-23 NON_CONNECTIVE_WORD token class
       [`No force-push evidence this head was already reviewed at \`${sha}\`.`, false],
+      // adversative control: the exclusion is family-agnostic, but a
+      // grammatical adversative sits in COPULA_FILLER's span, not
+      // NEGATION_FILLER's, so it stays a hedge rather than a skip.
+      [`No evidence yet this head was already reviewed at \`${sha}\`.`, false],
     ])("known residual: %s -> %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
     });
