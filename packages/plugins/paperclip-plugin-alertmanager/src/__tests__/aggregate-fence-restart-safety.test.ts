@@ -26,6 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   AlertDeliveryIncompleteError,
+  type AggregateFenceWaitPolicy,
   handleWebhook,
   reconcileAbandonedAggregateFences,
   workerFenceIdentity,
@@ -212,15 +213,37 @@ function mkCtx() {
   return { ctx: mocks as unknown as PluginContext, logger, mocks };
 }
 
-const deliver = (ctx: PluginContext) =>
-  handleWebhook(ctx, baseConfig(), true, {
-    companyId: COMPANY_ID,
-    endpointKey: "alertmanager",
-    headers: { authorization: "Bearer token" },
-    rawBody: JSON.stringify(firingPayload()),
-    parsedBody: firingPayload(),
-    requestId: "req-restart-safety",
-  } as never);
+/**
+ * PEN-3013 gave a refused firing claim a bounded wait before it fails, so the
+ * cases below that assert a *refusal* would otherwise sit out the full
+ * production budget on real timers. They are about who may steal a fence, not
+ * how long a loser waits, so they run on a compressed budget — the wait itself
+ * is covered in `aggregate-fence-contention.test.ts`.
+ */
+const REFUSAL_FAST_WAIT: AggregateFenceWaitPolicy = {
+  budgetMs: 30,
+  initialDelayMs: 2,
+  maxDelayMs: 10,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+  random: () => Math.random(),
+};
+
+const deliver = (ctx: PluginContext, fenceWait?: AggregateFenceWaitPolicy) =>
+  handleWebhook(
+    ctx,
+    baseConfig(),
+    true,
+    {
+      companyId: COMPANY_ID,
+      endpointKey: "alertmanager",
+      headers: { authorization: "Bearer token" },
+      rawBody: JSON.stringify(firingPayload()),
+      parsedBody: firingPayload(),
+      requestId: "req-restart-safety",
+    } as never,
+    fenceWait,
+  );
 
 beforeEach(async () => {
   db = new PGlite();
@@ -267,7 +290,9 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     });
     const { ctx, logger } = mkCtx();
 
-    await expect(deliver(ctx)).rejects.toThrow(AlertDeliveryIncompleteError);
+    await expect(deliver(ctx, REFUSAL_FAST_WAIT)).rejects.toThrow(
+      AlertDeliveryIncompleteError,
+    );
     expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
       "is held in phase 'firing'",
     );
@@ -287,7 +312,9 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).rejects.toThrow(AlertDeliveryIncompleteError);
+    await expect(deliver(ctx, REFUSAL_FAST_WAIT)).rejects.toThrow(
+      AlertDeliveryIncompleteError,
+    );
     expect((await readFence())?.phase).toBe("cancelling");
   });
 
@@ -303,7 +330,9 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).rejects.toThrow(AlertDeliveryIncompleteError);
+    await expect(deliver(ctx, REFUSAL_FAST_WAIT)).rejects.toThrow(
+      AlertDeliveryIncompleteError,
+    );
     expect((await readFence())?.phase).toBe("firing");
   });
 
