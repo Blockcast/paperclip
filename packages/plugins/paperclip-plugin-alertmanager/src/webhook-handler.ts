@@ -1005,14 +1005,15 @@ function operatorSuppressionMs(config: AlertmanagerPluginConfig): number | null 
  *    resolve delivery's cancel actually landed, `null` when we positively know
  *    it did not.
  *
- * `undefined` means the row predates the field, so authorship is unknown. We
- * fall back to the old `resolvedAt` reading rather than assuming an operator
- * close, because the two errors are not symmetric: reading a plugin close as
- * operator-authored *mutes a live recurring alert* for the suppression window,
- * while reading an operator close as plugin-authored costs one unwanted
- * re-open that the very next firing state-write corrects. Silence is the worse
- * failure. Legacy rows drain on their first post-deploy firing, which writes
- * the field explicitly.
+ * `undefined` means authorship is unknown for this row. Two sources: the row
+ * predates the field, or it is a member of an aggregate whose close decision
+ * this member deferred to a sibling (see `handleResolved`). We fall back to the
+ * old `resolvedAt` reading rather than assuming an operator close, because the
+ * two errors are not symmetric: reading a plugin close as operator-authored
+ * *mutes a live recurring alert* for the suppression window, while reading an
+ * operator close as plugin-authored costs one unwanted re-open that the very
+ * next firing state-write corrects. Silence is the worse failure. Legacy rows
+ * drain on their first post-deploy firing, which writes the field explicitly.
  */
 export function closedByPlugin(
   issue: { status: string },
@@ -1456,6 +1457,17 @@ export async function handleFiring(
         !decisionApplied || decision.kind === "issue_missing"
           ? {}
           : { pluginClosedAt: null };
+      // The same rule has to cover `resolvedAt`, or the guarantee above is only
+      // true for rows that already carry an explicit `pluginClosedAt`. For a
+      // legacy row (`pluginClosedAt: undefined`) `resolvedAt` *is* the
+      // authorship signal `closedByPlugin` falls back to, so clearing it on a
+      // delivery that applied nothing does exactly what the paragraph above
+      // refuses to do, one field over: one failed `issues.get` turns our own
+      // close into an apparent operator close and mutes the next re-fire.
+      // Leaving it untouched keeps the row's last real observation intact until
+      // a delivery that actually applied a decision replaces it.
+      const resolvedAtUpdate: Partial<Pick<AlertStateRecord, "resolvedAt">> =
+        !decisionApplied || decision.kind === "issue_missing" ? {} : { resolvedAt: null };
 
       await upsertAggregateMember(
         ctx,
@@ -1472,7 +1484,7 @@ export async function handleFiring(
         alertname,
         severity,
         lastFiredAt: nowIso,
-        resolvedAt: null,
+        ...resolvedAtUpdate,
         ...pluginClosureUpdate,
         operatorSuppressedAt: suppressionAnchor,
         nextEscalationAt: ladderRestart
@@ -2035,21 +2047,45 @@ export async function handleResolved(
       aggregateResolution.issueId,
     );
 
+    // BLO-31736: authorship is a property of the *issue*, but this record is
+    // keyed by fingerprint — and in a multi-member aggregate those are not the
+    // same thing, because every member points at one shared issue. Three cases:
+    //
+    //  - **Our cancel landed** → stamp it. This delivery closed the issue.
+    //  - **We deferred the close to a sibling** (`has-unresolved-siblings`):
+    //    this delivery decided nothing, so the `null` our own *firing* write
+    //    planted is now a false assertion. The last member to resolve will
+    //    close the shared issue on this member's behalf and cannot reach back
+    //    to correct this row, so leaving `null` made every non-last member read
+    //    its own aggregate's close as an operator close and suppress the next
+    //    genuine recurrence — the muting direction this ticket exists to
+    //    remove. Drop to `undefined` ("authorship unknown"), which falls back
+    //    to `resolvedAt` exactly as a legacy row does: a spurious re-open is
+    //    the cheap error, silence is the expensive one.
+    //  - **Anything else** — the terminal guard declining to overwrite someone
+    //    else's close, a withheld cancel, a missing membership,
+    //    `autoCloseOnResolve` off — leaves the previous value untouched via the
+    //    spread, because this delivery learned nothing new about who closed the
+    //    row. Overwriting would break the recurrence contract on a repeated
+    //    `resolved` notification: Alertmanager may re-deliver one, the guard
+    //    would hold (we already cancelled it), and clearing the flag would then
+    //    mute the next real re-fire.
+    const closeDeferredToSibling =
+      config.autoCloseOnResolve !== false &&
+      aggregateResolution.disposition === "has-unresolved-siblings";
+    const pluginClosureUpdate: Partial<Pick<AlertStateRecord, "pluginClosedAt">> =
+      pluginCancelLanded
+        ? { pluginClosedAt: resolvedAt }
+        : closeDeferredToSibling
+          ? { pluginClosedAt: undefined }
+          : {};
+
     const updated: AlertStateRecord = {
       ...existing,
       aggregateKey,
       paperclipIssueId: aggregateResolution.issueId,
       resolvedAt,
-      // BLO-31736: stamp authorship only when our cancel landed. Every other
-      // branch — the terminal guard declining to overwrite someone else's
-      // close, a withheld cancel, a missing membership, autoCloseOnResolve
-      // off — deliberately leaves the previous value untouched via the spread
-      // rather than writing `null`, because this delivery learned nothing new
-      // about who closed the row. Overwriting here would break the recurrence
-      // contract on a repeated `resolved` notification: Alertmanager may
-      // re-deliver one, the guard would hold (we already cancelled it), and
-      // clearing the flag would then mute the next real re-fire.
-      ...(pluginCancelLanded ? { pluginClosedAt: resolvedAt } : {}),
+      ...pluginClosureUpdate,
       nextEscalationAt: null,
       escalationComplete: true,
       cancelWithheldForRunId,

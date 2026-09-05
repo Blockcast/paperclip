@@ -370,6 +370,7 @@ from telemetry rather than by reading the issue body's `Started:` timestamp.
 |---|---|---|---|
 | open (any non-terminal) | — | refresh description | `alertmanager.firing.deduped` |
 | `cancelled` | yes — `pluginClosedAt` set | re-open → `todo` | `alertmanager.firing.reopened` |
+| `cancelled` with `pluginClosedAt` **absent** | unknown — legacy row, or an aggregate member whose close a sibling landed; falls back to `resolvedAt` | re-open → `todo` | `alertmanager.firing.reopened` |
 | `done`, or `cancelled` with `pluginClosedAt: null` | no (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
 | as above — window expired | no | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
 | issue unreadable / deleted | — | leave state intact | `alertmanager.firing.issue_missing` |
@@ -392,8 +393,16 @@ observed the issue's status. Two details worth knowing when reading the table:
 - **`done` is never a close of ours.** The plugin's only status writes are
   `todo` and `cancelled`, so a `done` row was always dispositioned by someone
   else — true even for state rows written before this field existed.
-- **Legacy rows fall back to `resolvedAt`** while `pluginClosedAt` is absent.
-  Deliberate, and asymmetric on purpose: reading our close as an operator's
+- **An absent `pluginClosedAt` means authorship is unknown**, and falls back to
+  `resolvedAt`. Two rows land there: one written before the field existed, and
+  one belonging to an **aggregate** whose close this member deferred to a
+  sibling. The second case is why the record cannot simply be `null` when our
+  own cancel did not land here: `pluginClosedAt` is per-fingerprint, but the
+  close it records happens to the aggregate's *shared* issue, and only the last
+  member to resolve lands it. A non-last member that kept asserting `null` read
+  its own aggregate's close as an operator close and muted the next genuine
+  recurrence.
+  The fallback is asymmetric on purpose: reading our close as an operator's
   would *mute a live recurring alert* for a whole window, while the reverse
   costs one unwanted re-open. Legacy rows drain on their first firing.
 

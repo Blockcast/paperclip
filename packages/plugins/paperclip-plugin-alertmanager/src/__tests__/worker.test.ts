@@ -1349,6 +1349,122 @@ describe("handleWebhook — closure authorship across cycles (BLO-31736)", () =>
       expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
     );
   });
+
+  // -------------------------------------------------------------------------
+  // The tests above are single-*fingerprint*, which is the same blind spot one
+  // level up from the single-*shot* tests that let the original defect ship.
+  // `pluginClosedAt` lives on the per-fingerprint state row, but the close it
+  // records happens to a shared issue, and only the last member to resolve
+  // actually lands it. So the record and the fact it records sit at different
+  // scopes, and the gap is invisible until an aggregate has two members.
+  // -------------------------------------------------------------------------
+  it("re-opens for a non-last aggregate member whose sibling landed the cancel", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const AGG = "CiliumPolicyDropsHigh|critical";
+    const memberState = (fingerprint: string): AlertStateRecord => ({
+      ...freshlyFiredState(),
+      paperclipIssueId: "issue-shared",
+      aggregateKey: AGG,
+      // Both members fired, so both rows carry the firing write's "no close of
+      // ours on record" — the value that used to persist into the shared
+      // issue's cancellation and mute the non-last member.
+      pluginClosedAt: null,
+      lastFiredAt: "2026-04-29T08:00:00Z",
+    });
+
+    // One shared issue, one state row per member fingerprint, and a members
+    // table that reports a sibling unresolved until both have cleared.
+    const rows: Record<string, AlertStateRecord> = {
+      "alert-a": memberState("alert-a"),
+      "alert-b": memberState("alert-b"),
+    };
+    const resolvedMembers = new Set<string>();
+    const issue = { id: "issue-shared", status: "todo" };
+    const fpOf = (ref: { stateKey: string }) => ref.stateKey.replace(/^alert:/, "");
+
+    mocks.state.get.mockImplementation(async (ref: { stateKey: string }) => rows[fpOf(ref)] ?? null);
+    mocks.state.set.mockImplementation(
+      async (ref: { stateKey: string }, record: AlertStateRecord) => {
+        rows[fpOf(ref)] = { ...record };
+      },
+    );
+    mocks.issues.get.mockImplementation(async () => ({ ...issue }));
+    mocks.issues.update.mockImplementation(async (_id: string, patch: { status?: string }) => {
+      if (patch.status) issue.status = patch.status;
+      return { id: issue.id };
+    });
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[]) => {
+      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        resolvedMembers.add(String(params[2]));
+        return { rowCount: 1 };
+      }
+      if (/INSERT INTO alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        resolvedMembers.delete(String(params[2]));
+        return { rowCount: 1 };
+      }
+      return { rowCount: 1 };
+    });
+    mocks.db.query.mockImplementation(async (sql: string) => {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        return [{ issue_id: "issue-shared" }];
+      }
+      // The unresolved-sibling probe: true until every member has cleared.
+      if (/SELECT 1 AS one/i.test(sql)) {
+        return Object.keys(rows).some((fp) => !resolvedMembers.has(fp)) ? [{ one: 1 }] : [];
+      }
+      return [];
+    });
+
+    const deliver = (fingerprint: string, endsAt?: string) =>
+      handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({
+            status: endsAt ? "resolved" : "firing",
+            alerts: [
+              baseAlert({
+                fingerprint,
+                ...(endsAt ? { status: "resolved" as const, endsAt } : {}),
+              }),
+            ],
+          }),
+        }),
+      );
+
+    // Member A clears first. Its cancel is deferred to the sibling, so this
+    // delivery decided nothing about authorship — and must not keep asserting
+    // the firing write's `null`, which is now a claim it cannot back.
+    await deliver("alert-a", "2026-04-29T10:00:00Z");
+    expect(issue.status).toBe("todo");
+    expect(rows["alert-a"].resolvedAt).toBe("2026-04-29T10:00:00Z");
+    expect(rows["alert-a"].pluginClosedAt).toBeUndefined();
+
+    // Member B clears last, so the aggregate's cancel lands here. B records the
+    // close it authored; A cannot be reached to record anything.
+    await deliver("alert-b", "2026-04-29T10:05:00Z");
+    expect(issue.status).toBe("cancelled");
+    expect(rows["alert-b"].pluginClosedAt).toBe("2026-04-29T10:05:00Z");
+
+    // A re-fires against an issue the plugin itself cancelled. This is a
+    // genuine recurrence: before the fix A's `null` read as an operator close
+    // and muted it for the whole suppression window.
+    await deliver("alert-a");
+    expect(issue.status).toBe("todo");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
